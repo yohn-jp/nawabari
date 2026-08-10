@@ -10,13 +10,14 @@ import {
   type GitWorktreeInfo,
   type RepositoryContext,
 } from "./git.js";
-import { SessionRegistryError } from "./errors.js";
+import { SessionRegistryError, type RegistryErrorCode, type RegistryErrorDetails } from "./errors.js";
 import { generateSessionId, isSessionId } from "./session-id.js";
 
 export const REGISTRY_SCHEMA_VERSION = 1 as const;
 export const REGISTRY_DIRECTORY_NAME = "git-paw";
 export const REGISTRY_FILE_NAME = "session-registry.json";
 export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
+export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
 export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
@@ -51,6 +52,37 @@ export interface ProvisionSessionOptions {
   readonly protectedWorktreePaths?: readonly string[];
 }
 
+export interface CloseSessionResult {
+  readonly session: SessionRecord;
+  readonly worktreeRemoved: boolean;
+  readonly branchRemoved: boolean;
+  readonly idempotent: boolean;
+}
+
+export interface CloseSessionOptions {
+  readonly sessionId?: string | null;
+  readonly session_id?: string | null;
+}
+
+export interface GarbageCollectOptions {
+  readonly apply?: boolean;
+  readonly staleAfterMs?: number;
+}
+
+export interface GarbageCollectBlocked {
+  readonly sessionId: string;
+  readonly code: RegistryErrorCode;
+  readonly message: string;
+  readonly details: RegistryErrorDetails;
+}
+
+export interface GarbageCollectResult {
+  readonly apply: boolean;
+  readonly candidates: readonly SessionRecord[];
+  readonly cleaned: readonly SessionRecord[];
+  readonly blocked: readonly GarbageCollectBlocked[];
+}
+
 export interface SessionRegistryOptions {
   readonly cwd?: string;
   readonly repository?: RepositoryContext;
@@ -62,6 +94,7 @@ export interface SessionRegistryOptions {
   readonly protectedBranchNames?: readonly string[];
   readonly protectedWorktreePaths?: readonly string[];
   readonly worktreeRoot?: string;
+  readonly staleAfterMs?: number;
 }
 
 export interface RegistryPaths {
@@ -91,6 +124,7 @@ export interface PersistedRegistry {
 }
 
 const ACTIVE_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "stale"]);
+const CURRENT_SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing"]);
 const SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "closed", "stale"]);
 const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const MAX_ID_GENERATION_ATTEMPTS = 8;
@@ -107,6 +141,7 @@ export class SessionRegistry {
   private readonly protectedBranchNames: readonly string[];
   private readonly protectedWorktreePaths: readonly string[];
   private readonly worktreeRoot: string;
+  private readonly staleAfterMs: number;
 
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
@@ -118,9 +153,13 @@ export class SessionRegistry {
     this.protectedBranchNames = Object.freeze([...(options.protectedBranchNames ?? [])]);
     this.protectedWorktreePaths = Object.freeze([...(options.protectedWorktreePaths ?? [])]);
     this.worktreeRoot = path.resolve(options.worktreeRoot ?? path.dirname(this.repository.worktreePath));
+    this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
 
     if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0) {
       throw new RangeError("lockTimeoutMs must be a non-negative safe integer");
+    }
+    if (!Number.isSafeInteger(this.staleAfterMs) || this.staleAfterMs < 0) {
+      throw new RangeError("staleAfterMs must be a non-negative safe integer");
     }
 
     const directory = path.join(this.repository.commonGitDirectory, REGISTRY_DIRECTORY_NAME);
@@ -257,7 +296,7 @@ export class SessionRegistry {
   resolveCurrentSession(): SessionRecord {
     const records = this.readUnsafe();
     const matches = records.filter(
-      (record) => ACTIVE_STATES.has(record.state) && record.worktreeId === this.repository.worktreePath,
+      (record) => CURRENT_SESSION_STATES.has(record.state) && record.worktreeId === this.repository.worktreePath,
     );
 
     if (matches.length === 1) {
@@ -280,6 +319,246 @@ export class SessionRegistry {
 
   currentSession(): SessionRecord {
     return this.resolveCurrentSession();
+  }
+
+  /** Close one session only after its ownership and recoverability are proven safe. */
+  close(sessionIdOrOptions?: string | null | CloseSessionOptions): CloseSessionResult {
+    return this.withLock(() => {
+      const sessionId =
+        typeof sessionIdOrOptions === "object" && sessionIdOrOptions !== null
+          ? (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id)
+          : sessionIdOrOptions;
+      const selectedSessionId = sessionId ?? this.resolveCurrentSession().sessionId;
+      assertSessionId(selectedSessionId);
+      return this.closeUnsafe(selectedSessionId);
+    });
+  }
+
+  closeSession(sessionIdOrOptions?: string | null | CloseSessionOptions): CloseSessionResult {
+    return this.close(sessionIdOrOptions);
+  }
+
+  /** Detect stale sessions, optionally applying only cleanup that passes close preflight. */
+  garbageCollect(options: GarbageCollectOptions = {}): GarbageCollectResult {
+    const apply = options.apply ?? false;
+    const staleAfterMs = options.staleAfterMs ?? this.staleAfterMs;
+    assertStaleAfterMs(staleAfterMs);
+
+    return this.withLock(() => {
+      let records = [...this.readUnsafe()];
+      const now = toTimestamp(this.clock());
+      const worktrees = listGitWorktrees(this.git ?? defaultGit, this.repository.worktreePath);
+      const candidates = records
+        .filter((record) => isStaleCandidate(record, now, staleAfterMs, worktrees))
+        .map(cloneSessionRecord);
+
+      if (!apply || candidates.length === 0) {
+        return {
+          apply,
+          candidates,
+          cleaned: [],
+          blocked: [],
+        };
+      }
+
+      const cleaned: SessionRecord[] = [];
+      const blocked: GarbageCollectBlocked[] = [];
+      for (const candidate of candidates) {
+        const current = records.find((record) => record.sessionId === candidate.sessionId);
+        if (current === undefined || current.state === "closed") continue;
+
+        if (current.state !== "stale" && current.state !== "closing") {
+          const staleRecord = transitionSessionState(current, "stale", this.clock);
+          records = replaceRecord(records, staleRecord);
+          validateRecords(records, this.repository.repositoryId);
+          this.writeUnsafe(records);
+        }
+
+        try {
+          const result = this.closeUnsafe(candidate.sessionId);
+          cleaned.push(result.session);
+        } catch (error: unknown) {
+          if (!(error instanceof SessionRegistryError)) throw error;
+          blocked.push({
+            sessionId: candidate.sessionId,
+            code: error.code,
+            message: error.message,
+            details: error.details,
+          });
+        }
+        records = [...this.readUnsafe()];
+      }
+
+      return {
+        apply,
+        candidates,
+        cleaned: cleaned.map(cloneSessionRecord),
+        blocked,
+      };
+    });
+  }
+
+  gc(options: GarbageCollectOptions = {}): GarbageCollectResult {
+    return this.garbageCollect(options);
+  }
+
+  private closeUnsafe(sessionId: string): CloseSessionResult {
+    const records = this.readUnsafe();
+    const record = records.find((candidate) => candidate.sessionId === sessionId);
+    if (record === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, {
+        sessionId,
+      });
+    }
+    if (record.state === "closed") {
+      return {
+        session: cloneSessionRecord(record),
+        worktreeRemoved: false,
+        branchRemoved: false,
+        idempotent: true,
+      };
+    }
+
+    const resources = this.inspectCleanupResources(record);
+    const closingRecord = record.state === "closing" ? record : transitionSessionState(record, "closing", this.clock);
+    let closingRecords = replaceRecord(records, closingRecord);
+    validateRecords(closingRecords, this.repository.repositoryId);
+    this.writeUnsafe(closingRecords);
+
+    let worktreeRemoved = false;
+    let branchRemoved = false;
+
+    if (resources.worktreePresent && resources.removeWorktree) {
+      removeSessionWorktree(this.git ?? defaultGit, resources.gitCwd, record.worktreePath);
+      worktreeRemoved = true;
+    }
+
+    if (resources.branchPresent && resources.removeBranch) {
+      removeSessionBranch(this.git ?? defaultGit, resources.gitCwd, record.branchName);
+      branchRemoved = true;
+    }
+
+    const closedRecord = transitionSessionState(closingRecord, "closed", this.clock);
+    closingRecords = replaceRecord(closingRecords, closedRecord);
+    validateRecords(closingRecords, this.repository.repositoryId);
+    this.writeUnsafe(closingRecords);
+
+    return {
+      session: cloneSessionRecord(closedRecord),
+      worktreeRemoved,
+      branchRemoved,
+      idempotent: false,
+    };
+  }
+
+  private inspectCleanupResources(record: SessionRecord): CleanupResources {
+    const git = this.git ?? defaultGit;
+    const worktrees = listGitWorktrees(git, this.repository.worktreePath);
+    const gitCwd =
+      worktrees.find((worktree) => !samePath(worktree.worktreePath, record.worktreePath))?.worktreePath ??
+      this.repository.worktreePath;
+    const registeredWorktree = worktrees.find((worktree) => samePath(worktree.worktreePath, record.worktreePath));
+    const branchWorktree = worktrees.find((worktree) => worktree.branchName === record.branchName);
+
+    if (registeredWorktree !== undefined && registeredWorktree.branchName !== record.branchName) {
+      throw ownershipMismatch(record, "The registered worktree branch does not match the session branch", {
+        actualBranch: registeredWorktree.branchName ?? "<detached>",
+      });
+    }
+    if (branchWorktree !== undefined && !samePath(branchWorktree.worktreePath, record.worktreePath)) {
+      throw ownershipMismatch(record, "The session branch is checked out by another worktree", {
+        actualWorktree: branchWorktree.worktreePath,
+      });
+    }
+
+    const pathEntry = lstatIfPresent(record.worktreePath);
+    if (registeredWorktree === undefined && pathEntry !== undefined) {
+      throw ownershipMismatch(record, "The session worktree path exists but is not a Git worktree");
+    }
+    if (pathEntry !== undefined && (pathEntry.isSymbolicLink() || !pathEntry.isDirectory())) {
+      throw ownershipMismatch(record, "The session worktree path is not a directory worktree");
+    }
+
+    const worktreePresent = registeredWorktree !== undefined;
+    const branchPresent = localBranchExists(git, this.repository.worktreePath, record.branchId);
+    if (worktreePresent) {
+      if (!branchPresent || registeredWorktree?.branchName !== record.branchName) {
+        throw ownershipMismatch(record, "The registered worktree no longer has the owned local branch");
+      }
+      assertWorktreeClean(git, record.worktreePath);
+    }
+
+    const worktreeProtection = this.protectedWorktree(record.worktreePath, worktrees);
+    const branchProtection = this.protectedBranch(record.branchName, worktrees);
+    const removeBranch = branchPresent && !branchProtection && this.branchIsReachableFromIntegration(record);
+
+    return {
+      gitCwd,
+      worktreePresent,
+      branchPresent,
+      removeWorktree: worktreePresent && !worktreeProtection,
+      removeBranch,
+    };
+  }
+
+  private protectedWorktree(worktreePath: string, worktrees: readonly GitWorktreeInfo[]): boolean {
+    const defaultWorktreePath = worktrees[0]?.worktreePath ?? this.repository.worktreePath;
+    const configured = this.protectedWorktreePaths.map((candidate) =>
+      resolvePotentialWorktreePath(candidate, this.repository.worktreePath),
+    );
+    return (
+      samePath(worktreePath, defaultWorktreePath) || configured.some((candidate) => samePath(worktreePath, candidate))
+    );
+  }
+
+  private protectedBranch(branchName: string, worktrees: readonly GitWorktreeInfo[]): boolean {
+    const defaultBranchName = resolveDefaultBranchName(
+      this.git ?? defaultGit,
+      this.repository.worktreePath,
+      worktrees,
+      this.defaultBranchName,
+    );
+    const protectedBranchIds = [
+      ...(defaultBranchName === undefined ? [] : [normalizeBranchId(defaultBranchName)]),
+      ...this.protectedBranchNames.map((candidate) => normalizeBranchId(candidate)),
+    ];
+    return protectedBranchIds.includes(normalizeBranchId(branchName));
+  }
+
+  private branchIsReachableFromIntegration(record: SessionRecord): boolean {
+    const git = this.git ?? defaultGit;
+    const worktrees = listGitWorktrees(git, this.repository.worktreePath);
+    const defaultBranchName = resolveDefaultBranchName(
+      git,
+      this.repository.worktreePath,
+      worktrees,
+      this.defaultBranchName,
+    );
+    if (defaultBranchName === undefined) {
+      throw new SessionRegistryError(
+        "RECOVERABLE_COMMITS",
+        `Cannot prove that commits on ${record.branchName} are safely retained: no integration branch is known`,
+        { branch: record.branchName },
+      );
+    }
+    if (normalizeBranchId(defaultBranchName) === record.branchId) return true;
+    try {
+      git.run(
+        ["merge-base", "--is-ancestor", record.branchId, normalizeBranchId(defaultBranchName)],
+        this.repository.worktreePath,
+      );
+      return true;
+    } catch (error: unknown) {
+      if (error instanceof SessionRegistryError && error.code === "GIT_COMMAND_FAILED") {
+        throw new SessionRegistryError(
+          "RECOVERABLE_COMMITS",
+          `Commits on ${record.branchName} are not proven reachable from ${defaultBranchName}`,
+          { branch: record.branchName, integrationBranch: defaultBranchName },
+          error,
+        );
+      }
+      throw error;
+    }
   }
 
   private resolveProvisioningResources(options: ProvisionSessionOptions, sessionId: string): ProvisioningResources {
@@ -510,6 +789,75 @@ interface ProvisioningResources {
 interface MutationResult<T> {
   readonly records: readonly SessionRecord[];
   readonly result: T;
+}
+
+interface CleanupResources {
+  readonly gitCwd: string;
+  readonly worktreePresent: boolean;
+  readonly branchPresent: boolean;
+  readonly removeWorktree: boolean;
+  readonly removeBranch: boolean;
+}
+
+function assertStaleAfterMs(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError("staleAfterMs must be a non-negative safe integer");
+  }
+}
+
+function isStaleCandidate(
+  record: SessionRecord,
+  now: string,
+  staleAfterMs: number,
+  worktrees: readonly GitWorktreeInfo[],
+): boolean {
+  if (record.state === "closed") return false;
+  if (record.state === "stale" || record.state === "closing") return true;
+  const age = Date.parse(now) - Date.parse(record.updatedAt);
+  const worktreePresent = worktrees.some((worktree) => samePath(worktree.worktreePath, record.worktreePath));
+  return age >= staleAfterMs || (!worktreePresent && !fs.existsSync(record.worktreePath));
+}
+
+function replaceRecord(records: readonly SessionRecord[], replacement: SessionRecord): SessionRecord[] {
+  return records.map((record) => (record.sessionId === replacement.sessionId ? replacement : record));
+}
+
+function transitionSessionState(record: SessionRecord, state: SessionState, clock: () => Date): SessionRecord {
+  const clockTimestamp = toTimestamp(clock());
+  const updatedAt = new Date(Math.max(Date.parse(record.updatedAt), Date.parse(clockTimestamp))).toISOString();
+  return freezeSessionRecord({ ...record, state, updatedAt });
+}
+
+function ownershipMismatch(
+  record: SessionRecord,
+  message: string,
+  details: RegistryErrorDetails = {},
+): SessionRegistryError {
+  return new SessionRegistryError("OWNERSHIP_MISMATCH", message, {
+    sessionId: record.sessionId,
+    worktree: record.worktreePath,
+    branch: record.branchName,
+    ...details,
+  });
+}
+
+function assertWorktreeClean(git: GitCommandRunner, worktreePath: string): void {
+  const status = git.run(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"], worktreePath);
+  if (status.length > 0) {
+    throw new SessionRegistryError("DIRTY_WORKTREE", `Worktree contains recoverable changes: ${worktreePath}`, {
+      worktree: worktreePath,
+      status,
+    });
+  }
+}
+
+function removeSessionWorktree(git: GitCommandRunner, cwd: string, worktreePath: string): void {
+  const force = !fs.existsSync(worktreePath);
+  git.run(["worktree", "remove", ...(force ? ["--force"] : []), worktreePath], cwd);
+}
+
+function removeSessionBranch(git: GitCommandRunner, cwd: string, branchName: string): void {
+  git.run(["branch", "-d", "--", branchName], cwd);
 }
 
 function generateUniqueSessionId(records: readonly SessionRecord[], idGenerator: () => string): string {

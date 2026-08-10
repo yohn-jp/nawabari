@@ -1,4 +1,4 @@
-import { DomainError, type DomainResult, failure } from "./errors.js";
+import { DomainError, type DomainResult, failure, type ErrorCode, type JsonObject } from "./errors.js";
 
 export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
 
@@ -56,12 +56,21 @@ export type SessionCloseResult = {
   session: SessionRecord;
   worktree_removed: boolean;
   branch_removed: boolean;
+  idempotent?: boolean;
+};
+
+export type GarbageCollectBlocked = {
+  session_id: string;
+  code: ErrorCode;
+  message: string;
+  details: JsonObject;
 };
 
 export type GarbageCollectResult = {
   apply: boolean;
   candidates: SessionRecord[];
   cleaned: SessionRecord[];
+  blocked?: GarbageCollectBlocked[];
 };
 
 export interface SessionBackend {
