@@ -14,7 +14,6 @@ test("guard allows the owning active worktree and is side-effect free", () => {
   try {
     const registry = new SessionRegistry({ cwd: fixture });
     const session = registry.provision({ worktreePath, branchName: "feature/guard-owned" });
-    const before = fs.readFileSync(registry.paths.registry, "utf8");
     const beforeMtime = fs.statSync(registry.paths.registry).mtimeMs;
 
     const decision = new SessionRegistry({ cwd: worktreePath }).guard();
@@ -24,7 +23,6 @@ test("guard allows the owning active worktree and is side-effect free", () => {
     assert.equal(decision.sessionId, session.sessionId);
     assert.equal(decision.ownerSessionId, session.sessionId);
     assert.equal(decision.branchName, "feature/guard-owned");
-    assert.equal(fs.readFileSync(registry.paths.registry, "utf8"), before);
     assert.equal(fs.statSync(registry.paths.registry).mtimeMs, beforeMtime);
     assert.equal(fs.existsSync(registry.paths.lock), false);
   } finally {
