@@ -99,6 +99,46 @@ test("the local backend preserves unexpected error diagnostics", async () => {
   }
 });
 
+test("the local backend exposes close and gc as stable automation results", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-lifecycle-contract`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/lifecycle-contract", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const closed = await backend.closeSession({ cwd: worktreePath }, { session_id: null });
+    assert.equal(closed.ok, true, closed.ok ? "close succeeded" : JSON.stringify(closed.error));
+    if (!closed.ok) return;
+    assert.equal(closed.value.session.session_id, created.value.session_id);
+    assert.equal(closed.value.session.state, "closed");
+    assert.equal(closed.value.worktree_removed, true);
+    assert.equal(closed.value.branch_removed, true);
+
+    const output: string[] = [];
+    const exitCode = await runCli(["gc", "--dry-run", "--json"], {
+      cwd: repositoryPath,
+      io: { stdout: (line) => output.push(line), stderr: () => undefined },
+    });
+    assert.equal(exitCode, 0);
+    assert.deepEqual(JSON.parse(output[0]), {
+      ok: true,
+      command: "gc",
+      apply: false,
+      candidates: [],
+      cleaned: [],
+      blocked: [],
+    });
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 function createRepository(): string {
   const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "git-paw-domain-"));
   runGit(["init", "-b", "main", repositoryPath], repositoryPath);

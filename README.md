@@ -54,6 +54,35 @@ schema versions, and domain-specific ownership conflicts. `RegistryError.code`
 and `RegistryLockError.code` are the stable machine-readable outcomes for
 callers.
 
+## Session lifecycle and safe cleanup
+
+`session close` operates only on the selected session (or the session owning
+the current worktree). It verifies the registry ownership against Git's local
+worktree inventory, refuses dirty or ambiguous worktrees, and refuses to delete
+a branch whose commits are not proven reachable from the repository's
+integration branch. A clean provisioned session transitions through
+`closing` to `closed`; the `closing` state is retained if an operation is
+interrupted so a later close or `gc --apply` can retry safely. Repeating close
+for a closed session is an idempotent success.
+
+```bash
+git paw session close --json
+git paw session close --session <session-id> --json
+git paw gc --dry-run --json
+git paw gc --apply --json
+```
+
+`gc` is detection-only by default. A session is a candidate when it is already
+`stale`, a close is in progress, its `updated_at` is older than the default
+24-hour stale threshold, or its worktree path is missing. `gc --apply` first
+marks candidates stale, then applies the same close safety checks. Dirty,
+ambiguous, ownership-mismatched, or recoverable-commit sessions remain in the
+registry and are returned in the machine-readable `blocked` list. Missing
+resources are cleaned only when the remaining branch state is proven safe.
+
+GitPaw governs operations routed through GitPaw; it cannot prevent a process
+with filesystem permission from editing or deleting another worktree directly.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

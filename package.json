@@ -14,7 +14,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/chmod-bin.mjs",
     "start": "node dist/index.js",
-    "test": "node --test --import tsx src/**/*.test.ts scripts/**/*.test.mjs",
+    "test": "node --test --import tsx src/*.test.ts src/**/*.test.ts scripts/**/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint 'src/**/*.ts' 'scripts/**/*.mjs' 'eslint.config.mjs'",
     "format": "prettier --write .",

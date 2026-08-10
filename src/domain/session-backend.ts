@@ -1,5 +1,6 @@
 import {
   SessionRegistry,
+  type GarbageCollectResult as RegistryGarbageCollectResult,
   type SessionRecord as RegistrySessionRecord,
   type SessionRegistryOptions,
 } from "../session-registry.js";
@@ -27,8 +28,8 @@ export interface LocalSessionBackendOptions {
 export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
   session_registry: true,
   provisioning: true,
-  lifecycle: false,
-  garbage_collection: false,
+  lifecycle: true,
+  garbage_collection: true,
   current_session_resolution: true,
 });
 
@@ -54,6 +55,9 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   PROTECTED_BRANCH: "PROTECTED_BRANCH",
   SESSION_ID_COLLISION: "OPERATION_REJECTED",
   SESSION_NOT_FOUND: "SESSION_NOT_FOUND",
+  DIRTY_WORKTREE: "DIRTY_WORKTREE",
+  OWNERSHIP_MISMATCH: "OWNERSHIP_MISMATCH",
+  RECOVERABLE_COMMITS: "RECOVERABLE_COMMITS",
   REGISTRY_LOCK_TIMEOUT: "LOCK_CONTENTION",
   REGISTRY_IO_FAILURE: "REGISTRY_UNREADABLE",
 });
@@ -137,28 +141,40 @@ export class LocalSessionBackend implements SessionBackend {
   }
 
   public closeSession(
-    _context: SessionContext,
-    _options: SessionCloseOptions,
+    context: SessionContext,
+    options: SessionCloseOptions,
   ): Promise<DomainResult<SessionCloseResult>> {
-    return Promise.resolve(failure(this.unavailableError("session.close")));
+    try {
+      const registry = this.registryFor(context);
+      const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
+      const result = registry.close(sessionId);
+      return Promise.resolve(
+        success({
+          session: toDomainRecord(result.session),
+          worktree_removed: result.worktreeRemoved,
+          branch_removed: result.branchRemoved,
+          idempotent: result.idempotent,
+        }),
+      );
+    } catch (error: unknown) {
+      return Promise.resolve(failure(toDomainError(error, "NO_CURRENT_SESSION")));
+    }
   }
 
   public garbageCollect(
-    _context: SessionContext,
-    _options: GarbageCollectOptions,
+    context: SessionContext,
+    options: GarbageCollectOptions,
   ): Promise<DomainResult<GarbageCollectResult>> {
-    return Promise.resolve(failure(this.unavailableError("gc")));
+    try {
+      const result = this.registryFor(context).garbageCollect({ apply: options.apply });
+      return Promise.resolve(success(toDomainGarbageCollectResult(result)));
+    } catch (error: unknown) {
+      return Promise.resolve(failure(toDomainError(error)));
+    }
   }
 
   private registryFor(context: SessionContext): SessionRegistry {
     return new SessionRegistry({ ...this.registryOptions, cwd: context.cwd, git: this.git });
-  }
-
-  private unavailableError(operation: string): DomainError {
-    return new DomainError("BACKEND_UNAVAILABLE", "The requested GitPaw session capability is not available.", {
-      operation,
-      capabilities: { ...LOCAL_SESSION_CAPABILITIES, lifecycle: false, garbage_collection: false },
-    });
   }
 }
 
@@ -177,6 +193,20 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
     created_at: record.createdAt,
     updated_at: record.updatedAt,
     ...(record.label === undefined ? {} : { label: record.label }),
+  };
+}
+
+function toDomainGarbageCollectResult(result: RegistryGarbageCollectResult): GarbageCollectResult {
+  return {
+    apply: result.apply,
+    candidates: result.candidates.map(toDomainRecord),
+    cleaned: result.cleaned.map(toDomainRecord),
+    blocked: result.blocked.map((blocked) => ({
+      session_id: blocked.sessionId,
+      code: REGISTRY_ERROR_CODE_MAP[blocked.code],
+      message: blocked.message,
+      details: { ...blocked.details },
+    })),
   };
 }
 
