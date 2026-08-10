@@ -1,6 +1,6 @@
 import { DomainError, type DomainResult, failure } from "./errors.js";
 
-export type SessionState = "active" | "closing" | "closed" | "stale";
+export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
 
 export type SessionRecord = {
   schema_version: number;
@@ -11,6 +11,7 @@ export type SessionRecord = {
   state: SessionState;
   created_at: string;
   updated_at: string;
+  label?: string;
 };
 
 export type SessionContext = {
@@ -21,6 +22,7 @@ export type SessionCreateOptions = {
   branch: string | null;
   worktree: string | null;
   label: string | null;
+  base?: string | null;
 };
 
 export type SessionCloseOptions = {

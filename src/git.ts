@@ -21,6 +21,11 @@ export interface WorktreeIdentity {
   readonly branchName: string;
 }
 
+export interface GitWorktreeInfo {
+  readonly worktreePath: string;
+  readonly branchName: string | null;
+}
+
 export interface ResolveRepositoryOptions {
   readonly cwd?: string;
   readonly git?: GitCommandRunner;
@@ -96,10 +101,44 @@ export function resolveWorktreeIdentity(options: ResolveWorktreeOptions = {}): W
   });
 }
 
+/** Read the repository's local worktree inventory without consulting a remote. */
+export function listGitWorktrees(git: GitCommandRunner, cwd: string): readonly GitWorktreeInfo[] {
+  const output = git.run(["worktree", "list", "--porcelain"], cwd);
+  const entries: GitWorktreeInfo[] = [];
+  let currentPath: string | undefined;
+  let currentBranch: string | null = null;
+
+  const flush = (): void => {
+    if (currentPath === undefined) return;
+    entries.push(Object.freeze({ worktreePath: canonicalListedPath(currentPath), branchName: currentBranch }));
+    currentPath = undefined;
+    currentBranch = null;
+  };
+
+  for (const line of output.split(/\r?\n/u)) {
+    if (line.startsWith("worktree ")) {
+      flush();
+      currentPath = line.slice("worktree ".length);
+      continue;
+    }
+    if (line.startsWith("branch ")) {
+      const branchId = line.slice("branch ".length);
+      if (branchId.startsWith("refs/heads/")) {
+        currentBranch = branchId.slice("refs/heads/".length);
+      }
+    }
+  }
+  flush();
+  return entries;
+}
+
 export function normalizeBranchId(branchName: string): string {
   const trimmed = branchName.trim();
   if (trimmed !== branchName) {
     throw new SessionRegistryError("INVALID_BRANCH_ID", `Invalid branch identity: ${branchName}`, { branchName });
+  }
+  if (trimmed.startsWith("refs/") && !trimmed.startsWith("refs/heads/")) {
+    throw new SessionRegistryError("INVALID_BRANCH_ID", `Invalid local branch identity: ${branchName}`, { branchName });
   }
   const normalized = trimmed.startsWith("refs/heads/") ? trimmed : `refs/heads/${trimmed}`;
   const shortName = normalized.slice("refs/heads/".length);
@@ -122,6 +161,15 @@ export function normalizeBranchId(branchName: string): string {
   }
 
   return normalized;
+}
+
+function canonicalListedPath(candidate: string): string {
+  const resolved = path.resolve(candidate);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
 }
 
 function readCurrentBranch(git: GitCommandRunner, cwd: string): string {

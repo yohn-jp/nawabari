@@ -2,13 +2,13 @@ import { createRequire } from "node:module";
 import { runDoctor } from "./domain/doctor.js";
 import { DomainError, EXIT_CODES, failure, type DomainResult, type JsonObject } from "./domain/errors.js";
 import {
-  createUnavailableSessionBackend,
   type GarbageCollectOptions,
   type SessionBackend,
   type SessionCloseOptions,
   type SessionContext,
   type SessionCreateOptions,
 } from "./domain/session.js";
+import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
 
 const CLI_NAME = "git-paw";
@@ -35,7 +35,7 @@ const HELP_TEXT = [
   "  -h, --help           Show this help",
   "",
   "Session options:",
-  "  session create --branch <name> --worktree <path> --label <text>",
+  "  session create --branch <name> --worktree <path> --base <ref> --label <text>",
   "  session show|close --session <id>",
   "  gc [--dry-run|--apply]",
 ].join("\n");
@@ -43,7 +43,7 @@ const HELP_TEXT = [
 const HELP_DATA: JsonObject = {
   usage: `Usage: ${CLI_NAME} <command> [options]`,
   commands: ["session create", "session id", "session show", "session list", "session close", "status", "gc", "doctor"],
-  options: ["--json", "--help", "--version"],
+  options: ["--json", "--help", "--version", "--base"],
 };
 
 export type CliDependencies = {
@@ -64,6 +64,7 @@ type ParsedOptions = {
   session_id: string | null;
   branch: string | null;
   worktree: string | null;
+  base: string | null;
   label: string | null;
   apply: boolean;
 };
@@ -114,6 +115,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     session_id: null,
     branch: null,
     worktree: null,
+    base: null,
     label: null,
     apply: false,
   };
@@ -143,6 +145,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     if (name === "--session") options.session_id = value;
     else if (name === "--branch") options.branch = value;
     else if (name === "--worktree") options.worktree = value;
+    else if (name === "--base") options.base = value;
     else if (name === "--label") options.label = value;
   }
 
@@ -181,11 +184,12 @@ async function executeCommand(
       return failure(usageError("MISSING_ARGUMENT", "session requires a subcommand."));
     }
     if (subcommand === "create") {
-      const parsed = parseOptions(rest, new Set(["--branch", "--worktree", "--label"]));
+      const parsed = parseOptions(rest, new Set(["--branch", "--worktree", "--base", "--label"]));
       if (!parsed.ok) return parsed;
       const options: SessionCreateOptions = {
         branch: parsed.value.branch,
         worktree: parsed.value.worktree,
+        base: parsed.value.base,
         label: parsed.value.label,
       };
       const result = await dependencies.backend.createSession(context, options);
@@ -289,7 +293,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   }
 
   const command = commandName(parsed.value.commandArguments);
-  const backend = dependencies.backend ?? createUnavailableSessionBackend();
+  const backend = dependencies.backend ?? createLocalSessionBackend();
   const cwd = dependencies.cwd ?? process.cwd();
   try {
     const result = await executeCommand(parsed.value.commandArguments, { backend, cwd });
