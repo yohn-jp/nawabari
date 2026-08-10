@@ -1,86 +1,45 @@
 # GitPaw
 
-GitPaw is the local command-line boundary for Git development-session state.
-The executable is named `git-paw`, so Git discovers it as the `git paw`
-external subcommand. GitPaw does not replace Git, orchestrate tasks, or call
-GitHub.
+GitPaw is a standalone local Git/session primitive. This repository currently
+provides the foundational repository-scoped session registry used by later
+worktree and lifecycle features. It does not require GitHub, a network
+connection, Mottainai, or a particular agent runtime.
 
-## Install
+## Session registry
 
-```bash
-npm install -g git-paw
+`SessionRegistry` stores authoritative state in the common Git directory at
+`.git/git-paw/session-registry.json`. The path is resolved through
+`git rev-parse --git-common-dir`, so linked worktrees share one registry.
+
+Session IDs are automatically generated UUIDv7 values. Their 48-bit
+millisecond timestamp supports useful ordering and their random portion makes
+local concurrent creation collision-resistant without a central coordinator.
+IDs are immutable; the optional `label` is display metadata and is never used
+to identify or own a session.
+
+The versioned record contains the repository identity, canonical worktree
+identity/path, canonical branch identity, lifecycle state, and UTC creation
+and update timestamps. Writers take an exclusive lock in the same common Git
+state and replace the registry through a synced temporary file and atomic
+rename. Invalid JSON, unsupported schema versions, repository identity
+mismatches, duplicate session IDs, and conflicting active resource ownership
+are rejected with typed errors; ambiguous state is not repaired implicitly.
+
+The domain API is independent of CLI output:
+
+```ts
+import { SessionRegistry } from "./src/session-registry.js";
+
+const registry = new SessionRegistry({ cwd: process.cwd() });
+const session = registry.create({ label: "reviewer" });
+console.log(session.sessionId, session.worktreePath, session.branchName);
+console.log(registry.resolveCurrentSession().sessionId);
 ```
 
-## Usage
-
-```bash
-git paw --help
-```
-
-## CLI contract
-
-All commands accept `--json`. JSON mode writes exactly one JSON document to
-stdout and never writes human-readable decoration there. Successful responses
-use this envelope:
-
-```json
-{
-  "ok": true,
-  "command": "session show",
-  "session_id": "...",
-  "state": "active"
-}
-```
-
-Rejected responses use the same command name and a stable top-level `code`:
-
-```json
-{
-  "ok": false,
-  "command": "session id",
-  "code": "BACKEND_UNAVAILABLE",
-  "message": "...",
-  "details": {}
-}
-```
-
-Exit codes are stable: `0` is success, `2` is usage error, `3` is a domain
-rejection, `4` means the requested backend capability is unavailable, `5`
-means `doctor` found a local failure, and `70` is an unexpected internal
-failure.
-
-The initial command surface is:
-
-```text
-git paw session create [--branch <name>] [--worktree <path>] [--label <text>]
-git paw session id
-git paw session show [--session <id>]
-git paw session list
-git paw session close [--session <id>]
-git paw status
-git paw gc [--dry-run|--apply]
-git paw doctor
-```
-
-`session id`, `session show`, and `session close` resolve the current session
-from the command's working directory when `--session` is omitted. The CLI
-does not prompt. The session registry, provisioning, lifecycle, and garbage
-collection implementations are supplied through the `SessionBackend` domain
-boundary. They are not present on the current `main` baseline, so those
-commands return `BACKEND_UNAVAILABLE` rather than claiming a false success;
-later backend work can be connected without changing the CLI contract.
-
-`doctor` is implemented locally. It checks the Node.js runtime, Git
-availability, repository/common-directory resolution, and the conventional
-repository-scoped registry path `.git/gitpaw/registry.json` when present. A
-missing registry is reported as `not_configured`, not as a successful session
-state. `doctor` never requires GitHub, `gh`, a network, Mottainai, or a
-particular agent runtime.
-
-Human output and JSON output are two presentations of the same domain result;
-JSON is the automation interface. GitPaw only governs operations routed
-through its backend and cannot prevent a process with filesystem permission
-from editing another worktree directly.
+This registry records existing worktree and branch identities; provisioning,
+cleanup, lifecycle transitions, and hook/orchestrator integration are handled
+by later issues. GitPaw governs operations that use its APIs and is not an
+operating-system or filesystem sandbox.
 
 ## Development
 
