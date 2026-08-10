@@ -1,0 +1,5 @@
+# List native-build packages here if pnpm's default ignored-builds
+# safety net blocks them (ERR_PNPM_IGNORED_BUILDS). esbuild (a transitive
+# dependency of tsx) is a known-safe, widely used build tool.
+allowBuilds:
+  esbuild: true

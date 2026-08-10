@@ -1,0 +1,4 @@
+# Governance-adjacent and public-surface files require owner review.
+/.github/ @OWNER
+/scripts/validate-*.mjs @OWNER
+/package.json @OWNER

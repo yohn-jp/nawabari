@@ -1,0 +1,16 @@
+name: Bug
+description: Reproducible defect
+title: "fix: "
+body:
+  - type: textarea
+    id: summary
+    attributes: { label: Summary, description: Concise defect description }
+    validations: { required: true }
+  - type: textarea
+    id: reproduction
+    attributes: { label: Reproduction, description: Minimal steps, observed result, expected result, and environment }
+    validations: { required: true }
+  - type: textarea
+    id: acceptance
+    attributes: { label: Acceptance criteria, description: Completion criteria, value: "- [ ] " }
+    validations: { required: true }
