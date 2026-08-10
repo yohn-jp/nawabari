@@ -1,41 +1,150 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runCli } from "./cli.js";
+import { success } from "./domain/errors.js";
+import type {
+  SessionBackend,
+  SessionCloseResult,
+  SessionContext,
+  SessionCreateOptions,
+  SessionRecord,
+} from "./domain/session.js";
+import { unavailableCapabilities } from "./domain/session.js";
+import type { CliIO } from "./presentation.js";
 
-test("--help exits 0 and prints usage", async () => {
-  const originalLog = console.log;
-  const lines: string[] = [];
-  console.log = (line: string) => lines.push(line);
-  try {
-    const exitCode = await runCli(["--help"]);
-    assert.equal(exitCode, 0);
-    assert.match(lines.join("\n"), /Usage:/);
-  } finally {
-    console.log = originalLog;
-  }
+const sampleSession: SessionRecord = {
+  schema_version: 1,
+  session_id: "0190f1e0-0000-7000-8000-000000000001",
+  repository: "/tmp/example-repository",
+  worktree: "/tmp/example-worktree",
+  branch: "feat/example",
+  state: "active",
+  created_at: "2026-08-10T00:00:00.000Z",
+  updated_at: "2026-08-10T00:00:00.000Z",
+};
+
+function capture(): { stdout: string[]; stderr: string[]; io: CliIO } {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  return {
+    stdout,
+    stderr,
+    io: {
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+    },
+  };
+}
+
+function backendForTests(overrides: Partial<SessionBackend> = {}): SessionBackend {
+  const closeResult: SessionCloseResult = {
+    session: sampleSession,
+    worktree_removed: true,
+    branch_removed: true,
+  };
+  return {
+    createSession: async (_context: SessionContext, _options: SessionCreateOptions) => success(sampleSession),
+    resolveCurrentSession: async (_context: SessionContext) => success(sampleSession),
+    getSession: async (_context: SessionContext, _sessionId: string) => success(sampleSession),
+    listSessions: async (_context: SessionContext) => success({ sessions: [sampleSession] }),
+    status: async (_context: SessionContext) =>
+      success({
+        repository: sampleSession.repository,
+        current_session: sampleSession,
+        sessions: [sampleSession],
+        capabilities: unavailableCapabilities(),
+      }),
+    closeSession: async (_context: SessionContext) => success(closeResult),
+    garbageCollect: async (_context: SessionContext) => success({ apply: false, candidates: [], cleaned: [] }),
+    ...overrides,
+  };
+}
+
+test("--help exits 0 and prints the git-paw usage", async () => {
+  const output = capture();
+  const exitCode = await runCli(["--help"], { io: output.io });
+
+  assert.equal(exitCode, 0);
+  assert.match(output.stdout.join("\n"), /Usage: git-paw/);
+  assert.equal(output.stderr.length, 0);
 });
 
-test("no arguments exits 1", async () => {
-  const originalLog = console.log;
-  console.log = () => {};
-  try {
-    const exitCode = await runCli([]);
-    assert.equal(exitCode, 1);
-  } finally {
-    console.log = originalLog;
-  }
+test("no arguments prints help and exits with the usage code", async () => {
+  const output = capture();
+  const exitCode = await runCli([], { io: output.io });
+
+  assert.equal(exitCode, 2);
+  assert.match(output.stdout.join("\n"), /session create/);
 });
 
-test("unknown command exits 1", async () => {
-  const originalLog = console.log;
-  const originalError = console.error;
-  console.log = () => {};
-  console.error = () => {};
-  try {
-    const exitCode = await runCli(["bogus"]);
-    assert.equal(exitCode, 1);
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
-  }
+test("unknown commands expose a stable JSON error without decoration", async () => {
+  const output = capture();
+  const exitCode = await runCli(["bogus", "--json"], { io: output.io });
+
+  assert.equal(exitCode, 2);
+  assert.equal(output.stderr.length, 0);
+  assert.equal(output.stdout.length, 1);
+  const response = JSON.parse(output.stdout[0]) as { ok: boolean; code: string; command: string };
+  assert.deepEqual(response, {
+    ok: false,
+    command: "bogus",
+    code: "UNKNOWN_COMMAND",
+    message: "Unknown command: bogus.",
+  });
+});
+
+test("state commands reject honestly when the current main backend is unavailable", async () => {
+  const output = capture();
+  const exitCode = await runCli(["session", "id", "--json"], { io: output.io, cwd: "/tmp/not-a-session" });
+
+  assert.equal(exitCode, 4);
+  assert.equal(output.stderr.length, 0);
+  const response = JSON.parse(output.stdout[0]) as {
+    ok: boolean;
+    code: string;
+    command: string;
+    details: { operation: string };
+  };
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "BACKEND_UNAVAILABLE");
+  assert.equal(response.command, "session id");
+  assert.equal(response.details.operation, "session.resolve_current");
+});
+
+test("session id resolves from the current worktree without an explicit id", async () => {
+  let receivedContext: SessionContext | null = null;
+  const backend = backendForTests({
+    resolveCurrentSession: async (context) => {
+      receivedContext = context;
+      return success(sampleSession);
+    },
+  });
+  const output = capture();
+  const exitCode = await runCli(["session", "id", "--json"], {
+    backend,
+    cwd: "/tmp/owned-worktree",
+    io: output.io,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(receivedContext, { cwd: "/tmp/owned-worktree" });
+  assert.deepEqual(JSON.parse(output.stdout[0]), {
+    ok: true,
+    command: "session id",
+    session_id: sampleSession.session_id,
+  });
+});
+
+test("human and JSON modes present the same backend status result", async () => {
+  const backend = backendForTests();
+  const jsonOutput = capture();
+  const humanOutput = capture();
+
+  assert.equal(await runCli(["status", "--json"], { backend, io: jsonOutput.io }), 0);
+  assert.equal(await runCli(["status"], { backend, io: humanOutput.io }), 0);
+
+  const json = JSON.parse(jsonOutput.stdout[0]) as { session_id: string; branch: string } & Record<string, unknown>;
+  assert.equal(json.session_id, sampleSession.session_id);
+  assert.match(humanOutput.stdout.join("\n"), new RegExp(sampleSession.session_id));
+  assert.match(humanOutput.stdout.join("\n"), new RegExp(sampleSession.branch));
 });

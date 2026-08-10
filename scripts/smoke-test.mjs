@@ -109,6 +109,39 @@ function main() {
       if (versionResult.stdout.trim().length === 0) fail(`launcher "${name}" --version printed nothing`);
     }
 
+    const gitEnvironment = {
+      ...process.env,
+      PATH: `${binDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+    };
+    // Git reserves `git <external-command> --help` for man-page lookup, so
+    // version is the portable discovery probe that does not require a manpage.
+    const gitPawResult = spawnSync("git", ["paw", "--version"], {
+      cwd: installDirectory,
+      env: gitEnvironment,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    if (gitPawResult.error) fail(`git paw failed to start: ${gitPawResult.error.message}`);
+    if (gitPawResult.status !== 0) fail(`git paw --version exited ${gitPawResult.status}, expected 0`);
+    if (gitPawResult.stdout.trim() !== "0.0.1") fail("git paw --version did not discover git-paw");
+
+    const jsonResult = spawnSync(path.join(binDirectory, "git-paw"), ["session", "id", "--json"], {
+      cwd: installDirectory,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    if (jsonResult.status !== 4) fail(`session id without a backend exited ${jsonResult.status}, expected 4`);
+    let parsedJson;
+    try {
+      parsedJson = JSON.parse(jsonResult.stdout);
+    } catch {
+      fail("session id --json did not emit one valid JSON document");
+    }
+    if (parsedJson.ok !== false || parsedJson.code !== "BACKEND_UNAVAILABLE") {
+      fail("session id --json did not expose the stable backend-unavailable contract");
+    }
+    if (jsonResult.stderr.trim().length > 0) fail("session id --json wrote decorative output to stderr");
+
     console.log("smoke test passed.");
   } finally {
     fs.rmSync(installDirectory, { recursive: true, force: true });
