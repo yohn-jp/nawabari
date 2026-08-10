@@ -46,6 +46,19 @@ function backendForTests(overrides: Partial<SessionBackend> = {}): SessionBacken
     createSession: async (_context: SessionContext, _options: SessionCreateOptions) => success(sampleSession),
     resolveCurrentSession: async (_context: SessionContext) => success(sampleSession),
     getSession: async (_context: SessionContext, _sessionId: string) => success(sampleSession),
+    guard: async (_context: SessionContext) =>
+      success({
+        allowed: true,
+        code: "ALLOWED" as const,
+        repository: sampleSession.repository,
+        worktree: sampleSession.worktree,
+        branch: sampleSession.branch,
+        session_id: sampleSession.session_id,
+        owner_session_id: sampleSession.session_id,
+        requested_session_id: null,
+        state: sampleSession.state,
+        details: {},
+      }),
     listSessions: async (_context: SessionContext) => success({ sessions: [sampleSession] }),
     status: async (_context: SessionContext) =>
       success({
@@ -85,6 +98,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session list",
       "session close",
       "status",
+      "guard",
       "gc",
       "doctor",
     ],

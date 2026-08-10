@@ -6,6 +6,7 @@ import {
   listGitWorktrees,
   normalizeBranchId,
   resolveRepositoryContext,
+  resolveWorktreeIdentity,
   type GitCommandRunner,
   type GitWorktreeInfo,
   type RepositoryContext,
@@ -81,6 +82,25 @@ export interface GarbageCollectResult {
   readonly candidates: readonly SessionRecord[];
   readonly cleaned: readonly SessionRecord[];
   readonly blocked: readonly GarbageCollectBlocked[];
+}
+
+export interface GuardOptions {
+  readonly sessionId?: string | null;
+}
+
+export type GuardReasonCode = "ALLOWED" | RegistryErrorCode;
+
+export interface GuardDecision {
+  readonly allowed: boolean;
+  readonly code: GuardReasonCode;
+  readonly repositoryId: string;
+  readonly worktreePath: string;
+  readonly branchName: string | null;
+  readonly sessionId: string | null;
+  readonly ownerSessionId: string | null;
+  readonly requestedSessionId: string | null;
+  readonly state: SessionState | null;
+  readonly details: RegistryErrorDetails;
 }
 
 export interface SessionRegistryOptions {
@@ -319,6 +339,169 @@ export class SessionRegistry {
 
   currentSession(): SessionRecord {
     return this.resolveCurrentSession();
+  }
+
+  /**
+   * Evaluate the current worktree as a GitPaw mutation context without taking
+   * the registry lock or changing Git or registry state.
+   */
+  guard(options: GuardOptions = {}): GuardDecision {
+    const requestedSessionId = options.sessionId ?? null;
+    const base = {
+      repositoryId: this.repository.repositoryId,
+      worktreePath: this.repository.worktreePath,
+      branchName: null as string | null,
+      sessionId: null as string | null,
+      ownerSessionId: null as string | null,
+      requestedSessionId,
+      state: null as SessionState | null,
+    };
+
+    try {
+      if (requestedSessionId !== null && !isSessionId(requestedSessionId)) {
+        return deniedGuard("INVALID_SESSION_ID", base, { sessionId: requestedSessionId });
+      }
+
+      const worktrees = listGitWorktrees(this.git ?? defaultGit, this.repository.worktreePath);
+      if (worktrees.length === 0) {
+        return deniedGuard("WORKTREE_IDENTITY_AMBIGUOUS", base, { worktree: this.repository.worktreePath });
+      }
+
+      const identity = resolveWorktreeIdentity({
+        repository: this.repository,
+        git: this.git ?? defaultGit,
+      });
+      const identityBase = { ...base, branchName: identity.branchName };
+      const records = this.readUnsafe();
+      const currentRecords = records.filter(
+        (record) => record.worktreeId === this.repository.worktreePath && record.state !== "closed",
+      );
+      if (currentRecords.length > 1) {
+        return deniedGuard(
+          "DUPLICATE_WORKTREE_OWNERSHIP",
+          identityBase,
+          {
+            worktree: this.repository.worktreePath,
+            sessionId: requestedSessionId ?? "<unspecified>",
+          },
+          currentRecords[0]?.sessionId ?? null,
+          currentRecords[0]?.state ?? null,
+        );
+      }
+
+      const currentRecord = currentRecords.find((record) => record.state === "active");
+      if (currentRecord !== undefined) {
+        identityBase.sessionId = currentRecord.sessionId;
+        identityBase.ownerSessionId = currentRecord.sessionId;
+        identityBase.state = currentRecord.state;
+      } else {
+        const transitionalRecord = currentRecords[0];
+        if (transitionalRecord !== undefined) {
+          identityBase.sessionId = transitionalRecord.sessionId;
+          identityBase.ownerSessionId = transitionalRecord.sessionId;
+          identityBase.state = transitionalRecord.state;
+        }
+      }
+
+      if (this.protectedWorktree(this.repository.worktreePath, worktrees)) {
+        return deniedGuard(
+          "PROTECTED_WORKTREE",
+          identityBase,
+          { worktree: this.repository.worktreePath },
+          identityBase.ownerSessionId,
+          identityBase.state,
+        );
+      }
+      if (this.protectedBranch(identity.branchName, worktrees)) {
+        return deniedGuard(
+          "PROTECTED_BRANCH",
+          identityBase,
+          { branch: identity.branchName },
+          identityBase.ownerSessionId,
+          identityBase.state,
+        );
+      }
+
+      if (currentRecord === undefined) {
+        const requestedRecord =
+          requestedSessionId === null ? undefined : records.find((record) => record.sessionId === requestedSessionId);
+        return deniedGuard(
+          "SESSION_NOT_FOUND",
+          identityBase,
+          {
+            worktree: this.repository.worktreePath,
+            ...(requestedRecord === undefined ? {} : { state: requestedRecord.state }),
+          },
+          identityBase.ownerSessionId,
+          identityBase.state,
+        );
+      }
+
+      if (currentRecord.branchId !== identity.branchId || currentRecord.branchName !== identity.branchName) {
+        return deniedGuard(
+          "OWNERSHIP_MISMATCH",
+          identityBase,
+          {
+            worktree: this.repository.worktreePath,
+            expectedBranch: currentRecord.branchName,
+            actualBranch: identity.branchName,
+          },
+          currentRecord.sessionId,
+          currentRecord.state,
+        );
+      }
+
+      if (requestedSessionId !== null) {
+        const requestedRecord = records.find((record) => record.sessionId === requestedSessionId);
+        if (requestedRecord === undefined || requestedRecord.state !== "active") {
+          return deniedGuard(
+            "SESSION_NOT_FOUND",
+            identityBase,
+            { sessionId: requestedSessionId },
+            currentRecord.sessionId,
+            currentRecord.state,
+          );
+        }
+        if (requestedRecord.sessionId !== currentRecord.sessionId) {
+          return deniedGuard(
+            "DUPLICATE_WORKTREE_OWNERSHIP",
+            identityBase,
+            {
+              worktree: this.repository.worktreePath,
+              sessionId: requestedSessionId,
+              ownerSessionId: currentRecord.sessionId,
+            },
+            currentRecord.sessionId,
+            currentRecord.state,
+          );
+        }
+        if (requestedRecord.branchId !== identity.branchId) {
+          return deniedGuard(
+            "OWNERSHIP_MISMATCH",
+            identityBase,
+            {
+              sessionId: requestedSessionId,
+              expectedBranch: requestedRecord.branchName,
+              actualBranch: identity.branchName,
+            },
+            currentRecord.sessionId,
+            currentRecord.state,
+          );
+        }
+      }
+
+      return Object.freeze({
+        allowed: true,
+        code: "ALLOWED" as const,
+        ...identityBase,
+        details: {},
+      });
+    } catch (error: unknown) {
+      if (error instanceof SessionRegistryError) {
+        return deniedGuard(error.code, base, error.details, base.ownerSessionId, base.state);
+      }
+      throw error;
+    }
   }
 
   /** Close one session only after its ownership and recoverability are proven safe. */
@@ -838,6 +1021,26 @@ function ownershipMismatch(
     worktree: record.worktreePath,
     branch: record.branchName,
     ...details,
+  });
+}
+
+type GuardDecisionBase = Omit<GuardDecision, "allowed" | "code" | "details">;
+
+function deniedGuard(
+  code: RegistryErrorCode,
+  base: GuardDecisionBase,
+  details: RegistryErrorDetails,
+  ownerSessionId: string | null = base.ownerSessionId,
+  state: SessionState | null = base.state,
+): GuardDecision {
+  return Object.freeze({
+    allowed: false,
+    code,
+    ...base,
+    sessionId: ownerSessionId,
+    ownerSessionId,
+    state,
+    details: { ...details },
   });
 }
 
