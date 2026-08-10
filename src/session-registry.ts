@@ -1586,8 +1586,8 @@ function validateSessionRecord(record: SessionRecord, expectedRepositoryId: stri
   if (Date.parse(record.updatedAt) < Date.parse(record.createdAt)) {
     throw invalidRecord(index, "updated_at cannot precede created_at");
   }
-  if (record.label !== undefined && typeof record.label !== "string") {
-    throw invalidRecord(index, "label must be a string");
+  if (record.label !== undefined && (typeof record.label !== "string" || record.label.length === 0)) {
+    throw invalidRecord(index, "label must be a non-empty string");
   }
 
   return freezeSessionRecord({ ...record });

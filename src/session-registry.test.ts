@@ -77,6 +77,31 @@ test("rejects an empty label before writing unreadable registry state", () => {
   }
 });
 
+test("rejects an empty label through register before writing unreadable registry state", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = makeDirectory("git-paw-register-label-");
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    const candidate = {
+      ...session,
+      sessionId: "01936f5e-7b00-7abc-8def-0123456789ab",
+      worktreeId: worktreePath,
+      worktreePath,
+      branchId: "refs/heads/feature/register-label",
+      branchName: "feature/register-label",
+      label: "",
+    };
+
+    assertRegistryError(() => registry.register(candidate), "INVALID_SESSION_RECORD");
+    assert.equal(registry.list().length, 1);
+    assert.equal(registry.list()[0]?.label, undefined);
+  } finally {
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
 test("rejects duplicate worktree, branch, and session ownership", () => {
   const fixture = createRepositoryFixture();
   const thirdWorktreePath = makeDirectory("git-paw-duplicate-worktree-");
