@@ -10,6 +10,8 @@ import {
   type BackendCapabilities,
   type GarbageCollectOptions,
   type GarbageCollectResult,
+  type GuardDecision,
+  type GuardOptions,
   type SessionBackend,
   type SessionCloseOptions,
   type SessionCloseResult,
@@ -112,6 +114,14 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
+  public async guard(context: SessionContext, options: GuardOptions): Promise<DomainResult<GuardDecision>> {
+    try {
+      return success(toDomainGuardDecision(this.registryFor(context).guard({ sessionId: options.session_id })));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
   public async listSessions(context: SessionContext): Promise<DomainResult<SessionListResult>> {
     try {
       return success({ sessions: this.registryFor(context).list().map(toDomainRecord) });
@@ -193,6 +203,21 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
     created_at: record.createdAt,
     updated_at: record.updatedAt,
     ...(record.label === undefined ? {} : { label: record.label }),
+  };
+}
+
+function toDomainGuardDecision(decision: import("../session-registry.js").GuardDecision): GuardDecision {
+  return {
+    allowed: decision.allowed,
+    code: decision.code === "ALLOWED" ? "ALLOWED" : REGISTRY_ERROR_CODE_MAP[decision.code],
+    repository: decision.repositoryId,
+    worktree: decision.worktreePath,
+    branch: decision.branchName,
+    session_id: decision.sessionId,
+    owner_session_id: decision.ownerSessionId,
+    requested_session_id: decision.requestedSessionId,
+    state: decision.state,
+    details: { ...decision.details },
   };
 }
 

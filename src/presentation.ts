@@ -25,7 +25,10 @@ function jsonFailure(command: string, error: DomainError): string {
     code: error.code,
     message: error.message,
   };
-  if (error.details !== null) response.details = error.details;
+  if (error.details !== null) {
+    if (typeof error.details.allowed === "boolean") response.allowed = error.details.allowed;
+    response.details = error.details;
+  }
   return JSON.stringify(response);
 }
 

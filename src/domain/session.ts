@@ -29,6 +29,23 @@ export type SessionCloseOptions = {
   session_id: string | null;
 };
 
+export type GuardOptions = {
+  session_id: string | null;
+};
+
+export type GuardDecision = {
+  allowed: boolean;
+  code: ErrorCode | "ALLOWED";
+  repository: string;
+  worktree: string;
+  branch: string | null;
+  session_id: string | null;
+  owner_session_id: string | null;
+  requested_session_id: string | null;
+  state: SessionState | null;
+  details: JsonObject;
+};
+
 export type GarbageCollectOptions = {
   apply: boolean;
 };
@@ -77,6 +94,7 @@ export interface SessionBackend {
   createSession(context: SessionContext, options: SessionCreateOptions): Promise<DomainResult<SessionRecord>>;
   resolveCurrentSession(context: SessionContext): Promise<DomainResult<SessionRecord>>;
   getSession(context: SessionContext, sessionId: string): Promise<DomainResult<SessionRecord>>;
+  guard(context: SessionContext, options: GuardOptions): Promise<DomainResult<GuardDecision>>;
   listSessions(context: SessionContext): Promise<DomainResult<SessionListResult>>;
   status(context: SessionContext): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
@@ -113,6 +131,10 @@ class UnavailableSessionBackend implements SessionBackend {
 
   resolveCurrentSession(_context: SessionContext): Promise<DomainResult<SessionRecord>> {
     return this.unavailable("session.resolve_current");
+  }
+
+  guard(_context: SessionContext, _options: GuardOptions): Promise<DomainResult<GuardDecision>> {
+    return this.unavailable("guard");
   }
 
   getSession(_context: SessionContext, _sessionId: string): Promise<DomainResult<SessionRecord>> {
