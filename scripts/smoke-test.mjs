@@ -130,15 +130,15 @@ function main() {
       encoding: "utf8",
       timeout: 10_000,
     });
-    if (jsonResult.status !== 4) fail(`session id without a backend exited ${jsonResult.status}, expected 4`);
+    if (jsonResult.status !== 3) fail(`session id outside a Git repository exited ${jsonResult.status}, expected 3`);
     let parsedJson;
     try {
       parsedJson = JSON.parse(jsonResult.stdout);
     } catch {
       fail("session id --json did not emit one valid JSON document");
     }
-    if (parsedJson.ok !== false || parsedJson.code !== "BACKEND_UNAVAILABLE") {
-      fail("session id --json did not expose the stable backend-unavailable contract");
+    if (parsedJson.ok !== false || parsedJson.code !== "NOT_GIT_REPOSITORY") {
+      fail("session id --json did not expose the stable local-repository error contract");
     }
     if (jsonResult.stderr.trim().length > 0) fail("session id --json wrote decorative output to stderr");
 

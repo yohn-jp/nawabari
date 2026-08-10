@@ -3,9 +3,11 @@ import path from "node:path";
 
 import {
   defaultGit,
+  listGitWorktrees,
   normalizeBranchId,
   resolveRepositoryContext,
   type GitCommandRunner,
+  type GitWorktreeInfo,
   type RepositoryContext,
 } from "./git.js";
 import { SessionRegistryError } from "./errors.js";
@@ -39,6 +41,16 @@ export interface CreateSessionOptions {
   readonly label?: string;
 }
 
+export interface ProvisionSessionOptions {
+  readonly worktreePath?: string;
+  readonly branchName?: string;
+  readonly baseRef?: string;
+  readonly label?: string;
+  readonly defaultBranchName?: string;
+  readonly protectedBranchNames?: readonly string[];
+  readonly protectedWorktreePaths?: readonly string[];
+}
+
 export interface SessionRegistryOptions {
   readonly cwd?: string;
   readonly repository?: RepositoryContext;
@@ -46,6 +58,10 @@ export interface SessionRegistryOptions {
   readonly clock?: () => Date;
   readonly idGenerator?: () => string;
   readonly lockTimeoutMs?: number;
+  readonly defaultBranchName?: string;
+  readonly protectedBranchNames?: readonly string[];
+  readonly protectedWorktreePaths?: readonly string[];
+  readonly worktreeRoot?: string;
 }
 
 export interface RegistryPaths {
@@ -87,6 +103,10 @@ export class SessionRegistry {
   private readonly clock: () => Date;
   private readonly idGenerator: () => string;
   private readonly lockTimeoutMs: number;
+  private readonly defaultBranchName: string | undefined;
+  private readonly protectedBranchNames: readonly string[];
+  private readonly protectedWorktreePaths: readonly string[];
+  private readonly worktreeRoot: string;
 
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
@@ -94,6 +114,10 @@ export class SessionRegistry {
     this.clock = options.clock ?? (() => new Date());
     this.idGenerator = options.idGenerator ?? generateSessionId;
     this.lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
+    this.defaultBranchName = options.defaultBranchName;
+    this.protectedBranchNames = Object.freeze([...(options.protectedBranchNames ?? [])]);
+    this.protectedWorktreePaths = Object.freeze([...(options.protectedWorktreePaths ?? [])]);
+    this.worktreeRoot = path.resolve(options.worktreeRoot ?? path.dirname(this.repository.worktreePath));
 
     if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0) {
       throw new RangeError("lockTimeoutMs must be a non-negative safe integer");
@@ -163,6 +187,56 @@ export class SessionRegistry {
     return this.create(options);
   }
 
+  /** Provision one isolated Git worktree and commit its ownership atomically. */
+  provision(options: ProvisionSessionOptions = {}): SessionRecord {
+    return this.withLock(() => {
+      const records = this.readUnsafe();
+      const sessionId = generateUniqueSessionId(records, this.idGenerator);
+      const resources = this.resolveProvisioningResources(options, sessionId);
+      const timestamp = toTimestamp(this.clock());
+      const record = freezeSessionRecord({
+        schemaVersion: REGISTRY_SCHEMA_VERSION,
+        sessionId,
+        repositoryId: this.repository.repositoryId,
+        worktreeId: resources.worktreePath,
+        worktreePath: resources.worktreePath,
+        branchId: resources.branchId,
+        branchName: resources.branchName,
+        state: "active",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
+      });
+
+      assertNoOwnershipConflict(records, record);
+      assertGitResourcesAvailable(this.git ?? defaultGit, this.repository.worktreePath, resources);
+
+      let gitAttempted = false;
+      try {
+        gitAttempted = true;
+        (this.git ?? defaultGit).run(
+          ["worktree", "add", "--quiet", "-b", resources.branchName, resources.worktreePath, resources.baseRef],
+          this.repository.worktreePath,
+        );
+        this.writeUnsafe([...records, record]);
+        return cloneSessionRecord(record);
+      } catch (error: unknown) {
+        if (gitAttempted) {
+          rollbackProvisionedResources(this.git ?? defaultGit, this.repository.worktreePath, resources);
+        }
+        throw error;
+      }
+    });
+  }
+
+  provisionSession(options: ProvisionSessionOptions = {}): SessionRecord {
+    return this.provision(options);
+  }
+
+  createProvisionedSession(options: ProvisionSessionOptions = {}): SessionRecord {
+    return this.provision(options);
+  }
+
   register(record: SessionRecord): SessionRecord {
     const validated = validateSessionRecord(record, this.repository.repositoryId);
     return this.mutate((records) => {
@@ -206,6 +280,64 @@ export class SessionRegistry {
 
   currentSession(): SessionRecord {
     return this.resolveCurrentSession();
+  }
+
+  private resolveProvisioningResources(options: ProvisionSessionOptions, sessionId: string): ProvisioningResources {
+    const git = this.git ?? defaultGit;
+    const worktrees = listGitWorktrees(git, this.repository.worktreePath);
+    const requestedWorktreePath = resolveProvisionedWorktreePath(
+      options.worktreePath ??
+        path.join(this.worktreeRoot, `${path.basename(this.repository.worktreePath)}-${sessionId}`),
+      this.repository.worktreePath,
+    );
+    const defaultWorktreePath = worktrees[0]?.worktreePath ?? this.repository.worktreePath;
+    const configuredProtectedWorktrees = [
+      ...this.protectedWorktreePaths,
+      ...(options.protectedWorktreePaths ?? []),
+    ].map((candidate) => resolvePotentialWorktreePath(candidate, this.repository.worktreePath));
+
+    if (
+      samePath(requestedWorktreePath, defaultWorktreePath) ||
+      samePath(requestedWorktreePath, this.repository.worktreePath) ||
+      configuredProtectedWorktrees.some((candidate) => samePath(requestedWorktreePath, candidate))
+    ) {
+      throw new SessionRegistryError(
+        "PROTECTED_WORKTREE",
+        `The integration worktree cannot be used as a session worktree: ${requestedWorktreePath}`,
+        { worktree: requestedWorktreePath },
+      );
+    }
+
+    const branchName = options.branchName ?? `gitpaw/session/${sessionId}`;
+    const branchId = normalizeBranchId(branchName);
+    const shortBranchName = branchId.slice("refs/heads/".length);
+    const defaultBranchName = resolveDefaultBranchName(
+      git,
+      this.repository.worktreePath,
+      worktrees,
+      options.defaultBranchName ?? this.defaultBranchName,
+    );
+    const protectedBranchIds = new Set<string>();
+    if (defaultBranchName !== undefined) protectedBranchIds.add(normalizeBranchId(defaultBranchName));
+    for (const protectedBranch of [...this.protectedBranchNames, ...(options.protectedBranchNames ?? [])]) {
+      protectedBranchIds.add(normalizeBranchId(protectedBranch));
+    }
+    if (protectedBranchIds.has(branchId)) {
+      throw new SessionRegistryError(
+        "PROTECTED_BRANCH",
+        `Protected branch cannot be used by a session: ${shortBranchName}`,
+        {
+          branch: shortBranchName,
+        },
+      );
+    }
+    const baseRef = resolveBaseRef(git, this.repository.worktreePath, options.baseRef ?? "HEAD");
+    return {
+      worktreePath: requestedWorktreePath,
+      branchId,
+      branchName: shortBranchName,
+      baseRef,
+    };
   }
 
   private resolveCreationResources(options: CreateSessionOptions): CreationResources {
@@ -368,9 +500,190 @@ interface CreationResources {
   readonly branchName: string;
 }
 
+interface ProvisioningResources {
+  readonly worktreePath: string;
+  readonly branchId: string;
+  readonly branchName: string;
+  readonly baseRef: string;
+}
+
 interface MutationResult<T> {
   readonly records: readonly SessionRecord[];
   readonly result: T;
+}
+
+function generateUniqueSessionId(records: readonly SessionRecord[], idGenerator: () => string): string {
+  for (let attempt = 0; attempt < MAX_ID_GENERATION_ATTEMPTS; attempt += 1) {
+    const sessionId = idGenerator();
+    assertSessionId(sessionId);
+    if (!records.some((record) => record.sessionId === sessionId)) return sessionId;
+  }
+  throw new SessionRegistryError(
+    "SESSION_ID_COLLISION",
+    `Could not generate a unique session ID after ${MAX_ID_GENERATION_ATTEMPTS} attempts`,
+    { attempts: MAX_ID_GENERATION_ATTEMPTS },
+  );
+}
+
+function resolveProvisionedWorktreePath(candidate: string, baseDirectory: string): string {
+  const resolved = resolvePotentialWorktreePath(candidate, baseDirectory);
+  if (resolved === path.parse(resolved).root) {
+    throw new SessionRegistryError(
+      "INVALID_WORKTREE_PATH",
+      `A filesystem root cannot be a session worktree: ${resolved}`,
+      {
+        worktree: resolved,
+      },
+    );
+  }
+  if (fs.existsSync(resolved)) {
+    try {
+      if (!fs.statSync(resolved).isDirectory()) throw new Error("worktree path is not a directory");
+      return resolved;
+    } catch (error: unknown) {
+      throw new SessionRegistryError(
+        "INVALID_WORKTREE_PATH",
+        `Worktree path is not a directory: ${resolved}`,
+        {
+          worktree: resolved,
+        },
+        error,
+      );
+    }
+  }
+  const parent = path.dirname(resolved);
+  try {
+    if (!fs.statSync(parent).isDirectory()) throw new Error("worktree parent is not a directory");
+    return resolved;
+  } catch (error: unknown) {
+    throw new SessionRegistryError(
+      "INVALID_WORKTREE_PATH",
+      `Worktree parent does not exist: ${parent}`,
+      { worktree: resolved },
+      error,
+    );
+  }
+}
+
+function resolvePotentialWorktreePath(candidate: string, baseDirectory: string): string {
+  if (candidate.includes("\u0000") || candidate.trim().length === 0) {
+    throw new SessionRegistryError("INVALID_WORKTREE_PATH", `Invalid worktree path: ${candidate}`, {
+      worktree: candidate,
+    });
+  }
+  const resolved = path.resolve(baseDirectory, candidate);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    const parent = path.dirname(resolved);
+    try {
+      return path.join(fs.realpathSync.native(parent), path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
+}
+
+function samePath(left: string, right: string): boolean {
+  return path.resolve(left) === path.resolve(right);
+}
+
+function resolveDefaultBranchName(
+  git: GitCommandRunner,
+  cwd: string,
+  worktrees: readonly GitWorktreeInfo[],
+  configured: string | undefined,
+): string | undefined {
+  if (configured !== undefined) return configured;
+  const integrationBranch = worktrees[0]?.branchName;
+  if (integrationBranch !== null && integrationBranch !== undefined) return integrationBranch;
+
+  try {
+    const configuredDefault = git.run(["config", "--get", "init.defaultBranch"], cwd);
+    if (configuredDefault.length > 0) return configuredDefault;
+  } catch {
+    // A repository without init.defaultBranch is valid; continue to the local HEAD fallback.
+  }
+
+  try {
+    const remoteHead = git.run(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], cwd);
+    if (remoteHead.startsWith("origin/")) return remoteHead.slice("origin/".length);
+  } catch {
+    // A local repository may not have an origin or a symbolic remote HEAD.
+  }
+  return undefined;
+}
+
+function localBranchExists(git: GitCommandRunner, cwd: string, branchId: string): boolean {
+  try {
+    git.run(["show-ref", "--verify", "--quiet", branchId], cwd);
+    return true;
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError && error.code === "GIT_COMMAND_FAILED") return false;
+    throw error;
+  }
+}
+
+function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resources: ProvisioningResources): void {
+  const worktrees = listGitWorktrees(git, cwd);
+  if (worktrees.some((worktree) => samePath(worktree.worktreePath, resources.worktreePath))) {
+    throw new SessionRegistryError(
+      "WORKTREE_ALREADY_EXISTS",
+      `Worktree path already exists: ${resources.worktreePath}`,
+      {
+        worktree: resources.worktreePath,
+      },
+    );
+  }
+  if (fs.existsSync(resources.worktreePath)) {
+    throw new SessionRegistryError(
+      "WORKTREE_ALREADY_EXISTS",
+      `Worktree path already exists: ${resources.worktreePath}`,
+      {
+        worktree: resources.worktreePath,
+      },
+    );
+  }
+  if (localBranchExists(git, cwd, resources.branchId)) {
+    throw new SessionRegistryError("BRANCH_ALREADY_EXISTS", `Local branch already exists: ${resources.branchName}`, {
+      branch: resources.branchName,
+    });
+  }
+}
+
+function resolveBaseRef(git: GitCommandRunner, cwd: string, candidate: string): string {
+  if (
+    candidate.trim().length === 0 ||
+    candidate !== candidate.trim() ||
+    candidate.startsWith("-") ||
+    candidate.includes("\u0000")
+  ) {
+    throw new SessionRegistryError("INVALID_BASE_REF", `Invalid base ref: ${candidate}`, { baseRef: candidate });
+  }
+  try {
+    git.run(["rev-parse", "--verify", `${candidate}^{commit}`], cwd);
+    return candidate;
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError && error.code === "GIT_COMMAND_FAILED") {
+      throw new SessionRegistryError("INVALID_BASE_REF", `Base ref does not resolve to a commit: ${candidate}`, {
+        baseRef: candidate,
+      });
+    }
+    throw error;
+  }
+}
+
+function rollbackProvisionedResources(git: GitCommandRunner, cwd: string, resources: ProvisioningResources): void {
+  try {
+    git.run(["worktree", "remove", "--force", "--", resources.worktreePath], cwd);
+  } catch {
+    // Best effort: the registry must remain unclaimed even if Git cleanup fails.
+  }
+  try {
+    git.run(["branch", "-D", "--", resources.branchName], cwd);
+  } catch {
+    // Best effort: never replace the original provisioning or registry error.
+  }
 }
 
 export function toPersistedSessionRecord(record: SessionRecord): PersistedSessionRecord {
