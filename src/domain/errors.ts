@@ -68,8 +68,14 @@ export class DomainError extends Error {
   readonly exitCode: number;
   readonly details: JsonObject | null;
 
-  constructor(code: ErrorCode, message: string, details: JsonObject | null = null, exitCode = defaultExitCode(code)) {
-    super(message);
+  constructor(
+    code: ErrorCode,
+    message: string,
+    details: JsonObject | null = null,
+    exitCode = defaultExitCode(code),
+    cause?: unknown,
+  ) {
+    super(message, cause === undefined ? undefined : { cause });
     this.name = "DomainError";
     this.code = code;
     this.exitCode = exitCode;

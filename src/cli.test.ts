@@ -69,6 +69,31 @@ test("--help exits 0 and prints the git-paw usage", async () => {
   assert.equal(output.stderr.length, 0);
 });
 
+test("JSON help separates global, session, and garbage-collection options", async () => {
+  const output = capture();
+  const exitCode = await runCli(["--help", "--json"], { io: output.io });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(JSON.parse(output.stdout[0]), {
+    ok: true,
+    command: "help",
+    usage: "Usage: git-paw <command> [options]",
+    commands: [
+      "session create",
+      "session id",
+      "session show",
+      "session list",
+      "session close",
+      "status",
+      "gc",
+      "doctor",
+    ],
+    options: ["--json", "--help", "--version"],
+    session_options: ["--branch", "--worktree", "--base", "--label", "--session"],
+    gc_options: ["--apply", "--dry-run"],
+  });
+});
+
 test("no arguments prints help and exits with the usage code", async () => {
   const output = capture();
   const exitCode = await runCli([], { io: output.io });
@@ -84,31 +109,37 @@ test("unknown commands expose a stable JSON error without decoration", async () 
   assert.equal(exitCode, 2);
   assert.equal(output.stderr.length, 0);
   assert.equal(output.stdout.length, 1);
-  const response = JSON.parse(output.stdout[0]) as { ok: boolean; code: string; command: string };
+  const response = JSON.parse(output.stdout[0]) as {
+    ok: boolean;
+    code: string;
+    command: string;
+    details: { command: string };
+  };
   assert.deepEqual(response, {
     ok: false,
     command: "bogus",
     code: "UNKNOWN_COMMAND",
     message: "Unknown command: bogus.",
+    details: { command: "bogus" },
   });
 });
 
-test("state commands reject honestly when the current main backend is unavailable", async () => {
+test("state commands reject honestly when the current directory is not a Git repository", async () => {
   const output = capture();
   const exitCode = await runCli(["session", "id", "--json"], { io: output.io, cwd: "/tmp/not-a-session" });
 
-  assert.equal(exitCode, 4);
+  assert.equal(exitCode, 3);
   assert.equal(output.stderr.length, 0);
   const response = JSON.parse(output.stdout[0]) as {
     ok: boolean;
     code: string;
     command: string;
-    details: { operation: string };
+    details: { path: string };
   };
   assert.equal(response.ok, false);
-  assert.equal(response.code, "BACKEND_UNAVAILABLE");
+  assert.equal(response.code, "NOT_GIT_REPOSITORY");
   assert.equal(response.command, "session id");
-  assert.equal(response.details.operation, "session.resolve_current");
+  assert.equal(response.details.path, "/tmp/not-a-session");
 });
 
 test("session id resolves from the current worktree without an explicit id", async () => {
@@ -143,8 +174,10 @@ test("human and JSON modes present the same backend status result", async () => 
   assert.equal(await runCli(["status", "--json"], { backend, io: jsonOutput.io }), 0);
   assert.equal(await runCli(["status"], { backend, io: humanOutput.io }), 0);
 
-  const json = JSON.parse(jsonOutput.stdout[0]) as { session_id: string; branch: string } & Record<string, unknown>;
-  assert.equal(json.session_id, sampleSession.session_id);
+  const json = JSON.parse(jsonOutput.stdout[0]) as {
+    current_session: { session_id: string; branch: string };
+  } & Record<string, unknown>;
+  assert.equal(json.current_session.session_id, sampleSession.session_id);
   assert.match(humanOutput.stdout.join("\n"), new RegExp(sampleSession.session_id));
   assert.match(humanOutput.stdout.join("\n"), new RegExp(sampleSession.branch));
 });

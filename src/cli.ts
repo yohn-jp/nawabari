@@ -43,7 +43,9 @@ const HELP_TEXT = [
 const HELP_DATA: JsonObject = {
   usage: `Usage: ${CLI_NAME} <command> [options]`,
   commands: ["session create", "session id", "session show", "session list", "session close", "status", "gc", "doctor"],
-  options: ["--json", "--help", "--version", "--base"],
+  options: ["--json", "--help", "--version"],
+  session_options: ["--branch", "--worktree", "--base", "--label", "--session"],
+  gc_options: ["--apply", "--dry-run"],
 };
 
 export type CliDependencies = {
@@ -293,9 +295,9 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   }
 
   const command = commandName(parsed.value.commandArguments);
-  const backend = dependencies.backend ?? createLocalSessionBackend();
   const cwd = dependencies.cwd ?? process.cwd();
   try {
+    const backend = dependencies.backend ?? createLocalSessionBackend();
     const result = await executeCommand(parsed.value.commandArguments, { backend, cwd });
     if (!result.ok) return emitFailure(mode, command, result.error, io);
     io.stdout(renderSuccess(mode, command, result.value));

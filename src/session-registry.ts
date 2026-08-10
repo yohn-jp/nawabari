@@ -211,17 +211,17 @@ export class SessionRegistry {
       assertNoOwnershipConflict(records, record);
       assertGitResourcesAvailable(this.git ?? defaultGit, this.repository.worktreePath, resources);
 
-      let gitAttempted = false;
+      let gitProvisioned = false;
       try {
-        gitAttempted = true;
         (this.git ?? defaultGit).run(
           ["worktree", "add", "--quiet", "-b", resources.branchName, resources.worktreePath, resources.baseRef],
           this.repository.worktreePath,
         );
+        gitProvisioned = true;
         this.writeUnsafe([...records, record]);
         return cloneSessionRecord(record);
       } catch (error: unknown) {
-        if (gitAttempted) {
+        if (gitProvisioned) {
           rollbackProvisionedResources(this.git ?? defaultGit, this.repository.worktreePath, resources);
         }
         throw error;
@@ -536,20 +536,14 @@ function resolveProvisionedWorktreePath(candidate: string, baseDirectory: string
       },
     );
   }
-  if (fs.existsSync(resolved)) {
-    try {
-      if (!fs.statSync(resolved).isDirectory()) throw new Error("worktree path is not a directory");
-      return resolved;
-    } catch (error: unknown) {
-      throw new SessionRegistryError(
-        "INVALID_WORKTREE_PATH",
-        `Worktree path is not a directory: ${resolved}`,
-        {
-          worktree: resolved,
-        },
-        error,
-      );
+  const entry = lstatIfPresent(resolved);
+  if (entry !== undefined) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new SessionRegistryError("INVALID_WORKTREE_PATH", `Worktree path is not a directory: ${resolved}`, {
+        worktree: resolved,
+      });
     }
+    return resolved;
   }
   const parent = path.dirname(resolved);
   try {
@@ -635,7 +629,17 @@ function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resourc
       },
     );
   }
-  if (fs.existsSync(resources.worktreePath)) {
+  const worktreeEntry = lstatIfPresent(resources.worktreePath);
+  if (worktreeEntry?.isSymbolicLink()) {
+    throw new SessionRegistryError(
+      "INVALID_WORKTREE_PATH",
+      `Worktree path is a symbolic link: ${resources.worktreePath}`,
+      {
+        worktree: resources.worktreePath,
+      },
+    );
+  }
+  if (worktreeEntry !== undefined) {
     throw new SessionRegistryError(
       "WORKTREE_ALREADY_EXISTS",
       `Worktree path already exists: ${resources.worktreePath}`,
@@ -683,6 +687,20 @@ function rollbackProvisionedResources(git: GitCommandRunner, cwd: string, resour
     git.run(["branch", "-D", "--", resources.branchName], cwd);
   } catch {
     // Best effort: never replace the original provisioning or registry error.
+  }
+}
+
+function lstatIfPresent(candidate: string): fs.Stats | undefined {
+  try {
+    return fs.lstatSync(candidate);
+  } catch (error: unknown) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw new SessionRegistryError(
+      "INVALID_WORKTREE_PATH",
+      `Could not inspect worktree path: ${candidate}`,
+      { worktree: candidate },
+      error,
+    );
   }
 }
 
