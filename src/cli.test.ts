@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import { runCli } from "./cli.js";
 import { success } from "./domain/errors.js";
@@ -140,20 +143,25 @@ test("unknown commands expose a stable JSON error without decoration", async () 
 
 test("state commands reject honestly when the current directory is not a Git repository", async () => {
   const output = capture();
-  const exitCode = await runCli(["session", "id", "--json"], { io: output.io, cwd: "/tmp/not-a-session" });
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "git-paw-not-a-repository-"));
+  try {
+    const exitCode = await runCli(["session", "id", "--json"], { io: output.io, cwd: directory });
 
-  assert.equal(exitCode, 3);
-  assert.equal(output.stderr.length, 0);
-  const response = JSON.parse(output.stdout[0]) as {
-    ok: boolean;
-    code: string;
-    command: string;
-    details: { path: string };
-  };
-  assert.equal(response.ok, false);
-  assert.equal(response.code, "NOT_GIT_REPOSITORY");
-  assert.equal(response.command, "session id");
-  assert.equal(response.details.path, "/tmp/not-a-session");
+    assert.equal(exitCode, 3);
+    assert.equal(output.stderr.length, 0);
+    const response = JSON.parse(output.stdout[0]) as {
+      ok: boolean;
+      code: string;
+      command: string;
+      details: { cwd: string };
+    };
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "NOT_GIT_REPOSITORY");
+    assert.equal(response.command, "session id");
+    assert.equal(response.details.cwd, directory);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("session id resolves from the current worktree without an explicit id", async () => {

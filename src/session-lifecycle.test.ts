@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
+import { defaultGit } from "./git.js";
 import { SessionRegistry } from "./session-registry.js";
 
 test("close removes a clean provisioned worktree and merged branch, and repeats idempotently", () => {
@@ -108,6 +109,42 @@ test("close safely releases registry state when Git already removed the worktree
   }
 });
 
+test("an interrupted close remains retryable from the explicit closing state", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-interrupted-close`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/interrupted-close" });
+    let failWorktreeRemoval = true;
+    const interruptedGit = {
+      run(args: readonly string[], cwd: string): string {
+        if (failWorktreeRemoval && args[0] === "worktree" && args[1] === "remove") {
+          failWorktreeRemoval = false;
+          throw new Error("simulated interrupted worktree removal");
+        }
+        return defaultGit.run(args, cwd);
+      },
+    };
+
+    const interruptedRegistry = new SessionRegistry({
+      repository: registry.repository,
+      git: interruptedGit,
+    });
+    assert.throws(() => interruptedRegistry.close(session.sessionId), /simulated interrupted worktree removal/u);
+    assert.equal(registry.get(session.sessionId)?.state, "closing");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+
+    const retried = registry.close(session.sessionId);
+    assert.equal(retried.session.state, "closed");
+    assert.equal(retried.worktreeRemoved, true);
+    assert.equal(retried.branchRemoved, true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 test("gc detects stale metadata without mutation and applies only safe cleanup", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = `${fixture.repositoryPath}-stale-cleanup`;
@@ -202,7 +239,20 @@ function assertRegistryError(operation: () => unknown, code: SessionRegistryErro
 }
 
 function runGit(args: readonly string[], cwd: string): string {
-  return String(execFileSync("git", [...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })).trim();
+  return String(
+    execFileSync("git", [...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_TERMINAL_PROMPT: "0",
+      },
+    }),
+  ).trim();
 }
 
 function runGitQuiet(args: readonly string[], cwd: string): boolean {

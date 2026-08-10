@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { runCli } from "./cli.js";
-import { SessionRegistry } from "./session-registry.js";
+import { SessionRegistry, toPersistedSessionRecord } from "./session-registry.js";
 
 test("guard allows the owning active worktree and is side-effect free", () => {
   const fixture = createRepository();
@@ -14,7 +14,7 @@ test("guard allows the owning active worktree and is side-effect free", () => {
   try {
     const registry = new SessionRegistry({ cwd: fixture });
     const session = registry.provision({ worktreePath, branchName: "feature/guard-owned" });
-    const beforeMtime = fs.statSync(registry.paths.registry).mtimeMs;
+    const before = fs.readFileSync(registry.paths.registry, "utf8");
 
     const decision = new SessionRegistry({ cwd: worktreePath }).guard();
 
@@ -23,7 +23,7 @@ test("guard allows the owning active worktree and is side-effect free", () => {
     assert.equal(decision.sessionId, session.sessionId);
     assert.equal(decision.ownerSessionId, session.sessionId);
     assert.equal(decision.branchName, "feature/guard-owned");
-    assert.equal(fs.statSync(registry.paths.registry).mtimeMs, beforeMtime);
+    assert.equal(fs.readFileSync(registry.paths.registry, "utf8"), before);
     assert.equal(fs.existsSync(registry.paths.lock), false);
   } finally {
     removeWorktree(fixture, worktreePath);
@@ -97,6 +97,45 @@ test("guard fails closed for detached and corrupt ownership state", () => {
     const corrupt = new SessionRegistry({ cwd: worktreePath }).guard();
     assert.equal(corrupt.allowed, false);
     assert.equal(corrupt.code, "REGISTRY_CORRUPT");
+  } finally {
+    removeWorktree(fixture, worktreePath);
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("guard fails closed for ambiguous persisted ownership and maps it through the CLI", async () => {
+  const fixture = createRepository();
+  const worktreePath = `${fixture}-guard-ambiguous`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture });
+    const session = registry.provision({ worktreePath, branchName: "feature/guard-ambiguous" });
+    const persisted = toPersistedSessionRecord(session);
+    fs.writeFileSync(
+      registry.paths.registry,
+      `${JSON.stringify(
+        {
+          schema_version: 1,
+          repository_id: registry.repository.repositoryId,
+          sessions: [persisted, { ...persisted, session_id: "01936f5e-7b00-7abc-8def-0123456789ab" }],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const decision = new SessionRegistry({ cwd: worktreePath }).guard();
+    assert.equal(decision.allowed, false);
+    assert.equal(decision.code, "DUPLICATE_WORKTREE_OWNERSHIP");
+
+    const output: string[] = [];
+    const exitCode = await runCli(["guard", "--json"], {
+      cwd: worktreePath,
+      io: { stdout: (line) => output.push(line), stderr: () => undefined },
+    });
+    assert.equal(exitCode, 3);
+    const response = JSON.parse(output[0]) as { code: string; allowed: boolean };
+    assert.equal(response.code, "WORKTREE_OWNED_BY_OTHER_SESSION");
+    assert.equal(response.allowed, false);
   } finally {
     removeWorktree(fixture, worktreePath);
     fs.rmSync(fixture, { recursive: true, force: true });

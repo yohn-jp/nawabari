@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
-import { resolveRepositoryContext, resolveWorktreeIdentity } from "./git.js";
+import { normalizeBranchId, resolveRepositoryContext, resolveWorktreeIdentity } from "./git.js";
 
 test("resolves the same repository identity from linked worktrees", () => {
   const fixture = createRepositoryFixture();
@@ -52,6 +52,13 @@ test("rejects a detached worktree as an ambiguous branch identity", () => {
   }
 });
 
+test("rejects a lock-suffixed component in a branch identity", () => {
+  assert.throws(
+    () => normalizeBranchId("feature/locked.lock/name"),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "INVALID_BRANCH_ID",
+  );
+});
+
 interface RepositoryFixture {
   readonly repositoryPath: string;
   readonly linkedWorktreePath: string;
@@ -85,5 +92,18 @@ function createRepositoryFixture(): RepositoryFixture {
 }
 
 function runGit(args: readonly string[], cwd: string): string {
-  return String(execFileSync("git", [...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })).trim();
+  return String(
+    execFileSync("git", [...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_TERMINAL_PROMPT: "0",
+      },
+    }),
+  ).trim();
 }
