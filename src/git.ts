@@ -43,6 +43,11 @@ export const defaultGit: GitCommandRunner = {
         cwd,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0",
+        },
       }).trim();
     } catch (error: unknown) {
       throw new SessionRegistryError(

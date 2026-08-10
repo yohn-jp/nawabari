@@ -112,7 +112,11 @@ function main() {
     const gitEnvironment = {
       ...process.env,
       PATH: `${binDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
     };
+    const installedBinary = path.join(binDirectory, "git-paw");
     // Git reserves `git <external-command> --help` for man-page lookup, so
     // version is the portable discovery probe that does not require a manpage.
     const gitPawResult = spawnSync("git", ["paw", "--version"], {
@@ -123,7 +127,9 @@ function main() {
     });
     if (gitPawResult.error) fail(`git paw failed to start: ${gitPawResult.error.message}`);
     if (gitPawResult.status !== 0) fail(`git paw --version exited ${gitPawResult.status}, expected 0`);
-    if (gitPawResult.stdout.trim() !== "0.0.1") fail("git paw --version did not discover git-paw");
+    if (gitPawResult.stdout.trim() !== String(packageJson.version)) {
+      fail("git paw --version did not match the installed package metadata");
+    }
 
     const jsonResult = spawnSync(path.join(binDirectory, "git-paw"), ["session", "id", "--json"], {
       cwd: installDirectory,
@@ -141,6 +147,115 @@ function main() {
       fail("session id --json did not expose the stable local-repository error contract");
     }
     if (jsonResult.stderr.trim().length > 0) fail("session id --json wrote decorative output to stderr");
+
+    const lifecycleRepository = path.join(installDirectory, "lifecycle-repository");
+    const lifecycleWorktree = path.join(installDirectory, "lifecycle-worktree");
+    const secondWorktree = path.join(installDirectory, "lifecycle-second-worktree");
+    run("git", ["init", "-b", "main", lifecycleRepository], { env: gitEnvironment });
+    run("git", ["config", "user.email", "git-paw-smoke@example.invalid"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+    run("git", ["config", "user.name", "GitPaw Smoke"], { cwd: lifecycleRepository, env: gitEnvironment });
+    run("git", ["config", "commit.gpgsign", "false"], { cwd: lifecycleRepository, env: gitEnvironment });
+    run("git", ["config", "core.hooksPath", "/dev/null"], { cwd: lifecycleRepository, env: gitEnvironment });
+    fs.writeFileSync(path.join(lifecycleRepository, "README.md"), "smoke fixture\n");
+    run("git", ["add", "README.md"], { cwd: lifecycleRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "initial"], { cwd: lifecycleRepository, env: gitEnvironment });
+
+    const invokeInstalled = (args, cwd) => {
+      const result = spawnSync(installedBinary, args, {
+        cwd,
+        env: gitEnvironment,
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      if (result.error) fail(`${args.join(" ")} failed to start: ${result.error.message}`);
+      return result;
+    };
+    const parseInstalledJson = (result, label) => {
+      if (result.stdout.trim().length === 0) fail(`${label} emitted no JSON`);
+      try {
+        return JSON.parse(result.stdout);
+      } catch {
+        fail(`${label} emitted invalid JSON: ${result.stdout}`);
+      }
+    };
+
+    console.log("running the installed GitPaw session lifecycle...");
+    const created = parseInstalledJson(
+      invokeInstalled(
+        ["session", "create", "--branch", "feature/installed-smoke", "--worktree", lifecycleWorktree, "--json"],
+        lifecycleRepository,
+      ),
+      "session create",
+    );
+    if (created.ok !== true || typeof created.session_id !== "string")
+      fail("session create did not return a session ID");
+    if (created.state !== "active" || created.branch !== "feature/installed-smoke") {
+      fail("session create returned incomplete ownership metadata");
+    }
+
+    const resolvedId = parseInstalledJson(
+      invokeInstalled(["session", "id", "--json"], lifecycleWorktree),
+      "session id",
+    );
+    if (resolvedId.ok !== true || resolvedId.session_id !== created.session_id) {
+      fail("session id did not resolve the installed owned worktree");
+    }
+
+    const status = parseInstalledJson(invokeInstalled(["status", "--json"], lifecycleWorktree), "status");
+    if (status.ok !== true || status.current_session?.session_id !== created.session_id) {
+      fail("status did not report the current installed session");
+    }
+
+    const allowedGuard = parseInstalledJson(invokeInstalled(["guard", "--json"], lifecycleWorktree), "guard");
+    if (allowedGuard.ok !== true || allowedGuard.allowed !== true || allowedGuard.code !== "ALLOWED") {
+      fail("guard did not allow the owning installed worktree");
+    }
+
+    const secondCreated = parseInstalledJson(
+      invokeInstalled(
+        ["session", "create", "--branch", "feature/installed-second", "--worktree", secondWorktree, "--json"],
+        lifecycleRepository,
+      ),
+      "second session create",
+    );
+    const deniedGuard = invokeInstalled(["guard", "--session", secondCreated.session_id, "--json"], lifecycleWorktree);
+    const deniedGuardJson = parseInstalledJson(deniedGuard, "cross-session guard");
+    if (deniedGuard.status !== 3 || deniedGuardJson.allowed !== false) {
+      fail("guard did not reject a cross-session mutation");
+    }
+
+    fs.writeFileSync(path.join(lifecycleWorktree, "recoverable.txt"), "keep until close is safe\n");
+    const dirtyClose = invokeInstalled(
+      ["session", "close", "--session", created.session_id, "--json"],
+      lifecycleRepository,
+    );
+    const dirtyCloseJson = parseInstalledJson(dirtyClose, "dirty close");
+    if (dirtyClose.status !== 3 || dirtyCloseJson.code !== "DIRTY_WORKTREE") {
+      fail("dirty close did not fail closed");
+    }
+    fs.rmSync(path.join(lifecycleWorktree, "recoverable.txt"), { force: true });
+
+    const closed = invokeInstalled(
+      ["session", "close", "--session", created.session_id, "--json"],
+      lifecycleRepository,
+    );
+    const closedJson = parseInstalledJson(closed, "safe close");
+    if (closed.status !== 0 || closedJson.ok !== true || closedJson.session?.state !== "closed") {
+      fail("safe close did not release the installed session");
+    }
+
+    const secondClosed = invokeInstalled(
+      ["session", "close", "--session", secondCreated.session_id, "--json"],
+      lifecycleRepository,
+    );
+    if (secondClosed.status !== 0) fail("second installed session did not close safely");
+    const gc = parseInstalledJson(invokeInstalled(["gc", "--dry-run", "--json"], lifecycleRepository), "gc");
+    if (gc.ok !== true || gc.candidates.length !== 0 || gc.cleaned.length !== 0) {
+      fail("gc did not report a clean installed repository after close");
+    }
 
     console.log("smoke test passed.");
   } finally {

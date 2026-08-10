@@ -85,5 +85,18 @@ function createRepositoryFixture(): RepositoryFixture {
 }
 
 function runGit(args: readonly string[], cwd: string): string {
-  return String(execFileSync("git", [...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })).trim();
+  return String(
+    execFileSync("git", [...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_TERMINAL_PROMPT: "0",
+      },
+    }),
+  ).trim();
 }
