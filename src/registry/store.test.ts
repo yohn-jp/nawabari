@@ -7,18 +7,122 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { RegistryError } from "./errors.js";
-import { RepositoryRegistry, createEmptyRegistry, parseRegistryDocument, validateRegistryDocument } from "./store.js";
-import type { RegistryDocument, SessionRecord } from "./types.js";
+import { RegistryMutationBoundary, type RegistryMutationBoundaryOptions } from "./store.js";
+import type { RegistryCodec } from "./types.js";
 
 const childModuleUrl = new URL("./store.ts", import.meta.url).href;
 const testRepositoryId = "repository-under-test";
+
+interface TestSession {
+  schemaVersion: 1;
+  sessionId: string;
+  repositoryId: string;
+  worktreePath: string;
+  branch: string;
+  state: "active" | "closed";
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface TestState {
+  schemaVersion: 1;
+  repositoryId: string;
+  updatedAt: string;
+  sessions: TestSession[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function fixtureError(
+  message: string,
+  code: "REGISTRY_CORRUPT" | "REGISTRY_UNSUPPORTED_SCHEMA" = "REGISTRY_CORRUPT",
+): RegistryError {
+  return new RegistryError(code, message);
+}
+
+function validateFixture(state: TestState): void {
+  if (state.schemaVersion !== 1) {
+    throw fixtureError("unsupported fixture schema", "REGISTRY_UNSUPPORTED_SCHEMA");
+  }
+  if (state.repositoryId !== testRepositoryId || !isString(state.updatedAt) || !Array.isArray(state.sessions)) {
+    throw fixtureError("invalid fixture state");
+  }
+  const sessionIds = new Set<string>();
+  const worktrees = new Map<string, string>();
+  const branches = new Map<string, string>();
+  for (const [index, session] of state.sessions.entries()) {
+    if (
+      !isRecord(session) ||
+      session.schemaVersion !== 1 ||
+      !isString(session.sessionId) ||
+      session.repositoryId !== testRepositoryId ||
+      !isString(session.worktreePath) ||
+      !isString(session.branch) ||
+      (session.state !== "active" && session.state !== "closed")
+    ) {
+      throw fixtureError(`invalid fixture session at ${index}`);
+    }
+    if (sessionIds.has(session.sessionId)) {
+      throw new RegistryError("REGISTRY_DUPLICATE_SESSION", "duplicate fixture session");
+    }
+    sessionIds.add(session.sessionId);
+    if (session.state === "closed") {
+      continue;
+    }
+    if (worktrees.has(session.worktreePath)) {
+      throw new RegistryError("REGISTRY_DUPLICATE_WORKTREE", "duplicate fixture worktree");
+    }
+    if (branches.has(session.branch)) {
+      throw new RegistryError("REGISTRY_DUPLICATE_BRANCH", "duplicate fixture branch");
+    }
+    worktrees.set(session.worktreePath, session.sessionId);
+    branches.set(session.branch, session.sessionId);
+  }
+}
+
+function parseFixture(value: unknown): TestState {
+  if (!isRecord(value)) {
+    throw fixtureError("fixture root is not an object");
+  }
+  if (typeof value.schemaVersion === "number" && value.schemaVersion !== 1) {
+    throw fixtureError("unsupported fixture schema", "REGISTRY_UNSUPPORTED_SCHEMA");
+  }
+  if (
+    value.schemaVersion !== 1 ||
+    typeof value.repositoryId !== "string" ||
+    typeof value.updatedAt !== "string" ||
+    !Array.isArray(value.sessions)
+  ) {
+    throw fixtureError("invalid fixture root");
+  }
+  const state = value as unknown as TestState;
+  validateFixture(state);
+  return state;
+}
+
+const codec: RegistryCodec<TestState> = {
+  empty: () => ({
+    schemaVersion: 1,
+    repositoryId: testRepositoryId,
+    updatedAt: new Date().toISOString(),
+    sessions: [],
+  }),
+  parse: parseFixture,
+  validate: validateFixture,
+  serialize: (state) => state,
+};
 
 interface ChildResult {
   ok: boolean;
   code?: string;
   message?: string;
 }
-
 interface ChildExit extends ChildResult {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
@@ -26,53 +130,35 @@ interface ChildExit extends ChildResult {
 }
 
 const childScript = `
-import { RepositoryRegistry } from ${JSON.stringify(childModuleUrl)};
-
-const operation = process.env.OPERATION;
-const sessionId = process.env.SESSION_ID;
-const commonGitDirectory = process.env.COMMON_GIT;
-const holdMs = Number(process.env.HOLD_MS ?? "0");
-const crashBeforeRename = process.env.CRASH_BEFORE_RENAME === "1";
-const registry = new RepositoryRegistry({
-  commonGitDirectory,
-  repositoryId: ${JSON.stringify(testRepositoryId)},
-  lock: {
-    staleAfterMs: Number(process.env.STALE_AFTER_MS ?? "100"),
-    acquireTimeoutMs: Number(process.env.ACQUIRE_TIMEOUT_MS ?? "10000"),
-    retryDelayMs: 2,
-  },
-  atomicWriteHooks: crashBeforeRename
-    ? { beforeRename: () => process.kill(process.pid, "SIGKILL") }
-    : undefined,
-});
-
-const now = new Date().toISOString();
-const record = {
-  schemaVersion: 1,
-  sessionId,
-  repositoryId: ${JSON.stringify(testRepositoryId)},
-  worktreePath: "/tmp/gitpaw-test-worktrees/" + sessionId,
-  branch: process.env.BRANCH ?? ("branch/" + sessionId),
-  state: "active",
-  createdAt: now,
-  updatedAt: now,
-};
-
-try {
-  if (holdMs > 0) {
-    await new Promise((resolve) => setTimeout(resolve, holdMs));
+import { RegistryError } from ${JSON.stringify(new URL("./errors.ts", import.meta.url).href)};
+import { RegistryMutationBoundary } from ${JSON.stringify(childModuleUrl)};
+const repositoryId = ${JSON.stringify(testRepositoryId)};
+const validate = (state) => {
+  if (state.schemaVersion !== 1 || state.repositoryId !== repositoryId || !Array.isArray(state.sessions)) throw new RegistryError("REGISTRY_CORRUPT", "invalid state");
+  const branches = new Set(); const worktrees = new Set(); const sessions = new Set();
+  for (const record of state.sessions) {
+    if (sessions.has(record.sessionId)) throw new RegistryError("REGISTRY_DUPLICATE_SESSION", "duplicate session");
+    sessions.add(record.sessionId);
+    if (record.state === "closed") continue;
+    if (branches.has(record.branch)) throw new RegistryError("REGISTRY_DUPLICATE_BRANCH", "duplicate branch");
+    if (worktrees.has(record.worktreePath)) throw new RegistryError("REGISTRY_DUPLICATE_WORKTREE", "duplicate worktree");
+    branches.add(record.branch); worktrees.add(record.worktreePath);
   }
-  await registry[operation]((draft) => {
-    draft.sessions.push(record);
-    return { sessionId };
-  });
+};
+const codec = { empty: () => ({ schemaVersion: 1, repositoryId, updatedAt: new Date().toISOString(), sessions: [] }), parse: (value) => value, validate, serialize: (value) => value };
+const boundary = new RegistryMutationBoundary({
+  commonGitDirectory: process.env.COMMON_GIT, codec,
+  lock: { staleAfterMs: Number(process.env.STALE_AFTER_MS ?? "100"), acquireTimeoutMs: Number(process.env.ACQUIRE_TIMEOUT_MS ?? "10000"), retryDelayMs: 2 },
+  atomicWriteHooks: process.env.CRASH_BEFORE_RENAME === "1" ? { beforeRename: () => process.kill(process.pid, "SIGKILL") } : undefined,
+});
+const operation = process.env.OPERATION; const sessionId = process.env.SESSION_ID; const now = new Date().toISOString();
+const record = { schemaVersion: 1, sessionId, repositoryId, worktreePath: "/tmp/gitpaw-test-worktrees/" + sessionId, branch: process.env.BRANCH ?? ("branch/" + sessionId), state: "active", createdAt: now, updatedAt: now };
+try {
+  if (Number(process.env.HOLD_MS ?? "0") > 0) await new Promise((resolve) => setTimeout(resolve, Number(process.env.HOLD_MS)));
+  await boundary[operation]((draft) => { draft.sessions.push(record); draft.updatedAt = new Date().toISOString(); });
   console.log(JSON.stringify({ ok: true }));
 } catch (error) {
-  console.log(JSON.stringify({
-    ok: false,
-    code: error && typeof error === "object" && "code" in error ? error.code : "UNKNOWN",
-    message: error instanceof Error ? error.message : String(error),
-  }));
+  console.log(JSON.stringify({ ok: false, code: error && typeof error === "object" && "code" in error ? error.code : "UNKNOWN", message: error instanceof Error ? error.message : String(error) }));
 }
 `;
 
@@ -80,12 +166,7 @@ async function runChild(commonGitDirectory: string, environment: Record<string, 
   return await new Promise<ChildExit>((resolveChild, rejectChild) => {
     const child = spawn(process.execPath, ["--import", "tsx/esm", "--input-type=module", "-e", childScript], {
       cwd: fileURLToPath(new URL("../../", import.meta.url)),
-      env: {
-        ...process.env,
-        NODE_NO_WARNINGS: "1",
-        COMMON_GIT: commonGitDirectory,
-        ...environment,
-      },
+      env: { ...process.env, NODE_NO_WARNINGS: "1", COMMON_GIT: commonGitDirectory, ...environment },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -99,39 +180,43 @@ async function runChild(commonGitDirectory: string, environment: Record<string, 
     child.on("error", rejectChild);
     child.on("close", (exitCode, signal) => {
       const output = stdout.trim().split("\n").at(-1);
-      let result: ChildResult = { ok: false, code: "NO_RESULT", message: stdout };
-      if (output !== undefined && output.length > 0) {
-        try {
-          const parsed: unknown = JSON.parse(output);
-          if (typeof parsed === "object" && parsed !== null && "ok" in parsed && typeof parsed.ok === "boolean") {
-            const parsedRecord = parsed as Record<string, unknown>;
-            result = {
-              ok: parsed.ok,
-              ...(typeof parsedRecord.code === "string" ? { code: parsedRecord.code } : {}),
-              ...(typeof parsedRecord.message === "string" ? { message: parsedRecord.message } : {}),
-            };
-          }
-        } catch {
-          result = { ok: false, code: "INVALID_RESULT", message: output };
-        }
+      if (output === undefined || output.length === 0) {
+        resolveChild({ ok: false, code: "NO_RESULT", exitCode, signal, stderr });
+        return;
       }
-      resolveChild({ ...result, exitCode, signal, stderr });
+      try {
+        const parsed: unknown = JSON.parse(output);
+        if (isRecord(parsed) && typeof parsed.ok === "boolean") {
+          resolveChild({
+            ok: parsed.ok,
+            ...(typeof parsed.code === "string" ? { code: parsed.code } : {}),
+            ...(typeof parsed.message === "string" ? { message: parsed.message } : {}),
+            exitCode,
+            signal,
+            stderr,
+          });
+          return;
+        }
+      } catch {
+        // The caller reports malformed child output as a failed race participant.
+      }
+      resolveChild({ ok: false, code: "INVALID_RESULT", message: output, exitCode, signal, stderr });
     });
   });
 }
 
-async function withCommonGitDirectory<T>(callback: (commonGitDirectory: string) => Promise<T>): Promise<T> {
+async function withCommonGitDirectory<T>(callback: (directory: string) => Promise<T>): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), "gitpaw-registry-"));
-  const commonGitDirectory = join(root, "common-git");
-  await mkdir(commonGitDirectory, { recursive: true });
+  const directory = join(root, "common-git");
+  await mkdir(directory, { recursive: true });
   try {
-    return await callback(commonGitDirectory);
+    return await callback(directory);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 }
 
-function makeRecord(sessionId: string, branch = `branch/${sessionId}`): SessionRecord {
+function makeRecord(sessionId: string, branch = `branch/${sessionId}`): TestSession {
   const now = new Date().toISOString();
   return {
     schemaVersion: 1,
@@ -145,163 +230,155 @@ function makeRecord(sessionId: string, branch = `branch/${sessionId}`): SessionR
   };
 }
 
-function createRegistry(
+type BoundaryOptions = RegistryMutationBoundaryOptions<TestState>;
+function createBoundary(
   commonGitDirectory: string,
-  extra: Partial<ConstructorParameters<typeof RepositoryRegistry>[0]> = {},
-) {
-  return new RepositoryRegistry({
+  extra: Partial<BoundaryOptions> = {},
+): RegistryMutationBoundary<TestState> {
+  return new RegistryMutationBoundary<TestState>({
     commonGitDirectory,
-    repositoryId: testRepositoryId,
-    lock: {
-      staleAfterMs: 30,
-      acquireTimeoutMs: 10_000,
-      retryDelayMs: 2,
-    },
+    codec,
+    lock: { staleAfterMs: 30, acquireTimeoutMs: 10_000, retryDelayMs: 2 },
     ...extra,
   });
 }
 
-test("persists a versioned document visible to another registry instance", async () => {
-  await withCommonGitDirectory(async (commonGitDirectory) => {
-    const first = createRegistry(commonGitDirectory);
+test("persists a codec-owned document visible to another boundary instance", async () => {
+  await withCommonGitDirectory(async (directory) => {
+    const first = createBoundary(directory);
     await first.create((draft) => {
       draft.sessions.push(makeRecord("session-1"));
     });
-
-    const second = createRegistry(commonGitDirectory);
-    const document = await second.read();
-    assert.equal(document.schemaVersion, 1);
-    assert.equal(document.repositoryId, testRepositoryId);
+    const second = createBoundary(directory);
+    const state = await second.read();
+    assert.equal(state.schemaVersion, 1);
     assert.deepEqual(
-      document.sessions.map((session) => session.sessionId),
+      state.sessions.map((s) => s.sessionId),
       ["session-1"],
     );
   });
 });
 
-test("readers reject corrupt and unsupported authoritative state", async () => {
-  await withCommonGitDirectory(async (commonGitDirectory) => {
-    const registry = createRegistry(commonGitDirectory);
-    await mkdir(registry.registryDirectory, { recursive: true });
-    await writeFile(registry.registryPath, '{"schemaVersion":1', "utf8");
-    await assert.rejects(registry.read(), (error: unknown) => {
-      return error instanceof RegistryError && error.code === "REGISTRY_CORRUPT";
+test("supports the domain registry's explicit common-state paths", async () => {
+  await withCommonGitDirectory(async (directory) => {
+    const boundary = createBoundary(directory, {
+      registryDirectoryName: "git-paw",
+      registryFileName: "session-registry.json",
+      lockFileName: "session-registry.lock",
     });
+    assert.equal(boundary.registryPath, join(directory, "git-paw", "session-registry.json"));
+    await boundary.create((draft) => {
+      draft.sessions.push(makeRecord("explicit-path"));
+    });
+    assert.equal((await boundary.read()).sessions.length, 1);
+  });
+});
 
+test("readers reject corrupt and unsupported authoritative state", async () => {
+  await withCommonGitDirectory(async (directory) => {
+    const boundary = createBoundary(directory);
+    await mkdir(boundary.registryDirectory, { recursive: true });
+    await writeFile(boundary.registryPath, '{"schemaVersion":1', "utf8");
+    await assert.rejects(
+      boundary.read(),
+      (error: unknown) => error instanceof RegistryError && error.code === "REGISTRY_CORRUPT",
+    );
     await writeFile(
-      registry.registryPath,
-      JSON.stringify({ ...createEmptyRegistry(testRepositoryId), schemaVersion: 99 }),
+      boundary.registryPath,
+      JSON.stringify({
+        schemaVersion: 99,
+        repositoryId: testRepositoryId,
+        updatedAt: new Date().toISOString(),
+        sessions: [],
+      }),
       "utf8",
     );
-    await assert.rejects(registry.read(), (error: unknown) => {
-      return error instanceof RegistryError && error.code === "REGISTRY_UNSUPPORTED_SCHEMA";
-    });
+    await assert.rejects(
+      boundary.read(),
+      (error: unknown) => error instanceof RegistryError && error.code === "REGISTRY_UNSUPPORTED_SCHEMA",
+    );
   });
 });
 
 test("duplicate active session, worktree, and branch ownership fails closed", async () => {
-  await withCommonGitDirectory(async (commonGitDirectory) => {
-    const registry = createRegistry(commonGitDirectory);
-    await registry.create((draft) => {
+  await withCommonGitDirectory(async (directory) => {
+    const boundary = createBoundary(directory);
+    await boundary.create((draft) => {
       draft.sessions.push(makeRecord("session-1", "branch/shared"));
     });
-
     await assert.rejects(
-      registry.claim((draft) => {
+      boundary.claim((draft) => {
         draft.sessions.push(makeRecord("session-1", "branch/other"));
       }),
       (error: unknown) => error instanceof RegistryError && error.code === "REGISTRY_DUPLICATE_SESSION",
     );
     await assert.rejects(
-      registry.claim((draft) => {
+      boundary.claim((draft) => {
         draft.sessions.push(makeRecord("session-2", "branch/shared"));
       }),
-      (error: unknown) =>
-        (error instanceof RegistryError && error.code === "REGISTRY_DUPLICATE_WORKTREE") ||
-        (error instanceof RegistryError && error.code === "REGISTRY_DUPLICATE_BRANCH"),
+      (error: unknown) => error instanceof RegistryError && error.code === "REGISTRY_DUPLICATE_BRANCH",
     );
-
-    const document = await registry.read();
-    assert.equal(document.sessions.length, 1);
+    assert.equal((await boundary.read()).sessions.length, 1);
   });
 });
 
 test("a failed write leaves the previous complete document authoritative", async () => {
-  await withCommonGitDirectory(async (commonGitDirectory) => {
-    const registry = createRegistry(commonGitDirectory);
-    await registry.create((draft) => {
+  await withCommonGitDirectory(async (directory) => {
+    const boundary = createBoundary(directory);
+    await boundary.create((draft) => {
       draft.sessions.push(makeRecord("base"));
     });
-
-    const failingRegistry = createRegistry(commonGitDirectory, {
+    const failing = createBoundary(directory, {
       atomicWriteHooks: {
         beforeRename: () => {
-          throw new Error("simulated process failure before rename");
+          throw new Error("simulated failure");
         },
       },
     });
     await assert.rejects(
-      failingRegistry.create((draft) => {
+      failing.create((draft) => {
         draft.sessions.push(makeRecord("not-committed"));
       }),
       (error: unknown) => error instanceof RegistryError && error.code === "REGISTRY_MUTATION_FAILED",
     );
-
-    const document = await registry.read();
     assert.deepEqual(
-      document.sessions.map((session) => session.sessionId),
+      (await boundary.read()).sessions.map((s) => s.sessionId),
       ["base"],
     );
   });
 });
 
 test("concurrent independent creates serialize across real processes", async () => {
-  await withCommonGitDirectory(async (commonGitDirectory) => {
+  await withCommonGitDirectory(async (directory) => {
     const results = await Promise.all(
       Array.from({ length: 10 }, (_, index) =>
-        runChild(commonGitDirectory, {
-          OPERATION: "create",
-          SESSION_ID: `concurrent-${index}`,
-          HOLD_MS: "5",
-        }),
+        runChild(directory, { OPERATION: "create", SESSION_ID: `concurrent-${index}`, HOLD_MS: "5" }),
       ),
     );
     assert.equal(results.filter((result) => result.ok).length, 10, JSON.stringify(results));
-
-    const registry = createRegistry(commonGitDirectory);
-    const document = await registry.read();
-    assert.equal(document.sessions.length, 10);
-    assert.equal(new Set(document.sessions.map((session) => session.sessionId)).size, 10);
+    const state = await createBoundary(directory).read();
+    assert.equal(state.sessions.length, 10);
   });
 });
 
 test("create, claim, close, release, and gc use one mutation boundary", async () => {
-  await withCommonGitDirectory(async (commonGitDirectory) => {
+  await withCommonGitDirectory(async (directory) => {
     const operations = ["create", "claim", "close", "release", "gc"];
     const results = await Promise.all(
       operations.map((operation, index) =>
-        runChild(commonGitDirectory, {
-          OPERATION: operation,
-          SESSION_ID: `operation-${index}`,
-        }),
+        runChild(directory, { OPERATION: operation, SESSION_ID: `operation-${index}` }),
       ),
     );
     assert.equal(results.filter((result) => result.ok).length, operations.length, JSON.stringify(results));
-
-    const document = await createRegistry(commonGitDirectory).read();
-    assert.equal(document.sessions.length, operations.length);
+    assert.equal((await createBoundary(directory).read()).sessions.length, operations.length);
   });
 });
 
 test("concurrent claims of one branch have exactly one valid winner", async () => {
-  await withCommonGitDirectory(async (commonGitDirectory) => {
+  await withCommonGitDirectory(async (directory) => {
     const results = await Promise.all(
       Array.from({ length: 10 }, (_, index) =>
-        runChild(commonGitDirectory, {
-          OPERATION: "claim",
-          SESSION_ID: `claim-${index}`,
-          BRANCH: "branch/one-winner",
-        }),
+        runChild(directory, { OPERATION: "claim", SESSION_ID: `claim-${index}`, BRANCH: "branch/one-winner" }),
       ),
     );
     assert.equal(results.filter((result) => result.ok).length, 1, JSON.stringify(results));
@@ -310,56 +387,41 @@ test("concurrent claims of one branch have exactly one valid winner", async () =
       9,
       JSON.stringify(results),
     );
-
-    const registry = createRegistry(commonGitDirectory);
-    const document = await registry.read();
-    assert.equal(document.sessions.length, 1);
-    assert.equal(document.sessions[0]?.branch, "branch/one-winner");
+    const state = await createBoundary(directory).read();
+    assert.equal(state.sessions.length, 1);
   });
 });
 
 test("a killed writer leaves no accepted partial state and allows safe retry", async () => {
-  await withCommonGitDirectory(async (commonGitDirectory) => {
-    const registry = createRegistry(commonGitDirectory);
-    await registry.create((draft) => {
+  await withCommonGitDirectory(async (directory) => {
+    const boundary = createBoundary(directory);
+    await boundary.create((draft) => {
       draft.sessions.push(makeRecord("base"));
     });
-
-    const crashed = await runChild(commonGitDirectory, {
+    const crashed = await runChild(directory, {
       OPERATION: "create",
       SESSION_ID: "killed-writer",
       CRASH_BEFORE_RENAME: "1",
       STALE_AFTER_MS: "20",
     });
     assert.equal(crashed.signal, "SIGKILL", JSON.stringify(crashed));
-
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 60));
-    const retry = createRegistry(commonGitDirectory);
-    await retry.create((draft) => {
+    await createBoundary(directory).create((draft) => {
       draft.sessions.push(makeRecord("retry"));
     });
-
-    const document = await retry.read();
-    assert.deepEqual(document.sessions.map((session) => session.sessionId).sort(), ["base", "retry"]);
-    const files = await readdir(registry.registryDirectory);
-    assert.ok(
-      files.some((file) => file.endsWith(".tmp")),
-      "the killed writer should leave an ignored temp file",
-    );
-    const authoritative = await readFile(registry.registryPath, "utf8");
-    assert.doesNotMatch(authoritative, /killed-writer/);
+    const state = await boundary.read();
+    assert.deepEqual(state.sessions.map((s) => s.sessionId).sort(), ["base", "retry"]);
+    assert.ok((await readdir(boundary.registryDirectory)).some((file) => file.endsWith(".tmp")));
+    assert.doesNotMatch(await readFile(boundary.registryPath, "utf8"), /killed-writer/);
   });
 });
 
-test("document validation rejects duplicate active resources but permits released history", () => {
-  const first = makeRecord("first", "branch/shared");
-  const second = { ...makeRecord("second", "branch/shared"), state: "closed" as const };
-  const document: RegistryDocument = {
+test("codec validation can preserve released history without reserving resources", () => {
+  const state: TestState = {
     schemaVersion: 1,
     repositoryId: testRepositoryId,
     updatedAt: new Date().toISOString(),
-    sessions: [first, second],
+    sessions: [makeRecord("active", "branch/shared"), { ...makeRecord("closed", "branch/shared"), state: "closed" }],
   };
-  assert.doesNotThrow(() => validateRegistryDocument(document, testRepositoryId));
-  assert.deepEqual(parseRegistryDocument(document, testRepositoryId).sessions.length, 2);
+  assert.doesNotThrow(() => validateFixture(state));
 });

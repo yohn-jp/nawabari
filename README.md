@@ -18,19 +18,24 @@ PACKAGE_NAME --help
 
 ## Registry concurrency and atomicity
 
-The authoritative registry lives in the repository-common Git directory at
-`gitpaw/registry.json`. This location is shared by every worktree of the same
-repository. `RepositoryRegistry` is the single mutation boundary: its
-`create`, `claim`, `close`, `release`, and `gc` operations all acquire the same
-repository-scoped local lock before reading, validating, and committing state.
-The callback supplied to each operation owns higher-level product semantics;
-the boundary does not implement worktree provisioning or lifecycle policy.
+The authoritative registry is supplied by the domain registry in the
+repository-common Git directory. `RegistryMutationBoundary` is the single
+concurrency/atomicity boundary: its `create`, `claim`, `close`, `release`, and
+`gc` operations all acquire the same repository-scoped local lock before
+reading, validating, and committing state. The domain supplies a codec and may
+configure its existing registry path, schema, and resource model. The callback
+supplied to each operation owns higher-level product semantics; this boundary
+does not implement session identity, worktree provisioning, or lifecycle
+policy.
 
-The lock is a local directory lock at `gitpaw/registry.lock`, created with an
-exclusive filesystem operation. It is intentionally not a distributed lock
-and does not coordinate different clones or machines. Lock metadata contains a
-random token, host, PID, and (where available) the process start token. A
-contender waits for a live owner and returns typed `LOCK_BUSY` on timeout.
+By default the boundary uses `gitpaw/registry.json` and a local directory lock
+at `gitpaw/registry.lock`, created with an exclusive filesystem operation. The
+domain can point it at an existing common-state authority such as
+`git-paw/session-registry.json` and its corresponding lock path. It is
+intentionally not a distributed lock and does not coordinate different clones
+or machines. Lock metadata contains a random token, host, PID, and (where
+available) the process start token. A contender waits for a live owner and
+returns typed `LOCK_BUSY` on timeout.
 Expired locks are reclaimed only when the owner is on the local host and its
 PID/start token can be proven dead. Remote, malformed, unverifiable, or
 ambiguous locks return typed `LOCK_STALE`/`LOCK_INVALID` outcomes and are never
@@ -44,11 +49,10 @@ leaves a recoverable lock only when the conservative stale-owner proof above is
 available. Otherwise retry fails closed until an operator or a future explicit
 recovery policy resolves the ambiguity.
 
-The registry document is versioned and rejects corrupt JSON, unsupported schema
-versions, duplicate session IDs, and duplicate active worktree/branch
-ownership. Closed records may remain as history and no longer reserve their
-resources. `RegistryError.code` and `RegistryLockError.code` are the stable
-machine-readable outcomes for callers.
+The codec owns the versioned document and rejects corrupt JSON, unsupported
+schema versions, and domain-specific ownership conflicts. `RegistryError.code`
+and `RegistryLockError.code` are the stable machine-readable outcomes for
+callers.
 
 ## Development
 
