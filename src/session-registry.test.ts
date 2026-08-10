@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
+import { RepositoryLock } from "./registry/lock.js";
 import { SessionRegistry, toPersistedSessionRecord, type PersistedRegistry } from "./session-registry.js";
 
 test("round-trips session metadata through common Git state", () => {
@@ -61,6 +62,17 @@ test("keeps human labels separate from session identity", () => {
     assert.equal(registry.list().length, 2);
   } finally {
     fs.rmSync(thirdWorktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("rejects an empty label before writing unreadable registry state", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    assertRegistryError(() => registry.create({ label: "" }), "INVALID_SESSION_RECORD");
+    assert.deepEqual(registry.list(), []);
+  } finally {
     fixture.cleanup();
   }
 });
@@ -138,6 +150,103 @@ test("fails closed when persisted records contain duplicate ownership", () => {
   }
 });
 
+test("toPersistedSessionRecord validates against the caller's expected repository", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    assertRegistryError(
+      () =>
+        toPersistedSessionRecord({ ...session, repositoryId: `${session.repositoryId}-other` }, session.repositoryId),
+      "REGISTRY_REPOSITORY_MISMATCH",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("recovers a stale session lock only when local process identity proves it dead", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      lockTimeoutMs: 50,
+      lockStaleAfterMs: 0,
+      lockMetadataGraceMs: 0,
+    });
+    fs.mkdirSync(registry.paths.directory, { recursive: true });
+    fs.mkdirSync(registry.paths.lock, { recursive: true });
+    fs.writeFileSync(
+      path.join(registry.paths.lock, "owner.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        token: "dead-owner",
+        pid: process.pid,
+        hostname: os.hostname(),
+        processStartTime: "0",
+        acquiredAt: new Date(Date.now() - 10_000).toISOString(),
+      })}\n`,
+    );
+
+    const session = registry.create({ label: "recovered" });
+    assert.equal(session.label, "recovered");
+    assert.equal(fs.existsSync(registry.paths.lock), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("does not steal a stale session lock whose owner cannot be verified dead", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      lockTimeoutMs: 0,
+      lockStaleAfterMs: 0,
+      lockMetadataGraceMs: 0,
+    });
+    fs.mkdirSync(registry.paths.directory, { recursive: true });
+    fs.mkdirSync(registry.paths.lock, { recursive: true });
+    fs.writeFileSync(
+      path.join(registry.paths.lock, "owner.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        token: "remote-owner",
+        pid: 1,
+        hostname: `${os.hostname()}-remote`,
+        processStartTime: "1",
+        acquiredAt: new Date(Date.now() - 10_000).toISOString(),
+      })}\n`,
+    );
+
+    assertRegistryError(() => registry.create(), "REGISTRY_LOCK_TIMEOUT");
+    assert.equal(fs.existsSync(registry.paths.lock), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("shares the repository lock format with the generic mutation boundary", async () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, lockTimeoutMs: 0 });
+    const externalLock = new RepositoryLock({
+      lockPath: registry.paths.lock,
+      staleAfterMs: 60_000,
+      acquireTimeoutMs: 0,
+    });
+    const lease = await externalLock.acquire();
+    try {
+      assertRegistryError(() => registry.create(), "REGISTRY_LOCK_TIMEOUT");
+    } finally {
+      await lease.release();
+    }
+    assert.equal(registry.create().state, "active");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("serializes concurrent creates without losing updates or duplicating ownership", { timeout: 30_000 }, async () => {
   const fixture = createRepositoryFixture();
   const worktreePaths = Array.from({ length: 8 }, () => makeDirectory("git-paw-concurrent-worktree-"));
@@ -145,7 +254,7 @@ test("serializes concurrent creates without losing updates or duplicating owners
     const workerPath = fileURLToPath(new URL("../scripts/session-registry-worker.mjs", import.meta.url));
     const results = await Promise.all(
       worktreePaths.map((worktreePath, index) =>
-        runWorker(workerPath, [fixture.repositoryPath, worktreePath, `feature/concurrent-${index}`]),
+        runWorker(workerPath, [fixture.repositoryPath, worktreePath, `feature/concurrent-${index}`, "25000"]),
       ),
     );
     assert.equal(new Set(results).size, worktreePaths.length);

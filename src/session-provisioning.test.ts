@@ -118,6 +118,23 @@ test("provision rejects a dangling worktree path symlink before invoking Git", (
   }
 });
 
+test("provision rejects a symlink to an existing directory before resolving its target", () => {
+  const fixture = createRepositoryFixture();
+  const symlinkPath = `${fixture.repositoryPath}-symlink-worktree`;
+  try {
+    fs.symlinkSync(fixture.repositoryPath, symlinkPath, "dir");
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+
+    assertRegistryError(
+      () => registry.provision({ worktreePath: symlinkPath, branchName: "feature/symlink-path" }),
+      "INVALID_WORKTREE_PATH",
+    );
+  } finally {
+    fs.unlinkSync(symlinkPath);
+    fixture.cleanup();
+  }
+});
+
 test("a Git provisioning failure leaves no active registry ownership or worktree", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), "git-paw-provisioned-failure");
@@ -256,7 +273,20 @@ function runProvisionWorker(
 }
 
 function runGit(args: readonly string[], cwd: string): string {
-  return String(execFileSync("git", [...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })).trim();
+  return String(
+    execFileSync("git", [...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_TERMINAL_PROMPT: "0",
+      },
+    }),
+  ).trim();
 }
 
 function runGitQuiet(args: readonly string[], cwd: string): boolean {

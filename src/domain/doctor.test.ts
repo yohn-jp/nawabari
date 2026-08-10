@@ -8,7 +8,14 @@ import { runDoctor } from "./doctor.js";
 
 function temporaryRepository(): string {
   const directory = mkdtempSync(path.join(os.tmpdir(), "git-paw-doctor-"));
-  execFileSync("git", ["init", "--quiet", directory]);
+  execFileSync("git", ["init", "--quiet", directory], {
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+    },
+  });
   return directory;
 }
 
@@ -31,8 +38,8 @@ test("doctor resolves Git and repository state locally without a registry", asyn
 test("doctor rejects malformed local registry state", async () => {
   const directory = temporaryRepository();
   try {
-    mkdirSync(path.join(directory, ".git", "gitpaw"));
-    writeFileSync(path.join(directory, ".git", "gitpaw", "registry.json"), "not-json\n");
+    mkdirSync(path.join(directory, ".git", "git-paw"));
+    writeFileSync(path.join(directory, ".git", "git-paw", "session-registry.json"), "not-json\n");
 
     const result = await runDoctor(directory);
     assert.equal(result.ok, true);

@@ -27,9 +27,16 @@ We aim to acknowledge reports within 5 business days. This is a small,
 independently maintained project without a dedicated security team, so
 response times are best-effort.
 
-<!--
-TODO: if this CLI executes user-supplied commands, reads/writes outside a
-confined workspace root, or handles credentials, document those trust
-boundaries explicitly here — see Mottainai's SECURITY.md for the shape of
-that section. Delete this comment once addressed.
--->
+## Trust boundaries
+
+GitPaw invokes the local `git` executable and reads or writes the repository's
+common Git directory and managed worktree paths. It is intended for a trusted
+local user and does not provide an operating-system sandbox, filesystem ACL,
+or process isolation. Direct filesystem writes by a process that already has
+permission to access another worktree are outside GitPaw's enforcement
+boundary.
+
+GitPaw does not contact GitHub, `gh`, an agent runtime, or a remote service,
+and it does not handle credentials. Inputs that select branches and paths are
+validated before Git mutation; ambiguous ownership and recoverable work fail
+closed.

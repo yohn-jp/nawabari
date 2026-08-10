@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
-import { resolveRepositoryContext, resolveWorktreeIdentity } from "./git.js";
+import { normalizeBranchId, resolveRepositoryContext, resolveWorktreeIdentity } from "./git.js";
 
 test("resolves the same repository identity from linked worktrees", () => {
   const fixture = createRepositoryFixture();
@@ -50,6 +50,13 @@ test("rejects a detached worktree as an ambiguous branch identity", () => {
     fs.rmSync(detachedPath, { recursive: true, force: true });
     fixture.cleanup();
   }
+});
+
+test("rejects a lock-suffixed component in a branch identity", () => {
+  assert.throws(
+    () => normalizeBranchId("feature/locked.lock/name"),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "INVALID_BRANCH_ID",
+  );
 });
 
 interface RepositoryFixture {

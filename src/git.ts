@@ -47,6 +47,7 @@ export const defaultGit: GitCommandRunner = {
         env: {
           ...process.env,
           GIT_TERMINAL_PROMPT: "0",
+          GIT_OPTIONAL_LOCKS: "0",
         },
       }).trim();
     } catch (error: unknown) {
@@ -158,7 +159,9 @@ export function normalizeBranchId(branchName: string): string {
     shortName.includes("@{") ||
     shortName.endsWith(".") ||
     shortName.endsWith(".lock") ||
-    components.some((component) => component.startsWith(".") || component.endsWith(".")) ||
+    components.some(
+      (component) => component.startsWith(".") || component.endsWith(".") || component.endsWith(".lock"),
+    ) ||
     shortName.includes("//") ||
     /[\u0000-\u0020~^:?*[\\]/u.test(shortName)
   ) {
@@ -177,7 +180,7 @@ function canonicalListedPath(candidate: string): string {
   }
 }
 
-function readCurrentBranch(git: GitCommandRunner, cwd: string): string {
+export function readCurrentBranch(git: GitCommandRunner, cwd: string): string {
   try {
     const branchName = git.run(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd);
     if (branchName.length === 0) {

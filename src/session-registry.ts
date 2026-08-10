@@ -1,10 +1,13 @@
 import fs from "node:fs";
+import { hostname as getHostname } from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import {
   defaultGit,
   listGitWorktrees,
   normalizeBranchId,
+  readCurrentBranch,
   resolveRepositoryContext,
   resolveWorktreeIdentity,
   type GitCommandRunner,
@@ -19,6 +22,8 @@ export const REGISTRY_DIRECTORY_NAME = "git-paw";
 export const REGISTRY_FILE_NAME = "session-registry.json";
 export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
 export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
+const SESSION_LOCK_SCHEMA_VERSION = 1 as const;
+const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
 
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
 export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
@@ -110,6 +115,8 @@ export interface SessionRegistryOptions {
   readonly clock?: () => Date;
   readonly idGenerator?: () => string;
   readonly lockTimeoutMs?: number;
+  readonly lockStaleAfterMs?: number;
+  readonly lockMetadataGraceMs?: number;
   readonly defaultBranchName?: string;
   readonly protectedBranchNames?: readonly string[];
   readonly protectedWorktreePaths?: readonly string[];
@@ -153,7 +160,7 @@ export class SessionRegistry {
   readonly repository: RepositoryContext;
   readonly paths: RegistryPaths;
 
-  private readonly git: GitCommandRunner | undefined;
+  private readonly git: GitCommandRunner;
   private readonly clock: () => Date;
   private readonly idGenerator: () => string;
   private readonly lockTimeoutMs: number;
@@ -162,6 +169,8 @@ export class SessionRegistry {
   private readonly protectedWorktreePaths: readonly string[];
   private readonly worktreeRoot: string;
   private readonly staleAfterMs: number;
+  private readonly lockStaleAfterMs: number;
+  private readonly lockMetadataGraceMs: number;
 
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
@@ -174,12 +183,20 @@ export class SessionRegistry {
     this.protectedWorktreePaths = Object.freeze([...(options.protectedWorktreePaths ?? [])]);
     this.worktreeRoot = path.resolve(options.worktreeRoot ?? path.dirname(this.repository.worktreePath));
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+    this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
+    this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
 
     if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0) {
       throw new RangeError("lockTimeoutMs must be a non-negative safe integer");
     }
     if (!Number.isSafeInteger(this.staleAfterMs) || this.staleAfterMs < 0) {
       throw new RangeError("staleAfterMs must be a non-negative safe integer");
+    }
+    if (!Number.isSafeInteger(this.lockStaleAfterMs) || this.lockStaleAfterMs < 0) {
+      throw new RangeError("lockStaleAfterMs must be a non-negative safe integer");
+    }
+    if (!Number.isSafeInteger(this.lockMetadataGraceMs) || this.lockMetadataGraceMs < 0) {
+      throw new RangeError("lockMetadataGraceMs must be a non-negative safe integer");
     }
 
     const directory = path.join(this.repository.commonGitDirectory, REGISTRY_DIRECTORY_NAME);
@@ -268,11 +285,11 @@ export class SessionRegistry {
       });
 
       assertNoOwnershipConflict(records, record);
-      assertGitResourcesAvailable(this.git ?? defaultGit, this.repository.worktreePath, resources);
+      assertGitResourcesAvailable(this.git, this.repository.worktreePath, resources);
 
       let gitProvisioned = false;
       try {
-        (this.git ?? defaultGit).run(
+        this.git.run(
           ["worktree", "add", "--quiet", "-b", resources.branchName, resources.worktreePath, resources.baseRef],
           this.repository.worktreePath,
         );
@@ -281,7 +298,7 @@ export class SessionRegistry {
         return cloneSessionRecord(record);
       } catch (error: unknown) {
         if (gitProvisioned) {
-          rollbackProvisionedResources(this.git ?? defaultGit, this.repository.worktreePath, resources);
+          rollbackProvisionedResources(this.git, this.repository.worktreePath, resources);
         }
         throw error;
       }
@@ -362,16 +379,26 @@ export class SessionRegistry {
         return deniedGuard("INVALID_SESSION_ID", base, { sessionId: requestedSessionId });
       }
 
-      const worktrees = listGitWorktrees(this.git ?? defaultGit, this.repository.worktreePath);
+      const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
       if (worktrees.length === 0) {
         return deniedGuard("WORKTREE_IDENTITY_AMBIGUOUS", base, { worktree: this.repository.worktreePath });
       }
 
       const identity = resolveWorktreeIdentity({
         repository: this.repository,
-        git: this.git ?? defaultGit,
+        git: this.git,
       });
       const identityBase = { ...base, branchName: identity.branchName };
+      const listedCurrentWorktree = worktrees.find((worktree) =>
+        samePath(worktree.worktreePath, this.repository.worktreePath),
+      );
+      if (listedCurrentWorktree?.branchName !== identity.branchName) {
+        return deniedGuard("WORKTREE_IDENTITY_AMBIGUOUS", identityBase, {
+          worktree: this.repository.worktreePath,
+          listedBranch: listedCurrentWorktree?.branchName ?? "<detached>",
+          resolvedBranch: identity.branchName,
+        });
+      }
       const records = this.readUnsafe();
       const currentRecords = records.filter(
         (record) => record.worktreeId === this.repository.worktreePath && record.state !== "closed",
@@ -530,7 +557,7 @@ export class SessionRegistry {
     return this.withLock(() => {
       let records = [...this.readUnsafe()];
       const now = toTimestamp(this.clock());
-      const worktrees = listGitWorktrees(this.git ?? defaultGit, this.repository.worktreePath);
+      const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
       const candidates = records
         .filter((record) => isStaleCandidate(record, now, staleAfterMs, worktrees))
         .map(cloneSessionRecord);
@@ -612,12 +639,12 @@ export class SessionRegistry {
     let branchRemoved = false;
 
     if (resources.worktreePresent && resources.removeWorktree) {
-      removeSessionWorktree(this.git ?? defaultGit, resources.gitCwd, record.worktreePath);
+      removeSessionWorktree(this.git, resources.gitCwd, record.worktreePath);
       worktreeRemoved = true;
     }
 
     if (resources.branchPresent && resources.removeBranch) {
-      removeSessionBranch(this.git ?? defaultGit, resources.gitCwd, record.branchName);
+      removeSessionBranch(this.git, resources.gitCwd, record.branchName);
       branchRemoved = true;
     }
 
@@ -635,7 +662,7 @@ export class SessionRegistry {
   }
 
   private inspectCleanupResources(record: SessionRecord): CleanupResources {
-    const git = this.git ?? defaultGit;
+    const git = this.git;
     const worktrees = listGitWorktrees(git, this.repository.worktreePath);
     const gitCwd =
       worktrees.find((worktree) => !samePath(worktree.worktreePath, record.worktreePath))?.worktreePath ??
@@ -696,7 +723,7 @@ export class SessionRegistry {
 
   private protectedBranch(branchName: string, worktrees: readonly GitWorktreeInfo[]): boolean {
     const defaultBranchName = resolveDefaultBranchName(
-      this.git ?? defaultGit,
+      this.git,
       this.repository.worktreePath,
       worktrees,
       this.defaultBranchName,
@@ -709,7 +736,7 @@ export class SessionRegistry {
   }
 
   private branchIsReachableFromIntegration(record: SessionRecord): boolean {
-    const git = this.git ?? defaultGit;
+    const git = this.git;
     const worktrees = listGitWorktrees(git, this.repository.worktreePath);
     const defaultBranchName = resolveDefaultBranchName(
       git,
@@ -745,7 +772,7 @@ export class SessionRegistry {
   }
 
   private resolveProvisioningResources(options: ProvisionSessionOptions, sessionId: string): ProvisioningResources {
-    const git = this.git ?? defaultGit;
+    const git = this.git;
     const worktrees = listGitWorktrees(git, this.repository.worktreePath);
     const requestedWorktreePath = resolveProvisionedWorktreePath(
       options.worktreePath ??
@@ -864,7 +891,7 @@ export class SessionRegistry {
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
       repository_id: this.repository.repositoryId,
-      sessions: records.map(toPersistedSessionRecord),
+      sessions: records.map((record) => toPersistedSessionRecord(record, this.repository.repositoryId)),
     };
     const contents = `${JSON.stringify(registry, null, 2)}\n`;
     const temporaryPath = `${this.paths.registry}.tmp-${process.pid}-${generateSessionId()}`;
@@ -908,13 +935,34 @@ export class SessionRegistry {
   private withLock<T>(operation: () => T): T {
     fs.mkdirSync(this.paths.directory, { recursive: true, mode: 0o700 });
     const startedAt = Date.now();
+    const owner = createSessionLockOwner();
     let descriptor: number | undefined;
 
     while (descriptor === undefined) {
       try {
-        descriptor = fs.openSync(this.paths.lock, "wx", 0o600);
-        fs.writeFileSync(descriptor, `${process.pid}\n`, "utf8");
+        fs.mkdirSync(this.paths.lock, { mode: 0o700 });
+        descriptor = fs.openSync(path.join(this.paths.lock, "owner.json"), "wx", 0o600);
+        try {
+          fs.writeFileSync(descriptor, `${JSON.stringify(owner)}\n`, "utf8");
+          fs.fsyncSync(descriptor);
+          fs.closeSync(descriptor);
+          descriptor = undefined;
+          break;
+        } catch (error: unknown) {
+          if (descriptor !== undefined) closeQuietly(descriptor);
+          descriptor = undefined;
+          fs.rmSync(this.paths.lock, { recursive: true, force: true });
+          throw new SessionRegistryError(
+            "REGISTRY_IO_FAILURE",
+            `Could not initialize ${this.paths.lock}`,
+            { path: this.paths.lock },
+            error,
+          );
+        }
       } catch (error: unknown) {
+        if (error instanceof SessionRegistryError) {
+          throw error;
+        }
         if (!isNodeError(error) || error.code !== "EEXIST") {
           throw new SessionRegistryError(
             "REGISTRY_IO_FAILURE",
@@ -924,6 +972,9 @@ export class SessionRegistry {
             },
             error,
           );
+        }
+        if (this.reclaimStaleLock()) {
+          continue;
         }
         if (Date.now() - startedAt >= this.lockTimeoutMs) {
           throw new SessionRegistryError("REGISTRY_LOCK_TIMEOUT", `Timed out waiting for ${this.paths.lock}`, {
@@ -935,22 +986,110 @@ export class SessionRegistry {
       }
     }
 
+    let result!: T;
+    let operationFailed = false;
+    let operationError: unknown;
     try {
-      return operation();
-    } finally {
-      closeQuietly(descriptor);
-      try {
-        fs.unlinkSync(this.paths.lock);
-      } catch (error: unknown) {
+      result = operation();
+    } catch (error: unknown) {
+      operationFailed = true;
+      operationError = error;
+    }
+
+    let releaseError: unknown;
+    try {
+      const currentOwner = readSessionLockOwner(this.paths.lock);
+      if (currentOwner?.token !== owner.token) {
         throw new SessionRegistryError(
           "REGISTRY_IO_FAILURE",
-          `Could not release ${this.paths.lock}`,
-          {
-            path: this.paths.lock,
-          },
-          error,
+          `Could not verify ownership of ${this.paths.lock} during release`,
+          { path: this.paths.lock },
         );
       }
+      fs.rmSync(this.paths.lock, { recursive: true, force: false });
+    } catch (error: unknown) {
+      releaseError =
+        error instanceof SessionRegistryError
+          ? error
+          : new SessionRegistryError(
+              "REGISTRY_IO_FAILURE",
+              `Could not release ${this.paths.lock}`,
+              { path: this.paths.lock },
+              error,
+            );
+    } finally {
+      if (descriptor !== undefined) closeQuietly(descriptor);
+    }
+
+    if (operationFailed) {
+      throw operationError;
+    }
+    if (releaseError !== undefined) {
+      throw releaseError;
+    }
+    return result;
+  }
+
+  private reclaimStaleLock(): boolean {
+    let lockStats: fs.Stats;
+    try {
+      lockStats = fs.statSync(this.paths.lock);
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === "ENOENT") return true;
+      throw new SessionRegistryError(
+        "REGISTRY_IO_FAILURE",
+        `Could not inspect ${this.paths.lock}`,
+        { path: this.paths.lock },
+        error,
+      );
+    }
+
+    const owner = readSessionLockOwner(this.paths.lock);
+    if (owner === undefined) {
+      if (Date.now() - lockStats.mtimeMs < this.lockMetadataGraceMs) return false;
+      throw new SessionRegistryError(
+        "REGISTRY_LOCK_TIMEOUT",
+        `Cannot safely recover ${this.paths.lock}: owner metadata is invalid`,
+        { path: this.paths.lock, reason: "invalid_owner_metadata" },
+      );
+    }
+
+    const age = Date.now() - Date.parse(owner.acquiredAt);
+    if (!Number.isFinite(age) || age < 0) {
+      throw new SessionRegistryError(
+        "REGISTRY_LOCK_TIMEOUT",
+        `Cannot safely recover ${this.paths.lock}: owner timestamp is invalid`,
+        { path: this.paths.lock, reason: "invalid_owner_timestamp" },
+      );
+    }
+    if (age < this.lockStaleAfterMs) return false;
+
+    if (sessionLockOwnerLiveness(owner) !== "dead") {
+      throw new SessionRegistryError(
+        "REGISTRY_LOCK_TIMEOUT",
+        `Cannot safely recover ${this.paths.lock}: owner death is unverifiable`,
+        {
+          path: this.paths.lock,
+          reason: "owner_liveness_unknown_or_alive",
+          pid: owner.pid,
+          hostname: owner.hostname,
+        },
+      );
+    }
+
+    const currentOwner = readSessionLockOwner(this.paths.lock);
+    if (currentOwner?.token !== owner.token || sessionLockOwnerLiveness(currentOwner) !== "dead") return false;
+    try {
+      fs.rmSync(this.paths.lock, { recursive: true, force: false });
+      return true;
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === "ENOENT") return true;
+      throw new SessionRegistryError(
+        "REGISTRY_IO_FAILURE",
+        `Could not recover stale ${this.paths.lock}`,
+        { path: this.paths.lock },
+        error,
+      );
     }
   }
 }
@@ -973,6 +1112,17 @@ interface MutationResult<T> {
   readonly records: readonly SessionRecord[];
   readonly result: T;
 }
+
+interface SessionLockOwner {
+  readonly schemaVersion: typeof SESSION_LOCK_SCHEMA_VERSION;
+  readonly token: string;
+  readonly pid: number;
+  readonly hostname: string;
+  readonly processStartTime: string | null;
+  readonly acquiredAt: string;
+}
+
+type SessionLockOwnerLiveness = "alive" | "dead" | "unknown";
 
 interface CleanupResources {
   readonly gitCwd: string;
@@ -998,7 +1148,8 @@ function isStaleCandidate(
   if (record.state === "stale" || record.state === "closing") return true;
   const age = Date.parse(now) - Date.parse(record.updatedAt);
   const worktreePresent = worktrees.some((worktree) => samePath(worktree.worktreePath, record.worktreePath));
-  return age >= staleAfterMs || (!worktreePresent && !fs.existsSync(record.worktreePath));
+  const pathEntryPresent = lstatIfPresent(record.worktreePath) !== undefined;
+  return age >= staleAfterMs || (!worktreePresent && !pathEntryPresent);
 }
 
 function replaceRecord(records: readonly SessionRecord[], replacement: SessionRecord): SessionRecord[] {
@@ -1117,6 +1268,7 @@ function resolvePotentialWorktreePath(candidate: string, baseDirectory: string):
     });
   }
   const resolved = path.resolve(baseDirectory, candidate);
+  assertNoSymlinkPath(resolved);
   try {
     return fs.realpathSync.native(resolved);
   } catch {
@@ -1125,6 +1277,31 @@ function resolvePotentialWorktreePath(candidate: string, baseDirectory: string):
       return path.join(fs.realpathSync.native(parent), path.basename(resolved));
     } catch {
       return resolved;
+    }
+  }
+}
+
+function assertNoSymlinkPath(candidate: string): void {
+  const root = path.parse(candidate).root;
+  let current = root;
+  for (const component of path.relative(root, candidate).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    let entry: fs.Stats;
+    try {
+      entry = fs.lstatSync(current);
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === "ENOENT") break;
+      throw new SessionRegistryError(
+        "INVALID_WORKTREE_PATH",
+        `Could not inspect worktree path: ${candidate}`,
+        { worktree: candidate },
+        error,
+      );
+    }
+    if (entry.isSymbolicLink()) {
+      throw new SessionRegistryError("INVALID_WORKTREE_PATH", `Worktree path contains a symbolic link: ${candidate}`, {
+        worktree: candidate,
+      });
     }
   }
 }
@@ -1255,8 +1432,11 @@ function lstatIfPresent(candidate: string): fs.Stats | undefined {
   }
 }
 
-export function toPersistedSessionRecord(record: SessionRecord): PersistedSessionRecord {
-  const validated = validateSessionRecord(record, record.repositoryId);
+export function toPersistedSessionRecord(
+  record: SessionRecord,
+  expectedRepositoryId: string = record.repositoryId,
+): PersistedSessionRecord {
+  const validated = validateSessionRecord(record, expectedRepositoryId);
   return {
     schema_version: validated.schemaVersion,
     session_id: validated.sessionId,
@@ -1499,33 +1679,6 @@ function canonicalWorktreePath(candidate: string): string {
   }
 }
 
-function readCurrentBranch(git: GitCommandRunner | undefined, cwd: string): string {
-  if (git === undefined) {
-    throw new SessionRegistryError(
-      "WORKTREE_IDENTITY_AMBIGUOUS",
-      `A Git runner is required to resolve the current branch for ${cwd}`,
-      { cwd },
-    );
-  }
-  try {
-    const branchName = git.run(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd);
-    if (branchName.length === 0) {
-      throw new SessionRegistryError("WORKTREE_IDENTITY_AMBIGUOUS", `The worktree at ${cwd} has no branch`, { cwd });
-    }
-    return branchName;
-  } catch (error: unknown) {
-    if (error instanceof SessionRegistryError && error.code === "WORKTREE_IDENTITY_AMBIGUOUS") {
-      throw error;
-    }
-    throw new SessionRegistryError(
-      "WORKTREE_IDENTITY_AMBIGUOUS",
-      `Could not resolve the current branch for ${cwd}`,
-      { cwd },
-      error,
-    );
-  }
-}
-
 function assertSessionId(sessionId: string): void {
   if (!isSessionId(sessionId)) {
     throw new SessionRegistryError("INVALID_SESSION_ID", `Invalid session ID: ${sessionId}`, { sessionId });
@@ -1533,8 +1686,8 @@ function assertSessionId(sessionId: string): void {
 }
 
 function validateLabel(label: string): string {
-  if (typeof label !== "string") {
-    throw new SessionRegistryError("INVALID_SESSION_RECORD", "Session label must be a string");
+  if (typeof label !== "string" || label.length === 0) {
+    throw new SessionRegistryError("INVALID_SESSION_RECORD", "Session label must be a non-empty string");
   }
   return label;
 }
@@ -1621,6 +1774,89 @@ function stringifyDetail(value: unknown): string {
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
     ? String(value)
     : "<invalid>";
+}
+
+function createSessionLockOwner(): SessionLockOwner {
+  return {
+    schemaVersion: SESSION_LOCK_SCHEMA_VERSION,
+    token: randomUUID(),
+    pid: process.pid,
+    hostname: getHostname(),
+    processStartTime: readProcessStartTimeSync(process.pid),
+    acquiredAt: new Date().toISOString(),
+  };
+}
+
+function readSessionLockOwner(lockPath: string): SessionLockOwner | undefined {
+  let contents: string;
+  try {
+    contents = fs.readFileSync(path.join(lockPath, "owner.json"), "utf8");
+  } catch (error: unknown) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw new SessionRegistryError("REGISTRY_IO_FAILURE", `Could not read ${lockPath}`, { path: lockPath }, error);
+  }
+
+  try {
+    const value: unknown = JSON.parse(contents);
+    if (!isRecord(value)) return undefined;
+    if (
+      value.schemaVersion !== SESSION_LOCK_SCHEMA_VERSION ||
+      typeof value.token !== "string" ||
+      value.token.length === 0 ||
+      typeof value.pid !== "number" ||
+      !Number.isSafeInteger(value.pid) ||
+      value.pid <= 0 ||
+      typeof value.hostname !== "string" ||
+      value.hostname.length === 0 ||
+      (typeof value.processStartTime !== "string" && value.processStartTime !== null) ||
+      typeof value.acquiredAt !== "string" ||
+      !Number.isFinite(Date.parse(value.acquiredAt))
+    ) {
+      return undefined;
+    }
+    return {
+      schemaVersion: SESSION_LOCK_SCHEMA_VERSION,
+      token: value.token,
+      pid: value.pid,
+      hostname: value.hostname,
+      processStartTime: value.processStartTime,
+      acquiredAt: value.acquiredAt,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function sessionLockOwnerLiveness(owner: SessionLockOwner | undefined): SessionLockOwnerLiveness {
+  if (owner === undefined || owner.hostname !== getHostname() || owner.processStartTime === null) return "unknown";
+  if (!/^\d+$/u.test(owner.processStartTime)) return "unknown";
+  const currentStartTime = readProcessStartTimeSync(owner.pid);
+  if (currentStartTime === null) {
+    try {
+      process.kill(owner.pid, 0);
+      return "unknown";
+    } catch (error: unknown) {
+      return isNodeError(error) && error.code === "ESRCH" ? "dead" : "unknown";
+    }
+  }
+  return currentStartTime === owner.processStartTime ? "alive" : "dead";
+}
+
+function readProcessStartTimeSync(pid: number): string | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = raw.lastIndexOf(")");
+    if (commandEnd === -1) return null;
+    const fields = raw
+      .slice(commandEnd + 1)
+      .trim()
+      .split(/\s+/u);
+    const startTime = fields[19];
+    return startTime !== undefined && /^\d+$/u.test(startTime) ? startTime : null;
+  } catch {
+    return null;
+  }
 }
 
 function waitBriefly(): void {

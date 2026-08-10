@@ -3,7 +3,7 @@
 // installed bin through its real npm-generated launcher. `npm pack --dry-run`
 // only lists file contents — it never proves install or execution actually
 // work, which is the failure mode this guards against.
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -45,7 +45,7 @@ function parseArgs(argv) {
   return { tarball: index === -1 ? undefined : argv[index + 1] };
 }
 
-function main() {
+async function main() {
   const { tarball } = parseArgs(process.argv.slice(2));
   let tarballPath;
   let ownsTarball;
@@ -71,7 +71,9 @@ function main() {
     );
 
     console.log("installing packed tarball into isolated directory...");
-    run("npm", ["install", "--no-save", tarballPath], { cwd: installDirectory });
+    run("npm", ["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--no-save", tarballPath], {
+      cwd: installDirectory,
+    });
 
     const scope = packageName.startsWith("@") ? packageName.split("/")[0] : undefined;
     const installedPackageDirectory = scope
@@ -115,6 +117,7 @@ function main() {
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_SYSTEM: "/dev/null",
       GIT_TERMINAL_PROMPT: "0",
+      GIT_OPTIONAL_LOCKS: "0",
     };
     const installedBinary = path.join(binDirectory, "git-paw");
     // Git reserves `git <external-command> --help` for man-page lookup, so
@@ -173,6 +176,26 @@ function main() {
       if (result.error) fail(`${args.join(" ")} failed to start: ${result.error.message}`);
       return result;
     };
+    const invokeInstalledAsync = (args, cwd) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(installedBinary, args, {
+          cwd,
+          env: gitEnvironment,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk;
+        });
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk;
+        });
+        child.once("error", reject);
+        child.once("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
+      });
     const parseInstalledJson = (result, label) => {
       if (result.stdout.trim().length === 0) fail(`${label} emitted no JSON`);
       try {
@@ -183,6 +206,41 @@ function main() {
     };
 
     console.log("running the installed GitPaw session lifecycle...");
+    const protectedGuardResult = invokeInstalled(["guard", "--json"], lifecycleRepository);
+    const protectedGuard = parseInstalledJson(protectedGuardResult, "protected worktree guard");
+    if (protectedGuardResult.status !== 3 || protectedGuard.allowed !== false) {
+      fail("guard did not reject the integration worktree");
+    }
+
+    const protectedAttemptResult = invokeInstalled(
+      [
+        "session",
+        "create",
+        "--branch",
+        "main",
+        "--worktree",
+        path.join(installDirectory, "protected-worktree"),
+        "--json",
+      ],
+      lifecycleRepository,
+    );
+    const protectedAttempt = parseInstalledJson(protectedAttemptResult, "protected branch create");
+    if (protectedAttemptResult.status !== 3 || protectedAttempt.code !== "PROTECTED_BRANCH") {
+      fail("session create did not reject the protected integration branch");
+    }
+
+    const existingWorktree = path.join(installDirectory, "existing-worktree");
+    fs.mkdirSync(existingWorktree);
+    const existingAttemptResult = invokeInstalled(
+      ["session", "create", "--branch", "feature/existing-path", "--worktree", existingWorktree, "--json"],
+      lifecycleRepository,
+    );
+    const existingAttempt = parseInstalledJson(existingAttemptResult, "existing worktree create");
+    if (existingAttemptResult.status !== 3 || existingAttempt.code !== "WORKTREE_ALREADY_EXISTS") {
+      fail("session create did not reject an existing worktree path");
+    }
+    fs.rmSync(existingWorktree, { recursive: true, force: true });
+
     const created = parseInstalledJson(
       invokeInstalled(
         ["session", "create", "--branch", "feature/installed-smoke", "--worktree", lifecycleWorktree, "--json"],
@@ -227,6 +285,55 @@ function main() {
       fail("guard did not reject a cross-session mutation");
     }
 
+    const concurrentSpecs = Array.from({ length: 4 }, (_, index) => ({
+      branch: `feature/installed-concurrent-${index}`,
+      worktree: path.join(installDirectory, `installed-concurrent-worktree-${index}`),
+    }));
+    const concurrentResults = await Promise.all(
+      concurrentSpecs.map(({ branch, worktree }) =>
+        invokeInstalledAsync(
+          ["session", "create", "--branch", branch, "--worktree", worktree, "--json"],
+          lifecycleRepository,
+        ),
+      ),
+    );
+    const concurrentCreated = concurrentResults.map((result, index) => {
+      if (result.status !== 0) fail(`concurrent session ${index} exited ${result.status}: ${result.stderr}`);
+      return parseInstalledJson(result, `concurrent session ${index}`);
+    });
+    if (new Set(concurrentCreated.map((session) => session.session_id)).size !== concurrentCreated.length) {
+      fail("concurrent installed sessions did not receive unique identities");
+    }
+
+    const hazardWorktree = path.join(installDirectory, "recoverable-commit-worktree");
+    const hazardCreated = parseInstalledJson(
+      invokeInstalled(
+        ["session", "create", "--branch", "feature/installed-recoverable", "--worktree", hazardWorktree, "--json"],
+        lifecycleRepository,
+      ),
+      "recoverable commit session create",
+    );
+    fs.writeFileSync(path.join(hazardWorktree, "recoverable-commit.txt"), "retain this commit\n");
+    run("git", ["add", "recoverable-commit.txt"], { cwd: hazardWorktree, env: gitEnvironment });
+    run("git", ["commit", "-m", "recoverable smoke commit"], { cwd: hazardWorktree, env: gitEnvironment });
+    const blockedCommitClose = invokeInstalled(
+      ["session", "close", "--session", hazardCreated.session_id, "--json"],
+      lifecycleRepository,
+    );
+    const blockedCommitCloseJson = parseInstalledJson(blockedCommitClose, "recoverable commit close");
+    if (blockedCommitClose.status !== 3 || blockedCommitCloseJson.code !== "RECOVERABLE_COMMITS") {
+      fail("close did not block a clean worktree with an unreachable commit");
+    }
+    run("git", ["merge", "--ff-only", "feature/installed-recoverable"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+    const hazardClosed = invokeInstalled(
+      ["session", "close", "--session", hazardCreated.session_id, "--json"],
+      lifecycleRepository,
+    );
+    if (hazardClosed.status !== 0) fail("close did not retry after the recoverable commit became retained");
+
     fs.writeFileSync(path.join(lifecycleWorktree, "recoverable.txt"), "keep until close is safe\n");
     const dirtyClose = invokeInstalled(
       ["session", "close", "--session", created.session_id, "--json"],
@@ -252,9 +359,40 @@ function main() {
       lifecycleRepository,
     );
     if (secondClosed.status !== 0) fail("second installed session did not close safely");
+    for (const session of concurrentCreated) {
+      const closedConcurrent = invokeInstalled(
+        ["session", "close", "--session", session.session_id, "--json"],
+        lifecycleRepository,
+      );
+      if (closedConcurrent.status !== 0) fail(`concurrent session ${session.session_id} did not close safely`);
+    }
+
+    const detachedWorktree = path.join(installDirectory, "detached-worktree");
+    run("git", ["worktree", "add", "--detach", detachedWorktree, "HEAD"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+    const detachedGuard = invokeInstalled(["guard", "--json"], detachedWorktree);
+    const detachedGuardJson = parseInstalledJson(detachedGuard, "detached guard");
+    if (detachedGuard.status !== 3 || detachedGuardJson.code !== "INVALID_WORKTREE") {
+      fail("guard did not fail closed for a detached worktree");
+    }
+    run("git", ["worktree", "remove", "--force", detachedWorktree], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+
     const gc = parseInstalledJson(invokeInstalled(["gc", "--dry-run", "--json"], lifecycleRepository), "gc");
     if (gc.ok !== true || gc.candidates.length !== 0 || gc.cleaned.length !== 0) {
       fail("gc did not report a clean installed repository after close");
+    }
+
+    const registryPath = path.join(lifecycleRepository, ".git", "git-paw", "session-registry.json");
+    fs.writeFileSync(registryPath, "{not-json\n");
+    const corruptStatus = invokeInstalled(["status", "--json"], lifecycleRepository);
+    const corruptStatusJson = parseInstalledJson(corruptStatus, "corrupt registry status");
+    if (corruptStatus.status !== 3 || corruptStatusJson.code !== "REGISTRY_CORRUPT") {
+      fail("status did not fail closed for a corrupt installed registry");
     }
 
     console.log("smoke test passed.");
@@ -264,4 +402,7 @@ function main() {
   }
 }
 
-main();
+main().catch((error) => {
+  if (process.exitCode === 0 || process.exitCode === undefined) process.exitCode = 1;
+  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
+});

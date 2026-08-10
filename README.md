@@ -75,6 +75,26 @@ decision has `allowed: false`, a stable code such as
 or conflicting state fails closed. The guard does not install hooks and does
 not prevent direct filesystem writes outside GitPaw.
 
+## Orchestrator integration
+
+An external orchestrator can create a session, capture the returned
+`session_id`, launch its worker with the returned `worktree` as `cwd`, and
+check the guard before each GitPaw-governed mutation:
+
+```bash
+created=$(git paw session create --branch feature/task --json)
+session_id=$(printf '%s' "$created" | jq -r .session_id)
+worktree=$(printf '%s' "$created" | jq -r .worktree)
+
+(cd "$worktree" && git paw guard --session "$session_id" --json)
+# run the worker in "$worktree"
+git paw session close --session "$session_id" --json
+```
+
+The orchestrator owns scheduling, prompts, and worker lifetime; GitPaw owns
+only local session identity, worktree/branch ownership, and safe cleanup. No
+Mottainai, GitHub, `gh`, network, or agent-runtime dependency is required.
+
 ## Repository state and concurrency
 
 The authoritative registry is stored in the repository-common Git directory at
@@ -85,8 +105,10 @@ ID, canonical worktree and branch identities, lifecycle state, and timestamps.
 Ownership-changing writes use an exclusive repository-local lock and a synced
 temporary file followed by atomic replacement. Concurrent creation cannot
 silently duplicate an active worktree or branch. Lock recovery is conservative:
-an owner that cannot be proven dead is never stolen, so ambiguous recovery
-fails closed.
+the lock records a random token, PID, host, and process-start identity; an
+owner is reclaimed only when the same host proves that exact process identity
+is dead. Invalid, remote, or otherwise unverifiable lock metadata is never
+stolen and fails closed so an operator can inspect or remove it deliberately.
 
 ## Development
 

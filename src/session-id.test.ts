@@ -22,4 +22,5 @@ test("UUIDv7 IDs preserve millisecond ordering", () => {
 test("rejects values that are not UUIDv7 IDs", () => {
   assert.equal(isSessionId("550e8400-e29b-41d4-a716-446655440000"), false);
   assert.equal(isSessionId("not-a-session-id"), false);
+  assert.equal(isSessionId("01936F5E-7B00-7ABC-8DEF-0123456789AB"), false);
 });

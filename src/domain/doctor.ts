@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { SessionRegistry } from "../session-registry.js";
+import { isSessionRegistryError } from "../errors.js";
 import { success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 
 export type DoctorCheckStatus = "ok" | "warning" | "error" | "not_configured" | "not_applicable";
@@ -35,10 +37,20 @@ type ProcessResult = {
 
 function runGit(args: string[], cwd: string): Promise<ProcessResult> {
   return new Promise((resolve) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("git", args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
+    });
     let stdout = "";
     let stderr = "";
     let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolve({ exit_code: null, stdout, stderr, error: "git command timed out" });
+    }, 10_000);
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -51,11 +63,13 @@ function runGit(args: string[], cwd: string): Promise<ProcessResult> {
     child.on("error", (error: Error) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       resolve({ exit_code: null, stdout, stderr, error: error.message });
     });
     child.on("close", (exitCode: number | null) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       resolve({ exit_code: exitCode, stdout, stderr, error: null });
     });
   });
@@ -85,11 +99,11 @@ function parseRepository(stdout: string, cwd: string): RepositoryInfo | null {
     .map((line) => line.trim());
   if (lines.length < 2 || lines[0] === "" || lines[1] === "") return null;
   const topLevel = path.resolve(cwd, lines[0]);
-  const commonDir = path.resolve(topLevel, lines[1]);
+  const commonDir = path.resolve(cwd, lines[1]);
   return {
     top_level: topLevel,
     common_dir: commonDir,
-    registry_path: path.join(commonDir, "gitpaw", "registry.json"),
+    registry_path: path.join(commonDir, "git-paw", "session-registry.json"),
   };
 }
 
@@ -109,10 +123,25 @@ async function inspectRegistry(repository: RepositoryInfo): Promise<DoctorCheck>
         path: repository.registry_path,
       });
     }
-    return check("registry", "ok", null, "The GitPaw registry is readable.", {
-      path: repository.registry_path,
-      bytes: contents.length,
-    });
+    try {
+      const registry = new SessionRegistry({ cwd: repository.top_level });
+      const sessions = registry.list();
+      return check("registry", "ok", null, "The GitPaw registry is readable and valid.", {
+        path: repository.registry_path,
+        bytes: contents.length,
+        sessions: sessions.length,
+      });
+    } catch (error: unknown) {
+      const code =
+        isSessionRegistryError(error) && error.code === "UNSUPPORTED_SCHEMA_VERSION"
+          ? "REGISTRY_CORRUPT"
+          : isSessionRegistryError(error) && error.code === "REGISTRY_REPOSITORY_MISMATCH"
+            ? "INVALID_REGISTRY"
+            : "REGISTRY_UNREADABLE";
+      return check("registry", "error", code, "The GitPaw registry failed authoritative validation.", {
+        path: repository.registry_path,
+      });
+    }
   } catch (error: unknown) {
     if (isFileNotFound(error)) {
       return check("registry", "not_configured", null, "The GitPaw session registry is not initialized.", {

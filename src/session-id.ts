@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 
-const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 /**
  * Generates an RFC 9562 UUIDv7. The millisecond timestamp makes IDs useful
