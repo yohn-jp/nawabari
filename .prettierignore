@@ -1,2 +1,2 @@
-# pnpm owns the lockfile formatting.
+# pnpm owns this generated lockfile's layout; source formatting checks do not rewrite it.
 pnpm-lock.yaml
