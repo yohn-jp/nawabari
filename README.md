@@ -1,92 +1,98 @@
 # GitPaw
 
-GitPaw is a local Git/session ownership layer for parallel coding agents. The
-repository registry is a persistence boundary for later session, worktree, and
-lifecycle commands; it does not provide an OS sandbox or network coordination.
+GitPaw is a standalone local Git/session ownership layer for parallel coding
+agents. It gives each active session one exclusively owned worktree and one
+mutable branch. It works without GitHub, `gh`, a network connection, Mottainai,
+or a particular agent runtime.
+
+GitPaw governs operations routed through GitPaw. It is an authorization and
+ownership boundary, not an operating-system or filesystem sandbox: a process
+that already has filesystem permissions can still edit another worktree
+directly.
 
 ## Install
 
 ```bash
-npm install -g @OWNER/PACKAGE_NAME
+npm install -g git-paw
 ```
 
-## Usage
+The package installs the `git-paw` executable, which Git discovers as the
+`git paw` external subcommand.
 
 ```bash
-PACKAGE_NAME --help
+git paw --help
+git-paw --version
 ```
 
-## Registry concurrency and atomicity
+## Session lifecycle
 
-The authoritative registry is supplied by the domain registry in the
-repository-common Git directory. `RegistryMutationBoundary` is the single
-concurrency/atomicity boundary: its `create`, `claim`, `close`, `release`, and
-`gc` operations all acquire the same repository-scoped local lock before
-reading, validating, and committing state. The domain supplies a codec and may
-configure its existing registry path, schema, and resource model. The callback
-supplied to each operation owns higher-level product semantics; this boundary
-does not implement session identity, worktree provisioning, or lifecycle
-policy.
-
-By default the boundary uses `gitpaw/registry.json` and a local directory lock
-at `gitpaw/registry.lock`, created with an exclusive filesystem operation. The
-domain can point it at an existing common-state authority such as
-`git-paw/session-registry.json` and its corresponding lock path. It is
-intentionally not a distributed lock and does not coordinate different clones
-or machines. Lock metadata contains a random token, host, PID, and (where
-available) the process start token. A contender waits for a live owner and
-returns typed `LOCK_BUSY` on timeout.
-Expired locks are reclaimed only when the owner is on the local host and its
-PID/start token can be proven dead. Remote, malformed, unverifiable, or
-ambiguous locks return typed `LOCK_STALE`/`LOCK_INVALID` outcomes and are never
-silently stolen.
-
-Registry writes use a same-directory temporary file, file sync, and atomic
-rename followed by a directory sync. Readers open only the authoritative
-`registry.json`, so a crash before rename leaves the previous complete document
-in place; an orphan temporary file is ignored. A crash after taking the lock
-leaves a recoverable lock only when the conservative stale-owner proof above is
-available. Otherwise retry fails closed until an operator or a future explicit
-recovery policy resolves the ambiguity.
-
-The codec owns the versioned document and rejects corrupt JSON, unsupported
-schema versions, and domain-specific ownership conflicts. `RegistryError.code`
-and `RegistryLockError.code` are the stable machine-readable outcomes for
-callers.
-
-## Session lifecycle and safe cleanup
-
-`session close` operates only on the selected session (or the session owning
-the current worktree). It verifies the registry ownership against Git's local
-worktree inventory, refuses dirty or ambiguous worktrees, and refuses to delete
-a branch whose commits are not proven reachable from the repository's
-integration branch. A clean provisioned session transitions through
-`closing` to `closed`; the `closing` state is retained if an operation is
-interrupted so a later close or `gc --apply` can retry safely. Repeating close
-for a closed session is an idempotent success.
+Session IDs are generated automatically as UUIDv7 values. They are immutable
+machine identities; labels and branch names are separate display metadata.
 
 ```bash
+git paw session create --branch feature/example --worktree ../example-worktree --json
+git paw session id --json
+git paw session show --json
+git paw session list --json
+git paw status --json
+git paw guard --json
 git paw session close --json
-git paw session close --session <session-id> --json
 git paw gc --dry-run --json
-git paw gc --apply --json
+git paw doctor --json
 ```
 
-`gc` is detection-only by default. A session is a candidate when it is already
-`stale`, a close is in progress, its `updated_at` is older than the default
-24-hour stale threshold, or its worktree path is missing. `gc --apply` first
-marks candidates stale, then applies the same close safety checks. Dirty,
-ambiguous, ownership-mismatched, or recoverable-commit sessions remain in the
-registry and are returned in the machine-readable `blocked` list. Missing
-resources are cleaned only when the remaining branch state is proven safe.
+`session create` provisions a dedicated worktree and mutable branch atomically
+under the repository-scoped mutation lock. The default/integration worktree
+and its protected branch cannot be session resources. `session id` and the
+other current-session commands resolve ownership from the current worktree;
+callers do not need to repeat the session ID.
 
-GitPaw governs operations routed through GitPaw; it cannot prevent a process
-with filesystem permission from editing or deleting another worktree directly.
+Close is conservative. Dirty worktrees, ambiguous ownership, mismatched Git
+state, and commits not proven reachable from the integration branch block
+destructive cleanup. A clean close releases only the owned worktree and
+branch, and repeating close is idempotent. `gc` detects stale or interrupted
+sessions; `--apply` uses the same close safety checks and reports blocked
+sessions instead of guessing.
+
+## Ownership guard
+
+`git paw guard` is a cheap, side-effect-free authorization decision for a
+GitPaw-governed mutation. It reads the current repository/worktree/branch and
+the same authoritative session registry used by provisioning and lifecycle
+operations. An optional `--session` asserts the caller's session identity.
+
+```bash
+decision=$(git paw guard --session "$GITPAW_SESSION_ID" --json) || {
+  printf '%s\n' "$decision" >&2
+  exit 1
+}
+```
+
+An allowed decision has `allowed: true` and `code: "ALLOWED"`. A denied
+decision has `allowed: false`, a stable code such as
+`WORKTREE_OWNED_BY_OTHER_SESSION`, `PROTECTED_WORKTREE`, or
+`OWNERSHIP_MISMATCH`, and a non-zero exit status. Detached, corrupt, missing,
+or conflicting state fails closed. The guard does not install hooks and does
+not prevent direct filesystem writes outside GitPaw.
+
+## Repository state and concurrency
+
+The authoritative registry is stored in the repository-common Git directory at
+`.git/git-paw/session-registry.json`; linked worktrees therefore share one
+registry. It records the schema version, repository identity, immutable session
+ID, canonical worktree and branch identities, lifecycle state, and timestamps.
+
+Ownership-changing writes use an exclusive repository-local lock and a synced
+temporary file followed by atomic replacement. Concurrent creation cannot
+silently duplicate an active worktree or branch. Lock recovery is conservative:
+an owner that cannot be proven dead is never stolen, so ambiguous recovery
+fails closed.
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+```bash
+pnpm install --frozen-lockfile
+pnpm run verify
+```
 
-## License
-
-MIT — see [LICENSE](LICENSE).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [LICENSE](LICENSE).

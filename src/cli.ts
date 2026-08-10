@@ -25,6 +25,7 @@ const HELP_TEXT = [
   "  session list         List repository sessions",
   "  session close        Close the current or selected session",
   "  status               Show GitPaw session status",
+  "  guard [--session id] Authorize the current worktree for mutation",
   "  gc                   Detect or clean eligible stale sessions",
   "  doctor               Check local GitPaw prerequisites",
   "  --help               Show this help",
@@ -42,7 +43,17 @@ const HELP_TEXT = [
 
 const HELP_DATA: JsonObject = {
   usage: `Usage: ${CLI_NAME} <command> [options]`,
-  commands: ["session create", "session id", "session show", "session list", "session close", "status", "gc", "doctor"],
+  commands: [
+    "session create",
+    "session id",
+    "session show",
+    "session list",
+    "session close",
+    "status",
+    "guard",
+    "gc",
+    "doctor",
+  ],
   options: ["--json", "--help", "--version"],
   session_options: ["--branch", "--worktree", "--base", "--label", "--session"],
   gc_options: ["--apply", "--dry-run"],
@@ -230,6 +241,32 @@ async function executeCommand(
     if (!parsed.ok) return parsed;
     const result = await dependencies.backend.status(context);
     return result.ok ? { ok: true, value: result.value } : result;
+  }
+
+  if (command === "guard") {
+    const parsed = parseOptions(
+      [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
+      new Set(["--session"]),
+    );
+    if (!parsed.ok) return parsed;
+    const result = await dependencies.backend.guard(context, { session_id: parsed.value.session_id });
+    if (!result.ok) return result;
+    if (result.value.allowed) return { ok: true, value: result.value as unknown as JsonObject };
+
+    const code = result.value.code === "ALLOWED" ? "OPERATION_REJECTED" : result.value.code;
+    return failure(
+      new DomainError(code, `Guard denied the current worktree: ${code}.`, {
+        allowed: false,
+        repository: result.value.repository,
+        worktree: result.value.worktree,
+        branch: result.value.branch,
+        session_id: result.value.session_id,
+        owner_session_id: result.value.owner_session_id,
+        requested_session_id: result.value.requested_session_id,
+        state: result.value.state,
+        details: result.value.details,
+      }),
+    );
   }
 
   if (command === "gc") {

@@ -47,7 +47,11 @@ export interface LockLease {
 const DEFAULT_STALE_AFTER_MS = 5_000;
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 10_000;
 const DEFAULT_RETRY_DELAY_MS = 10;
-const DEFAULT_METADATA_GRACE_MS = 100;
+// Lock-directory creation and owner metadata publication are separate
+// filesystem operations. Give a contending process enough time to observe
+// the atomic owner-file rename under a loaded CI or local filesystem before
+// treating an otherwise young lock as invalid.
+const DEFAULT_METADATA_GRACE_MS = 1_000;
 
 interface LockOptionsResolved {
   lockPath: string;
