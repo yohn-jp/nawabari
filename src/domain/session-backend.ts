@@ -3,7 +3,7 @@ import {
   type SessionRecord as RegistrySessionRecord,
   type SessionRegistryOptions,
 } from "../session-registry.js";
-import { isSessionRegistryError, type SessionRegistryError } from "../errors.js";
+import { isSessionRegistryError, type RegistryErrorCode, type SessionRegistryError } from "../errors.js";
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import {
   type BackendCapabilities,
@@ -30,6 +30,32 @@ export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
   lifecycle: false,
   garbage_collection: false,
   current_session_resolution: true,
+});
+
+const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = Object.freeze({
+  GIT_COMMAND_FAILED: "GIT_OPERATION_FAILED",
+  NOT_A_GIT_REPOSITORY: "NOT_GIT_REPOSITORY",
+  REPOSITORY_IDENTITY_AMBIGUOUS: "NOT_GIT_REPOSITORY",
+  WORKTREE_IDENTITY_AMBIGUOUS: "INVALID_WORKTREE",
+  INVALID_SESSION_ID: "INVALID_SESSION_ID",
+  INVALID_SESSION_RECORD: "INVALID_REGISTRY",
+  INVALID_BRANCH_ID: "INVALID_BRANCH",
+  INVALID_WORKTREE_PATH: "INVALID_WORKTREE",
+  INVALID_BASE_REF: "INVALID_BASE_REF",
+  REGISTRY_CORRUPT: "REGISTRY_CORRUPT",
+  UNSUPPORTED_SCHEMA_VERSION: "REGISTRY_CORRUPT",
+  REGISTRY_REPOSITORY_MISMATCH: "INVALID_REGISTRY",
+  DUPLICATE_SESSION_ID: "OPERATION_REJECTED",
+  DUPLICATE_WORKTREE_OWNERSHIP: "WORKTREE_OWNED_BY_OTHER_SESSION",
+  DUPLICATE_BRANCH_OWNERSHIP: "BRANCH_OWNED_BY_OTHER_SESSION",
+  WORKTREE_ALREADY_EXISTS: "WORKTREE_ALREADY_EXISTS",
+  BRANCH_ALREADY_EXISTS: "BRANCH_ALREADY_EXISTS",
+  PROTECTED_WORKTREE: "PROTECTED_WORKTREE",
+  PROTECTED_BRANCH: "PROTECTED_BRANCH",
+  SESSION_ID_COLLISION: "OPERATION_REJECTED",
+  SESSION_NOT_FOUND: "SESSION_NOT_FOUND",
+  REGISTRY_LOCK_TIMEOUT: "LOCK_CONTENTION",
+  REGISTRY_IO_FAILURE: "REGISTRY_UNREADABLE",
 });
 
 /** SessionBackend implementation backed only by the local Git repository. */
@@ -156,7 +182,14 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
 
 function toDomainError(error: unknown, fallbackCode?: ErrorCode): DomainError {
   if (!isSessionRegistryError(error)) {
-    return new DomainError("INTERNAL_ERROR", "An unexpected local session operation error occurred.");
+    const cause = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    return new DomainError(
+      "INTERNAL_ERROR",
+      "An unexpected local session operation error occurred.",
+      { cause },
+      undefined,
+      error,
+    );
   }
 
   const details: JsonObject = { ...error.details };
@@ -166,42 +199,5 @@ function toDomainError(error: unknown, fallbackCode?: ErrorCode): DomainError {
 
 function domainErrorCode(error: SessionRegistryError, fallbackCode?: ErrorCode): ErrorCode {
   if (error.code === "SESSION_NOT_FOUND" && fallbackCode !== undefined) return fallbackCode;
-  switch (error.code) {
-    case "GIT_COMMAND_FAILED":
-      return "GIT_OPERATION_FAILED";
-    case "INVALID_BRANCH_ID":
-      return "INVALID_BRANCH";
-    case "INVALID_BASE_REF":
-      return "INVALID_BASE_REF";
-    case "INVALID_WORKTREE_PATH":
-    case "WORKTREE_IDENTITY_AMBIGUOUS":
-      return "INVALID_WORKTREE";
-    case "DUPLICATE_BRANCH_OWNERSHIP":
-      return "BRANCH_OWNED_BY_OTHER_SESSION";
-    case "DUPLICATE_WORKTREE_OWNERSHIP":
-      return "WORKTREE_OWNED_BY_OTHER_SESSION";
-    case "BRANCH_ALREADY_EXISTS":
-      return "BRANCH_ALREADY_EXISTS";
-    case "WORKTREE_ALREADY_EXISTS":
-      return "WORKTREE_ALREADY_EXISTS";
-    case "PROTECTED_BRANCH":
-      return "PROTECTED_BRANCH";
-    case "PROTECTED_WORKTREE":
-      return "PROTECTED_WORKTREE";
-    case "NOT_A_GIT_REPOSITORY":
-      return "NOT_GIT_REPOSITORY";
-    case "REGISTRY_CORRUPT":
-    case "UNSUPPORTED_SCHEMA_VERSION":
-      return "REGISTRY_CORRUPT";
-    case "REGISTRY_IO_FAILURE":
-      return "REGISTRY_UNREADABLE";
-    case "REGISTRY_LOCK_TIMEOUT":
-      return "LOCK_CONTENTION";
-    case "INVALID_SESSION_ID":
-      return "INVALID_SESSION_ID";
-    case "SESSION_NOT_FOUND":
-      return "SESSION_NOT_FOUND";
-    default:
-      return "OPERATION_REJECTED";
-  }
+  return REGISTRY_ERROR_CODE_MAP[error.code];
 }

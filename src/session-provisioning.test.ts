@@ -101,13 +101,35 @@ test("provision rejects protected, invalid, and already-owned resources determin
   }
 });
 
+test("provision rejects a dangling worktree path symlink before invoking Git", () => {
+  const fixture = createRepositoryFixture();
+  const danglingPath = `${fixture.repositoryPath}-dangling-worktree`;
+  try {
+    fs.symlinkSync(`${danglingPath}-missing`, danglingPath, "dir");
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+
+    assertRegistryError(
+      () => registry.provision({ worktreePath: danglingPath, branchName: "feature/dangling-path" }),
+      "INVALID_WORKTREE_PATH",
+    );
+  } finally {
+    fs.unlinkSync(danglingPath);
+    fixture.cleanup();
+  }
+});
+
 test("a Git provisioning failure leaves no active registry ownership or worktree", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), "git-paw-provisioned-failure");
+  const branchName = "feature/injected-failure";
   try {
     const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
+    runGit(["branch", branchName], fixture.repositoryPath);
     const failingGit: GitCommandRunner = {
       run(args, cwd): string {
+        if (args[0] === "show-ref" && args[1] === "--verify") {
+          throw new SessionRegistryError("GIT_COMMAND_FAILED", "injected missing branch", { cwd });
+        }
         if (args[0] === "worktree" && args[1] === "add") {
           throw new SessionRegistryError("GIT_COMMAND_FAILED", "injected worktree failure", {
             command: args.join(" "),
@@ -119,18 +141,16 @@ test("a Git provisioning failure leaves no active registry ownership or worktree
     };
     const registry = new SessionRegistry({ repository, git: failingGit });
 
-    assertRegistryError(
-      () => registry.provision({ worktreePath, branchName: "feature/injected-failure" }),
-      "GIT_COMMAND_FAILED",
-    );
+    assertRegistryError(() => registry.provision({ worktreePath, branchName }), "GIT_COMMAND_FAILED");
     assert.equal(fs.existsSync(worktreePath), false);
     assert.deepEqual(registry.list(), []);
     assert.equal(
-      runGitQuiet(["show-ref", "--verify", "--quiet", "refs/heads/feature/injected-failure"], fixture.repositoryPath),
-      false,
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], fixture.repositoryPath),
+      true,
     );
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
     fixture.cleanup();
   }
 });
