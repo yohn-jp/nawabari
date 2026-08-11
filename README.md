@@ -107,10 +107,11 @@ decision=$(git nawabari guard --session "$NAWABARI_SESSION_ID" --json) || {
 
 An allowed decision has `allowed: true` and `code: "ALLOWED"`. A denied
 decision has `allowed: false`, a stable code such as
-`WORKTREE_OWNED_BY_OTHER_SESSION`, `PROTECTED_WORKTREE`, or
-`OWNERSHIP_MISMATCH`, and a non-zero exit status. Detached, corrupt, missing,
-or conflicting state fails closed. The guard does not install hooks and does
-not prevent direct filesystem writes outside Nawabari.
+`WORKTREE_OWNED_BY_OTHER_SESSION`, `PROTECTED_WORKTREE`, `DETACHED_HEAD`,
+`WORKTREE_MISMATCH`, or `OWNERSHIP_MISMATCH`, and a non-zero exit status.
+Detached, corrupt, missing, or conflicting state fails closed. The guard does
+not install hooks and does not prevent direct filesystem writes outside
+Nawabari.
 
 ## Orchestrator integration
 
@@ -131,6 +132,27 @@ git nawabari session close --session "$session_id" --json
 The orchestrator owns scheduling, prompts, and worker lifetime; Nawabari owns
 only local session identity, worktree/branch ownership, and safe cleanup. No
 Mottainai, GitHub, `gh`, network, or agent-runtime dependency is required.
+
+## Physical execution context
+
+Nawabari treats Git and the canonical filesystem as the authority for every
+governed session context. It independently observes the repository common
+directory, worktree path, current branch, and current `HEAD`, then compares
+those observations with the session registry. Caller-supplied paths and branch
+labels are expectations only; they are never used to replace an observation
+Git can make.
+
+The shared verifier fails closed with stable registry reasons for detached
+`HEAD`, missing or prunable worktrees, repository/worktree/branch mismatches,
+stale or conflicting registry ownership, ambiguous Git state, and unavailable
+physical observations. Git process failures remain distinct and bounded:
+spawn failure, timeout, output-limit, and non-zero/unexpected exit.
+
+Provisioning canonicalizes the managed root and every existing path segment
+before invoking Git. Traversal, symlink/intermediate-segment escapes, existing
+worktree paths, and existing local branches are rejected deterministically;
+the repository lock serializes Nawabari provisioning and Git's own ref checks
+remain the final collision authority.
 
 ## Repository state and concurrency
 

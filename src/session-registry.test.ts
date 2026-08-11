@@ -51,17 +51,19 @@ test("round-trips session metadata through common Git state", () => {
 
 test("keeps human labels separate from session identity", () => {
   const fixture = createRepositoryFixture();
-  const thirdWorktreePath = makeDirectory("nawabari-label-worktree-");
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const first = registry.create({ label: "worker" });
-    const second = registry.create({ worktreePath: thirdWorktreePath, branchName: "feature/second", label: "worker" });
+    const second = registry.create({
+      worktreePath: fixture.linkedWorktreePath,
+      branchName: "feature/linked",
+      label: "worker",
+    });
 
     assert.notEqual(first.sessionId, second.sessionId);
     assert.equal(first.label, second.label);
     assert.equal(registry.list().length, 2);
   } finally {
-    fs.rmSync(thirdWorktreePath, { recursive: true, force: true });
     fixture.cleanup();
   }
 });
@@ -104,16 +106,19 @@ test("rejects an empty label through register before writing unreadable registry
 
 test("rejects duplicate worktree, branch, and session ownership", () => {
   const fixture = createRepositoryFixture();
-  const thirdWorktreePath = makeDirectory("nawabari-duplicate-worktree-");
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const first = registry.create({ label: "first" });
 
-    assertRegistryError(() => registry.create({ branchName: "feature/other" }), "DUPLICATE_WORKTREE_OWNERSHIP");
-    const second = registry.create({ worktreePath: thirdWorktreePath, branchName: "feature/second" });
+    assertRegistryError(() => registry.create({ branchName: "feature/other" }), "BRANCH_MISMATCH");
+    const second = registry.create({ worktreePath: fixture.linkedWorktreePath, branchName: "feature/linked" });
     assertRegistryError(
-      () => registry.create({ worktreePath: fixture.linkedWorktreePath, branchName: second.branchName }),
-      "DUPLICATE_BRANCH_OWNERSHIP",
+      () => registry.create({ worktreePath: fixture.linkedWorktreePath, branchName: "feature/other" }),
+      "BRANCH_MISMATCH",
+    );
+    assertRegistryError(
+      () => registry.create({ worktreePath: fixture.linkedWorktreePath, branchName: "feature/linked" }),
+      "DUPLICATE_WORKTREE_OWNERSHIP",
     );
 
     const duplicateIdRegistry = new SessionRegistry({
@@ -121,11 +126,10 @@ test("rejects duplicate worktree, branch, and session ownership", () => {
       idGenerator: () => first.sessionId,
     });
     assertRegistryError(
-      () => duplicateIdRegistry.create({ worktreePath: thirdWorktreePath, branchName: "feature/third" }),
+      () => duplicateIdRegistry.create({ worktreePath: fixture.repositoryPath, branchName: "main" }),
       "SESSION_ID_COLLISION",
     );
   } finally {
-    fs.rmSync(thirdWorktreePath, { recursive: true, force: true });
     fixture.cleanup();
   }
 });
@@ -274,8 +278,13 @@ test("shares the repository lock format with the generic mutation boundary", asy
 
 test("serializes concurrent creates without losing updates or duplicating ownership", { timeout: 30_000 }, async () => {
   const fixture = createRepositoryFixture();
-  const worktreePaths = Array.from({ length: 8 }, () => makeDirectory("nawabari-concurrent-worktree-"));
+  const worktreePaths = Array.from({ length: 8 }, (_, index) =>
+    path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-concurrent-${index}`),
+  );
   try {
+    for (const [index, worktreePath] of worktreePaths.entries()) {
+      runGit(["worktree", "add", "-b", `feature/concurrent-${index}`, worktreePath], fixture.repositoryPath);
+    }
     const workerPath = fileURLToPath(new URL("../scripts/session-registry-worker.mjs", import.meta.url));
     const results = await Promise.all(
       worktreePaths.map((worktreePath, index) =>
@@ -291,6 +300,11 @@ test("serializes concurrent creates without losing updates or duplicating owners
     assert.equal(new Set(records.map((record) => record.branchId)).size, records.length);
   } finally {
     for (const worktreePath of worktreePaths) {
+      try {
+        runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
+      } catch {
+        // The directory cleanup below is sufficient if creation failed.
+      }
       fs.rmSync(worktreePath, { recursive: true, force: true });
     }
     fixture.cleanup();

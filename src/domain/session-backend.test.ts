@@ -228,7 +228,7 @@ test("the local backend preserves unexpected error diagnostics", async () => {
     });
     const result = await backend.createSession(
       { cwd: repositoryPath },
-      { branch: "feature/unexpected", worktree: `${repositoryPath}-unexpected`, label: null, base: null },
+      { branch: "main", worktree: repositoryPath, label: null, base: null },
     );
 
     assert.equal(result.ok, false);

@@ -6,7 +6,15 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
-import { listGitWorktrees, normalizeBranchId, resolveRepositoryContext, resolveWorktreeIdentity } from "./git.js";
+import {
+  createGitCommandRunner,
+  defaultGit,
+  listGitWorktrees,
+  normalizeBranchId,
+  resolveRepositoryContext,
+  resolveWorktreeIdentity,
+  verifyPhysicalExecutionContext,
+} from "./git.js";
 
 test("resolves the same repository identity from linked worktrees", () => {
   const fixture = createRepositoryFixture();
@@ -52,9 +60,131 @@ test("rejects a detached worktree as an ambiguous branch identity", () => {
   }
 });
 
+test("verifies repository, worktree, branch, and HEAD from physical Git state", () => {
+  const fixture = createRepositoryFixture();
+  const other = createRepositoryFixture();
+  const detachedPath = path.join(
+    path.dirname(fixture.repositoryPath),
+    `${path.basename(fixture.repositoryPath)}-verify-detached`,
+  );
+  try {
+    const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
+    const verified = verifyPhysicalExecutionContext({ cwd: fixture.linkedWorktreePath });
+    assert.equal(verified.repositoryId, repository.repositoryId);
+    assert.equal(verified.worktreePath, fs.realpathSync.native(fixture.linkedWorktreePath));
+    assert.equal(verified.branchName, "feature/linked");
+    assert.equal(verified.headId, runGit(["rev-parse", "HEAD"], fixture.linkedWorktreePath));
+
+    assert.throws(
+      () => verifyPhysicalExecutionContext({ cwd: other.repositoryPath, repository }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REPOSITORY_MISMATCH",
+    );
+    assert.throws(
+      () =>
+        verifyPhysicalExecutionContext({
+          cwd: fixture.linkedWorktreePath,
+          expectedWorktreePath: fixture.repositoryPath,
+        }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "WORKTREE_MISMATCH",
+    );
+    assert.throws(
+      () => verifyPhysicalExecutionContext({ cwd: fixture.linkedWorktreePath, branchName: "main" }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "BRANCH_MISMATCH",
+    );
+
+    runGit(["worktree", "add", "--detach", detachedPath, "HEAD"], fixture.repositoryPath);
+    assert.throws(
+      () => verifyPhysicalExecutionContext({ cwd: detachedPath }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "DETACHED_HEAD",
+    );
+    assert.throws(
+      () => verifyPhysicalExecutionContext({ repository, worktreePath: `${fixture.repositoryPath}-missing` }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "MISSING_WORKTREE",
+    );
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", detachedPath], fixture.repositoryPath);
+    } catch {
+      // Cleanup below is sufficient if the temporary worktree was already removed.
+    }
+    fs.rmSync(detachedPath, { recursive: true, force: true });
+    fixture.cleanup();
+    other.cleanup();
+  }
+});
+
+test("keeps bounded Git subprocess failures distinct", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-process-"));
+  try {
+    assert.throws(
+      () => createGitCommandRunner({ executable: path.join(directory, "missing-git") }).run([], directory),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "GIT_SPAWN_FAILED",
+    );
+    assert.throws(
+      () =>
+        createGitCommandRunner({ executable: process.execPath, timeoutMs: 250 }).run(
+          ["-e", "setTimeout(() => {}, 2_000)"],
+          directory,
+        ),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "GIT_TIMEOUT",
+    );
+    assert.throws(
+      () =>
+        createGitCommandRunner({ executable: process.execPath, maxOutputBytes: 16 }).run(
+          ["-e", "process.stdout.write('x'.repeat(10_000))"],
+          directory,
+        ),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "GIT_OUTPUT_LIMIT",
+    );
+    assert.throws(
+      () => createGitCommandRunner({ executable: process.execPath }).run(["-e", "process.exit(7)"], directory),
+      (error: unknown) =>
+        error instanceof SessionRegistryError && error.code === "GIT_COMMAND_FAILED" && error.details.exitCode === 7,
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("does not collapse unexpected Git exits or unavailable observations", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const unexpectedExitGit = {
+      run(args: readonly string[], cwd: string): string {
+        if (args[0] === "rev-parse" && args[1] === "--git-common-dir") {
+          throw new SessionRegistryError("GIT_COMMAND_FAILED", "injected unexpected exit", { exitCode: 7 });
+        }
+        return defaultGit.run(args, cwd);
+      },
+    };
+    assert.throws(
+      () => resolveRepositoryContext({ cwd: fixture.repositoryPath, git: unexpectedExitGit }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError && error.code === "GIT_COMMAND_FAILED" && error.details.exitCode === 7,
+    );
+
+    const unavailableGit = {
+      run(args: readonly string[], cwd: string): string {
+        if (args[0] === "worktree" && args[1] === "list") throw new Error("injected physical observation failure");
+        return defaultGit.run(args, cwd);
+      },
+    };
+    assert.throws(
+      () => verifyPhysicalExecutionContext({ cwd: fixture.repositoryPath, git: unavailableGit }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "PHYSICAL_OBSERVATION_UNAVAILABLE",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("rejects a lock-suffixed component in a branch identity", () => {
   assert.throws(
     () => normalizeBranchId("feature/locked.lock/name"),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "INVALID_BRANCH_ID",
+  );
+  assert.throws(
+    () => normalizeBranchId("feature/ends-at@"),
     (error: unknown) => error instanceof SessionRegistryError && error.code === "INVALID_BRANCH_ID",
   );
 });

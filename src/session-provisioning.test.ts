@@ -92,10 +92,21 @@ test("provision rejects protected, invalid, and already-owned resources determin
       () => registry.provision({ worktreePath: existingBranchPath, branchName: "feature/external-branch" }),
       "BRANCH_ALREADY_EXISTS",
     );
+
+    runGit(["branch", "feature/ref-namespace"], fixture.repositoryPath);
+    assertRegistryError(
+      () =>
+        registry.provision({
+          worktreePath: path.join(path.dirname(firstPath), "nawabari-ref-namespace"),
+          branchName: "feature/ref-namespace/child",
+        }),
+      "BRANCH_ALREADY_EXISTS",
+    );
   } finally {
     removeWorktree(fixture.repositoryPath, firstPath);
     removeWorktree(fixture.repositoryPath, existingBranchPath);
     runGitQuiet(["branch", "-D", "feature/external-branch"], fixture.repositoryPath);
+    runGitQuiet(["branch", "-D", "feature/ref-namespace"], fixture.repositoryPath);
     fs.rmSync(externalPath, { recursive: true, force: true });
     fixture.cleanup();
   }
@@ -131,6 +142,42 @@ test("provision rejects a symlink to an existing directory before resolving its 
     );
   } finally {
     fs.unlinkSync(symlinkPath);
+    fixture.cleanup();
+  }
+});
+
+test("provision rejects managed-root traversal and intermediate symlink escapes", () => {
+  const fixture = createRepositoryFixture();
+  const managedRoot = path.join(fixture.repositoryPath, "managed-worktrees");
+  const outsideRoot = path.join(path.dirname(fixture.repositoryPath), "nawabari-managed-outside");
+  try {
+    fs.mkdirSync(managedRoot);
+    fs.mkdirSync(outsideRoot);
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, worktreeRoot: managedRoot });
+
+    assertRegistryError(
+      () =>
+        registry.provision({ worktreePath: path.join(managedRoot, "..", "escaped"), branchName: "feature/escaped" }),
+      "INVALID_WORKTREE_PATH",
+    );
+
+    const redirect = path.join(managedRoot, "redirect");
+    fs.symlinkSync(outsideRoot, redirect, "dir");
+    assertRegistryError(
+      () => registry.provision({ worktreePath: path.join(redirect, "nested"), branchName: "feature/redirect" }),
+      "INVALID_WORKTREE_PATH",
+    );
+
+    const rootLink = `${managedRoot}-link`;
+    fs.symlinkSync(outsideRoot, rootLink, "dir");
+    assertRegistryError(
+      () => new SessionRegistry({ cwd: fixture.repositoryPath, worktreeRoot: rootLink }),
+      "INVALID_WORKTREE_PATH",
+    );
+    fs.unlinkSync(rootLink);
+  } finally {
+    fs.rmSync(outsideRoot, { recursive: true, force: true });
+    fs.rmSync(managedRoot, { recursive: true, force: true });
     fixture.cleanup();
   }
 });

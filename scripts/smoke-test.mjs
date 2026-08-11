@@ -384,7 +384,7 @@ async function main() {
     });
     const detachedGuard = invokeInstalled(["guard", "--json"], detachedWorktree);
     const detachedGuardJson = parseInstalledJson(detachedGuard, "detached guard");
-    if (detachedGuard.status !== 3 || detachedGuardJson.code !== "INVALID_WORKTREE") {
+    if (detachedGuard.status !== 3 || detachedGuardJson.code !== "DETACHED_HEAD") {
       fail("guard did not fail closed for a detached worktree");
     }
     run("git", ["worktree", "remove", "--force", detachedWorktree], {
