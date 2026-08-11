@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { writeJsonAtomically } from "./atomic.js";
+import { writeJsonAtomically, writeJsonAtomicallySync } from "./atomic.js";
 import { RegistryError } from "./errors.js";
 import { LOCK_SCHEMA_VERSION, type LockOwnerRecord } from "./types.js";
 
@@ -39,6 +39,8 @@ export interface RepositoryLockOptions {
   clock?: () => number;
   /** Test seam used to exercise the reclaim/create race deterministically. */
   beforeReclaimRemove?: () => void | Promise<void>;
+  /** Test seam used to confirm a contender observed an active reclaim marker. */
+  onReclaimMarkerObserved?: () => void;
 }
 
 export interface LockLease {
@@ -72,6 +74,7 @@ interface LockOptionsResolved {
   processStartTime: string | null | undefined;
   clock: () => number;
   beforeReclaimRemove?: () => void | Promise<void>;
+  onReclaimMarkerObserved?: () => void;
 }
 
 type LockInspection = { kind: "wait"; owner?: LockOwnerRecord } | { kind: "stale"; owner: LockOwnerRecord };
@@ -212,21 +215,24 @@ export async function readProcessStartTime(pid: number): Promise<string | null> 
   }
 
   try {
-    const raw = await readFile(`/proc/${pid}/stat`, "utf8");
-    const commandEnd = raw.lastIndexOf(")");
-    if (commandEnd === -1) {
-      return null;
-    }
-
-    const fields = raw
-      .slice(commandEnd + 1)
-      .trim()
-      .split(/\s+/);
-    const startTime = fields[19];
-    return startTime === undefined || startTime.length === 0 ? null : startTime;
+    return parseProcessStartTime(await readFile(`/proc/${pid}/stat`, "utf8"));
   } catch {
     return null;
   }
+}
+
+function parseProcessStartTime(raw: string): string | null {
+  const commandEnd = raw.lastIndexOf(")");
+  if (commandEnd === -1) {
+    return null;
+  }
+
+  const fields = raw
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/);
+  const startTime = fields[19];
+  return startTime === undefined || startTime.length === 0 ? null : startTime;
 }
 
 function readProcessStartTimeSync(pid: number): string | null {
@@ -235,18 +241,7 @@ function readProcessStartTimeSync(pid: number): string | null {
   }
 
   try {
-    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const commandEnd = raw.lastIndexOf(")");
-    if (commandEnd === -1) {
-      return null;
-    }
-
-    const fields = raw
-      .slice(commandEnd + 1)
-      .trim()
-      .split(/\s+/);
-    const startTime = fields[19];
-    return startTime === undefined || startTime.length === 0 ? null : startTime;
+    return parseProcessStartTime(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
   } catch {
     return null;
   }
@@ -370,6 +365,7 @@ export class RepositoryLock {
       processStartTime: options.processStartTime,
       clock: options.clock ?? Date.now,
       beforeReclaimRemove: options.beforeReclaimRemove,
+      onReclaimMarkerObserved: options.onReclaimMarkerObserved,
     };
     this.reclaimPath = `${this.options.lockPath}.reclaim`;
   }
@@ -447,6 +443,7 @@ export class RepositoryLock {
 
   private async tryCreate(): Promise<LockLease | undefined> {
     if (await this.reclaimMarkerExists()) {
+      this.options.onReclaimMarkerObserved?.();
       return undefined;
     }
 
@@ -464,7 +461,8 @@ export class RepositoryLock {
     // A reclaimer may have claimed the marker between the first check and
     // mkdir(). Never publish a new owner while that marker is active.
     if (await this.reclaimMarkerExists()) {
-      await rm(this.options.lockPath, { recursive: true, force: false });
+      this.options.onReclaimMarkerObserved?.();
+      await rm(this.options.lockPath, { recursive: true, force: true });
       return undefined;
     }
 
@@ -482,6 +480,7 @@ export class RepositoryLock {
 
   private tryCreateSync(): SyncLockLease | undefined {
     if (this.reclaimMarkerExistsSync()) {
+      this.options.onReclaimMarkerObserved?.();
       return undefined;
     }
 
@@ -496,18 +495,13 @@ export class RepositoryLock {
     }
 
     if (this.reclaimMarkerExistsSync()) {
-      fs.rmSync(this.options.lockPath, { recursive: true, force: false });
+      this.options.onReclaimMarkerObserved?.();
+      fs.rmSync(this.options.lockPath, { recursive: true, force: true });
       return undefined;
     }
 
     try {
-      const descriptor = fs.openSync(join(this.options.lockPath, "owner.json"), "wx", 0o600);
-      try {
-        fs.writeFileSync(descriptor, `${JSON.stringify(owner)}\n`, "utf8");
-        fs.fsyncSync(descriptor);
-      } finally {
-        fs.closeSync(descriptor);
-      }
+      writeJsonAtomicallySync(join(this.options.lockPath, "owner.json"), owner, { ensureParent: false });
     } catch (error) {
       this.removeCreatedLockSync(owner.token);
       throw asLockError(error, "LOCK_IO_ERROR", "Cannot initialize repository registry lock", this.options.lockPath);
@@ -730,13 +724,7 @@ export class RepositoryLock {
 
     const reclaimer = createOwnerSync(this.options, this.options.clock());
     try {
-      const descriptor = fs.openSync(join(this.reclaimPath, "owner.json"), "wx", 0o600);
-      try {
-        fs.writeFileSync(descriptor, `${JSON.stringify(reclaimer)}\n`, "utf8");
-        fs.fsyncSync(descriptor);
-      } finally {
-        fs.closeSync(descriptor);
-      }
+      writeJsonAtomicallySync(join(this.reclaimPath, "owner.json"), reclaimer, { ensureParent: false });
 
       const currentOwner = readOwnerSync(this.options.lockPath);
       if (currentOwner === undefined || currentOwner.token !== owner.token) {
@@ -844,7 +832,7 @@ export class RepositoryLock {
 
   private async removeCreatedLock(token: string): Promise<void> {
     const owner = await readOwner(this.options.lockPath);
-    if (owner?.token !== token) {
+    if (owner !== undefined && owner.token !== token) {
       return;
     }
     await rm(this.options.lockPath, { recursive: true, force: true });
@@ -852,7 +840,7 @@ export class RepositoryLock {
 
   private removeCreatedLockSync(token: string): void {
     const owner = readOwnerSync(this.options.lockPath);
-    if (owner?.token !== token) {
+    if (owner !== undefined && owner.token !== token) {
       return;
     }
     fs.rmSync(this.options.lockPath, { recursive: true, force: true });

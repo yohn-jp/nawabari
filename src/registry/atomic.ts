@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import { open, mkdir, rename, rm } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -50,6 +51,22 @@ async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
+function syncDirectorySync(directory: string): void {
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(directory, "r");
+    fs.fsyncSync(descriptor);
+  } catch (error) {
+    if (!isUnsupportedDirectorySync(error)) {
+      throw error;
+    }
+  } finally {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
 /**
  * Persist JSON by writing and syncing a same-directory temporary file, then
  * replacing the target with rename. Readers therefore observe either the
@@ -94,6 +111,48 @@ export async function writeJsonAtomically(
     }
     if (!renamed) {
       await rm(temporaryPath, { force: true });
+    }
+    throw error;
+  }
+}
+
+/** Synchronous counterpart used by the legacy synchronous registry boundary. */
+export function writeJsonAtomicallySync(
+  targetPath: string,
+  value: unknown,
+  options: Pick<AtomicWriteOptions, "ensureParent"> = {},
+): void {
+  const directory = dirname(targetPath);
+  if (options.ensureParent !== false) {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  }
+
+  const temporaryPath = join(directory, `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
+  const serialized = JSON.stringify(value, null, 2);
+  if (serialized === undefined) {
+    throw new RegistryError("REGISTRY_IO_ERROR", "Cannot serialize registry state", {
+      targetPath,
+    });
+  }
+
+  let descriptor: number | undefined;
+  let renamed = false;
+  try {
+    descriptor = fs.openSync(temporaryPath, "wx", 0o600);
+    fs.writeFileSync(descriptor, `${serialized}\n`, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+
+    fs.renameSync(temporaryPath, targetPath);
+    renamed = true;
+    syncDirectorySync(directory);
+  } catch (error) {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+    }
+    if (!renamed) {
+      fs.rmSync(temporaryPath, { force: true });
     }
     throw error;
   }

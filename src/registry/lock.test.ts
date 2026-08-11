@@ -103,12 +103,17 @@ test("a parallel reclaimer cannot remove a lock acquired after the final token c
       "utf8",
     );
 
+    let resolveContenderMarkerObserved: (() => void) | undefined;
+    const contenderMarkerObserved = new Promise<void>((resolve) => {
+      resolveContenderMarkerObserved = resolve;
+    });
     const contender = new RepositoryLock({
       lockPath,
       staleAfterMs: 0,
       metadataGraceMs: 100,
       acquireTimeoutMs: 2_000,
       retryDelayMs: 1,
+      onReclaimMarkerObserved: () => resolveContenderMarkerObserved?.(),
     });
     let contenderPromise: Promise<import("./lock.js").LockLease> | undefined;
     let contenderSurvived = false;
@@ -123,7 +128,6 @@ test("a parallel reclaimer cannot remove a lock acquired after the final token c
         // final token check. A correct contender must honor the reclaim marker.
         await rm(lockPath, { recursive: true, force: true });
         contenderPromise = contender.acquire().then(async (lease) => {
-          await new Promise<void>((resolve) => setTimeout(resolve, 50));
           try {
             contenderSurvived = (await readFile(join(lockPath, "owner.json"), "utf8")).includes(lease.token);
           } catch {
@@ -132,7 +136,7 @@ test("a parallel reclaimer cannot remove a lock acquired after the final token c
           await lease.release();
           return lease;
         });
-        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        await contenderMarkerObserved;
       },
     });
 
