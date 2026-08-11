@@ -116,6 +116,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "guard",
       "gc",
       "doctor",
+      "capabilities",
     ],
     options: ["--json", "--help", "--version"],
     session_options: [
@@ -219,6 +220,59 @@ test("session id resolves from the current worktree without an explicit id", asy
     ok: true,
     command: "session id",
     session_id: sampleSession.session_id,
+  });
+});
+
+test("capabilities discovery is available outside a Git repository and exposes the standalone contract", async () => {
+  const output = capture();
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-capabilities-"));
+  try {
+    const exitCode = await runCli(["capabilities", "--json"], {
+      cwd: directory,
+      io: output.io,
+      version: "test-version",
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(output.stderr.length, 0);
+    const response = JSON.parse(output.stdout[0] ?? "") as {
+      ok: boolean;
+      command: string;
+      contract_id: string;
+      package_version: string;
+      dependencies: { mottainai: boolean; github: boolean; gh: boolean; network: boolean };
+      capabilities: Array<{ id: string; commands: string[] }>;
+    };
+    assert.equal(response.ok, true);
+    assert.equal(response.command, "capabilities");
+    assert.equal(response.contract_id, "nawabari.standalone-execution.v1");
+    assert.equal(response.package_version, "test-version");
+    assert.deepEqual(response.dependencies, {
+      local_git: true,
+      network: false,
+      github: false,
+      gh: false,
+      mottainai: false,
+      llm: false,
+      agent_runtime: false,
+    });
+    assert.ok(response.capabilities.some((capability) => capability.commands.includes("commit")));
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("JSON version discovery includes the standalone contract identifier", async () => {
+  const output = capture();
+  const exitCode = await runCli(["--version", "--json"], { io: output.io, version: "test-version" });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(JSON.parse(output.stdout[0]), {
+    ok: true,
+    command: "version",
+    version: "test-version",
+    contract_id: "nawabari.standalone-execution.v1",
+    contract_schema_version: 1,
   });
 });
 

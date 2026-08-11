@@ -1,0 +1,174 @@
+import type { JsonObject } from "./domain/errors.js";
+
+/** Stable discovery identifier for the standalone local execution contract. */
+export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
+export const MACHINE_CONTRACT_SCHEMA_VERSION = 1 as const;
+
+const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
+  {
+    id: "session-lifecycle",
+    commands: ["session create", "session id", "session show", "session list", "status", "session close"],
+    result_schema: "session.v1",
+    identities: ["session_id", "repository", "worktree", "branch", "state"],
+    failure_codes: [
+      "NOT_GIT_REPOSITORY",
+      "PROTECTED_WORKTREE",
+      "PROTECTED_BRANCH",
+      "WORKTREE_ALREADY_EXISTS",
+      "BRANCH_ALREADY_EXISTS",
+      "WORKTREE_OWNED_BY_OTHER_SESSION",
+      "BRANCH_OWNED_BY_OTHER_SESSION",
+      "SESSION_NOT_FOUND",
+      "NO_CURRENT_SESSION",
+      "DIRTY_WORKTREE",
+      "RECOVERABLE_COMMITS",
+      "RECOVERABLE_STASHES",
+      "MISSING_WORKTREE",
+      "REGISTRY_CORRUPT",
+      "LOCK_CONTENTION",
+    ],
+  },
+  {
+    id: "resource-claims",
+    commands: ["session claim", "session update", "session claims", "session release"],
+    result_schema: "claim.v1",
+    identities: ["claim_id", "session_id", "repository", "worktree", "resource", "mode"],
+    failure_codes: [
+      "INVALID_CLAIM",
+      "INVALID_RESOURCE",
+      "INVALID_CLAIM_RESOURCE",
+      "CLAIM_PATH_TRAVERSAL",
+      "CLAIM_SYMLINK_ESCAPE",
+      "CLAIM_AMBIGUOUS_PATH",
+      "UNSUPPORTED_CLAIM_GLOB",
+      "CLAIM_REPOSITORY_MISMATCH",
+      "CLAIM_SESSION_MISMATCH",
+      "DUPLICATE_CLAIM",
+      "CONTRADICTORY_CLAIM",
+      "RESOURCE_CLAIM_CONFLICT",
+      "CLAIM_NOT_FOUND",
+      "SESSION_NOT_ACTIVE",
+      "LOCK_CONTENTION",
+    ],
+  },
+  {
+    id: "authorization-and-evidence",
+    commands: ["guard", "authorize", "checkpoint"],
+    result_schema: "decision.v1 / evidence.v1",
+    identities: ["operation", "allowed", "code", "claim_ids", "head", "in_claim", "out_of_claim"],
+    failure_codes: [
+      "INVALID_OPERATION",
+      "INVALID_RESOURCE",
+      "MISSING_RESOURCE_CLAIM",
+      "RESOURCE_CLAIM_CONFLICT",
+      "OWNERSHIP_MISMATCH",
+      "WORKTREE_MISMATCH",
+      "BRANCH_MISMATCH",
+      "DETACHED_HEAD",
+      "STALE_REGISTRY",
+      "GIT_STATE_AMBIGUOUS",
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+    ],
+  },
+  {
+    id: "governed-git-mutation",
+    commands: ["commit", "push"],
+    result_schema: "commit.v1 / push.v1",
+    identities: ["commit_sha", "remote", "branch", "target", "relation"],
+    failure_codes: [
+      "INVALID_COMMIT_MESSAGE",
+      "COMMIT_EMPTY_DIFF",
+      "UNEXPECTED_CHANGED_PATHS",
+      "COMMIT_STAGING_FAILED",
+      "COMMIT_FAILED",
+      "COMMIT_RESULT_UNAVAILABLE",
+      "INVALID_REMOTE",
+      "INVALID_REMOTE_BRANCH",
+      "PUSH_TARGET_MISMATCH",
+      "PUSH_REMOTE_INSPECTION_FAILED",
+      "PUSH_NO_UPSTREAM",
+      "PUSH_BEHIND",
+      "PUSH_DIVERGED",
+      "PUSH_DIRTY_WORKTREE",
+      "PUSH_FAILED",
+      "GIT_SPAWN_FAILED",
+      "GIT_TIMEOUT",
+      "GIT_OUTPUT_LIMIT",
+    ],
+  },
+  {
+    id: "reconciliation-and-cleanup",
+    commands: ["doctor", "gc"],
+    result_schema: "reconciliation.v1 / cleanup.v1",
+    identities: ["clean", "issues", "candidates", "cleaned", "blocked", "recovery_hints"],
+    failure_codes: [
+      "RECONCILIATION_DRIFT",
+      "MISSING_WORKTREE",
+      "OWNERSHIP_MISMATCH",
+      "DIRTY_WORKTREE",
+      "RECOVERABLE_COMMITS",
+      "RECOVERABLE_STASHES",
+      "NESTED_REPOSITORY",
+      "STALE_SESSION",
+      "REGISTRY_CORRUPT",
+      "LOCK_CONTENTION",
+    ],
+  },
+] as const);
+
+/**
+ * Return a JSON-safe description of the installed machine contract.
+ * Discovery intentionally has no repository or network precondition.
+ */
+export function machineContract(packageVersion: string): JsonObject {
+  return {
+    schema_version: MACHINE_CONTRACT_SCHEMA_VERSION,
+    contract_id: MACHINE_CONTRACT_ID,
+    capability_id: MACHINE_CONTRACT_ID,
+    package: "nawabari",
+    package_version: packageVersion,
+    capabilities: MACHINE_CONTRACT_CAPABILITIES.map((capability) => ({
+      id: capability.id,
+      commands: [...capability.commands],
+      result_schema: capability.result_schema,
+      identities: [...capability.identities],
+      failure_codes: [...capability.failure_codes],
+    })),
+    json: {
+      schema_version: 1,
+      success: {
+        required: ["ok", "command"],
+        ok: true,
+        exit_code: 0,
+      },
+      failure: {
+        required: ["ok", "command", "code", "message"],
+        ok: false,
+        exit_codes: {
+          usage: 2,
+          rejected: 3,
+          unavailable: 4,
+          doctor: 5,
+          internal: 70,
+        },
+        stderr: "empty",
+      },
+      one_document: true,
+      human_output_is_not_contract: true,
+    },
+    bounded_local_execution: {
+      git_timeout_ms: 10_000,
+      git_max_output_bytes: 65_536,
+      checkpoint_max_paths: 4_096,
+    },
+    dependencies: {
+      local_git: true,
+      network: false,
+      github: false,
+      gh: false,
+      mottainai: false,
+      llm: false,
+      agent_runtime: false,
+    },
+  };
+}
