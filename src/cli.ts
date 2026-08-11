@@ -12,6 +12,7 @@ import {
 } from "./domain/session.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
+import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -38,6 +39,7 @@ const HELP_TEXT = [
   "  guard [--session id] Authorize the current worktree or operation",
   "  gc                   Detect or clean eligible stale sessions",
   "  doctor               Check local Nawabari prerequisites",
+  "  capabilities         Describe the standalone CLI/JSON contract",
   "  --help               Show this help",
   "  --version            Print the installed version",
   "",
@@ -81,6 +83,7 @@ const HELP_DATA: JsonObject = {
     "guard",
     "gc",
     "doctor",
+    "capabilities",
   ],
   options: ["--json", "--help", "--version"],
   session_options: [
@@ -639,7 +642,11 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     return EXIT_CODES.success;
   }
   if (parsed.value.version) {
-    const payload: JsonObject = { version: dependencies.version ?? VERSION };
+    const payload: JsonObject = {
+      version: dependencies.version ?? VERSION,
+      contract_id: MACHINE_CONTRACT_ID,
+      contract_schema_version: MACHINE_CONTRACT_SCHEMA_VERSION,
+    };
     if (mode === "json") io.stdout(renderSuccess(mode, "version", payload));
     else io.stdout(String(payload.version));
     return EXIT_CODES.success;
@@ -648,6 +655,13 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     if (mode === "json") return emitFailure(mode, "cli", new DomainError("NO_COMMAND", "A command is required."), io);
     io.stdout(HELP_TEXT);
     return EXIT_CODES.usage;
+  }
+
+  if (parsed.value.commandArguments[0] === "capabilities") {
+    const capabilityOptions = noOptions(parsed.value.commandArguments.slice(1));
+    if (!capabilityOptions.ok) return emitFailure(mode, "capabilities", capabilityOptions.error, io);
+    io.stdout(renderSuccess(mode, "capabilities", machineContract(dependencies.version ?? VERSION)));
+    return EXIT_CODES.success;
   }
 
   const command = commandName(parsed.value.commandArguments);

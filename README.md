@@ -24,6 +24,56 @@ git nawabari --help
 nawabari --version
 ```
 
+## Standalone machine contract
+
+The installed CLI/JSON surface is the integration boundary. An orchestrator
+must discover the contract before using the lifecycle:
+
+```bash
+nawabari capabilities --json
+nawabari --version --json
+```
+
+Both discovery commands work without a Git repository. A compatible
+installation reports `contract_id: "nawabari.standalone-execution.v1"` and
+`schema_version: 1`. The capability response lists the exact commands,
+result-schema versions, identity fields, and stable `failure_codes`. The
+package version is release metadata; it is not a substitute for the
+machine-contract identifier.
+
+The supported standalone sequence is:
+
+```text
+session create -> session claim(s) -> authorize/checkpoint
+-> commit/push -> doctor (reconciliation) -> session close/gc
+```
+
+The JSON envelope is one document on stdout. Success has `ok: true`, a
+`command`, and the command's versioned result fields. Failure has `ok: false`,
+the `command`, a stable `code`, a bounded human-readable `message`, and
+optional structured `details`; JSON mode writes no decorative stderr. Exit
+codes are `0` success, `2` usage, `3` rejected/unsafe operation, `4`
+unavailable capability, `5` failed doctor checks, and `70` unexpected internal
+failure. Consumers must use these fields and codes, never human presentation.
+
+The result schemas expose the following identities:
+
+| Surface                | Versioned identities                                                             |
+| ---------------------- | -------------------------------------------------------------------------------- |
+| session lifecycle      | `session_id`, `repository`, `worktree`, `branch`, `state`                        |
+| claims                 | `claim_id`, `session_id`, `resource`, `mode`                                     |
+| authorization          | `operation`, `allowed`, `code`, `claim_ids`                                      |
+| checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim` |
+| commit/push            | `commit_sha`, `remote`, `branch`, `target`, `relation`                           |
+| reconciliation/cleanup | `clean`, `issues`, `candidates`, `cleaned`, `blocked`, `recovery_hints`          |
+
+Git subprocesses are bounded at 10 seconds and 64 KiB of output; checkpoint
+evidence is bounded to 4,096 paths. `GIT_SPAWN_FAILED`, `GIT_TIMEOUT`,
+`GIT_OUTPUT_LIMIT`, and `GIT_COMMAND_FAILED` remain distinct failure codes.
+The local lifecycle requires Git and the repository-local registry/lock only;
+it does not require Mottainai, GitHub, `gh`, network access, an LLM, or a
+coding-agent runtime.
+
 ## Session lifecycle
 
 Session IDs are generated automatically as UUIDv7 values. They are immutable
@@ -61,9 +111,6 @@ operation.
 `doctor` includes a non-destructive `reconciliation` check. It reports
 registry/Git ownership drift, including missing or prunable worktrees and
 unregistered physical worktrees, without repairing or deleting anything.
-Callers that use the TypeScript authority directly can request the same
-machine-readable result with `SessionRegistry#cleanupDecision` and
-`SessionRegistry#reconcile`.
 
 ## Session resource claims
 
@@ -143,6 +190,13 @@ git nawabari session close --session "$session_id" --json
 The orchestrator owns scheduling, prompts, and worker lifetime; Nawabari owns
 only local session identity, worktree/branch ownership, and safe cleanup. No
 Mottainai, GitHub, `gh`, network, or agent-runtime dependency is required.
+
+Mottainai is one optional caller of this contract, not a runtime dependency.
+It may retain task semantics, scheduling, validation policy, Issue/PR
+governance, and worker lifetime. It must pass concrete local declarations to
+Nawabari and retain the returned JSON identities. Nawabari does not import or
+execute Mottainai/GitHub workflow code, infer claims from task text, or create
+a second registry/database.
 
 ## Claim-aware operation authorization
 
@@ -240,6 +294,29 @@ the lock records a random token, PID, host, and process-start identity; an
 owner is reclaimed only when the same host proves that exact process identity
 is dead. Invalid, remote, or otherwise unverifiable lock metadata is never
 stolen and fails closed so an operator can inspect or remove it deliberately.
+
+### Conformance and extraction boundary
+
+The packed-package suite exercises the complete standalone sequence, including
+cross-process claim conflicts, governed commit/push, reconciliation, retryable
+cleanup, and prunable worktree recovery. Native tests additionally cover
+process interruption/atomic-write recovery, partial staging or commit failure,
+stale physical state, cleanup races, bounded subprocess failures, and
+idempotency (`src/registry/store.test.ts`, `src/git-mutation.test.ts`,
+`src/cleanup-authority.test.ts`, `src/session-lifecycle.test.ts`, and
+`scripts/smoke-test.mjs`).
+
+The relevant Mottainai #28 execution cases are mapped as follows:
+
+- repository/worktree identity, provisioning path safety, branch collision,
+  symlink escape, local staging/commit/push safety, cleanup revalidation, and
+  reconciliation are Nawabari-native authority and tests;
+- task semantics, prompts, validation evidence policy, Conventional Commit and
+  PR/Issue governance, GitHub operations, and agent hooks remain optional
+  orchestrator-only semantics and must not move into Nawabari.
+
+Run `pnpm run test:package` to validate the exact packed tarball and its
+installed CLI, or `pnpm run verify` for the complete local conformance gate.
 
 ## Development
 

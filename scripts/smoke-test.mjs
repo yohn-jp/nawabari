@@ -144,6 +144,60 @@ async function main() {
       fail("git nawabari --version did not match the installed package metadata");
     }
 
+    const capabilitiesResult = spawnSync(installedBinary, ["capabilities", "--json"], {
+      cwd: installDirectory,
+      env: gitEnvironment,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    if (capabilitiesResult.status !== 0) fail(`capabilities --json exited ${capabilitiesResult.status}`);
+    let capabilities;
+    try {
+      capabilities = JSON.parse(capabilitiesResult.stdout);
+    } catch {
+      fail("capabilities --json did not emit one valid JSON document");
+    }
+    if (capabilities.ok !== true || capabilities.contract_id !== "nawabari.standalone-execution.v1") {
+      fail("installed capabilities did not expose the standalone contract identifier");
+    }
+    if (
+      capabilities.dependencies?.mottainai !== false ||
+      capabilities.dependencies?.github !== false ||
+      capabilities.dependencies?.gh !== false ||
+      capabilities.dependencies?.network !== false
+    ) {
+      fail("installed capabilities exposed an unexpected external runtime dependency");
+    }
+    if (
+      !capabilities.capabilities?.some((capability) => capability.commands?.includes("commit")) ||
+      !capabilities.capabilities?.some((capability) => capability.commands?.includes("doctor"))
+    ) {
+      fail("installed capabilities did not enumerate the governed lifecycle");
+    }
+    if (capabilitiesResult.stderr.trim().length > 0) fail("capabilities --json wrote decorative output to stderr");
+
+    const versionJsonResult = spawnSync(installedBinary, ["--version", "--json"], {
+      cwd: installDirectory,
+      env: gitEnvironment,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    if (versionJsonResult.status !== 0) fail(`--version --json exited ${versionJsonResult.status}, expected 0`);
+    let versionJson;
+    try {
+      versionJson = JSON.parse(versionJsonResult.stdout);
+    } catch {
+      fail("--version --json did not emit one valid JSON document");
+    }
+    if (
+      versionJson.ok !== true ||
+      versionJson.contract_id !== "nawabari.standalone-execution.v1" ||
+      versionJson.contract_schema_version !== 1
+    ) {
+      fail("--version --json did not expose the standalone contract identifier and schema version");
+    }
+    if (versionJsonResult.stderr.trim().length > 0) fail("--version --json wrote decorative output to stderr");
+
     const jsonResult = spawnSync(path.join(binDirectory, "nawabari"), ["session", "id", "--json"], {
       cwd: installDirectory,
       encoding: "utf8",
@@ -175,6 +229,9 @@ async function main() {
     fs.writeFileSync(path.join(lifecycleRepository, "README.md"), "smoke fixture\n");
     run("git", ["add", "README.md"], { cwd: lifecycleRepository, env: gitEnvironment });
     run("git", ["commit", "-m", "initial"], { cwd: lifecycleRepository, env: gitEnvironment });
+    const remoteRepository = path.join(installDirectory, "lifecycle-remote.git");
+    run("git", ["init", "--bare", remoteRepository], { env: gitEnvironment });
+    run("git", ["remote", "add", "origin", remoteRepository], { cwd: lifecycleRepository, env: gitEnvironment });
 
     const invokeInstalled = (args, cwd) => {
       const result = spawnSync(installedBinary, args, {
@@ -195,6 +252,14 @@ async function main() {
         });
         let stdout = "";
         let stderr = "";
+        let settled = false;
+        const timeout = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            child.kill();
+            reject(new Error(`${args.join(" ")} timed out after 10000ms`));
+          }
+        }, 10_000);
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
         child.stdout.on("data", (chunk) => {
@@ -203,8 +268,20 @@ async function main() {
         child.stderr.on("data", (chunk) => {
           stderr += chunk;
         });
-        child.once("error", reject);
-        child.once("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
+        child.once("error", (error) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            reject(error);
+          }
+        });
+        child.once("close", (status, signal) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            resolve({ status, signal, stdout, stderr });
+          }
+        });
       });
     const parseInstalledJson = (result, label) => {
       if (result.stdout.trim().length === 0) fail(`${label} emitted no JSON`);
@@ -282,6 +359,114 @@ async function main() {
       fail("guard did not allow the owning installed worktree");
     }
 
+    const governedResource = "contract-lifecycle.txt";
+    const claim = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "claim",
+          "--session",
+          created.session_id,
+          "--resource",
+          governedResource,
+          "--mode",
+          "exclusive-write",
+          "--json",
+        ],
+        lifecycleWorktree,
+      ),
+      "resource claim",
+    );
+    if (claim.ok !== true || claim.claims?.[0]?.mode !== "exclusive-write") {
+      fail("installed session claim did not return the canonical exclusive claim");
+    }
+    const claims = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", created.session_id, "--json"], lifecycleWorktree),
+      "resource claims",
+    );
+    if (claims.ok !== true || claims.claims?.length !== 1 || claims.claims[0]?.claim_id !== claim.claims[0].claim_id) {
+      fail("installed claims listing did not preserve the claim identity");
+    }
+    const authorized = parseInstalledJson(
+      invokeInstalled(
+        [
+          "authorize",
+          "--session",
+          created.session_id,
+          "--operation",
+          "source-write",
+          "--resource",
+          governedResource,
+          "--json",
+        ],
+        lifecycleWorktree,
+      ),
+      "source-write authorization",
+    );
+    if (authorized.ok !== true || authorized.allowed !== true || authorized.resources?.[0]?.claim_ids?.length !== 1) {
+      fail("installed authorization did not return the claim-backed allow decision");
+    }
+    fs.writeFileSync(path.join(lifecycleWorktree, governedResource), "packed lifecycle\n");
+    const checkpoint = parseInstalledJson(
+      invokeInstalled(["checkpoint", "--session", created.session_id, "--json"], lifecycleWorktree),
+      "checkpoint evidence",
+    );
+    if (
+      checkpoint.ok !== true ||
+      !checkpoint.paths?.changed?.includes(governedResource) ||
+      !checkpoint.in_claim?.includes(governedResource) ||
+      checkpoint.out_of_claim?.length !== 0
+    ) {
+      fail("installed checkpoint did not classify the changed path against its claim");
+    }
+    const committed = parseInstalledJson(
+      invokeInstalled(
+        [
+          "commit",
+          "--session",
+          created.session_id,
+          "--message",
+          "exercise packed lifecycle",
+          "--resource",
+          governedResource,
+          "--json",
+        ],
+        lifecycleWorktree,
+      ),
+      "governed commit",
+    );
+    if (committed.ok !== true || !/^[0-9a-f]{40}$/.test(committed.commit_sha)) {
+      fail("installed governed commit did not return a commit SHA");
+    }
+    const pushed = parseInstalledJson(
+      invokeInstalled(
+        [
+          "push",
+          "--session",
+          created.session_id,
+          "--remote",
+          "origin",
+          "--branch",
+          "feature/installed-smoke",
+          "--resource",
+          governedResource,
+          "--create-upstream",
+          "--json",
+        ],
+        lifecycleWorktree,
+      ),
+      "governed push",
+    );
+    if (
+      pushed.ok !== true ||
+      pushed.target !== "origin/feature/installed-smoke" ||
+      pushed.relation !== "no-upstream" ||
+      pushed.upstream_created !== true
+    ) {
+      fail("installed governed push did not return the explicit target contract");
+    }
+    run("git", ["merge", "--ff-only", "feature/installed-smoke"], { cwd: lifecycleRepository, env: gitEnvironment });
+
     const secondCreated = parseInstalledJson(
       invokeInstalled(
         ["session", "create", "--branch", "feature/installed-second", "--worktree", secondWorktree, "--json"],
@@ -313,6 +498,64 @@ async function main() {
     });
     if (new Set(concurrentCreated.map((session) => session.session_id)).size !== concurrentCreated.length) {
       fail("concurrent installed sessions did not receive unique identities");
+    }
+
+    const conflictingResource = "shared-concurrent-resource.txt";
+    const claimRaceSpecs = [
+      { session: secondCreated, worktree: secondWorktree },
+      { session: concurrentCreated[0], worktree: concurrentSpecs[0].worktree },
+    ];
+    const claimRaceResults = await Promise.all(
+      claimRaceSpecs.map(({ session, worktree }) =>
+        invokeInstalledAsync(
+          [
+            "session",
+            "claim",
+            "--session",
+            session.session_id,
+            "--resource",
+            conflictingResource,
+            "--mode",
+            "exclusive-write",
+            "--json",
+          ],
+          worktree,
+        ),
+      ),
+    );
+    const claimRaceJson = claimRaceResults.map((result, index) => {
+      if (result.status !== 0 && result.status !== 3) {
+        fail(`concurrent claim ${index} exited ${result.status}: ${result.stderr}`);
+      }
+      return parseInstalledJson(result, `concurrent claim ${index}`);
+    });
+    if (claimRaceJson.filter((result) => result.ok === true).length !== 1) {
+      fail("concurrent installed claims did not produce exactly one winner");
+    }
+    const deniedClaim = claimRaceJson.find((result) => result.ok === false);
+    if (deniedClaim?.code !== "RESOURCE_CLAIM_CONFLICT") {
+      fail("concurrent installed claims did not expose RESOURCE_CLAIM_CONFLICT");
+    }
+    const winnerIndex = claimRaceJson.findIndex((result) => result.ok === true);
+    const retryClaim = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "claim",
+          "--session",
+          claimRaceSpecs[winnerIndex].session.session_id,
+          "--resource",
+          conflictingResource,
+          "--mode",
+          "exclusive-write",
+          "--json",
+        ],
+        claimRaceSpecs[winnerIndex].worktree,
+      ),
+      "idempotent claim retry",
+    );
+    if (retryClaim.ok !== true || retryClaim.idempotent !== true) {
+      fail("installed equivalent claim retry was not idempotent");
     }
 
     const hazardWorktree = path.join(installDirectory, "recoverable-commit-worktree");
@@ -377,6 +620,38 @@ async function main() {
       if (closedConcurrent.status !== 0) fail(`concurrent session ${session.session_id} did not close safely`);
     }
 
+    const prunableWorktree = path.join(installDirectory, "prunable-worktree");
+    const prunableSession = parseInstalledJson(
+      invokeInstalled(
+        ["session", "create", "--branch", "feature/installed-prunable", "--worktree", prunableWorktree, "--json"],
+        lifecycleRepository,
+      ),
+      "prunable session create",
+    );
+    fs.rmSync(prunableWorktree, { recursive: true, force: true });
+    const prunableDryRun = parseInstalledJson(
+      invokeInstalled(["gc", "--dry-run", "--json"], lifecycleRepository),
+      "prunable gc dry run",
+    );
+    if (
+      prunableDryRun.ok !== true ||
+      !prunableDryRun.candidates?.some((candidate) => candidate.session_id === prunableSession.session_id) ||
+      prunableDryRun.cleaned?.length !== 0
+    ) {
+      fail("gc dry-run did not expose the prunable session without mutation");
+    }
+    const prunableApplied = parseInstalledJson(
+      invokeInstalled(["gc", "--apply", "--json"], lifecycleRepository),
+      "prunable gc apply",
+    );
+    if (
+      prunableApplied.ok !== true ||
+      !prunableApplied.cleaned?.some((session) => session.session_id === prunableSession.session_id) ||
+      prunableApplied.blocked?.length !== 0
+    ) {
+      fail("gc apply did not safely clean the prunable session");
+    }
+
     const detachedWorktree = path.join(installDirectory, "detached-worktree");
     run("git", ["worktree", "add", "--detach", detachedWorktree, "HEAD"], {
       cwd: lifecycleRepository,
@@ -395,6 +670,17 @@ async function main() {
     const gc = parseInstalledJson(invokeInstalled(["gc", "--dry-run", "--json"], lifecycleRepository), "gc");
     if (gc.ok !== true || gc.candidates.length !== 0 || gc.cleaned.length !== 0) {
       fail("gc did not report a clean installed repository after close");
+    }
+
+    const doctor = parseInstalledJson(invokeInstalled(["doctor", "--json"], lifecycleRepository), "doctor");
+    const reconciliation = doctor.checks?.find((check) => check.name === "reconciliation");
+    if (
+      doctor.ok !== true ||
+      reconciliation?.status !== "ok" ||
+      reconciliation.details?.clean !== true ||
+      reconciliation.details?.issues?.length !== 0
+    ) {
+      fail("doctor did not report a clean packed registry/Git reconciliation");
     }
 
     const registryPath = path.join(lifecycleRepository, ".git", "nawabari", "session-registry.json");
