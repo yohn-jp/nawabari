@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { runCli } from "./cli.js";
-import { SessionRegistry, toPersistedSessionRecord } from "./session-registry.js";
+import { SessionRegistry, toPersistedSessionRecord, REGISTRY_SCHEMA_VERSION } from "./session-registry.js";
 
 test("guard allows the owning active worktree and is side-effect free", () => {
   const fixture = createRepository();
@@ -153,7 +153,7 @@ test("guard rejects stale registry state and a persisted branch that Git disprov
       registry.paths.registry,
       `${JSON.stringify(
         {
-          schema_version: 1,
+          schema_version: REGISTRY_SCHEMA_VERSION,
           repository_id: registry.repository.repositoryId,
           sessions: [toPersistedSessionRecord({ ...session, state: "stale" })],
         },
@@ -161,13 +161,17 @@ test("guard rejects stale registry state and a persisted branch that Git disprov
         2,
       )}\n`,
     );
-    assert.equal(new SessionRegistry({ cwd: worktreePath }).guard().code, "STALE_REGISTRY");
+    const staleDecision = new SessionRegistry({ cwd: worktreePath }).guard();
+    assert.equal(staleDecision.code, "STALE_REGISTRY");
+    assert.equal(staleDecision.allowed, false);
+    assert.equal(staleDecision.branchName, "feature/guard-physical");
+    assert.equal(staleDecision.ownerSessionId, session.sessionId);
 
     fs.writeFileSync(
       registry.paths.registry,
       `${JSON.stringify(
         {
-          schema_version: 1,
+          schema_version: REGISTRY_SCHEMA_VERSION,
           repository_id: registry.repository.repositoryId,
           sessions: [
             toPersistedSessionRecord({
@@ -181,7 +185,11 @@ test("guard rejects stale registry state and a persisted branch that Git disprov
         2,
       )}\n`,
     );
-    assert.equal(new SessionRegistry({ cwd: worktreePath }).guard().code, "BRANCH_MISMATCH");
+    const mismatchDecision = new SessionRegistry({ cwd: worktreePath }).guard();
+    assert.equal(mismatchDecision.code, "BRANCH_MISMATCH");
+    assert.equal(mismatchDecision.allowed, false);
+    assert.equal(mismatchDecision.branchName, "feature/guard-physical");
+    assert.equal(mismatchDecision.ownerSessionId, null);
   } finally {
     removeWorktree(fixture, worktreePath);
     fs.rmSync(fixture, { recursive: true, force: true });

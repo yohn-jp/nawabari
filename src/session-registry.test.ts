@@ -116,6 +116,10 @@ test("rejects duplicate worktree, branch, and session ownership", () => {
       () => registry.create({ worktreePath: fixture.linkedWorktreePath, branchName: "feature/other" }),
       "BRANCH_MISMATCH",
     );
+    assertRegistryError(
+      () => registry.create({ worktreePath: fixture.linkedWorktreePath, branchName: "feature/linked" }),
+      "DUPLICATE_WORKTREE_OWNERSHIP",
+    );
 
     const duplicateIdRegistry = new SessionRegistry({
       cwd: fixture.repositoryPath,

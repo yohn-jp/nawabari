@@ -166,6 +166,8 @@ function doctorErrorCode(error: unknown, fallback: ErrorCode): ErrorCode {
   if (code === "GIT_OUTPUT_LIMIT") return "GIT_OUTPUT_LIMIT";
   if (code === "GIT_COMMAND_FAILED") return "GIT_COMMAND_FAILED";
   if (code === "NOT_A_GIT_REPOSITORY") return "NOT_GIT_REPOSITORY";
+  if (code === "MISSING_WORKTREE") return "MISSING_WORKTREE";
+  if (code === "PHYSICAL_OBSERVATION_UNAVAILABLE") return "PHYSICAL_OBSERVATION_UNAVAILABLE";
   if (code === "REPOSITORY_IDENTITY_AMBIGUOUS") return "GIT_STATE_AMBIGUOUS";
   if (code === "REGISTRY_CORRUPT" || code === "UNSUPPORTED_SCHEMA_VERSION") return "REGISTRY_CORRUPT";
   if (code === "REGISTRY_REPOSITORY_MISMATCH") return "INVALID_REGISTRY";

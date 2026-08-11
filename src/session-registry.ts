@@ -388,18 +388,22 @@ export class SessionRegistry {
   ): SessionRecord {
     const records = this.readUnsafe();
     const currentRecords = records.filter(
-      (record) => record.state !== "closed" && samePath(record.worktreeId, physical.worktreePath),
+      (record) => ACTIVE_STATES.has(record.state) && samePath(record.worktreeId, physical.worktreePath),
     );
     if (currentRecords.length > 1) {
       throw new SessionRegistryError(
         "DUPLICATE_WORKTREE_OWNERSHIP",
         `Multiple sessions claim the current worktree: ${physical.worktreePath}`,
-        { worktree: physical.worktreePath, sessionId: requestedSessionId ?? "<unspecified>" },
+        {
+          worktree: physical.worktreePath,
+          sessionId: requestedSessionId ?? "<unspecified>",
+          ownerSessionId: currentRecords[0].sessionId,
+        },
       );
     }
     const currentRecord = currentRecords[0];
     if (currentRecord === undefined) {
-      const branchRecord = records.find((record) => record.state !== "closed" && record.branchId === physical.branchId);
+      const branchRecord = records.find((record) => ACTIVE_STATES.has(record.state) && record.branchId === physical.branchId);
       if (branchRecord !== undefined) {
         throw new SessionRegistryError(
           "WORKTREE_MISMATCH",
@@ -435,7 +439,7 @@ export class SessionRegistry {
         actualRepositoryId: physical.repositoryId,
       });
     }
-    if (currentRecord.worktreePath !== physical.worktreePath) {
+    if (!samePath(currentRecord.worktreePath, physical.worktreePath)) {
       throw new SessionRegistryError("WORKTREE_MISMATCH", "The session worktree identity does not match Git", {
         expectedWorktree: currentRecord.worktreePath,
         actualWorktree: physical.worktreePath,
@@ -491,10 +495,11 @@ export class SessionRegistry {
       requestedSessionId,
       state: null as SessionState | null,
     };
+    let verifiedIdentity = base;
 
     try {
       if (requestedSessionId !== null && !isSessionId(requestedSessionId)) {
-        return deniedGuard("INVALID_SESSION_ID", base, { sessionId: requestedSessionId });
+        return deniedGuard("INVALID_SESSION_ID", verifiedIdentity, { sessionId: requestedSessionId });
       }
 
       const physical = verifyPhysicalExecutionContext({
@@ -503,6 +508,7 @@ export class SessionRegistry {
         git: this.git,
       });
       const identityBase = { ...base, branchName: physical.branchName };
+      verifiedIdentity = identityBase;
 
       if (this.protectedWorktree(this.repository.worktreePath, physical.worktrees)) {
         return deniedGuard(
@@ -560,7 +566,7 @@ export class SessionRegistry {
       });
     } catch (error: unknown) {
       if (error instanceof SessionRegistryError) {
-        return deniedGuard(error.code, base, error.details, base.ownerSessionId, base.state);
+        return deniedGuard(error.code, verifiedIdentity, error.details, verifiedIdentity.ownerSessionId, verifiedIdentity.state);
       }
       throw error;
     }

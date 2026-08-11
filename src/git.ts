@@ -172,6 +172,26 @@ export function resolveRepositoryContext(options: ResolveRepositoryOptions = {})
   });
 }
 
+function readBranchOrDetached(git: GitCommandRunner, cwd: string): string {
+  try {
+    return readCurrentBranch(git, cwd);
+  } catch (error: unknown) {
+    if (
+      error instanceof SessionRegistryError &&
+      error.code === "WORKTREE_IDENTITY_AMBIGUOUS" &&
+      error.details.reason === "detached-head"
+    ) {
+      throw new SessionRegistryError(
+        "DETACHED_HEAD",
+        `The worktree at ${cwd} has no branch`,
+        { worktree: cwd },
+        error,
+      );
+    }
+    throw error;
+  }
+}
+
 export function resolveWorktreeIdentity(options: ResolveWorktreeOptions = {}): WorktreeIdentity {
   let context: PhysicalExecutionContext;
   try {
@@ -231,26 +251,7 @@ export function verifyPhysicalExecutionContext(options: ResolveWorktreeOptions =
     }
   }
 
-  let branchName: string;
-  try {
-    branchName = readCurrentBranch(git, repository.worktreePath);
-  } catch (error: unknown) {
-    if (
-      error instanceof SessionRegistryError &&
-      error.code === "WORKTREE_IDENTITY_AMBIGUOUS" &&
-      error.details.reason === "detached-head"
-    ) {
-      throw new SessionRegistryError(
-        "DETACHED_HEAD",
-        `The worktree at ${repository.worktreePath} has no branch`,
-        {
-          worktree: repository.worktreePath,
-        },
-        error,
-      );
-    }
-    throw error;
-  }
+  const branchName = readBranchOrDetached(git, repository.worktreePath);
   const branchId = normalizeBranchId(branchName);
   const headId = readCurrentHead(git, repository.worktreePath);
   const worktrees = listGitWorktrees(git, repository.worktreePath);
@@ -279,11 +280,6 @@ export function verifyPhysicalExecutionContext(options: ResolveWorktreeOptions =
       currentBranch: branchName,
     });
   }
-  if (worktree.branchName === null) {
-    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git worktree inventory omitted the current branch", {
-      worktree: repository.worktreePath,
-    });
-  }
   try {
     normalizeBranchId(worktree.branchName);
   } catch (error: unknown) {
@@ -295,7 +291,7 @@ export function verifyPhysicalExecutionContext(options: ResolveWorktreeOptions =
     );
   }
 
-  const finalBranchName = readCurrentBranch(git, repository.worktreePath);
+  const finalBranchName = readBranchOrDetached(git, repository.worktreePath);
   const finalHeadId = readCurrentHead(git, repository.worktreePath);
   if (finalBranchName !== branchName || finalHeadId !== headId) {
     throw new SessionRegistryError(
@@ -465,20 +461,12 @@ export function readCurrentBranch(git: GitCommandRunner, cwd: string): string {
       }
       throw error;
     }
-    if (!(error instanceof SessionRegistryError)) {
-      throw new SessionRegistryError(
-        "PHYSICAL_OBSERVATION_UNAVAILABLE",
-        `Could not observe the current branch for ${cwd}`,
-        {
-          cwd,
-        },
-        error,
-      );
-    }
     throw new SessionRegistryError(
-      "WORKTREE_IDENTITY_AMBIGUOUS",
-      `Could not resolve the current branch for ${cwd}`,
-      { cwd, reason: "detached-head" },
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      `Could not observe the current branch for ${cwd}`,
+      {
+        cwd,
+      },
       error,
     );
   }
@@ -510,21 +498,10 @@ export function readCurrentHead(git: GitCommandRunner, cwd: string): string {
       }
       throw error;
     }
-    if (!(error instanceof SessionRegistryError)) {
-      throw new SessionRegistryError(
-        "PHYSICAL_OBSERVATION_UNAVAILABLE",
-        `Could not observe HEAD for ${cwd}`,
-        { cwd },
-        error,
-      );
-    }
     throw new SessionRegistryError(
-      "GIT_STATE_AMBIGUOUS",
-      `Could not resolve HEAD for ${cwd}`,
-      {
-        cwd,
-        reason: "head-unavailable",
-      },
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      `Could not observe HEAD for ${cwd}`,
+      { cwd },
       error,
     );
   }
@@ -658,9 +635,12 @@ function gitProcessError(error: unknown, command: string, cwd: string): SessionR
   }
 
   let code: "GIT_COMMAND_FAILED" | "GIT_SPAWN_FAILED" | "GIT_TIMEOUT" | "GIT_OUTPUT_LIMIT";
-  if (candidate.code === "ETIMEDOUT" || candidate.killed === true) code = "GIT_TIMEOUT";
-  else if (candidate.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || candidate.code === "ENOBUFS") {
+  if (candidate.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || candidate.code === "ENOBUFS") {
     code = "GIT_OUTPUT_LIMIT";
+  } else if (candidate.code === "ETIMEDOUT") {
+    code = "GIT_TIMEOUT";
+  } else if (candidate.killed === true) {
+    code = "GIT_TIMEOUT";
   } else if (
     (candidate.status === undefined || candidate.status === null) &&
     (candidate.code === "ENOENT" || candidate.code === "EACCES" || candidate.code === "ENOTDIR")
