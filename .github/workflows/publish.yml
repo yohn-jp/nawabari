@@ -132,8 +132,8 @@ jobs:
 
       - name: Check namespace and version immediately before publish
         run: |
-          if npm view nawabari@0.1.0 version >/dev/null 2>&1; then
-            echo "nawabari@0.1.0 already exists; refusing a namespace collision" >&2
+          if npm view nawabari >/dev/null 2>&1; then
+            echo "nawabari already exists; refusing a namespace collision" >&2
             exit 1
           fi
 
