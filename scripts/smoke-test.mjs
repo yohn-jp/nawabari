@@ -46,6 +46,40 @@ function parseArgs(argv) {
   return { tarball: index === -1 ? undefined : argv[index + 1] };
 }
 
+function addClosedHistory(registryPath, count, installDirectory) {
+  const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  const now = "2026-08-10T00:00:00.000Z";
+  const generated = Array.from({ length: count }, (_, index) => {
+    const sessionId = `0190f1e0-0000-7000-8000-${(0xabc000000000 + index).toString(16).padStart(12, "0")}`;
+    const branchName = `history/packed-${index}`;
+    const worktreePath = path.join(installDirectory, `closed-history-${index}-${"x".repeat(40)}`);
+    return {
+      schema_version: 1,
+      session_id: sessionId,
+      repository_id: registry.repository_id,
+      worktree_id: worktreePath,
+      worktree_path: worktreePath,
+      branch_id: `refs/heads/${branchName}`,
+      branch_name: branchName,
+      state: "closed",
+      created_at: now,
+      updated_at: now,
+      label: `closed-history-${"x".repeat(160)}`,
+    };
+  });
+  registry.sessions.push(...generated);
+  fs.writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
+}
+
+function parseInstalledJson(result, label) {
+  if (result.stdout.trim().length === 0) fail(`${label} emitted no JSON`);
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    fail(`${label} emitted invalid JSON: ${result.stdout}`);
+  }
+}
+
 async function main() {
   const { tarball } = parseArgs(process.argv.slice(2));
   let tarballPath;
@@ -175,6 +209,19 @@ async function main() {
       fail("installed capabilities did not enumerate the governed lifecycle");
     }
     if (capabilitiesResult.stderr.trim().length > 0) fail("capabilities --json wrote decorative output to stderr");
+    if (capabilitiesResult.stdout.length > 12_000) fail("capabilities --json exceeded its fixed discovery budget");
+
+    const helpJsonResult = spawnSync(installedBinary, ["--help", "--json"], {
+      cwd: installDirectory,
+      env: gitEnvironment,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    if (helpJsonResult.status !== 0) fail(`--help --json exited ${helpJsonResult.status}, expected 0`);
+    const helpJson = parseInstalledJson(helpJsonResult, "JSON help");
+    if (helpJson.ok !== true || helpJson.command !== "help") fail("--help --json returned an invalid help document");
+    if (helpJsonResult.stdout.length > 12_000) fail("--help --json exceeded its fixed discovery budget");
+    if (helpJsonResult.stderr.trim().length > 0) fail("--help --json wrote decorative output to stderr");
 
     const versionJsonResult = spawnSync(installedBinary, ["--version", "--json"], {
       cwd: installDirectory,
@@ -283,15 +330,6 @@ async function main() {
           }
         });
       });
-    const parseInstalledJson = (result, label) => {
-      if (result.stdout.trim().length === 0) fail(`${label} emitted no JSON`);
-      try {
-        return JSON.parse(result.stdout);
-      } catch {
-        fail(`${label} emitted invalid JSON: ${result.stdout}`);
-      }
-    };
-
     console.log("running the installed Nawabari session lifecycle...");
     const protectedGuardResult = invokeInstalled(["guard", "--json"], lifecycleRepository);
     const protectedGuard = parseInstalledJson(protectedGuardResult, "protected worktree guard");
@@ -352,6 +390,18 @@ async function main() {
     const status = parseInstalledJson(invokeInstalled(["status", "--json"], lifecycleWorktree), "status");
     if (status.ok !== true || status.current_session?.session_id !== created.session_id) {
       fail("status did not report the current installed session");
+    }
+    const initialList = parseInstalledJson(
+      invokeInstalled(["session", "list", "--json"], lifecycleRepository),
+      "default session list",
+    );
+    if (
+      initialList.ok !== true ||
+      !initialList.sessions?.some((session) => session.session_id === created.session_id) ||
+      initialList.truncated !== false ||
+      initialList.history_included !== false
+    ) {
+      fail("default session list did not expose bounded active-session metadata");
     }
 
     const allowedGuard = parseInstalledJson(invokeInstalled(["guard", "--json"], lifecycleWorktree), "guard");
@@ -588,6 +638,9 @@ async function main() {
     if (hazardClosed.status !== 0) fail("close did not retry after the recoverable commit became retained");
 
     fs.writeFileSync(path.join(lifecycleWorktree, "recoverable.txt"), "keep until close is safe\n");
+    for (let index = 0; index < 64; index += 1) {
+      fs.writeFileSync(path.join(lifecycleWorktree, `dirty-${index}.txt`), "preserve\n");
+    }
     const dirtyClose = invokeInstalled(
       ["session", "close", "--session", created.session_id, "--json"],
       lifecycleRepository,
@@ -596,7 +649,18 @@ async function main() {
     if (dirtyClose.status !== 3 || dirtyCloseJson.code !== "DIRTY_WORKTREE") {
       fail("dirty close did not fail closed");
     }
+    if (
+      dirtyCloseJson.details?.paths?.length !== 32 ||
+      dirtyCloseJson.details?.paths_truncated !== true ||
+      dirtyCloseJson.details?.paths_total < 65 ||
+      dirtyCloseJson.details?.paths_next_offset !== 32
+    ) {
+      fail("dirty close did not expose explicit bounded path metadata");
+    }
     fs.rmSync(path.join(lifecycleWorktree, "recoverable.txt"), { force: true });
+    for (let index = 0; index < 64; index += 1) {
+      fs.rmSync(path.join(lifecycleWorktree, `dirty-${index}.txt`), { force: true });
+    }
 
     const closed = invokeInstalled(
       ["session", "close", "--session", created.session_id, "--json"],
@@ -684,6 +748,42 @@ async function main() {
     }
 
     const registryPath = path.join(lifecycleRepository, ".git", "nawabari", "session-registry.json");
+    addClosedHistory(registryPath, 512, installDirectory);
+    const boundedStatus = invokeInstalled(["status", "--json"], lifecycleRepository);
+    const boundedStatusJson = parseInstalledJson(boundedStatus, "bounded status");
+    const boundedList = invokeInstalled(["session", "list", "--json"], lifecycleRepository);
+    const boundedListJson = parseInstalledJson(boundedList, "bounded session list");
+    if (
+      boundedStatus.status !== 0 ||
+      boundedList.status !== 0 ||
+      boundedStatusJson.sessions?.length !== 0 ||
+      boundedListJson.sessions?.length !== 0 ||
+      boundedStatusJson.closed_count !== 512 + 8 ||
+      boundedListJson.closed_count !== 512 + 8 ||
+      boundedStatusJson.history_available !== true ||
+      boundedListJson.history_available !== true ||
+      boundedStatus.stdout.length > 4_000 ||
+      boundedList.stdout.length > 4_000
+    ) {
+      fail("default installed status/session list scaled with closed history");
+    }
+    const historyPage = parseInstalledJson(
+      invokeInstalled(
+        ["session", "list", "--history", "--limit", "8", "--offset", "16", "--json"],
+        lifecycleRepository,
+      ),
+      "installed session history page",
+    );
+    if (
+      historyPage.ok !== true ||
+      historyPage.sessions?.length !== 8 ||
+      historyPage.limit !== 8 ||
+      historyPage.offset !== 16 ||
+      historyPage.truncated !== true ||
+      historyPage.next_offset !== 24
+    ) {
+      fail("installed session history did not expose deterministic continuation metadata");
+    }
     fs.writeFileSync(registryPath, "{not-json\n");
     const corruptStatus = invokeInstalled(["status", "--json"], lifecycleRepository);
     const corruptStatusJson = parseInstalledJson(corruptStatus, "corrupt registry status");

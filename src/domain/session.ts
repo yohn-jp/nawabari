@@ -198,8 +198,31 @@ export type BackendCapabilities = {
   current_session_resolution: boolean;
 };
 
+/**
+ * Default discovery limits are semantic collection limits, not presentation
+ * byte targets. Callers that need more records can page an explicit history
+ * request with `offset` and `limit`.
+ */
+export const DEFAULT_SESSION_LIST_LIMIT = 32 as const;
+export const MAX_SESSION_LIST_LIMIT = 128 as const;
+
+export type SessionListOptions = {
+  include_closed?: boolean;
+  limit?: number;
+  offset?: number;
+};
+
 export type SessionListResult = {
   sessions: SessionRecord[];
+  total?: number;
+  returned?: number;
+  limit?: number;
+  offset?: number;
+  truncated?: boolean;
+  next_offset?: number | null;
+  closed_count?: number;
+  history_available?: boolean;
+  history_included?: boolean;
 };
 
 export type StatusResult = {
@@ -207,7 +230,49 @@ export type StatusResult = {
   current_session: SessionRecord | null;
   sessions: SessionRecord[];
   capabilities: BackendCapabilities;
+  total?: number;
+  returned?: number;
+  limit?: number;
+  offset?: number;
+  truncated?: boolean;
+  next_offset?: number | null;
+  closed_count?: number;
+  history_available?: boolean;
+  history_included?: boolean;
 };
+
+/** Project a registry collection into the bounded agent-facing listing shape. */
+export function boundedSessionListing(
+  records: readonly SessionRecord[],
+  options: SessionListOptions = {},
+): SessionListResult {
+  const includeClosed = options.include_closed ?? false;
+  const limit = options.limit ?? DEFAULT_SESSION_LIST_LIMIT;
+  const offset = options.offset ?? 0;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_SESSION_LIST_LIMIT) {
+    throw new RangeError(`session list limit must be an integer from 1 to ${MAX_SESSION_LIST_LIMIT}`);
+  }
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new RangeError("session list offset must be a non-negative integer");
+  }
+
+  const closedCount = records.reduce((count, record) => count + (record.state === "closed" ? 1 : 0), 0);
+  const visible = includeClosed ? [...records] : records.filter((record) => record.state !== "closed");
+  const sessions = visible.slice(offset, offset + limit);
+  const nextOffset = offset + sessions.length < visible.length ? offset + sessions.length : null;
+  return {
+    sessions: [...sessions],
+    total: visible.length,
+    returned: sessions.length,
+    limit,
+    offset,
+    truncated: nextOffset !== null,
+    next_offset: nextOffset,
+    closed_count: closedCount,
+    history_available: !includeClosed && closedCount > 0,
+    history_included: includeClosed,
+  };
+}
 
 export type SessionCloseResult = {
   session: SessionRecord;
@@ -243,8 +308,8 @@ export interface SessionBackend {
   checkpoint?(context: SessionContext, options: CheckpointOptions): Promise<DomainResult<CheckpointEvidence>>;
   commit?(context: SessionContext, options: CommitOptions): Promise<DomainResult<CommitResult>>;
   push?(context: SessionContext, options: PushOptions): Promise<DomainResult<PushResult>>;
-  listSessions(context: SessionContext): Promise<DomainResult<SessionListResult>>;
-  status(context: SessionContext): Promise<DomainResult<StatusResult>>;
+  listSessions(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<SessionListResult>>;
+  status(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
   garbageCollect(context: SessionContext, options: GarbageCollectOptions): Promise<DomainResult<GarbageCollectResult>>;
   claimResources?(context: SessionContext, options: ClaimResourcesOptions): Promise<DomainResult<ClaimResourcesResult>>;
