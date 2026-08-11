@@ -3,6 +3,7 @@ import path from "node:path";
 
 import {
   defaultGit,
+  captureGitCheckpoint,
   listGitWorktrees,
   normalizeBranchId,
   resolveRepositoryContext,
@@ -19,6 +20,7 @@ import {
   assertCanonicalClaimResource,
   canonicalClaimId,
   canonicalizeClaimInput,
+  canonicalizeClaimResource,
   claimError,
   claimsConflict,
   claimsOverlap,
@@ -26,6 +28,8 @@ import {
   compareCodePointStrings,
   createResourceClaim,
   isResourceClaimMode,
+  resourceClaimConflictsWithAccess,
+  resourceMatchesClaim,
   RESOURCE_CLAIM_SCHEMA_VERSION,
   sortResourceClaims,
   type ClaimOwnerContext,
@@ -33,6 +37,19 @@ import {
   type ResourceClaimInput,
   type ResourceClaimMode,
 } from "./resource-claims.js";
+import {
+  CHECKPOINT_EVIDENCE_SCHEMA_VERSION,
+  CHECKPOINT_MAX_PATHS,
+  OPERATION_AUTHORIZATION_SCHEMA_VERSION,
+  claimModeGrantsAccess,
+  isOperationName,
+  requiredAccessForOperation,
+  type CheckpointEvidence,
+  type CheckpointOptions,
+  type AuthorizedResource,
+  type OperationAuthorizationDecision,
+  type OperationAuthorizationOptions,
+} from "./operation-authorization.js";
 
 export type { ResourceClaim } from "./resource-claims.js";
 
@@ -164,6 +181,20 @@ export interface GuardDecision {
   readonly state: SessionState | null;
   readonly details: RegistryErrorDetails;
 }
+
+export type {
+  CheckpointEvidence,
+  CheckpointOptions,
+  OperationAuthorizationDecision,
+  OperationAuthorizationOptions,
+} from "./operation-authorization.js";
+export {
+  CHECKPOINT_EVIDENCE_SCHEMA_VERSION,
+  CHECKPOINT_MAX_PATHS,
+  OPERATION_AUTHORIZATION_SCHEMA_VERSION,
+  OPERATION_REQUIRED_ACCESS,
+  OPERATION_VOCABULARY,
+} from "./operation-authorization.js";
 
 export interface VerifiedExecutionContext extends PhysicalExecutionContext {
   readonly session: SessionRecord;
@@ -643,6 +674,32 @@ export class SessionRegistry {
     return Object.freeze({ ...physical, session: cloneSessionRecord(session) });
   }
 
+  /** Shared physical/protected/ownership path for every governed decision. */
+  private verifyGovernedExecutionContext(
+    requestedSessionId: string | null,
+    observedPhysical?: PhysicalExecutionContext,
+  ): VerifiedExecutionContext {
+    const physical =
+      observedPhysical ??
+      verifyPhysicalExecutionContext({
+        repository: this.repository,
+        worktreePath: this.repository.worktreePath,
+        git: this.git,
+      });
+    if (this.protectedWorktree(this.repository.worktreePath, physical.worktrees)) {
+      throw new SessionRegistryError("PROTECTED_WORKTREE", "The current worktree is protected", {
+        worktree: this.repository.worktreePath,
+      });
+    }
+    if (this.protectedBranch(physical.branchName, physical.worktrees)) {
+      throw new SessionRegistryError("PROTECTED_BRANCH", "The current branch is protected", {
+        branch: physical.branchName,
+      });
+    }
+    const session = this.resolveSessionOwnership(physical, requestedSessionId);
+    return Object.freeze({ ...physical, session: cloneSessionRecord(session) });
+  }
+
   private resolveSessionOwnership(
     physical: PhysicalExecutionContext,
     requestedSessionId: string | null,
@@ -664,7 +721,9 @@ export class SessionRegistry {
     }
     const currentRecord = currentRecords[0];
     if (currentRecord === undefined) {
-      const branchRecord = records.find((record) => ACTIVE_STATES.has(record.state) && record.branchId === physical.branchId);
+      const branchRecord = records.find(
+        (record) => ACTIVE_STATES.has(record.state) && record.branchId === physical.branchId,
+      );
       if (branchRecord !== undefined) {
         throw new SessionRegistryError(
           "WORKTREE_MISMATCH",
@@ -776,28 +835,9 @@ export class SessionRegistry {
       const identityBase = { ...base, branchName: physical.branchName };
       verifiedIdentity = identityBase;
 
-      if (this.protectedWorktree(this.repository.worktreePath, physical.worktrees)) {
-        return deniedGuard(
-          "PROTECTED_WORKTREE",
-          identityBase,
-          { worktree: this.repository.worktreePath },
-          identityBase.ownerSessionId,
-          identityBase.state,
-        );
-      }
-      if (this.protectedBranch(physical.branchName, physical.worktrees)) {
-        return deniedGuard(
-          "PROTECTED_BRANCH",
-          identityBase,
-          { branch: physical.branchName },
-          identityBase.ownerSessionId,
-          identityBase.state,
-        );
-      }
-
       let currentRecord: SessionRecord;
       try {
-        currentRecord = this.resolveSessionOwnership(physical, requestedSessionId);
+        currentRecord = this.verifyGovernedExecutionContext(requestedSessionId, physical).session;
       } catch (error: unknown) {
         if (
           error instanceof SessionRegistryError &&
@@ -835,10 +875,189 @@ export class SessionRegistry {
       });
     } catch (error: unknown) {
       if (error instanceof SessionRegistryError) {
-        return deniedGuard(error.code, verifiedIdentity, error.details, verifiedIdentity.ownerSessionId, verifiedIdentity.state);
+        return deniedGuard(
+          error.code,
+          verifiedIdentity,
+          error.details,
+          verifiedIdentity.ownerSessionId,
+          verifiedIdentity.state,
+        );
       }
       throw error;
     }
+  }
+
+  /**
+   * The single claim-aware authorization decision for every governed local
+   * operation. Ownership is observed first; caller labels never substitute for
+   * the physical repository/worktree/branch facts or persisted claims.
+   */
+  authorizeOperation(options: OperationAuthorizationOptions): OperationAuthorizationDecision {
+    const requestedSessionId = options.sessionId ?? null;
+    const base: OperationDecisionBase = {
+      schemaVersion: OPERATION_AUTHORIZATION_SCHEMA_VERSION,
+      allowed: false,
+      code: "OPERATION_REJECTED",
+      operation: typeof options.operation === "string" ? options.operation : "<invalid>",
+      requiredAccess: null,
+      repositoryId: this.repository.repositoryId,
+      worktreePath: this.repository.worktreePath,
+      branchName: null,
+      sessionId: null,
+      ownerSessionId: null,
+      requestedSessionId,
+      state: null,
+      resources: [],
+    };
+    let verified = base;
+
+    try {
+      if (requestedSessionId !== null && !isSessionId(requestedSessionId)) {
+        return deniedOperation("INVALID_SESSION_ID", verified, { sessionId: requestedSessionId });
+      }
+      if (!isOperationName(options.operation)) {
+        return deniedOperation("INVALID_OPERATION", verified, { operation: stringifyDetail(options.operation) });
+      }
+      const requiredAccess = requiredAccessForOperation(options.operation);
+      verified = { ...base, operation: options.operation, requiredAccess };
+
+      if (!Array.isArray(options.resources) || options.resources.length === 0) {
+        return deniedOperation("INVALID_RESOURCE", verified, { reason: "at-least-one-concrete-resource-required" });
+      }
+      if (options.resources.length > CHECKPOINT_MAX_PATHS) {
+        return deniedOperation("INVALID_RESOURCE", verified, {
+          reason: "too-many-resources",
+          maxResources: CHECKPOINT_MAX_PATHS,
+        });
+      }
+
+      const execution = this.verifyGovernedExecutionContext(requestedSessionId);
+      const physical = execution;
+      verified = { ...verified, branchName: physical.branchName };
+      const currentRecord = execution.session;
+      verified = {
+        ...verified,
+        sessionId: currentRecord.sessionId,
+        ownerSessionId: currentRecord.sessionId,
+        state: currentRecord.state,
+      };
+
+      const resources = canonicalOperationResources(options.resources, physical.worktreePath);
+      const state = this.readStateUnsafe();
+      const activeSessionIds = new Set(
+        state.sessions.filter((record) => record.state === "active").map((record) => record.sessionId),
+      );
+      const activeClaims = state.claims.filter((claim) => activeSessionIds.has(claim.sessionId));
+      const authorized: AuthorizedResource[] = [];
+
+      for (const resource of resources) {
+        const ownClaims = activeClaims.filter(
+          (claim) => claim.sessionId === currentRecord.sessionId && resourceMatchesClaim(claim, resource),
+        );
+        const grantingClaims = ownClaims.filter((claim) => claimModeGrantsAccess(claim.mode, requiredAccess));
+        if (grantingClaims.length === 0) {
+          const conflictingClaim = activeClaims.find(
+            (claim) =>
+              claim.sessionId !== currentRecord.sessionId &&
+              resourceClaimConflictsWithAccess(claim, resource, requiredAccess),
+          );
+          if (conflictingClaim !== undefined) {
+            return deniedOperation("RESOURCE_CLAIM_CONFLICT", verified, {
+              resource,
+              ownerSessionId: conflictingClaim.sessionId,
+              ownerClaimId: conflictingClaim.claimId,
+              ownerResource: conflictingClaim.resource,
+              ownerMode: conflictingClaim.mode,
+            });
+          }
+          return deniedOperation("MISSING_RESOURCE_CLAIM", verified, {
+            resource,
+            requiredAccess,
+            sessionId: currentRecord.sessionId,
+          });
+        }
+        authorized.push({
+          resource,
+          claimIds: sortStrings(grantingClaims.map((claim) => claim.claimId)),
+        });
+      }
+
+      return Object.freeze({
+        ...verified,
+        allowed: true,
+        code: "ALLOWED" as const,
+        resources: Object.freeze(authorized),
+        details: {},
+      });
+    } catch (error: unknown) {
+      if (error instanceof SessionRegistryError) {
+        const ownerSessionId =
+          typeof error.details.ownerSessionId === "string" ? error.details.ownerSessionId : verified.ownerSessionId;
+        const state = typeof error.details.state === "string" ? error.details.state : verified.state;
+        return deniedOperation(
+          error.code,
+          {
+            ...verified,
+            sessionId: ownerSessionId,
+            ownerSessionId,
+            state,
+          },
+          error.details,
+        );
+      }
+      throw error;
+    }
+  }
+
+  /** Capture bounded Git evidence for the current owned session's declaration. */
+  checkpoint(options: CheckpointOptions = {}): CheckpointEvidence {
+    const requestedSessionId = options.sessionId ?? null;
+    if (requestedSessionId !== null && !isSessionId(requestedSessionId)) {
+      throw new SessionRegistryError("INVALID_SESSION_ID", `Invalid session ID: ${requestedSessionId}`, {
+        sessionId: requestedSessionId,
+      });
+    }
+
+    const execution = this.verifyGovernedExecutionContext(requestedSessionId);
+    const physical = execution;
+    const session = execution.session;
+    const observed = captureGitCheckpoint(this.git, physical.worktreePath);
+    const paths = {
+      changed: canonicalObservedPaths(observed.changed, physical.worktreePath),
+      staged: canonicalObservedPaths(observed.staged, physical.worktreePath),
+      unstaged: canonicalObservedPaths(observed.unstaged, physical.worktreePath),
+      untracked: canonicalObservedPaths(observed.untracked, physical.worktreePath),
+    };
+    const state = this.readStateUnsafe();
+    const activeClaims = state.claims.filter(
+      (claim) =>
+        claim.sessionId === session.sessionId &&
+        state.sessions.some((record) => record.sessionId === claim.sessionId && record.state === "active"),
+    );
+    const inClaim = new Set<string>();
+    for (const resource of paths.changed) {
+      if (activeClaims.some((claim) => resourceMatchesClaim(claim, resource))) inClaim.add(resource);
+    }
+    const outOfClaim = paths.changed.filter((resource) => !inClaim.has(resource));
+
+    return Object.freeze({
+      schemaVersion: CHECKPOINT_EVIDENCE_SCHEMA_VERSION,
+      source: "git" as const,
+      guarantee: "git-observable-only" as const,
+      repositoryId: physical.repositoryId,
+      worktreePath: physical.worktreePath,
+      branchName: physical.branchName,
+      headId: physical.headId,
+      sessionId: session.sessionId,
+      paths: Object.freeze(paths),
+      inClaim: Object.freeze(sortStrings(inClaim)),
+      outOfClaim: Object.freeze(outOfClaim),
+      maxPaths: CHECKPOINT_MAX_PATHS,
+    });
+  }
+
+  captureCheckpoint(options: CheckpointOptions = {}): CheckpointEvidence {
+    return this.checkpoint(options);
   }
 
   /** Close one session only after its ownership and recoverability are proven safe. */
@@ -1384,9 +1603,7 @@ export class SessionRegistry {
       repository_id: this.repository.repositoryId,
       sessions: records.map((record) => toPersistedSessionRecord(record, this.repository.repositoryId)),
       claims_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
-      claims: sortResourceClaims(claims).map((claim) =>
-        toPersistedResourceClaim(claim, this.repository.repositoryId),
-      ),
+      claims: sortResourceClaims(claims).map((claim) => toPersistedResourceClaim(claim, this.repository.repositoryId)),
     };
     const contents = `${JSON.stringify(registry, null, 2)}\n`;
     const temporaryPath = `${this.paths.registry}.tmp-${process.pid}-${generateSessionId()}`;
@@ -1596,6 +1813,59 @@ function deniedGuard(
     state,
     details: { ...details },
   });
+}
+
+type OperationDecisionBase = Omit<OperationAuthorizationDecision, "details">;
+
+function deniedOperation(
+  code: string,
+  base: OperationDecisionBase,
+  details: RegistryErrorDetails,
+): OperationAuthorizationDecision {
+  return Object.freeze({
+    ...base,
+    allowed: false,
+    code,
+    resources: Object.freeze([...base.resources]),
+    details: { ...details },
+  });
+}
+
+function canonicalOperationResources(resources: readonly string[], worktreePath: string): readonly string[] {
+  const canonical = new Set<string>();
+  for (const resource of resources) {
+    if (typeof resource !== "string" || resource.length === 0 || resource.includes("*") || resource.includes("?")) {
+      throw new SessionRegistryError("INVALID_RESOURCE", "Operation resources must be concrete repository paths", {
+        resource: stringifyDetail(resource),
+      });
+    }
+    try {
+      canonical.add(canonicalizeClaimResource(resource, worktreePath));
+    } catch (error: unknown) {
+      if (
+        error instanceof SessionRegistryError &&
+        [
+          "INVALID_CLAIM_RESOURCE",
+          "CLAIM_PATH_TRAVERSAL",
+          "CLAIM_SYMLINK_ESCAPE",
+          "CLAIM_AMBIGUOUS_PATH",
+          "UNSUPPORTED_CLAIM_GLOB",
+        ].includes(error.code)
+      ) {
+        throw new SessionRegistryError("INVALID_RESOURCE", "Operation resource is invalid", error.details, error);
+      }
+      throw error;
+    }
+  }
+  return Object.freeze(sortStrings(canonical));
+}
+
+function canonicalObservedPaths(paths: readonly string[], worktreePath: string): readonly string[] {
+  return canonicalOperationResources(paths, worktreePath);
+}
+
+function sortStrings(values: Iterable<string>): string[] {
+  return [...new Set(values)].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 }
 
 function assertWorktreeClean(git: GitCommandRunner, worktreePath: string): void {

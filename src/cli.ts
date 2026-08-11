@@ -3,6 +3,8 @@ import { runDoctor } from "./domain/doctor.js";
 import { DomainError, EXIT_CODES, failure, type DomainResult, type JsonObject } from "./domain/errors.js";
 import {
   type GarbageCollectOptions,
+  type CheckpointOptions,
+  type OperationAuthorizationOptions,
   type SessionBackend,
   type SessionCloseOptions,
   type SessionContext,
@@ -28,8 +30,10 @@ const HELP_TEXT = [
   "  session claims       List canonical resource claims",
   "  session release      Release resource claims",
   "  session close        Close the current or selected session",
+  "  authorize            Authorize an operation against concrete claims",
+  "  checkpoint           Capture bounded Git execution evidence",
   "  status               Show Nawabari session status",
-  "  guard [--session id] Authorize the current worktree for mutation",
+  "  guard [--session id] Authorize the current worktree or operation",
   "  gc                   Detect or clean eligible stale sessions",
   "  doctor               Check local Nawabari prerequisites",
   "  --help               Show this help",
@@ -44,6 +48,8 @@ const HELP_TEXT = [
   "  session show|close --session <id>",
   "  session claim|update --session <id> --resource <path-or-glob> --mode <read|write|exclusive-write>",
   "  session claims|release --session <id> [--claim-id <id>]",
+  "  authorize --session <id> --operation <name> --resource <path> [--resource <path>]",
+  "  checkpoint [--session <id>]",
   "  gc [--dry-run|--apply]",
 ].join("\n");
 
@@ -63,6 +69,8 @@ const HELP_DATA: JsonObject = {
     "resource list",
     "resource release",
     "session close",
+    "authorize",
+    "checkpoint",
     "status",
     "guard",
     "gc",
@@ -80,6 +88,8 @@ const HELP_DATA: JsonObject = {
     "--claim-id",
     "--repository",
   ],
+  authorization_options: ["--session", "--operation", "--resource"],
+  checkpoint_options: ["--session"],
   gc_options: ["--apply", "--dry-run"],
 };
 
@@ -104,6 +114,8 @@ type ParsedOptions = {
   base: string | null;
   label: string | null;
   resource: string | null;
+  resources: string[];
+  operation: string | null;
   mode: string | null;
   claim_id: string | null;
   repository: string | null;
@@ -159,6 +171,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     base: null,
     label: null,
     resource: null,
+    resources: [],
+    operation: null,
     mode: null,
     claim_id: null,
     repository: null,
@@ -192,7 +206,10 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--worktree") options.worktree = value;
     else if (name === "--base") options.base = value;
     else if (name === "--label") options.label = value;
-    else if (name === "--resource") options.resource = value;
+    else if (name === "--resource") {
+      options.resource = value;
+      options.resources.push(value);
+    } else if (name === "--operation") options.operation = value;
     else if (name === "--mode") options.mode = value;
     else if (name === "--claim-id") options.claim_id = value;
     else if (name === "--repository") options.repository = value;
@@ -351,6 +368,43 @@ async function executeCommand(
     );
   }
 
+  if (command === "authorize") {
+    const parsed = parseOptions(
+      [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
+      new Set(["--session", "--operation", "--resource"]),
+    );
+    if (!parsed.ok) return parsed;
+    if (parsed.value.operation === null) {
+      return failure(usageError("MISSING_ARGUMENT", "--operation requires a value.", { option: "--operation" }));
+    }
+    if (parsed.value.resources.length === 0) {
+      return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
+    }
+    if (dependencies.backend.authorizeOperation === undefined) return authorizationCapabilityUnavailable();
+    const options: OperationAuthorizationOptions = {
+      session_id: parsed.value.session_id,
+      operation: parsed.value.operation,
+      resources: parsed.value.resources,
+    };
+    const result = await dependencies.backend.authorizeOperation(context, options);
+    if (!result.ok) return result;
+    return result.value.allowed
+      ? { ok: true, value: result.value as unknown as JsonObject }
+      : deniedAuthorization(result.value);
+  }
+
+  if (command === "checkpoint") {
+    const parsed = parseOptions(
+      [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
+      new Set(["--session"]),
+    );
+    if (!parsed.ok) return parsed;
+    if (dependencies.backend.checkpoint === undefined) return checkpointCapabilityUnavailable();
+    const options: CheckpointOptions = { session_id: parsed.value.session_id };
+    const result = await dependencies.backend.checkpoint(context, options);
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  }
+
   if (command === "status") {
     const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
     if (!parsed.ok) return parsed;
@@ -361,9 +415,24 @@ async function executeCommand(
   if (command === "guard") {
     const parsed = parseOptions(
       [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
-      new Set(["--session"]),
+      new Set(["--session", "--operation", "--resource"]),
     );
     if (!parsed.ok) return parsed;
+    if (parsed.value.operation !== null) {
+      if (parsed.value.resources.length === 0) {
+        return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
+      }
+      if (dependencies.backend.authorizeOperation === undefined) return authorizationCapabilityUnavailable();
+      const result = await dependencies.backend.authorizeOperation(context, {
+        session_id: parsed.value.session_id,
+        operation: parsed.value.operation,
+        resources: parsed.value.resources,
+      });
+      if (!result.ok) return result;
+      return result.value.allowed
+        ? { ok: true, value: result.value as unknown as JsonObject }
+        : deniedAuthorization(result.value);
+    }
     const result = await dependencies.backend.guard(context, { session_id: parsed.value.session_id });
     if (!result.ok) return result;
     if (result.value.allowed) return { ok: true, value: result.value as unknown as JsonObject };
@@ -421,6 +490,45 @@ function commandName(commandArguments: string[]): string {
 
 function claimCapabilityUnavailable(operation: string): DomainResult<JsonObject> {
   return failure(new DomainError("BACKEND_UNAVAILABLE", "Resource claim capability is not available.", { operation }));
+}
+
+function authorizationCapabilityUnavailable(): DomainResult<JsonObject> {
+  return failure(
+    new DomainError("BACKEND_UNAVAILABLE", "Operation authorization capability is not available.", {
+      operation: "authorize",
+    }),
+  );
+}
+
+function checkpointCapabilityUnavailable(): DomainResult<JsonObject> {
+  return failure(
+    new DomainError("BACKEND_UNAVAILABLE", "Checkpoint evidence capability is not available.", {
+      operation: "checkpoint",
+    }),
+  );
+}
+
+function deniedAuthorization(
+  decision: import("./domain/session.js").OperationAuthorizationDecision,
+): DomainResult<JsonObject> {
+  const code = decision.code === "ALLOWED" ? "OPERATION_REJECTED" : decision.code;
+  return failure(
+    new DomainError(code, `Operation denied: ${code}.`, {
+      allowed: false,
+      schema_version: decision.schema_version,
+      operation: decision.operation,
+      required_access: decision.required_access,
+      repository: decision.repository,
+      worktree: decision.worktree,
+      branch: decision.branch,
+      session_id: decision.session_id,
+      owner_session_id: decision.owner_session_id,
+      requested_session_id: decision.requested_session_id,
+      state: decision.state,
+      resources: decision.resources,
+      details: decision.details,
+    } as JsonObject),
+  );
 }
 
 function emitFailure(mode: CliMode, command: string, error: DomainError, io: CliIO): number {

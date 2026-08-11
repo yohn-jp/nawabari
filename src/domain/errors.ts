@@ -51,6 +51,9 @@ export type ErrorCode =
   | "WORKTREE_OWNED_BY_OTHER_SESSION"
   | "WORKTREE_ALREADY_EXISTS"
   | "INVALID_CLAIM"
+  | "INVALID_OPERATION"
+  | "INVALID_RESOURCE"
+  | "MISSING_RESOURCE_CLAIM"
   | "INVALID_CLAIM_RESOURCE"
   | "CLAIM_PATH_TRAVERSAL"
   | "CLAIM_SYMLINK_ESCAPE"
@@ -82,7 +85,8 @@ function defaultExitCode(code: ErrorCode): number {
     code === "UNKNOWN_COMMAND" ||
     code === "NO_COMMAND" ||
     code === "INVALID_ARGUMENT" ||
-    code === "MISSING_ARGUMENT"
+    code === "MISSING_ARGUMENT" ||
+    code === "INVALID_OPERATION"
   ) {
     return EXIT_CODES.usage;
   }

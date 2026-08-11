@@ -133,6 +133,41 @@ The orchestrator owns scheduling, prompts, and worker lifetime; Nawabari owns
 only local session identity, worktree/branch ownership, and safe cleanup. No
 Mottainai, GitHub, `gh`, network, or agent-runtime dependency is required.
 
+## Claim-aware operation authorization
+
+`authorize` is the single decision surface for a governed local operation. Its
+versioned vocabulary and required claim access are:
+
+| operation         | required access   |
+| ----------------- | ----------------- |
+| `source-write`    | `write`           |
+| `stage`           | `write`           |
+| `commit`          | `exclusive-write` |
+| `branch-mutation` | `exclusive-write` |
+| `push`            | `exclusive-write` |
+| `cleanup`         | `exclusive-write` |
+
+The request contains a session identity, an operation, and concrete
+repository-relative resources. Nawabari independently verifies the current
+repository, owned worktree, branch, active session, and persisted claims;
+caller-supplied labels do not weaken that decision. The JSON result is the
+automation contract and reports stable allow/deny codes such as
+`MISSING_RESOURCE_CLAIM`, `RESOURCE_CLAIM_CONFLICT`, `INVALID_RESOURCE`, and
+the existing ownership/physical-observation codes.
+
+```bash
+git nawabari authorize --session "$NAWABARI_SESSION_ID" \
+  --operation source-write --resource src/example.ts --json
+```
+
+`checkpoint --json` captures bounded Git-observable `changed`, `staged`,
+`unstaged`, and `untracked` path sets, canonicalizes them through the same
+resource model, and reports `in_claim` and `out_of_claim` paths. Checkpoint
+evidence is limited to the state Git exposes at that instant. Direct
+filesystem activity that is reverted, ignored, or otherwise not observable in
+the Git checkpoint is outside Nawabari's guarantee; this feature is not an
+OS-level filesystem monitor.
+
 ## Physical execution context
 
 Nawabari treats Git and the canonical filesystem as the authority for every

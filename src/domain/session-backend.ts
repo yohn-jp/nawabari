@@ -9,12 +9,16 @@ import { isSessionRegistryError, type RegistryErrorCode, type SessionRegistryErr
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import {
   type BackendCapabilities,
+  type CheckpointEvidence,
+  type CheckpointOptions,
   type ClaimResourcesOptions,
   type ClaimResourcesResult,
   type GarbageCollectOptions,
   type GarbageCollectResult,
   type GuardDecision,
   type GuardOptions,
+  type OperationAuthorizationDecision,
+  type OperationAuthorizationOptions,
   type SessionBackend,
   type SessionCloseOptions,
   type SessionCloseResult,
@@ -81,6 +85,9 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   REGISTRY_LOCK_TIMEOUT: "LOCK_CONTENTION",
   REGISTRY_IO_FAILURE: "REGISTRY_UNREADABLE",
   INVALID_CLAIM: "INVALID_CLAIM",
+  INVALID_OPERATION: "INVALID_OPERATION",
+  INVALID_RESOURCE: "INVALID_RESOURCE",
+  MISSING_RESOURCE_CLAIM: "MISSING_RESOURCE_CLAIM",
   INVALID_CLAIM_RESOURCE: "INVALID_CLAIM_RESOURCE",
   CLAIM_PATH_TRAVERSAL: "CLAIM_PATH_TRAVERSAL",
   CLAIM_SYMLINK_ESCAPE: "CLAIM_SYMLINK_ESCAPE",
@@ -149,6 +156,42 @@ export class LocalSessionBackend implements SessionBackend {
   public async guard(context: SessionContext, options: GuardOptions): Promise<DomainResult<GuardDecision>> {
     try {
       return success(toDomainGuardDecision(this.registryFor(context).guard({ sessionId: options.session_id })));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async authorizeOperation(
+    context: SessionContext,
+    options: OperationAuthorizationOptions,
+  ): Promise<DomainResult<OperationAuthorizationDecision>> {
+    try {
+      return success(
+        toDomainOperationAuthorizationDecision(
+          this.registryFor(context).authorizeOperation({
+            operation: options.operation,
+            resources: options.resources,
+            sessionId: options.session_id,
+          }),
+        ),
+      );
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async checkpoint(
+    context: SessionContext,
+    options: CheckpointOptions,
+  ): Promise<DomainResult<CheckpointEvidence>> {
+    try {
+      return success(
+        toDomainCheckpointEvidence(
+          this.registryFor(context).checkpoint({
+            sessionId: options.session_id,
+          }),
+        ),
+      );
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -313,6 +356,59 @@ function toDomainGuardDecision(decision: import("../session-registry.js").GuardD
     requested_session_id: decision.requestedSessionId,
     state: decision.state,
     details: { ...decision.details },
+  };
+}
+
+function toDomainOperationAuthorizationDecision(
+  decision: import("../session-registry.js").OperationAuthorizationDecision,
+): OperationAuthorizationDecision {
+  return {
+    schema_version: decision.schemaVersion,
+    allowed: decision.allowed,
+    code:
+      decision.code === "ALLOWED"
+        ? "ALLOWED"
+        : (REGISTRY_ERROR_CODE_MAP[decision.code as RegistryErrorCode] ?? "OPERATION_REJECTED"),
+    operation: decision.operation,
+    required_access: decision.requiredAccess,
+    repository: decision.repositoryId,
+    worktree: decision.worktreePath,
+    branch: decision.branchName,
+    session_id: decision.sessionId,
+    owner_session_id: decision.ownerSessionId,
+    requested_session_id: decision.requestedSessionId,
+    state: decision.state,
+    resources: decision.resources.map((resource) => ({
+      resource: resource.resource,
+      claim_ids: [...resource.claimIds],
+    })),
+    details: Object.fromEntries(
+      Object.entries(decision.details).map(([key, value]) => [key, Array.isArray(value) ? [...value] : value]),
+    ) as JsonObject,
+  };
+}
+
+function toDomainCheckpointEvidence(
+  evidence: import("../operation-authorization.js").CheckpointEvidence,
+): CheckpointEvidence {
+  return {
+    schema_version: evidence.schemaVersion,
+    source: evidence.source,
+    guarantee: evidence.guarantee,
+    repository: evidence.repositoryId,
+    worktree: evidence.worktreePath,
+    branch: evidence.branchName,
+    head: evidence.headId,
+    session_id: evidence.sessionId,
+    paths: {
+      changed: [...evidence.paths.changed],
+      staged: [...evidence.paths.staged],
+      unstaged: [...evidence.paths.unstaged],
+      untracked: [...evidence.paths.untracked],
+    },
+    in_claim: [...evidence.inClaim],
+    out_of_claim: [...evidence.outOfClaim],
+    max_paths: evidence.maxPaths,
   };
 }
 
