@@ -801,7 +801,13 @@ export class RepositoryLock {
       );
     }
 
-    await rm(this.reclaimPath, { recursive: true, force: false });
+    try {
+      await rm(this.reclaimPath, { recursive: true, force: false });
+    } catch (error) {
+      if (!isErrorCode(error, "ENOENT")) {
+        throw asLockError(error, "LOCK_IO_ERROR", "Cannot clear stale lock recovery marker", this.options.lockPath);
+      }
+    }
   }
 
   private handleExistingReclaimerSync(): void {
@@ -827,7 +833,13 @@ export class RepositoryLock {
       );
     }
 
-    fs.rmSync(this.reclaimPath, { recursive: true, force: false });
+    try {
+      fs.rmSync(this.reclaimPath, { recursive: true, force: false });
+    } catch (error) {
+      if (!isErrorCode(error, "ENOENT")) {
+        throw asLockError(error, "LOCK_IO_ERROR", "Cannot clear stale lock recovery marker", this.options.lockPath);
+      }
+    }
   }
 
   private async removeCreatedLock(token: string): Promise<void> {

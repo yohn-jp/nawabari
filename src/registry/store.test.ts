@@ -262,11 +262,11 @@ test("persists a codec-owned document visible to another boundary instance", asy
 test("supports the domain registry's explicit common-state paths", async () => {
   await withCommonGitDirectory(async (directory) => {
     const boundary = createBoundary(directory, {
-      registryDirectoryName: "nawabari",
+      registryDirectoryName: "custom-registry-dir",
       registryFileName: "session-registry.json",
       lockFileName: "session-registry.lock",
     });
-    assert.equal(boundary.registryPath, join(directory, "nawabari", "session-registry.json"));
+    assert.equal(boundary.registryPath, join(directory, "custom-registry-dir", "session-registry.json"));
     await boundary.create((draft) => {
       draft.sessions.push(makeRecord("explicit-path"));
     });

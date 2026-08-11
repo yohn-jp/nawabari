@@ -16,8 +16,8 @@ directly.
 npm install -g nawabari
 ```
 
-The package installs the `nawabari` executable, which Git discovers as the
-`git nawabari` external subcommand.
+The package installs `nawabari` for direct use and `git-nawabari` for Git's
+`git nawabari` external subcommand. Both names use the same entry point.
 
 ```bash
 git nawabari --help
