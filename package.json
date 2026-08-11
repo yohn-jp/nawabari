@@ -1,10 +1,11 @@
 {
-  "name": "git-paw",
-  "version": "0.0.1",
-  "description": "A stable local Git session CLI exposed as git paw.",
+  "name": "nawabari",
+  "version": "0.1.0",
+  "description": "A stable local Git session CLI exposed as git nawabari.",
   "type": "module",
   "bin": {
-    "git-paw": "dist/index.js"
+    "nawabari": "dist/index.js",
+    "git-nawabari": "dist/index.js"
   },
   "files": [
     "dist",
@@ -12,7 +13,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node scripts/chmod-bin.mjs",
+    "build": "node scripts/build.mjs",
     "start": "node dist/index.js",
     "test": "node --test --import tsx src/*.test.ts src/**/*.test.ts scripts/**/*.test.mjs",
     "typecheck": "tsc --noEmit",
@@ -36,7 +37,7 @@
     "typescript-eslint": "8.66.0"
   },
   "engines": {
-    "node": ">=22.13"
+    "node": ">=22.13 <25"
   },
   "packageManager": "pnpm@11.18.0",
   "publishConfig": {
@@ -46,11 +47,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yohn-jp/GitPaw.git"
+    "url": "git+https://github.com/yohn-jp/nawabari.git"
   },
-  "homepage": "https://github.com/yohn-jp/GitPaw#readme",
+  "homepage": "https://github.com/yohn-jp/nawabari#readme",
   "bugs": {
-    "url": "https://github.com/yohn-jp/GitPaw/issues"
+    "url": "https://github.com/yohn-jp/nawabari/issues"
   },
   "keywords": []
 }

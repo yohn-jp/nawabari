@@ -12,7 +12,7 @@ import { SessionRegistry } from "./session-registry.js";
 
 test("provision creates one dedicated worktree and one mutable branch", () => {
   const fixture = createRepositoryFixture();
-  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "git-paw-provisioned-one");
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-one");
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const session = registry.provision({
@@ -42,9 +42,9 @@ test("provision creates one dedicated worktree and one mutable branch", () => {
 
 test("provision rejects protected, invalid, and already-owned resources deterministically", () => {
   const fixture = createRepositoryFixture();
-  const firstPath = path.join(path.dirname(fixture.repositoryPath), "git-paw-provisioned-conflict");
-  const externalPath = path.join(path.dirname(fixture.repositoryPath), "git-paw-external-conflict");
-  const existingBranchPath = path.join(path.dirname(fixture.repositoryPath), "git-paw-existing-branch");
+  const firstPath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-conflict");
+  const externalPath = path.join(path.dirname(fixture.repositoryPath), "nawabari-external-conflict");
+  const existingBranchPath = path.join(path.dirname(fixture.repositoryPath), "nawabari-existing-branch");
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const first = registry.provision({ worktreePath: firstPath, branchName: "feature/conflict" });
@@ -52,7 +52,7 @@ test("provision rejects protected, invalid, and already-owned resources determin
     assertRegistryError(
       () =>
         registry.provision({
-          worktreePath: path.join(path.dirname(firstPath), "git-paw-other"),
+          worktreePath: path.join(path.dirname(firstPath), "nawabari-other"),
           branchName: first.branchName,
         }),
       "DUPLICATE_BRANCH_OWNERSHIP",
@@ -68,7 +68,7 @@ test("provision rejects protected, invalid, and already-owned resources determin
     assertRegistryError(
       () =>
         registry.provision({
-          worktreePath: path.join(path.dirname(firstPath), "git-paw-protected-branch"),
+          worktreePath: path.join(path.dirname(firstPath), "nawabari-protected-branch"),
           branchName: "main",
         }),
       "PROTECTED_BRANCH",
@@ -76,7 +76,7 @@ test("provision rejects protected, invalid, and already-owned resources determin
     assertRegistryError(
       () =>
         registry.provision({
-          worktreePath: path.join(path.dirname(firstPath), "git-paw-invalid"),
+          worktreePath: path.join(path.dirname(firstPath), "nawabari-invalid"),
           branchName: "bad name",
         }),
       "INVALID_BRANCH_ID",
@@ -137,7 +137,7 @@ test("provision rejects a symlink to an existing directory before resolving its 
 
 test("a Git provisioning failure leaves no active registry ownership or worktree", () => {
   const fixture = createRepositoryFixture();
-  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "git-paw-provisioned-failure");
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-failure");
   const branchName = "feature/injected-failure";
   try {
     const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
@@ -175,7 +175,7 @@ test("a Git provisioning failure leaves no active registry ownership or worktree
 test("simultaneous provisioning serializes ownership and creates distinct worktrees", { timeout: 30_000 }, async () => {
   const fixture = createRepositoryFixture();
   const worktreePaths = Array.from({ length: 4 }, (_, index) =>
-    path.join(path.dirname(fixture.repositoryPath), `git-paw-provisioned-concurrent-${index}`),
+    path.join(path.dirname(fixture.repositoryPath), `nawabari-provisioned-concurrent-${index}`),
   );
   try {
     const workerModule = new URL("./session-registry.ts", import.meta.url).href;
@@ -204,10 +204,10 @@ interface RepositoryFixture {
 }
 
 function createRepositoryFixture(): RepositoryFixture {
-  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "git-paw-provisioning-"));
+  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-provisioning-"));
   runGit(["init", "-b", "main", repositoryPath], repositoryPath);
-  runGit(["config", "user.email", "git-paw-tests@example.invalid"], repositoryPath);
-  runGit(["config", "user.name", "GitPaw Tests"], repositoryPath);
+  runGit(["config", "user.email", "nawabari-tests@example.invalid"], repositoryPath);
+  runGit(["config", "user.name", "Nawabari Tests"], repositoryPath);
   fs.writeFileSync(path.join(repositoryPath, "README.md"), "fixture\n");
   runGit(["add", "README.md"], repositoryPath);
   runGit(["commit", "-m", "initial"], repositoryPath);
@@ -236,9 +236,9 @@ function runProvisionWorker(
 ): Promise<string> {
   const script = `
     import { SessionRegistry } from ${JSON.stringify(workerModule)};
-    const session = new SessionRegistry({ cwd: process.env.GITPAW_REPOSITORY }).provision({
-      worktreePath: process.env.GITPAW_WORKTREE,
-      branchName: process.env.GITPAW_BRANCH,
+    const session = new SessionRegistry({ cwd: process.env.NAWABARI_REPOSITORY }).provision({
+      worktreePath: process.env.NAWABARI_WORKTREE,
+      branchName: process.env.NAWABARI_BRANCH,
     });
     process.stdout.write(session.sessionId);
   `;
@@ -248,9 +248,9 @@ function runProvisionWorker(
       env: {
         ...process.env,
         NODE_NO_WARNINGS: "1",
-        GITPAW_REPOSITORY: repositoryPath,
-        GITPAW_WORKTREE: worktreePath,
-        GITPAW_BRANCH: branchName,
+        NAWABARI_REPOSITORY: repositoryPath,
+        NAWABARI_WORKTREE: worktreePath,
+        NAWABARI_BRANCH: branchName,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });

@@ -10,6 +10,10 @@ test("accepts the exempt main branch", () => {
   assert.deepEqual(validateBranchName("main"), []);
 });
 
+test("accepts the Nawabari v0.1.0 release branch", () => {
+  assert.deepEqual(validateBranchName("chore/nawabari-0.1.0"), []);
+});
+
 test("rejects a branch missing an issue number", () => {
   assert.equal(validateBranchName("feat/add-init-command").length, 1);
 });

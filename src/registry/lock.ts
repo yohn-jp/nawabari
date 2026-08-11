@@ -1,9 +1,10 @@
 import { hostname as getHostname } from "node:os";
+import fs from "node:fs";
 import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { writeJsonAtomically } from "./atomic.js";
+import { writeJsonAtomically, writeJsonAtomicallySync } from "./atomic.js";
 import { RegistryError } from "./errors.js";
 import { LOCK_SCHEMA_VERSION, type LockOwnerRecord } from "./types.js";
 
@@ -36,12 +37,22 @@ export interface RepositoryLockOptions {
   hostname?: string;
   processStartTime?: string | null;
   clock?: () => number;
+  /** Test seam used to exercise the reclaim/create race deterministically. */
+  beforeReclaimRemove?: () => void | Promise<void>;
+  /** Test seam used to confirm a contender observed an active reclaim marker. */
+  onReclaimMarkerObserved?: () => void;
 }
 
 export interface LockLease {
   readonly token: string;
   readonly owner: LockOwnerRecord;
   release(): Promise<void>;
+}
+
+export interface SyncLockLease {
+  readonly token: string;
+  readonly owner: LockOwnerRecord;
+  release(): void;
 }
 
 const DEFAULT_STALE_AFTER_MS = 5_000;
@@ -62,6 +73,8 @@ interface LockOptionsResolved {
   hostname: string;
   processStartTime: string | null | undefined;
   clock: () => number;
+  beforeReclaimRemove?: () => void | Promise<void>;
+  onReclaimMarkerObserved?: () => void;
 }
 
 type LockInspection = { kind: "wait"; owner?: LockOwnerRecord } | { kind: "stale"; owner: LockOwnerRecord };
@@ -138,6 +151,24 @@ async function readOwner(directory: string): Promise<LockOwnerRecord | undefined
   }
 }
 
+function readOwnerSync(directory: string): LockOwnerRecord | undefined {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(join(directory, "owner.json"), "utf8");
+  } catch (error) {
+    if (isErrorCode(error, "ENOENT")) {
+      return undefined;
+    }
+    throw error;
+  }
+
+  try {
+    return parseLockOwner(JSON.parse(raw) as unknown);
+  } catch {
+    return undefined;
+  }
+}
+
 async function createOwner(options: LockOptionsResolved, now: number): Promise<LockOwnerRecord> {
   return {
     schemaVersion: LOCK_SCHEMA_VERSION,
@@ -146,6 +177,18 @@ async function createOwner(options: LockOptionsResolved, now: number): Promise<L
     hostname: options.hostname,
     processStartTime:
       options.processStartTime === undefined ? await readProcessStartTime(process.pid) : options.processStartTime,
+    acquiredAt: new Date(now).toISOString(),
+  };
+}
+
+function createOwnerSync(options: LockOptionsResolved, now: number): LockOwnerRecord {
+  return {
+    schemaVersion: LOCK_SCHEMA_VERSION,
+    token: randomUUID(),
+    pid: process.pid,
+    hostname: options.hostname,
+    processStartTime:
+      options.processStartTime === undefined ? readProcessStartTimeSync(process.pid) : options.processStartTime,
     acquiredAt: new Date(now).toISOString(),
   };
 }
@@ -172,18 +215,33 @@ export async function readProcessStartTime(pid: number): Promise<string | null> 
   }
 
   try {
-    const raw = await readFile(`/proc/${pid}/stat`, "utf8");
-    const commandEnd = raw.lastIndexOf(")");
-    if (commandEnd === -1) {
-      return null;
-    }
+    return parseProcessStartTime(await readFile(`/proc/${pid}/stat`, "utf8"));
+  } catch {
+    return null;
+  }
+}
 
-    const fields = raw
-      .slice(commandEnd + 1)
-      .trim()
-      .split(/\s+/);
-    const startTime = fields[19];
-    return startTime === undefined || startTime.length === 0 ? null : startTime;
+function parseProcessStartTime(raw: string): string | null {
+  const commandEnd = raw.lastIndexOf(")");
+  if (commandEnd === -1) {
+    return null;
+  }
+
+  const fields = raw
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/);
+  const startTime = fields[19];
+  return startTime === undefined || startTime.length === 0 ? null : startTime;
+}
+
+function readProcessStartTimeSync(pid: number): string | null {
+  if (process.platform !== "linux") {
+    return null;
+  }
+
+  try {
+    return parseProcessStartTime(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
   } catch {
     return null;
   }
@@ -198,6 +256,27 @@ async function ownerLiveness(owner: LockOwnerRecord, localHostname: string): Pro
   }
 
   const currentStartTime = await readProcessStartTime(owner.pid);
+  if (currentStartTime !== null) {
+    return currentStartTime === owner.processStartTime ? "alive" : "dead";
+  }
+
+  try {
+    process.kill(owner.pid, 0);
+    return "unknown";
+  } catch (error) {
+    return isErrorCode(error, "ESRCH") ? "dead" : "unknown";
+  }
+}
+
+function ownerLivenessSync(owner: LockOwnerRecord, localHostname: string): OwnerLiveness {
+  if (owner.hostname !== localHostname || owner.processStartTime === null) {
+    return "unknown";
+  }
+  if (process.platform === "linux" && !/^\d+$/.test(owner.processStartTime)) {
+    return "unknown";
+  }
+
+  const currentStartTime = readProcessStartTimeSync(owner.pid);
   if (currentStartTime !== null) {
     return currentStartTime === owner.processStartTime ? "alive" : "dead";
   }
@@ -243,6 +322,25 @@ class Lease implements LockLease {
   }
 }
 
+class SyncLease implements SyncLockLease {
+  private released = false;
+
+  public constructor(
+    public readonly token: string,
+    public readonly owner: LockOwnerRecord,
+    private readonly releaseLock: (owner: LockOwnerRecord) => void,
+  ) {}
+
+  public release(): void {
+    if (this.released) {
+      return;
+    }
+
+    this.releaseLock(this.owner);
+    this.released = true;
+  }
+}
+
 export class RepositoryLock {
   private readonly options: LockOptionsResolved;
   private readonly reclaimPath: string;
@@ -266,6 +364,8 @@ export class RepositoryLock {
       hostname: options.hostname ?? getHostname(),
       processStartTime: options.processStartTime,
       clock: options.clock ?? Date.now,
+      beforeReclaimRemove: options.beforeReclaimRemove,
+      onReclaimMarkerObserved: options.onReclaimMarkerObserved,
     };
     this.reclaimPath = `${this.options.lockPath}.reclaim`;
   }
@@ -307,7 +407,46 @@ export class RepositoryLock {
     }
   }
 
+  /** Synchronous adapter for the legacy synchronous SessionRegistry API. */
+  public acquireSync(): SyncLockLease {
+    fs.mkdirSync(dirname(this.options.lockPath), { recursive: true, mode: 0o700 });
+    const deadline = this.options.clock() + this.options.acquireTimeoutMs;
+
+    while (true) {
+      const created = this.tryCreateSync();
+      if (created !== undefined) {
+        return created;
+      }
+
+      const inspection = this.inspectExistingSync();
+      if (inspection.kind === "stale") {
+        const reclaimed = this.tryReclaimSync(inspection.owner);
+        if (reclaimed) {
+          continue;
+        }
+      }
+
+      const remaining = deadline - this.options.clock();
+      if (remaining <= 0) {
+        throw new RegistryLockError(
+          "LOCK_BUSY",
+          "Repository registry lock is held by another process",
+          this.options.lockPath,
+          detailsForOwner(inspection.owner),
+          inspection.owner,
+        );
+      }
+
+      waitSync(Math.min(Math.max(this.options.retryDelayMs, 1), remaining));
+    }
+  }
+
   private async tryCreate(): Promise<LockLease | undefined> {
+    if (await this.reclaimMarkerExists()) {
+      this.options.onReclaimMarkerObserved?.();
+      return undefined;
+    }
+
     const now = this.options.clock();
     const owner = await createOwner(this.options, now);
     try {
@@ -317,6 +456,14 @@ export class RepositoryLock {
         return undefined;
       }
       throw asLockError(error, "LOCK_IO_ERROR", "Cannot create repository registry lock", this.options.lockPath);
+    }
+
+    // A reclaimer may have claimed the marker between the first check and
+    // mkdir(). Never publish a new owner while that marker is active.
+    if (await this.reclaimMarkerExists()) {
+      this.options.onReclaimMarkerObserved?.();
+      await rm(this.options.lockPath, { recursive: true, force: true });
+      return undefined;
     }
 
     try {
@@ -329,6 +476,38 @@ export class RepositoryLock {
     }
 
     return new Lease(owner.token, owner, (leaseOwner) => this.release(leaseOwner));
+  }
+
+  private tryCreateSync(): SyncLockLease | undefined {
+    if (this.reclaimMarkerExistsSync()) {
+      this.options.onReclaimMarkerObserved?.();
+      return undefined;
+    }
+
+    const owner = createOwnerSync(this.options, this.options.clock());
+    try {
+      fs.mkdirSync(this.options.lockPath, { mode: 0o700 });
+    } catch (error) {
+      if (isErrorCode(error, "EEXIST")) {
+        return undefined;
+      }
+      throw asLockError(error, "LOCK_IO_ERROR", "Cannot create repository registry lock", this.options.lockPath);
+    }
+
+    if (this.reclaimMarkerExistsSync()) {
+      this.options.onReclaimMarkerObserved?.();
+      fs.rmSync(this.options.lockPath, { recursive: true, force: true });
+      return undefined;
+    }
+
+    try {
+      writeJsonAtomicallySync(join(this.options.lockPath, "owner.json"), owner, { ensureParent: false });
+    } catch (error) {
+      this.removeCreatedLockSync(owner.token);
+      throw asLockError(error, "LOCK_IO_ERROR", "Cannot initialize repository registry lock", this.options.lockPath);
+    }
+
+    return new SyncLease(owner.token, owner, (leaseOwner) => this.releaseSync(leaseOwner));
   }
 
   private async inspectExisting(): Promise<LockInspection> {
@@ -388,6 +567,61 @@ export class RepositoryLock {
     return { kind: "stale", owner };
   }
 
+  private inspectExistingSync(): LockInspection {
+    let lockStats: fs.Stats;
+    try {
+      lockStats = fs.statSync(this.options.lockPath);
+    } catch (error) {
+      if (isErrorCode(error, "ENOENT")) {
+        return { kind: "wait" };
+      }
+      throw asLockError(error, "LOCK_IO_ERROR", "Cannot inspect repository registry lock", this.options.lockPath);
+    }
+
+    const owner = readOwnerSync(this.options.lockPath);
+    const now = this.options.clock();
+    if (owner === undefined) {
+      if (now - lockStats.mtimeMs < this.options.metadataGraceMs) {
+        return { kind: "wait" };
+      }
+      throw new RegistryLockError(
+        "LOCK_INVALID",
+        "Repository registry lock metadata is missing or invalid",
+        this.options.lockPath,
+      );
+    }
+
+    const age = now - Date.parse(owner.acquiredAt);
+    if (!Number.isFinite(age) || age < 0) {
+      throw new RegistryLockError(
+        "LOCK_INVALID",
+        "Repository registry lock timestamp is invalid",
+        this.options.lockPath,
+        detailsForOwner(owner),
+        owner,
+      );
+    }
+    if (age < this.options.staleAfterMs) {
+      return { kind: "wait", owner };
+    }
+
+    const liveness = ownerLivenessSync(owner, this.options.hostname);
+    if (liveness === "alive") {
+      return { kind: "wait", owner };
+    }
+    if (liveness === "unknown") {
+      throw new RegistryLockError(
+        "LOCK_STALE",
+        "Repository registry lock is old but its owner cannot be proven dead",
+        this.options.lockPath,
+        { ...detailsForOwner(owner), reason: "owner_liveness_unknown" },
+        owner,
+      );
+    }
+
+    return { kind: "stale", owner };
+  }
+
   private async tryReclaim(owner: LockOwnerRecord): Promise<boolean> {
     let markerCreated = false;
     try {
@@ -398,7 +632,17 @@ export class RepositoryLock {
         throw asLockError(error, "LOCK_IO_ERROR", "Cannot coordinate stale lock recovery", this.options.lockPath);
       }
 
-      await this.handleExistingReclaimer();
+      try {
+        await this.handleExistingReclaimer();
+      } catch (error) {
+        // An active reclaimer is a normal contention state. Wait for its
+        // marker to disappear; malformed or abandoned metadata still fails
+        // closed through the typed error.
+        if (error instanceof RegistryLockError && error.details.reason === "reclaimer_active") {
+          return false;
+        }
+        throw error;
+      }
       return false;
     }
 
@@ -419,6 +663,24 @@ export class RepositoryLock {
         return false;
       }
 
+      const finalOwner = await readOwner(this.options.lockPath);
+      if (finalOwner === undefined || finalOwner.token !== owner.token) {
+        return false;
+      }
+      const finalAge = this.options.clock() - Date.parse(finalOwner.acquiredAt);
+      if (
+        (await ownerLiveness(finalOwner, this.options.hostname)) !== "dead" ||
+        !Number.isFinite(finalAge) ||
+        finalAge < this.options.staleAfterMs ||
+        !(await this.reclaimMarkerExists())
+      ) {
+        return false;
+      }
+
+      // The marker blocks new creators for the entire interval between the
+      // final owner-token check and removal. This is the TOCTOU boundary.
+      await this.options.beforeReclaimRemove?.();
+
       try {
         await rm(this.options.lockPath, { recursive: true, force: false });
       } catch (error) {
@@ -436,6 +698,82 @@ export class RepositoryLock {
     } finally {
       if (markerCreated) {
         await rm(this.reclaimPath, { recursive: true, force: true });
+      }
+    }
+  }
+
+  private tryReclaimSync(owner: LockOwnerRecord): boolean {
+    let markerCreated = false;
+    try {
+      fs.mkdirSync(this.reclaimPath, { mode: 0o700 });
+      markerCreated = true;
+    } catch (error) {
+      if (!isErrorCode(error, "EEXIST")) {
+        throw asLockError(error, "LOCK_IO_ERROR", "Cannot coordinate stale lock recovery", this.options.lockPath);
+      }
+      try {
+        this.handleExistingReclaimerSync();
+      } catch (error) {
+        if (error instanceof RegistryLockError && error.details.reason === "reclaimer_active") {
+          return false;
+        }
+        throw error;
+      }
+      return false;
+    }
+
+    const reclaimer = createOwnerSync(this.options, this.options.clock());
+    try {
+      writeJsonAtomicallySync(join(this.reclaimPath, "owner.json"), reclaimer, { ensureParent: false });
+
+      const currentOwner = readOwnerSync(this.options.lockPath);
+      if (currentOwner === undefined || currentOwner.token !== owner.token) {
+        return false;
+      }
+      const currentAge = this.options.clock() - Date.parse(currentOwner.acquiredAt);
+      if (ownerLivenessSync(currentOwner, this.options.hostname) !== "dead" || currentAge < this.options.staleAfterMs) {
+        return false;
+      }
+
+      const finalOwner = readOwnerSync(this.options.lockPath);
+      const finalAge = finalOwner === undefined ? Number.NaN : this.options.clock() - Date.parse(finalOwner.acquiredAt);
+      if (
+        finalOwner === undefined ||
+        finalOwner.token !== owner.token ||
+        ownerLivenessSync(finalOwner, this.options.hostname) !== "dead" ||
+        !Number.isFinite(finalAge) ||
+        finalAge < this.options.staleAfterMs ||
+        !this.reclaimMarkerExistsSync()
+      ) {
+        return false;
+      }
+
+      const hookResult = this.options.beforeReclaimRemove?.();
+      if (hookResult !== undefined && typeof (hookResult as Promise<void>).then === "function") {
+        throw new RegistryLockError(
+          "LOCK_IO_ERROR",
+          "Synchronous stale-lock reclaim hook returned a promise",
+          this.options.lockPath,
+        );
+      }
+
+      try {
+        fs.rmSync(this.options.lockPath, { recursive: true, force: false });
+      } catch (error) {
+        if (!isErrorCode(error, "ENOENT")) {
+          throw asLockError(
+            error,
+            "LOCK_IO_ERROR",
+            "Cannot remove stale repository registry lock",
+            this.options.lockPath,
+          );
+        }
+        return false;
+      }
+      return true;
+    } finally {
+      if (markerCreated) {
+        fs.rmSync(this.reclaimPath, { recursive: true, force: true });
       }
     }
   }
@@ -466,12 +804,46 @@ export class RepositoryLock {
     await rm(this.reclaimPath, { recursive: true, force: false });
   }
 
+  private handleExistingReclaimerSync(): void {
+    const reclaimer = readOwnerSync(this.reclaimPath);
+    if (reclaimer === undefined) {
+      throw new RegistryLockError(
+        "LOCK_STALE",
+        "Stale lock recovery is already in progress with invalid metadata",
+        this.options.lockPath,
+        { reason: "reclaimer_invalid" },
+      );
+    }
+
+    const age = this.options.clock() - Date.parse(reclaimer.acquiredAt);
+    const liveness = ownerLivenessSync(reclaimer, this.options.hostname);
+    if (liveness !== "dead" || age < this.options.staleAfterMs) {
+      throw new RegistryLockError(
+        "LOCK_STALE",
+        "Stale lock recovery is already in progress",
+        this.options.lockPath,
+        { reason: "reclaimer_active", reclaimer },
+        reclaimer,
+      );
+    }
+
+    fs.rmSync(this.reclaimPath, { recursive: true, force: false });
+  }
+
   private async removeCreatedLock(token: string): Promise<void> {
     const owner = await readOwner(this.options.lockPath);
-    if (owner?.token !== token) {
+    if (owner !== undefined && owner.token !== token) {
       return;
     }
     await rm(this.options.lockPath, { recursive: true, force: true });
+  }
+
+  private removeCreatedLockSync(token: string): void {
+    const owner = readOwnerSync(this.options.lockPath);
+    if (owner !== undefined && owner.token !== token) {
+      return;
+    }
+    fs.rmSync(this.options.lockPath, { recursive: true, force: true });
   }
 
   private async release(owner: LockOwnerRecord): Promise<void> {
@@ -522,4 +894,82 @@ export class RepositoryLock {
       );
     }
   }
+
+  private releaseSync(owner: LockOwnerRecord): void {
+    const currentOwner = readOwnerSync(this.options.lockPath);
+    if (currentOwner === undefined) {
+      try {
+        fs.statSync(this.options.lockPath);
+      } catch (error) {
+        if (isErrorCode(error, "ENOENT")) {
+          return;
+        }
+        throw new RegistryLockError(
+          "LOCK_RELEASE_FAILED",
+          "Cannot verify repository registry lock during release",
+          this.options.lockPath,
+          { cause: error instanceof Error ? error.message : String(error) },
+          owner,
+        );
+      }
+      throw new RegistryLockError(
+        "LOCK_RELEASE_FAILED",
+        "Repository registry lock metadata disappeared during release",
+        this.options.lockPath,
+        {},
+        owner,
+      );
+    }
+
+    if (currentOwner.token !== owner.token) {
+      throw new RegistryLockError(
+        "LOCK_RELEASE_FAILED",
+        "Repository registry lock is owned by another token",
+        this.options.lockPath,
+        detailsForOwner(currentOwner),
+        currentOwner,
+      );
+    }
+
+    try {
+      fs.rmSync(this.options.lockPath, { recursive: true, force: false });
+    } catch (error) {
+      throw new RegistryLockError(
+        "LOCK_RELEASE_FAILED",
+        "Cannot release repository registry lock",
+        this.options.lockPath,
+        { cause: error instanceof Error ? error.message : String(error) },
+        owner,
+      );
+    }
+  }
+
+  private async reclaimMarkerExists(): Promise<boolean> {
+    try {
+      await stat(this.reclaimPath);
+      return true;
+    } catch (error) {
+      if (isErrorCode(error, "ENOENT")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private reclaimMarkerExistsSync(): boolean {
+    try {
+      fs.statSync(this.reclaimPath);
+      return true;
+    } catch (error) {
+      if (isErrorCode(error, "ENOENT")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+}
+
+function waitSync(milliseconds: number): void {
+  const buffer = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(buffer, 0, 0, milliseconds);
 }
