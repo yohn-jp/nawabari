@@ -237,6 +237,96 @@ test("gc marks stale dirty sessions but does not remove recoverable work", () =>
   }
 });
 
+test("gc recovers an externally removed prunable worktree and permits branch reuse", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-prunable-worktree`;
+  let now = new Date("2026-01-01T00:00:00.000Z");
+  try {
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      clock: () => now,
+      staleAfterMs: 24 * 60 * 60 * 1_000,
+    });
+    const session = registry.provision({ worktreePath, branchName: "feature/prunable-worktree" });
+
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    const worktreeList = runGit(["worktree", "list", "--porcelain"], fixture.repositoryPath).split(/\r?\n/u);
+    assert.equal(worktreeList.includes(`worktree ${worktreePath}`), true);
+    assert.equal(
+      worktreeList.some((line) => line.startsWith("prunable ")),
+      true,
+    );
+
+    const detected = registry.garbageCollect({ apply: false });
+    assert.deepEqual(
+      detected.candidates.map((candidate) => candidate.sessionId),
+      [session.sessionId],
+    );
+    assert.equal(detected.cleaned.length, 0);
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+
+    const applied = registry.garbageCollect({ apply: true });
+    assert.deepEqual(
+      applied.candidates.map((candidate) => candidate.sessionId),
+      [session.sessionId],
+    );
+    assert.deepEqual(
+      applied.cleaned.map((cleaned) => cleaned.sessionId),
+      [session.sessionId],
+    );
+    assert.equal(applied.blocked.length, 0);
+    assert.equal(applied.cleaned[0]?.state, "closed");
+    assert.equal(registry.get(session.sessionId)?.state, "closed");
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+
+    const repeated = registry.garbageCollect({ apply: true });
+    assert.deepEqual(repeated.candidates, []);
+    assert.deepEqual(repeated.cleaned, []);
+    assert.deepEqual(repeated.blocked, []);
+
+    const reused = registry.provision({ worktreePath, branchName: session.branchName });
+    assert.notEqual(reused.sessionId, session.sessionId);
+    assert.equal(reused.state, "active");
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("close succeeds when multiple prunable worktree entries exist alongside the session worktree", () => {
+  const fixture = createRepositoryFixture();
+  const sessionWorktreePath = `${fixture.repositoryPath}-session-prunable`;
+  const externalWorktreePath1 = `${fixture.repositoryPath}-external-prunable-1`;
+  const externalWorktreePath2 = `${fixture.repositoryPath}-external-prunable-2`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath: sessionWorktreePath, branchName: "feature/session-prunable" });
+
+    runGit(["worktree", "add", "-b", "feature/external-1", externalWorktreePath1], fixture.repositoryPath);
+    runGit(["worktree", "add", "-b", "feature/external-2", externalWorktreePath2], fixture.repositoryPath);
+
+    fs.rmSync(externalWorktreePath1, { recursive: true, force: true });
+    fs.rmSync(externalWorktreePath2, { recursive: true, force: true });
+
+    const worktreeList = runGit(["worktree", "list", "--porcelain"], fixture.repositoryPath).split(/\r?\n/u);
+    const prunableLines = worktreeList.filter((line) => line.startsWith("prunable "));
+    assert.equal(prunableLines.length >= 2, true, "Expected at least two prunable worktree entries");
+
+    const result = registry.close(session.sessionId);
+    assert.equal(result.session.state, "closed");
+    assert.equal(result.worktreeRemoved, true);
+    assert.equal(result.branchRemoved, true);
+    assert.equal(fs.existsSync(sessionWorktreePath), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+  } finally {
+    removeWorktree(fixture.repositoryPath, sessionWorktreePath);
+    removeWorktree(fixture.repositoryPath, externalWorktreePath1);
+    removeWorktree(fixture.repositoryPath, externalWorktreePath2);
+    fixture.cleanup();
+  }
+});
+
 interface RepositoryFixture {
   readonly repositoryPath: string;
   cleanup(): void;

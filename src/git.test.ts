@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
-import { normalizeBranchId, resolveRepositoryContext, resolveWorktreeIdentity } from "./git.js";
+import { listGitWorktrees, normalizeBranchId, resolveRepositoryContext, resolveWorktreeIdentity } from "./git.js";
 
 test("resolves the same repository identity from linked worktrees", () => {
   const fixture = createRepositoryFixture();
@@ -57,6 +57,38 @@ test("rejects a lock-suffixed component in a branch identity", () => {
     () => normalizeBranchId("feature/locked.lock/name"),
     (error: unknown) => error instanceof SessionRegistryError && error.code === "INVALID_BRANCH_ID",
   );
+});
+
+test("preserves prunable status from Git's porcelain worktree inventory", () => {
+  const prunablePath = "/tmp/nawabari-prunable-parser";
+  const healthyPath = "/tmp/nawabari-healthy-parser";
+  const output = [
+    `worktree ${prunablePath}`,
+    "HEAD 0123456789012345678901234567890123456789",
+    "branch refs/heads/feature/prunable",
+    "prunable gitdir file points to non-existent location",
+    "",
+    `worktree ${healthyPath}`,
+    "HEAD 0123456789012345678901234567890123456789",
+    "branch refs/heads/main",
+    "",
+  ].join("\n");
+
+  const worktrees = listGitWorktrees(
+    {
+      run(args: readonly string[], cwd: string): string {
+        assert.deepEqual(args, ["worktree", "list", "--porcelain"]);
+        assert.equal(cwd, process.cwd());
+        return output;
+      },
+    },
+    process.cwd(),
+  );
+
+  assert.deepEqual(worktrees, [
+    { worktreePath: path.resolve(prunablePath), branchName: "feature/prunable", prunable: true },
+    { worktreePath: path.resolve(healthyPath), branchName: "main", prunable: false },
+  ]);
 });
 
 interface RepositoryFixture {

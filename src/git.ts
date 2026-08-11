@@ -24,6 +24,7 @@ export interface WorktreeIdentity {
 export interface GitWorktreeInfo {
   readonly worktreePath: string;
   readonly branchName: string | null;
+  readonly prunable: boolean;
 }
 
 export interface ResolveRepositoryOptions {
@@ -113,12 +114,20 @@ export function listGitWorktrees(git: GitCommandRunner, cwd: string): readonly G
   const entries: GitWorktreeInfo[] = [];
   let currentPath: string | undefined;
   let currentBranch: string | null = null;
+  let currentPrunable = false;
 
   const flush = (): void => {
     if (currentPath === undefined) return;
-    entries.push(Object.freeze({ worktreePath: canonicalListedPath(currentPath), branchName: currentBranch }));
+    entries.push(
+      Object.freeze({
+        worktreePath: canonicalListedPath(currentPath),
+        branchName: currentBranch,
+        prunable: currentPrunable,
+      }),
+    );
     currentPath = undefined;
     currentBranch = null;
+    currentPrunable = false;
   };
 
   for (const line of output.split(/\r?\n/u)) {
@@ -132,6 +141,10 @@ export function listGitWorktrees(git: GitCommandRunner, cwd: string): readonly G
       if (branchId.startsWith("refs/heads/")) {
         currentBranch = branchId.slice("refs/heads/".length);
       }
+      continue;
+    }
+    if (line === "prunable" || line.startsWith("prunable ")) {
+      currentPrunable = true;
     }
   }
   flush();

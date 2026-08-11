@@ -643,9 +643,9 @@ export class SessionRegistry {
     let worktreeRemoved = false;
     let branchRemoved = false;
 
-    if (resources.worktreePresent && resources.removeWorktree) {
+    if (resources.removeWorktree) {
       removeSessionWorktree(this.git, resources.gitCwd, record.worktreePath);
-      worktreeRemoved = true;
+      worktreeRemoved = resources.worktreePresent;
     }
 
     if (resources.branchPresent && resources.removeBranch) {
@@ -670,8 +670,8 @@ export class SessionRegistry {
     const git = this.git;
     const worktrees = listGitWorktrees(git, this.repository.worktreePath);
     const gitCwd =
-      worktrees.find((worktree) => !samePath(worktree.worktreePath, record.worktreePath))?.worktreePath ??
-      this.repository.worktreePath;
+      worktrees.find((worktree) => !worktree.prunable && !samePath(worktree.worktreePath, record.worktreePath))
+        ?.worktreePath ?? this.repository.worktreePath;
     const registeredWorktree = worktrees.find((worktree) => samePath(worktree.worktreePath, record.worktreePath));
     const branchWorktree = worktrees.find((worktree) => worktree.branchName === record.branchName);
 
@@ -686,15 +686,21 @@ export class SessionRegistry {
       });
     }
 
-    const pathEntry = lstatIfPresent(record.worktreePath);
-    if (registeredWorktree === undefined && pathEntry !== undefined) {
+    const worktreeState = inspectWorktreeState(record.worktreePath, worktrees);
+    if (worktreeState.kind === "unregistered-present") {
       throw ownershipMismatch(record, "The session worktree path exists but is not a Git worktree");
     }
-    if (pathEntry !== undefined && (pathEntry.isSymbolicLink() || !pathEntry.isDirectory())) {
+    if (worktreeState.kind === "invalid") {
       throw ownershipMismatch(record, "The session worktree path is not a directory worktree");
     }
+    if (worktreeState.kind === "registered-missing") {
+      throw ownershipMismatch(record, "The registered worktree path is missing without a prunable Git entry");
+    }
+    if (worktreeState.kind === "prunable-present") {
+      throw ownershipMismatch(record, "Git marks the worktree prunable but its physical path still exists");
+    }
 
-    const worktreePresent = registeredWorktree !== undefined;
+    const worktreePresent = worktreeState.kind === "healthy";
     const branchPresent = localBranchExists(git, this.repository.worktreePath, record.branchId);
     if (worktreePresent) {
       if (!branchPresent || registeredWorktree?.branchName !== record.branchName) {
@@ -711,13 +717,14 @@ export class SessionRegistry {
       gitCwd,
       worktreePresent,
       branchPresent,
-      removeWorktree: worktreePresent && !worktreeProtection,
+      removeWorktree: registeredWorktree !== undefined && !worktreeProtection,
       removeBranch,
     };
   }
 
   private protectedWorktree(worktreePath: string, worktrees: readonly GitWorktreeInfo[]): boolean {
-    const defaultWorktreePath = worktrees[0]?.worktreePath ?? this.repository.worktreePath;
+    const defaultWorktreePath =
+      worktrees.find((worktree) => !worktree.prunable)?.worktreePath ?? this.repository.worktreePath;
     const configured = this.protectedWorktreePaths.map((candidate) =>
       resolvePotentialWorktreePath(candidate, this.repository.worktreePath),
     );
@@ -784,7 +791,8 @@ export class SessionRegistry {
         path.join(this.worktreeRoot, `${path.basename(this.repository.worktreePath)}-${sessionId}`),
       this.repository.worktreePath,
     );
-    const defaultWorktreePath = worktrees[0]?.worktreePath ?? this.repository.worktreePath;
+    const defaultWorktreePath =
+      worktrees.find((worktree) => !worktree.prunable)?.worktreePath ?? this.repository.worktreePath;
     const configuredProtectedWorktrees = [
       ...this.protectedWorktreePaths,
       ...(options.protectedWorktreePaths ?? []),
@@ -1014,9 +1022,55 @@ function isStaleCandidate(
   if (record.state === "closed") return false;
   if (record.state === "stale" || record.state === "closing") return true;
   const age = Date.parse(now) - Date.parse(record.updatedAt);
-  const worktreePresent = worktrees.some((worktree) => samePath(worktree.worktreePath, record.worktreePath));
-  const pathEntryPresent = lstatIfPresent(record.worktreePath) !== undefined;
-  return age >= staleAfterMs || (!worktreePresent && !pathEntryPresent);
+  const worktreeState = inspectWorktreeState(record.worktreePath, worktrees);
+  const physicallyMissing =
+    worktreeState.kind === "prunable-missing" ||
+    worktreeState.kind === "registered-missing" ||
+    worktreeState.kind === "unregistered-missing";
+  return age >= staleAfterMs || physicallyMissing;
+}
+
+type WorktreePhysicalState =
+  | "healthy"
+  | "prunable-missing"
+  | "unregistered-missing"
+  | "registered-missing"
+  | "prunable-present"
+  | "unregistered-present"
+  | "invalid";
+
+interface WorktreeInspection {
+  readonly kind: WorktreePhysicalState;
+  readonly entry: GitWorktreeInfo | undefined;
+  readonly pathEntry: fs.Stats | undefined;
+}
+
+function inspectWorktreeState(worktreePath: string, worktrees: readonly GitWorktreeInfo[]): WorktreeInspection {
+  const entry = worktrees.find((worktree) => samePath(worktree.worktreePath, worktreePath));
+  const pathEntry = lstatIfPresent(worktreePath);
+
+  if (pathEntry !== undefined && (pathEntry.isSymbolicLink() || !pathEntry.isDirectory())) {
+    return { kind: "invalid", entry, pathEntry };
+  }
+  if (entry === undefined) {
+    return {
+      kind: pathEntry === undefined ? "unregistered-missing" : "unregistered-present",
+      entry,
+      pathEntry,
+    };
+  }
+  if (entry.prunable) {
+    return {
+      kind: pathEntry === undefined ? "prunable-missing" : "prunable-present",
+      entry,
+      pathEntry,
+    };
+  }
+  return {
+    kind: pathEntry === undefined ? "registered-missing" : "healthy",
+    entry,
+    pathEntry,
+  };
 }
 
 function replaceRecord(records: readonly SessionRecord[], replacement: SessionRecord): SessionRecord[] {
@@ -1186,7 +1240,7 @@ function resolveDefaultBranchName(
   configured: string | undefined,
 ): string | undefined {
   if (configured !== undefined) return configured;
-  const integrationBranch = worktrees[0]?.branchName;
+  const integrationBranch = worktrees.find((worktree) => !worktree.prunable)?.branchName;
   if (integrationBranch !== null && integrationBranch !== undefined) return integrationBranch;
 
   try {
