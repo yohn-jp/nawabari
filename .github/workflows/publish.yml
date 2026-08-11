@@ -132,10 +132,22 @@ jobs:
 
       - name: Check namespace and version immediately before publish
         run: |
-          if npm view nawabari >/dev/null 2>&1; then
-            echo "nawabari already exists; refusing a namespace collision" >&2
+          if ! status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --connect-timeout 10 --max-time 30 https://registry.npmjs.org/nawabari)"; then
+            echo "could not verify npm namespace availability" >&2
             exit 1
           fi
+          case "$status" in
+            404) ;;
+            200)
+              echo "nawabari already exists; refusing a namespace collision" >&2
+              exit 1
+              ;;
+            *)
+              echo "npm namespace lookup returned HTTP $status" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Publish validated tarball
         env:
