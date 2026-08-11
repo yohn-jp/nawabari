@@ -3,12 +3,24 @@
 // is a preflight only; it must finish before the irreversible publish command.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 const tarballPath = process.argv[2];
 const publishDryRun = process.argv.includes("--publish-dry-run");
 if (tarballPath === undefined) throw new Error("usage: validate-release-tarball.mjs <tarball> [--publish-dry-run]");
 if (!fs.existsSync(tarballPath)) throw new Error(`tarball not found: ${tarballPath}`);
+
+const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const expectedName = "nawabari";
+const expectedVersion = packageJson.version;
+const expectedTarballName = `${expectedName}-${expectedVersion}.tgz`;
+if (packageJson.name !== expectedName || typeof expectedVersion !== "string" || expectedVersion.length === 0) {
+  throw new Error("repository package.json must define the nawabari package name and a non-empty version");
+}
+if (path.basename(tarballPath) !== expectedTarballName) {
+  throw new Error(`tarball filename must be ${expectedTarballName}, got ${path.basename(tarballPath)}`);
+}
 
 function run(command, args) {
   const result = spawnSync(command, args, { encoding: "utf8" });
@@ -20,8 +32,10 @@ function run(command, args) {
 }
 
 const metadata = JSON.parse(run("tar", ["-xOf", tarballPath, "package/package.json"]).stdout);
-if (metadata.name !== "nawabari" || metadata.version !== "0.1.0") {
-  throw new Error(`tarball metadata must be nawabari@0.1.0, got ${metadata.name}@${metadata.version}`);
+if (metadata.name !== expectedName || metadata.version !== expectedVersion) {
+  throw new Error(
+    `tarball metadata must be ${expectedName}@${expectedVersion}, got ${metadata.name}@${metadata.version}`,
+  );
 }
 if (metadata.bin?.nawabari !== "dist/index.js" || metadata.bin?.["git-nawabari"] !== "dist/index.js") {
   throw new Error("tarball must expose nawabari and git-nawabari from dist/index.js");
