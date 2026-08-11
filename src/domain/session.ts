@@ -221,6 +221,7 @@ export type GarbageCollectBlocked = {
   code: ErrorCode;
   message: string;
   details: JsonObject;
+  recovery_hints: string[];
 };
 
 export type GarbageCollectResult = {

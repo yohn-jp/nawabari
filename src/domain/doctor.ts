@@ -10,7 +10,7 @@ import { success, type DomainResult, type ErrorCode, type JsonObject } from "./e
 export type DoctorCheckStatus = "ok" | "warning" | "error" | "not_configured" | "not_applicable";
 
 export type DoctorCheck = {
-  name: "git" | "repository" | "registry" | "runtime";
+  name: "git" | "repository" | "registry" | "reconciliation" | "runtime";
   status: DoctorCheckStatus;
   code: ErrorCode | null;
   message: string;
@@ -96,6 +96,43 @@ async function inspectRegistry(repository: RepositoryInfo, context: RepositoryCo
   }
 }
 
+async function inspectReconciliation(context: RepositoryContext): Promise<DoctorCheck> {
+  try {
+    const result = new SessionRegistry({ repository: context, git: defaultGit }).reconcile();
+    const issues = result.issues.map((issue) => ({
+      code: issue.code,
+      message: issue.message,
+      session_id: issue.sessionId,
+      worktree: issue.worktreePath,
+      branch: issue.branchName,
+      details: { ...issue.details },
+      recovery_hints: [...issue.recoveryHints],
+    }));
+    return check(
+      "reconciliation",
+      result.clean ? "ok" : "warning",
+      result.clean ? null : "RECONCILIATION_DRIFT",
+      result.clean
+        ? "Registry session ownership matches the observed Git worktree state."
+        : "Registry/Git ownership drift is present; no destructive repair was performed.",
+      {
+        clean: result.clean,
+        sessions: result.sessions.length,
+        worktrees: result.worktrees.length,
+        issues,
+      },
+    );
+  } catch (error: unknown) {
+    return check(
+      "reconciliation",
+      "error",
+      doctorErrorCode(error, "REGISTRY_UNREADABLE"),
+      "Authoritative registry/Git reconciliation could not be completed.",
+      { ...(isSessionRegistryError(error) ? { reason: error.code, ...error.details } : {}) },
+    );
+  }
+}
+
 export async function runDoctor(cwd = process.cwd()): Promise<DomainResult<DoctorReport>> {
   const checks: DoctorCheck[] = [];
   const runtimeOk = supportsRuntime(process.versions.node);
@@ -138,7 +175,18 @@ export async function runDoctor(cwd = process.cwd()): Promise<DomainResult<Docto
         common_dir: repository.common_dir,
       }),
     );
-    checks.push(await inspectRegistry(repository, context));
+    const registryCheck = await inspectRegistry(repository, context);
+    checks.push(registryCheck);
+    checks.push(
+      registryCheck.status === "ok"
+        ? await inspectReconciliation(context)
+        : check(
+            "reconciliation",
+            "not_applicable",
+            null,
+            "Reconciliation was skipped because the registry is invalid.",
+          ),
+    );
   } catch (error: unknown) {
     checks.push(
       check(
@@ -174,6 +222,7 @@ function doctorErrorCode(error: unknown, fallback: ErrorCode): ErrorCode {
   if (code === "INVALID_BRANCH_ID") return "INVALID_BRANCH";
   if (code === "INVALID_WORKTREE_PATH") return "INVALID_WORKTREE";
   if (code === "WORKTREE_IDENTITY_AMBIGUOUS") return "GIT_STATE_AMBIGUOUS";
+  if (code === "RECONCILIATION_DRIFT") return "RECONCILIATION_DRIFT";
   return fallback;
 }
 

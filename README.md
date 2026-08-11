@@ -52,7 +52,18 @@ state, and commits not proven reachable from the integration branch block
 destructive cleanup. A clean close releases only the owned worktree and
 branch, and repeating close is idempotent. `gc` detects stale or interrupted
 sessions; `--apply` uses the same close safety checks and reports blocked
-sessions instead of guessing.
+sessions instead of guessing. `gc --dry-run` performs the same non-mutating
+cleanup preflight and includes stable blocker codes and `recovery_hints` for
+every candidate that is not safe. Cleanup revalidates the physical worktree,
+branch, and `HEAD` observations immediately before each destructive Git
+operation.
+
+`doctor` includes a non-destructive `reconciliation` check. It reports
+registry/Git ownership drift, including missing or prunable worktrees and
+unregistered physical worktrees, without repairing or deleting anything.
+Callers that use the TypeScript authority directly can request the same
+machine-readable result with `SessionRegistry#cleanupDecision` and
+`SessionRegistry#reconcile`.
 
 ## Session resource claims
 
