@@ -5,11 +5,13 @@ import fs from "node:fs";
 
 const REQUIRED_SECTIONS = ["## Summary", "## Validation"];
 const CLOSING_KEYWORD_PATTERN = /\b(closes|fixes|resolves)\s+#\d+/iu;
+const RELEASE_BRANCH_PATTERN = /^release\/\d+\.\d+\.\d+$/;
 
-export function validatePullRequest({ title, body }) {
+export function validatePullRequest({ title, body, headRef }) {
   const errors = [];
   if (!title || title.trim().length === 0) errors.push("PR title must not be empty");
-  if (!CLOSING_KEYWORD_PATTERN.test(body ?? "")) {
+  const isReleaseBranch = RELEASE_BRANCH_PATTERN.test(headRef ?? "");
+  if (!isReleaseBranch && !CLOSING_KEYWORD_PATTERN.test(body ?? "")) {
     errors.push('PR body must link a closing Issue (e.g. "Closes #123")');
   }
   for (const section of REQUIRED_SECTIONS) {
@@ -25,7 +27,11 @@ function main() {
   const pullRequest = event.pull_request;
   if (!pullRequest) throw new Error("event has no pull_request");
 
-  const { errors } = validatePullRequest({ title: pullRequest.title ?? "", body: pullRequest.body ?? "" });
+  const { errors } = validatePullRequest({
+    title: pullRequest.title ?? "",
+    body: pullRequest.body ?? "",
+    headRef: pullRequest.head?.ref ?? "",
+  });
   if (errors.length > 0) {
     for (const error of errors) console.error(error);
     process.exitCode = 1;

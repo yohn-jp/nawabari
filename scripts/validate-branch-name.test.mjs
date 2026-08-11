@@ -21,3 +21,11 @@ test("rejects a branch missing an issue number", () => {
 test("rejects an unknown type prefix", () => {
   assert.equal(validateBranchName("wip/42-add-init-command").length, 1);
 });
+
+test("accepts a release/<semver> branch", () => {
+  assert.deepEqual(validateBranchName("release/0.1.0"), []);
+});
+
+test("rejects a release branch with a non-semver suffix", () => {
+  assert.equal(validateBranchName("release/nawabari-0.1.0").length, 1);
+});
