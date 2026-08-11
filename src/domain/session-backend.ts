@@ -84,8 +84,11 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   SESSION_ID_COLLISION: "OPERATION_REJECTED",
   SESSION_NOT_FOUND: "SESSION_NOT_FOUND",
   DIRTY_WORKTREE: "DIRTY_WORKTREE",
+  NESTED_REPOSITORY: "NESTED_REPOSITORY",
   OWNERSHIP_MISMATCH: "OWNERSHIP_MISMATCH",
   RECOVERABLE_COMMITS: "RECOVERABLE_COMMITS",
+  RECOVERABLE_STASHES: "RECOVERABLE_STASHES",
+  RECONCILIATION_DRIFT: "RECONCILIATION_DRIFT",
   REGISTRY_LOCK_TIMEOUT: "LOCK_CONTENTION",
   REGISTRY_IO_FAILURE: "REGISTRY_UNREADABLE",
   INVALID_CLAIM: "INVALID_CLAIM",
@@ -492,6 +495,7 @@ function toDomainGarbageCollectResult(result: RegistryGarbageCollectResult): Gar
       code: REGISTRY_ERROR_CODE_MAP[blocked.code],
       message: blocked.message,
       details: { ...blocked.details },
+      recovery_hints: [...blocked.recoveryHints],
     })),
   };
 }

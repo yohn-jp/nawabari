@@ -61,6 +61,8 @@ export const REGISTRY_DIRECTORY_NAME = "nawabari";
 export const REGISTRY_FILE_NAME = "session-registry.json";
 export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
 export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
+export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
+export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
 
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
@@ -118,6 +120,7 @@ export interface GarbageCollectBlocked {
   readonly code: RegistryErrorCode;
   readonly message: string;
   readonly details: RegistryErrorDetails;
+  readonly recoveryHints: readonly string[];
 }
 
 export interface GarbageCollectResult {
@@ -125,6 +128,56 @@ export interface GarbageCollectResult {
   readonly candidates: readonly SessionRecord[];
   readonly cleaned: readonly SessionRecord[];
   readonly blocked: readonly GarbageCollectBlocked[];
+}
+
+export interface CleanupBlocker {
+  readonly code: RegistryErrorCode;
+  readonly message: string;
+  readonly details: RegistryErrorDetails;
+  readonly recoveryHints: readonly string[];
+}
+
+export interface CleanupDecision {
+  readonly schemaVersion: typeof CLEANUP_DECISION_SCHEMA_VERSION;
+  readonly operation: "cleanup";
+  readonly allowed: boolean;
+  readonly code: "ALLOWED" | RegistryErrorCode;
+  readonly repositoryId: string;
+  readonly worktreePath: string;
+  readonly branchName: string;
+  readonly session: SessionRecord;
+  readonly claims: readonly ResourceClaim[];
+  readonly physicalState: string;
+  readonly blockers: readonly CleanupBlocker[];
+  readonly recoveryHints: readonly string[];
+}
+
+export type ReconciliationSessionStatus = "healthy" | "candidate" | "drift" | "closed";
+
+export interface ReconciliationSession {
+  readonly session: SessionRecord;
+  readonly status: ReconciliationSessionStatus;
+  readonly physicalState: string;
+  readonly blockers: readonly CleanupBlocker[];
+}
+
+export interface ReconciliationIssue {
+  readonly code: RegistryErrorCode;
+  readonly message: string;
+  readonly sessionId: string | null;
+  readonly worktreePath: string | null;
+  readonly branchName: string | null;
+  readonly details: RegistryErrorDetails;
+  readonly recoveryHints: readonly string[];
+}
+
+export interface ReconciliationResult {
+  readonly schemaVersion: typeof RECONCILIATION_SCHEMA_VERSION;
+  readonly repositoryId: string;
+  readonly worktrees: readonly GitWorktreeInfo[];
+  readonly sessions: readonly ReconciliationSession[];
+  readonly issues: readonly ReconciliationIssue[];
+  readonly clean: boolean;
 }
 
 export interface ClaimResourcesOptions {
@@ -1306,6 +1359,98 @@ export class SessionRegistry {
     return this.checkpoint(options);
   }
 
+  /**
+   * Produce the authoritative, non-mutating cleanup decision for one session.
+   * The decision observes registry claims and current Git/filesystem state in
+   * one repository-locked read; it never repairs drift or removes resources.
+   */
+  cleanupDecision(sessionIdOrOptions?: string | null | CloseSessionOptions): CleanupDecision {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const requestedSessionId =
+        typeof sessionIdOrOptions === "object" && sessionIdOrOptions !== null
+          ? (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id)
+          : sessionIdOrOptions;
+      const sessionId = requestedSessionId ?? this.resolveOwnerSession(state.sessions).sessionId;
+      assertSessionId(sessionId);
+      const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+      if (record === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      return this.cleanupDecisionUnsafe(record, state);
+    });
+  }
+
+  /** Compatibility alias for callers that name the same authority an assessment. */
+  assessCleanup(sessionIdOrOptions?: string | null | CloseSessionOptions): CleanupDecision {
+    return this.cleanupDecision(sessionIdOrOptions);
+  }
+
+  /**
+   * Reconcile registry ownership with Git's physical worktree inventory.
+   * This is deliberately diagnostic-only: no stale metadata is repaired and
+   * no physical resource is removed by this method.
+   */
+  reconcile(): ReconciliationResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
+      const now = toTimestamp(this.clock());
+      const sessions = state.sessions.map((record) => this.reconcileSessionUnsafe(record, worktrees, now));
+      const issues: ReconciliationIssue[] = [];
+      for (const item of sessions) {
+        for (const blocker of item.blockers) {
+          issues.push({
+            code: blocker.code,
+            message: blocker.message,
+            sessionId: item.session.sessionId,
+            worktreePath: item.session.worktreePath,
+            branchName: item.session.branchName,
+            details: blocker.details,
+            recoveryHints: blocker.recoveryHints,
+          });
+        }
+      }
+
+      const recordedPaths = new Set(
+        state.sessions.filter((record) => ACTIVE_STATES.has(record.state)).map((record) => record.worktreePath),
+      );
+      const recordedBranches = new Set(
+        state.sessions.filter((record) => ACTIVE_STATES.has(record.state)).map((record) => record.branchName),
+      );
+      for (const worktree of worktrees) {
+        if (recordedPaths.has(worktree.worktreePath) || recordedBranches.has(worktree.branchName ?? "")) continue;
+        if (this.protectedWorktree(worktree.worktreePath, worktrees)) continue;
+        issues.push({
+          code: "OWNERSHIP_MISMATCH",
+          message: "Git reports a worktree with no active Nawabari owner",
+          sessionId: null,
+          worktreePath: worktree.worktreePath,
+          branchName: worktree.branchName,
+          details: {
+            worktree: worktree.worktreePath,
+            branch: worktree.branchName ?? "<detached>",
+            prunable: worktree.prunable,
+          },
+          recoveryHints: recoveryHintsForCode("OWNERSHIP_MISMATCH"),
+        });
+      }
+
+      return Object.freeze({
+        schemaVersion: RECONCILIATION_SCHEMA_VERSION,
+        repositoryId: this.repository.repositoryId,
+        worktrees: Object.freeze(worktrees.map((worktree) => Object.freeze({ ...worktree }))),
+        sessions: Object.freeze(sessions),
+        issues: Object.freeze(issues),
+        clean: issues.length === 0,
+      });
+    });
+  }
+
+  reconcileState(): ReconciliationResult {
+    return this.reconcile();
+  }
+
   /** Close one session only after its ownership and recoverability are proven safe. */
   close(sessionIdOrOptions?: string | null | CloseSessionOptions): CloseSessionResult {
     return this.withLock(() => {
@@ -1339,17 +1484,26 @@ export class SessionRegistry {
         .filter((record) => isStaleCandidate(record, now, staleAfterMs, worktrees))
         .map(cloneSessionRecord);
 
-      if (!apply || candidates.length === 0) {
+      const blocked: GarbageCollectBlocked[] = [];
+      if (!apply) {
+        for (const candidate of candidates) {
+          const current = records.find((record) => record.sessionId === candidate.sessionId);
+          if (current === undefined || current.state === "closed") continue;
+          try {
+            this.assertCleanupAllowed(current, state);
+          } catch (error: unknown) {
+            blocked.push(toGarbageCollectBlocked(candidate.sessionId, error));
+          }
+        }
         return {
           apply,
           candidates,
           cleaned: [],
-          blocked: [],
+          blocked,
         };
       }
 
       const cleaned: SessionRecord[] = [];
-      const blocked: GarbageCollectBlocked[] = [];
       for (const candidate of candidates) {
         const current = records.find((record) => record.sessionId === candidate.sessionId);
         if (current === undefined || current.state === "closed") continue;
@@ -1365,13 +1519,7 @@ export class SessionRegistry {
           const result = this.closeUnsafe(candidate.sessionId);
           cleaned.push(result.session);
         } catch (error: unknown) {
-          if (!(error instanceof SessionRegistryError)) throw error;
-          blocked.push({
-            sessionId: candidate.sessionId,
-            code: error.code,
-            message: error.message,
-            details: error.details,
-          });
+          blocked.push(toGarbageCollectBlocked(candidate.sessionId, error));
         }
         const updatedState = this.readStateUnsafe();
         records = [...updatedState.sessions];
@@ -1588,13 +1736,29 @@ export class SessionRegistry {
     let branchRemoved = false;
 
     if (resources.removeWorktree) {
-      removeSessionWorktree(this.git, resources.gitCwd, record.worktreePath);
-      worktreeRemoved = resources.worktreePresent;
+      const revalidated = this.inspectCleanupResources(record);
+      assertSameCleanupObservation(resources, revalidated, "worktree-remove");
+      if (revalidated.removeWorktree) {
+        removeSessionWorktree(this.git, revalidated.gitCwd, record.worktreePath);
+        worktreeRemoved = revalidated.worktreePresent;
+      }
     }
 
-    if (resources.branchPresent && resources.removeBranch) {
-      removeSessionBranch(this.git, resources.gitCwd, record.branchName);
-      branchRemoved = true;
+    // Once the owned worktree has been removed, the original registry cwd may
+    // no longer exist. Reobserve Git from the stable integration/peer cwd that
+    // was selected during the authoritative preflight.
+    const branchWorktrees = listGitWorktrees(this.git, resources.gitCwd);
+    const branchResources = this.inspectCleanupResources(record, branchWorktrees);
+    if (branchResources.branchPresent && branchResources.removeBranch) {
+      const branchRevalidated = this.inspectCleanupResources(
+        record,
+        listGitWorktrees(this.git, branchResources.gitCwd),
+      );
+      assertSameCleanupObservation(branchResources, branchRevalidated, "branch-remove");
+      if (branchRevalidated.branchPresent && branchRevalidated.removeBranch) {
+        removeSessionBranch(this.git, branchRevalidated.gitCwd, record.branchName);
+        branchRemoved = true;
+      }
     }
 
     const closedRecord = transitionSessionState(closingRecord, "closed", this.clock);
@@ -1613,9 +1777,12 @@ export class SessionRegistry {
     };
   }
 
-  private inspectCleanupResources(record: SessionRecord): CleanupResources {
+  private inspectCleanupResources(
+    record: SessionRecord,
+    observedWorktrees: readonly GitWorktreeInfo[] = listGitWorktrees(this.git, this.repository.worktreePath),
+  ): CleanupResources {
     const git = this.git;
-    const worktrees = listGitWorktrees(git, this.repository.worktreePath);
+    const worktrees = observedWorktrees;
     const gitCwd =
       worktrees.find((worktree) => !worktree.prunable && !samePath(worktree.worktreePath, record.worktreePath))
         ?.worktreePath ?? this.repository.worktreePath;
@@ -1648,7 +1815,7 @@ export class SessionRegistry {
     }
 
     const worktreePresent = worktreeState.kind === "healthy";
-    const branchPresent = localBranchExists(git, this.repository.worktreePath, record.branchId);
+    const branchPresent = localBranchExists(git, gitCwd, record.branchId);
     if (worktreePresent) {
       if (!branchPresent || registeredWorktree?.branchName !== record.branchName) {
         throw ownershipMismatch(record, "The registered worktree no longer has the owned local branch");
@@ -1656,17 +1823,133 @@ export class SessionRegistry {
       assertWorktreeClean(git, record.worktreePath);
     }
 
+    assertNoRecoverableStashes(git, gitCwd, record.branchName);
+
     const worktreeProtection = this.protectedWorktree(record.worktreePath, worktrees);
-    const branchProtection = this.protectedBranch(record.branchName, worktrees);
-    const removeBranch = branchPresent && !branchProtection && this.branchIsReachableFromIntegration(record);
+    const branchProtection = this.protectedBranch(record.branchName, worktrees, gitCwd);
+    const removeBranch = branchPresent && !branchProtection && this.branchIsReachableFromIntegration(record, gitCwd);
 
     return {
       gitCwd,
+      physicalState: worktreeState.kind,
+      registeredBranch: registeredWorktree?.branchName ?? null,
+      branchWorktree: branchWorktree?.worktreePath ?? null,
+      worktreeHead: worktreePresent ? readCurrentHead(git, record.worktreePath) : null,
       worktreePresent,
       branchPresent,
       removeWorktree: registeredWorktree !== undefined && !worktreeProtection,
       removeBranch,
     };
+  }
+
+  private cleanupDecisionUnsafe(record: SessionRecord, state: RegistryState): CleanupDecision {
+    let physicalState = "unavailable";
+    let blockers: readonly CleanupBlocker[] = [];
+    try {
+      const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
+      physicalState = inspectWorktreeState(record.worktreePath, worktrees).kind;
+      this.inspectCleanupResources(record, worktrees);
+    } catch (error: unknown) {
+      blockers = [toCleanupBlocker(error)];
+    }
+    const claims = state.claims.filter((claim) => claim.sessionId === record.sessionId).map(cloneResourceClaim);
+    const recoveryHints = sortStrings(blockers.flatMap((blocker) => blocker.recoveryHints));
+    return Object.freeze({
+      schemaVersion: CLEANUP_DECISION_SCHEMA_VERSION,
+      operation: "cleanup" as const,
+      allowed: blockers.length === 0,
+      code: blockers[0]?.code ?? ("ALLOWED" as const),
+      repositoryId: this.repository.repositoryId,
+      worktreePath: record.worktreePath,
+      branchName: record.branchName,
+      session: cloneSessionRecord(record),
+      claims: Object.freeze(claims),
+      physicalState,
+      blockers: Object.freeze(blockers),
+      recoveryHints: Object.freeze(recoveryHints),
+    });
+  }
+
+  private assertCleanupAllowed(record: SessionRecord, state: RegistryState): void {
+    const decision = this.cleanupDecisionUnsafe(record, state);
+    if (decision.allowed) return;
+    const blocker = decision.blockers[0];
+    if (blocker === undefined) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Cleanup was denied without a blocker");
+    }
+    throw new SessionRegistryError(blocker.code, blocker.message, blocker.details);
+  }
+
+  private reconcileSessionUnsafe(
+    record: SessionRecord,
+    worktrees: readonly GitWorktreeInfo[],
+    now: string,
+  ): ReconciliationSession {
+    const physical = inspectWorktreeState(record.worktreePath, worktrees);
+    if (record.state === "closed") {
+      try {
+        const branchPresent = localBranchExists(this.git, this.repository.worktreePath, record.branchId);
+        if (physical.entry !== undefined || physical.pathEntry !== undefined || branchPresent) {
+          const error = ownershipMismatch(record, "A closed session still has a physical Git resource", {
+            physicalState: physical.kind,
+            branchPresent,
+          });
+          return {
+            session: cloneSessionRecord(record),
+            status: "drift",
+            physicalState: physical.kind,
+            blockers: [toCleanupBlocker(error)],
+          };
+        }
+      } catch (error: unknown) {
+        return {
+          session: cloneSessionRecord(record),
+          status: "drift",
+          physicalState: physical.kind,
+          blockers: [toCleanupBlocker(error)],
+        };
+      }
+      return {
+        session: cloneSessionRecord(record),
+        status: "closed",
+        physicalState: physical.kind,
+        blockers: [],
+      };
+    }
+
+    try {
+      this.inspectCleanupResources(record, worktrees);
+      if (physical.kind === "prunable-missing") {
+        const error = new SessionRegistryError(
+          "MISSING_WORKTREE",
+          "Git has a prunable entry for a missing session worktree",
+          {
+            sessionId: record.sessionId,
+            worktree: record.worktreePath,
+            prunable: true,
+          },
+        );
+        return {
+          session: cloneSessionRecord(record),
+          status: "candidate",
+          physicalState: physical.kind,
+          blockers: [toCleanupBlocker(error)],
+        };
+      }
+      return {
+        session: cloneSessionRecord(record),
+        status: isStaleCandidate(record, now, this.staleAfterMs, worktrees) ? "candidate" : "healthy",
+        physicalState: physical.kind,
+        blockers: [],
+      };
+    } catch (error: unknown) {
+      return {
+        session: cloneSessionRecord(record),
+        status: "drift",
+        physicalState: physical.kind,
+        blockers: [toCleanupBlocker(error)],
+      };
+    }
   }
 
   private protectedWorktree(worktreePath: string, worktrees: readonly GitWorktreeInfo[]): boolean {
@@ -1680,13 +1963,12 @@ export class SessionRegistry {
     );
   }
 
-  private protectedBranch(branchName: string, worktrees: readonly GitWorktreeInfo[]): boolean {
-    const defaultBranchName = resolveDefaultBranchName(
-      this.git,
-      this.repository.worktreePath,
-      worktrees,
-      this.defaultBranchName,
-    );
+  private protectedBranch(
+    branchName: string,
+    worktrees: readonly GitWorktreeInfo[],
+    gitCwd = this.repository.worktreePath,
+  ): boolean {
+    const defaultBranchName = resolveDefaultBranchName(this.git, gitCwd, worktrees, this.defaultBranchName);
     const protectedBranchIds = [
       ...(defaultBranchName === undefined ? [] : [normalizeBranchId(defaultBranchName)]),
       ...this.protectedBranchNames.map((candidate) => normalizeBranchId(candidate)),
@@ -1694,35 +1976,31 @@ export class SessionRegistry {
     return protectedBranchIds.includes(normalizeBranchId(branchName));
   }
 
-  private branchIsReachableFromIntegration(record: SessionRecord): boolean {
+  private branchIsReachableFromIntegration(record: SessionRecord, gitCwd = this.repository.worktreePath): boolean {
     const git = this.git;
-    const worktrees = listGitWorktrees(git, this.repository.worktreePath);
-    const defaultBranchName = resolveDefaultBranchName(
-      git,
-      this.repository.worktreePath,
-      worktrees,
-      this.defaultBranchName,
-    );
+    const worktrees = listGitWorktrees(git, gitCwd);
+    const defaultBranchName = resolveDefaultBranchName(git, gitCwd, worktrees, this.defaultBranchName);
     if (defaultBranchName === undefined) {
       throw new SessionRegistryError(
         "RECOVERABLE_COMMITS",
         `Cannot prove that commits on ${record.branchName} are safely retained: no integration branch is known`,
-        { branch: record.branchName },
+        { branch: record.branchName, recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS") },
       );
     }
     if (normalizeBranchId(defaultBranchName) === record.branchId) return true;
     try {
-      git.run(
-        ["merge-base", "--is-ancestor", record.branchId, normalizeBranchId(defaultBranchName)],
-        this.repository.worktreePath,
-      );
+      git.run(["merge-base", "--is-ancestor", record.branchId, normalizeBranchId(defaultBranchName)], gitCwd);
       return true;
     } catch (error: unknown) {
       if (isExpectedGitLookupFailure(error)) {
         throw new SessionRegistryError(
           "RECOVERABLE_COMMITS",
           `Commits on ${record.branchName} are not proven reachable from ${defaultBranchName}`,
-          { branch: record.branchName, integrationBranch: defaultBranchName },
+          {
+            branch: record.branchName,
+            integrationBranch: defaultBranchName,
+            recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
+          },
           error,
         );
       }
@@ -1946,6 +2224,10 @@ interface MutationResult<T> {
 
 interface CleanupResources {
   readonly gitCwd: string;
+  readonly physicalState: WorktreePhysicalState;
+  readonly registeredBranch: string | null;
+  readonly branchWorktree: string | null;
+  readonly worktreeHead: string | null;
   readonly worktreePresent: boolean;
   readonly branchPresent: boolean;
   readonly removeWorktree: boolean;
@@ -2038,7 +2320,92 @@ function ownershipMismatch(
     worktree: record.worktreePath,
     branch: record.branchName,
     ...details,
+    ...(details.recoveryHints === undefined ? { recoveryHints: recoveryHintsForCode("OWNERSHIP_MISMATCH") } : {}),
   });
+}
+
+function recoveryHintsForCode(code: RegistryErrorCode): string[] {
+  switch (code) {
+    case "DIRTY_WORKTREE":
+      return ["Preserve, commit, or explicitly recover tracked and untracked changes, then retry cleanup."];
+    case "NESTED_REPOSITORY":
+      return ["Inspect and explicitly preserve or remove the nested repository before retrying cleanup."];
+    case "RECOVERABLE_COMMITS":
+      return ["Retain or merge the session branch commits into an authoritative local branch before retrying cleanup."];
+    case "RECOVERABLE_STASHES":
+      return ["Inspect and explicitly apply, export, or drop the session stash before retrying cleanup."];
+    case "MISSING_WORKTREE":
+      return ["Run the authoritative GC apply path after confirming the Git worktree entry is prunable and missing."];
+    case "OWNERSHIP_MISMATCH":
+      return ["Reconcile registry and Git ownership, then retry only after the physical owner is unambiguous."];
+    case "GIT_STATE_AMBIGUOUS":
+    case "PHYSICAL_OBSERVATION_UNAVAILABLE":
+      return ["Restore a stable, observable Git/worktree state and rerun reconciliation before cleanup."];
+    case "PROTECTED_WORKTREE":
+    case "PROTECTED_BRANCH":
+      return ["Use the owner of the protected integration resource; do not delete it as a session resource."];
+    case "STALE_REGISTRY":
+      return ["Reconcile the lifecycle record under the repository mutation lock before retrying cleanup."];
+    default:
+      return ["Resolve the reported blocker and retry the same Nawabari cleanup operation."];
+  }
+}
+
+function toCleanupBlocker(error: unknown): CleanupBlocker {
+  if (!(error instanceof SessionRegistryError)) throw error;
+  const supplied = error.details.recoveryHints;
+  const recoveryHints = Array.isArray(supplied)
+    ? supplied.filter((hint): hint is string => typeof hint === "string")
+    : recoveryHintsForCode(error.code);
+  return Object.freeze({
+    code: error.code,
+    message: error.message,
+    details: error.details,
+    recoveryHints: Object.freeze(recoveryHints),
+  });
+}
+
+function toGarbageCollectBlocked(sessionId: string, error: unknown): GarbageCollectBlocked {
+  const blocker = toCleanupBlocker(error);
+  return Object.freeze({
+    sessionId,
+    code: blocker.code,
+    message: blocker.message,
+    details: blocker.details,
+    recoveryHints: blocker.recoveryHints,
+  });
+}
+
+function assertSameCleanupObservation(
+  expected: CleanupResources,
+  actual: CleanupResources,
+  phase: "worktree-remove" | "branch-remove",
+): void {
+  if (
+    expected.physicalState !== actual.physicalState ||
+    expected.registeredBranch !== actual.registeredBranch ||
+    expected.branchWorktree !== actual.branchWorktree ||
+    expected.worktreeHead !== actual.worktreeHead ||
+    expected.worktreePresent !== actual.worktreePresent ||
+    expected.branchPresent !== actual.branchPresent ||
+    expected.removeWorktree !== actual.removeWorktree ||
+    expected.removeBranch !== actual.removeBranch
+  ) {
+    throw new SessionRegistryError(
+      "GIT_STATE_AMBIGUOUS",
+      "Cleanup physical observations changed before destructive mutation",
+      {
+        phase,
+        expectedPhysicalState: expected.physicalState,
+        actualPhysicalState: actual.physicalState,
+        expectedWorktree: expected.branchWorktree ?? "<none>",
+        actualWorktree: actual.branchWorktree ?? "<none>",
+        expectedHead: expected.worktreeHead ?? "<none>",
+        actualHead: actual.worktreeHead ?? "<none>",
+        recoveryHints: recoveryHintsForCode("GIT_STATE_AMBIGUOUS"),
+      },
+    );
+  }
 }
 
 type GuardDecisionBase = Omit<GuardDecision, "allowed" | "code" | "details">;
@@ -2441,15 +2808,76 @@ function sortStrings(values: Iterable<string>): string[] {
 }
 
 function assertWorktreeClean(git: GitCommandRunner, worktreePath: string): void {
-  // Ignore build/cache artifacts owned by the repository's .gitignore. Git's
-  // default status still reports tracked edits and recoverable untracked files.
-  const status = git.run(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=no"], worktreePath);
-  if (status.length > 0) {
-    throw new SessionRegistryError("DIRTY_WORKTREE", `Worktree contains recoverable changes: ${worktreePath}`, {
-      worktree: worktreePath,
-      status,
-    });
+  // Git is authoritative for this decision. --ignored=no means ignored or
+  // generated artifacts alone are intentionally absent from the blocker set.
+  const checkpoint = captureGitCheckpoint(git, worktreePath);
+  if (checkpoint.changed.length === 0) return;
+
+  const nested = nestedRepositoryPaths(worktreePath, checkpoint.changed);
+  if (nested.length > 0) {
+    throw new SessionRegistryError(
+      "NESTED_REPOSITORY",
+      `Worktree contains nested repositories that require explicit recovery: ${worktreePath}`,
+      {
+        worktree: worktreePath,
+        paths: [...checkpoint.changed],
+        nestedRepositories: nested,
+        recoveryHints: recoveryHintsForCode("NESTED_REPOSITORY"),
+      },
+    );
   }
+
+  const untracked = new Set(checkpoint.untracked);
+  const tracked = checkpoint.changed.filter((resource) => !untracked.has(resource));
+  throw new SessionRegistryError("DIRTY_WORKTREE", `Worktree contains recoverable changes: ${worktreePath}`, {
+    worktree: worktreePath,
+    paths: [...checkpoint.changed],
+    trackedPaths: tracked,
+    untrackedPaths: [...checkpoint.untracked],
+    stagedPaths: [...checkpoint.staged],
+    unstagedPaths: [...checkpoint.unstaged],
+    recoveryHints: recoveryHintsForCode("DIRTY_WORKTREE"),
+  });
+}
+
+function nestedRepositoryPaths(worktreePath: string, untracked: readonly string[]): string[] {
+  const nested = new Set<string>();
+  for (const resource of untracked) {
+    const absolute = path.resolve(worktreePath, resource);
+    const relative = path.relative(worktreePath, absolute);
+    if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) continue;
+    const components = relative.split(path.sep).filter((component) => component.length > 0);
+    let current = worktreePath;
+    for (const component of components) {
+      current = path.join(current, component);
+      const stat = lstatIfPresent(current);
+      if (stat?.isDirectory() !== true) continue;
+      if (lstatIfPresent(path.join(current, ".git")) !== undefined) {
+        nested.add(components.join("/"));
+        break;
+      }
+    }
+  }
+  return sortStrings(nested);
+}
+
+function assertNoRecoverableStashes(git: GitCommandRunner, cwd: string, branchName: string): void {
+  const output = git.run(["stash", "list", "--format=%H%x00%gs"], cwd);
+  const matching = output
+    .split(/\r?\n/u)
+    .filter((line) => {
+      const separator = line.indexOf("\u0000");
+      const subject = separator === -1 ? line : line.slice(separator + 1);
+      return subject.includes(`on ${branchName}:`) || subject.includes(`On ${branchName}:`);
+    })
+    .map((line) => line.split("\u0000", 1)[0])
+    .filter((hash) => hash.length > 0);
+  if (matching.length === 0) return;
+  throw new SessionRegistryError("RECOVERABLE_STASHES", `Session branch has recoverable stashes: ${branchName}`, {
+    branch: branchName,
+    stashes: matching,
+    recoveryHints: recoveryHintsForCode("RECOVERABLE_STASHES"),
+  });
 }
 
 function removeSessionWorktree(git: GitCommandRunner, cwd: string, worktreePath: string): void {
