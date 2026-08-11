@@ -418,6 +418,9 @@ async function executeCommand(
       new Set(["--session", "--operation", "--resource"]),
     );
     if (!parsed.ok) return parsed;
+    if (parsed.value.resources.length > 0 && parsed.value.operation === null) {
+      return failure(usageError("MISSING_ARGUMENT", "--operation is required when --resource is provided.", { option: "--operation" }));
+    }
     if (parsed.value.operation !== null) {
       if (parsed.value.resources.length === 0) {
         return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));

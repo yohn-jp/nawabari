@@ -1,4 +1,5 @@
 import type { ResourceClaimMode } from "./resource-claims.js";
+import type { RegistryErrorCode } from "./errors.js";
 
 /** Version of the local operation vocabulary and its access policy. */
 export const OPERATION_AUTHORIZATION_SCHEMA_VERSION = 1 as const;
@@ -29,7 +30,12 @@ export const OPERATION_REQUIRED_ACCESS: Readonly<Record<OperationName, ResourceC
   cleanup: "exclusive-write",
 });
 
-export type OperationAuthorizationCode = "ALLOWED" | "INVALID_OPERATION" | "MISSING_RESOURCE_CLAIM";
+/**
+ * Complete decision vocabulary: the operation-authorization-specific codes
+ * plus every RegistryErrorCode, since any registry error encountered while
+ * authorizing an operation is propagated verbatim as the denial code.
+ */
+export type OperationAuthorizationCode = "ALLOWED" | "OPERATION_REJECTED" | RegistryErrorCode;
 
 export function isOperationName(value: unknown): value is OperationName {
   return typeof value === "string" && (OPERATION_VOCABULARY as readonly string[]).includes(value);
@@ -63,7 +69,7 @@ export interface AuthorizedResource {
 export interface OperationAuthorizationDecision {
   readonly schemaVersion: typeof OPERATION_AUTHORIZATION_SCHEMA_VERSION;
   readonly allowed: boolean;
-  readonly code: OperationAuthorizationCode | string;
+  readonly code: OperationAuthorizationCode;
   readonly operation: string;
   readonly requiredAccess: ResourceClaimMode | null;
   readonly repositoryId: string;

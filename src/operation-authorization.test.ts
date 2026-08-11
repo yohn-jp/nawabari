@@ -8,11 +8,12 @@ import { test } from "node:test";
 import { runCli } from "./cli.js";
 import {
   CHECKPOINT_MAX_PATHS,
+  claimModeGrantsAccess,
   OPERATION_REQUIRED_ACCESS,
   OPERATION_VOCABULARY,
   requiredAccessForOperation,
 } from "./operation-authorization.js";
-import { SessionRegistry, toPersistedSessionRecord } from "./session-registry.js";
+import { SessionRegistry, toPersistedSessionRecord, REGISTRY_SCHEMA_VERSION, RESOURCE_CLAIM_SCHEMA_VERSION } from "./session-registry.js";
 
 test("the versioned operation vocabulary has an explicit access mapping", () => {
   assert.deepEqual(OPERATION_VOCABULARY, ["source-write", "stage", "commit", "branch-mutation", "push", "cleanup"]);
@@ -56,6 +57,19 @@ test("one registry authority authorizes every operation class against concrete c
         [resource],
       );
     }
+
+    const exclusiveWriteOperation = OPERATION_VOCABULARY.find((op) => requiredAccessForOperation(op) === "exclusive-write");
+    assert.ok(exclusiveWriteOperation !== undefined, "expected at least one exclusive-write operation");
+    const deniedDecision = new SessionRegistry({ cwd: worktreePath }).authorizeOperation({
+      operation: exclusiveWriteOperation,
+      resources: ["write.txt"],
+      sessionId: session.sessionId,
+    });
+    assert.equal(deniedDecision.allowed, false);
+    assert.equal(deniedDecision.code, "MISSING_RESOURCE_CLAIM");
+    assert.ok(claimModeGrantsAccess("write", "write"));
+    assert.ok(!claimModeGrantsAccess("write", "exclusive-write"));
+    assert.ok(claimModeGrantsAccess("exclusive-write", "write"));
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });
@@ -106,10 +120,10 @@ test("authorization fails closed for missing/stale sessions, context mismatch, a
       registry.paths.registry,
       `${JSON.stringify(
         {
-          schema_version: 1,
+          schema_version: REGISTRY_SCHEMA_VERSION,
           repository_id: registry.repository.repositoryId,
           sessions: [toPersistedSessionRecord(staleRecord), toPersistedSessionRecord(second)],
-          claims_schema_version: 1,
+          claims_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
           claims: [],
         },
         null,
@@ -230,6 +244,8 @@ test("CLI exposes deterministic JSON for authorization and checkpoint evidence",
     assert.equal(authorization.ok, true);
     assert.equal(authorization.command, "authorize");
     assert.equal(authorization.code, "ALLOWED");
+    assert.ok(typeof authorization.schema_version === "number");
+    assert.equal(authorization.required_access, "write");
 
     const checkpointOutput: string[] = [];
     const checkpointExit = await runCli(["checkpoint", "--session", session.sessionId, "--json"], {
@@ -241,6 +257,9 @@ test("CLI exposes deterministic JSON for authorization and checkpoint evidence",
     assert.equal(checkpoint.ok, true);
     assert.equal(checkpoint.command, "checkpoint");
     assert.deepEqual((checkpoint.paths as { changed: string[] }).changed, ["README.md"]);
+    assert.ok(typeof checkpoint.schema_version === "number");
+    assert.ok(Array.isArray(checkpoint.out_of_claim));
+    assert.equal(typeof checkpoint.head, "string");
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });

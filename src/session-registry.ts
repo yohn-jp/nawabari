@@ -48,6 +48,7 @@ import {
   type CheckpointOptions,
   type AuthorizedResource,
   type OperationAuthorizationDecision,
+  type OperationAuthorizationCode,
   type OperationAuthorizationOptions,
 } from "./operation-authorization.js";
 
@@ -943,6 +944,10 @@ export class SessionRegistry {
       };
 
       const resources = canonicalOperationResources(options.resources, physical.worktreePath);
+      // Authorization decision is advisory only. Claims may change between this
+      // read and actual commit/push execution. Stale-decision handling is deferred
+      // to future commit/push execution path; this PR adds no locking, revalidation,
+      // claim-version tokens, or mutation logic.
       const state = this.readStateUnsafe();
       const activeSessionIds = new Set(
         state.sessions.filter((record) => record.state === "active").map((record) => record.sessionId),
@@ -1818,7 +1823,7 @@ function deniedGuard(
 type OperationDecisionBase = Omit<OperationAuthorizationDecision, "details">;
 
 function deniedOperation(
-  code: string,
+  code: OperationAuthorizationCode,
   base: OperationDecisionBase,
   details: RegistryErrorDetails,
 ): OperationAuthorizationDecision {
@@ -1861,11 +1866,33 @@ function canonicalOperationResources(resources: readonly string[], worktreePath:
 }
 
 function canonicalObservedPaths(paths: readonly string[], worktreePath: string): readonly string[] {
-  return canonicalOperationResources(paths, worktreePath);
+  const canonical = new Set<string>();
+  for (const resource of paths) {
+    if (typeof resource !== "string" || resource.length === 0) {
+      continue;
+    }
+    try {
+      // Git-observed paths are concrete repository-relative paths reported by Git.
+      // They may contain literal * or ? characters in filenames (not wildcards).
+      // Canonicalize and bounds-check them without rejecting metacharacters.
+      // If canonicalization encounters traversal, symlink escape, or invalid
+      // syntax, skip the path so it is reported as outOfClaim rather than throwing.
+      canonical.add(canonicalizeClaimResource(resource, worktreePath));
+    } catch (error: unknown) {
+      // Let observed paths that fail canonicalization appear in the outOfClaim
+      // set rather than causing checkpoint to throw. This ensures Git-reported
+      // paths with unusual names or structure are observable in evidence.
+      if (error instanceof SessionRegistryError) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  return Object.freeze(sortStrings(canonical));
 }
 
 function sortStrings(values: Iterable<string>): string[] {
-  return [...new Set(values)].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  return [...new Set(values)].sort(compareCodePointStrings);
 }
 
 function assertWorktreeClean(git: GitCommandRunner, worktreePath: string): void {

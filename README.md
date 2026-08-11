@@ -155,6 +155,10 @@ automation contract and reports stable allow/deny codes such as
 `MISSING_RESOURCE_CLAIM`, `RESOURCE_CLAIM_CONFLICT`, `INVALID_RESOURCE`, and
 the existing ownership/physical-observation codes.
 
+**`authorize` returns an authorization decision only; it does NOT execute the
+operation itself.** Commits, pushes, and all other local operations remain
+outside this feature.
+
 ```bash
 git nawabari authorize --session "$NAWABARI_SESSION_ID" \
   --operation source-write --resource src/example.ts --json
