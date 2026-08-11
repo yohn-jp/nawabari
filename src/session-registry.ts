@@ -15,8 +15,29 @@ import {
 import { SessionRegistryError, type RegistryErrorCode, type RegistryErrorDetails } from "./errors.js";
 import { generateSessionId, isSessionId } from "./session-id.js";
 import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
+import {
+  assertCanonicalClaimResource,
+  canonicalClaimId,
+  canonicalizeClaimInput,
+  claimError,
+  claimsConflict,
+  claimsOverlap,
+  cloneResourceClaim,
+  compareCodePointStrings,
+  createResourceClaim,
+  isResourceClaimMode,
+  RESOURCE_CLAIM_SCHEMA_VERSION,
+  sortResourceClaims,
+  type ClaimOwnerContext,
+  type ResourceClaim,
+  type ResourceClaimInput,
+  type ResourceClaimMode,
+} from "./resource-claims.js";
+
+export type { ResourceClaim } from "./resource-claims.js";
 
 export const REGISTRY_SCHEMA_VERSION = 1 as const;
+export { RESOURCE_CLAIM_SCHEMA_VERSION };
 export const REGISTRY_DIRECTORY_NAME = "nawabari";
 export const REGISTRY_FILE_NAME = "session-registry.json";
 export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
@@ -87,6 +108,44 @@ export interface GarbageCollectResult {
   readonly blocked: readonly GarbageCollectBlocked[];
 }
 
+export interface ClaimResourcesOptions {
+  readonly sessionId?: string | null;
+  readonly session_id?: string | null;
+  readonly claims: readonly ResourceClaimInput[];
+  readonly repositoryId?: string;
+  readonly repository_id?: string;
+}
+
+export interface UpdateClaimsOptions extends ClaimResourcesOptions {}
+
+export interface ReleaseClaimsOptions {
+  readonly sessionId?: string | null;
+  readonly session_id?: string | null;
+  readonly claimIds?: readonly string[];
+  readonly claim_ids?: readonly string[];
+}
+
+export interface ClaimResourcesResult {
+  readonly session: SessionRecord;
+  readonly claims: readonly ResourceClaim[];
+  readonly added: readonly ResourceClaim[];
+  readonly released: readonly ResourceClaim[];
+  readonly idempotent: boolean;
+}
+
+export interface ReleaseClaimsResult {
+  readonly sessionId: string;
+  readonly released: readonly ResourceClaim[];
+  readonly remaining: readonly ResourceClaim[];
+  readonly idempotent: boolean;
+}
+
+export interface RegistryMigrationResult {
+  readonly migrated: boolean;
+  readonly registrySchemaVersion: typeof REGISTRY_SCHEMA_VERSION;
+  readonly claimSchemaVersion: typeof RESOURCE_CLAIM_SCHEMA_VERSION;
+}
+
 export interface GuardOptions {
   readonly sessionId?: string | null;
 }
@@ -146,13 +205,47 @@ export interface PersistedSessionRecord {
   readonly label?: string;
 }
 
+export interface PersistedResourceClaim {
+  readonly schema_version: typeof RESOURCE_CLAIM_SCHEMA_VERSION;
+  readonly claim_id: string;
+  readonly session_id: string;
+  readonly repository_id: string;
+  readonly worktree_path: string;
+  readonly resource: string;
+  readonly mode: ResourceClaimMode;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
 export interface PersistedRegistry {
   readonly schema_version: RegistrySchemaVersion;
   readonly repository_id: string;
   readonly sessions: readonly PersistedSessionRecord[];
+  /** Optional in the TypeScript shape so v0.1.0 fixtures remain readable. */
+  readonly claims_schema_version?: typeof RESOURCE_CLAIM_SCHEMA_VERSION;
+  /** Optional in the TypeScript shape so v0.1.0 fixtures remain readable. */
+  readonly claims?: readonly PersistedResourceClaim[];
+}
+
+interface RegistryState {
+  readonly sessions: readonly SessionRecord[];
+  readonly claims: readonly ResourceClaim[];
+  readonly legacyClaimsAbsent: boolean;
+}
+
+interface ClaimOwner extends ClaimOwnerContext {
+  readonly record: SessionRecord;
+}
+
+interface ClaimMutationResult {
+  readonly sessions: readonly SessionRecord[];
+  readonly claims: readonly ResourceClaim[];
+  readonly sessionClaims: readonly ResourceClaim[];
+  readonly added: readonly ResourceClaim[];
 }
 
 const ACTIVE_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "stale"]);
+const CURRENT_SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing"]);
 const SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "closed", "stale"]);
 const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const MAX_ID_GENERATION_ATTEMPTS = 8;
@@ -229,6 +322,174 @@ export class SessionRegistry {
     return record === undefined ? undefined : cloneSessionRecord(record);
   }
 
+  /** Return the single authoritative claim set, optionally scoped to a session. */
+  listClaims(sessionId?: string | null): readonly ResourceClaim[] {
+    const claims = this.readStateUnsafe().claims;
+    if (sessionId === undefined || sessionId === null) return claims.map(cloneResourceClaim);
+    assertSessionId(sessionId);
+    return claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim);
+  }
+
+  claims(sessionId?: string | null): readonly ResourceClaim[] {
+    return this.listClaims(sessionId);
+  }
+
+  getClaim(claimId: string): ResourceClaim | undefined {
+    if (typeof claimId !== "string" || claimId.length === 0) {
+      throw claimError("CLAIM_NOT_FOUND", "Claim ID must be a non-empty string", { claimId: stringifyDetail(claimId) });
+    }
+    const claim = this.readStateUnsafe().claims.find((candidate) => candidate.claimId === claimId);
+    return claim === undefined ? undefined : cloneResourceClaim(claim);
+  }
+
+  /**
+   * Explicitly materialize the v0.1.0 registry's empty claim section. This is
+   * also performed by the first ownership mutation after a legacy read.
+   */
+  migrate(): RegistryMigrationResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      if (state.legacyClaimsAbsent) this.writeUnsafe(state.sessions, state.claims);
+      return {
+        migrated: state.legacyClaimsAbsent,
+        registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
+        claimSchemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
+      };
+    });
+  }
+
+  claim(
+    sessionIdOrOptions: string | ClaimResourcesOptions,
+    inputs?: readonly ResourceClaimInput[],
+  ): ClaimResourcesResult {
+    const options: ClaimResourcesOptions =
+      typeof sessionIdOrOptions === "string"
+        ? { sessionId: sessionIdOrOptions, claims: inputs ?? [] }
+        : sessionIdOrOptions;
+    return this.claimResources(options);
+  }
+
+  acquireClaims(
+    sessionIdOrOptions: string | ClaimResourcesOptions,
+    inputs?: readonly ResourceClaimInput[],
+  ): ClaimResourcesResult {
+    return this.claim(sessionIdOrOptions, inputs);
+  }
+
+  /** Add claims atomically. Repeating an equivalent operation is idempotent. */
+  claimResources(options: ClaimResourcesOptions): ClaimResourcesResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
+      const requested = this.canonicalClaimInputs(options.claims, owner);
+      const result = this.addClaimsUnsafe(state, owner, requested);
+      this.writeUnsafe(result.sessions, result.claims);
+      return {
+        session: cloneSessionRecord(owner.record),
+        claims: result.sessionClaims.map(cloneResourceClaim),
+        added: result.added.map(cloneResourceClaim),
+        released: [],
+        idempotent: result.added.length === 0,
+      };
+    });
+  }
+
+  updateClaims(options: UpdateClaimsOptions): ClaimResourcesResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
+      const requested = this.canonicalClaimInputs(options.claims, owner, true);
+      const current = state.claims.filter((claim) => claim.sessionId === sessionId);
+      const currentById = new Map(current.map((claim) => [claim.claimId, claim]));
+      const timestamp = toTimestamp(this.clock());
+      const next = this.validateRequestedClaims(
+        requested.map((input) => createResourceClaim(input, owner, timestamp)),
+        owner,
+        state.claims.filter((claim) => claim.sessionId !== sessionId),
+      );
+      const nextIds = new Set(next.map((claim) => claim.claimId));
+      const released = current.filter((claim) => !nextIds.has(claim.claimId));
+      const added = next.filter((claim) => !currentById.has(claim.claimId));
+      const unchanged = released.length === 0 && added.length === 0 && next.length === current.length;
+      const materialized = next.map((claim) => {
+        const prior = currentById.get(claim.claimId);
+        return prior === undefined
+          ? claim
+          : cloneResourceClaim({ ...claim, createdAt: prior.createdAt, updatedAt: prior.updatedAt });
+      });
+      this.writeUnsafe(
+        state.sessions,
+        sortResourceClaims([...state.claims.filter((claim) => claim.sessionId !== sessionId), ...materialized]),
+      );
+      return {
+        session: cloneSessionRecord(owner.record),
+        claims: materialized.map(cloneResourceClaim),
+        added: added.map(cloneResourceClaim),
+        released: released.map(cloneResourceClaim),
+        idempotent: unchanged,
+      };
+    });
+  }
+
+  releaseClaims(sessionIdOrOptions: string | ReleaseClaimsOptions, claimIds?: readonly string[]): ReleaseClaimsResult {
+    const options: ReleaseClaimsOptions =
+      typeof sessionIdOrOptions === "string" ? { sessionId: sessionIdOrOptions, claimIds } : sessionIdOrOptions;
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+      if (record === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      const selectedIds = options.claimIds ?? options.claim_ids;
+      if (selectedIds !== undefined) {
+        for (const claimId of selectedIds) {
+          if (typeof claimId !== "string" || claimId.length === 0) {
+            throw claimError("CLAIM_NOT_FOUND", "Claim ID must be a non-empty string", {
+              claimId: stringifyDetail(claimId),
+            });
+          }
+        }
+      }
+      const sessionClaims = state.claims.filter((claim) => claim.sessionId === sessionId);
+      const wanted =
+        selectedIds === undefined ? new Set(sessionClaims.map((claim) => claim.claimId)) : new Set(selectedIds);
+      if (selectedIds !== undefined) {
+        for (const claimId of wanted) {
+          const existing = state.claims.find((claim) => claim.claimId === claimId);
+          if (existing !== undefined && existing.sessionId !== sessionId) {
+            throw claimError("CLAIM_SESSION_MISMATCH", "Claim is owned by another session", {
+              claimId,
+              ownerSessionId: existing.sessionId,
+              sessionId,
+            });
+          }
+        }
+      }
+      const released = sessionClaims.filter((claim) => wanted.has(claim.claimId));
+      const remaining = sessionClaims.filter((claim) => !wanted.has(claim.claimId));
+      this.writeUnsafe(
+        state.sessions,
+        state.claims.filter((claim) => claim.sessionId !== sessionId || !wanted.has(claim.claimId)),
+      );
+      return {
+        sessionId,
+        released: released.map(cloneResourceClaim),
+        remaining: remaining.map(cloneResourceClaim),
+        // Release is a delete-style operation: an already absent claim is an
+        // explicitly stable no-op, which makes a retried release safe after a
+        // process crash or timeout.
+        idempotent: released.length === 0,
+      };
+    });
+  }
+
+  releaseSessionClaims(sessionId: string): ReleaseClaimsResult {
+    return this.releaseClaims(sessionId);
+  }
+
   create(options: CreateSessionOptions = {}): SessionRecord {
     return this.mutate((records) => {
       const resources = this.resolveCreationResources(options);
@@ -278,8 +539,8 @@ export class SessionRegistry {
         worktreePath: this.repository.worktreePath,
         git: this.git,
       });
-      const records = this.readUnsafe();
-      const sessionId = generateUniqueSessionId(records, this.idGenerator);
+      const state = this.readStateUnsafe();
+      const sessionId = generateUniqueSessionId(state.sessions, this.idGenerator);
       const resources = this.resolveProvisioningResources(options, sessionId);
       const timestamp = toTimestamp(this.clock());
       const record = freezeSessionRecord({
@@ -296,7 +557,7 @@ export class SessionRegistry {
         ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
       });
 
-      assertNoOwnershipConflict(records, record);
+      assertNoOwnershipConflict(state.sessions, record);
       assertGitResourcesAvailable(this.git, this.repository.worktreePath, resources);
 
       let gitProvisioned = false;
@@ -312,7 +573,7 @@ export class SessionRegistry {
           branchName: resources.branchName,
           git: this.git,
         });
-        this.writeUnsafe([...records, record]);
+        this.writeUnsafe([...state.sessions, record], state.claims);
         return cloneSessionRecord(record);
       } catch (error: unknown) {
         if (gitProvisioned) {
@@ -430,7 +691,12 @@ export class SessionRegistry {
       throw new SessionRegistryError(
         "STALE_REGISTRY",
         `The current worktree is recorded in non-active state: ${currentRecord.state}`,
-        { sessionId: currentRecord.sessionId, state: currentRecord.state, worktree: physical.worktreePath },
+        {
+          sessionId: currentRecord.sessionId,
+          ownerSessionId: currentRecord.sessionId,
+          state: currentRecord.state,
+          worktree: physical.worktreePath,
+        },
       );
     }
     if (currentRecord.repositoryId !== physical.repositoryId) {
@@ -533,7 +799,10 @@ export class SessionRegistry {
       try {
         currentRecord = this.resolveSessionOwnership(physical, requestedSessionId);
       } catch (error: unknown) {
-        if (error instanceof SessionRegistryError && error.code === "DUPLICATE_WORKTREE_OWNERSHIP") {
+        if (
+          error instanceof SessionRegistryError &&
+          (error.code === "DUPLICATE_WORKTREE_OWNERSHIP" || error.code === "STALE_REGISTRY")
+        ) {
           const ownerSessionId = typeof error.details.ownerSessionId === "string" ? error.details.ownerSessionId : null;
           const owner =
             ownerSessionId === null
@@ -596,7 +865,9 @@ export class SessionRegistry {
     assertStaleAfterMs(staleAfterMs);
 
     return this.withLock(() => {
-      let records = [...this.readUnsafe()];
+      const state = this.readStateUnsafe();
+      let records = [...state.sessions];
+      let claims = state.claims;
       const now = toTimestamp(this.clock());
       const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
       const candidates = records
@@ -622,7 +893,7 @@ export class SessionRegistry {
           const staleRecord = transitionSessionState(current, "stale", this.clock);
           records = replaceRecord(records, staleRecord);
           validateRecords(records, this.repository.repositoryId);
-          this.writeUnsafe(records);
+          this.writeUnsafe(records, claims);
         }
 
         try {
@@ -637,7 +908,9 @@ export class SessionRegistry {
             details: error.details,
           });
         }
-        records = [...this.readUnsafe()];
+        const updatedState = this.readStateUnsafe();
+        records = [...updatedState.sessions];
+        claims = updatedState.claims;
       }
 
       return {
@@ -653,8 +926,178 @@ export class SessionRegistry {
     return this.garbageCollect(options);
   }
 
+  private resolveOwnerSession(records: readonly SessionRecord[]): SessionRecord {
+    const matches = records.filter(
+      (record) => CURRENT_SESSION_STATES.has(record.state) && record.worktreeId === this.repository.worktreePath,
+    );
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+      throw new SessionRegistryError(
+        "DUPLICATE_WORKTREE_OWNERSHIP",
+        `Multiple active sessions own the current worktree: ${this.repository.worktreePath}`,
+        { worktree: this.repository.worktreePath },
+      );
+    }
+    throw new SessionRegistryError(
+      "SESSION_NOT_FOUND",
+      `No active session owns the current worktree: ${this.repository.worktreePath}`,
+      { worktree: this.repository.worktreePath },
+    );
+  }
+
+  private selectSessionId(requested: string | null | undefined, records: readonly SessionRecord[]): string {
+    if (requested !== undefined && requested !== null) {
+      assertSessionId(requested);
+      return requested;
+    }
+    return this.resolveOwnerSession(records).sessionId;
+  }
+
+  private claimOwner(records: readonly SessionRecord[], sessionId: string, requestedRepositoryId?: string): ClaimOwner {
+    if (requestedRepositoryId !== undefined && requestedRepositoryId !== this.repository.repositoryId) {
+      throw claimError("CLAIM_REPOSITORY_MISMATCH", "Resource claim repository does not match the current repository", {
+        expectedRepositoryId: this.repository.repositoryId,
+        actualRepositoryId: requestedRepositoryId,
+      });
+    }
+    const record = records.find((candidate) => candidate.sessionId === sessionId);
+    if (record === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    if (record.repositoryId !== this.repository.repositoryId) {
+      throw claimError("CLAIM_REPOSITORY_MISMATCH", "Session repository does not match the current repository", {
+        expectedRepositoryId: this.repository.repositoryId,
+        actualRepositoryId: record.repositoryId,
+        sessionId,
+      });
+    }
+    if (record.state !== "active") {
+      throw claimError("SESSION_NOT_ACTIVE", `Session cannot acquire resource claims while ${record.state}`, {
+        sessionId,
+        state: record.state,
+      });
+    }
+    return {
+      ...record,
+      record,
+    };
+  }
+
+  private canonicalClaimInputs(
+    inputs: readonly ResourceClaimInput[],
+    owner: ClaimOwner,
+    allowEmpty = false,
+  ): readonly { resource: string; mode: ResourceClaimMode }[] {
+    if (!Array.isArray(inputs) || (!allowEmpty && inputs.length === 0)) {
+      throw claimError("INVALID_CLAIM", "At least one resource claim is required");
+    }
+    const canonical = inputs
+      .map((input) => canonicalizeClaimInput(input, owner))
+      .sort((left, right) =>
+        compareCodePointStrings(`${left.resource}\u0000${left.mode}`, `${right.resource}\u0000${right.mode}`),
+      );
+    const timestamp = toTimestamp(this.clock());
+    const claims = canonical.map((input) => createResourceClaim(input, owner, timestamp));
+    for (let index = 0; index < claims.length; index += 1) {
+      const current = claims[index];
+      for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
+        const prior = claims[priorIndex];
+        if (!claimsOverlap(current, prior)) continue;
+        if (current.mode === prior.mode) {
+          throw claimError("DUPLICATE_CLAIM", "Request contains overlapping equivalent claims", {
+            resource: current.resource,
+            mode: current.mode,
+          });
+        }
+        throw claimError("CONTRADICTORY_CLAIM", "Request contains overlapping claims with different modes", {
+          resource: current.resource,
+          mode: current.mode,
+          otherResource: prior.resource,
+          otherMode: prior.mode,
+        });
+      }
+    }
+    return canonical;
+  }
+
+  private addClaimsUnsafe(
+    state: RegistryState,
+    owner: ClaimOwner,
+    requested: readonly { resource: string; mode: ResourceClaimMode }[],
+  ): ClaimMutationResult {
+    const timestamp = toTimestamp(this.clock());
+    const candidates = requested.map((input) => createResourceClaim(input, owner, timestamp));
+    const existing = state.claims.filter((claim) => claim.sessionId !== owner.sessionId);
+    const current = state.claims.filter((claim) => claim.sessionId === owner.sessionId);
+    const added = this.validateRequestedClaims(candidates, owner, [...existing, ...current]);
+    const nextClaims = sortResourceClaims([
+      ...state.claims,
+      ...added.filter((candidate) => !current.some((claim) => claim.claimId === candidate.claimId)),
+    ]);
+    return {
+      sessions: state.sessions,
+      claims: nextClaims,
+      sessionClaims: nextClaims.filter((claim) => claim.sessionId === owner.sessionId),
+      added: added.filter((candidate) => !current.some((claim) => claim.claimId === candidate.claimId)),
+    };
+  }
+
+  private validateRequestedClaims(
+    candidates: readonly ResourceClaim[],
+    owner: ClaimOwner,
+    existing: readonly ResourceClaim[],
+  ): readonly ResourceClaim[] {
+    for (const candidate of candidates) {
+      const exact = existing.find((claim) => claim.claimId === candidate.claimId);
+      if (exact !== undefined) {
+        if (
+          exact.sessionId !== owner.sessionId ||
+          exact.repositoryId !== owner.repositoryId ||
+          exact.worktreePath !== owner.worktreePath ||
+          exact.resource !== candidate.resource ||
+          exact.mode !== candidate.mode
+        ) {
+          throw claimError("CONTRADICTORY_CLAIM", "Claim identity is already bound to different canonical data", {
+            claimId: candidate.claimId,
+          });
+        }
+        continue;
+      }
+      for (const current of existing) {
+        if (!claimsOverlap(candidate, current)) continue;
+        if (current.sessionId === owner.sessionId) {
+          if (current.mode === candidate.mode) {
+            throw claimError("DUPLICATE_CLAIM", "Session already owns an overlapping claim", {
+              claimId: current.claimId,
+              resource: current.resource,
+              mode: current.mode,
+            });
+          }
+          throw claimError("CONTRADICTORY_CLAIM", "Session already owns an overlapping claim with another mode", {
+            claimId: current.claimId,
+            resource: current.resource,
+            mode: current.mode,
+          });
+        }
+        if (claimsConflict(candidate, current)) {
+          throw claimError("RESOURCE_CLAIM_CONFLICT", "Resource claim conflicts with an active session claim", {
+            claimId: candidate.claimId,
+            resource: candidate.resource,
+            mode: candidate.mode,
+            ownerSessionId: current.sessionId,
+            ownerClaimId: current.claimId,
+            ownerResource: current.resource,
+            ownerMode: current.mode,
+          });
+        }
+      }
+    }
+    return candidates;
+  }
+
   private closeUnsafe(sessionId: string): CloseSessionResult {
-    const records = this.readUnsafe();
+    const state = this.readStateUnsafe();
+    const records = state.sessions;
     const record = records.find((candidate) => candidate.sessionId === sessionId);
     if (record === undefined) {
       throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, {
@@ -674,7 +1117,7 @@ export class SessionRegistry {
     const closingRecord = record.state === "closing" ? record : transitionSessionState(record, "closing", this.clock);
     let closingRecords = replaceRecord(records, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
-    this.writeUnsafe(closingRecords);
+    this.writeUnsafe(closingRecords, state.claims);
 
     let worktreeRemoved = false;
     let branchRemoved = false;
@@ -692,7 +1135,10 @@ export class SessionRegistry {
     const closedRecord = transitionSessionState(closingRecord, "closed", this.clock);
     closingRecords = replaceRecord(closingRecords, closedRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
-    this.writeUnsafe(closingRecords);
+    this.writeUnsafe(
+      closingRecords,
+      state.claims.filter((claim) => claim.sessionId !== sessionId),
+    );
 
     return {
       session: cloneSessionRecord(closedRecord),
@@ -893,13 +1339,13 @@ export class SessionRegistry {
     };
   }
 
-  private readUnsafe(): readonly SessionRecord[] {
+  private readStateUnsafe(): RegistryState {
     let contents: string;
     try {
       contents = fs.readFileSync(this.paths.registry, "utf8");
     } catch (error: unknown) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        return [];
+        return { sessions: [], claims: [], legacyClaimsAbsent: false };
       }
       throw new SessionRegistryError(
         "REGISTRY_IO_FAILURE",
@@ -928,11 +1374,19 @@ export class SessionRegistry {
     return parseRegistry(parsed, this.repository.repositoryId);
   }
 
-  private writeUnsafe(records: readonly SessionRecord[]): void {
+  private readUnsafe(): readonly SessionRecord[] {
+    return this.readStateUnsafe().sessions;
+  }
+
+  private writeUnsafe(records: readonly SessionRecord[], claims: readonly ResourceClaim[]): void {
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
       repository_id: this.repository.repositoryId,
       sessions: records.map((record) => toPersistedSessionRecord(record, this.repository.repositoryId)),
+      claims_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
+      claims: sortResourceClaims(claims).map((claim) =>
+        toPersistedResourceClaim(claim, this.repository.repositoryId),
+      ),
     };
     const contents = `${JSON.stringify(registry, null, 2)}\n`;
     const temporaryPath = `${this.paths.registry}.tmp-${process.pid}-${generateSessionId()}`;
@@ -965,10 +1419,10 @@ export class SessionRegistry {
 
   private mutate<T>(mutation: (records: readonly SessionRecord[]) => MutationResult<T>): T {
     return this.withLock(() => {
-      const records = this.readUnsafe();
-      const { records: nextRecords, result } = mutation(records);
+      const state = this.readStateUnsafe();
+      const { records: nextRecords, result } = mutation(state.sessions);
       validateRecords(nextRecords, this.repository.repositoryId);
-      this.writeUnsafe(nextRecords);
+      this.writeUnsafe(nextRecords, state.claims);
       return result;
     });
   }
@@ -1551,7 +2005,25 @@ export function toPersistedSessionRecord(
   };
 }
 
-function parseRegistry(value: unknown, expectedRepositoryId: string): readonly SessionRecord[] {
+export function toPersistedResourceClaim(
+  claim: ResourceClaim,
+  expectedRepositoryId: string = claim.repositoryId,
+): PersistedResourceClaim {
+  const validated = validateResourceClaim(claim, expectedRepositoryId);
+  return {
+    schema_version: validated.schemaVersion,
+    claim_id: validated.claimId,
+    session_id: validated.sessionId,
+    repository_id: validated.repositoryId,
+    worktree_path: validated.worktreePath,
+    resource: validated.resource,
+    mode: validated.mode,
+    created_at: validated.createdAt,
+    updated_at: validated.updatedAt,
+  };
+}
+
+function parseRegistry(value: unknown, expectedRepositoryId: string): RegistryState {
   if (!isRecord(value)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry root must be an object");
   }
@@ -1567,7 +2039,7 @@ function parseRegistry(value: unknown, expectedRepositoryId: string): readonly S
     }
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry schema_version must be a number");
   }
-  assertExactKeys(value, ["schema_version", "repository_id", "sessions"]);
+  assertExactKeys(value, ["schema_version", "repository_id", "sessions"], ["claims_schema_version", "claims"]);
 
   if (typeof value.repository_id !== "string" || value.repository_id !== expectedRepositoryId) {
     throw new SessionRegistryError(
@@ -1582,7 +2054,161 @@ function parseRegistry(value: unknown, expectedRepositoryId: string): readonly S
 
   const records = value.sessions.map((candidate, index) => parseSessionRecord(candidate, index, expectedRepositoryId));
   validateRecords(records, expectedRepositoryId);
-  return records;
+  const hasClaimsSchema = Object.hasOwn(value, "claims_schema_version");
+  const hasClaims = Object.hasOwn(value, "claims");
+  if (hasClaimsSchema !== hasClaims) {
+    throw new SessionRegistryError(
+      "REGISTRY_CORRUPT",
+      "Registry claim schema metadata and claims must be migrated together",
+    );
+  }
+  if (!hasClaimsSchema) {
+    // v0.1.0 had no claim section. It is a deterministic empty claim set,
+    // materialized on the next locked mutation or via migrate().
+    return { sessions: records, claims: [], legacyClaimsAbsent: true };
+  }
+  if (value.claims_schema_version !== RESOURCE_CLAIM_SCHEMA_VERSION) {
+    throw new SessionRegistryError(
+      "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
+      `Unsupported resource claim schema version: ${stringifyDetail(value.claims_schema_version)}`,
+      { schemaVersion: value.claims_schema_version as number },
+    );
+  }
+  if (!Array.isArray(value.claims)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry claims must be an array");
+  }
+  const claims = value.claims.map((candidate, index) => parseResourceClaim(candidate, index, expectedRepositoryId));
+  validateRegistryClaims(records, claims, expectedRepositoryId);
+  return { sessions: records, claims: sortResourceClaims(claims), legacyClaimsAbsent: false };
+}
+
+function parseResourceClaim(value: unknown, index: number, expectedRepositoryId: string): ResourceClaim {
+  if (!isRecord(value)) throw invalidRecord(index, "claim must be an object");
+  assertExactKeys(
+    value,
+    [
+      "schema_version",
+      "claim_id",
+      "session_id",
+      "repository_id",
+      "worktree_path",
+      "resource",
+      "mode",
+      "created_at",
+      "updated_at",
+    ],
+    [],
+    index,
+  );
+  if (value.schema_version !== RESOURCE_CLAIM_SCHEMA_VERSION) {
+    throw new SessionRegistryError(
+      "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
+      `Unsupported resource claim schema version at index ${index}: ${stringifyDetail(value.schema_version)}`,
+      { schemaVersion: value.schema_version as number, index },
+    );
+  }
+  const claim: ResourceClaim = {
+    schemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
+    claimId: requireString(value.claim_id, index, "claim_id"),
+    sessionId: requireString(value.session_id, index, "session_id"),
+    repositoryId: requireString(value.repository_id, index, "repository_id"),
+    worktreePath: requireString(value.worktree_path, index, "worktree_path"),
+    resource: requireString(value.resource, index, "resource"),
+    mode: requireClaimMode(value.mode, index),
+    createdAt: requireString(value.created_at, index, "created_at"),
+    updatedAt: requireString(value.updated_at, index, "updated_at"),
+  };
+  return validateResourceClaim(claim, expectedRepositoryId, index);
+}
+
+function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: string, index?: number): ResourceClaim {
+  const position = index === undefined ? "" : ` at index ${index}`;
+  if (claim.schemaVersion !== RESOURCE_CLAIM_SCHEMA_VERSION) {
+    throw new SessionRegistryError("UNSUPPORTED_CLAIM_SCHEMA_VERSION", `Unsupported claim schema version${position}`, {
+      schemaVersion: claim.schemaVersion,
+    });
+  }
+  if (!isSessionId(claim.sessionId)) {
+    throw invalidRecord(index, `claim session_id is invalid${position}`);
+  }
+  if (claim.repositoryId !== expectedRepositoryId) {
+    throw claimError("CLAIM_REPOSITORY_MISMATCH", "Claim repository identity does not match the registry", {
+      expectedRepositoryId,
+      actualRepositoryId: claim.repositoryId,
+      claimId: claim.claimId,
+    });
+  }
+  if (!isAbsolutePath(claim.worktreePath)) {
+    throw invalidRecord(index, `claim worktree_path must be an absolute canonical path${position}`);
+  }
+  assertCanonicalClaimResource(claim.resource);
+  if (claim.claimId !== canonicalClaimId(claim.sessionId, claim.resource, claim.mode)) {
+    throw invalidRecord(index, `claim_id is not the canonical claim identity${position}`);
+  }
+  if (!isTimestamp(claim.createdAt) || !isTimestamp(claim.updatedAt)) {
+    throw invalidRecord(index, `claim timestamps must be canonical UTC timestamps${position}`);
+  }
+  if (Date.parse(claim.updatedAt) < Date.parse(claim.createdAt)) {
+    throw invalidRecord(index, `claim updated_at cannot precede created_at${position}`);
+  }
+  return Object.freeze({ ...claim });
+}
+
+function validateRegistryClaims(
+  records: readonly SessionRecord[],
+  claims: readonly ResourceClaim[],
+  expectedRepositoryId: string,
+): void {
+  const sessions = new Map(records.map((record) => [record.sessionId, record]));
+  const claimIds = new Set<string>();
+  for (const claim of claims) {
+    if (claimIds.has(claim.claimId)) {
+      throw claimError("DUPLICATE_CLAIM", `Duplicate resource claim: ${claim.claimId}`, {
+        claimId: claim.claimId,
+      });
+    }
+    claimIds.add(claim.claimId);
+    const owner = sessions.get(claim.sessionId);
+    if (owner === undefined) {
+      throw claimError("CLAIM_SESSION_MISMATCH", "Claim references an unknown session", {
+        claimId: claim.claimId,
+        sessionId: claim.sessionId,
+      });
+    }
+    if (owner.repositoryId !== claim.repositoryId || owner.worktreePath !== claim.worktreePath) {
+      throw claimError("CLAIM_SESSION_MISMATCH", "Claim does not match its session worktree identity", {
+        claimId: claim.claimId,
+        sessionId: claim.sessionId,
+      });
+    }
+    if (owner.state === "closed") {
+      throw claimError("CLAIM_SESSION_MISMATCH", "Closed sessions cannot retain resource claims", {
+        claimId: claim.claimId,
+        sessionId: claim.sessionId,
+      });
+    }
+  }
+  const sorted = sortResourceClaims(claims);
+  for (let index = 0; index < sorted.length; index += 1) {
+    for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
+      const current = sorted[index];
+      const prior = sorted[priorIndex];
+      if (!claimsOverlap(current, prior)) continue;
+      if (current.sessionId === prior.sessionId) {
+        throw claimError(
+          current.mode === prior.mode ? "DUPLICATE_CLAIM" : "CONTRADICTORY_CLAIM",
+          "Persisted claims contain overlapping claims for one session",
+          { claimId: current.claimId, ownerClaimId: prior.claimId },
+        );
+      }
+      if (!claimsConflict(current, prior)) continue;
+      throw claimError("RESOURCE_CLAIM_CONFLICT", "Persisted claims contain an unresolved conflict", {
+        claimId: current.claimId,
+        ownerClaimId: prior.claimId,
+        ownerSessionId: prior.sessionId,
+      });
+    }
+  }
 }
 
 function parseSessionRecord(value: unknown, index: number, expectedRepositoryId: string): SessionRecord {
@@ -1808,6 +2434,13 @@ function requireState(value: unknown, index: number): SessionState {
     throw invalidRecord(index, `state is invalid: ${stringifyDetail(value)}`);
   }
   return value as SessionState;
+}
+
+function requireClaimMode(value: unknown, index: number): ResourceClaimMode {
+  if (!isResourceClaimMode(value)) {
+    throw invalidRecord(index, `mode is invalid: ${stringifyDetail(value)}`);
+  }
+  return value;
 }
 
 function invalidRecord(index: number | undefined, reason: string): SessionRegistryError {

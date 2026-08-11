@@ -30,6 +30,66 @@ test("local session backend provisions through the domain contract", async () =>
   }
 });
 
+test("resource claims expose canonical machine fields through the backend and CLI", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-claim-contract`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/claim-contract", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const claimed = await backend.claimResources(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        claims: [{ resource: "README.md", mode: "read" }],
+      },
+    );
+    assert.equal(claimed.ok, true, claimed.ok ? "claim succeeded" : JSON.stringify(claimed.error));
+    if (!claimed.ok) return;
+    assert.equal(claimed.value.claims.length, 1);
+    assert.equal(claimed.value.claims[0]?.schema_version, 1);
+    assert.match(claimed.value.claims[0]?.claim_id ?? "", /^claim-[0-9a-f]{64}$/u);
+    assert.equal(claimed.value.claims[0]?.resource, "README.md");
+    assert.equal(claimed.value.claims[0]?.mode, "read");
+
+    const stdout: string[] = [];
+    const exitCode = await runCli(["session", "claims", "--session", created.value.session_id, "--json"], {
+      cwd: worktreePath,
+      io: { stdout: (line) => stdout.push(line), stderr: () => undefined },
+    });
+    assert.equal(exitCode, 0);
+    const listed = JSON.parse(stdout[0] ?? "") as {
+      ok: boolean;
+      command: string;
+      claims: Array<{ resource: string; mode: string }>;
+    };
+    assert.equal(listed.ok, true);
+    assert.equal(listed.command, "session claims");
+    assert.deepEqual(
+      listed.claims.map((claim) => [claim.resource, claim.mode]),
+      [["README.md", "read"]],
+    );
+
+    const released = await backend.releaseClaims(
+      { cwd: worktreePath },
+      { session_id: created.value.session_id, claim_ids: null },
+    );
+    assert.equal(released.ok, true);
+    if (!released.ok) return;
+    assert.equal(released.value.released.length, 1);
+    assert.equal(released.value.remaining.length, 0);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("the CLI create command uses the local backend and emits stable JSON", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-cli-session`;

@@ -54,6 +54,43 @@ branch, and repeating close is idempotent. `gc` detects stale or interrupted
 sessions; `--apply` uses the same close safety checks and reports blocked
 sessions instead of guessing.
 
+## Session resource claims
+
+Resource claims are versioned, session-scoped ownership records stored in the
+same repository registry and protected by the same mutation lock. They are
+caller declarations; Nawabari does not infer them from task text or source
+code. Claim JSON exposes `schema_version`, `claim_id`, `session_id`, the
+repository/worktree identities, canonical `resource`, `mode`, and timestamps.
+The initial claim schema version is `1` and supports `read`, `write`, and
+`exclusive-write`.
+
+```bash
+git nawabari session claim --session "$NAWABARI_SESSION_ID" \
+  --resource 'src/**/*.ts' --mode read --json
+git nawabari session claims --session "$NAWABARI_SESSION_ID" --json
+git nawabari session update --session "$NAWABARI_SESSION_ID" \
+  --resource 'src/**/*.ts' --mode write --json
+git nawabari session release --session "$NAWABARI_SESSION_ID" --json
+```
+
+Overlapping claims use this complete compatibility matrix; non-overlapping
+claims are compatible for every mode:
+
+| existing \/ requested | read       | write    | exclusive-write |
+| --------------------- | ---------- | -------- | --------------- |
+| read                  | compatible | conflict | conflict        |
+| write                 | conflict   | conflict | conflict        |
+| exclusive-write       | conflict   | conflict | conflict        |
+
+Claims use canonical repository-relative POSIX paths. Literal path segments,
+`*`/`?` segment wildcards, and a complete `**` segment are supported. Empty,
+`.`/`..`, absolute, drive-relative, backslash, unsupported-glob, and
+symlink-escaping forms are rejected with stable machine-readable codes.
+Equivalent claim acquisition and release retries are idempotent. Closing or
+garbage-collecting a session releases its claims; no separate claim registry
+or claim lock exists. Claims describe ownership state only and do not provide
+OS-level filesystem observation or a filesystem sandbox.
+
 ## Ownership guard
 
 `git nawabari guard` is a cheap, side-effect-free authorization decision for a
