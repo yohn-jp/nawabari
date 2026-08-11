@@ -202,4 +202,25 @@ test("human and JSON modes present the same backend status result", async () => 
   assert.equal(json.current_session.session_id, sampleSession.session_id);
   assert.match(humanOutput.stdout.join("\n"), new RegExp(sampleSession.session_id));
   assert.match(humanOutput.stdout.join("\n"), new RegExp(sampleSession.branch));
+  assert.match(humanOutput.stdout.join("\n"), /  current_session:\n    schema_version: 1/u);
+  assert.match(humanOutput.stdout.join("\n"), /  sessions:\n    - schema_version: 1/u);
+  assert.doesNotMatch(humanOutput.stdout.join("\n"), /\{"schema_version"/u);
+});
+
+test("human session create, show, and close output avoids inline structured JSON", async () => {
+  for (const arguments_ of [
+    ["session", "create"],
+    ["session", "show"],
+    ["session", "close"],
+  ]) {
+    const output = capture();
+    const exitCode = await runCli(arguments_, { backend: backendForTests(), io: output.io });
+
+    assert.equal(exitCode, 0);
+    const text = output.stdout.join("\n");
+    assert.match(text, /schema_version: 1/u);
+    assert.match(text, /session_id: 0190f1e0-0000-7000-8000-000000000001/u);
+    assert.doesNotMatch(text, /\{"schema_version"/u);
+    assert.doesNotMatch(text, /\[object Object\]/u);
+  }
 });
