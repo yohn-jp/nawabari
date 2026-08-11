@@ -294,6 +294,39 @@ test("gc recovers an externally removed prunable worktree and permits branch reu
   }
 });
 
+test("close succeeds when multiple prunable worktree entries exist alongside the session worktree", () => {
+  const fixture = createRepositoryFixture();
+  const sessionWorktreePath = `${fixture.repositoryPath}-session-prunable`;
+  const externalWorktreePath1 = `${fixture.repositoryPath}-external-prunable-1`;
+  const externalWorktreePath2 = `${fixture.repositoryPath}-external-prunable-2`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath: sessionWorktreePath, branchName: "feature/session-prunable" });
+
+    runGit(["worktree", "add", "-b", "feature/external-1", externalWorktreePath1], fixture.repositoryPath);
+    runGit(["worktree", "add", "-b", "feature/external-2", externalWorktreePath2], fixture.repositoryPath);
+
+    fs.rmSync(externalWorktreePath1, { recursive: true, force: true });
+    fs.rmSync(externalWorktreePath2, { recursive: true, force: true });
+
+    const worktreeList = runGit(["worktree", "list", "--porcelain"], fixture.repositoryPath).split(/\r?\n/u);
+    const prunableLines = worktreeList.filter((line) => line.startsWith("prunable "));
+    assert.equal(prunableLines.length >= 2, true, "Expected at least two prunable worktree entries");
+
+    const result = registry.close(session.sessionId);
+    assert.equal(result.session.state, "closed");
+    assert.equal(result.worktreeRemoved, true);
+    assert.equal(result.branchRemoved, true);
+    assert.equal(fs.existsSync(sessionWorktreePath), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+  } finally {
+    removeWorktree(fixture.repositoryPath, sessionWorktreePath);
+    removeWorktree(fixture.repositoryPath, externalWorktreePath1);
+    removeWorktree(fixture.repositoryPath, externalWorktreePath2);
+    fixture.cleanup();
+  }
+});
+
 interface RepositoryFixture {
   readonly repositoryPath: string;
   cleanup(): void;

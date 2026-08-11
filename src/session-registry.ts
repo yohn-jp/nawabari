@@ -670,8 +670,8 @@ export class SessionRegistry {
     const git = this.git;
     const worktrees = listGitWorktrees(git, this.repository.worktreePath);
     const gitCwd =
-      worktrees.find((worktree) => !samePath(worktree.worktreePath, record.worktreePath))?.worktreePath ??
-      this.repository.worktreePath;
+      worktrees.find((worktree) => !worktree.prunable && !samePath(worktree.worktreePath, record.worktreePath))
+        ?.worktreePath ?? this.repository.worktreePath;
     const registeredWorktree = worktrees.find((worktree) => samePath(worktree.worktreePath, record.worktreePath));
     const branchWorktree = worktrees.find((worktree) => worktree.branchName === record.branchName);
 
