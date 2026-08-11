@@ -67,6 +67,21 @@ export type ErrorCode =
   | "CLAIM_NOT_FOUND"
   | "SESSION_NOT_ACTIVE"
   | "UNSUPPORTED_CLAIM_SCHEMA_VERSION"
+  | "INVALID_COMMIT_MESSAGE"
+  | "COMMIT_EMPTY_DIFF"
+  | "UNEXPECTED_CHANGED_PATHS"
+  | "COMMIT_STAGING_FAILED"
+  | "COMMIT_FAILED"
+  | "COMMIT_RESULT_UNAVAILABLE"
+  | "INVALID_REMOTE"
+  | "INVALID_REMOTE_BRANCH"
+  | "PUSH_TARGET_MISMATCH"
+  | "PUSH_REMOTE_INSPECTION_FAILED"
+  | "PUSH_NO_UPSTREAM"
+  | "PUSH_BEHIND"
+  | "PUSH_DIVERGED"
+  | "PUSH_DIRTY_WORKTREE"
+  | "PUSH_FAILED"
   | "INTERNAL_ERROR";
 
 export const EXIT_CODES = Object.freeze({
@@ -86,7 +101,10 @@ function defaultExitCode(code: ErrorCode): number {
     code === "NO_COMMAND" ||
     code === "INVALID_ARGUMENT" ||
     code === "MISSING_ARGUMENT" ||
-    code === "INVALID_OPERATION"
+    code === "INVALID_OPERATION" ||
+    code === "INVALID_COMMIT_MESSAGE" ||
+    code === "INVALID_REMOTE" ||
+    code === "INVALID_REMOTE_BRANCH"
   ) {
     return EXIT_CODES.usage;
   }

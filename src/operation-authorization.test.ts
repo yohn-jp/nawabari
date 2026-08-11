@@ -13,7 +13,12 @@ import {
   OPERATION_VOCABULARY,
   requiredAccessForOperation,
 } from "./operation-authorization.js";
-import { SessionRegistry, toPersistedSessionRecord, REGISTRY_SCHEMA_VERSION, RESOURCE_CLAIM_SCHEMA_VERSION } from "./session-registry.js";
+import {
+  SessionRegistry,
+  toPersistedSessionRecord,
+  REGISTRY_SCHEMA_VERSION,
+  RESOURCE_CLAIM_SCHEMA_VERSION,
+} from "./session-registry.js";
 
 test("the versioned operation vocabulary has an explicit access mapping", () => {
   assert.deepEqual(OPERATION_VOCABULARY, ["source-write", "stage", "commit", "branch-mutation", "push", "cleanup"]);
@@ -58,7 +63,9 @@ test("one registry authority authorizes every operation class against concrete c
       );
     }
 
-    const exclusiveWriteOperation = OPERATION_VOCABULARY.find((op) => requiredAccessForOperation(op) === "exclusive-write");
+    const exclusiveWriteOperation = OPERATION_VOCABULARY.find(
+      (op) => requiredAccessForOperation(op) === "exclusive-write",
+    );
     assert.ok(exclusiveWriteOperation !== undefined, "expected at least one exclusive-write operation");
     const deniedDecision = new SessionRegistry({ cwd: worktreePath }).authorizeOperation({
       operation: exclusiveWriteOperation,

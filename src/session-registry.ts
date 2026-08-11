@@ -6,6 +6,7 @@ import {
   captureGitCheckpoint,
   listGitWorktrees,
   normalizeBranchId,
+  readCurrentHead,
   resolveRepositoryContext,
   verifyPhysicalExecutionContext,
   type GitCommandRunner,
@@ -199,6 +200,51 @@ export {
 
 export interface VerifiedExecutionContext extends PhysicalExecutionContext {
   readonly session: SessionRecord;
+}
+
+export const GOVERNED_GIT_OPERATION_SCHEMA_VERSION = 1 as const;
+
+export interface CommitOptions {
+  readonly sessionId?: string | null;
+  readonly session_id?: string | null;
+  readonly message: string;
+  /** Concrete repository-relative paths. Globs are never accepted here. */
+  readonly resources?: readonly string[];
+  /** Alias for callers that name the same explicit paths as paths. */
+  readonly paths?: readonly string[];
+}
+
+export interface CommitResult {
+  readonly schemaVersion: typeof GOVERNED_GIT_OPERATION_SCHEMA_VERSION;
+  readonly commitSha: string;
+  readonly message: string;
+  readonly resources: readonly string[];
+}
+
+export type PushRelation = "no-upstream" | "up-to-date" | "ahead" | "behind" | "diverged";
+
+export interface PushOptions {
+  readonly sessionId?: string | null;
+  readonly session_id?: string | null;
+  /** Explicit claim-covered resources; push never infers these from the registry. */
+  readonly resources?: readonly string[];
+  readonly remote?: string | null;
+  readonly branch?: string | null;
+  readonly remoteBranch?: string | null;
+  readonly remote_branch?: string | null;
+  readonly force?: boolean;
+  readonly createUpstream?: boolean;
+  readonly create_upstream?: boolean;
+}
+
+export interface PushResult {
+  readonly schemaVersion: typeof GOVERNED_GIT_OPERATION_SCHEMA_VERSION;
+  readonly remote: string;
+  readonly branch: string;
+  readonly target: string;
+  readonly relation: PushRelation;
+  readonly force: boolean;
+  readonly upstreamCreated: boolean;
 }
 
 export interface SessionRegistryOptions {
@@ -1012,6 +1058,201 @@ export class SessionRegistry {
       }
       throw error;
     }
+  }
+
+  /**
+   * Stage and commit only caller-declared, claim-authorized resources.
+   * Authorization, physical observations, and Git mutation are serialized by
+   * the existing repository lock; this method does not introduce another
+   * ownership or mutation authority.
+   */
+  commit(options: CommitOptions): CommitResult {
+    return this.withLock(() => {
+      const sessionId = operationSessionId(options.sessionId, options.session_id);
+      const requestedResources = operationResources(options.resources ?? options.paths);
+      const authorization = this.requireMutationAuthorization("commit", requestedResources, sessionId);
+      const initial = this.verifyGovernedExecutionContext(sessionId);
+      assertFinalCommitMessage(options.message);
+
+      const before = observeMutationPaths(this.git, initial.worktreePath);
+      assertNoUnexpectedMutationPaths(
+        before.changed,
+        authorization.resources.map((resource) => resource.resource),
+      );
+      const stageResources = authorization.resources
+        .map((resource) => resource.resource)
+        .filter((resource) => before.changed.includes(resource));
+      if (stageResources.length === 0) {
+        throw new SessionRegistryError(
+          "COMMIT_EMPTY_DIFF",
+          "None of the authorized resources has a Git-visible change",
+          {
+            resources: authorization.resources.map((resource) => resource.resource),
+          },
+        );
+      }
+
+      reverifyMutationContext(this, initial, sessionId, "stage");
+      runMutationGit(
+        this.git,
+        ["add", "--", ...stageResources],
+        initial.worktreePath,
+        "stage",
+        "COMMIT_STAGING_FAILED",
+      );
+
+      const afterStage = observeMutationPaths(this.git, initial.worktreePath);
+      assertNoUnexpectedMutationPaths(afterStage.changed, stageResources);
+      if (!afterStage.staged.some((resource) => stageResources.includes(resource))) {
+        throw new SessionRegistryError("COMMIT_STAGING_FAILED", "Git staging produced no authorized staged paths", {
+          resources: stageResources,
+        });
+      }
+
+      reverifyMutationContext(this, initial, sessionId, "commit");
+      const beforeCommit = observeMutationPaths(this.git, initial.worktreePath);
+      assertNoUnexpectedMutationPaths(beforeCommit.changed, stageResources);
+      if (!beforeCommit.staged.some((resource) => stageResources.includes(resource))) {
+        throw new SessionRegistryError("COMMIT_STAGING_FAILED", "Authorized staged paths disappeared before commit", {
+          resources: stageResources,
+        });
+      }
+
+      runMutationGit(this.git, ["commit", "-m", options.message], initial.worktreePath, "commit", "COMMIT_FAILED");
+
+      let commitSha: string;
+      try {
+        commitSha = readCurrentHead(this.git, initial.worktreePath);
+      } catch (error: unknown) {
+        if (error instanceof SessionRegistryError && isBoundedGitFailure(error.code)) throw error;
+        throw new SessionRegistryError(
+          "COMMIT_RESULT_UNAVAILABLE",
+          "Git committed the operation but the resulting commit SHA could not be resolved",
+          { phase: "resolve-commit-result" },
+          error,
+        );
+      }
+
+      return Object.freeze({
+        schemaVersion: GOVERNED_GIT_OPERATION_SCHEMA_VERSION,
+        commitSha,
+        message: options.message,
+        resources: Object.freeze([...stageResources]),
+      });
+    });
+  }
+
+  commitSession(options: CommitOptions): CommitResult {
+    return this.commit(options);
+  }
+
+  /** Push the currently owned branch to an explicit remote/branch target. */
+  push(options: PushOptions): PushResult {
+    return this.withLock(() => {
+      const sessionId = operationSessionId(options.sessionId, options.session_id);
+      const requestedResources = operationResources(options.resources);
+      this.requireMutationAuthorization("push", requestedResources, sessionId);
+      const initial = this.verifyGovernedExecutionContext(sessionId);
+      const remote = explicitRemote(options.remote);
+      const branch = explicitRemoteBranch(options.branch, options.remoteBranch ?? options.remote_branch);
+      const force = options.force === true;
+      const createUpstream = options.createUpstream === true || options.create_upstream === true;
+
+      if (branch !== initial.session.branchName) {
+        throw new SessionRegistryError(
+          "PUSH_TARGET_MISMATCH",
+          "The explicit push branch must match the session-owned branch",
+          {
+            sessionBranch: initial.session.branchName,
+            pushBranch: branch,
+          },
+        );
+      }
+
+      const inspection = inspectPushTarget(this.git, initial.worktreePath, remote, branch);
+      if (inspection.upstream !== undefined && inspection.upstream !== `${remote}/${branch}`) {
+        throw new SessionRegistryError(
+          "PUSH_TARGET_MISMATCH",
+          "The explicit push target does not match the currently configured upstream",
+          { upstream: inspection.upstream, remote, branch },
+        );
+      }
+      if (inspection.relation === "no-upstream" && !createUpstream) {
+        throw new SessionRegistryError(
+          "PUSH_NO_UPSTREAM",
+          "The current branch has no upstream; upstream creation must be explicitly requested",
+          { remote, branch, relation: "no-upstream", upstreamCreated: false },
+        );
+      }
+      if (inspection.relation !== "no-upstream" && createUpstream) {
+        throw new SessionRegistryError(
+          "PUSH_TARGET_MISMATCH",
+          "Upstream creation was requested for a branch that already has an upstream",
+          { upstream: inspection.upstream ?? `${remote}/${branch}`, remote, branch },
+        );
+      }
+      if ((inspection.relation === "behind" || inspection.relation === "diverged") && !force) {
+        const code = inspection.relation === "behind" ? "PUSH_BEHIND" : "PUSH_DIVERGED";
+        throw new SessionRegistryError(
+          code,
+          `The local and remote branches are ${inspection.relation}; explicit force intent is required`,
+          { remote, branch, relation: inspection.relation, forceRequired: true },
+        );
+      }
+
+      const dirtyBefore = observeMutationPaths(this.git, initial.worktreePath);
+      if (dirtyBefore.changed.length > 0) {
+        throw new SessionRegistryError("PUSH_DIRTY_WORKTREE", "Push requires a clean Git worktree", {
+          paths: [...dirtyBefore.changed],
+        });
+      }
+
+      reverifyMutationContext(this, initial, sessionId, "push");
+      const dirtyBeforePush = observeMutationPaths(this.git, initial.worktreePath);
+      if (dirtyBeforePush.changed.length > 0) {
+        throw new SessionRegistryError("PUSH_DIRTY_WORKTREE", "The worktree changed before push mutation", {
+          paths: [...dirtyBeforePush.changed],
+        });
+      }
+
+      const pushArguments = [
+        "push",
+        ...(force ? ["--force-with-lease"] : []),
+        ...(createUpstream ? ["--set-upstream"] : []),
+        remote,
+        `HEAD:refs/heads/${branch}`,
+      ];
+      runMutationGit(this.git, pushArguments, initial.worktreePath, "push", "PUSH_FAILED");
+
+      return Object.freeze({
+        schemaVersion: GOVERNED_GIT_OPERATION_SCHEMA_VERSION,
+        remote,
+        branch,
+        target: `${remote}/${branch}`,
+        relation: inspection.relation,
+        force,
+        upstreamCreated: createUpstream,
+      });
+    });
+  }
+
+  pushSession(options: PushOptions): PushResult {
+    return this.push(options);
+  }
+
+  private requireMutationAuthorization(
+    operation: "commit" | "push",
+    resources: readonly string[],
+    sessionId: string | null,
+  ): OperationAuthorizationDecision {
+    const decision = this.authorizeOperation({ operation, resources, sessionId });
+    if (decision.allowed) return decision;
+    const code = decision.code === "ALLOWED" ? "OPERATION_REJECTED" : decision.code;
+    throw new SessionRegistryError(code, `Operation ${operation} was denied: ${code}`, {
+      ...decision.details,
+      operation,
+      resources: decision.resources.map((resource) => resource.resource),
+    });
   }
 
   /** Capture bounded Git evidence for the current owned session's declaration. */
@@ -1863,6 +2104,310 @@ function canonicalOperationResources(resources: readonly string[], worktreePath:
     }
   }
   return Object.freeze(sortStrings(canonical));
+}
+
+interface MutationPaths {
+  readonly changed: readonly string[];
+  readonly staged: readonly string[];
+}
+
+interface PushInspection {
+  readonly relation: PushRelation;
+  readonly upstream: string | undefined;
+}
+
+function operationSessionId(first: string | null | undefined, second: string | null | undefined): string | null {
+  if (first !== undefined) return first;
+  return second ?? null;
+}
+
+function operationResources(resources: readonly string[] | undefined): readonly string[] {
+  return resources === undefined ? [] : [...resources];
+}
+
+function assertFinalCommitMessage(message: string): void {
+  if (
+    typeof message !== "string" ||
+    message.length === 0 ||
+    message.trim().length === 0 ||
+    message.includes("\u0000")
+  ) {
+    throw new SessionRegistryError(
+      "INVALID_COMMIT_MESSAGE",
+      "Commit message must be a non-empty final message without NUL bytes",
+    );
+  }
+}
+
+function explicitRemote(remote: string | null | undefined): string {
+  if (typeof remote !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(remote)) {
+    throw new SessionRegistryError("INVALID_REMOTE", "Push requires an explicit local Git remote name", {
+      remote: typeof remote === "string" ? remote : "<missing>",
+    });
+  }
+  return remote;
+}
+
+function explicitRemoteBranch(branch: string | null | undefined, alias: string | null | undefined): string {
+  if (branch !== undefined && branch !== null && alias !== undefined && alias !== null && branch !== alias) {
+    throw new SessionRegistryError("INVALID_REMOTE_BRANCH", "Conflicting remote branch targets were supplied", {
+      branch,
+      remoteBranch: alias,
+    });
+  }
+  const candidate = branch ?? alias;
+  if (typeof candidate !== "string" || candidate.length === 0) {
+    throw new SessionRegistryError("INVALID_REMOTE_BRANCH", "Push requires an explicit remote branch name", {
+      branch: "<missing>",
+    });
+  }
+  try {
+    return normalizeBranchId(candidate).slice("refs/heads/".length);
+  } catch (error: unknown) {
+    throw new SessionRegistryError(
+      "INVALID_REMOTE_BRANCH",
+      "Git rejected the explicit remote branch name",
+      {
+        branch: candidate,
+      },
+      error,
+    );
+  }
+}
+
+function observeMutationPaths(git: GitCommandRunner, worktreePath: string): MutationPaths {
+  const observed = captureGitCheckpoint(git, worktreePath);
+  return Object.freeze({
+    changed: Object.freeze(canonicalMutationPaths(observed.changed, worktreePath)),
+    staged: Object.freeze(canonicalMutationPaths(observed.staged, worktreePath)),
+  });
+}
+
+function canonicalMutationPaths(paths: readonly string[], worktreePath: string): string[] {
+  const canonical = new Set<string>();
+  for (const resource of paths) {
+    try {
+      canonical.add(canonicalizeClaimResource(resource, worktreePath));
+    } catch (error: unknown) {
+      throw new SessionRegistryError(
+        "GIT_STATE_AMBIGUOUS",
+        "Git reported a path that cannot be represented as a canonical repository resource",
+        { path: resource },
+        error,
+      );
+    }
+  }
+  return sortStrings(canonical);
+}
+
+function assertNoUnexpectedMutationPaths(paths: readonly string[], authorized: readonly string[]): void {
+  const authorizedSet = new Set(authorized);
+  const unexpected = paths.filter((resource) => !authorizedSet.has(resource));
+  if (unexpected.length > 0) {
+    throw new SessionRegistryError(
+      "UNEXPECTED_CHANGED_PATHS",
+      "Git reports changed or staged paths outside the explicit authorized resource set",
+      {
+        paths: sortStrings(unexpected),
+        authorizedResources: sortStrings(authorized),
+      },
+    );
+  }
+}
+
+function reverifyMutationContext(
+  registry: SessionRegistry,
+  expected: VerifiedExecutionContext,
+  sessionId: string | null,
+  phase: "stage" | "commit" | "push",
+): VerifiedExecutionContext {
+  const actual = registry.verifyExecutionContext({ sessionId });
+  if (
+    actual.repositoryId !== expected.repositoryId ||
+    actual.worktreePath !== expected.worktreePath ||
+    actual.branchId !== expected.branchId ||
+    actual.headId !== expected.headId
+  ) {
+    throw new SessionRegistryError(
+      "GIT_STATE_AMBIGUOUS",
+      "Repository, worktree, branch, or HEAD changed before Git mutation",
+      {
+        phase,
+        expectedRepository: expected.repositoryId,
+        actualRepository: actual.repositoryId,
+        expectedWorktree: expected.worktreePath,
+        actualWorktree: actual.worktreePath,
+        expectedBranch: expected.branchName,
+        actualBranch: actual.branchName,
+        expectedHead: expected.headId,
+        actualHead: actual.headId,
+      },
+    );
+  }
+  return actual;
+}
+
+function isBoundedGitFailure(code: RegistryErrorCode): boolean {
+  return code === "GIT_SPAWN_FAILED" || code === "GIT_TIMEOUT" || code === "GIT_OUTPUT_LIMIT";
+}
+
+function runMutationGit(
+  git: GitCommandRunner,
+  args: readonly string[],
+  cwd: string,
+  phase: string,
+  failureCode: RegistryErrorCode,
+): void {
+  try {
+    git.run(args, cwd);
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError && isBoundedGitFailure(error.code)) {
+      throw new SessionRegistryError(
+        error.code,
+        `${phase} Git operation did not complete`,
+        {
+          ...error.details,
+          phase,
+        },
+        error,
+      );
+    }
+    const details: RegistryErrorDetails = {
+      phase,
+      command: args.join(" "),
+      ...(error instanceof SessionRegistryError ? error.details : {}),
+      ...(error instanceof SessionRegistryError ? { gitCode: error.code } : {}),
+    };
+    throw new SessionRegistryError(failureCode, `${phase} Git operation failed`, details, error);
+  }
+}
+
+function inspectPushTarget(git: GitCommandRunner, cwd: string, remote: string, branch: string): PushInspection {
+  try {
+    git.run(["remote", "get-url", remote], cwd);
+  } catch (error: unknown) {
+    throwRemoteInspectionFailure(error, "remote");
+  }
+
+  let remoteTargetOutput: string;
+  try {
+    remoteTargetOutput = git.run(["ls-remote", "--heads", remote, `refs/heads/${branch}`], cwd);
+  } catch (error: unknown) {
+    throwRemoteInspectionFailure(error, "ls-remote");
+  }
+  const remoteTargetExists = remoteTargetOutput.trim().length > 0;
+  if (remoteTargetExists && !/^[0-9a-f]{40,64}\s+refs\/heads\//u.test(remoteTargetOutput.trim())) {
+    throw new SessionRegistryError(
+      "PUSH_REMOTE_INSPECTION_FAILED",
+      "Remote branch inspection returned an invalid record",
+      {
+        remote,
+        branch,
+      },
+    );
+  }
+
+  let upstream: string | undefined;
+  try {
+    upstream = git.run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], cwd).trim();
+  } catch (error: unknown) {
+    if (!isExpectedMissingRef(error)) throwRemoteInspectionFailure(error, "upstream");
+    upstream = undefined;
+  }
+  if (upstream === "") upstream = undefined;
+  if (upstream === undefined) {
+    // The absence of an upstream is itself a first-class relation. A remote
+    // branch may exist, but it must not silently become tracking state.
+    return { relation: "no-upstream", upstream: undefined };
+  }
+
+  const separator = upstream.indexOf("/");
+  if (separator <= 0 || separator === upstream.length - 1) {
+    throw new SessionRegistryError("PUSH_REMOTE_INSPECTION_FAILED", "Configured upstream has an invalid format", {
+      upstream,
+    });
+  }
+  if (!remoteTargetExists) {
+    throw new SessionRegistryError(
+      "PUSH_REMOTE_INSPECTION_FAILED",
+      "Configured upstream target is absent on the remote",
+      {
+        upstream,
+        remote,
+        branch,
+      },
+    );
+  }
+
+  const remoteShaMatch = remoteTargetOutput.trim().match(/^([0-9a-f]{40,64})\s+/u);
+  if (remoteShaMatch === null) {
+    throw new SessionRegistryError(
+      "PUSH_REMOTE_INSPECTION_FAILED",
+      "Could not extract remote SHA from ls-remote output",
+      {
+        remote,
+        branch,
+      },
+    );
+  }
+  const remoteSha = remoteShaMatch[1];
+
+  let headSha: string;
+  try {
+    headSha = git.run(["rev-parse", "HEAD"], cwd).trim();
+  } catch (error: unknown) {
+    throwRemoteInspectionFailure(error, "HEAD");
+  }
+
+  let relationOutput: string;
+  try {
+    relationOutput = git.run(["rev-list", "--left-right", "--count", `HEAD...${remoteSha}`], cwd);
+  } catch (error: unknown) {
+    throwRemoteInspectionFailure(error, "relation");
+  }
+  const counts = relationOutput
+    .trim()
+    .split(/\s+/u)
+    .map((value) => Number(value));
+  if (counts.length !== 2 || counts.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    throw new SessionRegistryError("PUSH_REMOTE_INSPECTION_FAILED", "Remote ancestry relation was not numeric", {
+      remote,
+      branch,
+    });
+  }
+  const [ahead, behind] = counts as [number, number];
+  const relation: PushRelation =
+    ahead > 0 && behind > 0 ? "diverged" : behind > 0 ? "behind" : ahead > 0 ? "ahead" : "up-to-date";
+  return { relation, upstream };
+}
+
+function isExpectedMissingRef(error: unknown): boolean {
+  return (
+    error instanceof SessionRegistryError &&
+    error.code === "GIT_COMMAND_FAILED" &&
+    (error.details.exitCode === 1 || error.details.exitCode === 128)
+  );
+}
+
+function throwRemoteInspectionFailure(error: unknown, phase: string): never {
+  if (error instanceof SessionRegistryError && isBoundedGitFailure(error.code)) {
+    throw new SessionRegistryError(
+      error.code,
+      "Remote inspection did not complete",
+      { ...error.details, phase },
+      error,
+    );
+  }
+  throw new SessionRegistryError(
+    "PUSH_REMOTE_INSPECTION_FAILED",
+    "Remote/upstream inspection failed before push mutation",
+    {
+      phase,
+      ...(error instanceof SessionRegistryError ? error.details : {}),
+      ...(error instanceof SessionRegistryError ? { gitCode: error.code } : {}),
+    },
+    error,
+  );
 }
 
 function canonicalObservedPaths(paths: readonly string[], worktreePath: string): readonly string[] {

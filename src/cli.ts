@@ -32,6 +32,8 @@ const HELP_TEXT = [
   "  session close        Close the current or selected session",
   "  authorize            Authorize an operation against concrete claims",
   "  checkpoint           Capture bounded Git execution evidence",
+  "  commit               Commit explicit claim-authorized resources",
+  "  push                 Push the owned branch to an explicit target",
   "  status               Show Nawabari session status",
   "  guard [--session id] Authorize the current worktree or operation",
   "  gc                   Detect or clean eligible stale sessions",
@@ -50,6 +52,8 @@ const HELP_TEXT = [
   "  session claims|release --session <id> [--claim-id <id>]",
   "  authorize --session <id> --operation <name> --resource <path> [--resource <path>]",
   "  checkpoint [--session <id>]",
+  "  commit --message <final-message> --resource <path> [--resource <path>] [--session <id>]",
+  "  push --remote <name> --branch <name> --resource <path> [--create-upstream] [--force] [--session <id>]",
   "  gc [--dry-run|--apply]",
 ].join("\n");
 
@@ -71,6 +75,8 @@ const HELP_DATA: JsonObject = {
     "session close",
     "authorize",
     "checkpoint",
+    "commit",
+    "push",
     "status",
     "guard",
     "gc",
@@ -90,6 +96,8 @@ const HELP_DATA: JsonObject = {
   ],
   authorization_options: ["--session", "--operation", "--resource"],
   checkpoint_options: ["--session"],
+  commit_options: ["--session", "--message", "--resource"],
+  push_options: ["--session", "--resource", "--remote", "--branch", "--remote-branch", "--force", "--create-upstream"],
   gc_options: ["--apply", "--dry-run"],
 };
 
@@ -116,10 +124,15 @@ type ParsedOptions = {
   resource: string | null;
   resources: string[];
   operation: string | null;
+  message: string | null;
+  remote: string | null;
+  remote_branch: string | null;
   mode: string | null;
   claim_id: string | null;
   repository: string | null;
   apply: boolean;
+  force: boolean;
+  create_upstream: boolean;
 };
 
 function usageError(
@@ -173,10 +186,15 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     resource: null,
     resources: [],
     operation: null,
+    message: null,
+    remote: null,
+    remote_branch: null,
     mode: null,
     claim_id: null,
     repository: null,
     apply: false,
+    force: false,
+    create_upstream: false,
   };
   let dryRun = false;
 
@@ -186,12 +204,14 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       return failure(usageError("INVALID_ARGUMENT", `Unknown option: ${name}.`, { option: name }));
     }
 
-    if (name === "--apply" || name === "--dry-run") {
+    if (name === "--apply" || name === "--dry-run" || name === "--force" || name === "--create-upstream") {
       if (inlineValue !== null) {
         return failure(usageError("INVALID_ARGUMENT", `${name} does not accept a value.`, { option: name }));
       }
       if (name === "--apply") options.apply = true;
-      else dryRun = true;
+      else if (name === "--dry-run") dryRun = true;
+      else if (name === "--force") options.force = true;
+      else options.create_upstream = true;
       continue;
     }
 
@@ -210,6 +230,9 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       options.resource = value;
       options.resources.push(value);
     } else if (name === "--operation") options.operation = value;
+    else if (name === "--message") options.message = value;
+    else if (name === "--remote") options.remote = value;
+    else if (name === "--remote-branch") options.remote_branch = value;
     else if (name === "--mode") options.mode = value;
     else if (name === "--claim-id") options.claim_id = value;
     else if (name === "--repository") options.repository = value;
@@ -405,6 +428,61 @@ async function executeCommand(
     return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
   }
 
+  if (command === "commit") {
+    const parsed = parseOptions(
+      [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
+      new Set(["--session", "--message", "--resource"]),
+    );
+    if (!parsed.ok) return parsed;
+    if (parsed.value.message === null) {
+      return failure(usageError("MISSING_ARGUMENT", "--message requires a value.", { option: "--message" }));
+    }
+    if (parsed.value.resources.length === 0) {
+      return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
+    }
+    if (dependencies.backend.commit === undefined) return mutationCapabilityUnavailable("commit");
+    const result = await dependencies.backend.commit(context, {
+      session_id: parsed.value.session_id,
+      message: parsed.value.message,
+      resources: parsed.value.resources,
+    });
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  }
+
+  if (command === "push") {
+    const parsed = parseOptions(
+      [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
+      new Set(["--session", "--resource", "--remote", "--branch", "--remote-branch", "--force", "--create-upstream"]),
+    );
+    if (!parsed.ok) return parsed;
+    if (parsed.value.remote === null) {
+      return failure(usageError("MISSING_ARGUMENT", "--remote requires a value.", { option: "--remote" }));
+    }
+    if (parsed.value.branch === null && parsed.value.remote_branch === null) {
+      return failure(usageError("MISSING_ARGUMENT", "--branch requires a value.", { option: "--branch" }));
+    }
+    if (
+      parsed.value.branch !== null &&
+      parsed.value.remote_branch !== null &&
+      parsed.value.branch !== parsed.value.remote_branch
+    ) {
+      return failure(usageError("INVALID_ARGUMENT", "--branch and --remote-branch must identify the same target."));
+    }
+    if (parsed.value.resources.length === 0) {
+      return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
+    }
+    if (dependencies.backend.push === undefined) return mutationCapabilityUnavailable("push");
+    const result = await dependencies.backend.push(context, {
+      session_id: parsed.value.session_id,
+      resources: parsed.value.resources,
+      remote: parsed.value.remote,
+      branch: parsed.value.branch ?? parsed.value.remote_branch,
+      force: parsed.value.force,
+      create_upstream: parsed.value.create_upstream,
+    });
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  }
+
   if (command === "status") {
     const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
     if (!parsed.ok) return parsed;
@@ -419,7 +497,11 @@ async function executeCommand(
     );
     if (!parsed.ok) return parsed;
     if (parsed.value.resources.length > 0 && parsed.value.operation === null) {
-      return failure(usageError("MISSING_ARGUMENT", "--operation is required when --resource is provided.", { option: "--operation" }));
+      return failure(
+        usageError("MISSING_ARGUMENT", "--operation is required when --resource is provided.", {
+          option: "--operation",
+        }),
+      );
     }
     if (parsed.value.operation !== null) {
       if (parsed.value.resources.length === 0) {
@@ -508,6 +590,12 @@ function checkpointCapabilityUnavailable(): DomainResult<JsonObject> {
     new DomainError("BACKEND_UNAVAILABLE", "Checkpoint evidence capability is not available.", {
       operation: "checkpoint",
     }),
+  );
+}
+
+function mutationCapabilityUnavailable(operation: "commit" | "push"): DomainResult<JsonObject> {
+  return failure(
+    new DomainError("BACKEND_UNAVAILABLE", "Governed Git mutation capability is not available.", { operation }),
   );
 }
 

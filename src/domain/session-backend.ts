@@ -11,6 +11,8 @@ import {
   type BackendCapabilities,
   type CheckpointEvidence,
   type CheckpointOptions,
+  type CommitOptions,
+  type CommitResult,
   type ClaimResourcesOptions,
   type ClaimResourcesResult,
   type GarbageCollectOptions,
@@ -19,6 +21,8 @@ import {
   type GuardOptions,
   type OperationAuthorizationDecision,
   type OperationAuthorizationOptions,
+  type PushOptions,
+  type PushResult,
   type SessionBackend,
   type SessionCloseOptions,
   type SessionCloseResult,
@@ -86,6 +90,7 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   REGISTRY_IO_FAILURE: "REGISTRY_UNREADABLE",
   INVALID_CLAIM: "INVALID_CLAIM",
   INVALID_OPERATION: "INVALID_OPERATION",
+  OPERATION_REJECTED: "OPERATION_REJECTED",
   INVALID_RESOURCE: "INVALID_RESOURCE",
   MISSING_RESOURCE_CLAIM: "MISSING_RESOURCE_CLAIM",
   INVALID_CLAIM_RESOURCE: "INVALID_CLAIM_RESOURCE",
@@ -101,6 +106,21 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   CLAIM_NOT_FOUND: "CLAIM_NOT_FOUND",
   SESSION_NOT_ACTIVE: "SESSION_NOT_ACTIVE",
   UNSUPPORTED_CLAIM_SCHEMA_VERSION: "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
+  INVALID_COMMIT_MESSAGE: "INVALID_COMMIT_MESSAGE",
+  COMMIT_EMPTY_DIFF: "COMMIT_EMPTY_DIFF",
+  UNEXPECTED_CHANGED_PATHS: "UNEXPECTED_CHANGED_PATHS",
+  COMMIT_STAGING_FAILED: "COMMIT_STAGING_FAILED",
+  COMMIT_FAILED: "COMMIT_FAILED",
+  COMMIT_RESULT_UNAVAILABLE: "COMMIT_RESULT_UNAVAILABLE",
+  INVALID_REMOTE: "INVALID_REMOTE",
+  INVALID_REMOTE_BRANCH: "INVALID_REMOTE_BRANCH",
+  PUSH_TARGET_MISMATCH: "PUSH_TARGET_MISMATCH",
+  PUSH_REMOTE_INSPECTION_FAILED: "PUSH_REMOTE_INSPECTION_FAILED",
+  PUSH_NO_UPSTREAM: "PUSH_NO_UPSTREAM",
+  PUSH_BEHIND: "PUSH_BEHIND",
+  PUSH_DIVERGED: "PUSH_DIVERGED",
+  PUSH_DIRTY_WORKTREE: "PUSH_DIRTY_WORKTREE",
+  PUSH_FAILED: "PUSH_FAILED",
 });
 
 /** SessionBackend implementation backed only by the local Git repository. */
@@ -192,6 +212,35 @@ export class LocalSessionBackend implements SessionBackend {
           }),
         ),
       );
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async commit(context: SessionContext, options: CommitOptions): Promise<DomainResult<CommitResult>> {
+    try {
+      const result = this.registryFor(context).commit({
+        sessionId: options.session_id,
+        message: options.message,
+        resources: options.resources,
+      });
+      return success(toDomainCommitResult(result));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async push(context: SessionContext, options: PushOptions): Promise<DomainResult<PushResult>> {
+    try {
+      const result = this.registryFor(context).push({
+        sessionId: options.session_id,
+        resources: options.resources,
+        remote: options.remote,
+        branch: options.branch,
+        force: options.force,
+        createUpstream: options.create_upstream,
+      });
+      return success(toDomainPushResult(result));
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -409,6 +458,27 @@ function toDomainCheckpointEvidence(
     in_claim: [...evidence.inClaim],
     out_of_claim: [...evidence.outOfClaim],
     max_paths: evidence.maxPaths,
+  };
+}
+
+function toDomainCommitResult(result: import("../session-registry.js").CommitResult): CommitResult {
+  return {
+    schema_version: result.schemaVersion,
+    commit_sha: result.commitSha,
+    message: result.message,
+    resources: [...result.resources],
+  };
+}
+
+function toDomainPushResult(result: import("../session-registry.js").PushResult): PushResult {
+  return {
+    schema_version: result.schemaVersion,
+    remote: result.remote,
+    branch: result.branch,
+    target: result.target,
+    relation: result.relation,
+    force: result.force,
+    upstream_created: result.upstreamCreated,
   };
 }
 

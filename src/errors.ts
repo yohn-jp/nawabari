@@ -38,6 +38,7 @@ export type RegistryErrorCode =
   | "REGISTRY_IO_FAILURE"
   | "INVALID_CLAIM"
   | "INVALID_OPERATION"
+  | "OPERATION_REJECTED"
   | "INVALID_RESOURCE"
   | "MISSING_RESOURCE_CLAIM"
   | "INVALID_CLAIM_RESOURCE"
@@ -52,9 +53,24 @@ export type RegistryErrorCode =
   | "RESOURCE_CLAIM_CONFLICT"
   | "CLAIM_NOT_FOUND"
   | "SESSION_NOT_ACTIVE"
-  | "UNSUPPORTED_CLAIM_SCHEMA_VERSION";
+  | "UNSUPPORTED_CLAIM_SCHEMA_VERSION"
+  | "INVALID_COMMIT_MESSAGE"
+  | "COMMIT_EMPTY_DIFF"
+  | "UNEXPECTED_CHANGED_PATHS"
+  | "COMMIT_STAGING_FAILED"
+  | "COMMIT_FAILED"
+  | "COMMIT_RESULT_UNAVAILABLE"
+  | "INVALID_REMOTE"
+  | "INVALID_REMOTE_BRANCH"
+  | "PUSH_TARGET_MISMATCH"
+  | "PUSH_REMOTE_INSPECTION_FAILED"
+  | "PUSH_NO_UPSTREAM"
+  | "PUSH_BEHIND"
+  | "PUSH_DIVERGED"
+  | "PUSH_DIRTY_WORKTREE"
+  | "PUSH_FAILED";
 
-export type RegistryErrorDetails = Readonly<Record<string, boolean | number | string>>;
+export type RegistryErrorDetails = Readonly<Record<string, boolean | number | string | string[]>>;
 
 export class SessionRegistryError extends Error {
   readonly code: RegistryErrorCode;
