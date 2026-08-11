@@ -32,34 +32,67 @@ function jsonFailure(command: string, error: DomainError): string {
   return JSON.stringify(response);
 }
 
-function formatValue(value: JsonValue): string {
-  if (typeof value === "string") return value;
-  return JSON.stringify(value);
+type JsonPrimitive = null | boolean | number | string;
+
+const INDENT = "  ";
+
+function isPrimitive(value: JsonValue): value is JsonPrimitive {
+  return value === null || typeof value !== "object";
+}
+
+function formatPrimitive(value: JsonPrimitive): string {
+  if (value === null) return "null";
+  return String(value);
+}
+
+function inlineValue(value: JsonValue): string | null {
+  if (isPrimitive(value)) return formatPrimitive(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "[]";
+    if (value.every(isPrimitive)) return `[${value.map(formatPrimitive).join(", ")}]`;
+    return null;
+  }
+  return Object.keys(value).length === 0 ? "{}" : null;
+}
+
+function formatListItem(value: JsonValue, indent: string): string[] {
+  const inline = inlineValue(value);
+  if (inline !== null) return [`${indent}- ${inline}`];
+
+  const nested = formatValue(value, `${indent}${INDENT}`);
+  if (Array.isArray(value)) return [`${indent}-`, ...nested];
+
+  const itemIndent = `${indent}${INDENT}`;
+  return [`${indent}- ${nested[0].slice(itemIndent.length)}`, ...nested.slice(1)];
+}
+
+function formatValue(value: JsonValue, indent = ""): string[] {
+  const inline = inlineValue(value);
+  if (inline !== null) return [`${indent}${inline}`];
+
+  if (isPrimitive(value)) return [`${indent}${formatPrimitive(value)}`];
+  if (Array.isArray(value)) return value.flatMap((item) => formatListItem(item, indent));
+
+  return Object.entries(value).flatMap(([key, child]) => formatField(key, child, indent));
+}
+
+function formatField(key: string, value: JsonValue, indent: string): string[] {
+  const inline = inlineValue(value);
+  if (inline !== null) return [`${indent}${key}: ${inline}`];
+  return [`${indent}${key}:`, ...formatValue(value, `${indent}${INDENT}`)];
 }
 
 function humanSuccess(command: string, payload: JsonObject): string {
   if (Object.keys(payload).length === 0) return `${command}: ok`;
 
   const lines = [`${command}: ok`];
-  for (const [key, value] of Object.entries(payload)) {
-    if (key === "checks" && Array.isArray(value)) {
-      for (const item of value) {
-        if (typeof item === "object" && item !== null && !Array.isArray(item) && "name" in item && "status" in item) {
-          const name = item.name;
-          const status = item.status;
-          if (typeof name === "string" && typeof status === "string") lines.push(`  ${name}: ${status}`);
-        }
-      }
-      continue;
-    }
-    lines.push(`  ${key}: ${formatValue(value)}`);
-  }
+  for (const [key, value] of Object.entries(payload)) lines.push(...formatField(key, value, INDENT));
   return lines.join("\n");
 }
 
 function humanFailure(command: string, error: DomainError): string {
   const lines = [`${command}: rejected`, `  code: ${error.code}`, `  message: ${error.message}`];
-  if (error.details !== null) lines.push(`  details: ${JSON.stringify(error.details)}`);
+  if (error.details !== null) lines.push(...formatField("details", error.details, INDENT));
   return lines.join("\n");
 }
 
