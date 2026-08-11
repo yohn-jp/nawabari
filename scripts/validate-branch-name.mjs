@@ -6,7 +6,7 @@
 // (see isReleaseDocsOnlyChange in ci docs-only guard).
 import { execFileSync } from "node:child_process";
 
-const BRANCH_PATTERN = /^(feat|fix|docs|refactor|test|chore)\/\d+-[a-z0-9-]+$/;
+const BRANCH_PATTERN = /^(feat|fix|docs|refactor|test|chore|perf)\/\d+-[a-z0-9-]+$/;
 const RELEASE_BRANCH_PATTERN = /^release\/\d+\.\d+\.\d+$/;
 const EXEMPT_BRANCHES = new Set(["main", "chore/nawabari-0.1.0"]);
 
@@ -17,7 +17,7 @@ export function validateBranchName(branch) {
   return [
     `branch name "${branch}" does not match <type>/<issue-number>-<slug>` +
       ' (e.g. "feat/42-add-init-command") or release/<semver> (e.g. "release/0.1.0");' +
-      " type must be one of feat, fix, docs, refactor, test, chore",
+      " type must be one of feat, fix, docs, refactor, test, chore, perf",
   ];
 }
 

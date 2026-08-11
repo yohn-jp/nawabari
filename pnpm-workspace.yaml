@@ -3,3 +3,4 @@
 # dependency of tsx) is a known-safe, widely used build tool.
 allowBuilds:
   esbuild: true
+enableGlobalVirtualStore: true
