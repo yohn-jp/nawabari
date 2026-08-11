@@ -48,6 +48,13 @@ test("close permits ignored generated artifacts but still protects recoverable f
     fs.mkdirSync(path.join(worktreePath, ".cache"), { recursive: true });
     fs.writeFileSync(path.join(worktreePath, ".cache", "metadata"), "generated\n");
 
+    fs.writeFileSync(path.join(worktreePath, "notes.txt"), "recoverable\n");
+    assert.throws(
+      () => registry.close(session.sessionId),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "DIRTY_WORKTREE",
+    );
+    fs.rmSync(path.join(worktreePath, "notes.txt"));
+
     const result = registry.close(session.sessionId);
     assert.equal(result.session.state, "closed");
     assert.equal(result.worktreeRemoved, true);

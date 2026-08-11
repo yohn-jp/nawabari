@@ -95,7 +95,8 @@ test("a parallel reclaimer cannot remove a lock acquired after the final token c
       JSON.stringify({
         schemaVersion: 1,
         token: "dead-owner",
-        pid: process.pid,
+        // The maximum portable PID is not a live process on supported CI hosts.
+        pid: 2_147_483_647,
         hostname: hostname(),
         processStartTime: "0",
         acquiredAt: new Date(Date.now() - 10_000).toISOString(),
