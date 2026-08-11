@@ -51,7 +51,7 @@ test("round-trips session metadata through common Git state", () => {
 
 test("keeps human labels separate from session identity", () => {
   const fixture = createRepositoryFixture();
-  const thirdWorktreePath = makeDirectory("git-paw-label-worktree-");
+  const thirdWorktreePath = makeDirectory("nawabari-label-worktree-");
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const first = registry.create({ label: "worker" });
@@ -79,7 +79,7 @@ test("rejects an empty label before writing unreadable registry state", () => {
 
 test("rejects an empty label through register before writing unreadable registry state", () => {
   const fixture = createRepositoryFixture();
-  const worktreePath = makeDirectory("git-paw-register-label-");
+  const worktreePath = makeDirectory("nawabari-register-label-");
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const session = registry.create();
@@ -104,7 +104,7 @@ test("rejects an empty label through register before writing unreadable registry
 
 test("rejects duplicate worktree, branch, and session ownership", () => {
   const fixture = createRepositoryFixture();
-  const thirdWorktreePath = makeDirectory("git-paw-duplicate-worktree-");
+  const thirdWorktreePath = makeDirectory("nawabari-duplicate-worktree-");
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const first = registry.create({ label: "first" });
@@ -274,7 +274,7 @@ test("shares the repository lock format with the generic mutation boundary", asy
 
 test("serializes concurrent creates without losing updates or duplicating ownership", { timeout: 30_000 }, async () => {
   const fixture = createRepositoryFixture();
-  const worktreePaths = Array.from({ length: 8 }, () => makeDirectory("git-paw-concurrent-worktree-"));
+  const worktreePaths = Array.from({ length: 8 }, () => makeDirectory("nawabari-concurrent-worktree-"));
   try {
     const workerPath = fileURLToPath(new URL("../scripts/session-registry-worker.mjs", import.meta.url));
     const results = await Promise.all(
@@ -325,11 +325,11 @@ interface RepositoryFixture {
 }
 
 function createRepositoryFixture(): RepositoryFixture {
-  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "git-paw-registry-"));
+  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-registry-"));
   const linkedWorktreePath = path.join(path.dirname(repositoryPath), `${path.basename(repositoryPath)}-linked`);
   runGit(["init", "-b", "main"], repositoryPath);
-  runGit(["config", "user.email", "git-paw-tests@example.invalid"], repositoryPath);
-  runGit(["config", "user.name", "GitPaw Tests"], repositoryPath);
+  runGit(["config", "user.email", "nawabari-tests@example.invalid"], repositoryPath);
+  runGit(["config", "user.name", "Nawabari Tests"], repositoryPath);
   fs.writeFileSync(path.join(repositoryPath, "README.md"), "fixture\n");
   runGit(["add", "README.md"], repositoryPath);
   runGit(["commit", "-m", "initial"], repositoryPath);

@@ -33,6 +33,32 @@ test("close removes a clean provisioned worktree and merged branch, and repeats 
   }
 });
 
+test("close permits ignored generated artifacts but still protects recoverable files", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-ignored-build-close`;
+  try {
+    fs.writeFileSync(path.join(fixture.repositoryPath, ".gitignore"), "dist/\n.cache/\n");
+    runGit(["add", ".gitignore"], fixture.repositoryPath);
+    runGit(["commit", "-m", "ignore generated artifacts"], fixture.repositoryPath);
+
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/ignored-build-close" });
+    fs.mkdirSync(path.join(worktreePath, "dist"), { recursive: true });
+    fs.writeFileSync(path.join(worktreePath, "dist", "generated.js"), "generated\n");
+    fs.mkdirSync(path.join(worktreePath, ".cache"), { recursive: true });
+    fs.writeFileSync(path.join(worktreePath, ".cache", "metadata"), "generated\n");
+
+    const result = registry.close(session.sessionId);
+    assert.equal(result.session.state, "closed");
+    assert.equal(result.worktreeRemoved, true);
+    assert.equal(result.branchRemoved, true);
+    assert.equal(fs.existsSync(worktreePath), false);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 test("close refuses dirty worktrees without changing ownership", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = `${fixture.repositoryPath}-dirty-close`;
@@ -210,10 +236,10 @@ interface RepositoryFixture {
 }
 
 function createRepositoryFixture(): RepositoryFixture {
-  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "git-paw-lifecycle-"));
+  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-lifecycle-"));
   runGit(["init", "-b", "main", repositoryPath], repositoryPath);
-  runGit(["config", "user.email", "git-paw-tests@example.invalid"], repositoryPath);
-  runGit(["config", "user.name", "GitPaw Tests"], repositoryPath);
+  runGit(["config", "user.email", "nawabari-tests@example.invalid"], repositoryPath);
+  runGit(["config", "user.name", "Nawabari Tests"], repositoryPath);
   fs.writeFileSync(path.join(repositoryPath, "README.md"), "fixture\n");
   runGit(["add", "README.md"], repositoryPath);
   runGit(["commit", "-m", "initial"], repositoryPath);

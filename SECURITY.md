@@ -29,14 +29,14 @@ response times are best-effort.
 
 ## Trust boundaries
 
-GitPaw invokes the local `git` executable and reads or writes the repository's
+Nawabari invokes the local `git` executable and reads or writes the repository's
 common Git directory and managed worktree paths. It is intended for a trusted
 local user and does not provide an operating-system sandbox, filesystem ACL,
 or process isolation. Direct filesystem writes by a process that already has
-permission to access another worktree are outside GitPaw's enforcement
+permission to access another worktree are outside Nawabari's enforcement
 boundary.
 
-GitPaw does not contact GitHub, `gh`, an agent runtime, or a remote service,
+Nawabari does not contact GitHub, `gh`, an agent runtime, or a remote service,
 and it does not handle credentials. Inputs that select branches and paths are
 validated before Git mutation; ambiguous ownership and recoverable work fail
 closed.

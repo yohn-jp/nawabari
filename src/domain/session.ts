@@ -117,7 +117,7 @@ class UnavailableSessionBackend implements SessionBackend {
   private unavailable<T>(operation: string): Promise<DomainResult<T>> {
     return Promise.resolve(
       failure(
-        new DomainError("BACKEND_UNAVAILABLE", "The requested GitPaw session capability is not available.", {
+        new DomainError("BACKEND_UNAVAILABLE", "The requested Nawabari session capability is not available.", {
           operation,
           capabilities: unavailableCapabilities(),
         }),
