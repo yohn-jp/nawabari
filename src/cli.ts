@@ -9,6 +9,8 @@ import {
   type SessionCloseOptions,
   type SessionContext,
   type SessionCreateOptions,
+  type SessionListOptions,
+  MAX_SESSION_LIST_LIMIT,
 } from "./domain/session.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
@@ -136,6 +138,10 @@ type ParsedOptions = {
   apply: boolean;
   force: boolean;
   create_upstream: boolean;
+  all: boolean;
+  history: boolean;
+  limit: string | null;
+  offset: string | null;
 };
 
 function usageError(
@@ -198,6 +204,10 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     apply: false,
     force: false,
     create_upstream: false,
+    all: false,
+    history: false,
+    limit: null,
+    offset: null,
   };
   let dryRun = false;
 
@@ -207,14 +217,23 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       return failure(usageError("INVALID_ARGUMENT", `Unknown option: ${name}.`, { option: name }));
     }
 
-    if (name === "--apply" || name === "--dry-run" || name === "--force" || name === "--create-upstream") {
+    if (
+      name === "--apply" ||
+      name === "--dry-run" ||
+      name === "--force" ||
+      name === "--create-upstream" ||
+      name === "--all" ||
+      name === "--history"
+    ) {
       if (inlineValue !== null) {
         return failure(usageError("INVALID_ARGUMENT", `${name} does not accept a value.`, { option: name }));
       }
       if (name === "--apply") options.apply = true;
       else if (name === "--dry-run") dryRun = true;
       else if (name === "--force") options.force = true;
-      else options.create_upstream = true;
+      else if (name === "--create-upstream") options.create_upstream = true;
+      else if (name === "--all") options.all = true;
+      else options.history = true;
       continue;
     }
 
@@ -239,6 +258,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--mode") options.mode = value;
     else if (name === "--claim-id") options.claim_id = value;
     else if (name === "--repository") options.repository = value;
+    else if (name === "--limit") options.limit = value;
+    else if (name === "--offset") options.offset = value;
   }
 
   if (options.apply && dryRun) {
@@ -250,6 +271,41 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
 
 function noOptions(arguments_: string[]): DomainResult<ParsedOptions> {
   return parseOptions(arguments_, new Set());
+}
+
+function sessionListingOptions(parsed: ParsedOptions): DomainResult<SessionListOptions> {
+  const parseInteger = (option: "--limit" | "--offset", value: string | null): DomainResult<number | undefined> => {
+    if (value === null) return { ok: true, value: undefined };
+    if (!/^\d+$/u.test(value)) {
+      return failure(usageError("INVALID_ARGUMENT", `${option} requires a non-negative integer.`, { option, value }));
+    }
+    const parsedValue = Number(value);
+    if (!Number.isSafeInteger(parsedValue)) {
+      return failure(usageError("INVALID_ARGUMENT", `${option} is outside the safe integer range.`, { option }));
+    }
+    return { ok: true, value: parsedValue };
+  };
+
+  const limit = parseInteger("--limit", parsed.limit);
+  if (!limit.ok) return limit;
+  if (limit.value !== undefined && (limit.value < 1 || limit.value > MAX_SESSION_LIST_LIMIT)) {
+    return failure(
+      usageError("INVALID_ARGUMENT", `--limit must be between 1 and ${MAX_SESSION_LIST_LIMIT}.`, {
+        option: "--limit",
+        max: MAX_SESSION_LIST_LIMIT,
+      }),
+    );
+  }
+  const offset = parseInteger("--offset", parsed.offset);
+  if (!offset.ok) return offset;
+  return {
+    ok: true,
+    value: {
+      include_closed: parsed.all || parsed.history,
+      ...(limit.value === undefined ? {} : { limit: limit.value }),
+      ...(offset.value === undefined ? {} : { offset: offset.value }),
+    },
+  };
 }
 
 function sessionContext(cwd: string): SessionContext {
@@ -344,9 +400,11 @@ async function executeCommand(
       return selected.ok ? { ok: true, value: selected.value } : selected;
     }
     if (subcommand === "list") {
-      const parsed = noOptions(rest);
+      const parsed = parseOptions(rest, new Set(["--all", "--history", "--limit", "--offset"]));
       if (!parsed.ok) return parsed;
-      const result = await dependencies.backend.listSessions(context);
+      const options = sessionListingOptions(parsed.value);
+      if (!options.ok) return options;
+      const result = await dependencies.backend.listSessions(context, options.value);
       return result.ok ? { ok: true, value: result.value } : result;
     }
     return failure(new DomainError("UNKNOWN_COMMAND", `Unknown session subcommand: ${subcommand}.`, { subcommand }));
@@ -487,9 +545,14 @@ async function executeCommand(
   }
 
   if (command === "status") {
-    const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
+    const parsed = parseOptions(
+      [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
+      new Set(["--all", "--history", "--limit", "--offset"]),
+    );
     if (!parsed.ok) return parsed;
-    const result = await dependencies.backend.status(context);
+    const options = sessionListingOptions(parsed.value);
+    if (!options.ok) return options;
+    const result = await dependencies.backend.status(context, options.value);
     return result.ok ? { ok: true, value: result.value } : result;
   }
 

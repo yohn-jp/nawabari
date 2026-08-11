@@ -1,4 +1,5 @@
 import { DomainError, type JsonObject, type JsonValue } from "./domain/errors.js";
+import { boundOutputDetails, boundOutputMessage, FAILURE_MESSAGE_LENGTH_LIMIT } from "./output-budget.js";
 
 export type CliMode = "human" | "json";
 
@@ -19,15 +20,31 @@ function jsonSuccess(command: string, payload: JsonObject): string {
 }
 
 function jsonFailure(command: string, error: DomainError): string {
+  const message = boundOutputMessage(error.message);
   const response: JsonObject = {
     ok: false,
     command,
     code: error.code,
-    message: error.message,
+    message: message.value,
   };
   if (error.details !== null) {
     if (typeof error.details.allowed === "boolean") response.allowed = error.details.allowed;
-    response.details = error.details;
+    response.details = boundOutputDetails(error.details);
+  }
+  if (message.truncated) {
+    const details: JsonObject =
+      response.details !== undefined &&
+      response.details !== null &&
+      typeof response.details === "object" &&
+      !Array.isArray(response.details)
+        ? (response.details as JsonObject)
+        : {};
+    response.details = {
+      ...details,
+      message_total: message.total,
+      message_limit: FAILURE_MESSAGE_LENGTH_LIMIT,
+      message_truncated: true,
+    };
   }
   return JSON.stringify(response);
 }
@@ -91,8 +108,22 @@ function humanSuccess(command: string, payload: JsonObject): string {
 }
 
 function humanFailure(command: string, error: DomainError): string {
-  const lines = [`${command}: rejected`, `  code: ${error.code}`, `  message: ${error.message}`];
-  if (error.details !== null) lines.push(...formatField("details", error.details, INDENT));
+  const message = boundOutputMessage(error.message);
+  const lines = [`${command}: rejected`, `  code: ${error.code}`, `  message: ${message.value}`];
+  if (error.details !== null) lines.push(...formatField("details", boundOutputDetails(error.details), INDENT));
+  if (message.truncated) {
+    lines.push(
+      ...formatField(
+        "message_budget",
+        {
+          total: message.total,
+          limit: FAILURE_MESSAGE_LENGTH_LIMIT,
+          truncated: true,
+        },
+        INDENT,
+      ),
+    );
+  }
   return lines.join("\n");
 }
 

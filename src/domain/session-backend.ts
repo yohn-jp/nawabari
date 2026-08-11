@@ -30,6 +30,8 @@ import {
   type SessionCreateOptions,
   type SessionListResult,
   type SessionRecord,
+  boundedSessionListing,
+  type SessionListOptions,
   type ReleaseClaimsOptions,
   type ReleaseClaimsResult,
   type ResourceClaim,
@@ -249,15 +251,19 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
-  public async listSessions(context: SessionContext): Promise<DomainResult<SessionListResult>> {
+  public async listSessions(
+    context: SessionContext,
+    options: SessionListOptions = {},
+  ): Promise<DomainResult<SessionListResult>> {
     try {
-      return success({ sessions: this.registryFor(context).list().map(toDomainRecord) });
+      const records = this.registryFor(context).list().map(toDomainRecord);
+      return success(boundedSessionListing(records, options));
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
   }
 
-  public async status(context: SessionContext): Promise<DomainResult<StatusResult>> {
+  public async status(context: SessionContext, options: SessionListOptions = {}): Promise<DomainResult<StatusResult>> {
     try {
       const registry = this.registryFor(context);
       let currentSession: SessionRecord | null = null;
@@ -266,10 +272,11 @@ export class LocalSessionBackend implements SessionBackend {
       } catch (error: unknown) {
         if (!isSessionRegistryError(error) || error.code !== "SESSION_NOT_FOUND") throw error;
       }
+      const listing = boundedSessionListing(registry.list().map(toDomainRecord), options);
       return success({
         repository: registry.repository.repositoryId,
         current_session: currentSession,
-        sessions: registry.list().map(toDomainRecord),
+        ...listing,
         capabilities: { ...LOCAL_SESSION_CAPABILITIES },
       });
     } catch (error: unknown) {

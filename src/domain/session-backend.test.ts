@@ -196,7 +196,7 @@ test("the CLI gc path recovers a prunable worktree before branch reuse", async (
 
     const listed = await runJsonCli<{
       sessions: Array<{ session_id: string; state: string }>;
-    }>(repositoryPath, ["session", "list"]);
+    }>(repositoryPath, ["session", "list", "--all"]);
     assert.equal(listed.sessions.find((session) => session.session_id === created.session_id)?.state, "closed");
 
     const reused = await runJsonCli<{
