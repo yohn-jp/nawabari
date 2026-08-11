@@ -240,7 +240,15 @@ test("capabilities discovery is available outside a Git repository and exposes t
       command: string;
       contract_id: string;
       package_version: string;
-      dependencies: { mottainai: boolean; github: boolean; gh: boolean; network: boolean };
+      dependencies: {
+        mottainai: boolean;
+        github: boolean;
+        gh: boolean;
+        network: boolean;
+        local_git: boolean;
+        llm: boolean;
+        agent_runtime: boolean;
+      };
       capabilities: Array<{ id: string; commands: string[] }>;
     };
     assert.equal(response.ok, true);

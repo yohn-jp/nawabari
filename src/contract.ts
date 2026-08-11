@@ -26,6 +26,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "MISSING_WORKTREE",
       "REGISTRY_CORRUPT",
       "LOCK_CONTENTION",
+      "GIT_COMMAND_FAILED",
     ],
   },
   {

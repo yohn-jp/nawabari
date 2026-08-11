@@ -111,9 +111,6 @@ operation.
 `doctor` includes a non-destructive `reconciliation` check. It reports
 registry/Git ownership drift, including missing or prunable worktrees and
 unregistered physical worktrees, without repairing or deleting anything.
-Callers that use the TypeScript authority directly can request the same
-machine-readable result with `SessionRegistry#cleanupDecision` and
-`SessionRegistry#reconcile`.
 
 ## Session resource claims
 

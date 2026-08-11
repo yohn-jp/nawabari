@@ -176,6 +176,28 @@ async function main() {
     }
     if (capabilitiesResult.stderr.trim().length > 0) fail("capabilities --json wrote decorative output to stderr");
 
+    const versionJsonResult = spawnSync(installedBinary, ["--version", "--json"], {
+      cwd: installDirectory,
+      env: gitEnvironment,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    if (versionJsonResult.status !== 0) fail(`--version --json exited ${versionJsonResult.status}, expected 0`);
+    let versionJson;
+    try {
+      versionJson = JSON.parse(versionJsonResult.stdout);
+    } catch {
+      fail("--version --json did not emit one valid JSON document");
+    }
+    if (
+      versionJson.ok !== true ||
+      versionJson.contract_id !== "nawabari.standalone-execution.v1" ||
+      versionJson.contract_schema_version !== 1
+    ) {
+      fail("--version --json did not expose the standalone contract identifier and schema version");
+    }
+    if (versionJsonResult.stderr.trim().length > 0) fail("--version --json wrote decorative output to stderr");
+
     const jsonResult = spawnSync(path.join(binDirectory, "nawabari"), ["session", "id", "--json"], {
       cwd: installDirectory,
       encoding: "utf8",
@@ -230,6 +252,14 @@ async function main() {
         });
         let stdout = "";
         let stderr = "";
+        let settled = false;
+        const timeout = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            child.kill();
+            reject(new Error(`${args.join(" ")} timed out after 10000ms`));
+          }
+        }, 10_000);
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
         child.stdout.on("data", (chunk) => {
@@ -238,8 +268,20 @@ async function main() {
         child.stderr.on("data", (chunk) => {
           stderr += chunk;
         });
-        child.once("error", reject);
-        child.once("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
+        child.once("error", (error) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            reject(error);
+          }
+        });
+        child.once("close", (status, signal) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            resolve({ status, signal, stdout, stderr });
+          }
+        });
       });
     const parseInstalledJson = (result, label) => {
       if (result.stdout.trim().length === 0) fail(`${label} emitted no JSON`);
