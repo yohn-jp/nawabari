@@ -61,8 +61,6 @@ export const REGISTRY_DIRECTORY_NAME = "nawabari";
 export const REGISTRY_FILE_NAME = "session-registry.json";
 export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
 export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
-/** Default number of non-closed records returned by agent-facing listings. */
-export const DEFAULT_SESSION_LIST_LIMIT = 64;
 export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
 export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
@@ -130,19 +128,6 @@ export interface GarbageCollectResult {
   readonly candidates: readonly SessionRecord[];
   readonly cleaned: readonly SessionRecord[];
   readonly blocked: readonly GarbageCollectBlocked[];
-}
-
-export interface SessionListOptions {
-  /** Include closed history instead of the bounded active-session view. */
-  readonly includeClosed?: boolean;
-  /** Override the bounded active-session view limit. */
-  readonly limit?: number;
-}
-
-export interface BoundedSessionList {
-  readonly sessions: readonly SessionRecord[];
-  readonly total: number;
-  readonly truncated: boolean;
 }
 
 export interface CleanupBlocker {
@@ -465,26 +450,6 @@ export class SessionRegistry {
 
   list(): readonly SessionRecord[] {
     return this.read();
-  }
-
-  /** Return the bounded, agent-facing session view without changing registry history. */
-  listForAgent(options: SessionListOptions = {}): BoundedSessionList {
-    const allRecords = this.read();
-    const source =
-      options.includeClosed === true ? allRecords : allRecords.filter((record) => record.state !== "closed");
-    if (options.includeClosed === true) {
-      return Object.freeze({ sessions: Object.freeze(source), total: source.length, truncated: false });
-    }
-    const limit = options.limit ?? DEFAULT_SESSION_LIST_LIMIT;
-    if (!Number.isSafeInteger(limit) || limit < 1) {
-      throw new RangeError("session list limit must be a positive safe integer");
-    }
-    const sessions = source.slice(0, limit);
-    return Object.freeze({
-      sessions: Object.freeze(sessions),
-      total: source.length,
-      truncated: source.length > sessions.length,
-    });
   }
 
   get(sessionId: string): SessionRecord | undefined {

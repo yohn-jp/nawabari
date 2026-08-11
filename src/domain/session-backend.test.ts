@@ -46,7 +46,7 @@ test("status exposes the resolved managed root and bounded history selection", a
     assert.equal(status.ok, true);
     if (!status.ok) return;
     assert.equal(status.value.managed_worktree_root, path.dirname(fs.realpathSync.native(repositoryPath)));
-    assert.equal(status.value.history, false);
+    assert.equal(status.value.history_included, false);
     assert.equal(
       status.value.sessions.some((session) => session.session_id === created.value.session_id),
       true,
@@ -61,10 +61,10 @@ test("status exposes the resolved managed root and bounded history selection", a
       bounded.value.sessions.some((session) => session.session_id === created.value.session_id),
       false,
     );
-    const history = await backend.status({ cwd: repositoryPath }, { include_history: true });
+    const history = await backend.status({ cwd: repositoryPath }, { include_closed: true });
     assert.equal(history.ok, true);
     if (!history.ok) return;
-    assert.equal(history.value.history, true);
+    assert.equal(history.value.history_included, true);
     assert.equal(
       history.value.sessions.find((session) => session.session_id === created.value.session_id)?.state,
       "closed",
@@ -241,19 +241,8 @@ test("the CLI gc path recovers a prunable worktree before branch reuse", async (
 
     const listed = await runJsonCli<{
       sessions: Array<{ session_id: string; state: string }>;
-      history: boolean;
-    }>(repositoryPath, ["session", "list"]);
-    assert.equal(listed.history, false);
-    assert.equal(
-      listed.sessions.some((session) => session.session_id === created.session_id),
-      false,
-    );
-    const historical = await runJsonCli<{
-      sessions: Array<{ session_id: string; state: string }>;
-      history: boolean;
     }>(repositoryPath, ["session", "list", "--all"]);
-    assert.equal(historical.history, true);
-    assert.equal(historical.sessions.find((session) => session.session_id === created.session_id)?.state, "closed");
+    assert.equal(listed.sessions.find((session) => session.session_id === created.session_id)?.state, "closed");
 
     const reused = await runJsonCli<{
       ok: boolean;

@@ -31,11 +31,11 @@ import {
   type SessionListResult,
   type SessionListOptions,
   type SessionRecord,
+  boundedSessionListing,
   type ReleaseClaimsOptions,
   type ReleaseClaimsResult,
   type ResourceClaim,
   type StatusResult,
-  type StatusOptions,
   type UpdateClaimsOptions,
 } from "./session.js";
 
@@ -257,39 +257,29 @@ export class LocalSessionBackend implements SessionBackend {
     options: SessionListOptions = {},
   ): Promise<DomainResult<SessionListResult>> {
     try {
-      const history = options.include_history === true;
-      const listing = this.registryFor(context).listForAgent({ includeClosed: history });
-      return success({
-        sessions: listing.sessions.map(toDomainRecord),
-        history,
-        total: listing.total,
-        truncated: listing.truncated,
-      });
+      const records = this.registryFor(context).list().map(toDomainRecord);
+      return success(boundedSessionListing(records, options));
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
   }
 
-  public async status(context: SessionContext, options: StatusOptions = {}): Promise<DomainResult<StatusResult>> {
+  public async status(context: SessionContext, options: SessionListOptions = {}): Promise<DomainResult<StatusResult>> {
     try {
       const registry = this.registryFor(context);
-      const history = options.include_history === true;
-      const listing = registry.listForAgent({ includeClosed: history });
       let currentSession: SessionRecord | null = null;
       try {
         currentSession = toDomainRecord(registry.resolveCurrentSession());
       } catch (error: unknown) {
         if (!isSessionRegistryError(error) || error.code !== "SESSION_NOT_FOUND") throw error;
       }
+      const listing = boundedSessionListing(registry.list().map(toDomainRecord), options);
       return success({
         repository: registry.repository.repositoryId,
         current_session: currentSession,
-        sessions: listing.sessions.map(toDomainRecord),
+        ...listing,
         capabilities: { ...LOCAL_SESSION_CAPABILITIES },
         managed_worktree_root: registry.managedWorktreeRoot,
-        history,
-        total_sessions: listing.total,
-        truncated: listing.truncated,
       });
     } catch (error: unknown) {
       return failure(toDomainError(error));
