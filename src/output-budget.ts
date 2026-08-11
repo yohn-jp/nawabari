@@ -21,7 +21,7 @@ export function boundOutputMessage(message: string): {
 } {
   const total = message.length;
   return {
-    value: total > FAILURE_MESSAGE_LENGTH_LIMIT ? `${message.slice(0, FAILURE_MESSAGE_LENGTH_LIMIT)}…` : message,
+    value: total > FAILURE_MESSAGE_LENGTH_LIMIT ? `${message.slice(0, FAILURE_MESSAGE_LENGTH_LIMIT - 1)}…` : message,
     truncated: total > FAILURE_MESSAGE_LENGTH_LIMIT,
     total,
   };
@@ -48,7 +48,18 @@ function boundObject(value: JsonObject): JsonObject {
 
 function boundValue(value: JsonValue): JsonValue {
   if (Array.isArray(value)) {
-    return value.slice(0, FAILURE_DETAIL_ARRAY_LIMIT).map(boundValue);
+    const truncated = value.length > FAILURE_DETAIL_ARRAY_LIMIT;
+    const sliced = value.slice(0, FAILURE_DETAIL_ARRAY_LIMIT).map(boundValue);
+    if (truncated) {
+      return {
+        items: sliced,
+        items_total: value.length,
+        items_limit: FAILURE_DETAIL_ARRAY_LIMIT,
+        items_truncated: true,
+        items_next_offset: FAILURE_DETAIL_ARRAY_LIMIT,
+      };
+    }
+    return sliced;
   }
   if (value !== null && typeof value === "object") return boundObject(value);
   return value;

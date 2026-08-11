@@ -6,13 +6,13 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { runCli } from "./cli.js";
-import { DomainError, type JsonObject } from "./domain/errors.js";
+import { DomainError, type JsonObject, type JsonValue } from "./domain/errors.js";
 import { boundedSessionListing, DEFAULT_SESSION_LIST_LIMIT } from "./domain/session.js";
 import { SessionRegistry } from "./session-registry.js";
 import { captureGitCheckpoint } from "./git.js";
 import { CHECKPOINT_MAX_PATHS } from "./operation-authorization.js";
 import { renderFailure } from "./presentation.js";
-import { FAILURE_DETAIL_ARRAY_LIMIT, FAILURE_MESSAGE_LENGTH_LIMIT } from "./output-budget.js";
+import { boundOutputDetails, FAILURE_DETAIL_ARRAY_LIMIT, FAILURE_MESSAGE_LENGTH_LIMIT } from "./output-budget.js";
 import { canonicalClaimId } from "./resource-claims.js";
 
 test("default session discovery excludes closed history and exposes bounded continuation metadata", () => {
@@ -162,7 +162,7 @@ test("failure detail arrays are explicitly bounded without dropping recovery met
       message_truncated: boolean;
     };
   };
-  assert.equal(response.message.length, FAILURE_MESSAGE_LENGTH_LIMIT + 1);
+  assert.equal(response.message.length, FAILURE_MESSAGE_LENGTH_LIMIT);
   assert.equal(response.details.message_total, longMessage.length);
   assert.equal(response.details.message_limit, FAILURE_MESSAGE_LENGTH_LIMIT);
   assert.equal(response.details.message_truncated, true);
@@ -172,6 +172,23 @@ test("failure detail arrays are explicitly bounded without dropping recovery met
   assert.equal(response.details.paths_truncated, true);
   assert.equal(response.details.paths_next_offset, FAILURE_DETAIL_ARRAY_LIMIT);
   assert.deepEqual(response.details.recovery_hints, ["Inspect the changed paths before retrying."]);
+
+  const humanRendered = renderFailure(
+    "human",
+    "push",
+    new DomainError("PUSH_DIRTY_WORKTREE", longMessage, {
+      paths,
+      recovery_hints: ["Inspect the changed paths before retrying."],
+    }),
+  );
+  assert.equal(humanRendered.includes(`changed-${FAILURE_DETAIL_ARRAY_LIMIT + 9}`), false);
+  assert.equal(humanRendered.includes("changed-0"), true);
+  assert.equal(humanRendered.includes("paths_total:"), true);
+  assert.equal(humanRendered.includes("paths_truncated:"), true);
+  assert.equal(humanRendered.includes("message_budget:"), true);
+  assert.equal(humanRendered.includes(`total: ${longMessage.length}`), true);
+  assert.equal(humanRendered.includes(`limit: ${FAILURE_MESSAGE_LENGTH_LIMIT}`), true);
+  assert.equal(humanRendered.includes("truncated: true"), true);
 });
 
 test("checkpoint accepts the documented maximum and fails deterministically on overflow", () => {
@@ -192,6 +209,28 @@ test("checkpoint accepts the documented maximum and fails deterministically on o
       "details" in error &&
       (error.details as { maxPaths?: number }).maxPaths === CHECKPOINT_MAX_PATHS,
   );
+});
+
+test("arrays nested within arrays retain truncation metadata", () => {
+  const oversizedGroup = Array.from({ length: FAILURE_DETAIL_ARRAY_LIMIT + 5 }, (_, index) => `nested-item-${index}`);
+  const input: JsonObject = {
+    groups: [oversizedGroup, "marker"],
+  };
+  const bounded = boundOutputDetails(input);
+  const groups = bounded.groups as JsonValue[];
+  assert.equal(Array.isArray(groups), true);
+  // The outer array itself has only 2 members, so it is not truncated and gets no sibling keys.
+  assert.equal(Object.hasOwn(bounded, "groups_truncated"), false);
+
+  const firstGroup = groups[0] as JsonObject;
+  assert.ok(firstGroup !== null && typeof firstGroup === "object" && !Array.isArray(firstGroup));
+  assert.equal(Array.isArray(firstGroup.items), true);
+  assert.equal((firstGroup.items as unknown[]).length, FAILURE_DETAIL_ARRAY_LIMIT);
+  assert.equal(firstGroup.items_total, oversizedGroup.length);
+  assert.equal(firstGroup.items_limit, FAILURE_DETAIL_ARRAY_LIMIT);
+  assert.equal(firstGroup.items_truncated, true);
+  assert.equal(firstGroup.items_next_offset, FAILURE_DETAIL_ARRAY_LIMIT);
+  assert.equal(groups[1], "marker");
 });
 
 function makeSession(sessionId: string, state: "active" | "closed") {
