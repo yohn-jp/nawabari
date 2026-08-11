@@ -6,6 +6,10 @@ test("accepts a well-formed branch name", () => {
   assert.deepEqual(validateBranchName("feat/42-add-init-command"), []);
 });
 
+test("accepts a performance branch name", () => {
+  assert.deepEqual(validateBranchName("perf/44-pnpm-worktree-install"), []);
+});
+
 test("accepts the exempt main branch", () => {
   assert.deepEqual(validateBranchName("main"), []);
 });

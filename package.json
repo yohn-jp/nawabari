@@ -20,6 +20,7 @@
     "lint": "eslint 'src/**/*.ts' 'scripts/**/*.mjs' 'eslint.config.mjs'",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "benchmark:pnpm-worktree-install": "node scripts/benchmark-pnpm-worktree-install.mjs",
     "smoke-test": "node scripts/smoke-test.mjs",
     "test:package": "pnpm run build && node scripts/run-package-suite.mjs",
     "governance:actions": "node scripts/validate-actions.mjs",
