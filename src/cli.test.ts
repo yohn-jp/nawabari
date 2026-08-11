@@ -96,7 +96,7 @@ test("command-specific help is projected from one spec and marks session create 
     required_options: string[];
     optional_options: string[];
     defaults: Record<string, string>;
-    options: Array<{ name: string; required: boolean }>;
+    options: Array<{ name: string; required: boolean; default?: string; description?: string }>;
   };
   assert.equal(response.command, "help");
   assert.equal(response.help_for, "session create");
@@ -112,7 +112,31 @@ test("command-specific help is projected from one spec and marks session create 
     response.options.every((option) => option.required === false),
     true,
   );
-  assert.match(response.options.find((option) => option.name === "--worktree")?.name ?? "", /worktree/u);
+  const worktreeOption = response.options.find((option) => option.name === "--worktree");
+  assert.ok(worktreeOption, "--worktree option should exist");
+  assert.equal(worktreeOption.default, "<managed_worktree_root>/<repository>-<session_id>");
+  assert.match(worktreeOption.description ?? "", /worktree/iu);
+});
+
+test("resource list help displays only resource-list options and does not inherit session-list options", async () => {
+  const output = capture();
+  const exitCode = await runCli(["resource", "list", "--help", "--json"], { io: output.io });
+
+  assert.equal(exitCode, 0);
+  const response = JSON.parse(output.stdout[0] ?? "") as {
+    command: string;
+    help_for: string;
+    optional_options: string[];
+    options: Array<{ name: string }>;
+  };
+  assert.equal(response.command, "help");
+  assert.equal(response.help_for, "resource list");
+  assert.ok(response.optional_options.includes("--session"));
+  assert.ok(!response.optional_options.includes("--all"), "resource list should not advertise --all");
+  assert.ok(!response.optional_options.includes("--history"), "resource list should not advertise --history");
+  assert.ok(response.options.some((option) => option.name === "--session"));
+  assert.ok(!response.options.some((option) => option.name === "--all"));
+  assert.ok(!response.options.some((option) => option.name === "--history"));
 });
 
 test("JSON help separates global, session, and garbage-collection options", async () => {
@@ -157,8 +181,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--session",
       "--resource",
       "--mode",
-      "--claim-id",
       "--repository",
+      "--claim-id",
     ],
     authorization_options: ["--session", "--operation", "--resource"],
     checkpoint_options: ["--session"],

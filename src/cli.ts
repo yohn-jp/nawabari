@@ -162,9 +162,9 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     summary: "Authorize an operation against concrete claims",
     usage: `${CLI_NAME} authorize --operation <name> --resource <path> [--resource <path>] [--session <id>]`,
     options: [
+      option("--session", "Assert the current session identity", { value: "<id>" }),
       option("--operation", "Operation vocabulary entry", { value: "<name>", required: true }),
       option("--resource", "Concrete repository-relative path; repeatable", { value: "<path>", required: true }),
-      option("--session", "Assert the current session identity", { value: "<id>" }),
     ],
   },
   {
@@ -178,9 +178,9 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     summary: "Commit explicit claim-authorized resources",
     usage: `${CLI_NAME} commit --message <final-message> --resource <path> [--resource <path>] [--session <id>]`,
     options: [
+      option("--session", "Assert the current session identity", { value: "<id>" }),
       option("--message", "Caller-decided final commit message", { value: "<final-message>", required: true }),
       option("--resource", "Claim-covered concrete path; repeatable", { value: "<path>", required: true }),
-      option("--session", "Assert the current session identity", { value: "<id>" }),
     ],
   },
   {
@@ -188,13 +188,13 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     summary: "Push the owned branch to an explicit target",
     usage: `${CLI_NAME} push --remote <name> --branch <name> --resource <path> [options]`,
     options: [
+      option("--session", "Assert the current session identity", { value: "<id>" }),
+      option("--resource", "Claim-covered concrete path; repeatable", { value: "<path>", required: true }),
       option("--remote", "Explicit Git remote", { value: "<name>", required: true }),
       option("--branch", "Explicit target branch", { value: "<name>", required: true }),
-      option("--resource", "Claim-covered concrete path; repeatable", { value: "<path>", required: true }),
       option("--remote-branch", "Explicit remote branch alias for --branch", { value: "<name>" }),
-      option("--create-upstream", "Allow creation of a missing upstream"),
       option("--force", "Allow force-with-lease when relation requires it"),
-      option("--session", "Assert the current session identity", { value: "<id>" }),
+      option("--create-upstream", "Allow creation of a missing upstream"),
     ],
   },
   {
@@ -222,8 +222,8 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     summary: "Detect or clean eligible stale sessions",
     usage: `${CLI_NAME} gc [--dry-run|--apply]`,
     options: [
-      option("--dry-run", "Preflight eligible stale cleanup without mutation"),
       option("--apply", "Apply only cleanup that passes safety checks"),
+      option("--dry-run", "Preflight eligible stale cleanup without mutation"),
     ],
     notes: [
       "Default stale threshold is 24 hours (86,400,000 ms). Eligibility uses persisted state age or missing/prunable Git worktree physical state; closed history is not a stale candidate.",
@@ -252,20 +252,22 @@ const ROOT_HELP_SPEC: HelpCommandSpec = {
 
 function helpSpecFor(commandArguments: readonly string[]): HelpCommandSpec {
   if (commandArguments.length === 0) return ROOT_HELP_SPEC;
-  const key =
+  let key =
     commandArguments[0] === "resource"
       ? `resource ${commandArguments[1] ?? "list"}`
       : commandArguments.slice(0, 2).join(" ");
+  if (key === "resource claims") key = "resource list";
   const direct = HELP_COMMANDS.find((spec) => spec.name === key);
   if (direct !== undefined && !direct.name.startsWith("resource ")) return direct;
   const aliasTarget = direct?.name.replace(/^resource /u, "session ");
   const target = aliasTarget === undefined ? undefined : HELP_COMMANDS.find((spec) => spec.name === aliasTarget);
   if (direct !== undefined && target !== undefined) {
     return {
-      ...target,
       name: direct.name,
       summary: direct.summary,
       usage: direct.usage,
+      options: direct.options,
+      notes: direct.notes,
     };
   }
   return HELP_COMMANDS.find((spec) => spec.name === commandArguments[0]) ?? ROOT_HELP_SPEC;
@@ -274,53 +276,23 @@ function helpSpecFor(commandArguments: readonly string[]): HelpCommandSpec {
 function helpPayload(spec: HelpCommandSpec): JsonObject {
   if (spec.name === "root") {
     const optionNames = (options: readonly HelpOptionSpec[]): string[] => options.map((candidate) => candidate.name);
-    const optionsInOrder = (names: readonly string[], options: readonly HelpOptionSpec[]): string[] => {
-      const available = new Set(optionNames(options));
-      return names.filter((name) => available.has(name));
-    };
     const sessionOptions = HELP_COMMANDS.filter((command) => command.name.startsWith("session ")).flatMap(
       (command) => command.options,
     );
     const unique = (values: string[]): string[] => values.filter((value, index) => values.indexOf(value) === index);
+    const sessionListOnlyOptions = new Set(["--all", "--history"]);
     const optionsFor = (name: string): string[] =>
       optionNames(HELP_COMMANDS.find((command) => command.name === name)?.options ?? []);
     return {
       usage: `Usage: ${spec.usage}`,
       commands: HELP_COMMANDS.map((command) => command.name),
       options: ["--json", "--help", "--version"],
-      session_options: unique(
-        optionsInOrder(
-          [
-            "--branch",
-            "--worktree",
-            "--base",
-            "--label",
-            "--session",
-            "--resource",
-            "--mode",
-            "--claim-id",
-            "--repository",
-          ],
-          sessionOptions,
-        ),
-      ),
-      authorization_options: optionsInOrder(
-        ["--session", "--operation", "--resource"],
-        HELP_COMMANDS.find((command) => command.name === "authorize")?.options ?? [],
-      ),
+      session_options: unique(sessionOptions.map((option) => option.name).filter((name) => !sessionListOnlyOptions.has(name))),
+      authorization_options: optionsFor("authorize"),
       checkpoint_options: optionsFor("checkpoint"),
-      commit_options: optionsInOrder(
-        ["--session", "--message", "--resource"],
-        HELP_COMMANDS.find((command) => command.name === "commit")?.options ?? [],
-      ),
-      push_options: optionsInOrder(
-        ["--session", "--resource", "--remote", "--branch", "--remote-branch", "--force", "--create-upstream"],
-        HELP_COMMANDS.find((command) => command.name === "push")?.options ?? [],
-      ),
-      gc_options: optionsInOrder(
-        ["--apply", "--dry-run"],
-        HELP_COMMANDS.find((command) => command.name === "gc")?.options ?? [],
-      ),
+      commit_options: optionsFor("commit"),
+      push_options: optionsFor("push"),
+      gc_options: optionsFor("gc"),
     };
   }
   const options = spec.options.map((candidate) => ({
