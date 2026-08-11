@@ -1158,6 +1158,17 @@ export class SessionRegistry {
       const force = options.force === true;
       const createUpstream = options.createUpstream === true || options.create_upstream === true;
 
+      if (branch !== initial.session.branchName) {
+        throw new SessionRegistryError(
+          "PUSH_TARGET_MISMATCH",
+          "The explicit push branch must match the session-owned branch",
+          {
+            sessionBranch: initial.session.branchName,
+            pushBranch: branch,
+          },
+        );
+      }
+
       const inspection = inspectPushTarget(this.git, initial.worktreePath, remote, branch);
       if (inspection.upstream !== undefined && inspection.upstream !== `${remote}/${branch}`) {
         throw new SessionRegistryError(
@@ -2328,9 +2339,29 @@ function inspectPushTarget(git: GitCommandRunner, cwd: string, remote: string, b
     );
   }
 
+  const remoteShaMatch = remoteTargetOutput.trim().match(/^([0-9a-f]{40,64})\s+/u);
+  if (remoteShaMatch === null) {
+    throw new SessionRegistryError(
+      "PUSH_REMOTE_INSPECTION_FAILED",
+      "Could not extract remote SHA from ls-remote output",
+      {
+        remote,
+        branch,
+      },
+    );
+  }
+  const remoteSha = remoteShaMatch[1];
+
+  let headSha: string;
+  try {
+    headSha = git.run(["rev-parse", "HEAD"], cwd).trim();
+  } catch (error: unknown) {
+    throwRemoteInspectionFailure(error, "HEAD");
+  }
+
   let relationOutput: string;
   try {
-    relationOutput = git.run(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], cwd);
+    relationOutput = git.run(["rev-list", "--left-right", "--count", `HEAD...${remoteSha}`], cwd);
   } catch (error: unknown) {
     throwRemoteInspectionFailure(error, "relation");
   }

@@ -303,6 +303,25 @@ test("push distinguishes missing upstream, creates it explicitly, and reports th
   }
 });
 
+test("push rejects explicit branch different from session branch", () => {
+  const fixture = createFixture(true);
+  try {
+    claim(fixture);
+    assert.throws(
+      () =>
+        fixture.current.push({
+          sessionId: fixture.session.sessionId,
+          resources: ["file.txt"],
+          remote: "origin",
+          branch: "different-branch",
+        }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "PUSH_TARGET_MISMATCH",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("CLI push preserves the explicit target in JSON", async () => {
   const fixture = createFixture(true);
   try {

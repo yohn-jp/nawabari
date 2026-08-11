@@ -101,7 +101,10 @@ function defaultExitCode(code: ErrorCode): number {
     code === "NO_COMMAND" ||
     code === "INVALID_ARGUMENT" ||
     code === "MISSING_ARGUMENT" ||
-    code === "INVALID_OPERATION"
+    code === "INVALID_OPERATION" ||
+    code === "INVALID_COMMIT_MESSAGE" ||
+    code === "INVALID_REMOTE" ||
+    code === "INVALID_REMOTE_BRANCH"
   ) {
     return EXIT_CODES.usage;
   }

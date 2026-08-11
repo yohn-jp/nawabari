@@ -53,7 +53,7 @@ const HELP_TEXT = [
   "  authorize --session <id> --operation <name> --resource <path> [--resource <path>]",
   "  checkpoint [--session <id>]",
   "  commit --message <final-message> --resource <path> [--resource <path>] [--session <id>]",
-  "  push --remote <name> --branch <name> --resource <path> [--create-upstream] [--force]",
+  "  push --remote <name> --branch <name> --resource <path> [--create-upstream] [--force] [--session <id>]",
   "  gc [--dry-run|--apply]",
 ].join("\n");
 
