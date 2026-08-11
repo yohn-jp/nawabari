@@ -47,13 +47,21 @@ test("defines every overlapping mode combination in the compatibility matrix", (
   // Identical all-wildcard final segments overlap and conflict when modes differ
   const srcStarA = createResourceClaim({ resource: "src/*", mode: "write" }, owner, "2026-01-01T00:00:00.000Z");
   const srcStarB = createResourceClaim({ resource: "src/*", mode: "write" }, owner, "2026-01-01T00:00:00.000Z");
-  const srcStarExclusive = createResourceClaim({ resource: "src/*", mode: "exclusive-write" }, owner, "2026-01-01T00:00:00.000Z");
+  const srcStarExclusive = createResourceClaim(
+    { resource: "src/*", mode: "exclusive-write" },
+    owner,
+    "2026-01-01T00:00:00.000Z",
+  );
   assert.equal(claimsConflict(srcStarA, srcStarB), true, "src/* write vs src/* write");
   assert.equal(claimsConflict(srcStarA, srcStarExclusive), true, "src/* write vs src/* exclusive-write");
 
   const starA = createResourceClaim({ resource: "*", mode: "write" }, owner, "2026-01-01T00:00:00.000Z");
   const starB = createResourceClaim({ resource: "*", mode: "write" }, owner, "2026-01-01T00:00:00.000Z");
-  const starExclusive = createResourceClaim({ resource: "*", mode: "exclusive-write" }, owner, "2026-01-01T00:00:00.000Z");
+  const starExclusive = createResourceClaim(
+    { resource: "*", mode: "exclusive-write" },
+    owner,
+    "2026-01-01T00:00:00.000Z",
+  );
   assert.equal(claimsConflict(starA, starB), true, "* write vs * write");
   assert.equal(claimsConflict(starA, starExclusive), true, "* write vs * exclusive-write");
 });

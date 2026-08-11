@@ -1,5 +1,7 @@
 import { DomainError, type DomainResult, failure, type ErrorCode, type JsonObject } from "./errors.js";
 
+export type { OperationName } from "../operation-authorization.js";
+
 export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
 
 export type SessionRecord = {
@@ -96,6 +98,60 @@ export type GuardDecision = {
   details: JsonObject;
 };
 
+export type OperationAuthorizationOptions = {
+  operation: string;
+  resources: string[];
+  session_id: string | null;
+};
+
+export type AuthorizedResource = {
+  resource: string;
+  claim_ids: string[];
+};
+
+export type OperationAuthorizationDecision = {
+  schema_version: number;
+  allowed: boolean;
+  code: ErrorCode | "ALLOWED";
+  operation: string;
+  required_access: ResourceClaimMode | null;
+  repository: string;
+  worktree: string;
+  branch: string | null;
+  session_id: string | null;
+  owner_session_id: string | null;
+  requested_session_id: string | null;
+  state: string | null;
+  resources: AuthorizedResource[];
+  details: JsonObject;
+};
+
+export type CheckpointOptions = {
+  session_id: string | null;
+};
+
+export type CheckpointPaths = {
+  changed: string[];
+  staged: string[];
+  unstaged: string[];
+  untracked: string[];
+};
+
+export type CheckpointEvidence = {
+  schema_version: number;
+  source: "git";
+  guarantee: "git-observable-only";
+  repository: string;
+  worktree: string;
+  branch: string;
+  head: string;
+  session_id: string;
+  paths: CheckpointPaths;
+  in_claim: string[];
+  out_of_claim: string[];
+  max_paths: number;
+};
+
 export type GarbageCollectOptions = {
   apply: boolean;
 };
@@ -145,6 +201,11 @@ export interface SessionBackend {
   resolveCurrentSession(context: SessionContext): Promise<DomainResult<SessionRecord>>;
   getSession(context: SessionContext, sessionId: string): Promise<DomainResult<SessionRecord>>;
   guard(context: SessionContext, options: GuardOptions): Promise<DomainResult<GuardDecision>>;
+  authorizeOperation?(
+    context: SessionContext,
+    options: OperationAuthorizationOptions,
+  ): Promise<DomainResult<OperationAuthorizationDecision>>;
+  checkpoint?(context: SessionContext, options: CheckpointOptions): Promise<DomainResult<CheckpointEvidence>>;
   listSessions(context: SessionContext): Promise<DomainResult<SessionListResult>>;
   status(context: SessionContext): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
@@ -189,6 +250,17 @@ class UnavailableSessionBackend implements SessionBackend {
 
   guard(_context: SessionContext, _options: GuardOptions): Promise<DomainResult<GuardDecision>> {
     return this.unavailable("guard");
+  }
+
+  authorizeOperation(
+    _context: SessionContext,
+    _options: OperationAuthorizationOptions,
+  ): Promise<DomainResult<OperationAuthorizationDecision>> {
+    return this.unavailable("authorize");
+  }
+
+  checkpoint(_context: SessionContext, _options: CheckpointOptions): Promise<DomainResult<CheckpointEvidence>> {
+    return this.unavailable("checkpoint");
   }
 
   getSession(_context: SessionContext, _sessionId: string): Promise<DomainResult<SessionRecord>> {

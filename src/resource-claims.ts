@@ -212,6 +212,23 @@ export function claimsOverlap(left: ResourceClaim, right: ResourceClaim): boolea
   return globPatternsOverlap(left.resource, right.resource);
 }
 
+/** Match a canonical concrete repository resource against a persisted claim. */
+export function resourceMatchesClaim(claim: Pick<ResourceClaim, "resource">, resource: string): boolean {
+  return globPatternsOverlap(claim.resource, resource);
+}
+
+/** Apply the existing claim compatibility matrix to one concrete resource. */
+export function resourceClaimConflictsWithAccess(
+  claim: Pick<ResourceClaim, "resource" | "mode">,
+  resource: string,
+  requiredMode: ResourceClaimMode,
+): boolean {
+  return (
+    resourceMatchesClaim(claim, resource) &&
+    RESOURCE_CLAIM_COMPATIBILITY_MATRIX[claim.mode][requiredMode] === "conflict"
+  );
+}
+
 export function claimsConflict(left: ResourceClaim, right: ResourceClaim): boolean {
   return claimsOverlap(left, right) && RESOURCE_CLAIM_COMPATIBILITY_MATRIX[left.mode][right.mode] === "conflict";
 }

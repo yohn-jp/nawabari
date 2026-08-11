@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { SessionRegistryError } from "./errors.js";
+import { CHECKPOINT_MAX_PATHS, type GitCheckpointPaths } from "./operation-authorization.js";
 
 export const GIT_COMMAND_TIMEOUT_MS = 10_000;
 export const GIT_COMMAND_MAX_OUTPUT_BYTES = 64 * 1024;
@@ -10,6 +11,8 @@ const MAX_ERROR_DETAIL_LENGTH = 4_096;
 
 export interface GitCommandRunner {
   run(args: readonly string[], cwd: string): string;
+  /** Preserve leading/trailing whitespace for NUL-delimited Git records. */
+  readonly runRaw?: (args: readonly string[], cwd: string) => string;
 }
 
 export interface GitCommandRunnerOptions {
@@ -75,11 +78,11 @@ export function createGitCommandRunner(options: GitCommandRunnerOptions = {}): G
     throw new RangeError("Git command output limit must be a positive safe integer");
   }
 
-  return Object.freeze({
-    run(args: readonly string[], cwd: string): string {
-      const command = args.map((argument) => boundedDetail(argument)).join(" ");
-      try {
-        return execFileSync(executable, [...args], {
+  const execute = (args: readonly string[], cwd: string): string => {
+    const command = args.map((argument) => boundedDetail(argument)).join(" ");
+    try {
+      return String(
+        execFileSync(executable, [...args], {
           cwd,
           encoding: "utf8",
           maxBuffer: maxOutputBytes,
@@ -91,10 +94,19 @@ export function createGitCommandRunner(options: GitCommandRunnerOptions = {}): G
             GIT_TERMINAL_PROMPT: "0",
             GIT_OPTIONAL_LOCKS: "0",
           },
-        }).trim();
-      } catch (error: unknown) {
-        throw gitProcessError(error, command, cwd);
-      }
+        }),
+      );
+    } catch (error: unknown) {
+      throw gitProcessError(error, command, cwd);
+    }
+  };
+
+  return Object.freeze({
+    run(args: readonly string[], cwd: string): string {
+      return execute(args, cwd).trim();
+    },
+    runRaw(args: readonly string[], cwd: string): string {
+      return execute(args, cwd);
     },
   });
 }
@@ -181,12 +193,7 @@ function readBranchOrDetached(git: GitCommandRunner, cwd: string): string {
       error.code === "WORKTREE_IDENTITY_AMBIGUOUS" &&
       error.details.reason === "detached-head"
     ) {
-      throw new SessionRegistryError(
-        "DETACHED_HEAD",
-        `The worktree at ${cwd} has no branch`,
-        { worktree: cwd },
-        error,
-      );
+      throw new SessionRegistryError("DETACHED_HEAD", `The worktree at ${cwd} has no branch`, { worktree: cwd }, error);
     }
     throw error;
   }
@@ -395,6 +402,79 @@ export function listGitWorktrees(git: GitCommandRunner, cwd: string): readonly G
   }
   flush();
   return entries;
+}
+
+/**
+ * Capture only the paths Git currently exposes as changed, staged, unstaged,
+ * or untracked. This is evidence, not an OS-level write monitor.
+ */
+export function captureGitCheckpoint(git: GitCommandRunner, cwd: string): GitCheckpointPaths {
+  let output: string;
+  try {
+    const run = git.runRaw ?? git.run;
+    output = run(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=no", "-z"], cwd);
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw new SessionRegistryError(
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      "Could not observe Git checkpoint paths",
+      {
+        cwd,
+      },
+      error,
+    );
+  }
+
+  const changed = new Set<string>();
+  const staged = new Set<string>();
+  const unstaged = new Set<string>();
+  const untracked = new Set<string>();
+  const records = output.split("\u0000");
+
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (record.length === 0) continue;
+    if (record.length < 4 || record[2] !== " ") {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid status record", { cwd });
+    }
+
+    const indexStatus = record[0];
+    const worktreeStatus = record[1];
+    const paths = [record.slice(3)];
+    if (indexStatus === "R" || indexStatus === "C") {
+      const source = records[index + 1];
+      if (source === undefined || source.length === 0) {
+        throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an incomplete rename status record", {
+          cwd,
+        });
+      }
+      index += 1;
+      paths.push(source);
+    }
+
+    for (const resource of paths) {
+      if (resource.length === 0 || resource.includes("\u0000")) {
+        throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid changed path", { cwd });
+      }
+      changed.add(resource);
+      if (indexStatus !== " " && indexStatus !== "?") staged.add(resource);
+      if (worktreeStatus !== " " && worktreeStatus !== "?") unstaged.add(resource);
+      if (indexStatus === "?" && worktreeStatus === "?") untracked.add(resource);
+      if (changed.size > CHECKPOINT_MAX_PATHS) {
+        throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Git checkpoint contains too many paths", {
+          cwd,
+          maxPaths: CHECKPOINT_MAX_PATHS,
+        });
+      }
+    }
+  }
+
+  return Object.freeze({
+    changed: sortGitPaths(changed),
+    staged: sortGitPaths(staged),
+    unstaged: sortGitPaths(unstaged),
+    untracked: sortGitPaths(untracked),
+  });
 }
 
 export function normalizeBranchId(branchName: string): string {
@@ -609,6 +689,10 @@ function assertDirectoryPath(candidate: string): void {
 
 function isPathInside(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function sortGitPaths(paths: ReadonlySet<string>): readonly string[] {
+  return Object.freeze([...paths].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)));
 }
 
 function boundedDetail(value: unknown): string {

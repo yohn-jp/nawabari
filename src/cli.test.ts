@@ -108,6 +108,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "resource list",
       "resource release",
       "session close",
+      "authorize",
+      "checkpoint",
       "status",
       "guard",
       "gc",
@@ -125,6 +127,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--claim-id",
       "--repository",
     ],
+    authorization_options: ["--session", "--operation", "--resource"],
+    checkpoint_options: ["--session"],
     gc_options: ["--apply", "--dry-run"],
   });
 });
