@@ -1,9 +1,10 @@
-import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
-import { SessionRegistry } from "../session-registry.js";
+
+import { defaultGit, resolveRepositoryContext, type RepositoryContext } from "../git.js";
 import { isSessionRegistryError } from "../errors.js";
+import { SessionRegistry } from "../session-registry.js";
 import { success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 
 export type DoctorCheckStatus = "ok" | "warning" | "error" | "not_configured" | "not_applicable";
@@ -28,53 +29,6 @@ export type DoctorReport = {
   repository: RepositoryInfo | null;
 };
 
-type ProcessResult = {
-  exit_code: number | null;
-  stdout: string;
-  stderr: string;
-  error: string | null;
-};
-
-function runGit(args: string[], cwd: string): Promise<ProcessResult> {
-  return new Promise((resolve) => {
-    const child = spawn("git", args, {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill("SIGKILL");
-      resolve({ exit_code: null, stdout, stderr, error: "git command timed out" });
-    }, 10_000);
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.on("error", (error: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ exit_code: null, stdout, stderr, error: error.message });
-    });
-    child.on("close", (exitCode: number | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ exit_code: exitCode, stdout, stderr, error: null });
-    });
-  });
-}
-
 function supportsRuntime(version: string): boolean {
   const [majorText, minorText] = version.split(".");
   const major = Number(majorText);
@@ -92,22 +46,15 @@ function check(
   return { name, status, code, message, details };
 }
 
-function parseRepository(stdout: string, cwd: string): RepositoryInfo | null {
-  const lines = stdout
-    .trim()
-    .split(/\r?\n/u)
-    .map((line) => line.trim());
-  if (lines.length < 2 || lines[0] === "" || lines[1] === "") return null;
-  const topLevel = path.resolve(cwd, lines[0]);
-  const commonDir = path.resolve(cwd, lines[1]);
+function repositoryInfo(context: RepositoryContext): RepositoryInfo {
   return {
-    top_level: topLevel,
-    common_dir: commonDir,
-    registry_path: path.join(commonDir, "nawabari", "session-registry.json"),
+    top_level: context.worktreePath,
+    common_dir: context.commonGitDirectory,
+    registry_path: path.join(context.commonGitDirectory, "nawabari", "session-registry.json"),
   };
 }
 
-async function inspectRegistry(repository: RepositoryInfo): Promise<DoctorCheck> {
+async function inspectRegistry(repository: RepositoryInfo, context: RepositoryContext): Promise<DoctorCheck> {
   try {
     const contents = await readFile(repository.registry_path, "utf8");
     let parsed: unknown;
@@ -124,22 +71,17 @@ async function inspectRegistry(repository: RepositoryInfo): Promise<DoctorCheck>
       });
     }
     try {
-      const registry = new SessionRegistry({ cwd: repository.top_level });
-      const sessions = registry.list();
+      const sessions = new SessionRegistry({ repository: context, git: defaultGit }).list();
       return check("registry", "ok", null, "The Nawabari registry is readable and valid.", {
         path: repository.registry_path,
         bytes: contents.length,
         sessions: sessions.length,
       });
     } catch (error: unknown) {
-      const code =
-        isSessionRegistryError(error) && error.code === "UNSUPPORTED_SCHEMA_VERSION"
-          ? "REGISTRY_CORRUPT"
-          : isSessionRegistryError(error) && error.code === "REGISTRY_REPOSITORY_MISMATCH"
-            ? "INVALID_REGISTRY"
-            : "REGISTRY_UNREADABLE";
+      const code = doctorErrorCode(error, "REGISTRY_UNREADABLE");
       return check("registry", "error", code, "The Nawabari registry failed authoritative validation.", {
         path: repository.registry_path,
+        ...(isSessionRegistryError(error) ? { reason: error.code } : {}),
       });
     }
   } catch (error: unknown) {
@@ -152,10 +94,6 @@ async function inspectRegistry(repository: RepositoryInfo): Promise<DoctorCheck>
       path: repository.registry_path,
     });
   }
-}
-
-function isFileNotFound(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
 export async function runDoctor(cwd = process.cwd()): Promise<DomainResult<DoctorReport>> {
@@ -171,12 +109,14 @@ export async function runDoctor(cwd = process.cwd()): Promise<DomainResult<Docto
         }),
   );
 
-  const gitVersion = await runGit(["--version"], cwd);
-  if (gitVersion.exit_code !== 0) {
+  try {
+    const version = defaultGit.run(["--version"], cwd);
+    checks.push(check("git", "ok", null, "Git is available.", { version }));
+  } catch (error: unknown) {
     checks.push(
-      check("git", "error", "GIT_UNAVAILABLE", "Git is not available to the local CLI.", {
+      check("git", "error", doctorErrorCode(error, "GIT_UNAVAILABLE"), "Git is not available to the local CLI.", {
         command: "git --version",
-        reason: gitVersion.error ?? gitVersion.stderr.trim(),
+        ...(isSessionRegistryError(error) ? { reason: error.code } : {}),
       }),
     );
     checks.push(
@@ -185,34 +125,56 @@ export async function runDoctor(cwd = process.cwd()): Promise<DomainResult<Docto
     checks.push(
       check("registry", "not_applicable", null, "Registry inspection was skipped because Git is unavailable."),
     );
-  } else {
-    checks.push(check("git", "ok", null, "Git is available.", { version: gitVersion.stdout.trim() }));
-    const repositoryResult = await runGit(["rev-parse", "--show-toplevel", "--git-common-dir"], cwd);
-    const repository = repositoryResult.exit_code === 0 ? parseRepository(repositoryResult.stdout, cwd) : null;
-    if (repository === null) {
-      checks.push(
-        check("repository", "error", "NOT_GIT_REPOSITORY", "The current directory is not a Git repository.", {
-          command: "git rev-parse --show-toplevel --git-common-dir",
-          reason: repositoryResult.stderr.trim(),
-        }),
-      );
-      checks.push(
-        check("registry", "not_applicable", null, "Registry inspection was skipped outside a Git repository."),
-      );
-    } else {
-      checks.push(
-        check("repository", "ok", null, "Repository and common Git directory resolved.", {
-          top_level: repository.top_level,
-          common_dir: repository.common_dir,
-        }),
-      );
-      checks.push(await inspectRegistry(repository));
-    }
+    return success({ ok: false, checks, repository: null });
+  }
 
-    const hasError = checks.some((item) => item.status === "error");
-    return success({ ok: !hasError, checks, repository });
+  let repository: RepositoryInfo | null = null;
+  try {
+    const context = resolveRepositoryContext({ cwd, git: defaultGit });
+    repository = repositoryInfo(context);
+    checks.push(
+      check("repository", "ok", null, "Repository and common Git directory resolved.", {
+        top_level: repository.top_level,
+        common_dir: repository.common_dir,
+      }),
+    );
+    checks.push(await inspectRegistry(repository, context));
+  } catch (error: unknown) {
+    checks.push(
+      check(
+        "repository",
+        "error",
+        doctorErrorCode(error, "NOT_GIT_REPOSITORY"),
+        "The current directory is not a valid Git repository context.",
+        {
+          ...(isSessionRegistryError(error) ? { reason: error.code, ...error.details } : {}),
+        },
+      ),
+    );
+    checks.push(check("registry", "not_applicable", null, "Registry inspection was skipped outside a Git repository."));
   }
 
   const hasError = checks.some((item) => item.status === "error");
-  return success({ ok: !hasError, checks, repository: null });
+  return success({ ok: !hasError, checks, repository });
+}
+
+function doctorErrorCode(error: unknown, fallback: ErrorCode): ErrorCode {
+  if (!isSessionRegistryError(error)) return fallback;
+  const code = error.code;
+  if (code === "GIT_SPAWN_FAILED") return "GIT_SPAWN_FAILED";
+  if (code === "GIT_TIMEOUT") return "GIT_TIMEOUT";
+  if (code === "GIT_OUTPUT_LIMIT") return "GIT_OUTPUT_LIMIT";
+  if (code === "GIT_COMMAND_FAILED") return "GIT_COMMAND_FAILED";
+  if (code === "NOT_A_GIT_REPOSITORY") return "NOT_GIT_REPOSITORY";
+  if (code === "REPOSITORY_IDENTITY_AMBIGUOUS") return "GIT_STATE_AMBIGUOUS";
+  if (code === "REGISTRY_CORRUPT" || code === "UNSUPPORTED_SCHEMA_VERSION") return "REGISTRY_CORRUPT";
+  if (code === "REGISTRY_REPOSITORY_MISMATCH") return "INVALID_REGISTRY";
+  if (code === "INVALID_BRANCH_ID") return "INVALID_BRANCH";
+  if (code === "INVALID_WORKTREE_PATH") return "INVALID_WORKTREE";
+  if (code === "WORKTREE_IDENTITY_AMBIGUOUS") return "GIT_STATE_AMBIGUOUS";
+  return fallback;
+}
+
+function isFileNotFound(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }

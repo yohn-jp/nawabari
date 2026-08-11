@@ -5,11 +5,11 @@ import {
   defaultGit,
   listGitWorktrees,
   normalizeBranchId,
-  readCurrentBranch,
   resolveRepositoryContext,
-  resolveWorktreeIdentity,
+  verifyPhysicalExecutionContext,
   type GitCommandRunner,
   type GitWorktreeInfo,
+  type PhysicalExecutionContext,
   type RepositoryContext,
 } from "./git.js";
 import { SessionRegistryError, type RegistryErrorCode, type RegistryErrorDetails } from "./errors.js";
@@ -106,6 +106,10 @@ export interface GuardDecision {
   readonly details: RegistryErrorDetails;
 }
 
+export interface VerifiedExecutionContext extends PhysicalExecutionContext {
+  readonly session: SessionRecord;
+}
+
 export interface SessionRegistryOptions {
   readonly cwd?: string;
   readonly repository?: RepositoryContext;
@@ -149,7 +153,6 @@ export interface PersistedRegistry {
 }
 
 const ACTIVE_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "stale"]);
-const CURRENT_SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing"]);
 const SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "closed", "stale"]);
 const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const MAX_ID_GENERATION_ATTEMPTS = 8;
@@ -180,7 +183,7 @@ export class SessionRegistry {
     this.defaultBranchName = options.defaultBranchName;
     this.protectedBranchNames = Object.freeze([...(options.protectedBranchNames ?? [])]);
     this.protectedWorktreePaths = Object.freeze([...(options.protectedWorktreePaths ?? [])]);
-    this.worktreeRoot = path.resolve(options.worktreeRoot ?? path.dirname(this.repository.worktreePath));
+    this.worktreeRoot = resolveManagedWorktreeRoot(options.worktreeRoot ?? path.dirname(this.repository.worktreePath));
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
     this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
@@ -227,9 +230,8 @@ export class SessionRegistry {
   }
 
   create(options: CreateSessionOptions = {}): SessionRecord {
-    const resources = this.resolveCreationResources(options);
-
     return this.mutate((records) => {
+      const resources = this.resolveCreationResources(options);
       for (let attempt = 0; attempt < MAX_ID_GENERATION_ATTEMPTS; attempt += 1) {
         const sessionId = this.idGenerator();
         assertSessionId(sessionId);
@@ -271,6 +273,11 @@ export class SessionRegistry {
   /** Provision one isolated Git worktree and commit its ownership atomically. */
   provision(options: ProvisionSessionOptions = {}): SessionRecord {
     return this.withLock(() => {
+      verifyPhysicalExecutionContext({
+        repository: this.repository,
+        worktreePath: this.repository.worktreePath,
+        git: this.git,
+      });
       const records = this.readUnsafe();
       const sessionId = generateUniqueSessionId(records, this.idGenerator);
       const resources = this.resolveProvisioningResources(options, sessionId);
@@ -299,13 +306,19 @@ export class SessionRegistry {
           this.repository.worktreePath,
         );
         gitProvisioned = true;
+        verifyPhysicalExecutionContext({
+          repository: this.repository,
+          worktreePath: resources.worktreePath,
+          branchName: resources.branchName,
+          git: this.git,
+        });
         this.writeUnsafe([...records, record]);
         return cloneSessionRecord(record);
       } catch (error: unknown) {
         if (gitProvisioned) {
           rollbackProvisionedResources(this.git, this.repository.worktreePath, resources);
         }
-        throw error;
+        throw classifyProvisioningFailure(error, this.git, this.repository.worktreePath, resources);
       }
     });
   }
@@ -321,6 +334,18 @@ export class SessionRegistry {
   register(record: SessionRecord): SessionRecord {
     const validated = validateSessionRecord(record, this.repository.repositoryId);
     return this.mutate((records) => {
+      const physical = verifyPhysicalExecutionContext({
+        repository: this.repository,
+        worktreePath: validated.worktreePath,
+        branchName: validated.branchName,
+        git: this.git,
+      });
+      if (validated.worktreeId !== physical.worktreePath) {
+        throw new SessionRegistryError("WORKTREE_MISMATCH", "Registered worktree identity does not match Git", {
+          expectedWorktree: validated.worktreePath,
+          actualWorktree: physical.worktreePath,
+        });
+      }
       if (records.some((candidate) => candidate.sessionId === validated.sessionId)) {
         throw new SessionRegistryError("DUPLICATE_SESSION_ID", `Session ID already exists: ${validated.sessionId}`, {
           sessionId: validated.sessionId,
@@ -336,31 +361,119 @@ export class SessionRegistry {
   }
 
   resolveCurrentSession(): SessionRecord {
-    const records = this.readUnsafe();
-    const matches = records.filter(
-      (record) => CURRENT_SESSION_STATES.has(record.state) && record.worktreeId === this.repository.worktreePath,
-    );
-
-    if (matches.length === 1) {
-      return cloneSessionRecord(matches[0]);
-    }
-    if (matches.length > 1) {
-      throw new SessionRegistryError(
-        "DUPLICATE_WORKTREE_OWNERSHIP",
-        `Multiple active sessions claim the current worktree: ${this.repository.worktreePath}`,
-        { worktree: this.repository.worktreePath },
-      );
-    }
-
-    throw new SessionRegistryError(
-      "SESSION_NOT_FOUND",
-      `No active session owns the current worktree: ${this.repository.worktreePath}`,
-      { worktree: this.repository.worktreePath },
-    );
+    return cloneSessionRecord(this.verifyExecutionContext().session);
   }
 
   currentSession(): SessionRecord {
     return this.resolveCurrentSession();
+  }
+
+  /**
+   * Resolve Git's physical facts and the registry's active owner as one
+   * fail-closed observation for governed operations.
+   */
+  verifyExecutionContext(options: GuardOptions = {}): VerifiedExecutionContext {
+    const physical = verifyPhysicalExecutionContext({
+      repository: this.repository,
+      worktreePath: this.repository.worktreePath,
+      git: this.git,
+    });
+    const session = this.resolveSessionOwnership(physical, options.sessionId ?? null);
+    return Object.freeze({ ...physical, session: cloneSessionRecord(session) });
+  }
+
+  private resolveSessionOwnership(
+    physical: PhysicalExecutionContext,
+    requestedSessionId: string | null,
+  ): SessionRecord {
+    const records = this.readUnsafe();
+    const currentRecords = records.filter(
+      (record) => record.state !== "closed" && samePath(record.worktreeId, physical.worktreePath),
+    );
+    if (currentRecords.length > 1) {
+      throw new SessionRegistryError(
+        "DUPLICATE_WORKTREE_OWNERSHIP",
+        `Multiple sessions claim the current worktree: ${physical.worktreePath}`,
+        { worktree: physical.worktreePath, sessionId: requestedSessionId ?? "<unspecified>" },
+      );
+    }
+    const currentRecord = currentRecords[0];
+    if (currentRecord === undefined) {
+      const branchRecord = records.find((record) => record.state !== "closed" && record.branchId === physical.branchId);
+      if (branchRecord !== undefined) {
+        throw new SessionRegistryError(
+          "WORKTREE_MISMATCH",
+          "The current worktree is not the worktree owned by the current branch session",
+          {
+            sessionId: branchRecord.sessionId,
+            expectedWorktree: branchRecord.worktreePath,
+            actualWorktree: physical.worktreePath,
+          },
+        );
+      }
+      const requestedRecord =
+        requestedSessionId === null ? undefined : records.find((record) => record.sessionId === requestedSessionId);
+      throw new SessionRegistryError(
+        "SESSION_NOT_FOUND",
+        `No active session owns the current worktree: ${physical.worktreePath}`,
+        {
+          worktree: physical.worktreePath,
+          ...(requestedRecord === undefined ? {} : { state: requestedRecord.state }),
+        },
+      );
+    }
+    if (currentRecord.state !== "active") {
+      throw new SessionRegistryError(
+        "STALE_REGISTRY",
+        `The current worktree is recorded in non-active state: ${currentRecord.state}`,
+        { sessionId: currentRecord.sessionId, state: currentRecord.state, worktree: physical.worktreePath },
+      );
+    }
+    if (currentRecord.repositoryId !== physical.repositoryId) {
+      throw new SessionRegistryError("REPOSITORY_MISMATCH", "The session repository identity does not match Git", {
+        expectedRepositoryId: currentRecord.repositoryId,
+        actualRepositoryId: physical.repositoryId,
+      });
+    }
+    if (currentRecord.worktreePath !== physical.worktreePath) {
+      throw new SessionRegistryError("WORKTREE_MISMATCH", "The session worktree identity does not match Git", {
+        expectedWorktree: currentRecord.worktreePath,
+        actualWorktree: physical.worktreePath,
+      });
+    }
+    if (currentRecord.branchId !== physical.branchId || currentRecord.branchName !== physical.branchName) {
+      throw new SessionRegistryError("BRANCH_MISMATCH", "The session branch identity does not match Git", {
+        expectedBranch: currentRecord.branchName,
+        actualBranch: physical.branchName,
+      });
+    }
+
+    if (requestedSessionId !== null) {
+      const requestedRecord = records.find((record) => record.sessionId === requestedSessionId);
+      if (requestedRecord === undefined || requestedRecord.state === "closed") {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${requestedSessionId}`, {
+          sessionId: requestedSessionId,
+        });
+      }
+      if (requestedRecord.state !== "active") {
+        throw new SessionRegistryError("STALE_REGISTRY", `Session is not active: ${requestedSessionId}`, {
+          sessionId: requestedSessionId,
+          state: requestedRecord.state,
+        });
+      }
+      if (requestedRecord.sessionId !== currentRecord.sessionId) {
+        throw new SessionRegistryError(
+          "DUPLICATE_WORKTREE_OWNERSHIP",
+          "The requested session does not own the current worktree",
+          {
+            worktree: physical.worktreePath,
+            sessionId: requestedSessionId,
+            ownerSessionId: currentRecord.sessionId,
+          },
+        );
+      }
+    }
+    return currentRecord;
   }
 
   /**
@@ -384,58 +497,14 @@ export class SessionRegistry {
         return deniedGuard("INVALID_SESSION_ID", base, { sessionId: requestedSessionId });
       }
 
-      const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
-      if (worktrees.length === 0) {
-        return deniedGuard("WORKTREE_IDENTITY_AMBIGUOUS", base, { worktree: this.repository.worktreePath });
-      }
-
-      const identity = resolveWorktreeIdentity({
+      const physical = verifyPhysicalExecutionContext({
         repository: this.repository,
+        worktreePath: this.repository.worktreePath,
         git: this.git,
       });
-      const identityBase = { ...base, branchName: identity.branchName };
-      const listedCurrentWorktree = worktrees.find((worktree) =>
-        samePath(worktree.worktreePath, this.repository.worktreePath),
-      );
-      if (listedCurrentWorktree?.branchName !== identity.branchName) {
-        return deniedGuard("WORKTREE_IDENTITY_AMBIGUOUS", identityBase, {
-          worktree: this.repository.worktreePath,
-          listedBranch: listedCurrentWorktree?.branchName ?? "<detached>",
-          resolvedBranch: identity.branchName,
-        });
-      }
-      const records = this.readUnsafe();
-      const currentRecords = records.filter(
-        (record) => record.worktreeId === this.repository.worktreePath && record.state !== "closed",
-      );
-      if (currentRecords.length > 1) {
-        return deniedGuard(
-          "DUPLICATE_WORKTREE_OWNERSHIP",
-          identityBase,
-          {
-            worktree: this.repository.worktreePath,
-            sessionId: requestedSessionId ?? "<unspecified>",
-          },
-          currentRecords[0]?.sessionId ?? null,
-          currentRecords[0]?.state ?? null,
-        );
-      }
+      const identityBase = { ...base, branchName: physical.branchName };
 
-      const currentRecord = currentRecords.find((record) => record.state === "active");
-      if (currentRecord !== undefined) {
-        identityBase.sessionId = currentRecord.sessionId;
-        identityBase.ownerSessionId = currentRecord.sessionId;
-        identityBase.state = currentRecord.state;
-      } else {
-        const transitionalRecord = currentRecords[0];
-        if (transitionalRecord !== undefined) {
-          identityBase.sessionId = transitionalRecord.sessionId;
-          identityBase.ownerSessionId = transitionalRecord.sessionId;
-          identityBase.state = transitionalRecord.state;
-        }
-      }
-
-      if (this.protectedWorktree(this.repository.worktreePath, worktrees)) {
+      if (this.protectedWorktree(this.repository.worktreePath, physical.worktrees)) {
         return deniedGuard(
           "PROTECTED_WORKTREE",
           identityBase,
@@ -444,83 +513,44 @@ export class SessionRegistry {
           identityBase.state,
         );
       }
-      if (this.protectedBranch(identity.branchName, worktrees)) {
+      if (this.protectedBranch(physical.branchName, physical.worktrees)) {
         return deniedGuard(
           "PROTECTED_BRANCH",
           identityBase,
-          { branch: identity.branchName },
+          { branch: physical.branchName },
           identityBase.ownerSessionId,
           identityBase.state,
         );
       }
 
-      if (currentRecord === undefined) {
-        const requestedRecord =
-          requestedSessionId === null ? undefined : records.find((record) => record.sessionId === requestedSessionId);
-        return deniedGuard(
-          "SESSION_NOT_FOUND",
-          identityBase,
-          {
-            worktree: this.repository.worktreePath,
-            ...(requestedRecord === undefined ? {} : { state: requestedRecord.state }),
-          },
-          identityBase.ownerSessionId,
-          identityBase.state,
-        );
-      }
-
-      if (currentRecord.branchId !== identity.branchId || currentRecord.branchName !== identity.branchName) {
-        return deniedGuard(
-          "OWNERSHIP_MISMATCH",
-          identityBase,
-          {
-            worktree: this.repository.worktreePath,
-            expectedBranch: currentRecord.branchName,
-            actualBranch: identity.branchName,
-          },
-          currentRecord.sessionId,
-          currentRecord.state,
-        );
-      }
-
-      if (requestedSessionId !== null) {
-        const requestedRecord = records.find((record) => record.sessionId === requestedSessionId);
-        if (requestedRecord === undefined || requestedRecord.state !== "active") {
+      let currentRecord: SessionRecord;
+      try {
+        currentRecord = this.resolveSessionOwnership(physical, requestedSessionId);
+      } catch (error: unknown) {
+        if (error instanceof SessionRegistryError && error.code === "DUPLICATE_WORKTREE_OWNERSHIP") {
+          const ownerSessionId = typeof error.details.ownerSessionId === "string" ? error.details.ownerSessionId : null;
+          const owner =
+            ownerSessionId === null
+              ? undefined
+              : this.readUnsafe().find((record) => record.sessionId === ownerSessionId);
           return deniedGuard(
-            "SESSION_NOT_FOUND",
-            identityBase,
-            { sessionId: requestedSessionId },
-            currentRecord.sessionId,
-            currentRecord.state,
-          );
-        }
-        if (requestedRecord.sessionId !== currentRecord.sessionId) {
-          return deniedGuard(
-            "DUPLICATE_WORKTREE_OWNERSHIP",
-            identityBase,
+            error.code,
             {
-              worktree: this.repository.worktreePath,
-              sessionId: requestedSessionId,
-              ownerSessionId: currentRecord.sessionId,
+              ...identityBase,
+              sessionId: owner?.sessionId ?? null,
+              ownerSessionId: owner?.sessionId ?? null,
+              state: owner?.state ?? null,
             },
-            currentRecord.sessionId,
-            currentRecord.state,
+            error.details,
+            owner?.sessionId ?? null,
+            owner?.state ?? null,
           );
         }
-        if (requestedRecord.branchId !== identity.branchId) {
-          return deniedGuard(
-            "OWNERSHIP_MISMATCH",
-            identityBase,
-            {
-              sessionId: requestedSessionId,
-              expectedBranch: requestedRecord.branchName,
-              actualBranch: identity.branchName,
-            },
-            currentRecord.sessionId,
-            currentRecord.state,
-          );
-        }
+        throw error;
       }
+      identityBase.sessionId = currentRecord.sessionId;
+      identityBase.ownerSessionId = currentRecord.sessionId;
+      identityBase.state = currentRecord.state;
 
       return Object.freeze({
         allowed: true,
@@ -771,7 +801,7 @@ export class SessionRegistry {
       );
       return true;
     } catch (error: unknown) {
-      if (error instanceof SessionRegistryError && error.code === "GIT_COMMAND_FAILED") {
+      if (isExpectedGitLookupFailure(error)) {
         throw new SessionRegistryError(
           "RECOVERABLE_COMMITS",
           `Commits on ${record.branchName} are not proven reachable from ${defaultBranchName}`,
@@ -789,7 +819,7 @@ export class SessionRegistry {
     const requestedWorktreePath = resolveProvisionedWorktreePath(
       options.worktreePath ??
         path.join(this.worktreeRoot, `${path.basename(this.repository.worktreePath)}-${sessionId}`),
-      this.repository.worktreePath,
+      this.worktreeRoot,
     );
     const defaultWorktreePath =
       worktrees.find((worktree) => !worktree.prunable)?.worktreePath ?? this.repository.worktreePath;
@@ -843,25 +873,17 @@ export class SessionRegistry {
   }
 
   private resolveCreationResources(options: CreateSessionOptions): CreationResources {
-    const worktreePath = canonicalWorktreePath(options.worktreePath ?? this.repository.worktreePath);
-    const branchName =
-      options.branchName ??
-      (worktreePath === this.repository.worktreePath ? readCurrentBranch(this.git, worktreePath) : undefined);
-
-    if (branchName === undefined) {
-      throw new SessionRegistryError(
-        "WORKTREE_IDENTITY_AMBIGUOUS",
-        `A branch identity is required for a worktree other than the current worktree: ${worktreePath}`,
-        { worktree: worktreePath },
-      );
-    }
-
-    const branchId = normalizeBranchId(branchName);
+    const physical = verifyPhysicalExecutionContext({
+      repository: this.repository,
+      worktreePath: options.worktreePath ?? this.repository.worktreePath,
+      branchName: options.branchName ?? undefined,
+      git: this.git,
+    });
     return {
-      worktreeId: worktreePath,
-      worktreePath,
-      branchId,
-      branchName: branchId.slice("refs/heads/".length),
+      worktreeId: physical.worktreeId,
+      worktreePath: physical.worktreePath,
+      branchId: physical.branchId,
+      branchName: physical.branchName,
     };
   }
 
@@ -1150,8 +1172,46 @@ function generateUniqueSessionId(records: readonly SessionRecord[], idGenerator:
   );
 }
 
-function resolveProvisionedWorktreePath(candidate: string, baseDirectory: string): string {
-  const resolved = resolvePotentialWorktreePath(candidate, baseDirectory);
+function resolveManagedWorktreeRoot(candidate: string): string {
+  if (candidate.includes("\u0000") || candidate.trim().length === 0) {
+    throw new SessionRegistryError("INVALID_WORKTREE_PATH", `Invalid managed worktree root: ${candidate}`, {
+      worktree: candidate,
+    });
+  }
+  const resolved = path.resolve(candidate);
+  assertNoSymlinkPath(resolved);
+  try {
+    const stat = fs.statSync(resolved);
+    if (!stat.isDirectory()) throw new Error("managed worktree root is not a directory");
+    const canonical = fs.realpathSync.native(resolved);
+    if (canonical !== resolved) {
+      throw new Error("managed worktree root is a symbolic-link path");
+    }
+    return canonical;
+  } catch (error: unknown) {
+    throw new SessionRegistryError(
+      "INVALID_WORKTREE_PATH",
+      `Could not resolve managed worktree root: ${resolved}`,
+      { worktree: resolved },
+      error,
+    );
+  }
+}
+
+function resolveProvisionedWorktreePath(candidate: string, managedRoot: string): string {
+  if (candidate.includes("\u0000") || candidate.trim().length === 0) {
+    throw new SessionRegistryError("INVALID_WORKTREE_PATH", `Invalid worktree path: ${candidate}`, {
+      worktree: candidate,
+    });
+  }
+  const resolved = path.isAbsolute(candidate) ? path.resolve(candidate) : path.resolve(managedRoot, candidate);
+  if (!samePath(resolved, managedRoot) && !isPathInside(managedRoot, resolved)) {
+    throw new SessionRegistryError("INVALID_WORKTREE_PATH", `Worktree path escapes the managed root: ${resolved}`, {
+      worktree: resolved,
+      managedRoot,
+    });
+  }
+  assertNoSymlinkPath(resolved);
   if (resolved === path.parse(resolved).root) {
     throw new SessionRegistryError(
       "INVALID_WORKTREE_PATH",
@@ -1204,6 +1264,12 @@ function resolvePotentialWorktreePath(candidate: string, baseDirectory: string):
   }
 }
 
+function isPathInside(root: string, candidate: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  const resolvedCandidate = path.resolve(candidate);
+  return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
+}
+
 function assertNoSymlinkPath(candidate: string): void {
   const root = path.parse(candidate).root;
   let current = root;
@@ -1246,14 +1312,16 @@ function resolveDefaultBranchName(
   try {
     const configuredDefault = git.run(["config", "--get", "init.defaultBranch"], cwd);
     if (configuredDefault.length > 0) return configuredDefault;
-  } catch {
+  } catch (error: unknown) {
+    if (!isExpectedGitLookupFailure(error)) throw error;
     // A repository without init.defaultBranch is valid; continue to the local HEAD fallback.
   }
 
   try {
     const remoteHead = git.run(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], cwd);
     if (remoteHead.startsWith("origin/")) return remoteHead.slice("origin/".length);
-  } catch {
+  } catch (error: unknown) {
+    if (!isExpectedGitLookupFailure(error)) throw error;
     // A local repository may not have an origin or a symbolic remote HEAD.
   }
   return undefined;
@@ -1264,12 +1332,42 @@ function localBranchExists(git: GitCommandRunner, cwd: string, branchId: string)
     git.run(["show-ref", "--verify", "--quiet", branchId], cwd);
     return true;
   } catch (error: unknown) {
-    if (error instanceof SessionRegistryError && error.code === "GIT_COMMAND_FAILED") return false;
+    if (error instanceof SessionRegistryError && error.code === "GIT_COMMAND_FAILED" && error.details.exitCode === 1) {
+      return false;
+    }
     throw error;
   }
 }
 
+function localBranchCollision(git: GitCommandRunner, cwd: string, branchId: string): boolean {
+  if (localBranchExists(git, cwd, branchId)) return true;
+
+  const output = git.run(["for-each-ref", "--format=%(refname)", "refs/heads"], cwd);
+  return output
+    .split(/\r?\n/u)
+    .filter((candidate) => candidate.length > 0)
+    .some(
+      (candidate) =>
+        candidate === branchId || candidate.startsWith(`${branchId}/`) || branchId.startsWith(`${candidate}/`),
+    );
+}
+
 function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resources: ProvisioningResources): void {
+  assertNoSymlinkPath(resources.worktreePath);
+  const parent = path.dirname(resources.worktreePath);
+  try {
+    if (!fs.statSync(parent).isDirectory() || fs.realpathSync.native(parent) !== parent) {
+      throw new Error("worktree parent is not canonical");
+    }
+  } catch (error: unknown) {
+    throw new SessionRegistryError(
+      "INVALID_WORKTREE_PATH",
+      `Could not safely resolve worktree parent: ${parent}`,
+      { worktree: resources.worktreePath },
+      error,
+    );
+  }
+  assertGitBranchName(git, cwd, resources.branchName);
   const worktrees = listGitWorktrees(git, cwd);
   if (worktrees.some((worktree) => samePath(worktree.worktreePath, resources.worktreePath))) {
     throw new SessionRegistryError(
@@ -1299,11 +1397,75 @@ function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resourc
       },
     );
   }
-  if (localBranchExists(git, cwd, resources.branchId)) {
+  if (localBranchCollision(git, cwd, resources.branchId)) {
     throw new SessionRegistryError("BRANCH_ALREADY_EXISTS", `Local branch already exists: ${resources.branchName}`, {
       branch: resources.branchName,
     });
   }
+}
+
+function assertGitBranchName(git: GitCommandRunner, cwd: string, branchName: string): void {
+  try {
+    git.run(["check-ref-format", "--branch", branchName], cwd);
+  } catch (error: unknown) {
+    if (
+      error instanceof SessionRegistryError &&
+      error.code === "GIT_COMMAND_FAILED" &&
+      (error.details.exitCode === 1 || error.details.exitCode === 128)
+    ) {
+      throw new SessionRegistryError(
+        "INVALID_BRANCH_ID",
+        `Invalid branch identity: ${branchName}`,
+        {
+          branchName,
+        },
+        error,
+      );
+    }
+    throw error;
+  }
+}
+
+function classifyProvisioningFailure(
+  error: unknown,
+  git: GitCommandRunner,
+  cwd: string,
+  resources: ProvisioningResources,
+): unknown {
+  if (
+    !(error instanceof SessionRegistryError) ||
+    error.code !== "GIT_COMMAND_FAILED" ||
+    typeof error.details.exitCode !== "number"
+  ) {
+    return error;
+  }
+  try {
+    const worktrees = listGitWorktrees(git, cwd);
+    if (
+      worktrees.some((worktree) => samePath(worktree.worktreePath, resources.worktreePath)) ||
+      lstatIfPresent(resources.worktreePath) !== undefined
+    ) {
+      return new SessionRegistryError(
+        "WORKTREE_ALREADY_EXISTS",
+        `Worktree path already exists: ${resources.worktreePath}`,
+        { worktree: resources.worktreePath },
+        error,
+      );
+    }
+    if (localBranchCollision(git, cwd, resources.branchId)) {
+      return new SessionRegistryError(
+        "BRANCH_ALREADY_EXISTS",
+        `Local branch already exists: ${resources.branchName}`,
+        {
+          branch: resources.branchName,
+        },
+        error,
+      );
+    }
+  } catch {
+    // Preserve the original bounded Git failure when collision observation is unavailable.
+  }
+  return error;
 }
 
 function resolveBaseRef(git: GitCommandRunner, cwd: string, candidate: string): string {
@@ -1319,13 +1481,21 @@ function resolveBaseRef(git: GitCommandRunner, cwd: string, candidate: string): 
     git.run(["rev-parse", "--verify", `${candidate}^{commit}`], cwd);
     return candidate;
   } catch (error: unknown) {
-    if (error instanceof SessionRegistryError && error.code === "GIT_COMMAND_FAILED") {
+    if (isExpectedGitLookupFailure(error)) {
       throw new SessionRegistryError("INVALID_BASE_REF", `Base ref does not resolve to a commit: ${candidate}`, {
         baseRef: candidate,
       });
     }
     throw error;
   }
+}
+
+function isExpectedGitLookupFailure(error: unknown): boolean {
+  return (
+    error instanceof SessionRegistryError &&
+    error.code === "GIT_COMMAND_FAILED" &&
+    (error.details.exitCode === 1 || error.details.exitCode === 128)
+  );
 }
 
 function rollbackProvisionedResources(git: GitCommandRunner, cwd: string, resources: ProvisioningResources): void {
@@ -1579,26 +1749,6 @@ function assertNoOwnershipConflict(records: readonly SessionRecord[], candidate:
         ownerSessionId: record.sessionId,
       });
     }
-  }
-}
-
-function canonicalWorktreePath(candidate: string): string {
-  const resolved = path.resolve(candidate);
-  try {
-    const stat = fs.statSync(resolved);
-    if (!stat.isDirectory()) {
-      throw new Error("path is not a directory");
-    }
-    return fs.realpathSync.native(resolved);
-  } catch (error: unknown) {
-    throw new SessionRegistryError(
-      "WORKTREE_IDENTITY_AMBIGUOUS",
-      `Could not resolve worktree identity: ${resolved}`,
-      {
-        worktree: resolved,
-      },
-      error,
-    );
   }
 }
 

@@ -90,7 +90,7 @@ test("guard fails closed for detached and corrupt ownership state", () => {
     runGit(["checkout", "--detach"], worktreePath);
     const detached = new SessionRegistry({ cwd: worktreePath }).guard();
     assert.equal(detached.allowed, false);
-    assert.equal(detached.code, "WORKTREE_IDENTITY_AMBIGUOUS");
+    assert.equal(detached.code, "DETACHED_HEAD");
 
     runGit(["checkout", "feature/guard-invalid"], worktreePath);
     fs.writeFileSync(registry.paths.registry, "{not-json\n", "utf8");
@@ -136,6 +136,52 @@ test("guard fails closed for ambiguous persisted ownership and maps it through t
     const response = JSON.parse(output[0]) as { code: string; allowed: boolean };
     assert.equal(response.code, "WORKTREE_OWNED_BY_OTHER_SESSION");
     assert.equal(response.allowed, false);
+  } finally {
+    removeWorktree(fixture, worktreePath);
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("guard rejects stale registry state and a persisted branch that Git disproves", () => {
+  const fixture = createRepository();
+  const worktreePath = `${fixture}-guard-physical-mismatch`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture });
+    const session = registry.provision({ worktreePath, branchName: "feature/guard-physical" });
+
+    fs.writeFileSync(
+      registry.paths.registry,
+      `${JSON.stringify(
+        {
+          schema_version: 1,
+          repository_id: registry.repository.repositoryId,
+          sessions: [toPersistedSessionRecord({ ...session, state: "stale" })],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    assert.equal(new SessionRegistry({ cwd: worktreePath }).guard().code, "STALE_REGISTRY");
+
+    fs.writeFileSync(
+      registry.paths.registry,
+      `${JSON.stringify(
+        {
+          schema_version: 1,
+          repository_id: registry.repository.repositoryId,
+          sessions: [
+            toPersistedSessionRecord({
+              ...session,
+              branchId: "refs/heads/feature/other",
+              branchName: "feature/other",
+            }),
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    assert.equal(new SessionRegistry({ cwd: worktreePath }).guard().code, "BRANCH_MISMATCH");
   } finally {
     removeWorktree(fixture, worktreePath);
     fs.rmSync(fixture, { recursive: true, force: true });
