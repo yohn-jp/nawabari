@@ -237,6 +237,63 @@ test("gc marks stale dirty sessions but does not remove recoverable work", () =>
   }
 });
 
+test("gc recovers an externally removed prunable worktree and permits branch reuse", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-prunable-worktree`;
+  let now = new Date("2026-01-01T00:00:00.000Z");
+  try {
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      clock: () => now,
+      staleAfterMs: 24 * 60 * 60 * 1_000,
+    });
+    const session = registry.provision({ worktreePath, branchName: "feature/prunable-worktree" });
+
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    const worktreeList = runGit(["worktree", "list", "--porcelain"], fixture.repositoryPath).split(/\r?\n/u);
+    assert.equal(worktreeList.includes(`worktree ${worktreePath}`), true);
+    assert.equal(
+      worktreeList.some((line) => line.startsWith("prunable ")),
+      true,
+    );
+
+    const detected = registry.garbageCollect({ apply: false });
+    assert.deepEqual(
+      detected.candidates.map((candidate) => candidate.sessionId),
+      [session.sessionId],
+    );
+    assert.equal(detected.cleaned.length, 0);
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+
+    const applied = registry.garbageCollect({ apply: true });
+    assert.deepEqual(
+      applied.candidates.map((candidate) => candidate.sessionId),
+      [session.sessionId],
+    );
+    assert.deepEqual(
+      applied.cleaned.map((cleaned) => cleaned.sessionId),
+      [session.sessionId],
+    );
+    assert.equal(applied.blocked.length, 0);
+    assert.equal(applied.cleaned[0]?.state, "closed");
+    assert.equal(registry.get(session.sessionId)?.state, "closed");
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+
+    const repeated = registry.garbageCollect({ apply: true });
+    assert.deepEqual(repeated.candidates, []);
+    assert.deepEqual(repeated.cleaned, []);
+    assert.deepEqual(repeated.blocked, []);
+
+    const reused = registry.provision({ worktreePath, branchName: session.branchName });
+    assert.notEqual(reused.sessionId, session.sessionId);
+    assert.equal(reused.state, "active");
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 interface RepositoryFixture {
   readonly repositoryPath: string;
   cleanup(): void;

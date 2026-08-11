@@ -73,6 +73,88 @@ test("the CLI create command uses the local backend and emits stable JSON", asyn
   }
 });
 
+test("the CLI gc path recovers a prunable worktree before branch reuse", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-cli-prunable`;
+  const branchName = "feature/cli-prunable";
+  try {
+    const created = await runJsonCli<{
+      ok: boolean;
+      command: string;
+      session_id: string;
+      state: string;
+    }>(repositoryPath, ["session", "create", "--branch", branchName, "--worktree", worktreePath]);
+    assert.equal(created.ok, true);
+    assert.equal(created.command, "session create");
+    assert.equal(created.state, "active");
+
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    const worktreeList = runGit(["worktree", "list", "--porcelain"], repositoryPath).split(/\r?\n/u);
+    assert.equal(worktreeList.includes(`worktree ${worktreePath}`), true);
+    assert.equal(
+      worktreeList.some((line) => line.startsWith("prunable ")),
+      true,
+    );
+
+    const dryRun = await runJsonCli<{
+      ok: boolean;
+      command: string;
+      apply: boolean;
+      candidates: Array<{ session_id: string }>;
+      cleaned: unknown[];
+      blocked: unknown[];
+    }>(repositoryPath, ["gc", "--dry-run"]);
+    assert.equal(dryRun.ok, true);
+    assert.equal(dryRun.command, "gc");
+    assert.equal(dryRun.apply, false);
+    assert.deepEqual(
+      dryRun.candidates.map((candidate) => candidate.session_id),
+      [created.session_id],
+    );
+    assert.deepEqual(dryRun.cleaned, []);
+    assert.deepEqual(dryRun.blocked, []);
+
+    const applied = await runJsonCli<{
+      ok: boolean;
+      command: string;
+      apply: boolean;
+      candidates: Array<{ session_id: string; state: string }>;
+      cleaned: Array<{ session_id: string; state: string }>;
+      blocked: unknown[];
+    }>(repositoryPath, ["gc", "--apply"]);
+    assert.equal(applied.ok, true);
+    assert.equal(applied.command, "gc");
+    assert.equal(applied.apply, true);
+    assert.deepEqual(
+      applied.candidates.map((candidate) => candidate.session_id),
+      [created.session_id],
+    );
+    assert.equal(applied.cleaned.length, 1);
+    assert.equal(applied.cleaned[0]?.session_id, created.session_id);
+    assert.equal(applied.cleaned[0]?.state, "closed");
+    assert.deepEqual(applied.blocked, []);
+
+    const listed = await runJsonCli<{
+      sessions: Array<{ session_id: string; state: string }>;
+    }>(repositoryPath, ["session", "list"]);
+    assert.equal(listed.sessions.find((session) => session.session_id === created.session_id)?.state, "closed");
+
+    const reused = await runJsonCli<{
+      ok: boolean;
+      session_id: string;
+      branch: string;
+      state: string;
+    }>(repositoryPath, ["session", "create", "--branch", branchName, "--worktree", worktreePath]);
+    assert.equal(reused.ok, true);
+    assert.notEqual(reused.session_id, created.session_id);
+    assert.equal(reused.branch, branchName);
+    assert.equal(reused.state, "active");
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("the local backend preserves unexpected error diagnostics", async () => {
   const repositoryPath = createRepository();
   const expectedError = new TypeError("injected backend failure");
@@ -160,6 +242,21 @@ function removeWorktree(repositoryPath: string, worktreePath: string): void {
     // The directory cleanup below is sufficient when Git never created it.
   }
   fs.rmSync(worktreePath, { recursive: true, force: true });
+}
+
+async function runJsonCli<T>(cwd: string, args: readonly string[]): Promise<T> {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const exitCode = await runCli([...args, "--json"], {
+    cwd,
+    io: {
+      stdout: (line) => stdout.push(line),
+      stderr: (line) => stderr.push(line),
+    },
+  });
+  assert.equal(exitCode, 0, stderr.join("\n"));
+  assert.equal(stdout.length, 1);
+  return JSON.parse(stdout[0]) as T;
 }
 
 function runGit(args: readonly string[], cwd: string): string {
