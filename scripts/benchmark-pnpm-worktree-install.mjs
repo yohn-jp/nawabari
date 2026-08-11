@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 const DEFAULT_RUNS = 5;
 const GLOBAL_SETTING = "enableGlobalVirtualStore";
+const ESBUILD_LIFECYCLE_PATTERN = /esbuild[\s\S]*postinstall\$[\s\S]*postinstall:\s*Done/;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(SCRIPT_DIR, "..");
 
@@ -40,7 +41,9 @@ function parseArgs(argv) {
       options.keepTemp = true;
       continue;
     }
-    const [name, inlineValue] = argument.split("=", 2);
+    const parts = argument.split("=");
+    const name = parts[0];
+    const inlineValue = parts.length > 1 ? parts.slice(1).join("=") : undefined;
     if (name === "--runs" || name === "--base-ref" || name === "--output") {
       const value = inlineValue ?? argv[++index];
       if (value === undefined || value === "") throw new Error(`${name} requires a value`);
@@ -66,11 +69,13 @@ function run(command, args, cwd, environment = process.env) {
     env: environment,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 64 * 1024 * 1024,
   });
   if (result.error !== undefined) throw result.error;
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed with exit ${result.status}\n${output.slice(-4000)}`);
+    const exitDescription = result.status === null ? `signal ${result.signal}` : `exit ${result.status}`;
+    throw new Error(`${command} ${args.join(" ")} failed with ${exitDescription}\n${output.slice(-4000)}`);
   }
   return output;
 }
@@ -104,34 +109,48 @@ function localInstallEnvironment() {
 }
 
 function measureDiskUsage(target) {
-  const output = run("du", ["-sk", target], path.dirname(target));
-  const value = Number(output.trim().split(/\s+/, 1)[0]);
-  if (!Number.isFinite(value)) throw new Error(`could not parse disk usage for ${target}: ${output}`);
-  return value;
+  if (process.platform === "win32") {
+    throw new Error("measureDiskUsage requires the 'du' command, which is not available on Windows by default");
+  }
+  try {
+    const output = run("du", ["-sk", target], path.dirname(target));
+    const value = Number(output.trim().split(/\s+/, 1)[0]);
+    if (!Number.isFinite(value)) throw new Error(`could not parse disk usage for ${target}: ${output}`);
+    return value;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.error?.code === "ENOENT") {
+      throw new Error("measureDiskUsage requires the 'du' command, which is not available on this system");
+    }
+    throw error;
+  }
 }
 
 function findEsbuildBinary(worktree) {
-  const pnpmDirectory = path.join(worktree, "node_modules", ".pnpm");
-  const directCandidate = path.join(pnpmDirectory, "node_modules", "esbuild", "bin", "esbuild");
-  if (fs.existsSync(directCandidate)) return directCandidate;
-  if (!fs.existsSync(pnpmDirectory)) return undefined;
-  for (const entry of fs.readdirSync(pnpmDirectory)) {
-    if (!entry.startsWith("esbuild@")) continue;
-    const candidate = path.join(pnpmDirectory, entry, "node_modules", "esbuild", "bin", "esbuild");
-    if (fs.existsSync(candidate)) return candidate;
+  const binSymlink = path.join(worktree, "node_modules", ".bin", "esbuild");
+  try {
+    const resolved = fs.realpathSync(binSymlink);
+    return resolved;
+  } catch {
+    return undefined;
   }
-  return undefined;
 }
 
 function virtualStoreMode(worktree) {
   const modulesFile = path.join(worktree, "node_modules", ".modules.yaml");
   const contents = fs.readFileSync(modulesFile, "utf8");
   const match = contents.match(/["']?virtualStoreDir["']?\s*:\s*["']?([^"'\n,]+)["']?,?/);
-  const virtualStoreDir = match?.[1] ?? "unknown";
-  return {
-    virtualStoreDir,
-    mode: virtualStoreDir.endsWith("/links") || virtualStoreDir.includes("/links/") ? "global" : "local",
-  };
+  const virtualStoreDir = match?.[1];
+  if (virtualStoreDir === undefined) {
+    return { virtualStoreDir: "unknown", mode: "unknown" };
+  }
+  try {
+    const resolvedStore = path.resolve(worktree, virtualStoreDir);
+    const resolvedWorktree = path.resolve(worktree);
+    const isInsideWorktree = resolvedStore.startsWith(resolvedWorktree + path.sep) || resolvedStore === resolvedWorktree;
+    return { virtualStoreDir, mode: isInsideWorktree ? "local" : "global" };
+  } catch {
+    return { virtualStoreDir, mode: "unknown" };
+  }
 }
 
 function summarize(values) {
@@ -146,25 +165,20 @@ function addWorktree(cloneRoot, worktree, commit, worktrees) {
   worktrees.push(worktree);
 }
 
+function commitAll(seed, message) {
+  run(
+    "git",
+    ["-c", "user.name=benchmark", "-c", "user.email=benchmark@example.invalid", "commit", "--quiet", "-m", message],
+    seed,
+  );
+}
+
 function commitCandidate(cloneRoot, baseCommit, worktrees, label) {
   const seed = path.join(path.dirname(cloneRoot), `${label}-seed`);
   addWorktree(cloneRoot, seed, baseCommit, worktrees);
   run("pnpm", ["config", "set", GLOBAL_SETTING, "true", "--location", "project"], seed);
   run("git", ["add", "pnpm-workspace.yaml"], seed);
-  run(
-    "git",
-    [
-      "-c",
-      "user.name=benchmark",
-      "-c",
-      "user.email=benchmark@example.invalid",
-      "commit",
-      "--quiet",
-      "-m",
-      `benchmark ${GLOBAL_SETTING}`,
-    ],
-    seed,
-  );
+  commitAll(seed, `benchmark ${GLOBAL_SETTING}`);
   return run("git", ["rev-parse", "HEAD"], seed).trim();
 }
 
@@ -179,42 +193,16 @@ function commitDependencyChange(cloneRoot, baseCommit, worktrees) {
   );
   run("pnpm", ["add", "--save-dev", "--lockfile-only", "./benchmark-fixture"], seed);
   run("git", ["add", "package.json", "pnpm-lock.yaml", "benchmark-fixture/package.json"], seed);
-  run(
-    "git",
-    [
-      "-c",
-      "user.name=benchmark",
-      "-c",
-      "user.email=benchmark@example.invalid",
-      "commit",
-      "--quiet",
-      "-m",
-      "benchmark dependency change",
-    ],
-    seed,
-  );
+  commitAll(seed, "benchmark dependency change");
   const changedBaseCommit = run("git", ["rev-parse", "HEAD"], seed).trim();
   run("pnpm", ["config", "set", GLOBAL_SETTING, "true", "--location", "project"], seed);
   run("git", ["add", "pnpm-workspace.yaml"], seed);
-  run(
-    "git",
-    [
-      "-c",
-      "user.name=benchmark",
-      "-c",
-      "user.email=benchmark@example.invalid",
-      "commit",
-      "--quiet",
-      "-m",
-      "benchmark dependency change global virtual store",
-    ],
-    seed,
-  );
+  commitAll(seed, "benchmark dependency change global virtual store");
   return { changedBaseCommit, changedGlobalCommit: run("git", ["rev-parse", "HEAD"], seed).trim() };
 }
 
 function runCompatibilityChecks(worktree, output) {
-  const lifecycleBuilt = /esbuild[\s\S]*postinstall\$[\s\S]*postinstall:\s*Done/.test(output);
+  const lifecycleBuilt = ESBUILD_LIFECYCLE_PATTERN.test(output);
   const esbuildBinary = findEsbuildBinary(worktree);
   if (!lifecycleBuilt || esbuildBinary === undefined) {
     throw new Error(`esbuild lifecycle build was not verified in ${worktree}`);
@@ -256,7 +244,7 @@ function measureInstall({ cloneRoot, root, config, phase, repetition, commit, st
     nodeModulesKb: measureDiskUsage(path.join(worktree, "node_modules")),
     storeKb: measureDiskUsage(store),
     ...virtualStoreMode(worktree),
-    lifecycleBuild: /esbuild[\s\S]*postinstall\$[\s\S]*postinstall:\s*Done/.test(output),
+    lifecycleBuild: ESBUILD_LIFECYCLE_PATTERN.test(output),
   };
   if (phase === "cold") result.compatibility = runCompatibilityChecks(worktree, output);
   return result;
@@ -302,7 +290,11 @@ function main() {
     run("git", ["clone", "--local", "--no-hardlinks", "--quiet", REPOSITORY_ROOT, cloneRoot], REPOSITORY_ROOT);
     const baselineWorkspace = run("git", ["show", `${baseline.commit}:pnpm-workspace.yaml`], REPOSITORY_ROOT);
     if (new RegExp(`${GLOBAL_SETTING}:\\s*true`).test(baselineWorkspace)) {
-      throw new Error(`${baseline.ref} already enables ${GLOBAL_SETTING}; use a default-setting baseline`);
+      throw new Error(
+        `${baseline.ref} already enables ${GLOBAL_SETTING}; the benchmark requires a baseline with default settings (no explicit ${GLOBAL_SETTING}). ` +
+        `See docs/pnpm-worktree-install-benchmark.md for baseline requirements. ` +
+        `Use --base-ref to specify a commit before the setting was enabled, or use a pre-merge main branch.`
+      );
     }
     const currentCommit = baseline.commit;
     const globalCommit = commitCandidate(cloneRoot, baseline.commit, worktrees, "global");

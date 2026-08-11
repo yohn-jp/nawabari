@@ -52,7 +52,7 @@ virtual-store projection out of each worktree.
 
 The benchmark checks the approved `esbuild` postinstall and executable, a
 native ESM import of `tsx`, and a build followed by a native ESM import from
-`dist/contract.js` for both configurations. Both checks passed.
+`dist/contract.js` for both configurations. All three checks passed.
 
 `pnpm run verify` passed in both configurations, including formatting, lint,
 typecheck, 135 tests, pinned-action governance, exact package contents, and
