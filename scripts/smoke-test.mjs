@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
 const packageName = packageJson.name;
-const expectedVersion = "0.1.0";
+const expectedVersion = packageJson.version;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: "utf8", ...options });
