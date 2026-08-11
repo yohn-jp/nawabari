@@ -156,12 +156,34 @@ automation contract and reports stable allow/deny codes such as
 the existing ownership/physical-observation codes.
 
 **`authorize` returns an authorization decision only; it does NOT execute the
-operation itself.** Commits, pushes, and all other local operations remain
-outside this feature.
+operation itself.** Governed commit and push execution use this same decision
+path before invoking bounded Git subprocesses.
 
 ```bash
 git nawabari authorize --session "$NAWABARI_SESSION_ID" \
   --operation source-write --resource src/example.ts --json
+```
+
+Governed commit accepts only a caller-decided final message and explicit
+repository-relative resources. Every resource must be covered by an active
+`exclusive-write` claim; all Git-visible changed/staged paths must be in the
+explicit list. JSON includes the resulting `commit_sha`.
+
+```bash
+git nawabari commit --session "$NAWABARI_SESSION_ID" \
+  --message 'record the local change' --resource src/example.ts --json
+```
+
+Governed push requires explicit claim-covered resources and an explicit
+`--remote`/`--branch` target. Existing upstream and local/remote relation are
+inspected before mutation. A missing upstream requires `--create-upstream`;
+behind or diverged history requires explicit `--force`, which uses
+`--force-with-lease`. The JSON result identifies the pushed `target` and
+reports its relation.
+
+```bash
+git nawabari push --session "$NAWABARI_SESSION_ID" \
+  --remote origin --branch feature/example --resource src/example.ts --json
 ```
 
 `checkpoint --json` captures bounded Git-observable `changed`, `staged`,

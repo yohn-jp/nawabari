@@ -152,6 +152,40 @@ export type CheckpointEvidence = {
   max_paths: number;
 };
 
+export type CommitOptions = {
+  session_id: string | null;
+  message: string;
+  resources: string[];
+};
+
+export type CommitResult = {
+  schema_version: number;
+  commit_sha: string;
+  message: string;
+  resources: string[];
+};
+
+export type PushOptions = {
+  session_id: string | null;
+  resources: string[];
+  remote: string | null;
+  branch: string | null;
+  force: boolean;
+  create_upstream: boolean;
+};
+
+export type PushRelation = "no-upstream" | "up-to-date" | "ahead" | "behind" | "diverged";
+
+export type PushResult = {
+  schema_version: number;
+  remote: string;
+  branch: string;
+  target: string;
+  relation: PushRelation;
+  force: boolean;
+  upstream_created: boolean;
+};
+
 export type GarbageCollectOptions = {
   apply: boolean;
 };
@@ -206,6 +240,8 @@ export interface SessionBackend {
     options: OperationAuthorizationOptions,
   ): Promise<DomainResult<OperationAuthorizationDecision>>;
   checkpoint?(context: SessionContext, options: CheckpointOptions): Promise<DomainResult<CheckpointEvidence>>;
+  commit?(context: SessionContext, options: CommitOptions): Promise<DomainResult<CommitResult>>;
+  push?(context: SessionContext, options: PushOptions): Promise<DomainResult<PushResult>>;
   listSessions(context: SessionContext): Promise<DomainResult<SessionListResult>>;
   status(context: SessionContext): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
