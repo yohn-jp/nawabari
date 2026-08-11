@@ -146,7 +146,8 @@ function virtualStoreMode(worktree) {
   try {
     const resolvedStore = path.resolve(worktree, virtualStoreDir);
     const resolvedWorktree = path.resolve(worktree);
-    const isInsideWorktree = resolvedStore.startsWith(resolvedWorktree + path.sep) || resolvedStore === resolvedWorktree;
+    const isInsideWorktree =
+      resolvedStore.startsWith(resolvedWorktree + path.sep) || resolvedStore === resolvedWorktree;
     return { virtualStoreDir, mode: isInsideWorktree ? "local" : "global" };
   } catch {
     return { virtualStoreDir, mode: "unknown" };
@@ -292,8 +293,8 @@ function main() {
     if (new RegExp(`${GLOBAL_SETTING}:\\s*true`).test(baselineWorkspace)) {
       throw new Error(
         `${baseline.ref} already enables ${GLOBAL_SETTING}; the benchmark requires a baseline with default settings (no explicit ${GLOBAL_SETTING}). ` +
-        `See docs/pnpm-worktree-install-benchmark.md for baseline requirements. ` +
-        `Use --base-ref to specify a commit before the setting was enabled, or use a pre-merge main branch.`
+          `See docs/pnpm-worktree-install-benchmark.md for baseline requirements. ` +
+          `Use --base-ref to specify a commit before the setting was enabled, or use a pre-merge main branch.`,
       );
     }
     const currentCommit = baseline.commit;
