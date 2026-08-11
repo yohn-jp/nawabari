@@ -1,6 +1,7 @@
 import {
   SessionRegistry,
   type GarbageCollectResult as RegistryGarbageCollectResult,
+  type ResourceClaim as RegistryResourceClaim,
   type SessionRecord as RegistrySessionRecord,
   type SessionRegistryOptions,
 } from "../session-registry.js";
@@ -8,6 +9,8 @@ import { isSessionRegistryError, type RegistryErrorCode, type SessionRegistryErr
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import {
   type BackendCapabilities,
+  type ClaimResourcesOptions,
+  type ClaimResourcesResult,
   type GarbageCollectOptions,
   type GarbageCollectResult,
   type GuardDecision,
@@ -19,7 +22,11 @@ import {
   type SessionCreateOptions,
   type SessionListResult,
   type SessionRecord,
+  type ReleaseClaimsOptions,
+  type ReleaseClaimsResult,
+  type ResourceClaim,
   type StatusResult,
+  type UpdateClaimsOptions,
 } from "./session.js";
 
 export interface LocalSessionBackendOptions {
@@ -62,6 +69,20 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   RECOVERABLE_COMMITS: "RECOVERABLE_COMMITS",
   REGISTRY_LOCK_TIMEOUT: "LOCK_CONTENTION",
   REGISTRY_IO_FAILURE: "REGISTRY_UNREADABLE",
+  INVALID_CLAIM: "INVALID_CLAIM",
+  INVALID_CLAIM_RESOURCE: "INVALID_CLAIM_RESOURCE",
+  CLAIM_PATH_TRAVERSAL: "CLAIM_PATH_TRAVERSAL",
+  CLAIM_SYMLINK_ESCAPE: "CLAIM_SYMLINK_ESCAPE",
+  CLAIM_AMBIGUOUS_PATH: "CLAIM_AMBIGUOUS_PATH",
+  UNSUPPORTED_CLAIM_GLOB: "UNSUPPORTED_CLAIM_GLOB",
+  CLAIM_REPOSITORY_MISMATCH: "CLAIM_REPOSITORY_MISMATCH",
+  CLAIM_SESSION_MISMATCH: "CLAIM_SESSION_MISMATCH",
+  DUPLICATE_CLAIM: "DUPLICATE_CLAIM",
+  CONTRADICTORY_CLAIM: "CONTRADICTORY_CLAIM",
+  RESOURCE_CLAIM_CONFLICT: "RESOURCE_CLAIM_CONFLICT",
+  CLAIM_NOT_FOUND: "CLAIM_NOT_FOUND",
+  SESSION_NOT_ACTIVE: "SESSION_NOT_ACTIVE",
+  UNSUPPORTED_CLAIM_SCHEMA_VERSION: "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
 });
 
 /** SessionBackend implementation backed only by the local Git repository. */
@@ -183,6 +204,69 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
+  public async claimResources(
+    context: SessionContext,
+    options: ClaimResourcesOptions,
+  ): Promise<DomainResult<ClaimResourcesResult>> {
+    try {
+      const result = this.registryFor(context).claimResources({
+        sessionId: options.session_id ?? undefined,
+        repositoryId: options.repository ?? undefined,
+        claims: options.claims.map(toRegistryClaimInput),
+      });
+      return success(toDomainClaimResult(result));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async updateClaims(
+    context: SessionContext,
+    options: UpdateClaimsOptions,
+  ): Promise<DomainResult<ClaimResourcesResult>> {
+    try {
+      const result = this.registryFor(context).updateClaims({
+        sessionId: options.session_id ?? undefined,
+        repositoryId: options.repository ?? undefined,
+        claims: options.claims.map(toRegistryClaimInput),
+      });
+      return success(toDomainClaimResult(result));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async releaseClaims(
+    context: SessionContext,
+    options: ReleaseClaimsOptions,
+  ): Promise<DomainResult<ReleaseClaimsResult>> {
+    try {
+      const result = this.registryFor(context).releaseClaims({
+        sessionId: options.session_id ?? undefined,
+        claimIds: options.claim_ids ?? undefined,
+      });
+      return success({
+        session_id: result.sessionId,
+        released: result.released.map(toDomainClaim),
+        remaining: result.remaining.map(toDomainClaim),
+        idempotent: result.idempotent,
+      });
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async listClaims(
+    context: SessionContext,
+    sessionId: string | null,
+  ): Promise<DomainResult<{ claims: ResourceClaim[] }>> {
+    try {
+      return success({ claims: this.registryFor(context).listClaims(sessionId).map(toDomainClaim) });
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
   private registryFor(context: SessionContext): SessionRegistry {
     return new SessionRegistry({ ...this.registryOptions, cwd: context.cwd, git: this.git });
   }
@@ -232,6 +316,42 @@ function toDomainGarbageCollectResult(result: RegistryGarbageCollectResult): Gar
       message: blocked.message,
       details: { ...blocked.details },
     })),
+  };
+}
+
+function toRegistryClaimInput(
+  input: import("./session.js").ResourceClaimInput,
+): import("../resource-claims.js").ResourceClaimInput {
+  return {
+    resource: input.resource,
+    mode: input.mode,
+    ...(input.repository === null || input.repository === undefined ? {} : { repositoryId: input.repository }),
+    ...(input.session_id === null || input.session_id === undefined ? {} : { sessionId: input.session_id }),
+    ...(input.worktree === null || input.worktree === undefined ? {} : { worktreePath: input.worktree }),
+  };
+}
+
+function toDomainClaimResult(result: import("../session-registry.js").ClaimResourcesResult): ClaimResourcesResult {
+  return {
+    session: toDomainRecord(result.session),
+    claims: result.claims.map(toDomainClaim),
+    added: result.added.map(toDomainClaim),
+    released: result.released.map(toDomainClaim),
+    idempotent: result.idempotent,
+  };
+}
+
+function toDomainClaim(claim: RegistryResourceClaim): ResourceClaim {
+  return {
+    schema_version: claim.schemaVersion,
+    claim_id: claim.claimId,
+    session_id: claim.sessionId,
+    repository: claim.repositoryId,
+    worktree: claim.worktreePath,
+    resource: claim.resource,
+    mode: claim.mode,
+    created_at: claim.createdAt,
+    updated_at: claim.updatedAt,
   };
 }
 

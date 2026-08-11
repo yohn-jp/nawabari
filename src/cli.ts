@@ -23,6 +23,10 @@ const HELP_TEXT = [
   "  session id           Resolve the current session identity",
   "  session show         Show the current or selected session",
   "  session list         List repository sessions",
+  "  session claim        Add a canonical resource claim",
+  "  session update       Replace a session's resource claims",
+  "  session claims       List canonical resource claims",
+  "  session release      Release resource claims",
   "  session close        Close the current or selected session",
   "  status               Show Nawabari session status",
   "  guard [--session id] Authorize the current worktree for mutation",
@@ -38,6 +42,8 @@ const HELP_TEXT = [
   "Session options:",
   "  session create --branch <name> --worktree <path> --base <ref> --label <text>",
   "  session show|close --session <id>",
+  "  session claim|update --session <id> --resource <path-or-glob> --mode <read|write|exclusive-write>",
+  "  session claims|release --session <id> [--claim-id <id>]",
   "  gc [--dry-run|--apply]",
 ].join("\n");
 
@@ -48,6 +54,14 @@ const HELP_DATA: JsonObject = {
     "session id",
     "session show",
     "session list",
+    "session claim",
+    "session update",
+    "session claims",
+    "session release",
+    "resource claim",
+    "resource update",
+    "resource list",
+    "resource release",
     "session close",
     "status",
     "guard",
@@ -55,7 +69,17 @@ const HELP_DATA: JsonObject = {
     "doctor",
   ],
   options: ["--json", "--help", "--version"],
-  session_options: ["--branch", "--worktree", "--base", "--label", "--session"],
+  session_options: [
+    "--branch",
+    "--worktree",
+    "--base",
+    "--label",
+    "--session",
+    "--resource",
+    "--mode",
+    "--claim-id",
+    "--repository",
+  ],
   gc_options: ["--apply", "--dry-run"],
 };
 
@@ -79,6 +103,10 @@ type ParsedOptions = {
   worktree: string | null;
   base: string | null;
   label: string | null;
+  resource: string | null;
+  mode: string | null;
+  claim_id: string | null;
+  repository: string | null;
   apply: boolean;
 };
 
@@ -130,6 +158,10 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     worktree: null,
     base: null,
     label: null,
+    resource: null,
+    mode: null,
+    claim_id: null,
+    repository: null,
     apply: false,
   };
   let dryRun = false;
@@ -160,6 +192,10 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--worktree") options.worktree = value;
     else if (name === "--base") options.base = value;
     else if (name === "--label") options.label = value;
+    else if (name === "--resource") options.resource = value;
+    else if (name === "--mode") options.mode = value;
+    else if (name === "--claim-id") options.claim_id = value;
+    else if (name === "--repository") options.repository = value;
   }
 
   if (options.apply && dryRun) {
@@ -195,6 +231,43 @@ async function executeCommand(
   if (command === "session") {
     if (subcommand === undefined) {
       return failure(usageError("MISSING_ARGUMENT", "session requires a subcommand."));
+    }
+    if (subcommand === "claim" || subcommand === "update") {
+      const parsed = parseOptions(rest, new Set(["--session", "--resource", "--mode", "--repository"]));
+      if (!parsed.ok) return parsed;
+      if (parsed.value.resource === null) {
+        return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
+      }
+      if (parsed.value.mode === null) {
+        return failure(usageError("MISSING_ARGUMENT", "--mode requires a value.", { option: "--mode" }));
+      }
+      const options = {
+        session_id: parsed.value.session_id,
+        repository: parsed.value.repository,
+        claims: [{ resource: parsed.value.resource, mode: parsed.value.mode as "read" | "write" | "exclusive-write" }],
+      };
+      const operation =
+        subcommand === "claim" ? dependencies.backend.claimResources : dependencies.backend.updateClaims;
+      if (operation === undefined) return claimCapabilityUnavailable(subcommand);
+      const result = await operation.call(dependencies.backend, context, options);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (subcommand === "claims") {
+      const parsed = parseOptions(rest, new Set(["--session"]));
+      if (!parsed.ok) return parsed;
+      if (dependencies.backend.listClaims === undefined) return claimCapabilityUnavailable("claims");
+      const result = await dependencies.backend.listClaims(context, parsed.value.session_id);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (subcommand === "release") {
+      const parsed = parseOptions(rest, new Set(["--session", "--claim-id"]));
+      if (!parsed.ok) return parsed;
+      if (dependencies.backend.releaseClaims === undefined) return claimCapabilityUnavailable("release");
+      const result = await dependencies.backend.releaseClaims(context, {
+        session_id: parsed.value.session_id,
+        claim_ids: parsed.value.claim_id === null ? null : [parsed.value.claim_id],
+      });
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "create") {
       const parsed = parseOptions(rest, new Set(["--branch", "--worktree", "--base", "--label"]));
@@ -234,6 +307,48 @@ async function executeCommand(
       return result.ok ? { ok: true, value: result.value } : result;
     }
     return failure(new DomainError("UNKNOWN_COMMAND", `Unknown session subcommand: ${subcommand}.`, { subcommand }));
+  }
+
+  if (command === "resource") {
+    const resourceSubcommand = subcommand ?? "list";
+    if (resourceSubcommand === "claim" || resourceSubcommand === "update") {
+      const parsed = parseOptions(rest, new Set(["--session", "--resource", "--mode", "--repository"]));
+      if (!parsed.ok) return parsed;
+      if (parsed.value.resource === null || parsed.value.mode === null) {
+        return failure(usageError("MISSING_ARGUMENT", "resource claim requires --resource and --mode."));
+      }
+      const operation =
+        resourceSubcommand === "claim" ? dependencies.backend.claimResources : dependencies.backend.updateClaims;
+      if (operation === undefined) return claimCapabilityUnavailable(resourceSubcommand);
+      const result = await operation.call(dependencies.backend, context, {
+        session_id: parsed.value.session_id,
+        repository: parsed.value.repository,
+        claims: [{ resource: parsed.value.resource, mode: parsed.value.mode as "read" | "write" | "exclusive-write" }],
+      });
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (resourceSubcommand === "list" || resourceSubcommand === "claims") {
+      const parsed = parseOptions(rest, new Set(["--session"]));
+      if (!parsed.ok) return parsed;
+      if (dependencies.backend.listClaims === undefined) return claimCapabilityUnavailable("list");
+      const result = await dependencies.backend.listClaims(context, parsed.value.session_id);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (resourceSubcommand === "release") {
+      const parsed = parseOptions(rest, new Set(["--session", "--claim-id"]));
+      if (!parsed.ok) return parsed;
+      if (dependencies.backend.releaseClaims === undefined) return claimCapabilityUnavailable("release");
+      const result = await dependencies.backend.releaseClaims(context, {
+        session_id: parsed.value.session_id,
+        claim_ids: parsed.value.claim_id === null ? null : [parsed.value.claim_id],
+      });
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    return failure(
+      new DomainError("UNKNOWN_COMMAND", `Unknown resource subcommand: ${resourceSubcommand}.`, {
+        subcommand: resourceSubcommand,
+      }),
+    );
   }
 
   if (command === "status") {
@@ -300,7 +415,12 @@ async function executeCommand(
 
 function commandName(commandArguments: string[]): string {
   if (commandArguments[0] === "session") return commandArguments.slice(0, 2).join(" ");
+  if (commandArguments[0] === "resource") return commandArguments.slice(0, 2).join(" ");
   return commandArguments[0] ?? "cli";
+}
+
+function claimCapabilityUnavailable(operation: string): DomainResult<JsonObject> {
+  return failure(new DomainError("BACKEND_UNAVAILABLE", "Resource claim capability is not available.", { operation }));
 }
 
 function emitFailure(mode: CliMode, command: string, error: DomainError, io: CliIO): number {

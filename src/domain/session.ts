@@ -25,6 +25,56 @@ export type SessionCreateOptions = {
   base?: string | null;
 };
 
+export type ResourceClaimMode = "read" | "write" | "exclusive-write";
+
+export type ResourceClaim = {
+  schema_version: number;
+  claim_id: string;
+  session_id: string;
+  repository: string;
+  worktree: string;
+  resource: string;
+  mode: ResourceClaimMode;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ResourceClaimInput = {
+  resource: string;
+  mode: ResourceClaimMode;
+  repository?: string | null;
+  session_id?: string | null;
+  worktree?: string | null;
+};
+
+export type ClaimResourcesOptions = {
+  session_id: string | null;
+  claims: ResourceClaimInput[];
+  repository?: string | null;
+};
+
+export type UpdateClaimsOptions = ClaimResourcesOptions;
+
+export type ReleaseClaimsOptions = {
+  session_id: string | null;
+  claim_ids?: string[] | null;
+};
+
+export type ClaimResourcesResult = {
+  session: SessionRecord;
+  claims: ResourceClaim[];
+  added: ResourceClaim[];
+  released: ResourceClaim[];
+  idempotent: boolean;
+};
+
+export type ReleaseClaimsResult = {
+  session_id: string;
+  released: ResourceClaim[];
+  remaining: ResourceClaim[];
+  idempotent: boolean;
+};
+
 export type SessionCloseOptions = {
   session_id: string | null;
 };
@@ -99,6 +149,10 @@ export interface SessionBackend {
   status(context: SessionContext): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
   garbageCollect(context: SessionContext, options: GarbageCollectOptions): Promise<DomainResult<GarbageCollectResult>>;
+  claimResources?(context: SessionContext, options: ClaimResourcesOptions): Promise<DomainResult<ClaimResourcesResult>>;
+  updateClaims?(context: SessionContext, options: UpdateClaimsOptions): Promise<DomainResult<ClaimResourcesResult>>;
+  releaseClaims?(context: SessionContext, options: ReleaseClaimsOptions): Promise<DomainResult<ReleaseClaimsResult>>;
+  listClaims?(context: SessionContext, sessionId: string | null): Promise<DomainResult<{ claims: ResourceClaim[] }>>;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {
