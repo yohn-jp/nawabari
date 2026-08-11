@@ -439,6 +439,11 @@ export class SessionRegistry {
     });
   }
 
+  /** Resolved repository-local root used for default managed session worktrees. */
+  get managedWorktreeRoot(): string {
+    return this.worktreeRoot;
+  }
+
   read(): readonly SessionRecord[] {
     return this.readUnsafe().map(cloneSessionRecord);
   }
@@ -1072,6 +1077,14 @@ export class SessionRegistry {
               ownerClaimId: conflictingClaim.claimId,
               ownerResource: conflictingClaim.resource,
               ownerMode: conflictingClaim.mode,
+            });
+          }
+          if (ownClaims.length > 0) {
+            return deniedOperation("INSUFFICIENT_CLAIM_MODE", verified, {
+              resource,
+              requiredAccess,
+              grantedModes: sortStrings(new Set(ownClaims.map((claim) => claim.mode))),
+              sessionId: currentRecord.sessionId,
             });
           }
           return deniedOperation("MISSING_RESOURCE_CLAIM", verified, {
@@ -3205,19 +3218,32 @@ function resolveBaseRef(git: GitCommandRunner, cwd: string, candidate: string): 
     candidate.startsWith("-") ||
     candidate.includes("\u0000")
   ) {
-    throw new SessionRegistryError("INVALID_BASE_REF", `Invalid base ref: ${candidate}`, { baseRef: candidate });
+    throw invalidBaseRef(candidate, "invalid-format");
   }
   try {
     git.run(["rev-parse", "--verify", `${candidate}^{commit}`], cwd);
     return candidate;
   } catch (error: unknown) {
     if (isExpectedGitLookupFailure(error)) {
-      throw new SessionRegistryError("INVALID_BASE_REF", `Base ref does not resolve to a commit: ${candidate}`, {
-        baseRef: candidate,
-      });
+      throw invalidBaseRef(candidate, "does-not-resolve-to-commit");
     }
     throw error;
   }
+}
+
+function invalidBaseRef(candidate: string, reason: string): SessionRegistryError {
+  return new SessionRegistryError(
+    "INVALID_BASE_REF",
+    reason === "invalid-format"
+      ? `Invalid base ref: ${candidate}`
+      : `Base ref does not resolve to a commit: ${candidate}`,
+    {
+      baseRef: candidate,
+      reason,
+      defaultBaseRef: "HEAD",
+      recoveryHints: ["Omit --base to use HEAD, then retry session create."],
+    },
+  );
 }
 
 function isExpectedGitLookupFailure(error: unknown): boolean {

@@ -73,7 +73,13 @@ test("one registry authority authorizes every operation class against concrete c
       sessionId: session.sessionId,
     });
     assert.equal(deniedDecision.allowed, false);
-    assert.equal(deniedDecision.code, "MISSING_RESOURCE_CLAIM");
+    assert.equal(deniedDecision.code, "INSUFFICIENT_CLAIM_MODE");
+    assert.deepEqual(deniedDecision.details, {
+      resource: "write.txt",
+      requiredAccess: "exclusive-write",
+      grantedModes: ["write"],
+      sessionId: session.sessionId,
+    });
     assert.ok(claimModeGrantsAccess("write", "write"));
     assert.ok(!claimModeGrantsAccess("write", "exclusive-write"));
     assert.ok(claimModeGrantsAccess("exclusive-write", "write"));

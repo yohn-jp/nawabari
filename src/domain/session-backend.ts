@@ -29,9 +29,9 @@ import {
   type SessionContext,
   type SessionCreateOptions,
   type SessionListResult,
+  type SessionListOptions,
   type SessionRecord,
   boundedSessionListing,
-  type SessionListOptions,
   type ReleaseClaimsOptions,
   type ReleaseClaimsResult,
   type ResourceClaim,
@@ -98,6 +98,7 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   OPERATION_REJECTED: "OPERATION_REJECTED",
   INVALID_RESOURCE: "INVALID_RESOURCE",
   MISSING_RESOURCE_CLAIM: "MISSING_RESOURCE_CLAIM",
+  INSUFFICIENT_CLAIM_MODE: "INSUFFICIENT_CLAIM_MODE",
   INVALID_CLAIM_RESOURCE: "INVALID_CLAIM_RESOURCE",
   CLAIM_PATH_TRAVERSAL: "CLAIM_PATH_TRAVERSAL",
   CLAIM_SYMLINK_ESCAPE: "CLAIM_SYMLINK_ESCAPE",
@@ -278,6 +279,7 @@ export class LocalSessionBackend implements SessionBackend {
         current_session: currentSession,
         ...listing,
         capabilities: { ...LOCAL_SESSION_CAPABILITIES },
+        managed_worktree_root: registry.managedWorktreeRoot,
       });
     } catch (error: unknown) {
       return failure(toDomainError(error));

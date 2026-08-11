@@ -230,6 +230,7 @@ export type StatusResult = {
   current_session: SessionRecord | null;
   sessions: SessionRecord[];
   capabilities: BackendCapabilities;
+  managed_worktree_root?: string | null;
   total?: number;
   returned?: number;
   limit?: number;

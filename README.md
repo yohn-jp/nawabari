@@ -91,6 +91,11 @@ git nawabari gc --dry-run --json
 git nawabari doctor --json
 ```
 
+`status --json` reports the resolved `managed_worktree_root` used when
+`session create` omits `--worktree`. `session create --help --json` describes
+all four create options as optional and reports defaults for branch, worktree,
+base (`HEAD`), and label.
+
 `session create` provisions a dedicated worktree and mutable branch atomically
 under the repository-scoped mutation lock. The default/integration worktree
 and its protected branch cannot be session resources. `session id` and the
@@ -107,6 +112,19 @@ cleanup preflight and includes stable blocker codes and `recovery_hints` for
 every candidate that is not safe. Cleanup revalidates the physical worktree,
 branch, and `HEAD` observations immediately before each destructive Git
 operation.
+
+Routine `session list` and `status` output excludes `closed` history and is
+limited to 64 records. Use `--all` (or `--history`) for an explicit complete
+history view; closed records remain persisted and are never silently deleted
+by listing or cleanup.
+
+`gc` stale eligibility is separate from closed-history retention. Its default
+threshold is 24 hours (`86,400,000` ms), measured from persisted `updated_at`;
+records already in `stale` or `closing` state are eligible, and an otherwise
+live record is also eligible when Git reports its registered worktree as
+missing or prunable. Physical Git/worktree state is authoritative for that
+check. `gc --dry-run` and `gc --apply` do not treat a closed record as a stale
+cleanup candidate.
 
 `doctor` includes a non-destructive `reconciliation` check. It reports
 registry/Git ownership drift, including missing or prunable worktrees and
@@ -217,8 +235,14 @@ repository-relative resources. Nawabari independently verifies the current
 repository, owned worktree, branch, active session, and persisted claims;
 caller-supplied labels do not weaken that decision. The JSON result is the
 automation contract and reports stable allow/deny codes such as
-`MISSING_RESOURCE_CLAIM`, `RESOURCE_CLAIM_CONFLICT`, `INVALID_RESOURCE`, and
+`MISSING_RESOURCE_CLAIM`, `INSUFFICIENT_CLAIM_MODE`, `RESOURCE_CLAIM_CONFLICT`,
+`INVALID_RESOURCE`, and
 the existing ownership/physical-observation codes.
+
+`INSUFFICIENT_CLAIM_MODE` means a matching claim exists but its granted mode
+is weaker than the operation requires. Its bounded details identify the
+resource, required access, and matching granted mode names;
+`MISSING_RESOURCE_CLAIM` remains reserved for an absent matching claim.
 
 **`authorize` returns an authorization decision only; it does NOT execute the
 operation itself.** Governed commit and push execution use this same decision
@@ -279,6 +303,11 @@ before invoking Git. Traversal, symlink/intermediate-segment escapes, existing
 worktree paths, and existing local branches are rejected deterministically;
 the repository lock serializes Nawabari provisioning and Git's own ref checks
 remain the final collision authority.
+
+An explicit `--base` ref that is empty, malformed, or does not resolve to a
+commit fails with `INVALID_BASE_REF`. The bounded JSON details retain the
+rejected ref, identify `HEAD` as the default recovery base, and include the
+retry hint to omit `--base`; Nawabari does not enumerate or fuzzy-search refs.
 
 ## Repository state and concurrency
 

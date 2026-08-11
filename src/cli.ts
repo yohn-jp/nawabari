@@ -20,91 +20,340 @@ const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
 const VERSION = packageMetadata.version;
 
-const HELP_TEXT = [
-  `Usage: ${CLI_NAME} <command> [options]`,
-  "",
-  "Commands:",
-  "  session create       Request a new Nawabari session",
-  "  session id           Resolve the current session identity",
-  "  session show         Show the current or selected session",
-  "  session list         List repository sessions",
-  "  session claim        Add a canonical resource claim",
-  "  session update       Replace a session's resource claims",
-  "  session claims       List canonical resource claims",
-  "  session release      Release resource claims",
-  "  session close        Close the current or selected session",
-  "  authorize            Authorize an operation against concrete claims",
-  "  checkpoint           Capture bounded Git execution evidence",
-  "  commit               Commit explicit claim-authorized resources",
-  "  push                 Push the owned branch to an explicit target",
-  "  status               Show Nawabari session status",
-  "  guard [--session id] Authorize the current worktree or operation",
-  "  gc                   Detect or clean eligible stale sessions",
-  "  doctor               Check local Nawabari prerequisites",
-  "  capabilities         Describe the standalone CLI/JSON contract",
-  "  --help               Show this help",
-  "  --version            Print the installed version",
-  "",
-  "Global options:",
-  "  --json               Emit one stable JSON document on stdout",
-  "  -h, --help           Show this help",
-  "",
-  "Session options:",
-  "  session create --branch <name> --worktree <path> --base <ref> --label <text>",
-  "  session show|close --session <id>",
-  "  session claim|update --session <id> --resource <path-or-glob> --mode <read|write|exclusive-write>",
-  "  session claims|release --session <id> [--claim-id <id>]",
-  "  authorize --session <id> --operation <name> --resource <path> [--resource <path>]",
-  "  checkpoint [--session <id>]",
-  "  commit --message <final-message> --resource <path> [--resource <path>] [--session <id>]",
-  "  push --remote <name> --branch <name> --resource <path> [--create-upstream] [--force] [--session <id>]",
-  "  gc [--dry-run|--apply]",
-].join("\n");
-
-const HELP_DATA: JsonObject = {
-  usage: `Usage: ${CLI_NAME} <command> [options]`,
-  commands: [
-    "session create",
-    "session id",
-    "session show",
-    "session list",
-    "session claim",
-    "session update",
-    "session claims",
-    "session release",
-    "resource claim",
-    "resource update",
-    "resource list",
-    "resource release",
-    "session close",
-    "authorize",
-    "checkpoint",
-    "commit",
-    "push",
-    "status",
-    "guard",
-    "gc",
-    "doctor",
-    "capabilities",
-  ],
-  options: ["--json", "--help", "--version"],
-  session_options: [
-    "--branch",
-    "--worktree",
-    "--base",
-    "--label",
-    "--session",
-    "--resource",
-    "--mode",
-    "--claim-id",
-    "--repository",
-  ],
-  authorization_options: ["--session", "--operation", "--resource"],
-  checkpoint_options: ["--session"],
-  commit_options: ["--session", "--message", "--resource"],
-  push_options: ["--session", "--resource", "--remote", "--branch", "--remote-branch", "--force", "--create-upstream"],
-  gc_options: ["--apply", "--dry-run"],
+type HelpOptionSpec = {
+  readonly name: string;
+  readonly value?: string;
+  readonly required?: boolean;
+  readonly default?: string;
+  readonly description: string;
 };
+
+type HelpCommandSpec = {
+  readonly name: string;
+  readonly summary: string;
+  readonly usage: string;
+  readonly options: readonly HelpOptionSpec[];
+  readonly notes?: readonly string[];
+};
+
+const GLOBAL_HELP_OPTIONS: readonly HelpOptionSpec[] = [
+  { name: "--json", description: "Emit one stable JSON document on stdout" },
+  { name: "--help", description: "Show command-specific help" },
+  { name: "--version", description: "Print the installed version" },
+];
+
+const option = (
+  name: string,
+  description: string,
+  options: Pick<HelpOptionSpec, "value" | "required" | "default"> = {},
+): HelpOptionSpec => ({ name, description, ...options });
+
+const HELP_COMMANDS: readonly HelpCommandSpec[] = [
+  {
+    name: "session create",
+    summary: "Request a new Nawabari session",
+    usage: `${CLI_NAME} session create [options]`,
+    options: [
+      option("--branch", "Branch to create; omitted uses the generated session branch", {
+        value: "<name>",
+        default: "nawabari/session/<session_id>",
+      }),
+      option("--worktree", "Managed worktree path; omitted uses the resolved repository-local root", {
+        value: "<path>",
+        default: "<managed_worktree_root>/<repository>-<session_id>",
+      }),
+      option("--base", "Commit-resolving base ref for the new worktree", { value: "<ref>", default: "HEAD" }),
+      option("--label", "Optional display label; never used as an identity", { value: "<text>", default: "omitted" }),
+    ],
+    notes: ["All create options are optional. Use status --json to discover managed_worktree_root."],
+  },
+  {
+    name: "session id",
+    summary: "Resolve the current session identity",
+    usage: `${CLI_NAME} session id`,
+    options: [],
+  },
+  {
+    name: "session show",
+    summary: "Show the current or selected session",
+    usage: `${CLI_NAME} session show [--session <id>]`,
+    options: [option("--session", "Select a session instead of the current worktree owner", { value: "<id>" })],
+  },
+  {
+    name: "session list",
+    summary: "List bounded repository session records",
+    usage: `${CLI_NAME} session list [--all|--history]`,
+    options: [
+      option("--all", "Include closed history; explicit unbounded history view"),
+      option("--history", "Alias for --all"),
+    ],
+    notes: ["Default output excludes closed records and is limited to 64 records."],
+  },
+  {
+    name: "session claim",
+    summary: "Add a canonical resource claim",
+    usage: `${CLI_NAME} session claim --resource <path-or-glob> --mode <read|write|exclusive-write> [--session <id>]`,
+    options: [
+      option("--resource", "Repository-relative resource", { value: "<path-or-glob>", required: true }),
+      option("--mode", "Granted claim mode", { value: "<read|write|exclusive-write>", required: true }),
+      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
+      option("--repository", "Expected repository identity", { value: "<id>" }),
+    ],
+  },
+  {
+    name: "session update",
+    summary: "Replace a session's resource claims",
+    usage: `${CLI_NAME} session update --resource <path-or-glob> --mode <read|write|exclusive-write> [--session <id>]`,
+    options: [
+      option("--resource", "Repository-relative resource", { value: "<path-or-glob>", required: true }),
+      option("--mode", "Granted claim mode", { value: "<read|write|exclusive-write>", required: true }),
+      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
+      option("--repository", "Expected repository identity", { value: "<id>" }),
+    ],
+  },
+  {
+    name: "session claims",
+    summary: "List canonical resource claims",
+    usage: `${CLI_NAME} session claims [--session <id>]`,
+    options: [option("--session", "Select a session; omitted lists all claims", { value: "<id>" })],
+  },
+  {
+    name: "session release",
+    summary: "Release resource claims",
+    usage: `${CLI_NAME} session release [--session <id>] [--claim-id <id>]`,
+    options: [
+      option("--session", "Target session; omitted resolves the current owner", { value: "<id>" }),
+      option("--claim-id", "Release only one claim; omitted releases all owned claims", { value: "<id>" }),
+    ],
+  },
+  {
+    name: "resource claim",
+    summary: "Add a canonical resource claim (alias)",
+    usage: `${CLI_NAME} resource claim --resource <path-or-glob> --mode <read|write|exclusive-write>`,
+    options: [],
+  },
+  {
+    name: "resource update",
+    summary: "Replace a session's resource claims (alias)",
+    usage: `${CLI_NAME} resource update --resource <path-or-glob> --mode <read|write|exclusive-write>`,
+    options: [],
+  },
+  {
+    name: "resource list",
+    summary: "List canonical resource claims (alias)",
+    usage: `${CLI_NAME} resource list [--session <id>]`,
+    options: [option("--session", "Select a session; omitted lists all claims", { value: "<id>" })],
+  },
+  {
+    name: "resource release",
+    summary: "Release resource claims (alias)",
+    usage: `${CLI_NAME} resource release [--session <id>] [--claim-id <id>]`,
+    options: [
+      option("--session", "Target session; omitted resolves the current owner", { value: "<id>" }),
+      option("--claim-id", "Release only one claim; omitted releases all owned claims", { value: "<id>" }),
+    ],
+  },
+  {
+    name: "session close",
+    summary: "Close the current or selected session",
+    usage: `${CLI_NAME} session close [--session <id>]`,
+    options: [option("--session", "Select a session instead of the current worktree owner", { value: "<id>" })],
+  },
+  {
+    name: "authorize",
+    summary: "Authorize an operation against concrete claims",
+    usage: `${CLI_NAME} authorize --operation <name> --resource <path> [--resource <path>] [--session <id>]`,
+    options: [
+      option("--session", "Assert the current session identity", { value: "<id>" }),
+      option("--operation", "Operation vocabulary entry", { value: "<name>", required: true }),
+      option("--resource", "Concrete repository-relative path; repeatable", { value: "<path>", required: true }),
+    ],
+  },
+  {
+    name: "checkpoint",
+    summary: "Capture bounded Git execution evidence",
+    usage: `${CLI_NAME} checkpoint [--session <id>]`,
+    options: [option("--session", "Assert the current session identity", { value: "<id>" })],
+  },
+  {
+    name: "commit",
+    summary: "Commit explicit claim-authorized resources",
+    usage: `${CLI_NAME} commit --message <final-message> --resource <path> [--resource <path>] [--session <id>]`,
+    options: [
+      option("--session", "Assert the current session identity", { value: "<id>" }),
+      option("--message", "Caller-decided final commit message", { value: "<final-message>", required: true }),
+      option("--resource", "Claim-covered concrete path; repeatable", { value: "<path>", required: true }),
+    ],
+  },
+  {
+    name: "push",
+    summary: "Push the owned branch to an explicit target",
+    usage: `${CLI_NAME} push --remote <name> --branch <name> --resource <path> [options]`,
+    options: [
+      option("--session", "Assert the current session identity", { value: "<id>" }),
+      option("--resource", "Claim-covered concrete path; repeatable", { value: "<path>", required: true }),
+      option("--remote", "Explicit Git remote", { value: "<name>", required: true }),
+      option("--branch", "Explicit target branch", { value: "<name>", required: true }),
+      option("--remote-branch", "Explicit remote branch alias for --branch", { value: "<name>" }),
+      option("--force", "Allow force-with-lease when relation requires it"),
+      option("--create-upstream", "Allow creation of a missing upstream"),
+    ],
+  },
+  {
+    name: "status",
+    summary: "Show repository context and bounded session status",
+    usage: `${CLI_NAME} status [--all|--history]`,
+    options: [
+      option("--all", "Include closed history; explicit unbounded history view"),
+      option("--history", "Alias for --all"),
+    ],
+    notes: ["The default machine result exposes managed_worktree_root for session-create path discovery."],
+  },
+  {
+    name: "guard",
+    summary: "Authorize the current worktree or operation",
+    usage: `${CLI_NAME} guard [--session <id>] [--operation <name> --resource <path>]`,
+    options: [
+      option("--session", "Assert the current session identity", { value: "<id>" }),
+      option("--operation", "Authorize an operation when resources are supplied", { value: "<name>" }),
+      option("--resource", "Concrete resource; repeatable with --operation", { value: "<path>" }),
+    ],
+  },
+  {
+    name: "gc",
+    summary: "Detect or clean eligible stale sessions",
+    usage: `${CLI_NAME} gc [--dry-run|--apply]`,
+    options: [
+      option("--apply", "Apply only cleanup that passes safety checks"),
+      option("--dry-run", "Preflight eligible stale cleanup without mutation"),
+    ],
+    notes: [
+      "Default stale threshold is 24 hours (86,400,000 ms). Eligibility uses persisted state age or missing/prunable Git worktree physical state; closed history is not a stale candidate.",
+    ],
+  },
+  {
+    name: "doctor",
+    summary: "Check local Nawabari prerequisites and reconciliation",
+    usage: `${CLI_NAME} doctor`,
+    options: [],
+  },
+  {
+    name: "capabilities",
+    summary: "Describe the standalone CLI/JSON contract",
+    usage: `${CLI_NAME} capabilities`,
+    options: [],
+  },
+];
+
+const ROOT_HELP_SPEC: HelpCommandSpec = {
+  name: "root",
+  summary: "Standalone local Git/session ownership CLI",
+  usage: `${CLI_NAME} <command> [options]`,
+  options: GLOBAL_HELP_OPTIONS,
+};
+
+function helpSpecFor(commandArguments: readonly string[]): HelpCommandSpec {
+  if (commandArguments.length === 0) return ROOT_HELP_SPEC;
+  let key =
+    commandArguments[0] === "resource"
+      ? `resource ${commandArguments[1] ?? "list"}`
+      : commandArguments.slice(0, 2).join(" ");
+  if (key === "resource claims") key = "resource list";
+  const direct = HELP_COMMANDS.find((spec) => spec.name === key);
+  if (direct !== undefined && !direct.name.startsWith("resource ")) return direct;
+  const aliasTarget = direct?.name.replace(/^resource /u, "session ");
+  const target = aliasTarget === undefined ? undefined : HELP_COMMANDS.find((spec) => spec.name === aliasTarget);
+  if (direct !== undefined && target !== undefined) {
+    return {
+      name: direct.name,
+      summary: direct.summary,
+      usage: direct.usage,
+      options: direct.options,
+      notes: direct.notes,
+    };
+  }
+  return HELP_COMMANDS.find((spec) => spec.name === commandArguments[0]) ?? ROOT_HELP_SPEC;
+}
+
+function helpPayload(spec: HelpCommandSpec): JsonObject {
+  if (spec.name === "root") {
+    const optionNames = (options: readonly HelpOptionSpec[]): string[] => options.map((candidate) => candidate.name);
+    const sessionOptions = HELP_COMMANDS.filter((command) => command.name.startsWith("session ")).flatMap(
+      (command) => command.options,
+    );
+    const unique = (values: string[]): string[] => values.filter((value, index) => values.indexOf(value) === index);
+    const sessionListOnlyOptions = new Set(["--all", "--history"]);
+    const optionsFor = (name: string): string[] =>
+      optionNames(HELP_COMMANDS.find((command) => command.name === name)?.options ?? []);
+    return {
+      usage: `Usage: ${spec.usage}`,
+      commands: HELP_COMMANDS.map((command) => command.name),
+      options: ["--json", "--help", "--version"],
+      session_options: unique(sessionOptions.map((option) => option.name).filter((name) => !sessionListOnlyOptions.has(name))),
+      authorization_options: optionsFor("authorize"),
+      checkpoint_options: optionsFor("checkpoint"),
+      commit_options: optionsFor("commit"),
+      push_options: optionsFor("push"),
+      gc_options: optionsFor("gc"),
+    };
+  }
+  const options = spec.options.map((candidate) => ({
+    name: candidate.name,
+    ...(candidate.value === undefined ? {} : { value: candidate.value }),
+    required: candidate.required === true,
+    ...(candidate.default === undefined ? {} : { default: candidate.default }),
+    description: candidate.description,
+  }));
+  return {
+    help_for: spec.name,
+    usage: spec.usage,
+    summary: spec.summary,
+    required_options: spec.options
+      .filter((candidate) => candidate.required === true)
+      .map((candidate) => candidate.name),
+    optional_options: spec.options
+      .filter((candidate) => candidate.required !== true)
+      .map((candidate) => candidate.name),
+    defaults: Object.fromEntries(
+      spec.options
+        .filter((candidate) => candidate.default !== undefined)
+        .map((candidate) => [candidate.name, candidate.default as string]),
+    ) as JsonObject,
+    options,
+    ...(spec.notes === undefined ? {} : { notes: [...spec.notes] }),
+  };
+}
+
+function helpText(spec: HelpCommandSpec): string {
+  const lines = [`Usage: ${spec.usage}`, "", spec.summary];
+  if (spec.name === "root") {
+    lines.push("", "Commands:");
+    for (const command of HELP_COMMANDS) lines.push(`  ${command.name.padEnd(20)} ${command.summary}`);
+    lines.push("", "Global options:");
+    for (const candidate of GLOBAL_HELP_OPTIONS) {
+      const label = candidate.name === "--help" ? "-h, --help" : candidate.name;
+      lines.push(`  ${label.padEnd(20)} ${candidate.description}`);
+    }
+  } else {
+    lines.push("", "Options:");
+    if (spec.options.length === 0) lines.push("  (none)");
+    for (const candidate of spec.options) {
+      const label = candidate.value === undefined ? candidate.name : `${candidate.name} ${candidate.value}`;
+      const qualifier =
+        candidate.required === true
+          ? "required"
+          : `optional${candidate.default === undefined ? "" : `; default: ${candidate.default}`}`;
+      lines.push(`  ${label.padEnd(38)} ${qualifier}; ${candidate.description}`);
+    }
+    if (spec.notes !== undefined) {
+      lines.push("", "Notes:");
+      for (const note of spec.notes) lines.push(`  ${note}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+const HELP_TEXT = helpText(ROOT_HELP_SPEC);
 
 export type CliDependencies = {
   backend?: SessionBackend;
@@ -669,6 +918,13 @@ function deniedAuthorization(
   decision: import("./domain/session.js").OperationAuthorizationDecision,
 ): DomainResult<JsonObject> {
   const code = decision.code === "ALLOWED" ? "OPERATION_REJECTED" : decision.code;
+  const diagnosticDetails =
+    code === "INSUFFICIENT_CLAIM_MODE"
+      ? {
+          resource: decision.details.resource,
+          granted_modes: decision.details.grantedModes,
+        }
+      : {};
   return failure(
     new DomainError(code, `Operation denied: ${code}.`, {
       allowed: false,
@@ -683,6 +939,7 @@ function deniedAuthorization(
       requested_session_id: decision.requested_session_id,
       state: decision.state,
       resources: decision.resources,
+      ...diagnosticDetails,
       details: decision.details,
     } as JsonObject),
   );
@@ -700,8 +957,9 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   if (!parsed.ok) return emitFailure(mode, "cli", parsed.error, io);
 
   if (parsed.value.help) {
-    if (mode === "json") io.stdout(renderSuccess(mode, "help", HELP_DATA));
-    else io.stdout(HELP_TEXT);
+    const spec = helpSpecFor(parsed.value.commandArguments);
+    if (mode === "json") io.stdout(renderSuccess(mode, "help", helpPayload(spec)));
+    else io.stdout(helpText(spec));
     return EXIT_CODES.success;
   }
   if (parsed.value.version) {

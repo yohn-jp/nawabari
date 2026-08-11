@@ -391,6 +391,10 @@ async function main() {
     if (status.ok !== true || status.current_session?.session_id !== created.session_id) {
       fail("status did not report the current installed session");
     }
+    if (typeof status.managed_worktree_root !== "string") {
+      fail("status did not expose the resolved managed worktree root");
+    }
+
     const initialList = parseInstalledJson(
       invokeInstalled(["session", "list", "--json"], lifecycleRepository),
       "default session list",
@@ -402,6 +406,54 @@ async function main() {
       initialList.history_included !== false
     ) {
       fail("default session list did not expose bounded active-session metadata");
+    }
+
+    const createHelp = parseInstalledJson(
+      invokeInstalled(["session", "create", "--help", "--json"], lifecycleRepository),
+      "session create help",
+    );
+    if (
+      createHelp.ok !== true ||
+      createHelp.help_for !== "session create" ||
+      createHelp.required_options?.length !== 0 ||
+      createHelp.optional_options?.join(",") !== "--branch,--worktree,--base,--label" ||
+      createHelp.defaults?.["--base"] !== "HEAD"
+    ) {
+      fail("installed session create help did not expose the optional/defaulted contract");
+    }
+
+    const invalidBase = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "create",
+          "--branch",
+          "feature/invalid-base",
+          "--worktree",
+          path.join(installDirectory, "invalid-base-worktree"),
+          "--base",
+          "missing-base-ref",
+          "--json",
+        ],
+        lifecycleRepository,
+      ),
+      "invalid base ref",
+    );
+    if (
+      invalidBase.code !== "INVALID_BASE_REF" ||
+      invalidBase.details?.baseRef !== "missing-base-ref" ||
+      invalidBase.details?.defaultBaseRef !== "HEAD" ||
+      !Array.isArray(invalidBase.details?.recoveryHints)
+    ) {
+      fail("invalid base ref did not expose bounded recovery metadata");
+    }
+
+    const invalidSession = parseInstalledJson(
+      invokeInstalled(["session", "show", "--session", "not-a-session-id", "--json"], lifecycleRepository),
+      "invalid session id",
+    );
+    if (invalidSession.code !== "INVALID_SESSION_ID") {
+      fail("session lifecycle did not expose INVALID_SESSION_ID");
     }
 
     const allowedGuard = parseInstalledJson(invokeInstalled(["guard", "--json"], lifecycleWorktree), "guard");
@@ -430,11 +482,38 @@ async function main() {
     if (claim.ok !== true || claim.claims?.[0]?.mode !== "exclusive-write") {
       fail("installed session claim did not return the canonical exclusive claim");
     }
+    const weakResource = "weak-claim.txt";
+    const weakClaim = parseInstalledJson(
+      invokeInstalled(
+        ["session", "claim", "--session", created.session_id, "--resource", weakResource, "--mode", "write", "--json"],
+        lifecycleWorktree,
+      ),
+      "weak resource claim",
+    );
+    if (weakClaim.ok !== true) fail("installed weak resource claim could not be created");
+    const insufficient = parseInstalledJson(
+      invokeInstalled(
+        ["authorize", "--session", created.session_id, "--operation", "commit", "--resource", weakResource, "--json"],
+        lifecycleWorktree,
+      ),
+      "insufficient claim mode",
+    );
+    if (
+      insufficient.code !== "INSUFFICIENT_CLAIM_MODE" ||
+      insufficient.details?.resource !== weakResource ||
+      insufficient.details?.required_access !== "exclusive-write" ||
+      JSON.stringify(insufficient.details?.granted_modes) !== JSON.stringify(["write"])
+    ) {
+      fail("installed authorization did not distinguish insufficient claim mode");
+    }
     const claims = parseInstalledJson(
       invokeInstalled(["session", "claims", "--session", created.session_id, "--json"], lifecycleWorktree),
       "resource claims",
     );
-    if (claims.ok !== true || claims.claims?.length !== 1 || claims.claims[0]?.claim_id !== claim.claims[0].claim_id) {
+    if (
+      claims.ok !== true ||
+      !claims.claims?.some((listedClaim) => listedClaim.claim_id === claim.claims?.[0]?.claim_id)
+    ) {
       fail("installed claims listing did not preserve the claim identity");
     }
     const authorized = parseInstalledJson(
@@ -669,6 +748,24 @@ async function main() {
     const closedJson = parseInstalledJson(closed, "safe close");
     if (closed.status !== 0 || closedJson.ok !== true || closedJson.session?.state !== "closed") {
       fail("safe close did not release the installed session");
+    }
+
+    const defaultList = parseInstalledJson(
+      invokeInstalled(["session", "list", "--json"], lifecycleRepository),
+      "bounded session list",
+    );
+    if (defaultList.ok !== true || defaultList.sessions?.some((session) => session.session_id === created.session_id)) {
+      fail("default session list did not exclude closed history");
+    }
+    const historyList = parseInstalledJson(
+      invokeInstalled(["session", "list", "--all", "--json"], lifecycleRepository),
+      "session history list",
+    );
+    if (
+      historyList.ok !== true ||
+      !historyList.sessions?.some((session) => session.session_id === created.session_id && session.state === "closed")
+    ) {
+      fail("explicit session history list did not expose closed records");
     }
 
     const secondClosed = invokeInstalled(
