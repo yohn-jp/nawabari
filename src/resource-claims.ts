@@ -226,7 +226,7 @@ export function sortResourceClaims<T extends Pick<ResourceClaim, "sessionId" | "
   return [...claims].sort((left, right) => compareCodePointStrings(claimSortKey(left), claimSortKey(right)));
 }
 
-function compareCodePointStrings(left: string, right: string): number {
+export function compareCodePointStrings(left: string, right: string): number {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
@@ -329,14 +329,15 @@ function canonicalWorktreeRoot(worktreePath: string): string {
 
 function walkStaticPath(root: string, segments: readonly string[], resource: string): string {
   let current = root;
-  for (const segment of segments) {
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
     current = path.join(current, segment);
     assertWithinRoot(root, current, resource);
     const entry = lstatIfPresent(current);
     if (entry?.isSymbolicLink()) {
       throw claimError("CLAIM_SYMLINK_ESCAPE", "Claim path contains a symbolic link", { resource });
     }
-    if (entry !== undefined && !entry.isDirectory() && segment !== segments[segments.length - 1]) {
+    if (entry !== undefined && !entry.isDirectory() && index !== segments.length - 1) {
       throw claimError("INVALID_CLAIM_RESOURCE", "Claim path traverses a non-directory", { resource });
     }
     if (entry === undefined) break;
@@ -400,9 +401,7 @@ function globPatternsOverlap(left: string, right: string): boolean {
     visited.add(key);
     if (leftIndex === leftSegments.length && rightIndex === rightSegments.length) {
       if (consumed) return true;
-      // The root resource is never a valid empty path, but two ** patterns
-      // can both consume one arbitrary non-empty segment.
-      return leftSegments.length > 0;
+      continue;
     }
 
     const leftGlobStar = leftSegments[leftIndex] === "**";
@@ -444,7 +443,10 @@ function segmentPatternsOverlap(left: string, right: string): boolean {
     const key = `${leftIndex}:${rightIndex}:${consumed ? 1 : 0}`;
     if (visited.has(key)) continue;
     visited.add(key);
-    if (leftIndex === left.length && rightIndex === right.length) return consumed;
+    if (leftIndex === left.length && rightIndex === right.length) {
+      if (consumed) return true;
+      continue;
+    }
 
     const leftChar = left[leftIndex];
     const rightChar = right[rightIndex];

@@ -23,7 +23,9 @@ import {
   claimsConflict,
   claimsOverlap,
   cloneResourceClaim,
+  compareCodePointStrings,
   createResourceClaim,
+  isResourceClaimMode,
   RESOURCE_CLAIM_SCHEMA_VERSION,
   sortResourceClaims,
   type ClaimOwnerContext,
@@ -529,8 +531,8 @@ export class SessionRegistry {
   /** Provision one isolated Git worktree and commit its ownership atomically. */
   provision(options: ProvisionSessionOptions = {}): SessionRecord {
     return this.withLock(() => {
-      const records = this.readUnsafe();
-      const sessionId = generateUniqueSessionId(records, this.idGenerator);
+      const state = this.readStateUnsafe();
+      const sessionId = generateUniqueSessionId(state.sessions, this.idGenerator);
       const resources = this.resolveProvisioningResources(options, sessionId);
       const timestamp = toTimestamp(this.clock());
       const record = freezeSessionRecord({
@@ -547,7 +549,7 @@ export class SessionRegistry {
         ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
       });
 
-      assertNoOwnershipConflict(records, record);
+      assertNoOwnershipConflict(state.sessions, record);
       assertGitResourcesAvailable(this.git, this.repository.worktreePath, resources);
 
       let gitProvisioned = false;
@@ -557,7 +559,7 @@ export class SessionRegistry {
           this.repository.worktreePath,
         );
         gitProvisioned = true;
-        this.writeUnsafe([...records, record]);
+        this.writeUnsafe([...state.sessions, record], state.claims);
         return cloneSessionRecord(record);
       } catch (error: unknown) {
         if (gitProvisioned) {
@@ -595,26 +597,7 @@ export class SessionRegistry {
 
   resolveCurrentSession(): SessionRecord {
     const records = this.readUnsafe();
-    const matches = records.filter(
-      (record) => CURRENT_SESSION_STATES.has(record.state) && record.worktreeId === this.repository.worktreePath,
-    );
-
-    if (matches.length === 1) {
-      return cloneSessionRecord(matches[0]);
-    }
-    if (matches.length > 1) {
-      throw new SessionRegistryError(
-        "DUPLICATE_WORKTREE_OWNERSHIP",
-        `Multiple active sessions claim the current worktree: ${this.repository.worktreePath}`,
-        { worktree: this.repository.worktreePath },
-      );
-    }
-
-    throw new SessionRegistryError(
-      "SESSION_NOT_FOUND",
-      `No active session owns the current worktree: ${this.repository.worktreePath}`,
-      { worktree: this.repository.worktreePath },
-    );
+    return cloneSessionRecord(this.resolveOwnerSession(records));
   }
 
   currentSession(): SessionRecord {
@@ -818,7 +801,9 @@ export class SessionRegistry {
     assertStaleAfterMs(staleAfterMs);
 
     return this.withLock(() => {
-      let records = [...this.readUnsafe()];
+      const state = this.readStateUnsafe();
+      let records = [...state.sessions];
+      let claims = state.claims;
       const now = toTimestamp(this.clock());
       const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
       const candidates = records
@@ -844,7 +829,7 @@ export class SessionRegistry {
           const staleRecord = transitionSessionState(current, "stale", this.clock);
           records = replaceRecord(records, staleRecord);
           validateRecords(records, this.repository.repositoryId);
-          this.writeUnsafe(records);
+          this.writeUnsafe(records, claims);
         }
 
         try {
@@ -859,7 +844,9 @@ export class SessionRegistry {
             details: error.details,
           });
         }
-        records = [...this.readUnsafe()];
+        const updatedState = this.readStateUnsafe();
+        records = [...updatedState.sessions];
+        claims = updatedState.claims;
       }
 
       return {
@@ -875,16 +862,11 @@ export class SessionRegistry {
     return this.garbageCollect(options);
   }
 
-  private selectSessionId(requested: string | null | undefined, records: readonly SessionRecord[]): string {
-    if (requested !== undefined && requested !== null) {
-      assertSessionId(requested);
-      return requested;
-    }
+  private resolveOwnerSession(records: readonly SessionRecord[]): SessionRecord {
     const matches = records.filter(
-      (record) =>
-        CURRENT_SESSION_STATES.has(record.state) && samePath(record.worktreePath, this.repository.worktreePath),
+      (record) => CURRENT_SESSION_STATES.has(record.state) && record.worktreeId === this.repository.worktreePath,
     );
-    if (matches.length === 1) return matches[0].sessionId;
+    if (matches.length === 1) return matches[0];
     if (matches.length > 1) {
       throw new SessionRegistryError(
         "DUPLICATE_WORKTREE_OWNERSHIP",
@@ -897,6 +879,14 @@ export class SessionRegistry {
       `No active session owns the current worktree: ${this.repository.worktreePath}`,
       { worktree: this.repository.worktreePath },
     );
+  }
+
+  private selectSessionId(requested: string | null | undefined, records: readonly SessionRecord[]): string {
+    if (requested !== undefined && requested !== null) {
+      assertSessionId(requested);
+      return requested;
+    }
+    return this.resolveOwnerSession(records).sessionId;
   }
 
   private claimOwner(records: readonly SessionRecord[], sessionId: string, requestedRepositoryId?: string): ClaimOwner {
@@ -940,15 +930,15 @@ export class SessionRegistry {
     const canonical = inputs
       .map((input) => canonicalizeClaimInput(input, owner))
       .sort((left, right) =>
-        compareStableStrings(`${left.resource}\u0000${left.mode}`, `${right.resource}\u0000${right.mode}`),
+        compareCodePointStrings(`${left.resource}\u0000${left.mode}`, `${right.resource}\u0000${right.mode}`),
       );
-    for (let index = 0; index < canonical.length; index += 1) {
-      const current = canonical[index];
+    const timestamp = toTimestamp(this.clock());
+    const claims = canonical.map((input) => createResourceClaim(input, owner, timestamp));
+    for (let index = 0; index < claims.length; index += 1) {
+      const current = claims[index];
       for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
-        const prior = canonical[priorIndex];
-        const currentClaim = createResourceClaim(current, owner, "2026-01-01T00:00:00.000Z");
-        const priorClaim = createResourceClaim(prior, owner, "2026-01-01T00:00:00.000Z");
-        if (!claimsOverlap(currentClaim, priorClaim)) continue;
+        const prior = claims[priorIndex];
+        if (!claimsOverlap(current, prior)) continue;
         if (current.mode === prior.mode) {
           throw claimError("DUPLICATE_CLAIM", "Request contains overlapping equivalent claims", {
             resource: current.resource,
@@ -1332,14 +1322,13 @@ export class SessionRegistry {
     return this.readStateUnsafe().sessions;
   }
 
-  private writeUnsafe(records: readonly SessionRecord[], claims?: readonly ResourceClaim[]): void {
-    const persistedClaims = claims ?? this.readStateUnsafe().claims;
+  private writeUnsafe(records: readonly SessionRecord[], claims: readonly ResourceClaim[]): void {
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
       repository_id: this.repository.repositoryId,
       sessions: records.map((record) => toPersistedSessionRecord(record, this.repository.repositoryId)),
       claims_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
-      claims: sortResourceClaims(persistedClaims).map((claim) =>
+      claims: sortResourceClaims(claims).map((claim) =>
         toPersistedResourceClaim(claim, this.repository.repositoryId),
       ),
     };
@@ -1374,10 +1363,10 @@ export class SessionRegistry {
 
   private mutate<T>(mutation: (records: readonly SessionRecord[]) => MutationResult<T>): T {
     return this.withLock(() => {
-      const records = this.readUnsafe();
-      const { records: nextRecords, result } = mutation(records);
+      const state = this.readStateUnsafe();
+      const { records: nextRecords, result } = mutation(state.sessions);
       validateRecords(nextRecords, this.repository.repositoryId);
-      this.writeUnsafe(nextRecords);
+      this.writeUnsafe(nextRecords, state.claims);
       return result;
     });
   }
@@ -1968,31 +1957,30 @@ function validateRegistryClaims(
 ): void {
   const sessions = new Map(records.map((record) => [record.sessionId, record]));
   const claimIds = new Set<string>();
-  for (const [index, claim] of claims.entries()) {
-    const validated = validateResourceClaim(claim, expectedRepositoryId, index);
-    if (claimIds.has(validated.claimId)) {
-      throw claimError("DUPLICATE_CLAIM", `Duplicate resource claim: ${validated.claimId}`, {
-        claimId: validated.claimId,
+  for (const claim of claims) {
+    if (claimIds.has(claim.claimId)) {
+      throw claimError("DUPLICATE_CLAIM", `Duplicate resource claim: ${claim.claimId}`, {
+        claimId: claim.claimId,
       });
     }
-    claimIds.add(validated.claimId);
-    const owner = sessions.get(validated.sessionId);
+    claimIds.add(claim.claimId);
+    const owner = sessions.get(claim.sessionId);
     if (owner === undefined) {
       throw claimError("CLAIM_SESSION_MISMATCH", "Claim references an unknown session", {
-        claimId: validated.claimId,
-        sessionId: validated.sessionId,
+        claimId: claim.claimId,
+        sessionId: claim.sessionId,
       });
     }
-    if (owner.repositoryId !== validated.repositoryId || owner.worktreePath !== validated.worktreePath) {
+    if (owner.repositoryId !== claim.repositoryId || owner.worktreePath !== claim.worktreePath) {
       throw claimError("CLAIM_SESSION_MISMATCH", "Claim does not match its session worktree identity", {
-        claimId: validated.claimId,
-        sessionId: validated.sessionId,
+        claimId: claim.claimId,
+        sessionId: claim.sessionId,
       });
     }
     if (owner.state === "closed") {
       throw claimError("CLAIM_SESSION_MISMATCH", "Closed sessions cannot retain resource claims", {
-        claimId: validated.claimId,
-        sessionId: validated.sessionId,
+        claimId: claim.claimId,
+        sessionId: claim.sessionId,
       });
     }
   }
@@ -2265,7 +2253,7 @@ function requireState(value: unknown, index: number): SessionState {
 }
 
 function requireClaimMode(value: unknown, index: number): ResourceClaimMode {
-  if (value !== "read" && value !== "write" && value !== "exclusive-write") {
+  if (!isResourceClaimMode(value)) {
     throw invalidRecord(index, `mode is invalid: ${stringifyDetail(value)}`);
   }
   return value;
@@ -2314,12 +2302,6 @@ function stringifyDetail(value: unknown): string {
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
     ? String(value)
     : "<invalid>";
-}
-
-function compareStableStrings(left: string, right: string): number {
-  if (left < right) return -1;
-  if (left > right) return 1;
-  return 0;
 }
 
 function toSessionRegistryLockError(error: unknown, lockPath: string): SessionRegistryError {
