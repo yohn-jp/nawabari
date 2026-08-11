@@ -30,6 +30,51 @@ test("local session backend provisions through the domain contract", async () =>
   }
 });
 
+test("status exposes the resolved managed root and bounded history selection", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-status-root`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/status-root", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const status = await backend.status({ cwd: repositoryPath });
+    assert.equal(status.ok, true);
+    if (!status.ok) return;
+    assert.equal(status.value.managed_worktree_root, path.dirname(fs.realpathSync.native(repositoryPath)));
+    assert.equal(status.value.history, false);
+    assert.equal(
+      status.value.sessions.some((session) => session.session_id === created.value.session_id),
+      true,
+    );
+
+    const closed = await backend.closeSession({ cwd: repositoryPath }, { session_id: created.value.session_id });
+    assert.equal(closed.ok, true);
+    const bounded = await backend.status({ cwd: repositoryPath });
+    assert.equal(bounded.ok, true);
+    if (!bounded.ok) return;
+    assert.equal(
+      bounded.value.sessions.some((session) => session.session_id === created.value.session_id),
+      false,
+    );
+    const history = await backend.status({ cwd: repositoryPath }, { include_history: true });
+    assert.equal(history.ok, true);
+    if (!history.ok) return;
+    assert.equal(history.value.history, true);
+    assert.equal(
+      history.value.sessions.find((session) => session.session_id === created.value.session_id)?.state,
+      "closed",
+    );
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("resource claims expose canonical machine fields through the backend and CLI", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-claim-contract`;
@@ -196,8 +241,19 @@ test("the CLI gc path recovers a prunable worktree before branch reuse", async (
 
     const listed = await runJsonCli<{
       sessions: Array<{ session_id: string; state: string }>;
+      history: boolean;
     }>(repositoryPath, ["session", "list"]);
-    assert.equal(listed.sessions.find((session) => session.session_id === created.session_id)?.state, "closed");
+    assert.equal(listed.history, false);
+    assert.equal(
+      listed.sessions.some((session) => session.session_id === created.session_id),
+      false,
+    );
+    const historical = await runJsonCli<{
+      sessions: Array<{ session_id: string; state: string }>;
+      history: boolean;
+    }>(repositoryPath, ["session", "list", "--all"]);
+    assert.equal(historical.history, true);
+    assert.equal(historical.sessions.find((session) => session.session_id === created.session_id)?.state, "closed");
 
     const reused = await runJsonCli<{
       ok: boolean;

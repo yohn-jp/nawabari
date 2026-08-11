@@ -29,11 +29,13 @@ import {
   type SessionContext,
   type SessionCreateOptions,
   type SessionListResult,
+  type SessionListOptions,
   type SessionRecord,
   type ReleaseClaimsOptions,
   type ReleaseClaimsResult,
   type ResourceClaim,
   type StatusResult,
+  type StatusOptions,
   type UpdateClaimsOptions,
 } from "./session.js";
 
@@ -96,6 +98,7 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   OPERATION_REJECTED: "OPERATION_REJECTED",
   INVALID_RESOURCE: "INVALID_RESOURCE",
   MISSING_RESOURCE_CLAIM: "MISSING_RESOURCE_CLAIM",
+  INSUFFICIENT_CLAIM_MODE: "INSUFFICIENT_CLAIM_MODE",
   INVALID_CLAIM_RESOURCE: "INVALID_CLAIM_RESOURCE",
   CLAIM_PATH_TRAVERSAL: "CLAIM_PATH_TRAVERSAL",
   CLAIM_SYMLINK_ESCAPE: "CLAIM_SYMLINK_ESCAPE",
@@ -249,17 +252,29 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
-  public async listSessions(context: SessionContext): Promise<DomainResult<SessionListResult>> {
+  public async listSessions(
+    context: SessionContext,
+    options: SessionListOptions = {},
+  ): Promise<DomainResult<SessionListResult>> {
     try {
-      return success({ sessions: this.registryFor(context).list().map(toDomainRecord) });
+      const history = options.include_history === true;
+      const listing = this.registryFor(context).listForAgent({ includeClosed: history });
+      return success({
+        sessions: listing.sessions.map(toDomainRecord),
+        history,
+        total: listing.total,
+        truncated: listing.truncated,
+      });
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
   }
 
-  public async status(context: SessionContext): Promise<DomainResult<StatusResult>> {
+  public async status(context: SessionContext, options: StatusOptions = {}): Promise<DomainResult<StatusResult>> {
     try {
       const registry = this.registryFor(context);
+      const history = options.include_history === true;
+      const listing = registry.listForAgent({ includeClosed: history });
       let currentSession: SessionRecord | null = null;
       try {
         currentSession = toDomainRecord(registry.resolveCurrentSession());
@@ -269,8 +284,12 @@ export class LocalSessionBackend implements SessionBackend {
       return success({
         repository: registry.repository.repositoryId,
         current_session: currentSession,
-        sessions: registry.list().map(toDomainRecord),
+        sessions: listing.sessions.map(toDomainRecord),
         capabilities: { ...LOCAL_SESSION_CAPABILITIES },
+        managed_worktree_root: registry.managedWorktreeRoot,
+        history,
+        total_sessions: listing.total,
+        truncated: listing.truncated,
       });
     } catch (error: unknown) {
       return failure(toDomainError(error));

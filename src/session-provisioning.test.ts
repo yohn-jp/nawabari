@@ -40,6 +40,33 @@ test("provision creates one dedicated worktree and one mutable branch", () => {
   }
 });
 
+test("invalid base refs expose bounded recovery metadata", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-invalid-base");
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    assert.throws(
+      () => registry.provision({ worktreePath, branchName: "feature/invalid-base", baseRef: "missing-base-ref" }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "INVALID_BASE_REF");
+        assert.deepEqual(error.details, {
+          baseRef: "missing-base-ref",
+          reason: "does-not-resolve-to-commit",
+          defaultBaseRef: "HEAD",
+          recoveryHints: ["Omit --base to use HEAD, then retry session create."],
+        });
+        return true;
+      },
+    );
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.deepEqual(registry.list(), []);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 test("provision rejects protected, invalid, and already-owned resources deterministically", () => {
   const fixture = createRepositoryFixture();
   const firstPath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-conflict");

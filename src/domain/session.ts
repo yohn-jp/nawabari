@@ -190,6 +190,12 @@ export type GarbageCollectOptions = {
   apply: boolean;
 };
 
+export type SessionListOptions = {
+  include_history?: boolean;
+};
+
+export type StatusOptions = SessionListOptions;
+
 export type BackendCapabilities = {
   session_registry: boolean;
   provisioning: boolean;
@@ -200,6 +206,9 @@ export type BackendCapabilities = {
 
 export type SessionListResult = {
   sessions: SessionRecord[];
+  history?: boolean;
+  total?: number;
+  truncated?: boolean;
 };
 
 export type StatusResult = {
@@ -207,6 +216,10 @@ export type StatusResult = {
   current_session: SessionRecord | null;
   sessions: SessionRecord[];
   capabilities: BackendCapabilities;
+  managed_worktree_root?: string | null;
+  history?: boolean;
+  total_sessions?: number;
+  truncated?: boolean;
 };
 
 export type SessionCloseResult = {
@@ -243,8 +256,8 @@ export interface SessionBackend {
   checkpoint?(context: SessionContext, options: CheckpointOptions): Promise<DomainResult<CheckpointEvidence>>;
   commit?(context: SessionContext, options: CommitOptions): Promise<DomainResult<CommitResult>>;
   push?(context: SessionContext, options: PushOptions): Promise<DomainResult<PushResult>>;
-  listSessions(context: SessionContext): Promise<DomainResult<SessionListResult>>;
-  status(context: SessionContext): Promise<DomainResult<StatusResult>>;
+  listSessions(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<SessionListResult>>;
+  status(context: SessionContext, options?: StatusOptions): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
   garbageCollect(context: SessionContext, options: GarbageCollectOptions): Promise<DomainResult<GarbageCollectResult>>;
   claimResources?(context: SessionContext, options: ClaimResourcesOptions): Promise<DomainResult<ClaimResourcesResult>>;

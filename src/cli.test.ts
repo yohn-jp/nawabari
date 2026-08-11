@@ -85,6 +85,36 @@ test("--help exits 0 and prints the nawabari usage", async () => {
   assert.equal(output.stderr.length, 0);
 });
 
+test("command-specific help is projected from one spec and marks session create options accurately", async () => {
+  const output = capture();
+  const exitCode = await runCli(["session", "create", "--help", "--json"], { io: output.io });
+
+  assert.equal(exitCode, 0);
+  const response = JSON.parse(output.stdout[0] ?? "") as {
+    command: string;
+    help_for: string;
+    required_options: string[];
+    optional_options: string[];
+    defaults: Record<string, string>;
+    options: Array<{ name: string; required: boolean }>;
+  };
+  assert.equal(response.command, "help");
+  assert.equal(response.help_for, "session create");
+  assert.deepEqual(response.required_options, []);
+  assert.deepEqual(response.optional_options, ["--branch", "--worktree", "--base", "--label"]);
+  assert.deepEqual(response.defaults, {
+    "--branch": "nawabari/session/<session_id>",
+    "--worktree": "<managed_worktree_root>/<repository>-<session_id>",
+    "--base": "HEAD",
+    "--label": "omitted",
+  });
+  assert.equal(
+    response.options.every((option) => option.required === false),
+    true,
+  );
+  assert.match(response.options.find((option) => option.name === "--worktree")?.name ?? "", /worktree/u);
+});
+
 test("JSON help separates global, session, and garbage-collection options", async () => {
   const output = capture();
   const exitCode = await runCli(["--help", "--json"], { io: output.io });
@@ -249,7 +279,7 @@ test("capabilities discovery is available outside a Git repository and exposes t
         llm: boolean;
         agent_runtime: boolean;
       };
-      capabilities: Array<{ id: string; commands: string[] }>;
+      capabilities: Array<{ id: string; commands: string[]; failure_codes: string[] }>;
     };
     assert.equal(response.ok, true);
     assert.equal(response.command, "capabilities");
@@ -265,6 +295,11 @@ test("capabilities discovery is available outside a Git repository and exposes t
       agent_runtime: false,
     });
     assert.ok(response.capabilities.some((capability) => capability.commands.includes("commit")));
+    const lifecycle = response.capabilities.find((capability) => capability.commands.includes("session create"));
+    assert.ok(lifecycle?.failure_codes.includes("INVALID_SESSION_ID"));
+    assert.ok(lifecycle?.failure_codes.includes("INVALID_BASE_REF"));
+    const authorization = response.capabilities.find((capability) => capability.commands.includes("authorize"));
+    assert.ok(authorization?.failure_codes.includes("INSUFFICIENT_CLAIM_MODE"));
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

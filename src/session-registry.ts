@@ -61,6 +61,8 @@ export const REGISTRY_DIRECTORY_NAME = "nawabari";
 export const REGISTRY_FILE_NAME = "session-registry.json";
 export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
 export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
+/** Default number of non-closed records returned by agent-facing listings. */
+export const DEFAULT_SESSION_LIST_LIMIT = 64;
 export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
 export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
@@ -128,6 +130,19 @@ export interface GarbageCollectResult {
   readonly candidates: readonly SessionRecord[];
   readonly cleaned: readonly SessionRecord[];
   readonly blocked: readonly GarbageCollectBlocked[];
+}
+
+export interface SessionListOptions {
+  /** Include closed history instead of the bounded active-session view. */
+  readonly includeClosed?: boolean;
+  /** Override the bounded active-session view limit. */
+  readonly limit?: number;
+}
+
+export interface BoundedSessionList {
+  readonly sessions: readonly SessionRecord[];
+  readonly total: number;
+  readonly truncated: boolean;
 }
 
 export interface CleanupBlocker {
@@ -439,12 +454,37 @@ export class SessionRegistry {
     });
   }
 
+  /** Resolved repository-local root used for default managed session worktrees. */
+  get managedWorktreeRoot(): string {
+    return this.worktreeRoot;
+  }
+
   read(): readonly SessionRecord[] {
     return this.readUnsafe().map(cloneSessionRecord);
   }
 
   list(): readonly SessionRecord[] {
     return this.read();
+  }
+
+  /** Return the bounded, agent-facing session view without changing registry history. */
+  listForAgent(options: SessionListOptions = {}): BoundedSessionList {
+    const allRecords = this.read();
+    const source =
+      options.includeClosed === true ? allRecords : allRecords.filter((record) => record.state !== "closed");
+    if (options.includeClosed === true) {
+      return Object.freeze({ sessions: Object.freeze(source), total: source.length, truncated: false });
+    }
+    const limit = options.limit ?? DEFAULT_SESSION_LIST_LIMIT;
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new RangeError("session list limit must be a positive safe integer");
+    }
+    const sessions = source.slice(0, limit);
+    return Object.freeze({
+      sessions: Object.freeze(sessions),
+      total: source.length,
+      truncated: source.length > sessions.length,
+    });
   }
 
   get(sessionId: string): SessionRecord | undefined {
@@ -1072,6 +1112,14 @@ export class SessionRegistry {
               ownerClaimId: conflictingClaim.claimId,
               ownerResource: conflictingClaim.resource,
               ownerMode: conflictingClaim.mode,
+            });
+          }
+          if (ownClaims.length > 0) {
+            return deniedOperation("INSUFFICIENT_CLAIM_MODE", verified, {
+              resource,
+              requiredAccess,
+              grantedModes: sortStrings(new Set(ownClaims.map((claim) => claim.mode))),
+              sessionId: currentRecord.sessionId,
             });
           }
           return deniedOperation("MISSING_RESOURCE_CLAIM", verified, {
@@ -3205,19 +3253,32 @@ function resolveBaseRef(git: GitCommandRunner, cwd: string, candidate: string): 
     candidate.startsWith("-") ||
     candidate.includes("\u0000")
   ) {
-    throw new SessionRegistryError("INVALID_BASE_REF", `Invalid base ref: ${candidate}`, { baseRef: candidate });
+    throw invalidBaseRef(candidate, "invalid-format");
   }
   try {
     git.run(["rev-parse", "--verify", `${candidate}^{commit}`], cwd);
     return candidate;
   } catch (error: unknown) {
     if (isExpectedGitLookupFailure(error)) {
-      throw new SessionRegistryError("INVALID_BASE_REF", `Base ref does not resolve to a commit: ${candidate}`, {
-        baseRef: candidate,
-      });
+      throw invalidBaseRef(candidate, "does-not-resolve-to-commit");
     }
     throw error;
   }
+}
+
+function invalidBaseRef(candidate: string, reason: string): SessionRegistryError {
+  return new SessionRegistryError(
+    "INVALID_BASE_REF",
+    reason === "invalid-format"
+      ? `Invalid base ref: ${candidate}`
+      : `Base ref does not resolve to a commit: ${candidate}`,
+    {
+      baseRef: candidate,
+      reason,
+      defaultBaseRef: "HEAD",
+      recoveryHints: ["Omit --base to use HEAD, then retry session create."],
+    },
+  );
 }
 
 function isExpectedGitLookupFailure(error: unknown): boolean {
