@@ -103,7 +103,7 @@ function parseRepository(stdout: string, cwd: string): RepositoryInfo | null {
   return {
     top_level: topLevel,
     common_dir: commonDir,
-    registry_path: path.join(commonDir, "git-paw", "session-registry.json"),
+    registry_path: path.join(commonDir, "nawabari", "session-registry.json"),
   };
 }
 
@@ -114,19 +114,19 @@ async function inspectRegistry(repository: RepositoryInfo): Promise<DoctorCheck>
     try {
       parsed = JSON.parse(contents) as unknown;
     } catch {
-      return check("registry", "error", "REGISTRY_CORRUPT", "The GitPaw registry is not valid JSON.", {
+      return check("registry", "error", "REGISTRY_CORRUPT", "The Nawabari registry is not valid JSON.", {
         path: repository.registry_path,
       });
     }
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return check("registry", "error", "INVALID_REGISTRY", "The GitPaw registry must contain a JSON object.", {
+      return check("registry", "error", "INVALID_REGISTRY", "The Nawabari registry must contain a JSON object.", {
         path: repository.registry_path,
       });
     }
     try {
       const registry = new SessionRegistry({ cwd: repository.top_level });
       const sessions = registry.list();
-      return check("registry", "ok", null, "The GitPaw registry is readable and valid.", {
+      return check("registry", "ok", null, "The Nawabari registry is readable and valid.", {
         path: repository.registry_path,
         bytes: contents.length,
         sessions: sessions.length,
@@ -138,17 +138,17 @@ async function inspectRegistry(repository: RepositoryInfo): Promise<DoctorCheck>
           : isSessionRegistryError(error) && error.code === "REGISTRY_REPOSITORY_MISMATCH"
             ? "INVALID_REGISTRY"
             : "REGISTRY_UNREADABLE";
-      return check("registry", "error", code, "The GitPaw registry failed authoritative validation.", {
+      return check("registry", "error", code, "The Nawabari registry failed authoritative validation.", {
         path: repository.registry_path,
       });
     }
   } catch (error: unknown) {
     if (isFileNotFound(error)) {
-      return check("registry", "not_configured", null, "The GitPaw session registry is not initialized.", {
+      return check("registry", "not_configured", null, "The Nawabari session registry is not initialized.", {
         path: repository.registry_path,
       });
     }
-    return check("registry", "error", "REGISTRY_UNREADABLE", "The GitPaw registry cannot be read.", {
+    return check("registry", "error", "REGISTRY_UNREADABLE", "The Nawabari registry cannot be read.", {
       path: repository.registry_path,
     });
   }
@@ -163,7 +163,7 @@ export async function runDoctor(cwd = process.cwd()): Promise<DomainResult<Docto
   const runtimeOk = supportsRuntime(process.versions.node);
   checks.push(
     runtimeOk
-      ? check("runtime", "ok", null, "The GitPaw runtime meets the supported Node.js version.", {
+      ? check("runtime", "ok", null, "The Nawabari runtime meets the supported Node.js version.", {
           node: process.versions.node,
         })
       : check("runtime", "error", "UNSUPPORTED_RUNTIME", "The Node.js runtime is below the supported version.", {

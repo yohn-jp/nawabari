@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
 const packageName = packageJson.name;
+const expectedVersion = "0.1.0";
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: "utf8", ...options });
@@ -83,6 +84,13 @@ async function main() {
 
     const binTargets = packageBinTargets(installedPackageDirectory);
     if (binTargets.length === 0) fail("package.json defines no bin entries to smoke test");
+    if (packageName !== "nawabari" || packageJson.version !== expectedVersion) {
+      fail(`package metadata must be nawabari@${expectedVersion}`);
+    }
+    const binNames = new Set(binTargets.map(({ name }) => name));
+    for (const requiredBin of ["nawabari", "git-nawabari"]) {
+      if (!binNames.has(requiredBin)) fail(`package is missing required bin "${requiredBin}"`);
+    }
 
     for (const { name, target } of binTargets) {
       if (!fs.existsSync(target)) fail(`bin target for "${name}" does not exist at ${target}`);
@@ -108,7 +116,9 @@ async function main() {
       });
       if (versionResult.error) fail(`launcher "${name}" failed to start: ${versionResult.error.message}`);
       if (versionResult.status !== 0) fail(`launcher "${name}" --version exited ${versionResult.status}, expected 0`);
-      if (versionResult.stdout.trim().length === 0) fail(`launcher "${name}" --version printed nothing`);
+      if (versionResult.stdout.trim() !== expectedVersion) {
+        fail(`launcher "${name}" --version did not report ${expectedVersion}`);
+      }
     }
 
     const gitEnvironment = {
@@ -119,22 +129,22 @@ async function main() {
       GIT_TERMINAL_PROMPT: "0",
       GIT_OPTIONAL_LOCKS: "0",
     };
-    const installedBinary = path.join(binDirectory, "git-paw");
+    const installedBinary = path.join(binDirectory, "nawabari");
     // Git reserves `git <external-command> --help` for man-page lookup, so
     // version is the portable discovery probe that does not require a manpage.
-    const gitPawResult = spawnSync("git", ["paw", "--version"], {
+    const gitNawabariResult = spawnSync("git", ["nawabari", "--version"], {
       cwd: installDirectory,
       env: gitEnvironment,
       encoding: "utf8",
       timeout: 10_000,
     });
-    if (gitPawResult.error) fail(`git paw failed to start: ${gitPawResult.error.message}`);
-    if (gitPawResult.status !== 0) fail(`git paw --version exited ${gitPawResult.status}, expected 0`);
-    if (gitPawResult.stdout.trim() !== String(packageJson.version)) {
-      fail("git paw --version did not match the installed package metadata");
+    if (gitNawabariResult.error) fail(`git nawabari failed to start: ${gitNawabariResult.error.message}`);
+    if (gitNawabariResult.status !== 0) fail(`git nawabari --version exited ${gitNawabariResult.status}, expected 0`);
+    if (gitNawabariResult.stdout.trim() !== expectedVersion) {
+      fail("git nawabari --version did not match the installed package metadata");
     }
 
-    const jsonResult = spawnSync(path.join(binDirectory, "git-paw"), ["session", "id", "--json"], {
+    const jsonResult = spawnSync(path.join(binDirectory, "nawabari"), ["session", "id", "--json"], {
       cwd: installDirectory,
       encoding: "utf8",
       timeout: 10_000,
@@ -155,11 +165,11 @@ async function main() {
     const lifecycleWorktree = path.join(installDirectory, "lifecycle-worktree");
     const secondWorktree = path.join(installDirectory, "lifecycle-second-worktree");
     run("git", ["init", "-b", "main", lifecycleRepository], { env: gitEnvironment });
-    run("git", ["config", "user.email", "git-paw-smoke@example.invalid"], {
+    run("git", ["config", "user.email", "nawabari-smoke@example.invalid"], {
       cwd: lifecycleRepository,
       env: gitEnvironment,
     });
-    run("git", ["config", "user.name", "GitPaw Smoke"], { cwd: lifecycleRepository, env: gitEnvironment });
+    run("git", ["config", "user.name", "Nawabari Smoke"], { cwd: lifecycleRepository, env: gitEnvironment });
     run("git", ["config", "commit.gpgsign", "false"], { cwd: lifecycleRepository, env: gitEnvironment });
     run("git", ["config", "core.hooksPath", "/dev/null"], { cwd: lifecycleRepository, env: gitEnvironment });
     fs.writeFileSync(path.join(lifecycleRepository, "README.md"), "smoke fixture\n");
@@ -205,7 +215,7 @@ async function main() {
       }
     };
 
-    console.log("running the installed GitPaw session lifecycle...");
+    console.log("running the installed Nawabari session lifecycle...");
     const protectedGuardResult = invokeInstalled(["guard", "--json"], lifecycleRepository);
     const protectedGuard = parseInstalledJson(protectedGuardResult, "protected worktree guard");
     if (protectedGuardResult.status !== 3 || protectedGuard.allowed !== false) {
@@ -387,7 +397,7 @@ async function main() {
       fail("gc did not report a clean installed repository after close");
     }
 
-    const registryPath = path.join(lifecycleRepository, ".git", "git-paw", "session-registry.json");
+    const registryPath = path.join(lifecycleRepository, ".git", "nawabari", "session-registry.json");
     fs.writeFileSync(registryPath, "{not-json\n");
     const corruptStatus = invokeInstalled(["status", "--json"], lifecycleRepository);
     const corruptStatusJson = parseInstalledJson(corruptStatus, "corrupt registry status");

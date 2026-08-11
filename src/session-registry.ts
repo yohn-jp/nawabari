@@ -1,7 +1,5 @@
 import fs from "node:fs";
-import { hostname as getHostname } from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 
 import {
   defaultGit,
@@ -16,13 +14,13 @@ import {
 } from "./git.js";
 import { SessionRegistryError, type RegistryErrorCode, type RegistryErrorDetails } from "./errors.js";
 import { generateSessionId, isSessionId } from "./session-id.js";
+import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
 
 export const REGISTRY_SCHEMA_VERSION = 1 as const;
-export const REGISTRY_DIRECTORY_NAME = "git-paw";
+export const REGISTRY_DIRECTORY_NAME = "nawabari";
 export const REGISTRY_FILE_NAME = "session-registry.json";
 export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
 export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
-const SESSION_LOCK_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
 
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
@@ -171,6 +169,7 @@ export class SessionRegistry {
   private readonly staleAfterMs: number;
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
+  private readonly lock: RepositoryLock;
 
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
@@ -204,6 +203,12 @@ export class SessionRegistry {
       directory,
       registry: path.join(directory, REGISTRY_FILE_NAME),
       lock: path.join(directory, REGISTRY_LOCK_FILE_NAME),
+    });
+    this.lock = new RepositoryLock({
+      lockPath: this.paths.lock,
+      staleAfterMs: this.lockStaleAfterMs,
+      acquireTimeoutMs: this.lockTimeoutMs,
+      metadataGraceMs: this.lockMetadataGraceMs,
     });
   }
 
@@ -359,7 +364,7 @@ export class SessionRegistry {
   }
 
   /**
-   * Evaluate the current worktree as a GitPaw mutation context without taking
+   * Evaluate the current worktree as a Nawabari mutation context without taking
    * the registry lock or changing Git or registry state.
    */
   guard(options: GuardOptions = {}): GuardDecision {
@@ -797,7 +802,7 @@ export class SessionRegistry {
       );
     }
 
-    const branchName = options.branchName ?? `gitpaw/session/${sessionId}`;
+    const branchName = options.branchName ?? `nawabari/session/${sessionId}`;
     const branchId = normalizeBranchId(branchName);
     const shortBranchName = branchId.slice("refs/heads/".length);
     const defaultBranchName = resolveDefaultBranchName(
@@ -933,57 +938,11 @@ export class SessionRegistry {
   }
 
   private withLock<T>(operation: () => T): T {
-    fs.mkdirSync(this.paths.directory, { recursive: true, mode: 0o700 });
-    const startedAt = Date.now();
-    const owner = createSessionLockOwner();
-    let descriptor: number | undefined;
-
-    while (descriptor === undefined) {
-      try {
-        fs.mkdirSync(this.paths.lock, { mode: 0o700 });
-        descriptor = fs.openSync(path.join(this.paths.lock, "owner.json"), "wx", 0o600);
-        try {
-          fs.writeFileSync(descriptor, `${JSON.stringify(owner)}\n`, "utf8");
-          fs.fsyncSync(descriptor);
-          fs.closeSync(descriptor);
-          descriptor = undefined;
-          break;
-        } catch (error: unknown) {
-          if (descriptor !== undefined) closeQuietly(descriptor);
-          descriptor = undefined;
-          fs.rmSync(this.paths.lock, { recursive: true, force: true });
-          throw new SessionRegistryError(
-            "REGISTRY_IO_FAILURE",
-            `Could not initialize ${this.paths.lock}`,
-            { path: this.paths.lock },
-            error,
-          );
-        }
-      } catch (error: unknown) {
-        if (error instanceof SessionRegistryError) {
-          throw error;
-        }
-        if (!isNodeError(error) || error.code !== "EEXIST") {
-          throw new SessionRegistryError(
-            "REGISTRY_IO_FAILURE",
-            `Could not acquire ${this.paths.lock}`,
-            {
-              path: this.paths.lock,
-            },
-            error,
-          );
-        }
-        if (this.reclaimStaleLock()) {
-          continue;
-        }
-        if (Date.now() - startedAt >= this.lockTimeoutMs) {
-          throw new SessionRegistryError("REGISTRY_LOCK_TIMEOUT", `Timed out waiting for ${this.paths.lock}`, {
-            path: this.paths.lock,
-            timeoutMs: this.lockTimeoutMs,
-          });
-        }
-        waitBriefly();
-      }
+    let lease;
+    try {
+      lease = this.lock.acquireSync();
+    } catch (error: unknown) {
+      throw toSessionRegistryLockError(error, this.paths.lock);
     }
 
     let result!: T;
@@ -998,27 +957,9 @@ export class SessionRegistry {
 
     let releaseError: unknown;
     try {
-      const currentOwner = readSessionLockOwner(this.paths.lock);
-      if (currentOwner?.token !== owner.token) {
-        throw new SessionRegistryError(
-          "REGISTRY_IO_FAILURE",
-          `Could not verify ownership of ${this.paths.lock} during release`,
-          { path: this.paths.lock },
-        );
-      }
-      fs.rmSync(this.paths.lock, { recursive: true, force: false });
+      lease.release();
     } catch (error: unknown) {
-      releaseError =
-        error instanceof SessionRegistryError
-          ? error
-          : new SessionRegistryError(
-              "REGISTRY_IO_FAILURE",
-              `Could not release ${this.paths.lock}`,
-              { path: this.paths.lock },
-              error,
-            );
-    } finally {
-      if (descriptor !== undefined) closeQuietly(descriptor);
+      releaseError = toSessionRegistryLockError(error, this.paths.lock);
     }
 
     if (operationFailed) {
@@ -1028,69 +969,6 @@ export class SessionRegistry {
       throw releaseError;
     }
     return result;
-  }
-
-  private reclaimStaleLock(): boolean {
-    let lockStats: fs.Stats;
-    try {
-      lockStats = fs.statSync(this.paths.lock);
-    } catch (error: unknown) {
-      if (isNodeError(error) && error.code === "ENOENT") return true;
-      throw new SessionRegistryError(
-        "REGISTRY_IO_FAILURE",
-        `Could not inspect ${this.paths.lock}`,
-        { path: this.paths.lock },
-        error,
-      );
-    }
-
-    const owner = readSessionLockOwner(this.paths.lock);
-    if (owner === undefined) {
-      if (Date.now() - lockStats.mtimeMs < this.lockMetadataGraceMs) return false;
-      throw new SessionRegistryError(
-        "REGISTRY_LOCK_TIMEOUT",
-        `Cannot safely recover ${this.paths.lock}: owner metadata is invalid`,
-        { path: this.paths.lock, reason: "invalid_owner_metadata" },
-      );
-    }
-
-    const age = Date.now() - Date.parse(owner.acquiredAt);
-    if (!Number.isFinite(age) || age < 0) {
-      throw new SessionRegistryError(
-        "REGISTRY_LOCK_TIMEOUT",
-        `Cannot safely recover ${this.paths.lock}: owner timestamp is invalid`,
-        { path: this.paths.lock, reason: "invalid_owner_timestamp" },
-      );
-    }
-    if (age < this.lockStaleAfterMs) return false;
-
-    if (sessionLockOwnerLiveness(owner) !== "dead") {
-      throw new SessionRegistryError(
-        "REGISTRY_LOCK_TIMEOUT",
-        `Cannot safely recover ${this.paths.lock}: owner death is unverifiable`,
-        {
-          path: this.paths.lock,
-          reason: "owner_liveness_unknown_or_alive",
-          pid: owner.pid,
-          hostname: owner.hostname,
-        },
-      );
-    }
-
-    const currentOwner = readSessionLockOwner(this.paths.lock);
-    if (currentOwner?.token !== owner.token || sessionLockOwnerLiveness(currentOwner) !== "dead") return false;
-    try {
-      fs.rmSync(this.paths.lock, { recursive: true, force: false });
-      return true;
-    } catch (error: unknown) {
-      if (isNodeError(error) && error.code === "ENOENT") return true;
-      throw new SessionRegistryError(
-        "REGISTRY_IO_FAILURE",
-        `Could not recover stale ${this.paths.lock}`,
-        { path: this.paths.lock },
-        error,
-      );
-    }
   }
 }
 
@@ -1112,17 +990,6 @@ interface MutationResult<T> {
   readonly records: readonly SessionRecord[];
   readonly result: T;
 }
-
-interface SessionLockOwner {
-  readonly schemaVersion: typeof SESSION_LOCK_SCHEMA_VERSION;
-  readonly token: string;
-  readonly pid: number;
-  readonly hostname: string;
-  readonly processStartTime: string | null;
-  readonly acquiredAt: string;
-}
-
-type SessionLockOwnerLiveness = "alive" | "dead" | "unknown";
 
 interface CleanupResources {
   readonly gitCwd: string;
@@ -1196,7 +1063,9 @@ function deniedGuard(
 }
 
 function assertWorktreeClean(git: GitCommandRunner, worktreePath: string): void {
-  const status = git.run(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"], worktreePath);
+  // Ignore build/cache artifacts owned by the repository's .gitignore. Git's
+  // default status still reports tracked edits and recoverable untracked files.
+  const status = git.run(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=no"], worktreePath);
   if (status.length > 0) {
     throw new SessionRegistryError("DIRTY_WORKTREE", `Worktree contains recoverable changes: ${worktreePath}`, {
       worktree: worktreePath,
@@ -1776,92 +1645,26 @@ function stringifyDetail(value: unknown): string {
     : "<invalid>";
 }
 
-function createSessionLockOwner(): SessionLockOwner {
-  return {
-    schemaVersion: SESSION_LOCK_SCHEMA_VERSION,
-    token: randomUUID(),
-    pid: process.pid,
-    hostname: getHostname(),
-    processStartTime: readProcessStartTimeSync(process.pid),
-    acquiredAt: new Date().toISOString(),
-  };
-}
-
-function readSessionLockOwner(lockPath: string): SessionLockOwner | undefined {
-  let contents: string;
-  try {
-    contents = fs.readFileSync(path.join(lockPath, "owner.json"), "utf8");
-  } catch (error: unknown) {
-    if (isNodeError(error) && error.code === "ENOENT") return undefined;
-    throw new SessionRegistryError("REGISTRY_IO_FAILURE", `Could not read ${lockPath}`, { path: lockPath }, error);
+function toSessionRegistryLockError(error: unknown, lockPath: string): SessionRegistryError {
+  if (error instanceof SessionRegistryError) {
+    return error;
   }
 
-  try {
-    const value: unknown = JSON.parse(contents);
-    if (!isRecord(value)) return undefined;
-    if (
-      value.schemaVersion !== SESSION_LOCK_SCHEMA_VERSION ||
-      typeof value.token !== "string" ||
-      value.token.length === 0 ||
-      typeof value.pid !== "number" ||
-      !Number.isSafeInteger(value.pid) ||
-      value.pid <= 0 ||
-      typeof value.hostname !== "string" ||
-      value.hostname.length === 0 ||
-      (typeof value.processStartTime !== "string" && value.processStartTime !== null) ||
-      typeof value.acquiredAt !== "string" ||
-      !Number.isFinite(Date.parse(value.acquiredAt))
-    ) {
-      return undefined;
+  if (error instanceof RegistryLockError) {
+    const details: Record<string, string | number | boolean> = { path: lockPath };
+    for (const [key, value] of Object.entries(error.details)) {
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        details[key] = value;
+      }
     }
-    return {
-      schemaVersion: SESSION_LOCK_SCHEMA_VERSION,
-      token: value.token,
-      pid: value.pid,
-      hostname: value.hostname,
-      processStartTime: value.processStartTime,
-      acquiredAt: value.acquiredAt,
-    };
-  } catch {
-    return undefined;
+    const code =
+      error.code === "LOCK_BUSY" || error.code === "LOCK_STALE" || error.code === "LOCK_INVALID"
+        ? "REGISTRY_LOCK_TIMEOUT"
+        : "REGISTRY_IO_FAILURE";
+    return new SessionRegistryError(code, error.message, details, error);
   }
-}
 
-function sessionLockOwnerLiveness(owner: SessionLockOwner | undefined): SessionLockOwnerLiveness {
-  if (owner === undefined || owner.hostname !== getHostname() || owner.processStartTime === null) return "unknown";
-  if (!/^\d+$/u.test(owner.processStartTime)) return "unknown";
-  const currentStartTime = readProcessStartTimeSync(owner.pid);
-  if (currentStartTime === null) {
-    try {
-      process.kill(owner.pid, 0);
-      return "unknown";
-    } catch (error: unknown) {
-      return isNodeError(error) && error.code === "ESRCH" ? "dead" : "unknown";
-    }
-  }
-  return currentStartTime === owner.processStartTime ? "alive" : "dead";
-}
-
-function readProcessStartTimeSync(pid: number): string | null {
-  if (process.platform !== "linux") return null;
-  try {
-    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const commandEnd = raw.lastIndexOf(")");
-    if (commandEnd === -1) return null;
-    const fields = raw
-      .slice(commandEnd + 1)
-      .trim()
-      .split(/\s+/u);
-    const startTime = fields[19];
-    return startTime !== undefined && /^\d+$/u.test(startTime) ? startTime : null;
-  } catch {
-    return null;
-  }
-}
-
-function waitBriefly(): void {
-  const buffer = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(buffer, 0, 0, 10);
+  return new SessionRegistryError("REGISTRY_IO_FAILURE", `Could not operate on ${lockPath}`, { path: lockPath }, error);
 }
 
 function closeQuietly(descriptor: number): void {

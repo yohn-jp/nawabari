@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { RegistryLockError, RepositoryLock } from "./lock.js";
 
 async function withLockPath<T>(callback: (lockPath: string) => Promise<T>): Promise<T> {
-  const root = await mkdtemp(join(tmpdir(), "gitpaw-lock-"));
+  const root = await mkdtemp(join(tmpdir(), "nawabari-lock-"));
   try {
     return await callback(join(root, "registry.lock"));
   } finally {
@@ -84,5 +84,64 @@ test("an old remote-owner lock is reported stale without unsafe stealing", async
       await readFile(join(lockPath, "owner.json"), "utf8").then((raw) => raw.includes("remote-owner")),
       true,
     );
+  });
+});
+
+test("a parallel reclaimer cannot remove a lock acquired after the final token check", async () => {
+  await withLockPath(async (lockPath) => {
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(
+      join(lockPath, "owner.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        token: "dead-owner",
+        pid: process.pid,
+        hostname: hostname(),
+        processStartTime: "0",
+        acquiredAt: new Date(Date.now() - 10_000).toISOString(),
+      }),
+      "utf8",
+    );
+
+    const contender = new RepositoryLock({
+      lockPath,
+      staleAfterMs: 0,
+      metadataGraceMs: 100,
+      acquireTimeoutMs: 2_000,
+      retryDelayMs: 1,
+    });
+    let contenderPromise: Promise<import("./lock.js").LockLease> | undefined;
+    let contenderSurvived = false;
+    const reclaimer = new RepositoryLock({
+      lockPath,
+      staleAfterMs: 0,
+      metadataGraceMs: 100,
+      acquireTimeoutMs: 2_000,
+      retryDelayMs: 50,
+      beforeReclaimRemove: async () => {
+        // Model the stale owner releasing concurrently after the reclaimer's
+        // final token check. A correct contender must honor the reclaim marker.
+        await rm(lockPath, { recursive: true, force: true });
+        contenderPromise = contender.acquire().then(async (lease) => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+          try {
+            contenderSurvived = (await readFile(join(lockPath, "owner.json"), "utf8")).includes(lease.token);
+          } catch {
+            contenderSurvived = false;
+          }
+          await lease.release();
+          return lease;
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      },
+    });
+
+    const reclaimerLease = await reclaimer.acquire();
+    if (contenderPromise === undefined) {
+      throw new Error("contender was not started during reclaim");
+    }
+    await reclaimerLease.release();
+    await contenderPromise;
+    assert.equal(contenderSurvived, true);
   });
 });

@@ -66,11 +66,11 @@ interface RepositoryFixture {
 }
 
 function createRepositoryFixture(): RepositoryFixture {
-  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "git-paw-git-"));
+  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-"));
   const linkedWorktreePath = path.join(path.dirname(repositoryPath), `${path.basename(repositoryPath)}-linked`);
   runGit(["init", "-b", "main"], repositoryPath);
-  runGit(["config", "user.email", "git-paw-tests@example.invalid"], repositoryPath);
-  runGit(["config", "user.name", "GitPaw Tests"], repositoryPath);
+  runGit(["config", "user.email", "nawabari-tests@example.invalid"], repositoryPath);
+  runGit(["config", "user.name", "Nawabari Tests"], repositoryPath);
   fs.writeFileSync(path.join(repositoryPath, "README.md"), "fixture\n");
   runGit(["add", "README.md"], repositoryPath);
   runGit(["commit", "-m", "initial"], repositoryPath);

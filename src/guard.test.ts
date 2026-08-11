@@ -143,10 +143,10 @@ test("guard fails closed for ambiguous persisted ownership and maps it through t
 });
 
 function createRepository(): string {
-  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "git-paw-guard-"));
+  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-guard-"));
   runGit(["init", "-b", "main", repositoryPath], repositoryPath);
-  runGit(["config", "user.email", "git-paw-tests@example.invalid"], repositoryPath);
-  runGit(["config", "user.name", "GitPaw Tests"], repositoryPath);
+  runGit(["config", "user.email", "nawabari-tests@example.invalid"], repositoryPath);
+  runGit(["config", "user.name", "Nawabari Tests"], repositoryPath);
   runGit(["config", "commit.gpgsign", "false"], repositoryPath);
   runGit(["config", "core.hooksPath", "/dev/null"], repositoryPath);
   fs.writeFileSync(path.join(repositoryPath, "README.md"), "fixture\n");

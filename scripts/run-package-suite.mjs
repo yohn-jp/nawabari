@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Package-content validation: confirms `npm pack` includes exactly the files
-// package.json's "files" field promises (no more, no less), then delegates
-// install/exec verification to smoke-test.mjs against the same tarball.
+// Build/package validation deliberately passes one concrete tarball through
+// content checks and the isolated consumer smoke test. A second npm pack is
+// never allowed to hide a stale dist or packaging mismatch.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,39 +9,61 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { cwd: repoRoot, encoding: "utf8", ...options });
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} exited with ${result.status}`);
+  if (result.status !== 0) {
+    throw new Error(`${command} ${args.join(" ")} exited with ${result.status}\n${result.stdout}\n${result.stderr}`);
+  }
   return result;
 }
 
-function main() {
-  const distEntry = path.join(repoRoot, "dist", "index.js");
-  if (!fs.existsSync(distEntry)) throw new Error("dist is missing; run pnpm run build before the package suite");
+function parseArgs(argv) {
+  return { keepTarball: argv.includes("--keep-tarball") };
+}
 
-  const packResult = run("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"]);
-  const [packInfo] = JSON.parse(packResult.stdout);
+function assertPackContents(packInfo) {
   const packedFiles = packInfo.files.map((entry) => entry.path);
+  const allowed = new Set(["package.json", "README.md", "LICENSE"]);
+  for (const file of packedFiles) {
+    if (!allowed.has(file) && !file.startsWith("dist/")) {
+      throw new Error(`unexpected file in package tarball: ${file}`);
+    }
+  }
 
-  const executableBinPaths = Object.values(
-    JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8")).bin ?? {},
-  );
-  for (const binPath of executableBinPaths) {
+  for (const binPath of Object.values(packageJson.bin ?? {})) {
     if (!packedFiles.includes(binPath)) {
       throw new Error(`bin entry "${binPath}" is not included in the packed tarball`);
     }
     const stat = fs.statSync(path.join(repoRoot, binPath));
-    const isExecutableByOwner = (stat.mode & 0o100) !== 0;
-    if (!isExecutableByOwner) {
-      throw new Error(`bin entry "${binPath}" is not executable (chmod +x it, or check build step file perms)`);
+    if ((stat.mode & 0o100) === 0) {
+      throw new Error(`bin entry "${binPath}" is not executable`);
     }
   }
+}
 
-  console.log(`package contents verified: ${packedFiles.length} file(s), all bin targets present and executable.`);
+function main() {
+  const { keepTarball } = parseArgs(process.argv.slice(2));
+  const tarballName = `${packageJson.name}-${packageJson.version}.tgz`;
+  const tarballPath = path.join(repoRoot, tarballName);
+  fs.rmSync(tarballPath, { force: true });
 
-  run(process.execPath, ["scripts/smoke-test.mjs"], { stdio: "inherit" });
+  try {
+    const packResult = run("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", repoRoot]);
+    const [packInfo] = JSON.parse(packResult.stdout);
+    if (packInfo.filename !== tarballName) {
+      throw new Error(`npm produced ${packInfo.filename}; expected ${tarballName}`);
+    }
+    assertPackContents(packInfo);
+
+    run(process.execPath, ["scripts/validate-release-tarball.mjs", tarballPath]);
+    console.log(`package contents verified in exact tarball: ${tarballName}`);
+    run(process.execPath, ["scripts/smoke-test.mjs", "--tarball", tarballPath], { stdio: "inherit" });
+  } finally {
+    if (!keepTarball) fs.rmSync(tarballPath, { force: true });
+  }
 }
 
 main();

@@ -140,10 +140,10 @@ test("the local backend exposes close and gc as stable automation results", asyn
 });
 
 function createRepository(): string {
-  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "git-paw-domain-"));
+  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-domain-"));
   runGit(["init", "-b", "main", repositoryPath], repositoryPath);
-  runGit(["config", "user.email", "git-paw-tests@example.invalid"], repositoryPath);
-  runGit(["config", "user.name", "GitPaw Tests"], repositoryPath);
+  runGit(["config", "user.email", "nawabari-tests@example.invalid"], repositoryPath);
+  runGit(["config", "user.name", "Nawabari Tests"], repositoryPath);
   runGit(["config", "commit.gpgsign", "false"], repositoryPath);
   runGit(["config", "tag.gpgsign", "false"], repositoryPath);
   runGit(["config", "core.hooksPath", "/dev/null"], repositoryPath);

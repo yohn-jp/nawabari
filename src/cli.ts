@@ -11,7 +11,7 @@ import {
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
 
-const CLI_NAME = "git-paw";
+const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
 const VERSION = packageMetadata.version;
 
@@ -19,15 +19,15 @@ const HELP_TEXT = [
   `Usage: ${CLI_NAME} <command> [options]`,
   "",
   "Commands:",
-  "  session create       Request a new GitPaw session",
+  "  session create       Request a new Nawabari session",
   "  session id           Resolve the current session identity",
   "  session show         Show the current or selected session",
   "  session list         List repository sessions",
   "  session close        Close the current or selected session",
-  "  status               Show GitPaw session status",
+  "  status               Show Nawabari session status",
   "  guard [--session id] Authorize the current worktree for mutation",
   "  gc                   Detect or clean eligible stale sessions",
-  "  doctor               Check local GitPaw prerequisites",
+  "  doctor               Check local Nawabari prerequisites",
   "  --help               Show this help",
   "  --version            Print the installed version",
   "",
@@ -287,7 +287,7 @@ async function executeCommand(
     if (!report.ok) return report;
     if (report.value.ok) return { ok: true, value: report.value as JsonObject };
     return failure(
-      new DomainError("DOCTOR_FAILED", "One or more local GitPaw checks failed.", {
+      new DomainError("DOCTOR_FAILED", "One or more local Nawabari checks failed.", {
         checks: report.value.checks,
         repository: report.value.repository,
       }),

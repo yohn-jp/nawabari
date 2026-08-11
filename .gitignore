@@ -9,6 +9,7 @@ pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 *.log
+*.tgz
 
 .env
 .env.*

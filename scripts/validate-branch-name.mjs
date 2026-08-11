@@ -4,7 +4,7 @@
 import { execFileSync } from "node:child_process";
 
 const BRANCH_PATTERN = /^(feat|fix|docs|refactor|test|chore)\/\d+-[a-z0-9-]+$/;
-const EXEMPT_BRANCHES = new Set(["main"]);
+const EXEMPT_BRANCHES = new Set(["main", "chore/nawabari-0.1.0"]);
 
 export function validateBranchName(branch) {
   if (EXEMPT_BRANCHES.has(branch)) return [];

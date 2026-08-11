@@ -76,12 +76,12 @@ function backendForTests(overrides: Partial<SessionBackend> = {}): SessionBacken
   };
 }
 
-test("--help exits 0 and prints the git-paw usage", async () => {
+test("--help exits 0 and prints the nawabari usage", async () => {
   const output = capture();
   const exitCode = await runCli(["--help"], { io: output.io });
 
   assert.equal(exitCode, 0);
-  assert.match(output.stdout.join("\n"), /Usage: git-paw/);
+  assert.match(output.stdout.join("\n"), /Usage: nawabari/);
   assert.equal(output.stderr.length, 0);
 });
 
@@ -93,7 +93,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
   assert.deepEqual(JSON.parse(output.stdout[0]), {
     ok: true,
     command: "help",
-    usage: "Usage: git-paw <command> [options]",
+    usage: "Usage: nawabari <command> [options]",
     commands: [
       "session create",
       "session id",
@@ -143,7 +143,7 @@ test("unknown commands expose a stable JSON error without decoration", async () 
 
 test("state commands reject honestly when the current directory is not a Git repository", async () => {
   const output = capture();
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "git-paw-not-a-repository-"));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-not-a-repository-"));
   try {
     const exitCode = await runCli(["session", "id", "--json"], { io: output.io, cwd: directory });
 

@@ -152,7 +152,7 @@ const boundary = new RegistryMutationBoundary({
   atomicWriteHooks: process.env.CRASH_BEFORE_RENAME === "1" ? { beforeRename: () => process.kill(process.pid, "SIGKILL") } : undefined,
 });
 const operation = process.env.OPERATION; const sessionId = process.env.SESSION_ID; const now = new Date().toISOString();
-const record = { schemaVersion: 1, sessionId, repositoryId, worktreePath: "/tmp/gitpaw-test-worktrees/" + sessionId, branch: process.env.BRANCH ?? ("branch/" + sessionId), state: "active", createdAt: now, updatedAt: now };
+const record = { schemaVersion: 1, sessionId, repositoryId, worktreePath: "/tmp/nawabari-test-worktrees/" + sessionId, branch: process.env.BRANCH ?? ("branch/" + sessionId), state: "active", createdAt: now, updatedAt: now };
 try {
   if (Number(process.env.HOLD_MS ?? "0") > 0) await new Promise((resolve) => setTimeout(resolve, Number(process.env.HOLD_MS)));
   await boundary[operation]((draft) => { draft.sessions.push(record); draft.updatedAt = new Date().toISOString(); });
@@ -206,7 +206,7 @@ async function runChild(commonGitDirectory: string, environment: Record<string, 
 }
 
 async function withCommonGitDirectory<T>(callback: (directory: string) => Promise<T>): Promise<T> {
-  const root = await mkdtemp(join(tmpdir(), "gitpaw-registry-"));
+  const root = await mkdtemp(join(tmpdir(), "nawabari-registry-"));
   const directory = join(root, "common-git");
   await mkdir(directory, { recursive: true });
   try {
@@ -222,7 +222,7 @@ function makeRecord(sessionId: string, branch = `branch/${sessionId}`): TestSess
     schemaVersion: 1,
     sessionId,
     repositoryId: testRepositoryId,
-    worktreePath: `/tmp/gitpaw-test-worktrees/${sessionId}`,
+    worktreePath: `/tmp/nawabari-test-worktrees/${sessionId}`,
     branch,
     state: "active",
     createdAt: now,
@@ -262,11 +262,11 @@ test("persists a codec-owned document visible to another boundary instance", asy
 test("supports the domain registry's explicit common-state paths", async () => {
   await withCommonGitDirectory(async (directory) => {
     const boundary = createBoundary(directory, {
-      registryDirectoryName: "git-paw",
+      registryDirectoryName: "nawabari",
       registryFileName: "session-registry.json",
       lockFileName: "session-registry.lock",
     });
-    assert.equal(boundary.registryPath, join(directory, "git-paw", "session-registry.json"));
+    assert.equal(boundary.registryPath, join(directory, "nawabari", "session-registry.json"));
     await boundary.create((draft) => {
       draft.sessions.push(makeRecord("explicit-path"));
     });

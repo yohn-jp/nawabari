@@ -72,7 +72,7 @@ export class RegistryMutationBoundary<State> {
   public constructor(options: RegistryMutationBoundaryOptions<State>) {
     this.commonGitDirectory = resolve(options.commonGitDirectory);
     this.registryDirectory =
-      options.registryDirectory ?? join(this.commonGitDirectory, options.registryDirectoryName ?? "gitpaw");
+      options.registryDirectory ?? join(this.commonGitDirectory, options.registryDirectoryName ?? "nawabari");
     this.registryPath =
       options.registryPath ?? join(this.registryDirectory, options.registryFileName ?? "registry.json");
     this.lockPath = options.lockPath ?? join(this.registryDirectory, options.lockFileName ?? "registry.lock");
