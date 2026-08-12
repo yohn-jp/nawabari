@@ -64,6 +64,8 @@ export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
 export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
+/** Bounds a caller-declared commit-message pattern before it is compiled. */
+export const MAX_MESSAGE_PATTERN_LENGTH = 512 as const;
 
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
 export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
@@ -1140,13 +1142,17 @@ export class SessionRegistry {
    * ownership or mutation authority.
    */
   commit(options: CommitOptions): CommitResult {
+    // Validated before the repository lock is acquired: a pathological
+    // caller-declared pattern must not hold the cross-session repository
+    // lock hostage while it backtracks.
+    const messagePattern = options.messagePattern ?? options.message_pattern ?? null;
+    assertFinalCommitMessage(options.message, messagePattern);
+
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
       const requestedResources = operationResources(options.resources ?? options.paths);
       const authorization = this.requireMutationAuthorization("commit", requestedResources, sessionId);
       const initial = this.verifyGovernedExecutionContext(sessionId);
-      const messagePattern = options.messagePattern ?? options.message_pattern ?? null;
-      assertFinalCommitMessage(options.message, messagePattern);
 
       const before = observeMutationPaths(this.git, initial.worktreePath);
       assertNoUnexpectedMutationPaths(
@@ -2526,6 +2532,14 @@ function assertFinalCommitMessage(message: string, messagePattern: string | null
     );
   }
   if (messagePattern === null) return;
+
+  if (messagePattern.length > MAX_MESSAGE_PATTERN_LENGTH) {
+    throw new SessionRegistryError(
+      "INVALID_COMMIT_MESSAGE",
+      "The caller-declared commit-message pattern exceeds the maximum bounded length",
+      { reason: "message-pattern-too-long", maxMessagePatternLength: MAX_MESSAGE_PATTERN_LENGTH },
+    );
+  }
 
   let pattern: RegExp;
   try {

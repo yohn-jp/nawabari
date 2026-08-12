@@ -361,6 +361,53 @@ test("commit rejects a caller-declared message pattern that is not a valid regul
   }
 });
 
+test("commit rejects a caller-declared message pattern that exceeds the bounded length", () => {
+  const fixture = createFixture();
+  try {
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "too long pattern\n");
+    const oversizedPattern = `^(${"a".repeat(600)})$`;
+    assert.throws(
+      () =>
+        fixture.current.commit({
+          sessionId: fixture.session.sessionId,
+          message: "chore: anything",
+          resources: ["file.txt"],
+          messagePattern: oversizedPattern,
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "INVALID_COMMIT_MESSAGE" &&
+        error.details.reason === "message-pattern-too-long",
+    );
+    assert.equal(runGit(["diff", "--cached", "--name-only"], fixture.worktree), "");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("commit validates a caller-declared message pattern before acquiring the repository lock", () => {
+  const fixture = createFixture();
+  try {
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "unclaimed\n");
+    assert.throws(
+      () =>
+        fixture.current.commit({
+          sessionId: fixture.session.sessionId,
+          message: "not conventional",
+          resources: ["file.txt"],
+          messagePattern: "^(feat|fix|docs|refactor|test|chore): .+$",
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "INVALID_COMMIT_MESSAGE" &&
+        error.details.reason === "message-pattern-mismatch",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("push distinguishes missing upstream, creates it explicitly, and reports the target", () => {
   const fixture = createFixture(true);
   try {
