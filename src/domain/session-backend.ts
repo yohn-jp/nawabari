@@ -229,6 +229,7 @@ export class LocalSessionBackend implements SessionBackend {
         sessionId: options.session_id,
         message: options.message,
         resources: options.resources,
+        messagePattern: options.message_pattern,
       });
       return success(toDomainCommitResult(result));
     } catch (error: unknown) {

@@ -178,11 +178,14 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "commit",
     summary: "Commit explicit claim-authorized resources",
-    usage: `${CLI_NAME} commit --message <final-message> --resource <path> [--resource <path>] [--session <id>]`,
+    usage: `${CLI_NAME} commit --message <final-message> --resource <path> [--resource <path>] [--session <id>] [--message-pattern <regex>]`,
     options: [
       option("--session", "Assert the current session identity", { value: "<id>" }),
       option("--message", "Caller-decided final commit message", { value: "<final-message>", required: true }),
       option("--resource", "Claim-covered concrete path; repeatable", { value: "<path>", required: true }),
+      option("--message-pattern", "Caller-declared commit-message rule; validated only when supplied", {
+        value: "<regex>",
+      }),
     ],
   },
   {
@@ -289,7 +292,9 @@ function helpPayload(spec: HelpCommandSpec): JsonObject {
       usage: `Usage: ${spec.usage}`,
       commands: HELP_COMMANDS.map((command) => command.name),
       options: ["--json", "--help", "--version"],
-      session_options: unique(sessionOptions.map((option) => option.name).filter((name) => !sessionListOnlyOptions.has(name))),
+      session_options: unique(
+        sessionOptions.map((option) => option.name).filter((name) => !sessionListOnlyOptions.has(name)),
+      ),
       authorization_options: optionsFor("authorize"),
       checkpoint_options: optionsFor("checkpoint"),
       commit_options: optionsFor("commit"),
@@ -379,6 +384,7 @@ type ParsedOptions = {
   resources: string[];
   operation: string | null;
   message: string | null;
+  message_pattern: string | null;
   remote: string | null;
   remote_branch: string | null;
   mode: string | null;
@@ -445,6 +451,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     resources: [],
     operation: null,
     message: null,
+    message_pattern: null,
     remote: null,
     remote_branch: null,
     mode: null,
@@ -502,6 +509,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       options.resources.push(value);
     } else if (name === "--operation") options.operation = value;
     else if (name === "--message") options.message = value;
+    else if (name === "--message-pattern") options.message_pattern = value;
     else if (name === "--remote") options.remote = value;
     else if (name === "--remote-branch") options.remote_branch = value;
     else if (name === "--mode") options.mode = value;
@@ -741,7 +749,7 @@ async function executeCommand(
   if (command === "commit") {
     const parsed = parseOptions(
       [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
-      new Set(["--session", "--message", "--resource"]),
+      new Set(["--session", "--message", "--resource", "--message-pattern"]),
     );
     if (!parsed.ok) return parsed;
     if (parsed.value.message === null) {
@@ -755,6 +763,7 @@ async function executeCommand(
       session_id: parsed.value.session_id,
       message: parsed.value.message,
       resources: parsed.value.resources,
+      message_pattern: parsed.value.message_pattern,
     });
     return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
   }

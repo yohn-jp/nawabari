@@ -166,6 +166,38 @@ test("CLI commit preserves the JSON mutation result contract", async () => {
   }
 });
 
+test("CLI commit rejects a message that fails the caller-declared pattern and does not mutate", async () => {
+  const fixture = createFixture();
+  try {
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "cli pattern\n");
+    const before = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    const stdout: string[] = [];
+    const exitCode = await runCli(
+      [
+        "commit",
+        "--session",
+        fixture.session.sessionId,
+        "--message",
+        "not conventional",
+        "--resource",
+        "file.txt",
+        "--message-pattern",
+        "^(feat|fix|docs|refactor|test|chore): .+$",
+        "--json",
+      ],
+      { cwd: fixture.worktree, io: { stdout: (line) => stdout.push(line), stderr: () => undefined } },
+    );
+    assert.notEqual(exitCode, 0);
+    const result = JSON.parse(stdout[0] ?? "") as { ok: boolean; code: string };
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "INVALID_COMMIT_MESSAGE");
+    assert.equal(runGit(["rev-parse", "HEAD"], fixture.worktree), before);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("commit reports partial staging and commit failures and can be retried", () => {
   const fixture = createFixture();
   try {
@@ -266,6 +298,64 @@ test("commit rejects a branch changed outside the owned physical context", () =>
         }),
       (error: unknown) => error instanceof SessionRegistryError && error.code === "BRANCH_MISMATCH",
     );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("commit validates a caller-declared message pattern only when supplied", () => {
+  const fixture = createFixture();
+  try {
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "pattern\n");
+    const before = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    assert.throws(
+      () =>
+        fixture.current.commit({
+          sessionId: fixture.session.sessionId,
+          message: "not conventional",
+          resources: ["file.txt"],
+          messagePattern: "^(feat|fix|docs|refactor|test|chore): .+$",
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "INVALID_COMMIT_MESSAGE" &&
+        error.details.reason === "message-pattern-mismatch",
+    );
+    assert.equal(runGit(["rev-parse", "HEAD"], fixture.worktree), before);
+    assert.equal(runGit(["diff", "--cached", "--name-only"], fixture.worktree), "");
+
+    const result = fixture.current.commit({
+      sessionId: fixture.session.sessionId,
+      message: "chore: record the pattern change",
+      resources: ["file.txt"],
+      messagePattern: "^(feat|fix|docs|refactor|test|chore): .+$",
+    });
+    assert.match(result.commitSha, /^[0-9a-f]{40}$/u);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("commit rejects a caller-declared message pattern that is not a valid regular expression", () => {
+  const fixture = createFixture();
+  try {
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "invalid pattern\n");
+    assert.throws(
+      () =>
+        fixture.current.commit({
+          sessionId: fixture.session.sessionId,
+          message: "chore: anything",
+          resources: ["file.txt"],
+          messagePattern: "(unterminated",
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "INVALID_COMMIT_MESSAGE" &&
+        error.details.reason === "invalid-message-pattern",
+    );
+    assert.equal(runGit(["diff", "--cached", "--name-only"], fixture.worktree), "");
   } finally {
     fixture.cleanup();
   }
