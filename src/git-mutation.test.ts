@@ -9,6 +9,7 @@ import { defaultGit, type GitCommandRunner } from "./git.js";
 import { runCli } from "./cli.js";
 import { SessionRegistry } from "./session-registry.js";
 import { SessionRegistryError } from "./errors.js";
+import { RepositoryLock } from "./registry/lock.js";
 
 interface Fixture {
   readonly root: string;
@@ -386,23 +387,38 @@ test("commit rejects a caller-declared message pattern that exceeds the bounded 
   }
 });
 
-test("commit validates a caller-declared message pattern before acquiring the repository lock", () => {
+test("commit validates a caller-declared message pattern before acquiring the repository lock", async () => {
   const fixture = createFixture();
   try {
     fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "unclaimed\n");
-    assert.throws(
-      () =>
-        fixture.current.commit({
-          sessionId: fixture.session.sessionId,
-          message: "not conventional",
-          resources: ["file.txt"],
-          messagePattern: "^(feat|fix|docs|refactor|test|chore): .+$",
-        }),
-      (error: unknown) =>
-        error instanceof SessionRegistryError &&
-        error.code === "INVALID_COMMIT_MESSAGE" &&
-        error.details.reason === "message-pattern-mismatch",
-    );
+    const registry = new SessionRegistry({ cwd: fixture.worktree, lockTimeoutMs: 0 });
+    const externalLock = new RepositoryLock({
+      lockPath: registry.paths.lock,
+      staleAfterMs: 60_000,
+      acquireTimeoutMs: 0,
+    });
+    // Hold the repository lock externally: with lockTimeoutMs 0, a commit()
+    // that still tried to acquire it would fail closed with
+    // REGISTRY_LOCK_TIMEOUT instead of reaching message validation, proving
+    // the pattern check genuinely runs before the lock is touched.
+    const lease = await externalLock.acquire();
+    try {
+      assert.throws(
+        () =>
+          registry.commit({
+            sessionId: fixture.session.sessionId,
+            message: "not conventional",
+            resources: ["file.txt"],
+            messagePattern: "^(feat|fix|docs|refactor|test|chore): .+$",
+          }),
+        (error: unknown) =>
+          error instanceof SessionRegistryError &&
+          error.code === "INVALID_COMMIT_MESSAGE" &&
+          error.details.reason === "message-pattern-mismatch",
+      );
+    } finally {
+      await lease.release();
+    }
   } finally {
     fixture.cleanup();
   }
