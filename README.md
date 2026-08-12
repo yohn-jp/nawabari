@@ -263,6 +263,22 @@ git nawabari commit --session "$NAWABARI_SESSION_ID" \
   --message 'record the local change' --resource src/example.ts --json
 ```
 
+An optional `--message-pattern <regex>` validates the final message against a
+caller-declared rule before Git is invoked; Nawabari does not own or infer
+commit-message conventions (such as Conventional Commits) itself, so this
+check runs only when a caller explicitly supplies a pattern, and a mismatch
+fails with `INVALID_COMMIT_MESSAGE` before anything is staged. The pattern is
+bounded to 512 characters and is evaluated before the repository lock is
+acquired, so a pathological caller-supplied pattern cannot stall other
+sessions' governed operations. A repository's own `commit-msg` Git hook (if
+any) still runs normally, since governed commit invokes real `git commit`.
+
+```bash
+git nawabari commit --session "$NAWABARI_SESSION_ID" \
+  --message 'feat: record the local change' --resource src/example.ts \
+  --message-pattern '^(feat|fix|docs|refactor|test|chore): .+$' --json
+```
+
 Governed push requires explicit claim-covered resources and an explicit
 `--remote`/`--branch` target. Existing upstream and local/remote relation are
 inspected before mutation. A missing upstream requires `--create-upstream`;

@@ -64,6 +64,8 @@ export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
 export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
+/** Bounds a caller-declared commit-message pattern before it is compiled. */
+export const MAX_MESSAGE_PATTERN_LENGTH = 512 as const;
 
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
 export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
@@ -265,6 +267,13 @@ export interface CommitOptions {
   readonly resources?: readonly string[];
   /** Alias for callers that name the same explicit paths as paths. */
   readonly paths?: readonly string[];
+  /**
+   * Caller-declared commit-message rule (a RegExp source the final message
+   * must match). Nawabari does not own or infer commit-message conventions;
+   * it validates this pattern only when the caller explicitly supplies one.
+   */
+  readonly messagePattern?: string | null;
+  readonly message_pattern?: string | null;
 }
 
 export interface CommitResult {
@@ -1133,12 +1142,17 @@ export class SessionRegistry {
    * ownership or mutation authority.
    */
   commit(options: CommitOptions): CommitResult {
+    // Validated before the repository lock is acquired: a pathological
+    // caller-declared pattern must not hold the cross-session repository
+    // lock hostage while it backtracks.
+    const messagePattern = options.messagePattern ?? options.message_pattern ?? null;
+    assertFinalCommitMessage(options.message, messagePattern);
+
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
       const requestedResources = operationResources(options.resources ?? options.paths);
       const authorization = this.requireMutationAuthorization("commit", requestedResources, sessionId);
       const initial = this.verifyGovernedExecutionContext(sessionId);
-      assertFinalCommitMessage(options.message);
 
       const before = observeMutationPaths(this.git, initial.worktreePath);
       assertNoUnexpectedMutationPaths(
@@ -2505,7 +2519,7 @@ function operationResources(resources: readonly string[] | undefined): readonly 
   return resources === undefined ? [] : [...resources];
 }
 
-function assertFinalCommitMessage(message: string): void {
+function assertFinalCommitMessage(message: string, messagePattern: string | null): void {
   if (
     typeof message !== "string" ||
     message.length === 0 ||
@@ -2515,6 +2529,34 @@ function assertFinalCommitMessage(message: string): void {
     throw new SessionRegistryError(
       "INVALID_COMMIT_MESSAGE",
       "Commit message must be a non-empty final message without NUL bytes",
+    );
+  }
+  if (messagePattern === null) return;
+
+  if (messagePattern.length > MAX_MESSAGE_PATTERN_LENGTH) {
+    throw new SessionRegistryError(
+      "INVALID_COMMIT_MESSAGE",
+      "The caller-declared commit-message pattern exceeds the maximum bounded length",
+      { reason: "message-pattern-too-long", maxMessagePatternLength: MAX_MESSAGE_PATTERN_LENGTH },
+    );
+  }
+
+  let pattern: RegExp;
+  try {
+    pattern = new RegExp(messagePattern, "u");
+  } catch (error: unknown) {
+    throw new SessionRegistryError(
+      "INVALID_COMMIT_MESSAGE",
+      "The caller-declared commit-message pattern is not a valid regular expression",
+      { reason: "invalid-message-pattern", messagePattern },
+      error,
+    );
+  }
+  if (!pattern.test(message)) {
+    throw new SessionRegistryError(
+      "INVALID_COMMIT_MESSAGE",
+      "Commit message does not match the caller-declared commit-message pattern",
+      { reason: "message-pattern-mismatch", messagePattern, message },
     );
   }
 }

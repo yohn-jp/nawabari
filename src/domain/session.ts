@@ -156,6 +156,8 @@ export type CommitOptions = {
   session_id: string | null;
   message: string;
   resources: string[];
+  /** Caller-declared commit-message rule; validated only when supplied. */
+  message_pattern?: string | null;
 };
 
 export type CommitResult = {
