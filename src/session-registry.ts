@@ -6,6 +6,7 @@ import {
   captureGitCheckpoint,
   listGitWorktrees,
   normalizeBranchId,
+  readCommitChangedPaths,
   readCurrentHead,
   resolveRepositoryContext,
   verifyPhysicalExecutionContext,
@@ -280,6 +281,7 @@ export interface CommitResult {
   readonly schemaVersion: typeof GOVERNED_GIT_OPERATION_SCHEMA_VERSION;
   readonly commitSha: string;
   readonly message: string;
+  /** The commit's actual changed paths, read back from Git and proven to be within the authorized/staged set. */
   readonly resources: readonly string[];
 }
 
@@ -1213,11 +1215,47 @@ export class SessionRegistry {
         );
       }
 
+      // The Git commit succeeded and its SHA is known; every failure from here
+      // must retain commitSha so the caller can recover/reconcile the result
+      // instead of losing track of a commit that actually happened.
+      let committedPaths: readonly string[];
+      try {
+        committedPaths = canonicalGitObservedPaths(
+          readCommitChangedPaths(this.git, initial.worktreePath, commitSha),
+          initial.worktreePath,
+        );
+      } catch (error: unknown) {
+        if (error instanceof SessionRegistryError && isBoundedGitFailure(error.code)) {
+          throw new SessionRegistryError(error.code, error.message, { ...error.details, commitSha }, error);
+        }
+        throw new SessionRegistryError(
+          "COMMIT_RESULT_UNAVAILABLE",
+          "Git committed the operation but its actual changed paths could not be resolved",
+          { commitSha, phase: "resolve-commit-paths" },
+          error,
+        );
+      }
+
+      const authorizedSet = new Set(stageResources);
+      const divergentResources = committedPaths.filter((resource) => !authorizedSet.has(resource));
+      if (divergentResources.length > 0) {
+        throw new SessionRegistryError(
+          "COMMIT_RESULT_DIVERGED",
+          "The resulting commit contains paths outside the authorized/staged resource set",
+          {
+            commitSha,
+            authorizedResources: [...stageResources],
+            committedResources: [...committedPaths],
+            divergentResources,
+          },
+        );
+      }
+
       return Object.freeze({
         schemaVersion: GOVERNED_GIT_OPERATION_SCHEMA_VERSION,
         commitSha,
         message: options.message,
-        resources: Object.freeze([...stageResources]),
+        resources: committedPaths,
       });
     });
   }
@@ -1349,10 +1387,10 @@ export class SessionRegistry {
     const session = execution.session;
     const observed = captureGitCheckpoint(this.git, physical.worktreePath);
     const paths = {
-      changed: canonicalObservedPaths(observed.changed, physical.worktreePath),
-      staged: canonicalObservedPaths(observed.staged, physical.worktreePath),
-      unstaged: canonicalObservedPaths(observed.unstaged, physical.worktreePath),
-      untracked: canonicalObservedPaths(observed.untracked, physical.worktreePath),
+      changed: canonicalGitObservedPaths(observed.changed, physical.worktreePath),
+      staged: canonicalGitObservedPaths(observed.staged, physical.worktreePath),
+      unstaged: canonicalGitObservedPaths(observed.unstaged, physical.worktreePath),
+      untracked: canonicalGitObservedPaths(observed.untracked, physical.worktreePath),
     };
     const state = this.readStateUnsafe();
     const activeClaims = state.claims.filter(
@@ -2600,26 +2638,9 @@ function explicitRemoteBranch(branch: string | null | undefined, alias: string |
 function observeMutationPaths(git: GitCommandRunner, worktreePath: string): MutationPaths {
   const observed = captureGitCheckpoint(git, worktreePath);
   return Object.freeze({
-    changed: Object.freeze(canonicalMutationPaths(observed.changed, worktreePath)),
-    staged: Object.freeze(canonicalMutationPaths(observed.staged, worktreePath)),
+    changed: canonicalGitObservedPaths(observed.changed, worktreePath),
+    staged: canonicalGitObservedPaths(observed.staged, worktreePath),
   });
-}
-
-function canonicalMutationPaths(paths: readonly string[], worktreePath: string): string[] {
-  const canonical = new Set<string>();
-  for (const resource of paths) {
-    try {
-      canonical.add(canonicalizeClaimResource(resource, worktreePath));
-    } catch (error: unknown) {
-      throw new SessionRegistryError(
-        "GIT_STATE_AMBIGUOUS",
-        "Git reported a path that cannot be represented as a canonical repository resource",
-        { path: resource },
-        error,
-      );
-    }
-  }
-  return sortStrings(canonical);
 }
 
 function assertNoUnexpectedMutationPaths(paths: readonly string[], authorized: readonly string[]): void {
@@ -2832,27 +2853,27 @@ function throwRemoteInspectionFailure(error: unknown, phase: string): never {
   );
 }
 
-function canonicalObservedPaths(paths: readonly string[], worktreePath: string): readonly string[] {
+/**
+ * Canonicalize Git-observed paths (concrete repository-relative paths Git
+ * reports; they may contain literal `*`/`?` characters in filenames, not
+ * wildcards) against the physical worktree. Shared by checkpoint evidence and
+ * mutation observation so the two paths cannot drift semantically: a path
+ * Git reports that cannot be safely canonicalized (traversal, symlink
+ * escape, invalid syntax) fails the observation closed with
+ * `GIT_STATE_AMBIGUOUS` rather than being silently dropped from evidence.
+ */
+function canonicalGitObservedPaths(paths: readonly string[], worktreePath: string): readonly string[] {
   const canonical = new Set<string>();
   for (const resource of paths) {
-    if (typeof resource !== "string" || resource.length === 0) {
-      continue;
-    }
     try {
-      // Git-observed paths are concrete repository-relative paths reported by Git.
-      // They may contain literal * or ? characters in filenames (not wildcards).
-      // Canonicalize and bounds-check them without rejecting metacharacters.
-      // If canonicalization encounters traversal, symlink escape, or invalid
-      // syntax, skip the path so it is reported as outOfClaim rather than throwing.
       canonical.add(canonicalizeClaimResource(resource, worktreePath));
     } catch (error: unknown) {
-      // Let observed paths that fail canonicalization appear in the outOfClaim
-      // set rather than causing checkpoint to throw. This ensures Git-reported
-      // paths with unusual names or structure are observable in evidence.
-      if (error instanceof SessionRegistryError) {
-        continue;
-      }
-      throw error;
+      throw new SessionRegistryError(
+        "GIT_STATE_AMBIGUOUS",
+        "Git reported a path that cannot be represented as a canonical repository resource",
+        { path: resource },
+        error,
+      );
     }
   }
   return Object.freeze(sortStrings(canonical));

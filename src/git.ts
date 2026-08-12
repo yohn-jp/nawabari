@@ -477,6 +477,41 @@ export function captureGitCheckpoint(git: GitCommandRunner, cwd: string): GitChe
   });
 }
 
+/**
+ * Read the exact set of paths a resulting commit actually changed, directly
+ * from Git rather than from pre-commit staging intent. Bounded and NUL-safe,
+ * mirroring captureGitCheckpoint's evidence guarantees.
+ */
+export function readCommitChangedPaths(git: GitCommandRunner, cwd: string, commitSha: string): readonly string[] {
+  let output: string;
+  try {
+    const run = git.runRaw ?? git.run;
+    output = run(["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-z", commitSha], cwd);
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw new SessionRegistryError(
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      "Could not observe the resulting commit's changed paths",
+      { cwd, commitSha },
+      error,
+    );
+  }
+
+  const paths = new Set<string>();
+  for (const record of output.split("\u0000")) {
+    if (record.length === 0) continue;
+    paths.add(record);
+    if (paths.size > CHECKPOINT_MAX_PATHS) {
+      throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Committed path set exceeds the bounded evidence limit", {
+        cwd,
+        commitSha,
+        maxPaths: CHECKPOINT_MAX_PATHS,
+      });
+    }
+  }
+  return sortGitPaths(paths);
+}
+
 export function normalizeBranchId(branchName: string): string {
   const trimmed = branchName.trim();
   if (trimmed !== branchName) {
