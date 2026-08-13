@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { SessionRegistryError } from "./errors.js";
 import { CHECKPOINT_MAX_PATHS, type GitCheckpointPaths } from "./operation-authorization.js";
+import { canonicalizeConcretePath } from "./resource-claims.js";
 
 export const GIT_COMMAND_TIMEOUT_MS = 10_000;
 export const GIT_COMMAND_MAX_OUTPUT_BYTES = 64 * 1024;
@@ -510,6 +511,60 @@ export function readCommitChangedPaths(git: GitCommandRunner, cwd: string, commi
     }
   }
   return sortGitPaths(paths);
+}
+
+/**
+ * Canonicalize concrete paths reported by Git against the physical worktree.
+ * Git-observed paths are not glob patterns, so literal `*` and `?` characters
+ * remain valid filename characters. Any path that cannot be represented as a
+ * canonical repository resource fails closed as ambiguous Git state.
+ */
+export function canonicalizeGitObservedPaths(paths: readonly string[], worktreePath: string): readonly string[] {
+  const canonical = new Set<string>();
+  for (const resource of paths) {
+    try {
+      canonical.add(canonicalizeConcretePath(resource, worktreePath));
+    } catch (error: unknown) {
+      throw new SessionRegistryError(
+        "GIT_STATE_AMBIGUOUS",
+        "Git reported a path that cannot be represented as a canonical repository resource",
+        { path: resource },
+        error,
+      );
+    }
+  }
+  return sortGitPaths(canonical);
+}
+
+/** Observe and canonicalize all bounded Git checkpoint path sets. */
+export function observeGitCheckpoint(git: GitCommandRunner, cwd: string): GitCheckpointPaths {
+  const observed = captureGitCheckpoint(git, cwd);
+  return Object.freeze({
+    changed: canonicalizeGitObservedPaths(observed.changed, cwd),
+    staged: canonicalizeGitObservedPaths(observed.staged, cwd),
+    unstaged: canonicalizeGitObservedPaths(observed.unstaged, cwd),
+    untracked: canonicalizeGitObservedPaths(observed.untracked, cwd),
+  });
+}
+
+export interface GitMutationPaths {
+  readonly changed: readonly string[];
+  readonly staged: readonly string[];
+}
+
+/** Observe the canonical changed/staged sets used by governed mutations. */
+export function observeGitMutationPaths(git: GitCommandRunner, cwd: string): GitMutationPaths {
+  const observed = observeGitCheckpoint(git, cwd);
+  return Object.freeze({ changed: observed.changed, staged: observed.staged });
+}
+
+/** Read and canonicalize the exact paths changed by a resulting commit. */
+export function readCanonicalCommitChangedPaths(
+  git: GitCommandRunner,
+  cwd: string,
+  commitSha: string,
+): readonly string[] {
+  return canonicalizeGitObservedPaths(readCommitChangedPaths(git, cwd, commitSha), cwd);
 }
 
 export function normalizeBranchId(branchName: string): string {

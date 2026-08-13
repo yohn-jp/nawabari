@@ -6,7 +6,9 @@ import {
   captureGitCheckpoint,
   listGitWorktrees,
   normalizeBranchId,
-  readCommitChangedPaths,
+  observeGitCheckpoint,
+  observeGitMutationPaths,
+  readCanonicalCommitChangedPaths,
   readCurrentHead,
   resolveRepositoryContext,
   verifyPhysicalExecutionContext,
@@ -1157,7 +1159,7 @@ export class SessionRegistry {
       const authorization = this.requireMutationAuthorization("commit", requestedResources, sessionId);
       const initial = this.verifyGovernedExecutionContext(sessionId);
 
-      const before = observeMutationPaths(this.git, initial.worktreePath);
+      const before = observeGitMutationPaths(this.git, initial.worktreePath);
       assertNoUnexpectedMutationPaths(
         before.changed,
         authorization.resources.map((resource) => resource.resource),
@@ -1184,7 +1186,7 @@ export class SessionRegistry {
         "COMMIT_STAGING_FAILED",
       );
 
-      const afterStage = observeMutationPaths(this.git, initial.worktreePath);
+      const afterStage = observeGitMutationPaths(this.git, initial.worktreePath);
       assertNoUnexpectedMutationPaths(afterStage.changed, stageResources);
       if (!afterStage.staged.some((resource) => stageResources.includes(resource))) {
         throw new SessionRegistryError("COMMIT_STAGING_FAILED", "Git staging produced no authorized staged paths", {
@@ -1193,7 +1195,7 @@ export class SessionRegistry {
       }
 
       reverifyMutationContext(this, initial, sessionId, "commit");
-      const beforeCommit = observeMutationPaths(this.git, initial.worktreePath);
+      const beforeCommit = observeGitMutationPaths(this.git, initial.worktreePath);
       assertNoUnexpectedMutationPaths(beforeCommit.changed, stageResources);
       if (!beforeCommit.staged.some((resource) => stageResources.includes(resource))) {
         throw new SessionRegistryError("COMMIT_STAGING_FAILED", "Authorized staged paths disappeared before commit", {
@@ -1221,10 +1223,7 @@ export class SessionRegistry {
       // instead of losing track of a commit that actually happened.
       let committedPaths: readonly string[];
       try {
-        committedPaths = canonicalGitObservedPaths(
-          readCommitChangedPaths(this.git, initial.worktreePath, commitSha),
-          initial.worktreePath,
-        );
+        committedPaths = readCanonicalCommitChangedPaths(this.git, initial.worktreePath, commitSha);
       } catch (error: unknown) {
         if (error instanceof SessionRegistryError && isBoundedGitFailure(error.code)) {
           throw new SessionRegistryError(error.code, error.message, { ...error.details, commitSha }, error);
@@ -1319,7 +1318,7 @@ export class SessionRegistry {
         );
       }
 
-      const dirtyBefore = observeMutationPaths(this.git, initial.worktreePath);
+      const dirtyBefore = observeGitMutationPaths(this.git, initial.worktreePath);
       if (dirtyBefore.changed.length > 0) {
         throw new SessionRegistryError("PUSH_DIRTY_WORKTREE", "Push requires a clean Git worktree", {
           paths: [...dirtyBefore.changed],
@@ -1327,7 +1326,7 @@ export class SessionRegistry {
       }
 
       reverifyMutationContext(this, initial, sessionId, "push");
-      const dirtyBeforePush = observeMutationPaths(this.git, initial.worktreePath);
+      const dirtyBeforePush = observeGitMutationPaths(this.git, initial.worktreePath);
       if (dirtyBeforePush.changed.length > 0) {
         throw new SessionRegistryError("PUSH_DIRTY_WORKTREE", "The worktree changed before push mutation", {
           paths: [...dirtyBeforePush.changed],
@@ -1386,13 +1385,7 @@ export class SessionRegistry {
     const execution = this.verifyGovernedExecutionContext(requestedSessionId);
     const physical = execution;
     const session = execution.session;
-    const observed = captureGitCheckpoint(this.git, physical.worktreePath);
-    const paths = {
-      changed: canonicalGitObservedPaths(observed.changed, physical.worktreePath),
-      staged: canonicalGitObservedPaths(observed.staged, physical.worktreePath),
-      unstaged: canonicalGitObservedPaths(observed.unstaged, physical.worktreePath),
-      untracked: canonicalGitObservedPaths(observed.untracked, physical.worktreePath),
-    };
+    const paths = observeGitCheckpoint(this.git, physical.worktreePath);
     const state = this.readStateUnsafe();
     const activeClaims = state.claims.filter(
       (claim) =>
@@ -2539,11 +2532,6 @@ function canonicalOperationResources(resources: readonly string[], worktreePath:
   return Object.freeze(sortStrings(canonical));
 }
 
-interface MutationPaths {
-  readonly changed: readonly string[];
-  readonly staged: readonly string[];
-}
-
 interface PushInspection {
   readonly relation: PushRelation;
   readonly upstream: string | undefined;
@@ -2634,14 +2622,6 @@ function explicitRemoteBranch(branch: string | null | undefined, alias: string |
       error,
     );
   }
-}
-
-function observeMutationPaths(git: GitCommandRunner, worktreePath: string): MutationPaths {
-  const observed = captureGitCheckpoint(git, worktreePath);
-  return Object.freeze({
-    changed: canonicalGitObservedPaths(observed.changed, worktreePath),
-    staged: canonicalGitObservedPaths(observed.staged, worktreePath),
-  });
 }
 
 function assertNoUnexpectedMutationPaths(paths: readonly string[], authorized: readonly string[]): void {
@@ -2852,32 +2832,6 @@ function throwRemoteInspectionFailure(error: unknown, phase: string): never {
     },
     error,
   );
-}
-
-/**
- * Canonicalize Git-observed paths (concrete repository-relative paths Git
- * reports; they may contain literal `*`/`?` characters in filenames, not
- * wildcards) against the physical worktree. Shared by checkpoint evidence and
- * mutation observation so the two paths cannot drift semantically: a path
- * Git reports that cannot be safely canonicalized (traversal, symlink
- * escape, invalid syntax) fails the observation closed with
- * `GIT_STATE_AMBIGUOUS` rather than being silently dropped from evidence.
- */
-function canonicalGitObservedPaths(paths: readonly string[], worktreePath: string): readonly string[] {
-  const canonical = new Set<string>();
-  for (const resource of paths) {
-    try {
-      canonical.add(canonicalizeConcretePath(resource, worktreePath));
-    } catch (error: unknown) {
-      throw new SessionRegistryError(
-        "GIT_STATE_AMBIGUOUS",
-        "Git reported a path that cannot be represented as a canonical repository resource",
-        { path: resource },
-        error,
-      );
-    }
-  }
-  return Object.freeze(sortStrings(canonical));
 }
 
 function sortStrings(values: Iterable<string>): string[] {
