@@ -23,6 +23,7 @@ import {
   canonicalClaimId,
   canonicalizeClaimInput,
   canonicalizeClaimResource,
+  canonicalizeConcretePath,
   claimError,
   claimsConflict,
   claimsOverlap,
@@ -2518,7 +2519,7 @@ function canonicalOperationResources(resources: readonly string[], worktreePath:
       });
     }
     try {
-      canonical.add(canonicalizeClaimResource(resource, worktreePath));
+      canonical.add(canonicalizeConcretePath(resource, worktreePath));
     } catch (error: unknown) {
       if (
         error instanceof SessionRegistryError &&
@@ -2866,7 +2867,7 @@ function canonicalGitObservedPaths(paths: readonly string[], worktreePath: strin
   const canonical = new Set<string>();
   for (const resource of paths) {
     try {
-      canonical.add(canonicalizeClaimResource(resource, worktreePath));
+      canonical.add(canonicalizeConcretePath(resource, worktreePath));
     } catch (error: unknown) {
       throw new SessionRegistryError(
         "GIT_STATE_AMBIGUOUS",
