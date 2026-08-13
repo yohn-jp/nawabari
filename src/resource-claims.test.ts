@@ -8,6 +8,7 @@ import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
 import {
+  canonicalizeConcretePath,
   claimsConflict,
   createResourceClaim,
   RESOURCE_CLAIM_COMPATIBILITY_MATRIX,
@@ -364,6 +365,38 @@ test("concurrent conflicting acquisitions serialize to one winner without corrup
     for (const worktreePath of worktreePaths.slice(1)) {
       removeWorktree(fixture.repositoryPath, worktreePath);
     }
+    fixture.cleanup();
+  }
+});
+
+test("canonicalizeConcretePath treats wildcard characters as literal filename characters", () => {
+  const fixture = createRepositoryFixture();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-concrete-outside-"));
+  try {
+    const literalWildcardDir = path.join(fixture.repositoryPath, "wildcard*dir");
+    const literalQuestionFile = path.join(literalWildcardDir, "file?name.ts");
+    const escapeSymlink = path.join(fixture.repositoryPath, "escape-symlink");
+    fs.mkdirSync(literalWildcardDir, { recursive: true });
+    fs.writeFileSync(literalQuestionFile, "export const literal = true;\n");
+    fs.symlinkSync(outside, escapeSymlink, "dir");
+
+    // Literal wildcard characters in filenames are preserved as-is
+    const canonicalWildcard = canonicalizeConcretePath("wildcard*dir/file?name.ts", fixture.repositoryPath);
+    assert.equal(canonicalWildcard, "wildcard*dir/file?name.ts");
+
+    // Symlink-escape validation still applies
+    assertRegistryError(
+      () => canonicalizeConcretePath("escape-symlink/malicious.txt", fixture.repositoryPath),
+      "CLAIM_SYMLINK_ESCAPE",
+    );
+
+    // Traversal validation still applies
+    assertRegistryError(
+      () => canonicalizeConcretePath("wildcard*dir/../../../etc/passwd", fixture.repositoryPath),
+      "CLAIM_PATH_TRAVERSAL",
+    );
+  } finally {
+    fs.rmSync(outside, { recursive: true, force: true });
     fixture.cleanup();
   }
 });

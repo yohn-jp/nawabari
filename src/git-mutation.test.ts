@@ -138,6 +138,68 @@ test("commit rejects unexpected changed or staged paths and returns its SHA", ()
     assert.match(result.commitSha, /^[0-9a-f]{40}$/u);
     assert.equal(runGit(["rev-parse", "HEAD"], fixture.worktree), result.commitSha);
     assert.equal(runGit(["show", "--format=%s", "--no-patch", "HEAD"], fixture.worktree), "committed");
+    assert.deepEqual(result.resources, ["file.txt"]);
+    assert.deepEqual(
+      runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", result.commitSha], fixture.worktree).split(
+        "\n",
+      ),
+      result.resources,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("commit reads back the actual committed paths and fails closed when the commit diverges from the authorized set", () => {
+  const fixture = createFixture();
+  try {
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "authorized\n");
+    let injected = false;
+    // Simulate index/staging drift that happens strictly between the last
+    // pre-commit observation and the actual `git commit` invocation (e.g. a
+    // concurrent process or hook), which pre-commit checks cannot observe.
+    const driftGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "commit" && !injected) {
+          injected = true;
+          fs.writeFileSync(path.join(cwd, "drift.txt"), "unauthorized drift\n");
+          runGit(["add", "drift.txt"], cwd);
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () =>
+        new SessionRegistry({ cwd: fixture.worktree, git: driftGit }).commit({
+          sessionId: fixture.session.sessionId,
+          message: "drift",
+          resources: ["file.txt"],
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "COMMIT_RESULT_DIVERGED" &&
+        typeof error.details.commitSha === "string" &&
+        Array.isArray(error.details.divergentResources) &&
+        (error.details.divergentResources as string[]).includes("drift.txt") &&
+        Array.isArray(error.details.committedResources) &&
+        (error.details.committedResources as string[]).includes("drift.txt") &&
+        Array.isArray(error.details.authorizedResources) &&
+        !(error.details.authorizedResources as string[]).includes("drift.txt"),
+    );
+
+    // The underlying Git commit already happened; its SHA remains resolvable
+    // from the error details for recovery/reconciliation even though the
+    // governed result reports the divergence rather than an ordinary success.
+    assert.equal(runGit(["show", "--format=%s", "--no-patch", "HEAD"], fixture.worktree), "drift");
+    assert.equal(
+      runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "HEAD"], fixture.worktree),
+      "drift.txt\nfile.txt",
+    );
   } finally {
     fixture.cleanup();
   }

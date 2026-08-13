@@ -258,6 +258,20 @@ repository-relative resources. Every resource must be covered by an active
 `exclusive-write` claim; all Git-visible changed/staged paths must be in the
 explicit list. JSON includes the resulting `commit_sha`.
 
+Commit evidence distinguishes three sets: the caller's **declared/authorized**
+resources (the explicit, claim-covered list a caller passed in), the
+**staged** set Git reports as staged immediately before the commit runs, and
+the **actual committed** set — read back from the resulting commit itself via
+a bounded, NUL-safe `git diff-tree` observation, not inferred from staging
+intent. The `resources` field in a successful `commit --json` result is
+always the actual committed set, proven equal to or a subset of the
+authorized resources; if Git staging/index drift between staging and the
+commit (a hook, a concurrent process) causes the actual commit to contain a
+path outside the authorized set, the result is not reported as an ordinary
+successful commit — it fails with `COMMIT_RESULT_DIVERGED`, which retains the
+resulting `commitSha` (the Git commit already happened) alongside the
+authorized, actual, and divergent path sets for recovery/reconciliation.
+
 ```bash
 git nawabari commit --session "$NAWABARI_SESSION_ID" \
   --message 'record the local change' --resource src/example.ts --json
@@ -298,6 +312,15 @@ evidence is limited to the state Git exposes at that instant. Direct
 filesystem activity that is reverted, ignored, or otherwise not observable in
 the Git checkpoint is outside Nawabari's guarantee; this feature is not an
 OS-level filesystem monitor.
+
+Checkpoint canonicalization fails closed: a Git-reported path that cannot be
+represented as a canonical repository resource (traversal, symlink escape, or
+syntax reserved for the claim/glob model) never disappears from evidence.
+Checkpoint fails the whole observation with `GIT_STATE_AMBIGUOUS` instead of
+silently omitting the path, so a caller can never mistake an unrepresentable
+observation for a clean one. This mirrors the strictness governed mutation
+already applies to the same Git-observed paths, so checkpoint evidence is
+never weaker than mutation authorization.
 
 ## Physical execution context
 

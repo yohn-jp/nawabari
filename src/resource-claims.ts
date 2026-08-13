@@ -169,6 +169,38 @@ export function canonicalizeClaimResource(resource: string, worktreePath: string
   return canonical;
 }
 
+/**
+ * Canonicalize a concrete repository-relative path (NOT a glob pattern)
+ * against the physical worktree. Any `*` or `?` characters in the input are
+ * treated as literal filename characters, not glob wildcards. The path is
+ * validated for traversal and symlink escapes exactly like
+ * `canonicalizeClaimResource`, but without glob expansion or candidate
+ * scanning.
+ */
+export function canonicalizeConcretePath(resource: string, worktreePath: string): string {
+  validateResourceString(resource);
+  const canonical = canonicalResourceSyntax(resource);
+  const root = canonicalWorktreeRoot(worktreePath);
+  const segments = canonical.split("/");
+  const candidate = path.resolve(root, ...segments);
+  assertWithinRoot(root, candidate, canonical);
+  const entry = lstatIfPresent(candidate);
+  if (entry?.isSymbolicLink()) {
+    throw claimError("CLAIM_SYMLINK_ESCAPE", "Resource path is a symbolic link", { resource: canonical });
+  }
+  if (entry !== undefined) {
+    try {
+      assertWithinRoot(root, fs.realpathSync.native(candidate), canonical);
+    } catch (error: unknown) {
+      if (error instanceof SessionRegistryError) throw error;
+      throw claimError("CLAIM_SYMLINK_ESCAPE", "Resource path escapes its owning worktree", {
+        resource: canonical,
+      });
+    }
+  }
+  return canonical;
+}
+
 /** Validate a resource already persisted as canonical without requiring its worktree to exist. */
 export function assertCanonicalClaimResource(resource: string): void {
   validateResourceString(resource);

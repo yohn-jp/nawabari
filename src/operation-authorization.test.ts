@@ -6,6 +6,8 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { runCli } from "./cli.js";
+import { SessionRegistryError } from "./errors.js";
+import { defaultGit, type GitCommandRunner } from "./git.js";
 import {
   CHECKPOINT_MAX_PATHS,
   claimModeGrantsAccess,
@@ -232,6 +234,80 @@ test("checkpoint evidence is bounded, canonical, and explicitly reports out-of-c
     assert.deepEqual(evidence.paths.untracked, ["outside.txt", "untracked.txt"]);
     assert.deepEqual(evidence.inClaim, ["README.md", "staged.txt", "untracked.txt"]);
     assert.deepEqual(evidence.outOfClaim, ["outside.txt"]);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint fails closed instead of silently dropping a Git-observed path it cannot canonicalize", () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-unrepresentable`;
+  try {
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/unrepresentable" });
+    fs.writeFileSync(path.join(worktreePath, "README.md"), "changed\n");
+
+    // A fake runner injects a traversal-like path Git could theoretically report
+    // (e.g. via an unusual index state) that canonicalization must reject rather
+    // than silently drop from the changed set.
+    const injectingGit: GitCommandRunner = {
+      run(args, cwd): string {
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        if (args[0] === "status") {
+          return "?? README.md ?? ../escape.txt ";
+        }
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () => new SessionRegistry({ cwd: worktreePath, git: injectingGit }).checkpoint({ sessionId: session.sessionId }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "GIT_STATE_AMBIGUOUS" &&
+        error.details.path === "../escape.txt",
+    );
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint canonicalizes literal unusual Git path names without dropping them", () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-unusual-names`;
+  try {
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/unusual-names" });
+    fs.writeFileSync(path.join(worktreePath, "weird name, spaced 名前 🎉.txt"), "literal unusual characters\n");
+
+    const evidence = new SessionRegistry({ cwd: worktreePath }).checkpoint({ sessionId: session.sessionId });
+    assert.deepEqual(evidence.paths.untracked, ["weird name, spaced 名前 🎉.txt"]);
+    assert.deepEqual(evidence.outOfClaim, ["weird name, spaced 名前 🎉.txt"]);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint fails closed on a real Git-observed path outside the claim resource syntax", () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-real-unrepresentable`;
+  try {
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/real-unrepresentable" });
+    fs.writeFileSync(path.join(worktreePath, "literal(paren).txt"), "reserved glob syntax in a real filename\n");
+
+    assert.throws(
+      () => new SessionRegistry({ cwd: worktreePath }).checkpoint({ sessionId: session.sessionId }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "GIT_STATE_AMBIGUOUS" &&
+        error.details.path === "literal(paren).txt",
+    );
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });
