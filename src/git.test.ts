@@ -7,10 +7,14 @@ import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
 import {
+  canonicalizeGitObservedPaths,
   createGitCommandRunner,
   defaultGit,
   listGitWorktrees,
   normalizeBranchId,
+  observeGitCheckpoint,
+  observeGitMutationPaths,
+  readCanonicalCommitChangedPaths,
   resolveRepositoryContext,
   resolveWorktreeIdentity,
   verifyPhysicalExecutionContext,
@@ -219,6 +223,40 @@ test("preserves prunable status from Git's porcelain worktree inventory", () => 
     { worktreePath: path.resolve(prunablePath), branchName: "feature/prunable", prunable: true },
     { worktreePath: path.resolve(healthyPath), branchName: "main", prunable: false },
   ]);
+});
+
+test("shares canonical checkpoint and mutation observations without dropping literal path characters", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.repositoryPath, "literal*?.txt"), "untracked\n");
+
+    const checkpoint = observeGitCheckpoint(defaultGit, fixture.repositoryPath);
+    const mutation = observeGitMutationPaths(defaultGit, fixture.repositoryPath);
+
+    assert.deepEqual(checkpoint.untracked, ["literal*?.txt"]);
+    assert.deepEqual(mutation.changed, checkpoint.changed);
+    assert.deepEqual(mutation.staged, checkpoint.staged);
+    assert.throws(
+      () => canonicalizeGitObservedPaths(["../escape.txt"], fixture.repositoryPath),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "GIT_STATE_AMBIGUOUS",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("canonicalizes the exact paths reported for a resulting commit", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    fs.appendFileSync(path.join(fixture.repositoryPath, "README.md"), "committed\n");
+    runGit(["add", "README.md"], fixture.repositoryPath);
+    runGit(["commit", "-m", "changed"], fixture.repositoryPath);
+    const commitSha = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+
+    assert.deepEqual(readCanonicalCommitChangedPaths(defaultGit, fixture.repositoryPath, commitSha), ["README.md"]);
+  } finally {
+    fixture.cleanup();
+  }
 });
 
 interface RepositoryFixture {
