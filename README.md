@@ -327,9 +327,13 @@ git nawabari commit --session "$NAWABARI_SESSION_ID" \
 Governed push requires explicit claim-covered resources and an explicit
 `--remote`/`--branch` target. Existing upstream and local/remote relation are
 inspected before mutation. A missing upstream requires `--create-upstream`;
-behind or diverged history requires explicit `--force`, which uses
-`--force-with-lease`. The JSON result identifies the pushed `target` and
-reports its relation.
+behind or diverged history requires explicit `--force`. Force pushes use an
+exact `--force-with-lease` bound to the observed remote branch SHA; non-force
+pushes rely on `--no-force` without any lease option. Nawabari fetches only
+the explicit remote branch into a disposable ref when local ancestry is
+missing; it does not update tracking refs or fetch unrelated branches/tags.
+The JSON result includes the immutable `source_sha`, explicit `target_ref`,
+observed `observed_remote_sha`, and relation.
 
 ```bash
 git nawabari push --session "$NAWABARI_SESSION_ID" \

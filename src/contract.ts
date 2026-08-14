@@ -155,7 +155,16 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "governed-git-mutation",
     commands: ["commit", "push"],
     result_schema: "commit.v1 / push.v1",
-    identities: ["commit_sha", "remote", "branch", "target", "relation"],
+    identities: [
+      "commit_sha",
+      "source_sha",
+      "remote",
+      "branch",
+      "target",
+      "target_ref",
+      "observed_remote_sha",
+      "relation",
+    ],
     failure_codes: [
       "INVALID_COMMIT_MESSAGE",
       "INVALID_SESSION_ID",

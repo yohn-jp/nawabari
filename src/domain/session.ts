@@ -256,9 +256,12 @@ export type PushRelation = "no-upstream" | "up-to-date" | "ahead" | "behind" | "
 
 export type PushResult = {
   schema_version: number;
+  source_sha: string;
   remote: string;
   branch: string;
   target: string;
+  target_ref: string;
+  observed_remote_sha: string | null;
   relation: PushRelation;
   force: boolean;
   upstream_created: boolean;

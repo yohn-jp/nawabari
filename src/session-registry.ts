@@ -335,9 +335,15 @@ export interface PushOptions {
 
 export interface PushResult {
   readonly schemaVersion: typeof GOVERNED_GIT_OPERATION_SCHEMA_VERSION;
+  /** The immutable local commit SHA used as the push source. */
+  readonly sourceSha: string;
   readonly remote: string;
   readonly branch: string;
   readonly target: string;
+  /** The explicit remote ref targeted by the push. */
+  readonly targetRef: string;
+  /** The remote branch SHA observed before ancestry inspection and mutation. */
+  readonly observedRemoteSha: string | null;
   readonly relation: PushRelation;
   readonly force: boolean;
   readonly upstreamCreated: boolean;
@@ -1354,7 +1360,7 @@ export class SessionRegistry {
         );
       }
 
-      const inspection = inspectPushTarget(this.git, initial.worktreePath, remote, branch);
+      const inspection = inspectPushTarget(this.git, initial.worktreePath, remote, branch, initial.headId);
       if (inspection.upstream !== undefined && inspection.upstream !== `${remote}/${branch}`) {
         throw new SessionRegistryError(
           "PUSH_TARGET_MISMATCH",
@@ -1392,7 +1398,7 @@ export class SessionRegistry {
         });
       }
 
-      reverifyMutationContext(this, initial, sessionId, "push");
+      const finalContext = reverifyMutationContext(this, initial, sessionId, "push");
       const dirtyBeforePush = observeGitMutationPaths(this.git, initial.worktreePath);
       if (dirtyBeforePush.changed.length > 0) {
         throw new SessionRegistryError("PUSH_DIRTY_WORKTREE", "The worktree changed before push mutation", {
@@ -1400,20 +1406,38 @@ export class SessionRegistry {
         });
       }
 
+      const targetRef = `refs/heads/${branch}`;
+      const leaseValue = inspection.observedRemoteSha ?? "";
       const pushArguments = [
         "push",
-        ...(force ? ["--force-with-lease"] : []),
+        ...(force ? [`--force-with-lease=${targetRef}:${leaseValue}`] : ["--no-force"]),
         ...(createUpstream ? ["--set-upstream"] : []),
         remote,
-        `HEAD:refs/heads/${branch}`,
+        `${finalContext.headId}:${targetRef}`,
       ];
       runMutationGit(this.git, pushArguments, initial.worktreePath, "push", "PUSH_FAILED");
+      if (createUpstream) {
+        // A SHA:ref refspec is intentional: it cannot be redirected by a
+        // mutable symbolic HEAD. Git does not consistently infer the current
+        // branch's tracking configuration from a raw SHA source, so complete
+        // the explicitly requested local upstream setup after the push.
+        runMutationGit(
+          this.git,
+          ["branch", "--set-upstream-to", `${remote}/${branch}`, branch],
+          initial.worktreePath,
+          "set-upstream",
+          "PUSH_FAILED",
+        );
+      }
 
       return Object.freeze({
         schemaVersion: GOVERNED_GIT_OPERATION_SCHEMA_VERSION,
+        sourceSha: finalContext.headId,
         remote,
         branch,
         target: `${remote}/${branch}`,
+        targetRef,
+        observedRemoteSha: inspection.observedRemoteSha,
         relation: inspection.relation,
         force,
         upstreamCreated: createUpstream,
@@ -2735,8 +2759,11 @@ function canonicalOperationResources(resources: readonly string[], worktreePath:
 }
 
 interface PushInspection {
+  readonly sourceSha: string;
   readonly relation: PushRelation;
   readonly upstream: string | undefined;
+  readonly targetRef: string;
+  readonly observedRemoteSha: string | null;
 }
 
 function operationSessionId(first: string | null | undefined, second: string | null | undefined): string | null {
@@ -2908,7 +2935,14 @@ function runMutationGit(
   }
 }
 
-function inspectPushTarget(git: GitCommandRunner, cwd: string, remote: string, branch: string): PushInspection {
+function inspectPushTarget(
+  git: GitCommandRunner,
+  cwd: string,
+  remote: string,
+  branch: string,
+  sourceSha: string,
+): PushInspection {
+  const targetRef = `refs/heads/${branch}`;
   try {
     git.run(["remote", "get-url", remote], cwd);
   } catch (error: unknown) {
@@ -2917,7 +2951,7 @@ function inspectPushTarget(git: GitCommandRunner, cwd: string, remote: string, b
 
   let remoteTargetOutput: string;
   try {
-    remoteTargetOutput = git.run(["ls-remote", "--heads", remote, `refs/heads/${branch}`], cwd);
+    remoteTargetOutput = git.run(["ls-remote", "--heads", remote, targetRef], cwd);
   } catch (error: unknown) {
     throwRemoteInspectionFailure(error, "ls-remote");
   }
@@ -2944,7 +2978,13 @@ function inspectPushTarget(git: GitCommandRunner, cwd: string, remote: string, b
   if (upstream === undefined) {
     // The absence of an upstream is itself a first-class relation. A remote
     // branch may exist, but it must not silently become tracking state.
-    return { relation: "no-upstream", upstream: undefined };
+    return {
+      sourceSha,
+      relation: "no-upstream",
+      upstream: undefined,
+      targetRef,
+      observedRemoteSha: remoteTargetExists ? extractRemoteSha(remoteTargetOutput, remote, branch) : null,
+    };
   }
 
   const separator = upstream.indexOf("/");
@@ -2978,18 +3018,59 @@ function inspectPushTarget(git: GitCommandRunner, cwd: string, remote: string, b
   }
   const remoteSha = remoteShaMatch[1];
 
-  let headSha: string;
+  const temporaryRef = `refs/nawabari/push-inspection/${remoteSha}`;
+  let relationOutput: string | undefined;
+  let inspectionError: unknown;
   try {
-    headSha = git.run(["rev-parse", "HEAD"], cwd).trim();
+    try {
+      // Fetch only the explicitly inspected remote branch into a disposable
+      // ref. This obtains missing ancestry without mutating tracking refs or
+      // fetching unrelated branches/tags.
+      // Requires Git 2.29 or later for --no-write-fetch-head support.
+      // Unsupported Git versions will fail here and surface as
+      // PUSH_REMOTE_INSPECTION_FAILED via throwRemoteInspectionFailure.
+      git.run(
+        ["fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", remote, `+${targetRef}:${temporaryRef}`],
+        cwd,
+      );
+      const fetchedSha = git.run(["rev-parse", "--verify", temporaryRef], cwd).trim();
+      if (fetchedSha !== remoteSha) {
+        throw new SessionRegistryError(
+          "PUSH_REMOTE_INSPECTION_FAILED",
+          "The remote branch changed while its observed generation was being fetched",
+          {
+            remote,
+            branch,
+            observedRemoteSha: remoteSha,
+            fetchedRemoteSha: fetchedSha,
+          },
+        );
+      }
+    } catch (error: unknown) {
+      if (error instanceof SessionRegistryError && error.code === "PUSH_REMOTE_INSPECTION_FAILED") throw error;
+      throwRemoteInspectionFailure(error, "remote-generation");
+    }
+
+    try {
+      relationOutput = git.run(["rev-list", "--left-right", "--count", `${sourceSha}...${temporaryRef}`], cwd);
+    } catch (error: unknown) {
+      throwRemoteInspectionFailure(error, "relation");
+    }
   } catch (error: unknown) {
-    throwRemoteInspectionFailure(error, "HEAD");
+    inspectionError = error;
   }
 
-  let relationOutput: string;
   try {
-    relationOutput = git.run(["rev-list", "--left-right", "--count", `HEAD...${remoteSha}`], cwd);
+    git.run(["update-ref", "-d", temporaryRef], cwd);
   } catch (error: unknown) {
-    throwRemoteInspectionFailure(error, "relation");
+    if (inspectionError === undefined) throwRemoteInspectionFailure(error, "remote-generation-cleanup");
+  }
+  if (inspectionError !== undefined) throw inspectionError;
+  if (relationOutput === undefined) {
+    throw new SessionRegistryError("PUSH_REMOTE_INSPECTION_FAILED", "Remote ancestry relation was unavailable", {
+      remote,
+      branch,
+    });
   }
   const counts = relationOutput
     .trim()
@@ -3004,7 +3085,19 @@ function inspectPushTarget(git: GitCommandRunner, cwd: string, remote: string, b
   const [ahead, behind] = counts as [number, number];
   const relation: PushRelation =
     ahead > 0 && behind > 0 ? "diverged" : behind > 0 ? "behind" : ahead > 0 ? "ahead" : "up-to-date";
-  return { relation, upstream };
+  return { sourceSha, relation, upstream, targetRef, observedRemoteSha: remoteSha };
+}
+
+function extractRemoteSha(remoteTargetOutput: string, remote: string, branch: string): string {
+  const remoteShaMatch = remoteTargetOutput.trim().match(/^([0-9a-f]{40,64})\s+/u);
+  if (remoteShaMatch === null) {
+    throw new SessionRegistryError(
+      "PUSH_REMOTE_INSPECTION_FAILED",
+      "Could not extract remote SHA from ls-remote output",
+      { remote, branch },
+    );
+  }
+  return remoteShaMatch[1];
 }
 
 function isExpectedMissingRef(error: unknown): boolean {
