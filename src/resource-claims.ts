@@ -182,7 +182,7 @@ export function canonicalizeConcretePath(resource: string, worktreePath: string)
   const canonical = canonicalResourceSyntax(resource);
   const root = canonicalWorktreeRoot(worktreePath);
   const segments = canonical.split("/");
-  const candidate = path.resolve(root, ...segments);
+  const candidate = walkStaticPath(root, segments, canonical);
   assertWithinRoot(root, candidate, canonical);
   const entry = lstatIfPresent(candidate);
   if (entry?.isSymbolicLink()) {

@@ -58,14 +58,16 @@ failure. Consumers must use these fields and codes, never human presentation.
 
 The result schemas expose the following identities:
 
-| Surface                | Versioned identities                                                                                      |
-| ---------------------- | --------------------------------------------------------------------------------------------------------- |
-| session lifecycle      | `session_id`, `repository`, `worktree`, `branch`, `state`                                                 |
-| claims                 | `claim_id`, `session_id`, `resource`, `mode`                                                              |
-| authorization          | `operation`, `allowed`, `code`, `claim_ids`                                                               |
-| checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim`                          |
-| commit/push            | `commit_sha`, `source_sha`, `remote`, `branch`, `target`, `target_ref`, `observed_remote_sha`, `relation` |
-| reconciliation/cleanup | `clean`, `issues`, `candidates`, `cleaned`, `blocked`, `recovery_hints`                                   |
+| Surface                | Versioned identities                                                             |
+| ---------------------- | -------------------------------------------------------------------------------- |
+| session lifecycle      | `session_id`, `repository`, `worktree`, `branch`, `state`                        |
+| claims                 | `claim_id`, `session_id`, `resource`, `mode`                                     |
+| authorization          | `operation`, `allowed`, `code`, `claim_ids`                                      |
+| checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim` |
+| repository evidence    | `session_id`, `base_revision`, `head`, `clean`, `paths.stats`, `evidence_hash`   |
+| bounded diff           | `from_revision`, `to_revision`, `paths`, `stats`, `patch`, `evidence_hash`       |
+| commit/push            | `commit_sha`, `remote`, `branch`, `target`, `relation`                           |
+| reconciliation/cleanup | `clean`, `issues`, `candidates`, `cleaned`, `blocked`, `recovery_hints`          |
 
 Git subprocesses are bounded at 10 seconds and 64 KiB of output; checkpoint
 evidence is bounded to 4,096 paths. `GIT_SPAWN_FAILED`, `GIT_TIMEOUT`,
@@ -73,6 +75,35 @@ evidence is bounded to 4,096 paths. `GIT_SPAWN_FAILED`, `GIT_TIMEOUT`,
 The local lifecycle requires Git and the repository-local registry/lock only;
 it does not require Mottainai, GitHub, `gh`, network access, an LLM, or a
 coding-agent runtime.
+
+## Read-only repository evidence
+
+The evidence family is session-addressed and has no task, Issue, semantic, or
+GitHub interpretation. It is the physical repository authority for one owned
+session:
+
+```bash
+git nawabari evidence snapshot --session "$NAWABARI_SESSION_ID" --json
+git nawabari diff --session "$NAWABARI_SESSION_ID" --path src/example.ts --json
+git nawabari diff --session "$NAWABARI_SESSION_ID" --path src/example.ts \
+  --patch --max-bytes 32768 --max-hunks 32 --json
+```
+
+`evidence snapshot` verifies the registry's repository/worktree/branch owner,
+then reuses checkpoint's exact NUL-safe Git observation for `changed`,
+`staged`, `unstaged`, and `untracked` paths. It also reports canonical per-path
+stats, `clean`, the current `head`, session state, and an `evidence_hash`.
+New sessions persist the exact creation/base revision as `base_revision`;
+legacy records that lack this field report `base_revision: null` and
+`base_revision_proven: false` rather than inferring it from a mutable ref.
+
+`diff` requires at least one explicit concrete path and never accepts a glob or
+an empty repository-wide selection. Stats are returned by default. Patch text
+requires `--patch` and is bounded to at most 64 paths, 64 KiB, and 128 hunks;
+the caller may request smaller limits. Unrepresentable Git observations fail
+with `GIT_STATE_AMBIGUOUS`; a requested path whose stat is not exposed by Git
+remains in the result with `available: false` and makes snapshot evidence
+`complete: false`, so no path silently disappears.
 
 ## Session lifecycle
 

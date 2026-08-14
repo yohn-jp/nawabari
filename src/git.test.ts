@@ -14,6 +14,7 @@ import {
   normalizeBranchId,
   observeGitCheckpoint,
   observeGitMutationPaths,
+  readBoundedGitDiff,
   readCanonicalCommitChangedPaths,
   resolveRepositoryContext,
   resolveWorktreeIdentity,
@@ -254,6 +255,47 @@ test("canonicalizes the exact paths reported for a resulting commit", () => {
     const commitSha = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
 
     assert.deepEqual(readCanonicalCommitChangedPaths(defaultGit, fixture.repositoryPath, commitSha), ["README.md"]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("reads bounded literal-path stats and patch evidence without widening the selection", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const literalPath = "literal*?.txt";
+    fs.writeFileSync(path.join(fixture.repositoryPath, literalPath), "before\n");
+    runGit(["add", "--", literalPath], fixture.repositoryPath);
+    runGit(["commit", "-m", "literal"], fixture.repositoryPath);
+    fs.appendFileSync(path.join(fixture.repositoryPath, literalPath), "after\n");
+
+    const diff = readBoundedGitDiff(defaultGit, fixture.repositoryPath, {
+      paths: [literalPath],
+      includePatch: true,
+      maxBytes: 4_096,
+      maxHunks: 4,
+    });
+
+    assert.deepEqual(diff.paths, [literalPath]);
+    assert.equal(diff.stats.length, 1);
+    assert.deepEqual(diff.stats[0], {
+      path: literalPath,
+      additions: 1,
+      deletions: 0,
+      binary: false,
+      available: true,
+    });
+    assert.match(diff.patch ?? "", /after/u);
+    assert.equal(diff.hunkCount, 1);
+    assert.throws(
+      () =>
+        readBoundedGitDiff(defaultGit, fixture.repositoryPath, {
+          paths: [literalPath],
+          includePatch: true,
+          maxBytes: 1,
+        }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "GIT_OUTPUT_LIMIT",
+    );
   } finally {
     fixture.cleanup();
   }

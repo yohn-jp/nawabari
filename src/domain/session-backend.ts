@@ -11,6 +11,10 @@ import {
   type BackendCapabilities,
   type CheckpointEvidence,
   type CheckpointOptions,
+  type RepositoryDiffEvidence,
+  type RepositoryDiffOptions,
+  type RepositoryEvidence,
+  type RepositoryEvidenceOptions,
   type CommitOptions,
   type CommitResult,
   type ClaimResourcesOptions,
@@ -50,6 +54,7 @@ export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
   lifecycle: true,
   garbage_collection: true,
   current_session_resolution: true,
+  repository_evidence: true,
 });
 
 const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = Object.freeze({
@@ -216,6 +221,42 @@ export class LocalSessionBackend implements SessionBackend {
         toDomainCheckpointEvidence(
           this.registryFor(context).checkpoint({
             sessionId: options.session_id,
+          }),
+        ),
+      );
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async repositoryEvidence(
+    context: SessionContext,
+    options: RepositoryEvidenceOptions,
+  ): Promise<DomainResult<RepositoryEvidence>> {
+    try {
+      return success(
+        toDomainRepositoryEvidence(this.registryFor(context).repositoryEvidence({ sessionId: options.session_id })),
+      );
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async repositoryDiff(
+    context: SessionContext,
+    options: RepositoryDiffOptions,
+  ): Promise<DomainResult<RepositoryDiffEvidence>> {
+    try {
+      return success(
+        toDomainRepositoryDiff(
+          this.registryFor(context).repositoryDiff({
+            sessionId: options.session_id,
+            paths: options.paths,
+            from: options.from ?? undefined,
+            to: options.to ?? undefined,
+            includePatch: options.include_patch,
+            maxBytes: options.max_bytes ?? undefined,
+            maxHunks: options.max_hunks ?? undefined,
           }),
         ),
       );
@@ -403,6 +444,7 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
     state: record.state,
     created_at: record.createdAt,
     updated_at: record.updatedAt,
+    ...(record.baseRevision === undefined ? {} : { base_revision: record.baseRevision }),
     ...(record.label === undefined ? {} : { label: record.label }),
   };
 }
@@ -472,6 +514,73 @@ function toDomainCheckpointEvidence(
     in_claim: [...evidence.inClaim],
     out_of_claim: [...evidence.outOfClaim],
     max_paths: evidence.maxPaths,
+  };
+}
+
+function toDomainRepositoryEvidence(
+  evidence: import("../repository-evidence.js").RepositoryEvidenceSnapshot,
+): RepositoryEvidence {
+  return {
+    schema_version: evidence.schemaVersion,
+    source: evidence.source,
+    guarantee: evidence.guarantee,
+    repository: evidence.repositoryId,
+    worktree: evidence.worktreePath,
+    branch_id: evidence.branchId,
+    branch: evidence.branchName,
+    session_id: evidence.sessionId,
+    session_state: evidence.sessionState as RepositoryEvidence["session_state"],
+    session_created_at: evidence.sessionCreatedAt,
+    session_updated_at: evidence.sessionUpdatedAt,
+    base_revision: evidence.baseRevision,
+    base_revision_proven: evidence.baseRevisionProven,
+    head: evidence.headId,
+    clean: evidence.clean,
+    complete: evidence.complete,
+    incomplete_reasons: [...evidence.incompleteReasons],
+    paths: {
+      changed: [...evidence.paths.changed],
+      staged: [...evidence.paths.staged],
+      unstaged: [...evidence.paths.unstaged],
+      untracked: [...evidence.paths.untracked],
+      stats: evidence.paths.stats.map((stat) => ({ ...stat })),
+    },
+    evidence_hash: evidence.evidenceHash,
+    bounds: {
+      max_paths: evidence.bounds.maxPaths,
+      max_diff_paths: evidence.bounds.maxDiffPaths,
+      max_diff_bytes: evidence.bounds.maxDiffBytes,
+      max_diff_hunks: evidence.bounds.maxDiffHunks,
+    },
+  };
+}
+
+function toDomainRepositoryDiff(
+  evidence: import("../repository-evidence.js").RepositoryDiffEvidence,
+): RepositoryDiffEvidence {
+  return {
+    schema_version: evidence.schemaVersion,
+    source: evidence.source,
+    guarantee: evidence.guarantee,
+    repository: evidence.repositoryId,
+    worktree: evidence.worktreePath,
+    branch_id: evidence.branchId,
+    branch: evidence.branchName,
+    session_id: evidence.sessionId,
+    session_state: evidence.sessionState as RepositoryDiffEvidence["session_state"],
+    head: evidence.headId,
+    from_revision: evidence.fromRevision,
+    to_revision: evidence.toRevision,
+    paths: [...evidence.paths],
+    stats: evidence.stats.map((stat) => ({ ...stat })),
+    complete: evidence.complete,
+    incomplete_reasons: [...evidence.incompleteReasons],
+    patch: evidence.patch,
+    patch_bytes: evidence.patchBytes,
+    hunk_count: evidence.hunkCount,
+    max_bytes: evidence.maxBytes,
+    max_hunks: evidence.maxHunks,
+    evidence_hash: evidence.evidenceHash,
   };
 }
 

@@ -4,6 +4,8 @@ import { DomainError, EXIT_CODES, failure, type DomainResult, type JsonObject } 
 import {
   type GarbageCollectOptions,
   type CheckpointOptions,
+  type RepositoryDiffOptions,
+  type RepositoryEvidenceOptions,
   type OperationAuthorizationOptions,
   type SessionBackend,
   type SessionCloseOptions,
@@ -12,6 +14,7 @@ import {
   type SessionListOptions,
   MAX_SESSION_LIST_LIMIT,
 } from "./domain/session.js";
+import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS, EVIDENCE_MAX_DIFF_PATHS } from "./repository-evidence.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
@@ -174,6 +177,27 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     summary: "Capture bounded Git execution evidence",
     usage: `${CLI_NAME} checkpoint [--session <id>]`,
     options: [option("--session", "Assert the current session identity", { value: "<id>" })],
+  },
+  {
+    name: "evidence snapshot",
+    summary: "Capture bounded read-only evidence for one owned session",
+    usage: `${CLI_NAME} evidence snapshot --session <id>`,
+    options: [option("--session", "Explicit owned session to observe", { value: "<id>", required: true })],
+    notes: ["The result is Git-observable physical evidence only; it contains no task or semantic interpretation."],
+  },
+  {
+    name: "diff",
+    summary: "Inspect bounded Git evidence for explicit paths",
+    usage: `${CLI_NAME} diff --session <id> --path <path> [options]`,
+    options: [
+      option("--session", "Explicit owned session to observe", { value: "<id>", required: true }),
+      option("--path", "Concrete repository-relative path; repeatable", { value: "<path>", required: true }),
+      option("--from", "Commit/ref at the start of the range", { value: "<ref>", default: "HEAD" }),
+      option("--to", "Commit/ref at the end of the range; omitted means worktree", { value: "<ref>" }),
+      option("--patch", "Include patch text; requires the bounded byte/hunk limits"),
+      option("--max-bytes", "Maximum UTF-8 patch bytes", { value: "<n>", default: String(EVIDENCE_MAX_DIFF_BYTES) }),
+      option("--max-hunks", "Maximum patch hunks", { value: "<n>", default: String(EVIDENCE_MAX_DIFF_HUNKS) }),
+    ],
   },
   {
     name: "commit",
@@ -397,6 +421,12 @@ type ParsedOptions = {
   history: boolean;
   limit: string | null;
   offset: string | null;
+  paths: string[];
+  from_revision: string | null;
+  to_revision: string | null;
+  patch: boolean;
+  max_bytes: string | null;
+  max_hunks: string | null;
 };
 
 function usageError(
@@ -464,6 +494,12 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     history: false,
     limit: null,
     offset: null,
+    paths: [],
+    from_revision: null,
+    to_revision: null,
+    patch: false,
+    max_bytes: null,
+    max_hunks: null,
   };
   let dryRun = false;
 
@@ -479,7 +515,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       name === "--force" ||
       name === "--create-upstream" ||
       name === "--all" ||
-      name === "--history"
+      name === "--history" ||
+      name === "--patch"
     ) {
       if (inlineValue !== null) {
         return failure(usageError("INVALID_ARGUMENT", `${name} does not accept a value.`, { option: name }));
@@ -489,7 +526,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       else if (name === "--force") options.force = true;
       else if (name === "--create-upstream") options.create_upstream = true;
       else if (name === "--all") options.all = true;
-      else options.history = true;
+      else if (name === "--history") options.history = true;
+      else options.patch = true;
       continue;
     }
 
@@ -517,6 +555,11 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--repository") options.repository = value;
     else if (name === "--limit") options.limit = value;
     else if (name === "--offset") options.offset = value;
+    else if (name === "--path") options.paths.push(value);
+    else if (name === "--from") options.from_revision = value;
+    else if (name === "--to") options.to_revision = value;
+    else if (name === "--max-bytes") options.max_bytes = value;
+    else if (name === "--max-hunks") options.max_hunks = value;
   }
 
   if (options.apply && dryRun) {
@@ -563,6 +606,22 @@ function sessionListingOptions(parsed: ParsedOptions): DomainResult<SessionListO
       ...(offset.value === undefined ? {} : { offset: offset.value }),
     },
   };
+}
+
+function boundedEvidenceInteger(
+  option: "--max-bytes" | "--max-hunks",
+  value: string | null,
+  max: number,
+): DomainResult<number | undefined> {
+  if (value === null) return { ok: true, value: undefined };
+  if (!/^\d+$/u.test(value)) {
+    return failure(usageError("INVALID_ARGUMENT", `${option} requires a positive integer.`, { option, value }));
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
+    return failure(usageError("INVALID_ARGUMENT", `${option} must be between 1 and ${max}.`, { option, max, value }));
+  }
+  return { ok: true, value: parsed };
 }
 
 function sessionContext(cwd: string): SessionContext {
@@ -746,6 +805,60 @@ async function executeCommand(
     return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
   }
 
+  if (command === "evidence" && subcommand === "snapshot") {
+    const parsed = parseOptions(rest, new Set(["--session"]));
+    if (!parsed.ok) return parsed;
+    if (parsed.value.session_id === null) {
+      return failure(usageError("MISSING_ARGUMENT", "evidence snapshot requires --session.", { option: "--session" }));
+    }
+    if (dependencies.backend.repositoryEvidence === undefined) {
+      return repositoryEvidenceCapabilityUnavailable("evidence snapshot");
+    }
+    const options: RepositoryEvidenceOptions = { session_id: parsed.value.session_id };
+    const result = await dependencies.backend.repositoryEvidence(context, options);
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  }
+
+  if (command === "diff") {
+    const parsed = parseOptions(
+      [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
+      new Set(["--session", "--path", "--from", "--to", "--patch", "--max-bytes", "--max-hunks"]),
+    );
+    if (!parsed.ok) return parsed;
+    if (parsed.value.session_id === null) {
+      return failure(usageError("MISSING_ARGUMENT", "diff requires --session.", { option: "--session" }));
+    }
+    if (parsed.value.paths.length === 0) {
+      return failure(usageError("MISSING_ARGUMENT", "diff requires at least one --path.", { option: "--path" }));
+    }
+    if (parsed.value.paths.length > EVIDENCE_MAX_DIFF_PATHS) {
+      return failure(
+        usageError("INVALID_ARGUMENT", `diff accepts at most ${EVIDENCE_MAX_DIFF_PATHS} paths.`, {
+          option: "--path",
+          max: EVIDENCE_MAX_DIFF_PATHS,
+        }),
+      );
+    }
+    const maxBytes = boundedEvidenceInteger("--max-bytes", parsed.value.max_bytes, EVIDENCE_MAX_DIFF_BYTES);
+    if (!maxBytes.ok) return maxBytes;
+    const maxHunks = boundedEvidenceInteger("--max-hunks", parsed.value.max_hunks, EVIDENCE_MAX_DIFF_HUNKS);
+    if (!maxHunks.ok) return maxHunks;
+    if (dependencies.backend.repositoryDiff === undefined) {
+      return repositoryEvidenceCapabilityUnavailable("diff");
+    }
+    const options: RepositoryDiffOptions = {
+      session_id: parsed.value.session_id,
+      paths: parsed.value.paths,
+      from: parsed.value.from_revision,
+      to: parsed.value.to_revision,
+      include_patch: parsed.value.patch,
+      max_bytes: maxBytes.value,
+      max_hunks: maxHunks.value,
+    };
+    const result = await dependencies.backend.repositoryDiff(context, options);
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  }
+
   if (command === "commit") {
     const parsed = parseOptions(
       [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
@@ -894,6 +1007,7 @@ async function executeCommand(
 function commandName(commandArguments: string[]): string {
   if (commandArguments[0] === "session") return commandArguments.slice(0, 2).join(" ");
   if (commandArguments[0] === "resource") return commandArguments.slice(0, 2).join(" ");
+  if (commandArguments[0] === "evidence") return commandArguments.slice(0, 2).join(" ");
   return commandArguments[0] ?? "cli";
 }
 
@@ -914,6 +1028,12 @@ function checkpointCapabilityUnavailable(): DomainResult<JsonObject> {
     new DomainError("BACKEND_UNAVAILABLE", "Checkpoint evidence capability is not available.", {
       operation: "checkpoint",
     }),
+  );
+}
+
+function repositoryEvidenceCapabilityUnavailable(operation: string): DomainResult<JsonObject> {
+  return failure(
+    new DomainError("BACKEND_UNAVAILABLE", "Repository evidence capability is not available.", { operation }),
   );
 }
 

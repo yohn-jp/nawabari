@@ -13,6 +13,7 @@ export type SessionRecord = {
   state: SessionState;
   created_at: string;
   updated_at: string;
+  base_revision?: string;
   label?: string;
 };
 
@@ -152,6 +153,81 @@ export type CheckpointEvidence = {
   max_paths: number;
 };
 
+export type RepositoryEvidenceStat = {
+  path: string;
+  additions: number | null;
+  deletions: number | null;
+  binary: boolean | null;
+  available: boolean;
+};
+
+export type RepositoryEvidence = {
+  schema_version: number;
+  source: "git";
+  guarantee: "git-observable-only";
+  repository: string;
+  worktree: string;
+  branch_id: string;
+  branch: string;
+  session_id: string;
+  session_state: SessionState;
+  session_created_at: string;
+  session_updated_at: string;
+  base_revision: string | null;
+  base_revision_proven: boolean;
+  head: string;
+  clean: boolean;
+  complete: boolean;
+  incomplete_reasons: string[];
+  paths: CheckpointPaths & { stats: RepositoryEvidenceStat[] };
+  evidence_hash: string;
+  bounds: {
+    max_paths: number;
+    max_diff_paths: number;
+    max_diff_bytes: number;
+    max_diff_hunks: number;
+  };
+};
+
+export type RepositoryEvidenceOptions = {
+  session_id: string;
+};
+
+export type RepositoryDiffOptions = {
+  session_id: string;
+  paths: string[];
+  from?: string | null;
+  to?: string | null;
+  include_patch: boolean;
+  max_bytes?: number | null;
+  max_hunks?: number | null;
+};
+
+export type RepositoryDiffEvidence = {
+  schema_version: number;
+  source: "git";
+  guarantee: "git-observable-only";
+  repository: string;
+  worktree: string;
+  branch_id: string;
+  branch: string;
+  session_id: string;
+  session_state: SessionState;
+  head: string;
+  from_revision: string;
+  to_revision: string | null;
+  paths: string[];
+  stats: RepositoryEvidenceStat[];
+  complete: boolean;
+  incomplete_reasons: string[];
+  patch: string | null;
+  patch_bytes: number;
+  hunk_count: number;
+  max_bytes: number;
+  max_hunks: number;
+  evidence_hash: string;
+};
+
 export type CommitOptions = {
   session_id: string | null;
   message: string;
@@ -201,6 +277,7 @@ export type BackendCapabilities = {
   lifecycle: boolean;
   garbage_collection: boolean;
   current_session_resolution: boolean;
+  repository_evidence?: boolean;
 };
 
 /**
@@ -312,6 +389,14 @@ export interface SessionBackend {
     options: OperationAuthorizationOptions,
   ): Promise<DomainResult<OperationAuthorizationDecision>>;
   checkpoint?(context: SessionContext, options: CheckpointOptions): Promise<DomainResult<CheckpointEvidence>>;
+  repositoryEvidence?(
+    context: SessionContext,
+    options: RepositoryEvidenceOptions,
+  ): Promise<DomainResult<RepositoryEvidence>>;
+  repositoryDiff?(
+    context: SessionContext,
+    options: RepositoryDiffOptions,
+  ): Promise<DomainResult<RepositoryDiffEvidence>>;
   commit?(context: SessionContext, options: CommitOptions): Promise<DomainResult<CommitResult>>;
   push?(context: SessionContext, options: PushOptions): Promise<DomainResult<PushResult>>;
   listSessions(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<SessionListResult>>;
@@ -330,6 +415,7 @@ const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {
   lifecycle: false,
   garbage_collection: false,
   current_session_resolution: false,
+  repository_evidence: false,
 };
 
 export function unavailableCapabilities(): BackendCapabilities {
