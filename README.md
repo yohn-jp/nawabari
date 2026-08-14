@@ -58,14 +58,14 @@ failure. Consumers must use these fields and codes, never human presentation.
 
 The result schemas expose the following identities:
 
-| Surface                | Versioned identities                                                             |
-| ---------------------- | -------------------------------------------------------------------------------- |
-| session lifecycle      | `session_id`, `repository`, `worktree`, `branch`, `state`                        |
-| claims                 | `claim_id`, `session_id`, `resource`, `mode`                                     |
-| authorization          | `operation`, `allowed`, `code`, `claim_ids`                                      |
-| checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim` |
-| commit/push            | `commit_sha`, `remote`, `branch`, `target`, `relation`                           |
-| reconciliation/cleanup | `clean`, `issues`, `candidates`, `cleaned`, `blocked`, `recovery_hints`          |
+| Surface                | Versioned identities                                                                                      |
+| ---------------------- | --------------------------------------------------------------------------------------------------------- |
+| session lifecycle      | `session_id`, `repository`, `worktree`, `branch`, `state`                                                 |
+| claims                 | `claim_id`, `session_id`, `resource`, `mode`                                                              |
+| authorization          | `operation`, `allowed`, `code`, `claim_ids`                                                               |
+| checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim`                          |
+| commit/push            | `commit_sha`, `source_sha`, `remote`, `branch`, `target`, `target_ref`, `observed_remote_sha`, `relation` |
+| reconciliation/cleanup | `clean`, `issues`, `candidates`, `cleaned`, `blocked`, `recovery_hints`                                   |
 
 Git subprocesses are bounded at 10 seconds and 64 KiB of output; checkpoint
 evidence is bounded to 4,096 paths. `GIT_SPAWN_FAILED`, `GIT_TIMEOUT`,
@@ -296,9 +296,12 @@ git nawabari commit --session "$NAWABARI_SESSION_ID" \
 Governed push requires explicit claim-covered resources and an explicit
 `--remote`/`--branch` target. Existing upstream and local/remote relation are
 inspected before mutation. A missing upstream requires `--create-upstream`;
-behind or diverged history requires explicit `--force`, which uses
-`--force-with-lease`. The JSON result identifies the pushed `target` and
-reports its relation.
+behind or diverged history requires explicit `--force`, which uses an exact
+`--force-with-lease` bound to the observed remote branch SHA. Nawabari fetches
+only the explicit remote branch into a disposable ref when local ancestry is
+missing; it does not update tracking refs or fetch unrelated branches/tags.
+The JSON result includes the immutable `source_sha`, explicit `target_ref`,
+observed `observed_remote_sha`, and relation.
 
 ```bash
 git nawabari push --session "$NAWABARI_SESSION_ID" \

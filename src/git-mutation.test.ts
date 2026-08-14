@@ -502,17 +502,25 @@ test("push distinguishes missing upstream, creates it explicitly, and reports th
     );
     const pushed = fixture.current.push({ ...options, createUpstream: true });
     assert.equal(pushed.target, `origin/${fixture.session.branchName}`);
+    assert.match(pushed.sourceSha, /^[0-9a-f]{40}$/u);
+    assert.equal(pushed.targetRef, `refs/heads/${fixture.session.branchName}`);
+    assert.equal(pushed.observedRemoteSha, null);
     assert.equal(pushed.relation, "no-upstream");
     assert.equal(pushed.upstreamCreated, true);
     assert.equal(
       runGit(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], fixture.worktree),
       `origin/${fixture.session.branchName}`,
     );
+    const upToDate = fixture.current.push({ ...options, createUpstream: false });
+    assert.equal(upToDate.relation, "up-to-date");
+    assert.equal(upToDate.sourceSha, pushed.sourceSha);
+    assert.equal(upToDate.observedRemoteSha, pushed.sourceSha);
     fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "ahead\n");
     runGit(["add", "file.txt"], fixture.worktree);
     runGit(["commit", "-m", "ahead"], fixture.worktree);
     const ahead = fixture.current.push({ ...options, createUpstream: false });
     assert.equal(ahead.relation, "ahead");
+    assert.equal(ahead.observedRemoteSha, pushed.sourceSha);
   } finally {
     fixture.cleanup();
   }
@@ -670,6 +678,10 @@ test("push distinguishes behind and diverged histories and requires explicit for
       createUpstream: true,
     } as const;
     fixture.current.push(options);
+    const trackingShaBeforeRemoteAdvance = runGit(
+      ["rev-parse", `refs/remotes/origin/${fixture.session.branchName}`],
+      fixture.worktree,
+    );
     runGit(["clone", fixture.remote as string, clone], clone);
     runGit(["config", "user.email", "remote@example.invalid"], clone);
     runGit(["config", "user.name", "Remote"], clone);
@@ -677,22 +689,154 @@ test("push distinguishes behind and diverged histories and requires explicit for
     fs.appendFileSync(path.join(clone, "file.txt"), "remote\n");
     runGit(["commit", "-am", "remote"], clone);
     runGit(["push", "origin", `HEAD:refs/heads/${fixture.session.branchName}`], clone);
-    runGit(["fetch", "origin"], fixture.worktree);
+
+    const observedCommands: string[][] = [];
+    const observingGit: GitCommandRunner = {
+      run(args, cwd): string {
+        observedCommands.push([...args]);
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        observedCommands.push([...args]);
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+    const inspected = new SessionRegistry({ cwd: fixture.worktree, git: observingGit });
 
     assert.throws(
-      () => fixture.current.push({ ...options, createUpstream: false }),
+      () => inspected.push({ ...options, createUpstream: false }),
       (error: unknown) => error instanceof SessionRegistryError && error.code === "PUSH_BEHIND",
+    );
+    const fetchCommand = observedCommands.find((args) => args[0] === "fetch");
+    assert.ok(fetchCommand !== undefined);
+    assert.ok(fetchCommand.includes("--no-tags"));
+    assert.ok(fetchCommand.includes("--no-write-fetch-head"));
+    assert.ok(fetchCommand.includes("--refmap="));
+    assert.ok(fetchCommand.some((argument) => argument.startsWith(`+refs/heads/${fixture.session.branchName}:`)));
+    assert.ok(!fetchCommand.includes("--all"));
+    assert.ok(!fetchCommand.includes("--multiple"));
+    assert.equal(
+      runGit(["rev-parse", `refs/remotes/origin/${fixture.session.branchName}`], fixture.worktree),
+      trackingShaBeforeRemoteAdvance,
+    );
+    assert.equal(
+      runGit(["for-each-ref", "--format=%(refname)", "refs/nawabari/push-inspection"], fixture.worktree),
+      "",
     );
 
     fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "local\n");
     runGit(["commit", "-am", "local"], fixture.worktree);
     assert.throws(
-      () => fixture.current.push({ ...options, createUpstream: false }),
+      () => inspected.push({ ...options, createUpstream: false }),
       (error: unknown) => error instanceof SessionRegistryError && error.code === "PUSH_DIVERGED",
     );
-    const forced = fixture.current.push({ ...options, createUpstream: false, force: true });
+    const forced = inspected.push({ ...options, createUpstream: false, force: true });
     assert.equal(forced.relation, "diverged");
     assert.equal(forced.force, true);
+  } finally {
+    fs.rmSync(clone, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("push sends the captured source SHA and exact observed remote lease", () => {
+  const fixture = createFixture(true);
+  try {
+    claim(fixture);
+    const options = {
+      sessionId: fixture.session.sessionId,
+      resources: ["file.txt"],
+      remote: "origin",
+      branch: fixture.session.branchName,
+    } as const;
+    const initial = fixture.current.push({ ...options, createUpstream: true });
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "local\n");
+    runGit(["commit", "-am", "local"], fixture.worktree);
+    const sourceSha = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    const commands: string[][] = [];
+    const observingGit: GitCommandRunner = {
+      run(args, cwd): string {
+        commands.push([...args]);
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        commands.push([...args]);
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    const result = new SessionRegistry({ cwd: fixture.worktree, git: observingGit }).push({
+      ...options,
+      createUpstream: false,
+    });
+    const pushCommand = commands.find((args) => args[0] === "push");
+    assert.ok(pushCommand !== undefined);
+    assert.ok(!pushCommand.some((argument) => argument.includes("HEAD:")));
+    assert.ok(pushCommand.includes(`--force-with-lease=refs/heads/${fixture.session.branchName}:${initial.sourceSha}`));
+    assert.ok(pushCommand.includes("--no-force"));
+    assert.ok(pushCommand.includes(`${sourceSha}:refs/heads/${fixture.session.branchName}`));
+    assert.equal(result.sourceSha, sourceSha);
+    assert.equal(result.targetRef, `refs/heads/${fixture.session.branchName}`);
+    assert.equal(result.observedRemoteSha, initial.sourceSha);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("push rejects a remote race after inspection with the exact lease", () => {
+  const fixture = createFixture(true);
+  const clone = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-mutation-race-"));
+  try {
+    claim(fixture);
+    const options = {
+      sessionId: fixture.session.sessionId,
+      resources: ["file.txt"],
+      remote: "origin",
+      branch: fixture.session.branchName,
+    } as const;
+    const initial = fixture.current.push({ ...options, createUpstream: true });
+    runGit(["clone", "--branch", fixture.session.branchName, fixture.remote as string, clone], clone);
+    runGit(["config", "user.email", "race@example.invalid"], clone);
+    runGit(["config", "user.name", "Race"], clone);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "local\n");
+    runGit(["commit", "-am", "local"], fixture.worktree);
+    fs.appendFileSync(path.join(clone, "file.txt"), "remote-race\n");
+    runGit(["commit", "-am", "remote race"], clone);
+
+    let raced = false;
+    const raceGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "push" && !raced) {
+          raced = true;
+          runGit(["push", "origin", `HEAD:refs/heads/${fixture.session.branchName}`], clone);
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () =>
+        new SessionRegistry({ cwd: fixture.worktree, git: raceGit }).push({
+          ...options,
+          force: true,
+          createUpstream: false,
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "PUSH_FAILED" &&
+        typeof error.details.command === "string" &&
+        error.details.command.includes(
+          `--force-with-lease=refs/heads/${fixture.session.branchName}:${initial.sourceSha}`,
+        ),
+    );
+    assert.equal(raced, true);
+    assert.equal(
+      runGit(["rev-parse", `refs/heads/${fixture.session.branchName}`], fixture.remote as string),
+      runGit(["rev-parse", "HEAD"], clone),
+    );
   } finally {
     fs.rmSync(clone, { recursive: true, force: true });
     fixture.cleanup();

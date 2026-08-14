@@ -487,9 +487,12 @@ function toDomainCommitResult(result: import("../session-registry.js").CommitRes
 function toDomainPushResult(result: import("../session-registry.js").PushResult): PushResult {
   return {
     schema_version: result.schemaVersion,
+    source_sha: result.sourceSha,
     remote: result.remote,
     branch: result.branch,
     target: result.target,
+    target_ref: result.targetRef,
+    observed_remote_sha: result.observedRemoteSha,
     relation: result.relation,
     force: result.force,
     upstream_created: result.upstreamCreated,
