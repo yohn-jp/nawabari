@@ -2,6 +2,11 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+mottainai.*.json
+.mottainai/*
+!.mottainai/workflow.json
+.mcp.json
+
 .DS_Store
 *.local
 npm-debug.log*
@@ -9,7 +14,6 @@ pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 *.log
-*.tgz
 
 .env
 .env.*
@@ -20,4 +24,8 @@ yarn-error.log*
 .idea/
 
 coverage/
-.mottainai
+test-artifacts/
+
+.codegraph
+.claude/worktrees/
+.worktrees/
