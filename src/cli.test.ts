@@ -164,6 +164,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session close",
       "authorize",
       "checkpoint",
+      "evidence snapshot",
+      "diff",
       "commit",
       "push",
       "status",
@@ -324,6 +326,9 @@ test("capabilities discovery is available outside a Git repository and exposes t
     assert.ok(lifecycle?.failure_codes.includes("INVALID_BASE_REF"));
     const authorization = response.capabilities.find((capability) => capability.commands.includes("authorize"));
     assert.ok(authorization?.failure_codes.includes("INSUFFICIENT_CLAIM_MODE"));
+    const evidence = response.capabilities.find((capability) => capability.commands.includes("evidence snapshot"));
+    assert.ok(evidence?.commands.includes("diff"));
+    assert.ok(evidence?.failure_codes.includes("GIT_OUTPUT_LIMIT"));
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
