@@ -772,7 +772,7 @@ test("push sends the captured source SHA and exact observed remote lease", () =>
     const pushCommand = commands.find((args) => args[0] === "push");
     assert.ok(pushCommand !== undefined);
     assert.ok(!pushCommand.some((argument) => argument.includes("HEAD:")));
-    assert.ok(pushCommand.includes(`--force-with-lease=refs/heads/${fixture.session.branchName}:${initial.sourceSha}`));
+    assert.ok(!pushCommand.some((argument) => argument.includes("--force-with-lease")));
     assert.ok(pushCommand.includes("--no-force"));
     assert.ok(pushCommand.includes(`${sourceSha}:refs/heads/${fixture.session.branchName}`));
     assert.equal(result.sourceSha, sourceSha);

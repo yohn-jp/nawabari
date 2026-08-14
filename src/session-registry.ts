@@ -1343,8 +1343,7 @@ export class SessionRegistry {
       const leaseValue = inspection.observedRemoteSha ?? "";
       const pushArguments = [
         "push",
-        `--force-with-lease=${targetRef}:${leaseValue}`,
-        ...(!force ? ["--no-force"] : []),
+        ...(force ? [`--force-with-lease=${targetRef}:${leaseValue}`] : ["--no-force"]),
         ...(createUpstream ? ["--set-upstream"] : []),
         remote,
         `${finalContext.headId}:${targetRef}`,
@@ -2825,6 +2824,9 @@ function inspectPushTarget(
       // Fetch only the explicitly inspected remote branch into a disposable
       // ref. This obtains missing ancestry without mutating tracking refs or
       // fetching unrelated branches/tags.
+      // Requires Git 2.29 or later for --no-write-fetch-head support.
+      // Unsupported Git versions will fail here and surface as
+      // PUSH_REMOTE_INSPECTION_FAILED via throwRemoteInspectionFailure.
       git.run(
         ["fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", remote, `+${targetRef}:${temporaryRef}`],
         cwd,
