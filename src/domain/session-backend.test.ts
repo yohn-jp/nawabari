@@ -98,7 +98,7 @@ test("resource claims expose canonical machine fields through the backend and CL
     assert.equal(claimed.ok, true, claimed.ok ? "claim succeeded" : JSON.stringify(claimed.error));
     if (!claimed.ok) return;
     assert.equal(claimed.value.claims.length, 1);
-    assert.equal(claimed.value.claims[0]?.schema_version, 1);
+    assert.equal(claimed.value.claims[0]?.schema_version, 2);
     assert.match(claimed.value.claims[0]?.claim_id ?? "", /^claim-[0-9a-f]{64}$/u);
     assert.equal(claimed.value.claims[0]?.resource, "README.md");
     assert.equal(claimed.value.claims[0]?.mode, "read");

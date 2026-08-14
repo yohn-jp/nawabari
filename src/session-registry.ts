@@ -35,6 +35,7 @@ import {
   compareCodePointStrings,
   createResourceClaim,
   isResourceClaimMode,
+  LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
   resourceClaimConflictsWithAccess,
   resourceMatchesClaim,
   RESOURCE_CLAIM_SCHEMA_VERSION,
@@ -387,7 +388,7 @@ export interface PersistedSessionRecord {
 }
 
 export interface PersistedResourceClaim {
-  readonly schema_version: typeof RESOURCE_CLAIM_SCHEMA_VERSION;
+  readonly schema_version: typeof RESOURCE_CLAIM_SCHEMA_VERSION | typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
   readonly claim_id: string;
   readonly session_id: string;
   readonly repository_id: string;
@@ -402,9 +403,9 @@ export interface PersistedRegistry {
   readonly schema_version: RegistrySchemaVersion;
   readonly repository_id: string;
   readonly sessions: readonly PersistedSessionRecord[];
-  /** Optional in the TypeScript shape so v0.1.0 fixtures remain readable. */
-  readonly claims_schema_version?: typeof RESOURCE_CLAIM_SCHEMA_VERSION;
-  /** Optional in the TypeScript shape so v0.1.0 fixtures remain readable. */
+  /** Optional in the TypeScript shape so pre-claim fixtures remain readable. */
+  readonly claims_schema_version?: typeof RESOURCE_CLAIM_SCHEMA_VERSION | typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
+  /** Optional in the TypeScript shape so pre-claim fixtures remain readable. */
   readonly claims?: readonly PersistedResourceClaim[];
 }
 
@@ -412,6 +413,7 @@ interface RegistryState {
   readonly sessions: readonly SessionRecord[];
   readonly claims: readonly ResourceClaim[];
   readonly legacyClaimsAbsent: boolean;
+  readonly legacyClaimsSchemaVersion?: typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
 }
 
 interface ClaimOwner extends ClaimOwnerContext {
@@ -529,15 +531,17 @@ export class SessionRegistry {
   }
 
   /**
-   * Explicitly materialize the v0.1.0 registry's empty claim section. This is
-   * also performed by the first ownership mutation after a legacy read.
+   * Explicitly materialize a claim section or upgrade its semantics. A v1
+   * claim registry is intentionally unreadable through ordinary operations;
+   * only this locked, explicit migration rewrites it as v2.
    */
   migrate(): RegistryMigrationResult {
     return this.withLock(() => {
-      const state = this.readStateUnsafe();
-      if (state.legacyClaimsAbsent) this.writeUnsafe(state.sessions, state.claims);
+      const state = this.readStateUnsafe(true);
+      const migrated = state.legacyClaimsAbsent || state.legacyClaimsSchemaVersion !== undefined;
+      if (migrated) this.writeUnsafe(state.sessions, state.claims);
       return {
-        migrated: state.legacyClaimsAbsent,
+        migrated,
         registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
         claimSchemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
       };
@@ -2365,7 +2369,7 @@ export class SessionRegistry {
     };
   }
 
-  private readStateUnsafe(): RegistryState {
+  private readStateUnsafe(allowLegacyClaimSchema = false): RegistryState {
     let contents: string;
     try {
       contents = fs.readFileSync(this.paths.registry, "utf8");
@@ -2397,7 +2401,7 @@ export class SessionRegistry {
       );
     }
 
-    return parseRegistry(parsed, this.repository.repositoryId);
+    return parseRegistry(parsed, this.repository.repositoryId, allowLegacyClaimSchema);
   }
 
   private readUnsafe(): readonly SessionRecord[] {
@@ -3660,7 +3664,7 @@ export function toPersistedResourceClaim(
   };
 }
 
-function parseRegistry(value: unknown, expectedRepositoryId: string): RegistryState {
+function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacyClaimSchema = false): RegistryState {
   if (!isRecord(value)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry root must be an object");
   }
@@ -3704,22 +3708,49 @@ function parseRegistry(value: unknown, expectedRepositoryId: string): RegistrySt
     // materialized on the next locked mutation or via migrate().
     return { sessions: records, claims: [], legacyClaimsAbsent: true };
   }
-  if (value.claims_schema_version !== RESOURCE_CLAIM_SCHEMA_VERSION) {
+  const claimSchemaVersion = value.claims_schema_version;
+  const isLegacyClaimSchema = claimSchemaVersion === LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
+  if (claimSchemaVersion !== RESOURCE_CLAIM_SCHEMA_VERSION && !isLegacyClaimSchema) {
     throw new SessionRegistryError(
       "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
-      `Unsupported resource claim schema version: ${stringifyDetail(value.claims_schema_version)}`,
-      { schemaVersion: value.claims_schema_version as number },
+      `Unsupported resource claim schema version: ${stringifyDetail(claimSchemaVersion)}`,
+      { schemaVersion: claimSchemaVersion as number },
+    );
+  }
+  if (isLegacyClaimSchema && !allowLegacyClaimSchema) {
+    throw new SessionRegistryError(
+      "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
+      "Resource claim schema v1 requires explicit migration before use",
+      { schemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION, migrationRequired: true },
     );
   }
   if (!Array.isArray(value.claims)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry claims must be an array");
   }
-  const claims = value.claims.map((candidate, index) => parseResourceClaim(candidate, index, expectedRepositoryId));
+  const claims = value.claims.map((candidate, index) =>
+    parseResourceClaim(
+      candidate,
+      index,
+      expectedRepositoryId,
+      isLegacyClaimSchema ? LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION : undefined,
+    ),
+  );
   validateRegistryClaims(records, claims, expectedRepositoryId);
-  return { sessions: records, claims: sortResourceClaims(claims), legacyClaimsAbsent: false };
+  return {
+    sessions: records,
+    claims: sortResourceClaims(claims),
+    legacyClaimsAbsent: false,
+    ...(isLegacyClaimSchema ? { legacyClaimsSchemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION } : {}),
+  };
 }
 
-function parseResourceClaim(value: unknown, index: number, expectedRepositoryId: string): ResourceClaim {
+function parseResourceClaim(
+  value: unknown,
+  index: number,
+  expectedRepositoryId: string,
+  expectedSchemaVersion:
+    typeof RESOURCE_CLAIM_SCHEMA_VERSION | typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION = RESOURCE_CLAIM_SCHEMA_VERSION,
+): ResourceClaim {
   if (!isRecord(value)) throw invalidRecord(index, "claim must be an object");
   assertExactKeys(
     value,
@@ -3737,11 +3768,11 @@ function parseResourceClaim(value: unknown, index: number, expectedRepositoryId:
     [],
     index,
   );
-  if (value.schema_version !== RESOURCE_CLAIM_SCHEMA_VERSION) {
+  if (value.schema_version !== expectedSchemaVersion) {
     throw new SessionRegistryError(
       "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
       `Unsupported resource claim schema version at index ${index}: ${stringifyDetail(value.schema_version)}`,
-      { schemaVersion: value.schema_version as number, index },
+      { schemaVersion: value.schema_version as number, index, expectedSchemaVersion },
     );
   }
   const claim: ResourceClaim = {
