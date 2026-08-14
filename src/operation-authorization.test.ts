@@ -181,6 +181,40 @@ test("overlapping active claims produce a stable conflict decision", () => {
   }
 });
 
+test("ordinary writes coexist with read declarations while exclusive operations do not", () => {
+  const repositoryPath = createRepository();
+  const firstWorktree = `${repositoryPath}-read`;
+  const secondWorktree = `${repositoryPath}-write`;
+  try {
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const reader = registry.provision({ worktreePath: firstWorktree, branchName: "feature/read" });
+    const writer = registry.provision({ worktreePath: secondWorktree, branchName: "feature/write" });
+    registry.claimResources({ sessionId: reader.sessionId, claims: [{ resource: "shared.txt", mode: "read" }] });
+    registry.claimResources({ sessionId: writer.sessionId, claims: [{ resource: "shared.txt", mode: "write" }] });
+
+    const ordinary = new SessionRegistry({ cwd: secondWorktree }).authorizeOperation({
+      operation: "source-write",
+      resources: ["shared.txt"],
+      sessionId: writer.sessionId,
+    });
+    assert.equal(ordinary.allowed, true, JSON.stringify(ordinary));
+    assert.equal(ordinary.requiredAccess, "write");
+
+    const stronger = new SessionRegistry({ cwd: secondWorktree }).authorizeOperation({
+      operation: "commit",
+      resources: ["shared.txt"],
+      sessionId: writer.sessionId,
+    });
+    assert.equal(stronger.allowed, false);
+    assert.equal(stronger.code, "RESOURCE_CLAIM_CONFLICT");
+    assert.equal(stronger.details.ownerSessionId, reader.sessionId);
+  } finally {
+    removeWorktree(repositoryPath, firstWorktree);
+    removeWorktree(repositoryPath, secondWorktree);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("authorization rejects a detached physical worktree before evaluating claims", () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-detached`;

@@ -11,6 +11,7 @@ import {
   canonicalizeConcretePath,
   claimsConflict,
   createResourceClaim,
+  resourceClaimConflictsWithAccess,
   RESOURCE_CLAIM_COMPATIBILITY_MATRIX,
   RESOURCE_CLAIM_MODES,
 } from "./resource-claims.js";
@@ -18,8 +19,8 @@ import { SessionRegistry, type PersistedRegistry } from "./session-registry.js";
 
 test("defines every overlapping mode combination in the compatibility matrix", () => {
   assert.deepEqual(RESOURCE_CLAIM_COMPATIBILITY_MATRIX, {
-    read: { read: "compatible", write: "conflict", "exclusive-write": "conflict" },
-    write: { read: "conflict", write: "conflict", "exclusive-write": "conflict" },
+    read: { read: "compatible", write: "compatible", "exclusive-write": "conflict" },
+    write: { read: "compatible", write: "conflict", "exclusive-write": "conflict" },
     "exclusive-write": { read: "conflict", write: "conflict", "exclusive-write": "conflict" },
   });
 
@@ -41,6 +42,11 @@ test("defines every overlapping mode combination in the compatibility matrix", (
         claimsConflict(claims.get(leftMode)!, claims.get(rightMode)!),
         RESOURCE_CLAIM_COMPATIBILITY_MATRIX[leftMode][rightMode] === "conflict",
         `${leftMode}/${rightMode}`,
+      );
+      assert.equal(
+        resourceClaimConflictsWithAccess(claims.get(leftMode)!, "src/file.ts", rightMode),
+        RESOURCE_CLAIM_COMPATIBILITY_MATRIX[leftMode][rightMode] === "conflict",
+        `authorization ${leftMode}/${rightMode}`,
       );
     }
   }
@@ -82,12 +88,44 @@ test("migrates a v0.1.0 registry to the canonical claim section", () => {
     assert.deepEqual(migration, {
       migrated: true,
       registrySchemaVersion: 1,
-      claimSchemaVersion: 1,
+      claimSchemaVersion: 2,
     });
     const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as PersistedRegistry;
-    assert.equal(persisted.claims_schema_version, 1);
+    assert.equal(persisted.claims_schema_version, 2);
     assert.deepEqual(persisted.claims, []);
     assert.equal(registry.get(session.sessionId)?.sessionId, session.sessionId);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("requires explicit migration before interpreting v1 claim semantics", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    registry.claimResources({ sessionId: session.sessionId, claims: [{ resource: "README.md", mode: "read" }] });
+    const legacy = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
+      claims_schema_version: number;
+      claims: Array<{ schema_version: number }>;
+    };
+    legacy.claims_schema_version = 1;
+    for (const claim of legacy.claims) claim.schema_version = 1;
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
+
+    assertRegistryError(() => registry.listClaims(), "UNSUPPORTED_CLAIM_SCHEMA_VERSION");
+    assert.deepEqual(registry.migrate(), {
+      migrated: true,
+      registrySchemaVersion: 1,
+      claimSchemaVersion: 2,
+    });
+    assert.equal(registry.listClaims()[0]?.mode, "read");
+    const migrated = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
+      claims_schema_version: number;
+      claims: Array<{ schema_version: number }>;
+    };
+    assert.equal(migrated.claims_schema_version, 2);
+    assert.equal(migrated.claims[0]?.schema_version, 2);
   } finally {
     fixture.cleanup();
   }
@@ -173,6 +211,13 @@ test("applies the documented overlap matrix and makes retries idempotent", () =>
     });
     assert.equal(secondRead.added.length, 1);
 
+    // Ordinary mutation may coexist with a read access declaration.
+    const secondWrite = secondRegistry.updateClaims({
+      sessionId: second.sessionId,
+      claims: [{ resource: "src/file.ts", mode: "write" }],
+    });
+    assert.equal(secondWrite.added.length, 1);
+
     const retry = firstRegistry.claimResources({
       sessionId: first.sessionId,
       claims: [{ resource: "src/**/*.ts", mode: "read" }],
@@ -189,6 +234,13 @@ test("applies the documented overlap matrix and makes retries idempotent", () =>
         }),
       "CONTRADICTORY_CLAIM",
     );
+    // Two ordinary writers still conflict.
+    secondRegistry.releaseClaims(second.sessionId);
+    const firstWrite = firstRegistry.updateClaims({
+      sessionId: first.sessionId,
+      claims: [{ resource: "src/file.ts", mode: "write" }],
+    });
+    assert.equal(firstWrite.added.length, 1);
     assertRegistryError(
       () =>
         secondRegistry.claimResources({
@@ -197,6 +249,26 @@ test("applies the documented overlap matrix and makes retries idempotent", () =>
         }),
       "RESOURCE_CLAIM_CONFLICT",
     );
+
+    // Strong mutation excludes a reader even though ordinary mutation does not.
+    firstRegistry.releaseClaims(first.sessionId);
+    secondRegistry.claimResources({
+      sessionId: second.sessionId,
+      claims: [{ resource: "src/file.ts", mode: "exclusive-write" }],
+    });
+    assertRegistryError(
+      () =>
+        firstRegistry.claimResources({
+          sessionId: first.sessionId,
+          claims: [{ resource: "src/file.ts", mode: "read" }],
+        }),
+      "RESOURCE_CLAIM_CONFLICT",
+    );
+    secondRegistry.releaseClaims(second.sessionId);
+    firstRegistry.claimResources({
+      sessionId: first.sessionId,
+      claims: [{ resource: "src/file.ts", mode: "read" }],
+    });
     assertRegistryError(
       () =>
         secondRegistry.claimResources({

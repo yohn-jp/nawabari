@@ -4,22 +4,39 @@ import { createHash } from "node:crypto";
 
 import { SessionRegistryError, type RegistryErrorDetails } from "./errors.js";
 
-export const RESOURCE_CLAIM_SCHEMA_VERSION = 1 as const;
+/**
+ * Claim schema version 2 records the distinct overlap semantics below. A
+ * persisted v1 claim must be explicitly migrated before it is interpreted by
+ * the v2 authority.
+ */
+export const RESOURCE_CLAIM_SCHEMA_VERSION = 2 as const;
+export const LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION = 1 as const;
 
 export const RESOURCE_CLAIM_MODES = ["read", "write", "exclusive-write"] as const;
 export type ResourceClaimMode = (typeof RESOURCE_CLAIM_MODES)[number];
 
 /**
- * The resource authority intentionally uses one conservative matrix:
- * read/read overlap is shared; every other overlapping pair conflicts.
+ * Normative mode definitions:
+ * - read is a non-mutating access declaration, not a consistency lease;
+ * - write is ordinary mutation authority and may coexist with read;
+ * - exclusive-write is stronger mutation authority and excludes every
+ *   overlapping claim.
+ *
  * A non-overlapping pair is always compatible, regardless of mode.
  */
 export const RESOURCE_CLAIM_COMPATIBILITY_MATRIX: Readonly<
   Record<ResourceClaimMode, Readonly<Record<ResourceClaimMode, "compatible" | "conflict">>>
 > = Object.freeze({
-  read: Object.freeze({ read: "compatible", write: "conflict", "exclusive-write": "conflict" }),
-  write: Object.freeze({ read: "conflict", write: "conflict", "exclusive-write": "conflict" }),
+  read: Object.freeze({ read: "compatible", write: "compatible", "exclusive-write": "conflict" }),
+  write: Object.freeze({ read: "compatible", write: "conflict", "exclusive-write": "conflict" }),
   "exclusive-write": Object.freeze({ read: "conflict", write: "conflict", "exclusive-write": "conflict" }),
+});
+
+/** Access strength used by operation authorization; higher includes lower access. */
+export const RESOURCE_CLAIM_ACCESS_STRENGTH: Readonly<Record<ResourceClaimMode, number>> = Object.freeze({
+  read: 0,
+  write: 1,
+  "exclusive-write": 2,
 });
 
 export interface ResourceClaim {
@@ -68,6 +85,10 @@ const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 export function isResourceClaimMode(value: unknown): value is ResourceClaimMode {
   return typeof value === "string" && (RESOURCE_CLAIM_MODES as readonly string[]).includes(value);
+}
+
+export function claimModeGrantsAccess(granted: ResourceClaimMode, required: ResourceClaimMode): boolean {
+  return RESOURCE_CLAIM_ACCESS_STRENGTH[granted] >= RESOURCE_CLAIM_ACCESS_STRENGTH[required];
 }
 
 export function canonicalClaimId(sessionId: string, resource: string, mode: ResourceClaimMode): string {

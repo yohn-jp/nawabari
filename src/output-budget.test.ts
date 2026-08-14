@@ -61,7 +61,7 @@ test("CLI status and session list remain bounded as closed registry history grow
     const claims = Array.from({ length: 256 }, (_, index) => {
       const resource = `stress/resource-${index}.txt`;
       return {
-        schema_version: 1,
+        schema_version: 2,
         claim_id: canonicalClaimId(active.session_id, resource, "read"),
         session_id: active.session_id,
         repository_id: active.repository_id,
@@ -78,7 +78,7 @@ test("CLI status and session list remain bounded as closed registry history grow
       `${JSON.stringify({
         schema_version: 1,
         repository_id: registry.repository.repositoryId,
-        claims_schema_version: 1,
+        claims_schema_version: 2,
         claims,
         sessions: [active, ...sessions],
       })}\n`,

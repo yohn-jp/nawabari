@@ -1,4 +1,4 @@
-import type { ResourceClaimMode } from "./resource-claims.js";
+import { claimModeGrantsAccess as resourceClaimModeGrantsAccess, type ResourceClaimMode } from "./resource-claims.js";
 import type { RegistryErrorCode } from "./errors.js";
 
 /** Version of the local operation vocabulary and its access policy. */
@@ -45,14 +45,12 @@ export function requiredAccessForOperation(operation: OperationName): ResourceCl
   return OPERATION_REQUIRED_ACCESS[operation];
 }
 
-/** Claim modes are ordered by the authority's granted access strength. */
+/**
+ * Keep the authorization surface compatible while delegating mode strength to
+ * the resource-claim authority.
+ */
 export function claimModeGrantsAccess(granted: ResourceClaimMode, required: ResourceClaimMode): boolean {
-  const strength: Readonly<Record<ResourceClaimMode, number>> = {
-    read: 0,
-    write: 1,
-    "exclusive-write": 2,
-  };
-  return strength[granted] >= strength[required];
+  return resourceClaimModeGrantsAccess(granted, required);
 }
 
 export interface OperationAuthorizationOptions {

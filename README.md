@@ -168,8 +168,10 @@ same repository registry and protected by the same mutation lock. They are
 caller declarations; Nawabari does not infer them from task text or source
 code. Claim JSON exposes `schema_version`, `claim_id`, `session_id`, the
 repository/worktree identities, canonical `resource`, `mode`, and timestamps.
-The initial claim schema version is `1` and supports `read`, `write`, and
-`exclusive-write`.
+The claim schema version is `2` and supports `read`, `write`, and
+`exclusive-write`. Schema v1 records use different overlap semantics and are
+not interpreted implicitly: an embedding caller must explicitly run
+`SessionRegistry.migrate()` before using them.
 
 ```bash
 git nawabari session claim --session "$NAWABARI_SESSION_ID" \
@@ -180,14 +182,23 @@ git nawabari session update --session "$NAWABARI_SESSION_ID" \
 git nawabari session release --session "$NAWABARI_SESSION_ID" --json
 ```
 
+The modes have these normative meanings:
+
+- `read`: a non-mutating access declaration. It is not a consistency lease,
+  so it may overlap an ordinary `write` claim.
+- `write`: ordinary source-modification authority. It may overlap `read`, but
+  not another writer or any `exclusive-write` claim.
+- `exclusive-write`: stronger ownership-sensitive mutation authority. It
+  excludes every overlapping claim, including `read`.
+
 Overlapping claims use this complete compatibility matrix; non-overlapping
 claims are compatible for every mode:
 
-| existing \/ requested | read       | write    | exclusive-write |
-| --------------------- | ---------- | -------- | --------------- |
-| read                  | compatible | conflict | conflict        |
-| write                 | conflict   | conflict | conflict        |
-| exclusive-write       | conflict   | conflict | conflict        |
+| existing \/ requested | read       | write      | exclusive-write |
+| --------------------- | ---------- | ---------- | --------------- |
+| read                  | compatible | compatible | conflict        |
+| write                 | compatible | conflict   | conflict        |
+| exclusive-write       | conflict   | conflict   | conflict        |
 
 Claims use canonical repository-relative POSIX paths. Literal path segments,
 `*`/`?` segment wildcards, and a complete `**` segment are supported. Empty,
@@ -197,6 +208,26 @@ Equivalent claim acquisition and release retries are idempotent. Closing or
 garbage-collecting a session releases its claims; no separate claim registry
 or claim lock exists. Claims describe ownership state only and do not provide
 OS-level filesystem observation or a filesystem sandbox.
+
+An ordinary source change uses `write` and can proceed while another session
+holds a `read` declaration:
+
+```bash
+git nawabari session claim --session "$NAWABARI_SESSION_ID" \
+  --resource src/example.ts --mode write --json
+git nawabari authorize --session "$NAWABARI_SESSION_ID" \
+  --operation source-write --resource src/example.ts --json
+```
+
+A stronger ownership-sensitive operation uses `exclusive-write` and therefore
+requires no overlapping claim:
+
+```bash
+git nawabari session claim --session "$NAWABARI_SESSION_ID" \
+  --resource src/example.ts --mode exclusive-write --json
+git nawabari authorize --session "$NAWABARI_SESSION_ID" \
+  --operation commit --resource src/example.ts --json
+```
 
 ## Ownership guard
 
