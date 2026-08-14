@@ -8,6 +8,11 @@ import { canonicalizeConcretePath } from "./resource-claims.js";
 
 export const GIT_COMMAND_TIMEOUT_MS = 10_000;
 export const GIT_COMMAND_MAX_OUTPUT_BYTES = 64 * 1024;
+export const REPOSITORY_EVIDENCE_SCHEMA_VERSION = 1 as const;
+export const DIFF_EVIDENCE_SCHEMA_VERSION = 1 as const;
+export const EVIDENCE_MAX_DIFF_PATHS = 64 as const;
+export const EVIDENCE_MAX_DIFF_BYTES = GIT_COMMAND_MAX_OUTPUT_BYTES;
+export const EVIDENCE_MAX_DIFF_HUNKS = 128 as const;
 const MAX_ERROR_DETAIL_LENGTH = 4_096;
 
 export interface GitCommandRunner {
@@ -499,7 +504,8 @@ export function readCommitChangedPaths(git: GitCommandRunner, cwd: string, commi
   }
 
   const paths = new Set<string>();
-  for (const record of output.split("\u0000")) {
+  const records = output.endsWith("\n") ? output.slice(0, -1).split("\u0000") : output.split("\u0000");
+  for (const record of records) {
     if (record.length === 0) continue;
     paths.add(record);
     if (paths.size > CHECKPOINT_MAX_PATHS) {
@@ -552,6 +558,35 @@ export interface GitMutationPaths {
   readonly staged: readonly string[];
 }
 
+export interface GitPathStat {
+  readonly path: string;
+  readonly additions: number | null;
+  readonly deletions: number | null;
+  readonly binary: boolean | null;
+  /** False means Git did not expose a stat for this requested path. */
+  readonly available: boolean;
+}
+
+export interface BoundedGitDiffOptions {
+  readonly paths: readonly string[];
+  readonly from?: string;
+  readonly to?: string;
+  readonly includePatch?: boolean;
+  readonly maxBytes?: number;
+  readonly maxHunks?: number;
+}
+
+export interface BoundedGitDiff {
+  readonly schemaVersion: typeof DIFF_EVIDENCE_SCHEMA_VERSION;
+  readonly fromRevision: string;
+  readonly toRevision: string | null;
+  readonly paths: readonly string[];
+  readonly stats: readonly GitPathStat[];
+  readonly patch: string | null;
+  readonly patchBytes: number;
+  readonly hunkCount: number;
+}
+
 /** Observe the canonical changed/staged sets used by governed mutations. */
 export function observeGitMutationPaths(git: GitCommandRunner, cwd: string): GitMutationPaths {
   const observed = observeGitCheckpoint(git, cwd);
@@ -565,6 +600,291 @@ export function readCanonicalCommitChangedPaths(
   commitSha: string,
 ): readonly string[] {
   return canonicalizeGitObservedPaths(readCommitChangedPaths(git, cwd, commitSha), cwd);
+}
+
+/**
+ * Read bounded per-path Git statistics. The caller must provide explicit
+ * concrete paths; an empty path selection is rejected so this cannot become a
+ * repository-wide diff browser.
+ */
+export function readGitPathStats(
+  git: GitCommandRunner,
+  cwd: string,
+  paths: readonly string[],
+  from = "HEAD",
+  to?: string,
+): readonly GitPathStat[] {
+  const canonicalPaths = canonicalizeDiffPaths(paths, cwd);
+  const range = resolveDiffRange(git, cwd, from, to);
+  return readGitPathStatsForRange(git, cwd, canonicalPaths, range.fromRevision, range.toRevision);
+}
+
+/** Read a selected, byte- and hunk-bounded diff plus its canonical path stats. */
+export function readBoundedGitDiff(git: GitCommandRunner, cwd: string, options: BoundedGitDiffOptions): BoundedGitDiff {
+  const canonicalPaths = canonicalizeDiffPaths(options.paths, cwd);
+  const range = resolveDiffRange(git, cwd, options.from ?? "HEAD", options.to);
+  const stats = readGitPathStatsForRange(git, cwd, canonicalPaths, range.fromRevision, range.toRevision);
+  const includePatch = options.includePatch === true;
+  const maxBytes = options.maxBytes ?? EVIDENCE_MAX_DIFF_BYTES;
+  const maxHunks = options.maxHunks ?? EVIDENCE_MAX_DIFF_HUNKS;
+  assertDiffBound(maxBytes, EVIDENCE_MAX_DIFF_BYTES, "maxBytes");
+  assertDiffBound(maxHunks, EVIDENCE_MAX_DIFF_HUNKS, "maxHunks");
+
+  if (!includePatch) {
+    return Object.freeze({
+      schemaVersion: DIFF_EVIDENCE_SCHEMA_VERSION,
+      fromRevision: range.fromRevision,
+      toRevision: range.toRevision,
+      paths: canonicalPaths,
+      stats,
+      patch: null,
+      patchBytes: 0,
+      hunkCount: 0,
+    });
+  }
+
+  let patch: string;
+  try {
+    const run = git.runRaw ?? git.run;
+    patch = run(diffArguments(range.fromRevision, range.toRevision, canonicalPaths, ["--unified=0", "--patch"]), cwd);
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw new SessionRegistryError(
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      "Could not observe the selected Git diff",
+      {
+        cwd,
+      },
+      error,
+    );
+  }
+
+  const patchBytes = Buffer.byteLength(patch, "utf8");
+  if (patchBytes > maxBytes) {
+    throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Selected Git diff exceeds the byte bound", {
+      cwd,
+      maxBytes,
+      patchBytes,
+    });
+  }
+  const hunkCount = (patch.match(/^@@ /gmu) ?? []).length;
+  if (hunkCount > maxHunks) {
+    throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Selected Git diff exceeds the hunk bound", {
+      cwd,
+      maxHunks,
+      hunkCount,
+    });
+  }
+
+  return Object.freeze({
+    schemaVersion: DIFF_EVIDENCE_SCHEMA_VERSION,
+    fromRevision: range.fromRevision,
+    toRevision: range.toRevision,
+    paths: canonicalPaths,
+    stats,
+    patch,
+    patchBytes,
+    hunkCount,
+  });
+}
+
+function canonicalizeDiffPaths(paths: readonly string[], cwd: string): readonly string[] {
+  if (paths.length === 0) {
+    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "A bounded diff requires at least one explicit path", {
+      cwd,
+    });
+  }
+  if (paths.length > EVIDENCE_MAX_DIFF_PATHS) {
+    throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "The selected diff contains too many paths", {
+      cwd,
+      maxPaths: EVIDENCE_MAX_DIFF_PATHS,
+      pathCount: paths.length,
+    });
+  }
+  const canonical = new Set<string>();
+  for (const resource of paths) {
+    try {
+      canonical.add(canonicalizeConcretePath(resource, cwd));
+    } catch (error: unknown) {
+      throw new SessionRegistryError(
+        "GIT_STATE_AMBIGUOUS",
+        "The selected diff path cannot be represented as a canonical repository resource",
+        { path: resource },
+        error,
+      );
+    }
+  }
+  return sortGitPaths(canonical);
+}
+
+function resolveDiffRange(
+  git: GitCommandRunner,
+  cwd: string,
+  from: string,
+  to: string | undefined,
+): { readonly fromRevision: string; readonly toRevision: string | null } {
+  const fromRevision = resolveDiffRevision(git, cwd, from, "from");
+  const toRevision = to === undefined ? null : resolveDiffRevision(git, cwd, to, "to");
+  return { fromRevision, toRevision };
+}
+
+function resolveDiffRevision(git: GitCommandRunner, cwd: string, ref: string, side: string): string {
+  if (ref.length === 0 || ref !== ref.trim() || ref.startsWith("-") || ref.includes("\u0000")) {
+    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", `Invalid ${side} revision selector`, { side, ref });
+  }
+  try {
+    const revision = git.run(["rev-parse", "--verify", `${ref}^{commit}`], cwd);
+    if (!/^[0-9a-f]{40,64}$/u.test(revision)) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", `Git returned an invalid ${side} revision`, {
+        side,
+        ref,
+        revision,
+      });
+    }
+    return revision;
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError && error.code !== "GIT_COMMAND_FAILED") throw error;
+    throw new SessionRegistryError(
+      "GIT_STATE_AMBIGUOUS",
+      `Could not resolve the ${side} diff revision`,
+      {
+        side,
+        ref,
+      },
+      error,
+    );
+  }
+}
+
+function readGitPathStatsForRange(
+  git: GitCommandRunner,
+  cwd: string,
+  paths: readonly string[],
+  fromRevision: string,
+  toRevision: string | null,
+): readonly GitPathStat[] {
+  let output: string;
+  try {
+    const run = git.runRaw ?? git.run;
+    output = run(diffArguments(fromRevision, toRevision, paths, ["--numstat", "--no-renames"]), cwd);
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw new SessionRegistryError(
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      "Could not observe Git path statistics",
+      {
+        cwd,
+      },
+      error,
+    );
+  }
+
+  const observed = new Map<string, GitPathStat>();
+  const records = output.endsWith("\n") ? output.slice(0, -1).split("\u0000") : output.split("\u0000");
+  for (const record of records) {
+    if (record.length === 0) continue;
+    const firstTab = record.indexOf("\t");
+    const secondTab = firstTab === -1 ? -1 : record.indexOf("\t", firstTab + 1);
+    if (firstTab <= 0 || secondTab <= firstTab + 1 || secondTab === record.length - 1) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid numstat record", { cwd });
+    }
+    const additionsText = record.slice(0, firstTab);
+    const deletionsText = record.slice(firstTab + 1, secondTab);
+    const rawPath = record.slice(secondTab + 1);
+    let canonicalPath: string;
+    try {
+      canonicalPath = canonicalizeConcretePath(rawPath, cwd);
+    } catch (error: unknown) {
+      throw new SessionRegistryError(
+        "GIT_STATE_AMBIGUOUS",
+        "Git returned an unrepresentable stat path",
+        {
+          cwd,
+          path: rawPath,
+        },
+        error,
+      );
+    }
+    if (!paths.includes(canonicalPath) || observed.has(canonicalPath)) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an unexpected or duplicate stat path", {
+        cwd,
+        path: canonicalPath,
+      });
+    }
+    const binary = additionsText === "-" || deletionsText === "-";
+    const additions = binary ? null : parseStatCount(additionsText, cwd, canonicalPath);
+    const deletions = binary ? null : parseStatCount(deletionsText, cwd, canonicalPath);
+    observed.set(
+      canonicalPath,
+      Object.freeze({
+        path: canonicalPath,
+        additions,
+        deletions,
+        binary,
+        available: true,
+      }),
+    );
+  }
+
+  return Object.freeze(
+    paths.map(
+      (resource) =>
+        observed.get(resource) ??
+        Object.freeze({
+          path: resource,
+          additions: null,
+          deletions: null,
+          binary: null,
+          available: false,
+        }),
+    ),
+  );
+}
+
+function parseStatCount(value: string, cwd: string, resource: string): number {
+  if (!/^\d+$/u.test(value)) {
+    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid numstat count", {
+      cwd,
+      path: resource,
+      value,
+    });
+  }
+  const count = Number(value);
+  if (!Number.isSafeInteger(count)) {
+    throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Git returned an unbounded numstat count", {
+      cwd,
+      path: resource,
+    });
+  }
+  return count;
+}
+
+function diffArguments(
+  fromRevision: string,
+  toRevision: string | null,
+  paths: readonly string[],
+  flags: readonly string[],
+): string[] {
+  return [
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    ...flags,
+    fromRevision,
+    ...(toRevision === null ? [] : [toRevision]),
+    "--",
+    ...paths.map((resource) => `:(literal)${resource}`),
+  ];
+}
+
+function assertDiffBound(value: number, max: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value < 1 || value > max) {
+    throw new SessionRegistryError("GIT_OUTPUT_LIMIT", `${name} is outside the bounded diff limit`, {
+      [name]: value,
+      max,
+    });
+  }
 }
 
 export function normalizeBranchId(branchName: string): string {

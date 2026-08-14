@@ -8,7 +8,9 @@ import {
   normalizeBranchId,
   observeGitCheckpoint,
   observeGitMutationPaths,
+  readBoundedGitDiff,
   readCanonicalCommitChangedPaths,
+  readGitPathStats,
   readCurrentHead,
   resolveRepositoryContext,
   verifyPhysicalExecutionContext,
@@ -56,8 +58,33 @@ import {
   type OperationAuthorizationCode,
   type OperationAuthorizationOptions,
 } from "./operation-authorization.js";
+import {
+  EVIDENCE_MAX_DIFF_BYTES,
+  EVIDENCE_MAX_DIFF_HUNKS,
+  EVIDENCE_MAX_DIFF_PATHS,
+  evidenceHash,
+  type RepositoryDiffEvidence,
+  type RepositoryDiffOptions,
+  type RepositoryEvidenceOptions,
+  type RepositoryEvidenceSnapshot,
+} from "./repository-evidence.js";
 
 export type { ResourceClaim } from "./resource-claims.js";
+export type {
+  RepositoryDiffEvidence,
+  RepositoryDiffOptions,
+  RepositoryEvidenceBounds,
+  RepositoryEvidenceOptions,
+  RepositoryEvidencePaths,
+  RepositoryEvidenceSnapshot,
+} from "./repository-evidence.js";
+export {
+  DIFF_EVIDENCE_SCHEMA_VERSION,
+  EVIDENCE_MAX_DIFF_BYTES,
+  EVIDENCE_MAX_DIFF_HUNKS,
+  EVIDENCE_MAX_DIFF_PATHS,
+  REPOSITORY_EVIDENCE_SCHEMA_VERSION,
+} from "./repository-evidence.js";
 
 export const REGISTRY_SCHEMA_VERSION = 1 as const;
 export { RESOURCE_CLAIM_SCHEMA_VERSION };
@@ -85,6 +112,8 @@ export interface SessionRecord {
   readonly state: SessionState;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** Exact revision observed at session creation, when the registry can prove it. */
+  readonly baseRevision?: string;
   readonly label?: string;
 }
 
@@ -347,6 +376,7 @@ export interface PersistedSessionRecord {
   readonly state: SessionState;
   readonly created_at: string;
   readonly updated_at: string;
+  readonly base_revision?: string;
   readonly label?: string;
 }
 
@@ -662,6 +692,7 @@ export class SessionRegistry {
           state: "active",
           createdAt: timestamp,
           updatedAt: timestamp,
+          baseRevision: resources.baseRevision,
           ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
         });
 
@@ -704,6 +735,7 @@ export class SessionRegistry {
         state: "active",
         createdAt: timestamp,
         updatedAt: timestamp,
+        baseRevision: resources.baseRevision,
         ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
       });
 
@@ -713,7 +745,7 @@ export class SessionRegistry {
       let gitProvisioned = false;
       try {
         this.git.run(
-          ["worktree", "add", "--quiet", "-b", resources.branchName, resources.worktreePath, resources.baseRef],
+          ["worktree", "add", "--quiet", "-b", resources.branchName, resources.worktreePath, resources.baseRevision],
           this.repository.worktreePath,
         );
         gitProvisioned = true;
@@ -791,6 +823,41 @@ export class SessionRegistry {
     });
     const session = this.resolveSessionOwnership(physical, options.sessionId ?? null);
     return Object.freeze({ ...physical, session: cloneSessionRecord(session) });
+  }
+
+  /** Resolve and physically verify an explicitly addressed active session. */
+  private verifyEvidenceSession(sessionId: string): {
+    readonly session: SessionRecord;
+    readonly physical: PhysicalExecutionContext;
+  } {
+    assertSessionId(sessionId);
+    const record = this.readUnsafe().find((candidate) => candidate.sessionId === sessionId);
+    if (record === undefined || record.state === "closed") {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    if (record.state !== "active") {
+      throw new SessionRegistryError("STALE_REGISTRY", `Session is not active: ${sessionId}`, {
+        sessionId,
+        state: record.state,
+      });
+    }
+
+    const physical = verifyPhysicalExecutionContext({
+      repository: this.repository,
+      worktreePath: record.worktreePath,
+      branchName: record.branchName,
+      git: this.git,
+    });
+    if (physical.worktreeId !== record.worktreeId || physical.branchId !== record.branchId) {
+      throw new SessionRegistryError("OWNERSHIP_MISMATCH", "The selected session does not own the observed worktree", {
+        sessionId,
+        expectedWorktree: record.worktreePath,
+        actualWorktree: physical.worktreePath,
+        expectedBranch: record.branchName,
+        actualBranch: physical.branchName,
+      });
+    }
+    return Object.freeze({ session: cloneSessionRecord(record), physical });
   }
 
   /** Shared physical/protected/ownership path for every governed decision. */
@@ -1416,6 +1483,137 @@ export class SessionRegistry {
 
   captureCheckpoint(options: CheckpointOptions = {}): CheckpointEvidence {
     return this.checkpoint(options);
+  }
+
+  /**
+   * Capture one deterministic, read-only physical repository generation for
+   * an explicitly addressed owned session.
+   */
+  repositoryEvidence(options: RepositoryEvidenceOptions): RepositoryEvidenceSnapshot {
+    return this.withLock(() => {
+      const initial = this.verifyEvidenceSession(options.sessionId);
+      const paths = observeGitCheckpoint(this.git, initial.physical.worktreePath);
+      const stats =
+        paths.changed.length === 0
+          ? []
+          : readGitPathStats(this.git, initial.physical.worktreePath, paths.changed, initial.physical.headId);
+      const final = this.verifyEvidenceSession(options.sessionId);
+      if (
+        final.physical.branchName !== initial.physical.branchName ||
+        final.physical.headId !== initial.physical.headId ||
+        !sameCheckpointPaths(paths, observeGitCheckpoint(this.git, final.physical.worktreePath))
+      ) {
+        throw new SessionRegistryError(
+          "GIT_STATE_AMBIGUOUS",
+          "Repository evidence changed during physical observation",
+          {
+            sessionId: options.sessionId,
+            worktree: initial.physical.worktreePath,
+          },
+        );
+      }
+
+      const baseRevision = initial.session.baseRevision ?? null;
+      const incompleteReasons = stats.some((stat) => !stat.available) ? ["STAT_UNAVAILABLE"] : [];
+      const pathsEvidence = Object.freeze({
+        changed: paths.changed,
+        staged: paths.staged,
+        unstaged: paths.unstaged,
+        untracked: paths.untracked,
+        stats: Object.freeze([...stats]),
+      });
+      const snapshotWithoutHash = {
+        schemaVersion: 1 as const,
+        source: "git" as const,
+        guarantee: "git-observable-only" as const,
+        repositoryId: initial.physical.repositoryId,
+        worktreePath: initial.physical.worktreePath,
+        branchId: initial.physical.branchId,
+        branchName: initial.physical.branchName,
+        sessionId: initial.session.sessionId,
+        sessionState: initial.session.state,
+        sessionCreatedAt: initial.session.createdAt,
+        sessionUpdatedAt: initial.session.updatedAt,
+        baseRevision,
+        baseRevisionProven: baseRevision !== null,
+        headId: initial.physical.headId,
+        clean: paths.changed.length === 0,
+        complete: incompleteReasons.length === 0,
+        incompleteReasons: Object.freeze(incompleteReasons),
+        paths: pathsEvidence,
+        bounds: Object.freeze({
+          maxPaths: CHECKPOINT_MAX_PATHS,
+          maxDiffPaths: EVIDENCE_MAX_DIFF_PATHS,
+          maxDiffBytes: EVIDENCE_MAX_DIFF_BYTES,
+          maxDiffHunks: EVIDENCE_MAX_DIFF_HUNKS,
+        }),
+      };
+      return Object.freeze({
+        ...snapshotWithoutHash,
+        evidenceHash: evidenceHash(snapshotWithoutHash),
+      });
+    });
+  }
+
+  evidenceSnapshot(options: RepositoryEvidenceOptions): RepositoryEvidenceSnapshot {
+    return this.repositoryEvidence(options);
+  }
+
+  /** Inspect only explicitly selected paths with bounded stat/patch output. */
+  repositoryDiff(options: RepositoryDiffOptions): RepositoryDiffEvidence {
+    return this.withLock(() => {
+      const initial = this.verifyEvidenceSession(options.sessionId);
+      const diff = readBoundedGitDiff(this.git, initial.physical.worktreePath, {
+        paths: options.paths,
+        from: options.from,
+        to: options.to,
+        includePatch: options.includePatch,
+        maxBytes: options.maxBytes,
+        maxHunks: options.maxHunks,
+      });
+      const final = this.verifyEvidenceSession(options.sessionId);
+      if (
+        final.physical.branchName !== initial.physical.branchName ||
+        final.physical.headId !== initial.physical.headId
+      ) {
+        throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Repository diff changed during physical observation", {
+          sessionId: options.sessionId,
+          worktree: initial.physical.worktreePath,
+        });
+      }
+
+      const diffWithoutHash = {
+        schemaVersion: diff.schemaVersion,
+        source: "git" as const,
+        guarantee: "git-observable-only" as const,
+        repositoryId: initial.physical.repositoryId,
+        worktreePath: initial.physical.worktreePath,
+        branchId: initial.physical.branchId,
+        branchName: initial.physical.branchName,
+        sessionId: initial.session.sessionId,
+        sessionState: initial.session.state,
+        headId: initial.physical.headId,
+        fromRevision: diff.fromRevision,
+        toRevision: diff.toRevision,
+        paths: diff.paths,
+        stats: diff.stats,
+        complete: diff.stats.every((stat) => stat.available),
+        incompleteReasons: Object.freeze(diff.stats.some((stat) => !stat.available) ? ["STAT_UNAVAILABLE"] : []),
+        patch: diff.patch,
+        patchBytes: diff.patchBytes,
+        hunkCount: diff.hunkCount,
+        maxBytes: options.maxBytes ?? EVIDENCE_MAX_DIFF_BYTES,
+        maxHunks: options.maxHunks ?? EVIDENCE_MAX_DIFF_HUNKS,
+      };
+      return Object.freeze({
+        ...diffWithoutHash,
+        evidenceHash: evidenceHash(diffWithoutHash),
+      });
+    });
+  }
+
+  diff(options: RepositoryDiffOptions): RepositoryDiffEvidence {
+    return this.repositoryDiff(options);
   }
 
   /**
@@ -2117,12 +2315,13 @@ export class SessionRegistry {
         },
       );
     }
-    const baseRef = resolveBaseRef(git, this.repository.worktreePath, options.baseRef ?? "HEAD");
+    const base = resolveBaseRef(git, this.repository.worktreePath, options.baseRef ?? "HEAD");
     return {
       worktreePath: requestedWorktreePath,
       branchId,
       branchName: shortBranchName,
-      baseRef,
+      baseRef: base.ref,
+      baseRevision: base.revision,
     };
   }
 
@@ -2138,6 +2337,7 @@ export class SessionRegistry {
       worktreePath: physical.worktreePath,
       branchId: physical.branchId,
       branchName: physical.branchName,
+      baseRevision: physical.headId,
     };
   }
 
@@ -2267,6 +2467,7 @@ interface CreationResources {
   readonly worktreePath: string;
   readonly branchId: string;
   readonly branchName: string;
+  readonly baseRevision: string;
 }
 
 interface ProvisioningResources {
@@ -2274,6 +2475,7 @@ interface ProvisioningResources {
   readonly branchId: string;
   readonly branchName: string;
   readonly baseRef: string;
+  readonly baseRevision: string;
 }
 
 interface MutationResult<T> {
@@ -2838,6 +3040,22 @@ function sortStrings(values: Iterable<string>): string[] {
   return [...new Set(values)].sort(compareCodePointStrings);
 }
 
+function sameCheckpointPaths(
+  left: Pick<CheckpointEvidence, "paths">["paths"],
+  right: Pick<CheckpointEvidence, "paths">["paths"],
+): boolean {
+  return (
+    sameStringArray(left.changed, right.changed) &&
+    sameStringArray(left.staged, right.staged) &&
+    sameStringArray(left.unstaged, right.unstaged) &&
+    sameStringArray(left.untracked, right.untracked)
+  );
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 function assertWorktreeClean(git: GitCommandRunner, worktreePath: string): void {
   // Git is authoritative for this decision. --ignored=no means ignored or
   // generated artifacts alone are intentionally absent from the blocker set.
@@ -3229,7 +3447,12 @@ function classifyProvisioningFailure(
   return error;
 }
 
-function resolveBaseRef(git: GitCommandRunner, cwd: string, candidate: string): string {
+interface ResolvedBaseRef {
+  readonly ref: string;
+  readonly revision: string;
+}
+
+function resolveBaseRef(git: GitCommandRunner, cwd: string, candidate: string): ResolvedBaseRef {
   if (
     candidate.trim().length === 0 ||
     candidate !== candidate.trim() ||
@@ -3239,8 +3462,14 @@ function resolveBaseRef(git: GitCommandRunner, cwd: string, candidate: string): 
     throw invalidBaseRef(candidate, "invalid-format");
   }
   try {
-    git.run(["rev-parse", "--verify", `${candidate}^{commit}`], cwd);
-    return candidate;
+    const revision = git.run(["rev-parse", "--verify", `${candidate}^{commit}`], cwd);
+    if (!isRevision(revision)) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid base revision", {
+        baseRef: candidate,
+        revision,
+      });
+    }
+    return { ref: candidate, revision };
   } catch (error: unknown) {
     if (isExpectedGitLookupFailure(error)) {
       throw invalidBaseRef(candidate, "does-not-resolve-to-commit");
@@ -3315,6 +3544,7 @@ export function toPersistedSessionRecord(
     state: validated.state,
     created_at: validated.createdAt,
     updated_at: validated.updatedAt,
+    ...(validated.baseRevision === undefined ? {} : { base_revision: validated.baseRevision }),
     ...(validated.label === undefined ? {} : { label: validated.label }),
   };
 }
@@ -3543,7 +3773,7 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
       "created_at",
       "updated_at",
     ],
-    ["label"],
+    ["base_revision", "label"],
     index,
   );
 
@@ -3572,6 +3802,9 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
     state: requireState(value.state, index),
     createdAt: requireString(value.created_at, index, "created_at"),
     updatedAt: requireString(value.updated_at, index, "updated_at"),
+    ...(value.base_revision === undefined
+      ? {}
+      : { baseRevision: requireRevision(value.base_revision, index, "base_revision") }),
     ...(value.label === undefined ? {} : { label: requireString(value.label, index, "label") }),
   };
 
@@ -3624,6 +3857,9 @@ function validateSessionRecord(record: SessionRecord, expectedRepositoryId: stri
   }
   if (Date.parse(record.updatedAt) < Date.parse(record.createdAt)) {
     throw invalidRecord(index, "updated_at cannot precede created_at");
+  }
+  if (record.baseRevision !== undefined && !isRevision(record.baseRevision)) {
+    throw invalidRecord(index, "base_revision must be a full hexadecimal Git revision");
   }
   if (record.label !== undefined && (typeof record.label !== "string" || record.label.length === 0)) {
     throw invalidRecord(index, "label must be a non-empty string");
@@ -3741,6 +3977,18 @@ function requireString(value: unknown, index: number, field: string): string {
     throw invalidRecord(index, `${field} must be a non-empty string`);
   }
   return value;
+}
+
+function requireRevision(value: unknown, index: number, field: string): string {
+  const revision = requireString(value, index, field);
+  if (!isRevision(revision)) {
+    throw invalidRecord(index, `${field} must be a full hexadecimal Git revision`);
+  }
+  return revision;
+}
+
+function isRevision(value: string): boolean {
+  return /^[0-9a-f]{40,64}$/u.test(value);
 }
 
 function requireState(value: unknown, index: number): SessionState {

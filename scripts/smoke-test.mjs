@@ -395,6 +395,20 @@ async function main() {
       fail("status did not expose the resolved managed worktree root");
     }
 
+    const initialEvidence = parseInstalledJson(
+      invokeInstalled(["evidence", "snapshot", "--session", created.session_id, "--json"], lifecycleRepository),
+      "repository evidence snapshot",
+    );
+    if (
+      initialEvidence.ok !== true ||
+      initialEvidence.session_id !== created.session_id ||
+      initialEvidence.base_revision_proven !== true ||
+      typeof initialEvidence.base_revision !== "string" ||
+      typeof initialEvidence.evidence_hash !== "string"
+    ) {
+      fail("installed repository evidence did not expose the owned generation identity");
+    }
+
     const initialList = parseInstalledJson(
       invokeInstalled(["session", "list", "--json"], lifecycleRepository),
       "default session list",
@@ -536,6 +550,48 @@ async function main() {
       fail("installed authorization did not return the claim-backed allow decision");
     }
     fs.writeFileSync(path.join(lifecycleWorktree, governedResource), "packed lifecycle\n");
+    run("git", ["add", "--", governedResource], { cwd: lifecycleWorktree, env: gitEnvironment });
+    const changedEvidence = parseInstalledJson(
+      invokeInstalled(["evidence", "snapshot", "--session", created.session_id, "--json"], lifecycleWorktree),
+      "changed repository evidence snapshot",
+    );
+    if (
+      changedEvidence.ok !== true ||
+      changedEvidence.clean !== false ||
+      !changedEvidence.paths?.changed?.includes(governedResource) ||
+      changedEvidence.paths?.stats?.[0]?.available !== true
+    ) {
+      fail("installed repository evidence did not expose exact changed-path/stat state");
+    }
+    const selectedDiff = parseInstalledJson(
+      invokeInstalled(
+        [
+          "diff",
+          "--session",
+          created.session_id,
+          "--path",
+          governedResource,
+          "--patch",
+          "--max-bytes",
+          "4096",
+          "--max-hunks",
+          "4",
+          "--json",
+        ],
+        lifecycleWorktree,
+      ),
+      "bounded selected diff",
+    );
+    if (
+      selectedDiff.ok !== true ||
+      selectedDiff.paths?.length !== 1 ||
+      selectedDiff.paths[0] !== governedResource ||
+      typeof selectedDiff.patch !== "string" ||
+      !selectedDiff.patch.includes("packed lifecycle") ||
+      typeof selectedDiff.evidence_hash !== "string"
+    ) {
+      fail("installed bounded diff did not expose the explicit selected path");
+    }
     const checkpoint = parseInstalledJson(
       invokeInstalled(["checkpoint", "--session", created.session_id, "--json"], lifecycleWorktree),
       "checkpoint evidence",
