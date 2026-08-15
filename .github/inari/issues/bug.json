@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "bug",
+  "name": "Bug",
+  "description": "Reproducible defect",
+  "title": "fix: ",
+  "labels": [
+    "bug"
+  ],
+  "sections": [
+    {
+      "id": "summary",
+      "kind": "input",
+      "type": "string",
+      "label": "Summary",
+      "description": "Concise defect description",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "problem",
+      "kind": "input",
+      "type": "string",
+      "label": "Problem",
+      "description": "Actual result, expected result, reproduction steps, and environment",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "failing_scenario",
+      "kind": "input",
+      "type": "string",
+      "label": "Failing scenario",
+      "description": "Minimal reproduction, observed failure, and affected environment",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "goal",
+      "kind": "input",
+      "type": "string",
+      "label": "Goal",
+      "description": "State after the fix",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "expected_contract",
+      "kind": "input",
+      "type": "string",
+      "label": "Expected contract",
+      "description": "Behavior and invariant that the fix must establish",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "non_goals",
+      "kind": "input",
+      "type": "string",
+      "label": "Non-goals",
+      "description": "Explicitly excluded fixes",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "acceptance",
+      "kind": "input",
+      "type": "string",
+      "label": "Acceptance criteria",
+      "description": "Completion criteria including regression tests",
+      "required": true,
+      "element": "textarea",
+      "defaultValue": "- [ ] "
+    },
+    {
+      "id": "affected",
+      "kind": "input",
+      "type": "string",
+      "label": "Affected areas",
+      "description": "Affected areas",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "test_layer",
+      "kind": "input",
+      "type": "string",
+      "label": "Test layer",
+      "description": "Regression, unit, integration/process, fault, E2E, or package layer that proves the fix",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "risks",
+      "kind": "input",
+      "type": "string",
+      "label": "Risks / compatibility",
+      "description": "Fix risks and compatibility",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "release_impact",
+      "kind": "input",
+      "type": "string",
+      "label": "Release impact",
+      "description": "Package, publish, artifact, or explicit no-release impact",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "security_impact",
+      "kind": "input",
+      "type": "string",
+      "label": "Security impact",
+      "description": "Security boundary impact, negative scenario, or explicit no-impact decision",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "dependencies",
+      "kind": "input",
+      "type": "string",
+      "label": "Dependencies",
+      "description": "Related Issues and external conditions; explain if none",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "implementation",
+      "kind": "input",
+      "type": "string",
+      "label": "Implementation notes",
+      "description": "Root-cause hypothesis, logs, and workaround",
+      "required": true,
+      "element": "textarea"
+    }
+  ]
+}
