@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "feature",
+  "name": "Feature",
+  "description": "New capability or extension to an existing capability",
+  "title": "feat: ",
+  "labels": [
+    "enhancement"
+  ],
+  "sections": [
+    {
+      "id": "markdown-0",
+      "kind": "documentation",
+      "content": "Complete every field with specific evidence. One Issue has one objective."
+    },
+    {
+      "id": "summary",
+      "kind": "input",
+      "type": "string",
+      "label": "Summary",
+      "description": "Concise description of the change",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "problem",
+      "kind": "input",
+      "type": "string",
+      "label": "Problem",
+      "description": "Problem to solve and supporting evidence",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "failing_scenario",
+      "kind": "input",
+      "type": "string",
+      "label": "Failing scenario",
+      "description": "Reproducible failure or the concrete scenario this feature prevents; explain if no failure applies",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "goal",
+      "kind": "input",
+      "type": "string",
+      "label": "Goal",
+      "description": "State to achieve",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "expected_contract",
+      "kind": "input",
+      "type": "string",
+      "label": "Expected contract",
+      "description": "Observable behavior, invariant, or compatibility contract expected after implementation",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "non_goals",
+      "kind": "input",
+      "type": "string",
+      "label": "Non-goals",
+      "description": "Explicitly excluded work",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "acceptance",
+      "kind": "input",
+      "type": "string",
+      "label": "Acceptance criteria",
+      "description": "Verifiable completion criteria",
+      "required": true,
+      "element": "textarea",
+      "defaultValue": "- [ ] "
+    },
+    {
+      "id": "affected",
+      "kind": "input",
+      "type": "string",
+      "label": "Affected areas",
+      "description": "Affected capabilities, files, and users",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "test_layer",
+      "kind": "input",
+      "type": "string",
+      "label": "Test layer",
+      "description": "Expected unit, integration/process, package, E2E, fault, standards, or release layer and why",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "risks",
+      "kind": "input",
+      "type": "string",
+      "label": "Risks / compatibility",
+      "description": "Risks and backward compatibility",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "release_impact",
+      "kind": "input",
+      "type": "string",
+      "label": "Release impact",
+      "description": "Package, publish, artifact, or explicit no-release impact",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "security_impact",
+      "kind": "input",
+      "type": "string",
+      "label": "Security impact",
+      "description": "Security boundary impact, negative scenario, or explicit no-impact decision",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "dependencies",
+      "kind": "input",
+      "type": "string",
+      "label": "Dependencies",
+      "description": "Dependent Issues, PRs, and external conditions; explain if none",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "implementation",
+      "kind": "input",
+      "type": "string",
+      "label": "Implementation notes",
+      "description": "Constraints, proposed approach, and completed investigation",
+      "required": true,
+      "element": "textarea"
+    }
+  ]
+}
