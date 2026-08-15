@@ -5,10 +5,26 @@ agents. It gives each active session one exclusively owned worktree and one
 mutable branch. It works without GitHub, `gh`, a network connection, Mottainai,
 or a particular agent runtime.
 
-Nawabari governs operations routed through Nawabari. It is an authorization and
-ownership boundary, not an operating-system or filesystem sandbox: a process
-that already has filesystem permissions can still edit another worktree
-directly.
+Nawabari governs operations routed through Nawabari. By default it is an
+authorization and ownership boundary, not an operating-system or filesystem
+sandbox: a process that already has filesystem permissions can still edit
+another worktree directly. This default (legacy) mode is unchanged.
+
+A separate, opt-in protected session mode adds a Linux-only OS/filesystem/
+process enforcement boundary underneath the existing session/worktree/
+resource authority (`src/domain/sandbox.ts`, contract
+`nawabari.sandbox-execution.v1`). It binds one existing Nawabari session
+resolved through the authoritative registry/guard path to a typed sandbox
+execution request; it does not create a second session identity. A
+machine-readable capability/doctor report distinguishes required Linux
+primitives (bubblewrap, user/mount/PID/IPC/UTS namespaces) from optional
+defense-in-depth primitives (cgroups v2, Landlock, seccomp, capability
+inspection). When protected execution is requested and a required capability
+is unavailable or the platform is unsupported, resolution fails closed and
+never falls back to the legacy unsandboxed path. This first contract defines
+capability detection and the typed request/result shape only; it does not
+yet invoke bubblewrap to enforce the sandbox boundary, and network mode is
+honestly reported as `inherited` (shared with the host), not isolated.
 
 ## Install
 
