@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -109,6 +110,14 @@ export type SandboxFilesystemTopology = {
 export type SandboxExecutionRequest = {
   schema_version: number;
   contract_id: string;
+  /**
+   * Mirrors `SandboxExecutionOptions.enforce`. `true` means capability
+   * resolution already proved readiness and a downstream executor must
+   * establish protected execution. `false` means readiness was not required
+   * to reach this request, so a downstream executor may still need to fall
+   * back to the legacy unsandboxed path.
+   */
+  enforce: boolean;
   session_id: string;
   repository: string;
   worktree: string;
@@ -131,24 +140,21 @@ export type SandboxProbe = {
   uid(): number | null;
   gid(): number | null;
   hasBubblewrap(): boolean;
-  hasUserNamespaces(): boolean;
-  hasMountNamespaces(): boolean;
-  hasPidNamespace(): boolean;
-  hasIpcNamespace(): boolean;
-  hasUtsNamespace(): boolean;
+  /**
+   * Proves user, mount, PID, IPC, and UTS namespace creation together by
+   * actually asking bubblewrap to unshare all of them, not by inferring
+   * support from `/proc/self/ns/*` existence. Those files describe the
+   * calling process's own current namespace membership — present on any
+   * modern kernel — and prove nothing about whether this host or its
+   * container/seccomp/AppArmor policy permits `clone(CLONE_NEWUSER)` and
+   * friends. False-positive readiness here would let `enforce: true`
+   * resolve successfully even though bwrap cannot actually sandbox.
+   */
+  hasNamespaceSupport(): boolean;
   hasCgroupsV2(): boolean;
   hasLandlock(): boolean;
   hasSeccomp(): boolean;
   hasCapabilities(): boolean;
-};
-
-const PROC_NS_DIRECTORY = "/proc/self/ns";
-const RUNTIME_NAMESPACE_FILE: Record<"mnt" | "pid" | "ipc" | "uts" | "user", string> = {
-  mnt: `${PROC_NS_DIRECTORY}/mnt`,
-  pid: `${PROC_NS_DIRECTORY}/pid`,
-  ipc: `${PROC_NS_DIRECTORY}/ipc`,
-  uts: `${PROC_NS_DIRECTORY}/uts`,
-  user: `${PROC_NS_DIRECTORY}/user`,
 };
 
 function pathExists(candidate: string): boolean {
@@ -156,14 +162,6 @@ function pathExists(candidate: string): boolean {
     return existsSync(candidate);
   } catch {
     return false;
-  }
-}
-
-function readTrimmed(candidate: string): string | null {
-  try {
-    return readFileSync(candidate, "utf8").trim();
-  } catch {
-    return null;
   }
 }
 
@@ -183,34 +181,70 @@ function kernelSupportsLandlockAbi(): boolean {
   return major > 5 || (major === 5 && minor >= 13);
 }
 
-/** Best-effort local kernel/runtime capability probes; no external process is spawned. */
+const BUBBLEWRAP_NAMESPACE_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Execution-level evidence: actually unshare every required namespace class
+ * through bwrap itself instead of trusting static filesystem evidence. A
+ * process that already has its own namespace handles (every process does)
+ * says nothing about whether creating *new* ones is permitted here.
+ */
+function probeBubblewrapNamespaceSupport(hasBwrap: boolean): boolean {
+  if (!hasBwrap) return false;
+  try {
+    execFileSync(
+      "bwrap",
+      [
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "true",
+      ],
+      { stdio: ["ignore", "ignore", "ignore"], timeout: BUBBLEWRAP_NAMESPACE_PROBE_TIMEOUT_MS },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Local kernel/runtime capability probes. Required namespace support is
+ * verified by an actual bubblewrap execution probe; optional capabilities
+ * remain best-effort static filesystem evidence since they never gate
+ * `ready`.
+ */
 export const defaultSandboxProbe: SandboxProbe = Object.freeze({
   platform: () => process.platform,
   uid: () => (typeof process.getuid === "function" ? process.getuid() : null),
   gid: () => (typeof process.getgid === "function" ? process.getgid() : null),
   hasBubblewrap: () => commandExistsOnPath("bwrap"),
-  hasUserNamespaces: () => {
-    if (!pathExists(RUNTIME_NAMESPACE_FILE.user)) return false;
-    const flag = readTrimmed("/proc/sys/kernel/unprivileged_userns_clone");
-    return flag === null || flag === "1";
-  },
-  hasMountNamespaces: () => pathExists(RUNTIME_NAMESPACE_FILE.mnt),
-  hasPidNamespace: () => pathExists(RUNTIME_NAMESPACE_FILE.pid),
-  hasIpcNamespace: () => pathExists(RUNTIME_NAMESPACE_FILE.ipc),
-  hasUtsNamespace: () => pathExists(RUNTIME_NAMESPACE_FILE.uts),
+  hasNamespaceSupport: () => probeBubblewrapNamespaceSupport(commandExistsOnPath("bwrap")),
   hasCgroupsV2: () => pathExists("/sys/fs/cgroup/cgroup.controllers"),
   hasLandlock: () => pathExists("/sys/kernel/security/landlock") || kernelSupportsLandlockAbi(),
   hasSeccomp: () => pathExists("/proc/sys/kernel/seccomp"),
   hasCapabilities: () => pathExists("/proc/self/status"),
 });
 
+/**
+ * user_namespaces/mount_namespaces/pid_namespace/ipc_namespace/uts_namespace
+ * are reported as distinct capability ids for machine-readability, but all
+ * five share one execution-level probe: bwrap needs every one of them
+ * together to sandbox anything, so proving them together is what the
+ * doctor's `ready` signal actually needs.
+ */
 const CAPABILITY_PROBE: Readonly<Record<SandboxCapabilityId, (probe: SandboxProbe) => boolean>> = Object.freeze({
   bubblewrap: (probe) => probe.hasBubblewrap(),
-  user_namespaces: (probe) => probe.hasUserNamespaces(),
-  mount_namespaces: (probe) => probe.hasMountNamespaces(),
-  pid_namespace: (probe) => probe.hasPidNamespace(),
-  ipc_namespace: (probe) => probe.hasIpcNamespace(),
-  uts_namespace: (probe) => probe.hasUtsNamespace(),
+  user_namespaces: (probe) => probe.hasNamespaceSupport(),
+  mount_namespaces: (probe) => probe.hasNamespaceSupport(),
+  pid_namespace: (probe) => probe.hasNamespaceSupport(),
+  ipc_namespace: (probe) => probe.hasNamespaceSupport(),
+  uts_namespace: (probe) => probe.hasNamespaceSupport(),
   cgroups_v2: (probe) => probe.hasCgroupsV2(),
   landlock: (probe) => probe.hasLandlock(),
   seccomp: (probe) => probe.hasSeccomp(),
@@ -366,6 +400,7 @@ export async function resolveSandboxExecutionRequest(
   return success({
     schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
     contract_id: SANDBOX_CONTRACT_ID,
+    enforce: options.enforce,
     session_id: decision.session_id,
     repository: decision.repository,
     worktree: decision.worktree,

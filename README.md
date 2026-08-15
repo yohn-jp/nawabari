@@ -10,9 +10,9 @@ authorization and ownership boundary, not an operating-system or filesystem
 sandbox: a process that already has filesystem permissions can still edit
 another worktree directly. This default (legacy) mode is unchanged.
 
-A separate, opt-in protected session mode adds a Linux-only OS/filesystem/
-process enforcement boundary underneath the existing session/worktree/
-resource authority (`src/domain/sandbox.ts`, contract
+A separate, opt-in protected session mode defines a Linux-only contract for a
+future OS/filesystem/process enforcement boundary underneath the existing
+session/worktree/resource authority (`src/domain/sandbox.ts`, contract
 `nawabari.sandbox-execution.v1`). It binds one existing Nawabari session
 resolved through the authoritative registry/guard path to a typed sandbox
 execution request; it does not create a second session identity. A
@@ -21,9 +21,11 @@ primitives (bubblewrap, user/mount/PID/IPC/UTS namespaces) from optional
 defense-in-depth primitives (cgroups v2, Landlock, seccomp, capability
 inspection). When protected execution is requested and a required capability
 is unavailable or the platform is unsupported, resolution fails closed and
-never falls back to the legacy unsandboxed path. This first contract defines
-capability detection and the typed request/result shape only; it does not
-yet invoke bubblewrap to enforce the sandbox boundary, and network mode is
+never returns a request that claims the legacy unsandboxed path is
+protected. This first contract defines capability detection and the typed
+request/result shape only; `resolveSandboxExecutionRequest()` returns a
+request, it does not itself invoke bubblewrap or restrict filesystem or
+process access, so protected mode enforces nothing yet. Network mode is
 honestly reported as `inherited` (shared with the host), not isolated.
 
 ## Install

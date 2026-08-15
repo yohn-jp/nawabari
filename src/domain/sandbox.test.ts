@@ -20,11 +20,7 @@ function readyProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe {
     uid: () => 1_000,
     gid: () => 1_000,
     hasBubblewrap: () => true,
-    hasUserNamespaces: () => true,
-    hasMountNamespaces: () => true,
-    hasPidNamespace: () => true,
-    hasIpcNamespace: () => true,
-    hasUtsNamespace: () => true,
+    hasNamespaceSupport: () => true,
     hasCgroupsV2: () => true,
     hasLandlock: () => true,
     hasSeccomp: () => true,
@@ -55,10 +51,16 @@ test("sandbox doctor fails closed when bubblewrap itself is missing", () => {
   assert.equal(bwrap?.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
 });
 
-test("sandbox doctor fails closed when user namespaces are disabled", () => {
-  const report = sandboxDoctorReport(readyProbe({ hasUserNamespaces: () => false }));
+test("sandbox doctor fails closed when bubblewrap cannot actually establish the required namespaces", () => {
+  const report = sandboxDoctorReport(readyProbe({ hasNamespaceSupport: () => false }));
   assert.equal(report.ready, false);
-  assert.deepEqual(report.missing_required, ["user_namespaces"]);
+  assert.deepEqual(report.missing_required, [
+    "user_namespaces",
+    "mount_namespaces",
+    "pid_namespace",
+    "ipc_namespace",
+    "uts_namespace",
+  ]);
 });
 
 test("sandbox doctor marks every capability not_applicable on an unsupported platform", () => {
@@ -94,6 +96,7 @@ test("resolveSandboxExecutionRequest binds an owned active session and derives i
 
     assert.equal(result.ok, true);
     if (!result.ok) return;
+    assert.equal(result.value.enforce, true);
     assert.equal(result.value.session_id, created.value.session_id);
     assert.equal(result.value.worktree, created.value.worktree);
     assert.equal(result.value.branch, "feature/sandbox-owned");
@@ -106,6 +109,34 @@ test("resolveSandboxExecutionRequest binds an owned active session and derives i
       true,
     );
     assert.deepEqual(result.value.required_capabilities, [...SANDBOX_REQUIRED_CAPABILITIES]);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("resolveSandboxExecutionRequest returns an enforce:false request instead of failing when protection was not requested", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-sandbox-not-enforced`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/sandbox-not-enforced", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const result = await resolveSandboxExecutionRequest(
+      backend,
+      { cwd: worktreePath },
+      { session_id: created.value.session_id, enforce: false },
+      readyProbe({ hasBubblewrap: () => false }),
+    );
+
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.enforce, false);
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });
