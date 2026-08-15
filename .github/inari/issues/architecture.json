@@ -1,0 +1,137 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "architecture",
+  "name": "Architecture",
+  "description": "Change to boundaries, contracts, or architectural decisions",
+  "title": "refactor: ",
+  "sections": [
+    {
+      "id": "summary",
+      "kind": "input",
+      "type": "string",
+      "label": "Summary",
+      "description": "Concise architectural change description",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "problem",
+      "kind": "input",
+      "type": "string",
+      "label": "Problem",
+      "description": "Current design problem and evidence",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "failing_scenario",
+      "kind": "input",
+      "type": "string",
+      "label": "Failing scenario",
+      "description": "Failure, boundary mismatch, or concrete scenario motivating the architecture change; explain if no failure applies",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "goal",
+      "kind": "input",
+      "type": "string",
+      "label": "Goal",
+      "description": "Target architecture and invariants to preserve",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "expected_contract",
+      "kind": "input",
+      "type": "string",
+      "label": "Expected contract",
+      "description": "Boundary, invariant, and observable contract expected after the decision",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "non_goals",
+      "kind": "input",
+      "type": "string",
+      "label": "Non-goals",
+      "description": "Boundaries not changed in this work",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "acceptance",
+      "kind": "input",
+      "type": "string",
+      "label": "Acceptance criteria",
+      "description": "Verifiable design completion criteria",
+      "required": true,
+      "element": "textarea",
+      "defaultValue": "- [ ] "
+    },
+    {
+      "id": "affected",
+      "kind": "input",
+      "type": "string",
+      "label": "Affected areas",
+      "description": "Affected layers and public contracts",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "test_layer",
+      "kind": "input",
+      "type": "string",
+      "label": "Test layer",
+      "description": "Layer that proves the boundary, contract, migration, or failure behavior",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "risks",
+      "kind": "input",
+      "type": "string",
+      "label": "Risks / compatibility",
+      "description": "Migration, backward compatibility, and failure impact",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "release_impact",
+      "kind": "input",
+      "type": "string",
+      "label": "Release impact",
+      "description": "Package, publish, rollout, artifact, or explicit no-release impact",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "security_impact",
+      "kind": "input",
+      "type": "string",
+      "label": "Security impact",
+      "description": "Security boundary impact, negative scenario, or explicit no-impact decision",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "dependencies",
+      "kind": "input",
+      "type": "string",
+      "label": "Dependencies",
+      "description": "Prerequisites and follow-up Issues; explain if none",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "implementation",
+      "kind": "input",
+      "type": "string",
+      "label": "Implementation notes",
+      "description": "Alternatives, decision rationale, and phased rollout",
+      "required": true,
+      "element": "textarea"
+    }
+  ]
+}
