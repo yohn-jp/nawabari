@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "kind": "pull_request",
+  "id": "default",
+  "name": "default",
+  "sections": [
+    {
+      "id": "summary",
+      "kind": "input",
+      "type": "string",
+      "label": "Summary",
+      "placeholder": "<!-- Concisely describe the delivered result. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "linked_issue",
+      "kind": "input",
+      "type": "string",
+      "label": "Linked issue",
+      "placeholder": "Closes #",
+      "headingLevel": 2
+    },
+    {
+      "id": "scope",
+      "kind": "input",
+      "type": "string",
+      "label": "Scope",
+      "headingLevel": 2
+    },
+    {
+      "id": "included",
+      "kind": "input",
+      "type": "string",
+      "label": "Included",
+      "placeholder": "<!-- Implemented scope. -->",
+      "headingLevel": 3
+    },
+    {
+      "id": "excluded",
+      "kind": "input",
+      "type": "string",
+      "label": "Excluded",
+      "placeholder": "<!-- Explicitly excluded scope. -->",
+      "headingLevel": 3
+    },
+    {
+      "id": "implementation",
+      "kind": "input",
+      "type": "string",
+      "label": "Implementation",
+      "placeholder": "<!-- Key implementation decisions. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "behavioral_changes",
+      "kind": "input",
+      "type": "string",
+      "label": "Behavioral changes",
+      "placeholder": "<!-- User-visible and operational changes. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "validation",
+      "kind": "input",
+      "type": "checklist",
+      "label": "Validation",
+      "options": [
+        {
+          "label": "Typecheck",
+          "id": "typecheck",
+          "required": false
+        },
+        {
+          "label": "Tests",
+          "id": "tests",
+          "required": false
+        },
+        {
+          "label": "Build",
+          "id": "build",
+          "required": false
+        },
+        {
+          "label": "Package check",
+          "id": "package_check",
+          "required": false
+        }
+      ],
+      "headingLevel": 2
+    },
+    {
+      "id": "content_after_validation",
+      "kind": "documentation",
+      "content": "<!-- Keep this completion checklist. It records which repository checks ran;\nthe structured Validation evidence section records what each check proved. -->\n\nTest layers:\n\n- Fast / unit / contract: `pnpm test`\n- Integration / process: `pnpm run test:integration`\n- Package / E2E / smoke: `pnpm run test:e2e`, `pnpm run test:package`\n- Standards / static: `pnpm run verify:standards`\n- Coverage: `pnpm run test:coverage`\n- Test effectiveness (when critical logic changes): `pnpm run test:effectiveness`\n- Full verification: `pnpm run verify`"
+    },
+    {
+      "id": "test_contract",
+      "kind": "input",
+      "type": "string",
+      "label": "Test contract",
+      "placeholder": "<!-- Use one concrete value per field. List every required layer and explain\neach Not applicable decision. -->\n\n- change type:\n- required layers:\n- not-applicable decisions:",
+      "headingLevel": 2
+    },
+    {
+      "id": "regression_proof",
+      "kind": "input",
+      "type": "string",
+      "label": "Regression proof",
+      "placeholder": "<!-- Bug-fix PRs must provide the regression test path and identifier, the\npre-fix observed failure, and the post-fix result. Automated proof uses only a\ntrusted fixed runner selected by command id; the validator never executes a\nshell command copied from this section. Use reviewer-attested or unsupported\nautomated proof when the test-diff class is not safely applicable. -->\n\n- status:\n- reason:\n- test path:\n- test identifier:\n- pre-fix observed failure:\n- post-fix result:\n- command id:\n- base result:\n- head result:\n- isolation:\n- reviewer attestation:",
+      "headingLevel": 2
+    },
+    {
+      "id": "validation_evidence",
+      "kind": "input",
+      "type": "string",
+      "label": "Validation evidence",
+      "placeholder": "<!-- Add exactly one record for every class below. Canonical record syntax:\n- class: unit/contract; status: pass; command: pnpm test; target: path; result: 12 tests passed; artifact: path-or-digest\nUse status: not-applicable only when the changed paths do not trigger that\nclass, and provide a concrete reason. Do not use generic \"Tests checked\",\nTODO, TBD, placeholder, or template-comment-only content. -->\n\n- class: `unit/contract`; status: ; command: ; target: ; result: ; artifact:\n- class: `process/integration`; status: ; command: ; target: ; result: ; artifact:\n- class: `package smoke`; status: ; command: ; target: ; result: ; artifact:\n- class: `fault injection`; status: ; command: ; target: ; result: ; scenario: ; artifact:\n- class: `lint/architecture`; status: ; command: ; target: ; result: ; artifact:\n- class: `release`; status: ; command: ; target: ; result: ; artifact: ; warnings:\n- class: `security/negative`; status: ; command: ; target: ; result: ; scenario: ; artifact:",
+      "headingLevel": 2
+    },
+    {
+      "id": "release_impact",
+      "kind": "input",
+      "type": "string",
+      "label": "Release impact",
+      "placeholder": "<!-- State none with a reason when no package or publish path changed. For\nrelease-impacting paths, name the packed artifact, package smoke, and\nwarning-free packaging or publish evidence. -->\n\n- impact:\n- reason:",
+      "headingLevel": 2
+    },
+    {
+      "id": "risks",
+      "kind": "input",
+      "type": "string",
+      "label": "Risks",
+      "placeholder": "<!-- Risks and mitigations. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "breaking_changes",
+      "kind": "input",
+      "type": "string",
+      "label": "Breaking changes",
+      "placeholder": "No. <!-- If Yes, describe impact and migration. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "migration_compatibility",
+      "kind": "input",
+      "type": "string",
+      "label": "Migration / compatibility",
+      "placeholder": "<!-- Required for configuration, CLI registration, persisted state, export,\nand public tool-schema changes. State the explicit migration decision. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "security_impact",
+      "kind": "input",
+      "type": "string",
+      "label": "Security impact",
+      "placeholder": "<!-- Required for security-related changes. State impact and negative-test\nevidence when a security-sensitive path changes. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "review_focus",
+      "kind": "input",
+      "type": "string",
+      "label": "Review focus",
+      "placeholder": "<!-- Specific areas for reviewers to inspect. -->",
+      "headingLevel": 2
+    }
+  ]
+}
