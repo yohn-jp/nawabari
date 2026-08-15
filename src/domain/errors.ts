@@ -47,6 +47,8 @@ export type ErrorCode =
   | "RECONCILIATION_DRIFT"
   | "REGISTRY_CORRUPT"
   | "REGISTRY_UNREADABLE"
+  | "SANDBOX_UNSUPPORTED_PLATFORM"
+  | "SANDBOX_CAPABILITY_UNAVAILABLE"
   | "SESSION_NOT_FOUND"
   | "STALE_SESSION"
   | "UNSUPPORTED_RUNTIME"
@@ -99,7 +101,13 @@ export const EXIT_CODES = Object.freeze({
 });
 
 function defaultExitCode(code: ErrorCode): number {
-  if (code === "BACKEND_UNAVAILABLE") return EXIT_CODES.unavailable;
+  if (
+    code === "BACKEND_UNAVAILABLE" ||
+    code === "SANDBOX_UNSUPPORTED_PLATFORM" ||
+    code === "SANDBOX_CAPABILITY_UNAVAILABLE"
+  ) {
+    return EXIT_CODES.unavailable;
+  }
   if (code === "DOCTOR_FAILED") return EXIT_CODES.doctor;
   if (
     code === "UNKNOWN_COMMAND" ||
