@@ -6,46 +6,27 @@ Release PRs use a `release/*` head branch. This naming convention is an
 operational classification only; it is not an authorization or security
 boundary.
 
-## Target version
+## Version
 
 - Target version:
 - Version bump (patch/minor/major):
 
-## CHANGELOG / release notes
+## Release notes
 
-- [ ] CHANGELOG updated and reviewed
-- [ ] Release notes drafted and reviewed
-
-- Notes:
-
-## Package metadata
-
-- [ ] `package.json` version matches the target version
-- [ ] Package metadata and files list reviewed
-
-- Metadata notes:
-
-## Publish prerequisites
-
-- [ ] Required validation is complete
-- [ ] Publish tag and GitHub Release plan confirmed
-- [ ] npm/OIDC publish prerequisites confirmed
-
-- Prerequisite notes:
+<!-- User/reviewer-facing release summary. -->
 
 ## Breaking changes / migration
 
-- Breaking changes: None / Yes — describe:
-- Migration required: None / Yes — describe:
+None. <!-- If not None, describe the breaking change and migration path. -->
 
-## Post-release checks
+## Publish plan
 
-- [ ] GitHub Release publication will trigger the existing `release: published` workflow
-- [ ] npm package/version publication will be verified
-- [ ] Post-release smoke test and install verification planned
+<!-- Intended package/tag/GitHub Release path. -->
 
-- Follow-up checks:
+## Post-release verification
 
-## Linked issue / release tracking
+<!-- Checks that must happen after publication. -->
 
-- Issue or release tracking reference:
+## Tracking
+
+<!-- Optional. Linked Issue or release tracking reference. -->
