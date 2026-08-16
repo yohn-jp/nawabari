@@ -7,47 +7,47 @@
   "title": "refactor: ",
   "sections": [
     {
-      "id": "summary",
+      "id": "context",
       "kind": "input",
       "type": "string",
-      "label": "Summary",
-      "description": "Concise architectural change description",
+      "label": "Context",
+      "description": "Current boundary or design problem and supporting evidence",
       "required": true,
       "element": "textarea"
     },
     {
-      "id": "problem",
+      "id": "decision",
       "kind": "input",
       "type": "string",
-      "label": "Problem",
-      "description": "Current design problem and evidence",
+      "label": "Decision",
+      "description": "Architectural choice that becomes the intended design",
       "required": true,
       "element": "textarea"
     },
     {
-      "id": "failing_scenario",
+      "id": "invariants",
       "kind": "input",
       "type": "string",
-      "label": "Failing scenario",
-      "description": "Failure, boundary mismatch, or concrete scenario motivating the architecture change; explain if no failure applies",
+      "label": "Invariants",
+      "description": "Boundaries and contracts that must hold",
       "required": true,
       "element": "textarea"
     },
     {
-      "id": "goal",
+      "id": "alternatives",
       "kind": "input",
       "type": "string",
-      "label": "Goal",
-      "description": "Target architecture and invariants to preserve",
+      "label": "Alternatives",
+      "description": "Meaningful alternatives considered and why they were rejected",
       "required": true,
       "element": "textarea"
     },
     {
-      "id": "expected_contract",
+      "id": "consequences",
       "kind": "input",
       "type": "string",
-      "label": "Expected contract",
-      "description": "Boundary, invariant, and observable contract expected after the decision",
+      "label": "Consequences",
+      "description": "Operational, compatibility, security, release, or complexity consequences that follow from the decision",
       "required": true,
       "element": "textarea"
     },
@@ -61,77 +61,23 @@
       "element": "textarea"
     },
     {
+      "id": "migration",
+      "kind": "input",
+      "type": "string",
+      "label": "Migration",
+      "description": "Rollout, migration, or compatibility plan when needed",
+      "required": false,
+      "element": "textarea"
+    },
+    {
       "id": "acceptance",
       "kind": "input",
       "type": "string",
       "label": "Acceptance criteria",
-      "description": "Verifiable design completion criteria",
+      "description": "Verifiable design and implementation completion criteria",
       "required": true,
       "element": "textarea",
       "defaultValue": "- [ ] "
-    },
-    {
-      "id": "affected",
-      "kind": "input",
-      "type": "string",
-      "label": "Affected areas",
-      "description": "Affected layers and public contracts",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "test_layer",
-      "kind": "input",
-      "type": "string",
-      "label": "Test layer",
-      "description": "Layer that proves the boundary, contract, migration, or failure behavior",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "risks",
-      "kind": "input",
-      "type": "string",
-      "label": "Risks / compatibility",
-      "description": "Migration, backward compatibility, and failure impact",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "release_impact",
-      "kind": "input",
-      "type": "string",
-      "label": "Release impact",
-      "description": "Package, publish, rollout, artifact, or explicit no-release impact",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "security_impact",
-      "kind": "input",
-      "type": "string",
-      "label": "Security impact",
-      "description": "Security boundary impact, negative scenario, or explicit no-impact decision",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "dependencies",
-      "kind": "input",
-      "type": "string",
-      "label": "Dependencies",
-      "description": "Prerequisites and follow-up Issues; explain if none",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "implementation",
-      "kind": "input",
-      "type": "string",
-      "label": "Implementation notes",
-      "description": "Alternatives, decision rationale, and phased rollout",
-      "required": true,
-      "element": "textarea"
     }
   ]
 }
