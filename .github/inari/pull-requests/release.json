@@ -13,133 +13,51 @@
       "headingLevel": 1
     },
     {
-      "id": "target_version",
+      "id": "version",
       "kind": "input",
       "type": "string",
-      "label": "Target version",
+      "label": "Version",
       "placeholder": "- Target version:\n- Version bump (patch/minor/major):",
       "headingLevel": 2
     },
     {
-      "id": "changelog_release_notes",
+      "id": "release_notes",
       "kind": "input",
-      "type": "checklist",
-      "label": "CHANGELOG / release notes",
-      "options": [
-        {
-          "label": "CHANGELOG updated and reviewed",
-          "id": "changelog_updated_and_reviewed",
-          "required": false
-        },
-        {
-          "label": "Release notes drafted and reviewed",
-          "id": "release_notes_drafted_and_reviewed",
-          "required": false
-        }
-      ],
+      "type": "string",
+      "label": "Release notes",
+      "placeholder": "<!-- User/reviewer-facing release summary. -->",
       "headingLevel": 2
     },
     {
-      "id": "content_after_changelog_release_notes",
-      "kind": "documentation",
-      "content": "- Notes:"
-    },
-    {
-      "id": "package_metadata",
-      "kind": "input",
-      "type": "checklist",
-      "label": "Package metadata",
-      "options": [
-        {
-          "label": "`package.json` version matches the target version",
-          "id": "package_json_version_matches_the_target_version",
-          "required": false
-        },
-        {
-          "label": "Package metadata and files list reviewed",
-          "id": "package_metadata_and_files_list_reviewed",
-          "required": false
-        }
-      ],
-      "headingLevel": 2
-    },
-    {
-      "id": "content_after_package_metadata",
-      "kind": "documentation",
-      "content": "- Metadata notes:"
-    },
-    {
-      "id": "publish_prerequisites",
-      "kind": "input",
-      "type": "checklist",
-      "label": "Publish prerequisites",
-      "options": [
-        {
-          "label": "Required validation is complete",
-          "id": "required_validation_is_complete",
-          "required": false
-        },
-        {
-          "label": "Publish tag and GitHub Release plan confirmed",
-          "id": "publish_tag_and_github_release_plan_confirmed",
-          "required": false
-        },
-        {
-          "label": "npm/OIDC publish prerequisites confirmed",
-          "id": "npm_oidc_publish_prerequisites_confirmed",
-          "required": false
-        }
-      ],
-      "headingLevel": 2
-    },
-    {
-      "id": "content_after_publish_prerequisites",
-      "kind": "documentation",
-      "content": "- Prerequisite notes:"
-    },
-    {
-      "id": "breaking_changes_migration",
+      "id": "breaking_migration",
       "kind": "input",
       "type": "string",
       "label": "Breaking changes / migration",
-      "placeholder": "- Breaking changes: None / Yes — describe:\n- Migration required: None / Yes — describe:",
+      "placeholder": "None. <!-- If not None, describe the breaking change and migration path. -->",
       "headingLevel": 2
     },
     {
-      "id": "post-release_checks",
-      "kind": "input",
-      "type": "checklist",
-      "label": "Post-release checks",
-      "options": [
-        {
-          "label": "GitHub Release publication will trigger the existing `release: published` workflow",
-          "id": "github_release_publication_will_trigger_the_existing_release_published_workflow",
-          "required": false
-        },
-        {
-          "label": "npm package/version publication will be verified",
-          "id": "npm_package_version_publication_will_be_verified",
-          "required": false
-        },
-        {
-          "label": "Post-release smoke test and install verification planned",
-          "id": "post-release_smoke_test_and_install_verification_planned",
-          "required": false
-        }
-      ],
-      "headingLevel": 2
-    },
-    {
-      "id": "content_after_post-release_checks",
-      "kind": "documentation",
-      "content": "- Follow-up checks:"
-    },
-    {
-      "id": "linked_issue_release_tracking",
+      "id": "publish_plan",
       "kind": "input",
       "type": "string",
-      "label": "Linked issue / release tracking",
-      "placeholder": "- Issue or release tracking reference:",
+      "label": "Publish plan",
+      "placeholder": "<!-- Intended package/tag/GitHub Release path. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "post_release_verification",
+      "kind": "input",
+      "type": "string",
+      "label": "Post-release verification",
+      "placeholder": "<!-- Checks that must happen after publication. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "tracking",
+      "kind": "input",
+      "type": "string",
+      "label": "Tracking",
+      "placeholder": "<!-- Optional. Linked Issue or release tracking reference. -->",
       "headingLevel": 2
     }
   ]
