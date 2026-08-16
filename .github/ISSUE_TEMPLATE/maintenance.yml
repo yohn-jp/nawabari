@@ -4,45 +4,17 @@ description: Maintenance, dependency updates, or development infrastructure
 title: "chore: "
 body:
   - type: textarea
-    id: summary
+    id: task
     attributes:
-      label: Summary
-      description: Concise maintenance work description
+      label: Task
+      description: Concrete maintenance work
     validations:
       required: true
   - type: textarea
-    id: problem
+    id: reason
     attributes:
-      label: Problem
-      description: Need, deadline, and current debt
-    validations:
-      required: true
-  - type: textarea
-    id: failing_scenario
-    attributes:
-      label: Failing scenario
-      description: Current failure, operational gap, or concrete scenario motivating the maintenance work; explain if no failure applies
-    validations:
-      required: true
-  - type: textarea
-    id: goal
-    attributes:
-      label: Goal
-      description: State after completion
-    validations:
-      required: true
-  - type: textarea
-    id: expected_contract
-    attributes:
-      label: Expected contract
-      description: Observable behavior, invariant, or operational contract expected after completion
-    validations:
-      required: true
-  - type: textarea
-    id: non_goals
-    attributes:
-      label: Non-goals
-      description: Changes deliberately excluded from this work
+      label: Reason
+      description: Debt, deadline, operational need, or dependency reason
     validations:
       required: true
   - type: textarea
@@ -54,51 +26,9 @@ body:
     validations:
       required: true
   - type: textarea
-    id: affected
+    id: constraints
     attributes:
-      label: Affected areas
-      description: Affected areas
+      label: Constraints
+      description: Rollback, compatibility, or operational constraints when material
     validations:
-      required: true
-  - type: textarea
-    id: test_layer
-    attributes:
-      label: Test layer
-      description: Layer that proves the maintenance change and its failure or compatibility behavior
-    validations:
-      required: true
-  - type: textarea
-    id: risks
-    attributes:
-      label: Risks / compatibility
-      description: Operational and compatibility risks
-    validations:
-      required: true
-  - type: textarea
-    id: release_impact
-    attributes:
-      label: Release impact
-      description: Package, publish, rollout, artifact, or explicit no-release impact
-    validations:
-      required: true
-  - type: textarea
-    id: security_impact
-    attributes:
-      label: Security impact
-      description: Security boundary impact, negative scenario, or explicit no-impact decision
-    validations:
-      required: true
-  - type: textarea
-    id: dependencies
-    attributes:
-      label: Dependencies
-      description: Dependent work and external conditions; explain if none
-    validations:
-      required: true
-  - type: textarea
-    id: implementation
-    attributes:
-      label: Implementation notes
-      description: Execution plan and rollback
-    validations:
-      required: true
+      required: false
