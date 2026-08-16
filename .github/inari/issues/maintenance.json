@@ -7,56 +7,20 @@
   "title": "chore: ",
   "sections": [
     {
-      "id": "summary",
+      "id": "task",
       "kind": "input",
       "type": "string",
-      "label": "Summary",
-      "description": "Concise maintenance work description",
+      "label": "Task",
+      "description": "Concrete maintenance work",
       "required": true,
       "element": "textarea"
     },
     {
-      "id": "problem",
+      "id": "reason",
       "kind": "input",
       "type": "string",
-      "label": "Problem",
-      "description": "Need, deadline, and current debt",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "failing_scenario",
-      "kind": "input",
-      "type": "string",
-      "label": "Failing scenario",
-      "description": "Current failure, operational gap, or concrete scenario motivating the maintenance work; explain if no failure applies",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "goal",
-      "kind": "input",
-      "type": "string",
-      "label": "Goal",
-      "description": "State after completion",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "expected_contract",
-      "kind": "input",
-      "type": "string",
-      "label": "Expected contract",
-      "description": "Observable behavior, invariant, or operational contract expected after completion",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "non_goals",
-      "kind": "input",
-      "type": "string",
-      "label": "Non-goals",
-      "description": "Changes deliberately excluded from this work",
+      "label": "Reason",
+      "description": "Debt, deadline, operational need, or dependency reason",
       "required": true,
       "element": "textarea"
     },
@@ -71,66 +35,12 @@
       "defaultValue": "- [ ] "
     },
     {
-      "id": "affected",
+      "id": "constraints",
       "kind": "input",
       "type": "string",
-      "label": "Affected areas",
-      "description": "Affected areas",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "test_layer",
-      "kind": "input",
-      "type": "string",
-      "label": "Test layer",
-      "description": "Layer that proves the maintenance change and its failure or compatibility behavior",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "risks",
-      "kind": "input",
-      "type": "string",
-      "label": "Risks / compatibility",
-      "description": "Operational and compatibility risks",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "release_impact",
-      "kind": "input",
-      "type": "string",
-      "label": "Release impact",
-      "description": "Package, publish, rollout, artifact, or explicit no-release impact",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "security_impact",
-      "kind": "input",
-      "type": "string",
-      "label": "Security impact",
-      "description": "Security boundary impact, negative scenario, or explicit no-impact decision",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "dependencies",
-      "kind": "input",
-      "type": "string",
-      "label": "Dependencies",
-      "description": "Dependent work and external conditions; explain if none",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "implementation",
-      "kind": "input",
-      "type": "string",
-      "label": "Implementation notes",
-      "description": "Execution plan and rollback",
-      "required": true,
+      "label": "Constraints",
+      "description": "Rollback, compatibility, or operational constraints when material",
+      "required": false,
       "element": "textarea"
     }
   ]
