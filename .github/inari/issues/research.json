@@ -7,56 +7,47 @@
   "title": "docs: research ",
   "sections": [
     {
-      "id": "summary",
+      "id": "question",
       "kind": "input",
       "type": "string",
-      "label": "Summary",
-      "description": "Research topic",
+      "label": "Question",
+      "description": "Specific unresolved question",
       "required": true,
       "element": "textarea"
     },
     {
-      "id": "problem",
+      "id": "motivation",
       "kind": "input",
       "type": "string",
-      "label": "Problem",
-      "description": "Unresolved question or decision gap",
+      "label": "Motivation",
+      "description": "Why resolving it matters and which decision it blocks",
       "required": true,
       "element": "textarea"
     },
     {
-      "id": "failing_scenario",
+      "id": "evaluation_criteria",
       "kind": "input",
       "type": "string",
-      "label": "Failing scenario",
-      "description": "Observed failure, uncertainty, or concrete scenario the research must resolve; explain if no failure applies",
+      "label": "Evaluation criteria",
+      "description": "Dimensions and thresholds used to compare evidence",
       "required": true,
       "element": "textarea"
     },
     {
-      "id": "goal",
+      "id": "scope",
       "kind": "input",
       "type": "string",
-      "label": "Goal",
-      "description": "Decisions enabled by the research",
+      "label": "Scope",
+      "description": "Candidates, experiments, sources, and explicit research boundary",
       "required": true,
       "element": "textarea"
     },
     {
-      "id": "expected_contract",
+      "id": "deliverable",
       "kind": "input",
       "type": "string",
-      "label": "Expected contract",
-      "description": "Decision, evidence threshold, or invariant expected from the research",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "non_goals",
-      "kind": "input",
-      "type": "string",
-      "label": "Non-goals",
-      "description": "Research and implementation excluded from this work",
+      "label": "Deliverable",
+      "description": "Expected recommendation, measurement, or result",
       "required": true,
       "element": "textarea"
     },
@@ -65,73 +56,10 @@
       "kind": "input",
       "type": "string",
       "label": "Acceptance criteria",
-      "description": "Completion criteria for evidence, comparison, and conclusion",
+      "description": "Evidence required before the research is complete",
       "required": true,
       "element": "textarea",
       "defaultValue": "- [ ] "
-    },
-    {
-      "id": "affected",
-      "kind": "input",
-      "type": "string",
-      "label": "Affected areas",
-      "description": "Areas affected by the decision",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "test_layer",
-      "kind": "input",
-      "type": "string",
-      "label": "Test layer",
-      "description": "Experiment, contract, integration, fault, standards, or release layer needed for evidence",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "risks",
-      "kind": "input",
-      "type": "string",
-      "label": "Risks / compatibility",
-      "description": "Risks from insufficient research or adoption",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "release_impact",
-      "kind": "input",
-      "type": "string",
-      "label": "Release impact",
-      "description": "Package, publish, rollout, artifact, or explicit no-release impact",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "security_impact",
-      "kind": "input",
-      "type": "string",
-      "label": "Security impact",
-      "description": "Security boundary impact, negative scenario, or explicit no-impact decision",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "dependencies",
-      "kind": "input",
-      "type": "string",
-      "label": "Dependencies",
-      "description": "Required sources, environments, and prerequisite Issues",
-      "required": true,
-      "element": "textarea"
-    },
-    {
-      "id": "implementation",
-      "kind": "input",
-      "type": "string",
-      "label": "Implementation notes",
-      "description": "Alternatives, measurement method, and deliverables",
-      "required": true,
-      "element": "textarea"
     }
   ]
 }
