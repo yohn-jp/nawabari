@@ -5,49 +5,25 @@ title: "feat: "
 labels:
   - enhancement
 body:
-  - type: markdown
-    attributes:
-      value: Complete every field with specific evidence. One Issue has one objective.
-  - type: textarea
-    id: summary
-    attributes:
-      label: Summary
-      description: Concise description of the change
-    validations:
-      required: true
   - type: textarea
     id: problem
     attributes:
       label: Problem
-      description: Problem to solve and supporting evidence
+      description: User or system limitation being solved and supporting context
     validations:
       required: true
   - type: textarea
-    id: failing_scenario
+    id: capability
     attributes:
-      label: Failing scenario
-      description: Reproducible failure or the concrete scenario this feature prevents; explain if no failure applies
+      label: Capability
+      description: Capability to add and its intended observable behavior
     validations:
       required: true
   - type: textarea
-    id: goal
+    id: contract
     attributes:
-      label: Goal
-      description: State to achieve
-    validations:
-      required: true
-  - type: textarea
-    id: expected_contract
-    attributes:
-      label: Expected contract
-      description: Observable behavior, invariant, or compatibility contract expected after implementation
-    validations:
-      required: true
-  - type: textarea
-    id: non_goals
-    attributes:
-      label: Non-goals
-      description: Explicitly excluded work
+      label: Contract
+      description: API, CLI, behavioral invariant, or compatibility contract
     validations:
       required: true
   - type: textarea
@@ -59,51 +35,16 @@ body:
     validations:
       required: true
   - type: textarea
-    id: affected
+    id: non_goals
     attributes:
-      label: Affected areas
-      description: Affected capabilities, files, and users
+      label: Non-goals
+      description: Explicit boundary of the feature
     validations:
       required: true
   - type: textarea
-    id: test_layer
+    id: constraints
     attributes:
-      label: Test layer
-      description: Expected unit, integration/process, package, E2E, fault, standards, or release layer and why
+      label: Constraints
+      description: Compatibility, performance, security, or implementation constraints when material
     validations:
-      required: true
-  - type: textarea
-    id: risks
-    attributes:
-      label: Risks / compatibility
-      description: Risks and backward compatibility
-    validations:
-      required: true
-  - type: textarea
-    id: release_impact
-    attributes:
-      label: Release impact
-      description: Package, publish, artifact, or explicit no-release impact
-    validations:
-      required: true
-  - type: textarea
-    id: security_impact
-    attributes:
-      label: Security impact
-      description: Security boundary impact, negative scenario, or explicit no-impact decision
-    validations:
-      required: true
-  - type: textarea
-    id: dependencies
-    attributes:
-      label: Dependencies
-      description: Dependent Issues, PRs, and external conditions; explain if none
-    validations:
-      required: true
-  - type: textarea
-    id: implementation
-    attributes:
-      label: Implementation notes
-      description: Constraints, proposed approach, and completed investigation
-    validations:
-      required: true
+      required: false
