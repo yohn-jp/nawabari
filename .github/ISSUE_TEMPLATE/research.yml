@@ -4,101 +4,45 @@ description: Pre-implementation research or technical validation
 title: "docs: research "
 body:
   - type: textarea
-    id: summary
+    id: question
     attributes:
-      label: Summary
-      description: Research topic
+      label: Question
+      description: Specific unresolved question
     validations:
       required: true
   - type: textarea
-    id: problem
+    id: motivation
     attributes:
-      label: Problem
-      description: Unresolved question or decision gap
+      label: Motivation
+      description: Why resolving it matters and which decision it blocks
     validations:
       required: true
   - type: textarea
-    id: failing_scenario
+    id: evaluation_criteria
     attributes:
-      label: Failing scenario
-      description: Observed failure, uncertainty, or concrete scenario the research must resolve; explain if no failure applies
+      label: Evaluation criteria
+      description: Dimensions and thresholds used to compare evidence
     validations:
       required: true
   - type: textarea
-    id: goal
+    id: scope
     attributes:
-      label: Goal
-      description: Decisions enabled by the research
+      label: Scope
+      description: Candidates, experiments, sources, and explicit research boundary
     validations:
       required: true
   - type: textarea
-    id: expected_contract
+    id: deliverable
     attributes:
-      label: Expected contract
-      description: Decision, evidence threshold, or invariant expected from the research
-    validations:
-      required: true
-  - type: textarea
-    id: non_goals
-    attributes:
-      label: Non-goals
-      description: Research and implementation excluded from this work
+      label: Deliverable
+      description: Expected recommendation, measurement, or result
     validations:
       required: true
   - type: textarea
     id: acceptance
     attributes:
       label: Acceptance criteria
-      description: Completion criteria for evidence, comparison, and conclusion
+      description: Evidence required before the research is complete
       value: "- [ ] "
-    validations:
-      required: true
-  - type: textarea
-    id: affected
-    attributes:
-      label: Affected areas
-      description: Areas affected by the decision
-    validations:
-      required: true
-  - type: textarea
-    id: test_layer
-    attributes:
-      label: Test layer
-      description: Experiment, contract, integration, fault, standards, or release layer needed for evidence
-    validations:
-      required: true
-  - type: textarea
-    id: risks
-    attributes:
-      label: Risks / compatibility
-      description: Risks from insufficient research or adoption
-    validations:
-      required: true
-  - type: textarea
-    id: release_impact
-    attributes:
-      label: Release impact
-      description: Package, publish, rollout, artifact, or explicit no-release impact
-    validations:
-      required: true
-  - type: textarea
-    id: security_impact
-    attributes:
-      label: Security impact
-      description: Security boundary impact, negative scenario, or explicit no-impact decision
-    validations:
-      required: true
-  - type: textarea
-    id: dependencies
-    attributes:
-      label: Dependencies
-      description: Required sources, environments, and prerequisite Issues
-    validations:
-      required: true
-  - type: textarea
-    id: implementation
-    attributes:
-      label: Implementation notes
-      description: Alternatives, measurement method, and deliverables
     validations:
       required: true
