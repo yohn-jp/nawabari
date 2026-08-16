@@ -4,38 +4,38 @@ description: Change to boundaries, contracts, or architectural decisions
 title: "refactor: "
 body:
   - type: textarea
-    id: summary
+    id: context
     attributes:
-      label: Summary
-      description: Concise architectural change description
+      label: Context
+      description: Current boundary or design problem and supporting evidence
     validations:
       required: true
   - type: textarea
-    id: problem
+    id: decision
     attributes:
-      label: Problem
-      description: Current design problem and evidence
+      label: Decision
+      description: Architectural choice that becomes the intended design
     validations:
       required: true
   - type: textarea
-    id: failing_scenario
+    id: invariants
     attributes:
-      label: Failing scenario
-      description: Failure, boundary mismatch, or concrete scenario motivating the architecture change; explain if no failure applies
+      label: Invariants
+      description: Boundaries and contracts that must hold
     validations:
       required: true
   - type: textarea
-    id: goal
+    id: alternatives
     attributes:
-      label: Goal
-      description: Target architecture and invariants to preserve
+      label: Alternatives
+      description: Meaningful alternatives considered and why they were rejected
     validations:
       required: true
   - type: textarea
-    id: expected_contract
+    id: consequences
     attributes:
-      label: Expected contract
-      description: Boundary, invariant, and observable contract expected after the decision
+      label: Consequences
+      description: Operational, compatibility, security, release, or complexity consequences that follow from the decision
     validations:
       required: true
   - type: textarea
@@ -46,59 +46,17 @@ body:
     validations:
       required: true
   - type: textarea
+    id: migration
+    attributes:
+      label: Migration
+      description: Rollout, migration, or compatibility plan when needed
+    validations:
+      required: false
+  - type: textarea
     id: acceptance
     attributes:
       label: Acceptance criteria
-      description: Verifiable design completion criteria
+      description: Verifiable design and implementation completion criteria
       value: "- [ ] "
-    validations:
-      required: true
-  - type: textarea
-    id: affected
-    attributes:
-      label: Affected areas
-      description: Affected layers and public contracts
-    validations:
-      required: true
-  - type: textarea
-    id: test_layer
-    attributes:
-      label: Test layer
-      description: Layer that proves the boundary, contract, migration, or failure behavior
-    validations:
-      required: true
-  - type: textarea
-    id: risks
-    attributes:
-      label: Risks / compatibility
-      description: Migration, backward compatibility, and failure impact
-    validations:
-      required: true
-  - type: textarea
-    id: release_impact
-    attributes:
-      label: Release impact
-      description: Package, publish, rollout, artifact, or explicit no-release impact
-    validations:
-      required: true
-  - type: textarea
-    id: security_impact
-    attributes:
-      label: Security impact
-      description: Security boundary impact, negative scenario, or explicit no-impact decision
-    validations:
-      required: true
-  - type: textarea
-    id: dependencies
-    attributes:
-      label: Dependencies
-      description: Prerequisites and follow-up Issues; explain if none
-    validations:
-      required: true
-  - type: textarea
-    id: implementation
-    attributes:
-      label: Implementation notes
-      description: Alternatives, decision rationale, and phased rollout
     validations:
       required: true
