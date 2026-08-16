@@ -18,6 +18,14 @@ import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS, EVIDENCE_MAX_DIFF_PAT
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
+import {
+  resolveSandboxExecutionRequest,
+  runSandboxedCommand,
+  type SandboxCommand,
+  type SandboxExecutionResult,
+  type SandboxProbe,
+  type SandboxRuntimeLayout,
+} from "./domain/sandbox.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -81,6 +89,16 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     summary: "Show the current or selected session",
     usage: `${CLI_NAME} session show [--session <id>]`,
     options: [option("--session", "Select a session instead of the current worktree owner", { value: "<id>" })],
+  },
+  {
+    name: "session run",
+    summary: "Run one command inside the protected session sandbox",
+    usage: `${CLI_NAME} session run [--session <id>] -- <command> [args...]`,
+    options: [option("--session", "Select the active owned session", { value: "<id>" })],
+    notes: [
+      "The -- terminator is mandatory. The command is passed as argv without a shell, and protected execution is fail-closed.",
+      "session exec is an alias.",
+    ],
   },
   {
     name: "session list",
@@ -284,7 +302,9 @@ function helpSpecFor(commandArguments: readonly string[]): HelpCommandSpec {
   let key =
     commandArguments[0] === "resource"
       ? `resource ${commandArguments[1] ?? "list"}`
-      : commandArguments.slice(0, 2).join(" ");
+      : commandArguments[0] === "session" && commandArguments[1] === "exec"
+        ? "session run"
+        : commandArguments.slice(0, 2).join(" ");
   if (key === "resource claims") key = "resource list";
   const direct = HELP_COMMANDS.find((spec) => spec.name === key);
   if (direct !== undefined && !direct.name.startsWith("resource ")) return direct;
@@ -389,6 +409,12 @@ export type CliDependencies = {
   cwd?: string;
   io?: CliIO;
   version?: string;
+  sandboxRunner?: (
+    request: import("./domain/sandbox.js").SandboxExecutionRequest,
+    command: SandboxCommand,
+  ) => Promise<DomainResult<SandboxExecutionResult>>;
+  sandboxProbe?: SandboxProbe;
+  sandboxRuntimeLayout?: SandboxRuntimeLayout;
 };
 
 type GlobalArguments = {
@@ -443,7 +469,17 @@ function parseGlobalArguments(argv: string[]): DomainResult<GlobalArguments> {
   let version = false;
   const commandArguments: string[] = [];
 
+  let passthrough = false;
   for (const argument of argv) {
+    if (passthrough) {
+      commandArguments.push(argument);
+      continue;
+    }
+    if (argument === "--") {
+      passthrough = true;
+      commandArguments.push(argument);
+      continue;
+    }
     if (argument === "--json") {
       json = true;
     } else if (argument === "-h" || argument === "--help") {
@@ -638,7 +674,8 @@ async function resolveSelectedSession(
 
 async function executeCommand(
   commandArguments: string[],
-  dependencies: Required<Pick<CliDependencies, "backend" | "cwd">>,
+  dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
+    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout">,
 ): Promise<DomainResult<JsonObject>> {
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
@@ -695,6 +732,32 @@ async function executeCommand(
       };
       const result = await dependencies.backend.createSession(context, options);
       return result.ok ? { ok: true, value: result.value } : result;
+    }
+    if (subcommand === "run" || subcommand === "exec") {
+      const delimiter = rest.indexOf("--");
+      if (delimiter === -1) {
+        return failure(usageError("MISSING_ARGUMENT", "session run requires a -- terminator before the command."));
+      }
+      const parsed = parseOptions(rest.slice(0, delimiter), new Set(["--session"]));
+      if (!parsed.ok) return parsed;
+      const command = rest[delimiter + 1];
+      if (command === undefined || command.length === 0) {
+        return failure(usageError("MISSING_ARGUMENT", "session run requires a command after --."));
+      }
+      const request = await resolveSandboxExecutionRequest(
+        dependencies.backend,
+        context,
+        { session_id: parsed.value.session_id, enforce: true },
+        dependencies.sandboxProbe,
+        dependencies.sandboxRuntimeLayout,
+      );
+      if (!request.ok) return request;
+      const runner = dependencies.sandboxRunner ?? runSandboxedCommand;
+      const result = await runner(request.value, {
+        command,
+        args: rest.slice(delimiter + 2),
+      });
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "id" || subcommand === "show" || subcommand === "close") {
       if (subcommand === "id") {
@@ -1081,7 +1144,9 @@ function emitFailure(mode: CliMode, command: string, error: DomainError, io: Cli
 
 export async function runCli(argv: string[], dependencies: CliDependencies = {}): Promise<number> {
   const io = dependencies.io ?? defaultCliIO();
-  const mode: CliMode = argv.includes("--json") ? "json" : "human";
+  const delimiter = argv.indexOf("--");
+  const globalArguments = delimiter === -1 ? argv : argv.slice(0, delimiter);
+  const mode: CliMode = globalArguments.includes("--json") ? "json" : "human";
   const parsed = parseGlobalArguments(argv);
   if (!parsed.ok) return emitFailure(mode, "cli", parsed.error, io);
 
@@ -1118,9 +1183,24 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   const cwd = dependencies.cwd ?? process.cwd();
   try {
     const backend = dependencies.backend ?? createLocalSessionBackend();
-    const result = await executeCommand(parsed.value.commandArguments, { backend, cwd });
+    const result = await executeCommand(parsed.value.commandArguments, {
+      backend,
+      cwd,
+      sandboxRunner: dependencies.sandboxRunner,
+      sandboxProbe: dependencies.sandboxProbe,
+      sandboxRuntimeLayout: dependencies.sandboxRuntimeLayout,
+    });
     if (!result.ok) return emitFailure(mode, command, result.error, io);
     io.stdout(renderSuccess(mode, command, result.value));
+    if (
+      (command === "session run" || command === "session exec") &&
+      typeof result.value.exit_code === "number" &&
+      result.value.exit_code !== 0
+    ) {
+      return result.value.exit_code >= 1 && result.value.exit_code <= 255
+        ? result.value.exit_code
+        : EXIT_CODES.rejected;
+    }
     return EXIT_CODES.success;
   } catch {
     return emitFailure(mode, command, new DomainError("INTERNAL_ERROR", "An unexpected internal error occurred."), io);

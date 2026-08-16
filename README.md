@@ -10,9 +10,9 @@ authorization and ownership boundary, not an operating-system or filesystem
 sandbox: a process that already has filesystem permissions can still edit
 another worktree directly. This default (legacy) mode is unchanged.
 
-A separate, opt-in protected session mode defines a Linux-only contract for a
-future OS/filesystem/process enforcement boundary underneath the existing
-session/worktree/resource authority (`src/domain/sandbox.ts`, contract
+The opt-in protected session mode defines a Linux-only OS/filesystem/process
+enforcement boundary underneath the existing session/worktree/resource
+authority (`src/domain/sandbox.ts`, contract
 `nawabari.sandbox-execution.v1`). It binds one existing Nawabari session
 resolved through the authoritative registry/guard path to a typed sandbox
 execution request; it does not create a second session identity. A
@@ -22,11 +22,34 @@ defense-in-depth primitives (cgroups v2, Landlock, seccomp, capability
 inspection). When protected execution is requested and a required capability
 is unavailable or the platform is unsupported, resolution fails closed and
 never returns a request that claims the legacy unsandboxed path is
-protected. This first contract defines capability detection and the typed
-request/result shape only; `resolveSandboxExecutionRequest()` returns a
-request, it does not itself invoke bubblewrap or restrict filesystem or
-process access, so protected mode enforces nothing yet. Network mode is
-honestly reported as `inherited` (shared with the host), not isolated.
+protected. The lower-level contract remains responsible only for capability
+detection and the typed request/result shape; `resolveSandboxExecutionRequest()`
+returns a request without invoking bubblewrap. The managed `session run`
+launcher consumes that request and establishes the protected boundary. Network
+mode is honestly reported as `inherited` (shared with the host), not isolated.
+
+`git nawabari session run --session <id> -- <command> [args...]` is the
+managed protected execution entry point. It resolves the existing session
+through the normal guard authority and compiles a fixed bubblewrap argv; the
+command is passed after an argv terminator and is never interpreted by a
+shell. Resolution or launch failure never falls back to the legacy ambient
+filesystem view.
+
+The canonical profile starts from a private root, mounts only the owned
+worktree read-write, gives each session private `/tmp`, `/proc`, HOME and
+cache state, and exposes no sibling worktree or control-plane path. A small
+repository-owned `nawabari/sandbox/shared-home` subtree is the only HOME state
+shared between sessions. Selected host user-tool directories (`~/.local/bin`
+and pnpm's user bin when present) are read-only; credentials and the rest of
+the host HOME are not mounted. `/dev`, system certificates/configuration, and
+the detected runtime are explicit read-only/runtime inputs.
+
+On standalone Linux the profile uses existing `/usr`, `/bin`, `/lib*` and
+selected `/etc` paths only when present. On NixOS it additionally selects
+`/nix/store`, `/run/current-system`, `/run/wrappers`, and the per-user profile
+when present; no `/usr` layout is assumed. Missing required paths or namespace
+support produces a stable capability/topology error. Network remains
+inherited by design.
 
 ## Install
 
@@ -284,6 +307,17 @@ worktree=$(printf '%s' "$created" | jq -r .worktree)
 # run the worker in "$worktree"
 git nawabari session close --session "$session_id" --json
 ```
+
+For a worker that must receive the protected filesystem/process boundary, use
+the managed launcher instead of starting the worker directly:
+
+```bash
+git nawabari session run --session "$session_id" -- node worker.js
+```
+
+The launcher owns only the child sandbox topology and process attachment. The
+session registry, worktree/branch ownership, resource claims and lifecycle
+remain the authoritative Nawabari domain state.
 
 The orchestrator owns scheduling, prompts, and worker lifetime; Nawabari owns
 only local session identity, worktree/branch ownership, and safe cleanup. No

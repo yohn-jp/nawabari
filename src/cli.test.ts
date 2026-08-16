@@ -13,6 +13,7 @@ import type {
   SessionRecord,
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
+import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
 import type { CliIO } from "./presentation.js";
 
 const sampleSession: SessionRecord = {
@@ -80,9 +81,78 @@ test("--help exits 0 and prints the nawabari usage", async () => {
   const output = capture();
   const exitCode = await runCli(["--help"], { io: output.io });
 
-  assert.equal(exitCode, 0);
+  assert.equal(exitCode, 0, output.stderr.join("\\n") || output.stdout.join("\\n"));
   assert.match(output.stdout.join("\n"), /Usage: nawabari/);
   assert.equal(output.stderr.length, 0);
+});
+
+test("session run resolves the existing session authority and preserves command argv after --", async () => {
+  const output = capture();
+  let observedCommand: string[] = [];
+  const exitCode = await runCli(
+    ["--json", "session", "run", "--session", sampleSession.session_id, "--", "printf", "--json"],
+    {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: output.io,
+      sandboxProbe: {
+        platform: () => "linux",
+        uid: () => 1000,
+        gid: () => 1000,
+        hasBubblewrap: () => true,
+        hasNamespaceSupport: () => true,
+        hasCgroupsV2: () => false,
+        hasLandlock: () => false,
+        hasSeccomp: () => true,
+        hasCapabilities: () => true,
+      },
+      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRunner: async (_request, command) => {
+        observedCommand = [command.command, ...(command.args ?? [])];
+        return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+      },
+    },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
+  assert.deepEqual(observedCommand, ["printf", "--json"]);
+  assert.deepEqual(JSON.parse(output.stdout[0] ?? ""), {
+    ok: true,
+    command: "session run",
+    exit_code: 0,
+    signal: null,
+    stdout: "ok",
+    stderr: "",
+    duration_ms: 1,
+  });
+});
+
+test("session run does not interpret a child --json argument as a Nawabari global option", async () => {
+  const output = capture();
+  const exitCode = await runCli(["session", "run", "--session", sampleSession.session_id, "--", "printf", "--json"], {
+    cwd: sampleSession.worktree,
+    backend: backendForTests(),
+    io: output.io,
+    sandboxProbe: {
+      platform: () => "linux",
+      uid: () => 1000,
+      gid: () => 1000,
+      hasBubblewrap: () => true,
+      hasNamespaceSupport: () => true,
+      hasCgroupsV2: () => false,
+      hasLandlock: () => false,
+      hasSeccomp: () => true,
+      hasCapabilities: () => true,
+    },
+    sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+    sandboxRunner: async (_request, command) => {
+      assert.deepEqual([command.command, ...(command.args ?? [])], ["printf", "--json"]);
+      return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+    },
+  });
+
+  assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
+  assert.match(output.stdout[0] ?? "", /^session run: ok/);
 });
 
 test("command-specific help is projected from one spec and marks session create options accurately", async () => {
@@ -152,6 +222,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session create",
       "session id",
       "session show",
+      "session run",
       "session list",
       "session claim",
       "session update",
