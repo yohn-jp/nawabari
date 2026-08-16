@@ -13,94 +13,38 @@ body:
     validations:
       required: true
   - type: textarea
-    id: problem
+    id: reproduction
     attributes:
-      label: Problem
-      description: Actual result, expected result, reproduction steps, and environment
+      label: Reproduction
+      description: Minimal steps, input, and environment needed to reproduce the defect
     validations:
       required: true
   - type: textarea
-    id: failing_scenario
+    id: expected_behavior
     attributes:
-      label: Failing scenario
-      description: Minimal reproduction, observed failure, and affected environment
+      label: Expected behavior
+      description: Expected observable behavior or invariant
     validations:
       required: true
   - type: textarea
-    id: goal
+    id: actual_behavior
     attributes:
-      label: Goal
-      description: State after the fix
-    validations:
-      required: true
-  - type: textarea
-    id: expected_contract
-    attributes:
-      label: Expected contract
-      description: Behavior and invariant that the fix must establish
-    validations:
-      required: true
-  - type: textarea
-    id: non_goals
-    attributes:
-      label: Non-goals
-      description: Explicitly excluded fixes
+      label: Actual behavior
+      description: Observed behavior or error
     validations:
       required: true
   - type: textarea
     id: acceptance
     attributes:
       label: Acceptance criteria
-      description: Completion criteria including regression tests
+      description: Completion criteria, including regression proof where applicable
       value: "- [ ] "
     validations:
       required: true
   - type: textarea
-    id: affected
+    id: context
     attributes:
-      label: Affected areas
-      description: Affected areas
+      label: Context
+      description: Logs, workaround, related Issues, or environment details
     validations:
-      required: true
-  - type: textarea
-    id: test_layer
-    attributes:
-      label: Test layer
-      description: Regression, unit, integration/process, fault, E2E, or package layer that proves the fix
-    validations:
-      required: true
-  - type: textarea
-    id: risks
-    attributes:
-      label: Risks / compatibility
-      description: Fix risks and compatibility
-    validations:
-      required: true
-  - type: textarea
-    id: release_impact
-    attributes:
-      label: Release impact
-      description: Package, publish, artifact, or explicit no-release impact
-    validations:
-      required: true
-  - type: textarea
-    id: security_impact
-    attributes:
-      label: Security impact
-      description: Security boundary impact, negative scenario, or explicit no-impact decision
-    validations:
-      required: true
-  - type: textarea
-    id: dependencies
-    attributes:
-      label: Dependencies
-      description: Related Issues and external conditions; explain if none
-    validations:
-      required: true
-  - type: textarea
-    id: implementation
-    attributes:
-      label: Implementation notes
-      description: Root-cause hypothesis, logs, and workaround
-    validations:
-      required: true
+      required: false
