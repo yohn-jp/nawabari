@@ -249,6 +249,17 @@ export function machineContract(packageVersion: string): JsonObject {
       result_schema: capability.result_schema,
       identities: [...capability.identities],
       failure_codes: [...capability.failure_codes],
+      ...(capability.id === "resource-claims"
+        ? {
+            claim_set_replacement: {
+              commands: ["session update", "resource update"],
+              atomic: true,
+              pairing: "adjacent-resource-mode",
+              idempotent_retry: true,
+              unchanged_on_rejection: true,
+            },
+          }
+        : {}),
     })),
     json: {
       schema_version: 1,

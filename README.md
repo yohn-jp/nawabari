@@ -82,6 +82,13 @@ result-schema versions, identity fields, and stable `failure_codes`. The
 package version is release metadata; it is not a substitute for the
 machine-contract identifier.
 
+The `resource-claims` capability additionally exposes a machine-readable
+`claim_set_replacement` object (`commands`, `atomic: true`,
+`pairing: "adjacent-resource-mode"`, `idempotent_retry: true`,
+`unchanged_on_rejection: true`) describing the atomic multi-claim replacement
+surface documented above, so a caller can discover this contract instead of
+assuming it from the CLI help text.
+
 The supported standalone sequence is:
 
 ```text

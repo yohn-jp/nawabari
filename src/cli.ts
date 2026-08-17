@@ -171,8 +171,28 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "resource update",
     summary: "Atomically replace a session's complete resource claim set (alias)",
-    usage: `${CLI_NAME} resource update --resource <path-or-glob> --mode <read|write|exclusive-write> [--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
-    options: [],
+    usage: `${CLI_NAME} resource update --resource <path-or-glob> --mode <read|write|exclusive-write> [--resource <path-or-glob> --mode <read|write|exclusive-write> ...] [--session <id>]`,
+    options: [
+      option(
+        "--resource",
+        "Repository-relative resource; repeatable, each paired with the --mode immediately after it",
+        {
+          value: "<path-or-glob>",
+          required: true,
+        },
+      ),
+      option("--mode", "Mode for the --resource immediately before it; repeatable", {
+        value: "<read|write|exclusive-write>",
+        required: true,
+      }),
+      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
+      option("--repository", "Expected repository identity", { value: "<id>" }),
+    ],
+    notes: [
+      "The desired claim set fully replaces the session's current claims in one updateClaims() transaction; " +
+        "on any invalid or conflicting claim the prior set is left unchanged.",
+      "Each --resource must be immediately followed by its own --mode; pairing is positional adjacency, not flag order.",
+    ],
   },
   {
     name: "resource list",
@@ -634,8 +654,9 @@ type ClaimReplacementPairs = {
  * `update` accepts a complete desired claim set as repeated
  * `--resource <path> --mode <mode>` pairs. Pairing is by strict local
  * adjacency (each `--resource` must be immediately followed by its own
- * `--mode`) rather than by parallel-array position, so argv order can never
- * associate a resource with the wrong mode.
+ * `--mode`, with no other option able to intervene) rather than by
+ * parallel-array position, so argv order can never associate a resource
+ * with the wrong mode.
  */
 function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimReplacementPairs> {
   let sessionId: string | null = null;
@@ -648,6 +669,15 @@ function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimRep
     if (name !== "--session" && name !== "--repository" && name !== "--resource" && name !== "--mode") {
       return failure(usageError("INVALID_ARGUMENT", `Unknown option: ${name}.`, { option: name }));
     }
+    if (pendingResource !== null && name !== "--mode") {
+      return failure(
+        usageError(
+          "INVALID_ARGUMENT",
+          `${name} cannot appear between --resource and its --mode; only --mode is permitted immediately after --resource.`,
+          { option: name },
+        ),
+      );
+    }
 
     const value = inlineValue ?? arguments_[index + 1];
     if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-"))) {
@@ -657,18 +687,8 @@ function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimRep
 
     if (name === "--session") sessionId = value;
     else if (name === "--repository") repository = value;
-    else if (name === "--resource") {
-      if (pendingResource !== null) {
-        return failure(
-          usageError(
-            "INVALID_ARGUMENT",
-            "--resource must be immediately followed by --mode before the next --resource.",
-            { option: "--resource" },
-          ),
-        );
-      }
-      pendingResource = value;
-    } else {
+    else if (name === "--resource") pendingResource = value;
+    else {
       if (pendingResource === null) {
         return failure(
           usageError("INVALID_ARGUMENT", "--mode must be immediately preceded by its own --resource.", {
@@ -690,6 +710,41 @@ function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimRep
     return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
   }
   return { ok: true, value: { session_id: sessionId, repository, pairs } };
+}
+
+type SingleClaimPair = {
+  session_id: string | null;
+  repository: string | null;
+  resource: string;
+  mode: string;
+};
+
+/**
+ * `claim` accepts exactly one `--resource`/`--mode` pair. Reuses the same
+ * strict-adjacency scan as `update` so a second `--resource`/`--mode` (in
+ * any order) is rejected outright instead of silently overwriting the
+ * first pair (last-wins).
+ */
+function parseSingleClaimPair(arguments_: string[]): DomainResult<SingleClaimPair> {
+  const parsed = parseClaimReplacementPairs(arguments_);
+  if (!parsed.ok) return parsed;
+  if (parsed.value.pairs.length > 1) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "claim accepts exactly one --resource/--mode pair.", {
+        pair_count: parsed.value.pairs.length,
+      }),
+    );
+  }
+  const [pair] = parsed.value.pairs;
+  return {
+    ok: true,
+    value: {
+      session_id: parsed.value.session_id,
+      repository: parsed.value.repository,
+      resource: pair.resource,
+      mode: pair.mode,
+    },
+  };
 }
 
 function sessionListingOptions(parsed: ParsedOptions): DomainResult<SessionListOptions> {
@@ -768,14 +823,8 @@ async function executeCommand(
       return failure(usageError("MISSING_ARGUMENT", "session requires a subcommand."));
     }
     if (subcommand === "claim") {
-      const parsed = parseOptions(rest, new Set(["--session", "--resource", "--mode", "--repository"]));
+      const parsed = parseSingleClaimPair(rest);
       if (!parsed.ok) return parsed;
-      if (parsed.value.resource === null) {
-        return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
-      }
-      if (parsed.value.mode === null) {
-        return failure(usageError("MISSING_ARGUMENT", "--mode requires a value.", { option: "--mode" }));
-      }
       if (dependencies.backend.claimResources === undefined) return claimCapabilityUnavailable(subcommand);
       const result = await dependencies.backend.claimResources(context, {
         session_id: parsed.value.session_id,
@@ -886,11 +935,8 @@ async function executeCommand(
   if (command === "resource") {
     const resourceSubcommand = subcommand ?? "list";
     if (resourceSubcommand === "claim") {
-      const parsed = parseOptions(rest, new Set(["--session", "--resource", "--mode", "--repository"]));
+      const parsed = parseSingleClaimPair(rest);
       if (!parsed.ok) return parsed;
-      if (parsed.value.resource === null || parsed.value.mode === null) {
-        return failure(usageError("MISSING_ARGUMENT", "resource claim requires --resource and --mode."));
-      }
       if (dependencies.backend.claimResources === undefined) return claimCapabilityUnavailable(resourceSubcommand);
       const result = await dependencies.backend.claimResources(context, {
         session_id: parsed.value.session_id,
