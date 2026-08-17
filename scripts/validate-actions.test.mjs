@@ -36,6 +36,16 @@ test("accepts the pinned canonical reusable governance workflows", () => {
   assert.equal(result.references.filter((reference) => reference.trustedReusableWorkflow).length, 2);
 });
 
+test("rejects mutable untrusted reusable workflow references", () => {
+  const result = validateActionText(
+    "    uses: example-org/governance/.github/workflows/pr.yml@main",
+    ".github/workflows/example.yml",
+  );
+
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /full 40-character commit SHA/u);
+});
+
 test("rejects mutable, incomplete, and missing external action refs", () => {
   const result = validateActionText(
     ["      uses: actions/checkout@v4", "      uses: actions/setup-node@1234", "      uses:"].join("\n"),
