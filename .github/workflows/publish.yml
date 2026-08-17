@@ -3,13 +3,128 @@ name: Publish to npm
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable release tag to recover, for example v0.4.0
+        required: true
+        type: string
+      release_commit:
+        description: 40-character commit SHA targeted by the immutable release tag
+        required: true
+        type: string
+      package_version:
+        description: Package version expected at the immutable release commit
+        required: true
+        type: string
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
+  publish:
+    permissions:
+      contents: read
+      id-token: write
+
+jobs:
+  prepare:
+    name: Verify immutable release target
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.verify.outputs.release_tag }}
+      release_commit: ${{ steps.verify.outputs.release_commit }}
+      package_version: ${{ steps.verify.outputs.package_version }}
+      tarball_name: ${{ steps.verify.outputs.tarball_name }}
+
+    steps:
+      - name: Select release target
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_RELEASE_COMMIT: ${{ inputs.release_commit }}
+          INPUT_PACKAGE_VERSION: ${{ inputs.package_version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            release_tag="$INPUT_RELEASE_TAG"
+            release_commit="$INPUT_RELEASE_COMMIT"
+            package_version="$INPUT_PACKAGE_VERSION"
+          else
+            release_tag="$RELEASE_EVENT_TAG"
+            release_commit=""
+            package_version=""
+          fi
+
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*$ ]]; then
+            echo "release tag must be a v-prefixed semantic version: $release_tag" >&2
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [[ ! "$release_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "recovery release commit must be a 40-character SHA" >&2
+              exit 1
+            fi
+            if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*$ ]]; then
+              echo "recovery package version must be a semantic version: $package_version" >&2
+              exit 1
+            fi
+          fi
+
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "expected_commit=${release_commit,,}" >> "$GITHUB_OUTPUT"
+          echo "expected_package_version=$package_version" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout selected release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ steps.select.outputs.release_tag }}
+
+      - name: Verify tag, commit, and package version
+        id: verify
+        env:
+          RELEASE_TAG: ${{ steps.select.outputs.release_tag }}
+          EXPECTED_COMMIT: ${{ steps.select.outputs.expected_commit }}
+          EXPECTED_PACKAGE_VERSION: ${{ steps.select.outputs.expected_package_version }}
+        run: |
+          set -euo pipefail
+          if ! tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}" 2>/dev/null)"; then
+            echo "immutable release tag does not exist: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          checked_out_commit="$(git rev-parse HEAD)"
+          if [ "$checked_out_commit" != "$tag_commit" ]; then
+            echo "checkout did not resolve the selected release tag" >&2
+            echo "expected tag commit: $tag_commit" >&2
+            echo "checked out commit: $checked_out_commit" >&2
+            exit 1
+          fi
+          if [ -n "$EXPECTED_COMMIT" ] && [ "$EXPECTED_COMMIT" != "$tag_commit" ]; then
+            echo "recovery commit does not match the immutable release tag" >&2
+            exit 1
+          fi
+
+          package_version="$(node -p "require('./package.json').version")"
+          if [ "$RELEASE_TAG" != "v$package_version" ]; then
+            echo "package.json version $package_version requires release tag v$package_version, got $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [ -n "$EXPECTED_PACKAGE_VERSION" ] && [ "$EXPECTED_PACKAGE_VERSION" != "$package_version" ]; then
+            echo "recovery package version does not match package.json" >&2
+            exit 1
+          fi
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+          echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
+          echo "tarball_name=nawabari-${package_version}.tgz" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: prepare
     runs-on: ubuntu-latest
 
     steps:
@@ -17,6 +132,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ needs.prepare.outputs.release_commit }}
+
+      - name: Checkout current workflow implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: .workflow-source
+          ref: ${{ github.workflow_sha }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
@@ -35,12 +158,17 @@ jobs:
       - name: Verify release tag matches package version
         id: version
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          EXPECTED_PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
         run: |
           package_version="$(node -p "require('./package.json').version")"
           expected_tag="v${package_version}"
           if [ "$RELEASE_TAG" != "$expected_tag" ]; then
             echo "package.json version $package_version requires release tag $expected_tag, got $RELEASE_TAG"
+            exit 1
+          fi
+          if [ "$package_version" != "$EXPECTED_PACKAGE_VERSION" ]; then
+            echo "checked out package version $package_version does not match the selected immutable release"
             exit 1
           fi
           echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
@@ -51,6 +179,9 @@ jobs:
 
       - name: Lint
         run: pnpm run lint
+
+      - name: Provision sandbox-launcher test capability
+        uses: ./.workflow-source/.github/actions/provision-sandbox-launcher-test-capability
 
       - name: Typecheck
         run: pnpm run typecheck
@@ -73,7 +204,9 @@ jobs:
           retention-days: 1
 
   smoke-test:
-    needs: build
+    needs:
+      - prepare
+      - build
     name: packed package smoke test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     strategy:
@@ -86,6 +219,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ needs.prepare.outputs.release_commit }}
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -98,12 +232,21 @@ jobs:
           name: package-tarball
 
       - name: Smoke test the validated tarball
+        env:
+          EXPECTED_PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
+          TARBALL_NAME: ${{ needs.prepare.outputs.tarball_name }}
         run: |
           package_version="$(node -p "require('./package.json').version")"
-          node scripts/smoke-test.mjs --tarball "$GITHUB_WORKSPACE/nawabari-${package_version}.tgz"
+          if [ "$package_version" != "$EXPECTED_PACKAGE_VERSION" ]; then
+            echo "checked out package version $package_version does not match the selected immutable release"
+            exit 1
+          fi
+          node scripts/smoke-test.mjs --tarball "$GITHUB_WORKSPACE/$TARBALL_NAME"
 
   publish:
-    needs: smoke-test
+    needs:
+      - prepare
+      - smoke-test
     runs-on: ubuntu-latest
     environment: npm
 
@@ -112,6 +255,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ needs.prepare.outputs.release_commit }}
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -122,21 +266,40 @@ jobs:
       - name: Require an OIDC-capable npm CLI
         run: npm install --global npm@11.5.1
 
+      - name: Verify selected immutable release
+        env:
+          EXPECTED_COMMIT: ${{ needs.prepare.outputs.release_commit }}
+          EXPECTED_PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_COMMIT" ]; then
+            echo "publish job is not using the selected immutable release commit" >&2
+            exit 1
+          fi
+          package_version="$(node -p "require('./package.json').version")"
+          if [ "$package_version" != "$EXPECTED_PACKAGE_VERSION" ]; then
+            echo "publish job package version does not match the selected immutable release" >&2
+            exit 1
+          fi
+
       - name: Download tarball
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: package-tarball
 
       - name: Validate the exact tarball before publish
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
+          TARBALL_NAME: ${{ needs.prepare.outputs.tarball_name }}
         run: |
-          package_version="$(node -p "require('./package.json').version")"
-          node scripts/validate-release-tarball.mjs "$GITHUB_WORKSPACE/nawabari-${package_version}.tgz" --publish-dry-run
+          node scripts/validate-release-tarball.mjs "$GITHUB_WORKSPACE/$TARBALL_NAME" --publish-dry-run
 
       - name: Check whether version is already published
         id: registry
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
         run: |
-          package_version="$(node -p "require('./package.json').version")"
-          if npm view "nawabari@$package_version" version >/dev/null 2>&1; then
+          if npm view "nawabari@$PACKAGE_VERSION" version >/dev/null 2>&1; then
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
@@ -144,10 +307,11 @@ jobs:
 
       - name: Publish validated tarball
         if: steps.registry.outputs.published != 'true'
+        env:
+          TARBALL_NAME: ${{ needs.prepare.outputs.tarball_name }}
         run: |
-          package_version="$(node -p "require('./package.json').version")"
           set -o pipefail
-          npm publish "$GITHUB_WORKSPACE/nawabari-${package_version}.tgz" 2>&1 | tee publish.log
+          npm publish "$GITHUB_WORKSPACE/$TARBALL_NAME" 2>&1 | tee publish.log
           if grep -q "npm warn publish" publish.log; then
             echo "npm emitted a publish warning; treating as failure"
             exit 1
