@@ -114,6 +114,34 @@ test("an unexpected post-rename directory-sync failure is durability-uncertain, 
   });
 });
 
+test("an asynchronous post-rename failure is durability-uncertain", async () => {
+  await withRegistryDirectory(async (directory) => {
+    const registryPath = join(directory, "registry.json");
+    await assert.rejects(
+      writeJsonAtomically(
+        registryPath,
+        { hello: "world" },
+        {
+          hooks: {
+            afterRename: () => {
+              throw errnoError("EIO");
+            },
+          },
+        },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof RegistryError);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        assert.equal(isPostRenameFailure(error), true);
+        assert.equal((error.cause as NodeJS.ErrnoException | undefined)?.code, "EIO");
+        return true;
+      },
+    );
+    assert.deepEqual(JSON.parse(await readFile(registryPath, "utf8")), { hello: "world" });
+    assert.deepEqual(tempSiblingsOf(registryPath), []);
+  });
+});
+
 test("a frozen, non-extensible object thrown after rename is still classified durability-uncertain", async () => {
   await withRegistryDirectory(async (directory) => {
     const registryPath = join(directory, "registry.json");

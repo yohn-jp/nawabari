@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { SessionRegistryError } from "./errors.js";
 import { RepositoryLock } from "./registry/lock.js";
 import { SessionRegistry, toPersistedSessionRecord, type PersistedRegistry } from "./session-registry.js";
-import { errnoError, withDirectoryFsyncFailure } from "./testing/fs-fault-injection.js";
+import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
 
 test("round-trips session metadata through common Git state", () => {
   const fixture = createRepositoryFixture();
@@ -369,15 +369,15 @@ test("an unexpected pre-rename write failure never produces a successful mutatio
   const fixture = createRepositoryFixture();
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
-    const original = fs.fsyncSync;
-    fs.fsyncSync = (() => {
-      throw errnoError("EIO");
-    }) as typeof fs.fsyncSync;
-    try {
-      assertRegistryError(() => registry.create(), "REGISTRY_IO_FAILURE");
-    } finally {
-      fs.fsyncSync = original;
-    }
+    // Targets only the registry's own temporary-file fsync: an unconditional
+    // override would also fail RepositoryLock.acquireSync()'s owner.json
+    // write, which happens first, and the resulting lock failure would
+    // incidentally normalize to the same REGISTRY_IO_FAILURE code without
+    // ever exercising writeUnsafe()'s pre-rename path at all.
+    assertRegistryError(
+      () => withRegistryTempFileFsyncFailure(registry.paths.directory, "EIO", () => registry.create()),
+      "REGISTRY_IO_FAILURE",
+    );
     assert.deepEqual(registry.list(), []);
   } finally {
     fixture.cleanup();
