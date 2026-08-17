@@ -20,7 +20,12 @@ on:
 
 permissions:
   contents: read
-  id-token: write
+
+jobs:
+  publish:
+    permissions:
+      contents: read
+      id-token: write
 
 jobs:
   prepare:
