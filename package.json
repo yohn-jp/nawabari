@@ -3,16 +3,57 @@
   "version": "0.4.1",
   "description": "A stable local Git session CLI exposed as git nawabari.",
   "type": "module",
-  "bin": {"nawabari":"dist/index.js","git-nawabari":"dist/index.js"},
-  "files": ["dist","README.md","LICENSE"],
-  "scripts": {"build":"node scripts/build.mjs","start":"node dist/index.js","test":"node --test --import tsx src/*.test.ts src/**/*.test.ts scripts/**/*.test.mjs","typecheck":"tsc --noEmit","lint":"eslint 'src/**/*.ts' 'scripts/**/*.mjs' 'eslint.config.mjs'","format":"prettier --write .","format:check":"prettier --check .","benchmark:pnpm-worktree-install":"node scripts/benchmark-pnpm-worktree-install.mjs","smoke-test":"node scripts/smoke-test.mjs","test:package":"pnpm run build && node scripts/run-package-suite.mjs","governance:actions":"node scripts/validate-actions.mjs","governance:workflows":"node scripts/validate-workflows.mjs","verify":"pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm test && pnpm run governance:actions && pnpm run governance:workflows && pnpm run test:package","prepack":"pnpm run build","prepublishOnly":"pnpm run typecheck && pnpm test"},
-  "devDependencies": {"@types/node":"^26.1.2","eslint":"10.8.0","gh-inari":"0.7.0","prettier":"3.9.6","tsx":"^4.19.4","typescript":"^6.0.3","typescript-eslint":"8.66.0"},
-  "engines":{"node":">=22.13 <25"},
-  "packageManager":"pnpm@11.18.0",
-  "publishConfig":{"access":"public","registry":"https://registry.npmjs.org/"},
-  "license":"MIT",
-  "repository":{"type":"git","url":"git+https://github.com/yohn-jp/nawabari.git"},
-  "homepage":"https://github.com/yohn-jp/nawabari#readme",
-  "bugs":{"url":"https://github.com/yohn-jp/nawabari/issues"},
-  "keywords":[]
+  "bin": {
+    "nawabari": "dist/index.js",
+    "git-nawabari": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node dist/index.js",
+    "test": "node --test --import tsx src/*.test.ts src/**/*.test.ts scripts/**/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint 'src/**/*.ts' 'scripts/**/*.mjs' 'eslint.config.mjs'",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "benchmark:pnpm-worktree-install": "node scripts/benchmark-pnpm-worktree-install.mjs",
+    "smoke-test": "node scripts/smoke-test.mjs",
+    "test:package": "pnpm run build && node scripts/run-package-suite.mjs",
+    "governance:actions": "node scripts/validate-actions.mjs",
+    "governance:workflows": "node scripts/validate-workflows.mjs",
+    "verify": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm test && pnpm run governance:actions && pnpm run governance:workflows && pnpm run test:package",
+    "prepack": "pnpm run build",
+    "prepublishOnly": "pnpm run typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "eslint": "10.8.0",
+    "gh-inari": "0.7.0",
+    "prettier": "3.9.6",
+    "tsx": "^4.19.4",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "8.66.0"
+  },
+  "engines": {
+    "node": ">=22.13 <25"
+  },
+  "packageManager": "pnpm@11.18.0",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yohn-jp/nawabari.git"
+  },
+  "homepage": "https://github.com/yohn-jp/nawabari#readme",
+  "bugs": {
+    "url": "https://github.com/yohn-jp/nawabari/issues"
+  },
+  "keywords": []
 }
