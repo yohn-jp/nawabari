@@ -13,6 +13,9 @@ importers:
       eslint:
         specifier: 10.8.0
         version: 10.8.0(supports-color@7.2.0)
+      gh-inari:
+        specifier: 0.7.0
+        version: 0.7.0
       prettier:
         specifier: 3.9.6
         version: 3.9.6
@@ -716,6 +719,17 @@ packages:
       { integrity: sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q== }
     engines: { node: ">=10" }
 
+  gh-inari@0.7.0:
+    resolution:
+      { integrity: sha512-auwZETe6mSIpSN8bhT7BVDmvLbqEgY6vkha0F8Ts2PJl1C5zyiYDZsHH5Tuq7du7vcF9VKngPGHxhvLK47D32g== }
+    engines: { node: ">=22.13" }
+    hasBin: true
+
+  yaml@2.9.0:
+    resolution:
+      { integrity: sha512-2AvhNX3mb8zd6Zy7INTtSpl1F15HW6Wnqj0srWlkKLcpYl/gMIMJiyuGq2KeI2YFxUPjdlB+3Lc10seMLtL4cA== }
+    engines: { node: ">= 14.6" }
+    hasBin: true
 snapshots:
   "@esbuild/aix-ppc64@0.28.2":
     optional: true
@@ -1234,3 +1248,9 @@ snapshots:
   word-wrap@1.2.5: {}
 
   yocto-queue@0.1.0: {}
+
+  gh-inari@0.7.0:
+    dependencies:
+      yaml: 2.9.0
+
+  yaml@2.9.0: {}

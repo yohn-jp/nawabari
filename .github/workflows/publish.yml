@@ -22,12 +22,6 @@ permissions:
   contents: read
 
 jobs:
-  publish:
-    permissions:
-      contents: read
-      id-token: write
-
-jobs:
   prepare:
     name: Verify immutable release target
     runs-on: ubuntu-latest
@@ -141,6 +135,9 @@ jobs:
           path: .workflow-source
           ref: ${{ github.workflow_sha }}
 
+      - name: Verify GitHub Actions workflow structure
+        run: node .workflow-source/scripts/validate-workflows.mjs
+
       - name: Setup pnpm
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
@@ -247,6 +244,9 @@ jobs:
     needs:
       - prepare
       - smoke-test
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     environment: npm
 
