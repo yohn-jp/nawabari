@@ -14,6 +14,28 @@ import {
   type SandboxProbe,
 } from "./sandbox.js";
 
+/**
+ * CI-declared, controlled/fake bubblewrap substitute (see
+ * scripts/test-fixtures/sandbox-launcher-test-stub.sh and the workflow step
+ * that installs it). It forwards the argv following the compiled `--`
+ * separator to exec without establishing any sandbox isolation.
+ *
+ * Tests below prefer real bubblewrap when the host genuinely has it
+ * (`discoverSandboxRuntimeLayout()` resolves it), so this fallback never
+ * masks real capability. When real bubblewrap is absent, it keeps
+ * argv-construction, topology-validation, and output/timeout-bounding
+ * coverage deterministic instead of depending on undeclared ambient host
+ * state. It must never be presented as evidence of real bubblewrap
+ * sandboxing; only the dedicated real-isolation test below claims that,
+ * and only when it finds genuine bubblewrap.
+ */
+const CONTROLLED_TEST_SANDBOX_EXECUTABLE = "/usr/local/bin/nawabari-sandbox-test-stub";
+
+function resolveTestSandboxExecutable(discovered: string | null): string | null {
+  if (discovered !== null) return discovered;
+  return fs.existsSync(CONTROLLED_TEST_SANDBOX_EXECUTABLE) ? CONTROLLED_TEST_SANDBOX_EXECUTABLE : null;
+}
+
 function readyProbe(): SandboxProbe {
   return {
     platform: () => "linux",
@@ -66,7 +88,7 @@ async function resolvedRequest(repository: string, worktree: string) {
     discoverSandboxRuntimeLayout(),
   );
   if (!request.ok) throw request.error;
-  return request.value;
+  return { ...request.value, sandbox_executable: resolveTestSandboxExecutable(request.value.sandbox_executable) };
 }
 
 test("compileSandboxInvocation emits fixed namespace/topology argv and terminates before command argv", async () => {
