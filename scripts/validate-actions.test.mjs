@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { validateActionText, validateRepositoryActions } from "./validate-actions.mjs";
+import { repositoryActionFiles, validateActionText, validateRepositoryActions } from "./validate-actions.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sha = "a".repeat(40);
@@ -39,4 +40,30 @@ test("all repository-owned workflow and composite-action refs are pinned", () =>
   assert.deepEqual(result.errors, []);
   assert.ok(result.files.length > 0);
   assert.ok(result.references.some((reference) => !reference.local));
+});
+
+test("all workflows running the required test suite provision the shared capability first", () => {
+  const workflowFiles = repositoryActionFiles(repositoryRoot).filter((file) => file.startsWith(".github/workflows/"));
+  const provisionPattern = /uses:\s+\.\/[^\s]*\.github\/actions\/provision-sandbox-launcher-test-capability/u;
+  const violations = [];
+  let testWorkflowCount = 0;
+
+  for (const file of workflowFiles) {
+    const source = fs.readFileSync(path.join(repositoryRoot, file), "utf8");
+    const testIndex = source.indexOf("pnpm test");
+    if (testIndex === -1) continue;
+    testWorkflowCount += 1;
+    const provisionIndex = source.search(provisionPattern);
+    if (provisionIndex === -1 || provisionIndex > testIndex) violations.push(file);
+  }
+
+  assert.ok(testWorkflowCount > 0);
+  assert.deepEqual(violations, []);
+  assert.match(
+    fs.readFileSync(
+      path.join(repositoryRoot, ".github/actions/provision-sandbox-launcher-test-capability/action.yml"),
+      "utf8",
+    ),
+    /sandbox-launcher-test-stub\.sh/u,
+  );
 });

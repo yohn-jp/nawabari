@@ -130,10 +130,7 @@ jobs:
         run: pnpm run lint
 
       - name: Provision sandbox-launcher test capability
-        run: |
-          sudo install -m 0755 \
-            scripts/test-fixtures/sandbox-launcher-test-stub.sh \
-            /usr/local/bin/nawabari-sandbox-test-stub
+        uses: ./.github/actions/provision-sandbox-launcher-test-capability
 
       - name: Test
         run: pnpm test
