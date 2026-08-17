@@ -4,8 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { runCli } from "./cli.js";
-import { success } from "./domain/errors.js";
+import { DomainError, failure, success } from "./domain/errors.js";
 import type {
+  ClaimResourcesOptions,
+  ClaimResourcesResult,
+  ResourceClaim,
   SessionBackend,
   SessionCloseResult,
   SessionContext,
@@ -454,4 +457,204 @@ test("human session create, show, and close output avoids inline structured JSON
     assert.doesNotMatch(text, /\{"schema_version"/u);
     assert.doesNotMatch(text, /\[object Object\]/u);
   }
+});
+
+function sampleClaim(resource: string, mode: "read" | "write" | "exclusive-write"): ResourceClaim {
+  return {
+    schema_version: 2,
+    claim_id: `claim-${resource}-${mode}`,
+    session_id: sampleSession.session_id,
+    repository: sampleSession.repository,
+    worktree: sampleSession.worktree,
+    resource,
+    mode,
+    created_at: "2026-08-10T00:00:00.000Z",
+    updated_at: "2026-08-10T00:00:00.000Z",
+  };
+}
+
+test("session update submits one atomic claims[] transaction built from repeated --resource/--mode pairs", async () => {
+  let observedOptions: ClaimResourcesOptions | null = null;
+  const claims = [sampleClaim("src/a.ts", "exclusive-write"), sampleClaim("src/b.ts", "exclusive-write")];
+  const result: ClaimResourcesResult = {
+    session: sampleSession,
+    claims,
+    added: claims,
+    released: [],
+    idempotent: false,
+  };
+  const backend = backendForTests({
+    updateClaims: async (_context: SessionContext, options: ClaimResourcesOptions) => {
+      observedOptions = options;
+      return success(result);
+    },
+  });
+
+  const output = capture();
+  const exitCode = await runCli(
+    [
+      "--json",
+      "session",
+      "update",
+      "--session",
+      sampleSession.session_id,
+      "--resource",
+      "src/a.ts",
+      "--mode",
+      "exclusive-write",
+      "--resource",
+      "src/b.ts",
+      "--mode",
+      "exclusive-write",
+    ],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
+  assert.deepEqual(observedOptions, {
+    session_id: sampleSession.session_id,
+    repository: null,
+    claims: [
+      { resource: "src/a.ts", mode: "exclusive-write" },
+      { resource: "src/b.ts", mode: "exclusive-write" },
+    ],
+  });
+  const response = JSON.parse(output.stdout[0]) as { claims: ResourceClaim[] };
+  assert.equal(response.claims.length, 2);
+});
+
+test("resource update alias submits the same multi-claim transaction as session update", async () => {
+  let observedOptions: ClaimResourcesOptions | null = null;
+  const claims = [sampleClaim("src/a.ts", "read"), sampleClaim("src/b.ts", "write")];
+  const result: ClaimResourcesResult = {
+    session: sampleSession,
+    claims,
+    added: claims,
+    released: [],
+    idempotent: false,
+  };
+  const backend = backendForTests({
+    updateClaims: async (_context: SessionContext, options: ClaimResourcesOptions) => {
+      observedOptions = options;
+      return success(result);
+    },
+  });
+
+  const exitCode = await runCli(
+    [
+      "--json",
+      "resource",
+      "update",
+      "--resource",
+      "src/a.ts",
+      "--mode",
+      "read",
+      "--resource",
+      "src/b.ts",
+      "--mode",
+      "write",
+    ],
+    { backend, io: capture().io },
+  );
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(observedOptions, {
+    session_id: null,
+    repository: null,
+    claims: [
+      { resource: "src/a.ts", mode: "read" },
+      { resource: "src/b.ts", mode: "write" },
+    ],
+  });
+});
+
+test("session update rejects a conflicting desired claim set without touching the backend twice", async () => {
+  const backend = backendForTests({
+    updateClaims: async () =>
+      failure(
+        new DomainError("CONTRADICTORY_CLAIM", "Request contains overlapping claims with different modes", {
+          resource: "src/a.ts",
+        }),
+      ),
+  });
+
+  const output = capture();
+  const exitCode = await runCli(
+    [
+      "--json",
+      "session",
+      "update",
+      "--session",
+      sampleSession.session_id,
+      "--resource",
+      "src/a.ts",
+      "--mode",
+      "write",
+      "--resource",
+      "src/a.ts",
+      "--mode",
+      "exclusive-write",
+    ],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 3);
+  const response = JSON.parse(output.stdout[0]) as { ok: boolean; code: string };
+  assert.deepEqual(response, {
+    ok: false,
+    command: "session update",
+    code: "CONTRADICTORY_CLAIM",
+    message: "Request contains overlapping claims with different modes",
+    details: { resource: "src/a.ts" },
+  });
+});
+
+test("session update requires at least one --resource/--mode pair", async () => {
+  const output = capture();
+  const exitCode = await runCli(["--json", "session", "update", "--session", sampleSession.session_id], {
+    backend: backendForTests(),
+    io: output.io,
+  });
+
+  assert.equal(exitCode, 2);
+  const response = JSON.parse(output.stdout[0]) as { code: string };
+  assert.equal(response.code, "MISSING_ARGUMENT");
+});
+
+test("session update rejects a --resource that is not immediately followed by its own --mode", async () => {
+  const output = capture();
+  const exitCode = await runCli(
+    ["--json", "session", "update", "--resource", "src/a.ts", "--resource", "src/b.ts", "--mode", "write"],
+    { backend: backendForTests(), io: output.io },
+  );
+
+  assert.equal(exitCode, 2);
+  const response = JSON.parse(output.stdout[0]) as { code: string; details: { option: string } };
+  assert.equal(response.code, "INVALID_ARGUMENT");
+  assert.equal(response.details.option, "--resource");
+});
+
+test("session update rejects a --mode that is not immediately preceded by its own --resource", async () => {
+  const output = capture();
+  const exitCode = await runCli(["--json", "session", "update", "--mode", "write", "--resource", "src/a.ts"], {
+    backend: backendForTests(),
+    io: output.io,
+  });
+
+  assert.equal(exitCode, 2);
+  const response = JSON.parse(output.stdout[0]) as { code: string; details: { option: string } };
+  assert.equal(response.code, "INVALID_ARGUMENT");
+  assert.equal(response.details.option, "--mode");
+});
+
+test("session update rejects a trailing --resource left without a matching --mode", async () => {
+  const output = capture();
+  const exitCode = await runCli(
+    ["--json", "session", "update", "--resource", "src/a.ts", "--mode", "write", "--resource", "src/b.ts"],
+    { backend: backendForTests(), io: output.io },
+  );
+
+  assert.equal(exitCode, 2);
+  const response = JSON.parse(output.stdout[0]) as { code: string };
+  assert.equal(response.code, "MISSING_ARGUMENT");
 });

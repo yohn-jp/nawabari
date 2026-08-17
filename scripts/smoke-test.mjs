@@ -824,6 +824,98 @@ async function main() {
       fail("explicit session history list did not expose closed records");
     }
 
+    const multiUpdate = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "update",
+          "--session",
+          secondCreated.session_id,
+          "--resource",
+          "multi-claim-a.txt",
+          "--mode",
+          "exclusive-write",
+          "--resource",
+          "multi-claim-b.txt",
+          "--mode",
+          "exclusive-write",
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "atomic multi-claim update",
+    );
+    if (
+      multiUpdate.ok !== true ||
+      multiUpdate.claims?.length !== 2 ||
+      !multiUpdate.claims?.some(
+        (entry) => entry.resource === "multi-claim-a.txt" && entry.mode === "exclusive-write",
+      ) ||
+      !multiUpdate.claims?.some((entry) => entry.resource === "multi-claim-b.txt" && entry.mode === "exclusive-write")
+    ) {
+      fail("installed session update did not atomically replace the claim set with both requested claims");
+    }
+
+    const conflictingUpdate = invokeInstalled(
+      [
+        "session",
+        "update",
+        "--session",
+        secondCreated.session_id,
+        "--resource",
+        "multi-claim-conflict.txt",
+        "--mode",
+        "write",
+        "--resource",
+        "multi-claim-conflict.txt",
+        "--mode",
+        "exclusive-write",
+        "--json",
+      ],
+      secondWorktree,
+    );
+    const conflictingUpdateJson = parseInstalledJson(conflictingUpdate, "conflicting multi-claim update");
+    if (conflictingUpdate.status !== 3 || conflictingUpdateJson.code !== "CONTRADICTORY_CLAIM") {
+      fail("installed session update did not reject an internally conflicting desired claim set");
+    }
+    const claimsAfterConflict = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", secondCreated.session_id, "--json"], secondWorktree),
+      "claims after rejected update",
+    );
+    if (
+      claimsAfterConflict.ok !== true ||
+      claimsAfterConflict.claims?.length !== 2 ||
+      !claimsAfterConflict.claims?.some((entry) => entry.resource === "multi-claim-a.txt") ||
+      !claimsAfterConflict.claims?.some((entry) => entry.resource === "multi-claim-b.txt")
+    ) {
+      fail("a rejected multi-claim update mutated the persisted pre-update claim set");
+    }
+
+    const repeatedUpdate = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "update",
+          "--session",
+          secondCreated.session_id,
+          "--resource",
+          "multi-claim-a.txt",
+          "--mode",
+          "exclusive-write",
+          "--resource",
+          "multi-claim-b.txt",
+          "--mode",
+          "exclusive-write",
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "idempotent multi-claim update repeat",
+    );
+    if (repeatedUpdate.ok !== true || repeatedUpdate.idempotent !== true) {
+      fail("repeating the same desired multi-claim set was not idempotent");
+    }
+
     const secondClosed = invokeInstalled(
       ["session", "close", "--session", secondCreated.session_id, "--json"],
       lifecycleRepository,
