@@ -35,6 +35,45 @@ function isUnsupportedDirectorySync(error: unknown): boolean {
   return code === "EINVAL" || code === "ENOTSUP" || code === "EISDIR";
 }
 
+/**
+ * A failure observed after the target file was already renamed into place.
+ * Callers must not read this as "the write succeeded" — durability past
+ * that point is unproven — but they must also not treat it as an ordinary
+ * pre-effect failure: the renamed document may already be the one readers
+ * observe. `cause` always carries the original thrown value verbatim
+ * (whatever it was — an Error, a frozen object, a primitive), since a
+ * classification that depended on mutating or reading properties off the
+ * original thrown value would silently fail for values that reject writes
+ * (frozen/non-extensible objects) or carry no properties at all
+ * (primitives). Wrapping in a fresh, always-extensible error is fail-safe
+ * regardless of what the underlying I/O call happened to throw.
+ */
+export class AtomicWritePostRenameFailure extends RegistryError {
+  public constructor(paths: AtomicWritePaths, cause: unknown) {
+    super(
+      "REGISTRY_DURABILITY_UNCERTAIN",
+      `Rename to ${paths.targetPath} may have already committed, but durable persistence past that point could not be proven`,
+      { ...paths },
+      { cause },
+    );
+    this.name = "AtomicWritePostRenameFailure";
+  }
+}
+
+function toPostRenameFailure(error: unknown, paths: AtomicWritePaths): AtomicWritePostRenameFailure {
+  return new AtomicWritePostRenameFailure(paths, error);
+}
+
+/**
+ * True when `writeJsonAtomically`/`writeJsonAtomicallySync` failed only
+ * after the rename had already committed the new document. Recovery must
+ * reconcile authoritative state instead of assuming the mutation never
+ * happened.
+ */
+export function isPostRenameFailure(error: unknown): error is AtomicWritePostRenameFailure {
+  return error instanceof AtomicWritePostRenameFailure;
+}
+
 async function syncDirectory(directory: string): Promise<void> {
   let handle: FileHandle | undefined;
   try {
@@ -111,8 +150,9 @@ export async function writeJsonAtomically(
     }
     if (!renamed) {
       await rm(temporaryPath, { force: true });
+      throw error;
     }
-    throw error;
+    throw toPostRenameFailure(error, { temporaryPath, targetPath });
   }
 }
 
@@ -153,7 +193,8 @@ export function writeJsonAtomicallySync(
     }
     if (!renamed) {
       fs.rmSync(temporaryPath, { force: true });
+      throw error;
     }
-    throw error;
+    throw toPostRenameFailure(error, { temporaryPath, targetPath });
   }
 }

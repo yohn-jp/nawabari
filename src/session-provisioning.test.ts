@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { SessionRegistryError } from "./errors.js";
 import { defaultGit, type GitCommandRunner, resolveRepositoryContext } from "./git.js";
 import { SessionRegistry } from "./session-registry.js";
+import { errnoError, withDirectoryFsyncFailure } from "./testing/fs-fault-injection.js";
 
 test("provision creates one dedicated worktree and one mutable branch", () => {
   const fixture = createRepositoryFixture();
@@ -246,6 +247,174 @@ test("a Git provisioning failure leaves no active registry ownership or worktree
   }
 });
 
+test("a durability-uncertain registry write after provisioning does not roll back the already-committed worktree", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-durability-uncertain");
+  const branchName = "feature/durability-uncertain";
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+
+    let session: ReturnType<typeof registry.provision> | undefined;
+    assert.throws(
+      () => {
+        session = withDirectoryFsyncFailure(registry.paths.directory, "EIO", () =>
+          registry.provision({ worktreePath, branchName }),
+        );
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        return true;
+      },
+    );
+    assert.equal(session, undefined);
+
+    // The rename that commits the registry document already succeeded; only
+    // the post-rename directory fsync could not be proven. Rolling back the
+    // matching physical worktree/branch here would strand a registry entry
+    // pointing at resources that no longer exist, so both must remain.
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], fixture.repositoryPath),
+      true,
+    );
+    const reread = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const records = reread.list();
+    assert.equal(records.length, 1);
+    assert.equal(records[0].worktreePath, fs.realpathSync.native(worktreePath));
+    assert.equal(records[0].branchName, branchName);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
+test("a durability-uncertain failure with a definitively absent registry record rolls back the worktree", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-durability-absent");
+  const branchName = "feature/durability-absent";
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+
+    assert.throws(
+      () => {
+        withRenameRedirectedElsewhere(registry.paths.registry, () => {
+          withDirectoryFsyncFailure(registry.paths.directory, "EIO", () =>
+            registry.provision({ worktreePath, branchName }),
+          );
+        });
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        return true;
+      },
+    );
+
+    // The rename never actually reached the real registry path (redirected
+    // to a shadow file), so a reconciliation read positively proves the
+    // session record absent: rollback is safe here, unlike the "record
+    // present" case above.
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], fixture.repositoryPath),
+      false,
+    );
+    assert.deepEqual(new SessionRegistry({ cwd: fixture.repositoryPath }).list(), []);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
+test("a reconciliation read I/O failure after a durability-uncertain write preserves the original uncertain outcome and does not roll back", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-reconciliation-io-failure");
+  const branchName = "feature/reconciliation-io-failure";
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+
+    assert.throws(
+      () => {
+        withDirectoryFsyncFailure(registry.paths.directory, "EIO", () =>
+          // Call 1 (of reads targeting the registry file) is provision()'s
+          // own initial registry read; call 2 is the reconciliation read
+          // inside the durability-uncertain catch path.
+          withReadFileSyncOverrideOnCall(
+            registry.paths.registry,
+            2,
+            () => {
+              throw errnoError("EIO");
+            },
+            () => registry.provision({ worktreePath, branchName }),
+          ),
+        );
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        // Absence could not be proven (the reconciliation read itself
+        // failed), so the original durability-uncertain outcome must
+        // survive unchanged rather than being replaced by a registry
+        // read-failure code.
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        return true;
+      },
+    );
+
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], fixture.repositoryPath),
+      true,
+    );
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
+test("a reconciliation read hitting corrupt registry state after a durability-uncertain write preserves the original uncertain outcome and does not roll back", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-reconciliation-corrupt");
+  const branchName = "feature/reconciliation-corrupt";
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+
+    assert.throws(
+      () => {
+        withDirectoryFsyncFailure(registry.paths.directory, "EIO", () =>
+          withReadFileSyncOverrideOnCall(
+            registry.paths.registry,
+            2,
+            () => "{not-json",
+            () => registry.provision({ worktreePath, branchName }),
+          ),
+        );
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        // Reconciliation observed REGISTRY_CORRUPT, not a proof of absence:
+        // the original durability-uncertain outcome must still be what the
+        // caller sees, not the incidental corruption code.
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        return true;
+      },
+    );
+
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], fixture.repositoryPath),
+      true,
+    );
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
 test("simultaneous provisioning serializes ownership and creates distinct worktrees", { timeout: 30_000 }, async () => {
   const fixture = createRepositoryFixture();
   const worktreePaths = Array.from({ length: 4 }, (_, index) =>
@@ -291,6 +460,60 @@ function createRepositoryFixture(): RepositoryFixture {
       fs.rmSync(repositoryPath, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * Redirects the rename that would commit `targetPath` to a sibling
+ * "shadow" path instead, so the rename call itself still reports success
+ * (`renamed = true` inside the atomic writer) while the path readers
+ * actually observe is left untouched. Used to construct a registry read
+ * that positively proves session absence after a durability-uncertain
+ * outcome, without relying on an exotic real filesystem failure mode.
+ */
+function withRenameRedirectedElsewhere<T>(targetPath: string, run: () => T): T {
+  const original = fs.renameSync;
+  fs.renameSync = ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+    if (newPath === targetPath) {
+      return original(oldPath, `${String(newPath)}.shadow`);
+    }
+    return original(oldPath, newPath);
+  }) as typeof fs.renameSync;
+  try {
+    return run();
+  } finally {
+    fs.renameSync = original;
+  }
+}
+
+/**
+ * Overrides the `callIndex`-th `fs.readFileSync` call whose target is
+ * exactly `targetPath`; calls against any other path (such as the
+ * repository lock's own `/proc/<pid>/stat` liveness read) always pass
+ * through unchanged, so this is immune to unrelated reads elsewhere in the
+ * acquire/provision sequence.
+ */
+function withReadFileSyncOverrideOnCall<T>(
+  targetPath: string,
+  callIndex: number,
+  override: () => string,
+  run: () => T,
+): T {
+  const original = fs.readFileSync;
+  let calls = 0;
+  fs.readFileSync = ((...args: Parameters<typeof fs.readFileSync>) => {
+    if (args[0] === targetPath) {
+      calls += 1;
+      if (calls === callIndex) {
+        return override();
+      }
+    }
+    return original(...args);
+  }) as typeof fs.readFileSync;
+  try {
+    return run();
+  } finally {
+    fs.readFileSync = original;
+  }
 }
 
 function removeWorktree(repositoryPath: string, worktreePath: string): void {

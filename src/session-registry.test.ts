@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { SessionRegistryError } from "./errors.js";
 import { RepositoryLock } from "./registry/lock.js";
 import { SessionRegistry, toPersistedSessionRecord, type PersistedRegistry } from "./session-registry.js";
+import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
 
 test("round-trips session metadata through common Git state", () => {
   const fixture = createRepositoryFixture();
@@ -327,6 +328,57 @@ test("does not resolve a closed record as the current owner", () => {
     });
 
     assertRegistryError(() => registry.resolveCurrentSession(), "SESSION_NOT_FOUND");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("an unexpected post-rename directory-sync failure is reported durability-uncertain, not an ordinary IO failure", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    assert.throws(
+      () => withDirectoryFsyncFailure(registry.paths.directory, "EIO", () => registry.create()),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        return true;
+      },
+    );
+    // The rename already committed the document; the failure only means
+    // directory durability could not be proven, not that nothing happened.
+    assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).list().length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a known unsupported directory-fsync condition does not fail an ordinary mutation", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = withDirectoryFsyncFailure(registry.paths.directory, "EINVAL", () => registry.create());
+    assert.equal(registry.list().length, 1);
+    assert.equal(registry.get(session.sessionId)?.sessionId, session.sessionId);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("an unexpected pre-rename write failure never produces a successful mutation", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    // Targets only the registry's own temporary-file fsync: an unconditional
+    // override would also fail RepositoryLock.acquireSync()'s owner.json
+    // write, which happens first, and the resulting lock failure would
+    // incidentally normalize to the same REGISTRY_IO_FAILURE code without
+    // ever exercising writeUnsafe()'s pre-rename path at all.
+    assertRegistryError(
+      () => withRegistryTempFileFsyncFailure(registry.paths.directory, "EIO", () => registry.create()),
+      "REGISTRY_IO_FAILURE",
+    );
+    assert.deepEqual(registry.list(), []);
   } finally {
     fixture.cleanup();
   }
