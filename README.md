@@ -82,6 +82,13 @@ result-schema versions, identity fields, and stable `failure_codes`. The
 package version is release metadata; it is not a substitute for the
 machine-contract identifier.
 
+The `resource-claims` capability additionally exposes a machine-readable
+`claim_set_replacement` object (`commands`, `atomic: true`,
+`pairing: "adjacent-resource-mode"`, `idempotent_retry: true`,
+`unchanged_on_rejection: true`) describing the atomic multi-claim replacement
+surface documented above, so a caller can discover this contract instead of
+assuming it from the CLI help text.
+
 The supported standalone sequence is:
 
 ```text
@@ -222,6 +229,28 @@ git nawabari session update --session "$NAWABARI_SESSION_ID" \
   --resource 'src/**/*.ts' --mode write --json
 git nawabari session release --session "$NAWABARI_SESSION_ID" --json
 ```
+
+`session update` (and its `resource update` alias) atomically replaces a
+session's _complete_ claim set in one `updateClaims()` transaction, backed by
+the same repository lock as every other mutation. `--resource`/`--mode` are
+repeatable to submit a multi-resource desired set in a single call; each
+`--resource` must be immediately followed by its own `--mode`, so pairing is
+positional adjacency rather than flag order and repeated resources can never
+be associated with the wrong mode:
+
+```bash
+git nawabari session update --session "$NAWABARI_SESSION_ID" \
+  --resource src/a.ts --mode exclusive-write \
+  --resource src/b.ts --mode exclusive-write \
+  --json
+```
+
+If any requested claim in the set is invalid or conflicts, the whole update
+is rejected and the session's prior claim set is left unchanged; no partial
+or empty intermediate claim state is ever observable. Submitting the same
+complete desired set again is idempotent. A successful replacement's JSON
+exposes the resulting `claims` together with machine-readable `added` and
+`released` claims.
 
 The modes have these normative meanings:
 

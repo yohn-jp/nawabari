@@ -824,6 +824,186 @@ async function main() {
       fail("explicit session history list did not expose closed records");
     }
 
+    const preSeedRelease = invokeInstalled(
+      ["session", "release", "--session", secondCreated.session_id, "--json"],
+      secondWorktree,
+    );
+    if (preSeedRelease.status !== 0) {
+      fail("installed session release did not clear residual claims before the deterministic multi-claim setup");
+    }
+
+    const seedResource = "multi-claim-seed.txt";
+    const seedClaim = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "claim",
+          "--session",
+          secondCreated.session_id,
+          "--resource",
+          seedResource,
+          "--mode",
+          "read",
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "deterministic prior claim before multi-claim update",
+    );
+    if (seedClaim.ok !== true || seedClaim.claims?.length !== 1) {
+      fail("installed session claim did not establish the deterministic prior claim set");
+    }
+
+    const multiUpdate = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "update",
+          "--session",
+          secondCreated.session_id,
+          "--resource",
+          "multi-claim-a.txt",
+          "--mode",
+          "exclusive-write",
+          "--resource",
+          "multi-claim-b.txt",
+          "--mode",
+          "exclusive-write",
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "atomic multi-claim update",
+    );
+    if (
+      multiUpdate.ok !== true ||
+      multiUpdate.claims?.length !== 2 ||
+      !multiUpdate.claims?.some(
+        (entry) => entry.resource === "multi-claim-a.txt" && entry.mode === "exclusive-write",
+      ) ||
+      !multiUpdate.claims?.some((entry) => entry.resource === "multi-claim-b.txt" && entry.mode === "exclusive-write")
+    ) {
+      fail("installed session update did not atomically replace the claim set with both requested claims");
+    }
+    if (
+      multiUpdate.added?.length !== 2 ||
+      !multiUpdate.added?.some((entry) => entry.resource === "multi-claim-a.txt") ||
+      !multiUpdate.added?.some((entry) => entry.resource === "multi-claim-b.txt") ||
+      multiUpdate.released?.length !== 1 ||
+      multiUpdate.released?.[0]?.claim_id !== seedClaim.claims?.[0]?.claim_id
+    ) {
+      fail("installed session update did not report the exact added/released claim evidence for the replacement");
+    }
+
+    const interleavedUpdate = invokeInstalled(
+      [
+        "session",
+        "update",
+        "--session",
+        secondCreated.session_id,
+        "--resource",
+        "multi-claim-interleaved.txt",
+        "--session",
+        secondCreated.session_id,
+        "--mode",
+        "exclusive-write",
+        "--json",
+      ],
+      secondWorktree,
+    );
+    const interleavedUpdateJson = parseInstalledJson(interleavedUpdate, "interleaved-option multi-claim update");
+    if (interleavedUpdate.status !== 2 || interleavedUpdateJson.code !== "INVALID_ARGUMENT") {
+      fail("installed session update accepted --session interleaved between --resource and its --mode");
+    }
+
+    const doublePairClaim = invokeInstalled(
+      [
+        "session",
+        "claim",
+        "--session",
+        secondCreated.session_id,
+        "--resource",
+        "multi-claim-d.txt",
+        "--mode",
+        "read",
+        "--resource",
+        "multi-claim-e.txt",
+        "--mode",
+        "write",
+        "--json",
+      ],
+      secondWorktree,
+    );
+    const doublePairClaimJson = parseInstalledJson(doublePairClaim, "double-pair claim rejection");
+    if (doublePairClaim.status !== 2 || doublePairClaimJson.code !== "INVALID_ARGUMENT") {
+      fail("installed session claim silently accepted more than one --resource/--mode pair");
+    }
+
+    const conflictingUpdate = invokeInstalled(
+      [
+        "session",
+        "update",
+        "--session",
+        secondCreated.session_id,
+        "--resource",
+        "multi-claim-conflict.txt",
+        "--mode",
+        "write",
+        "--resource",
+        "multi-claim-conflict.txt",
+        "--mode",
+        "exclusive-write",
+        "--json",
+      ],
+      secondWorktree,
+    );
+    const conflictingUpdateJson = parseInstalledJson(conflictingUpdate, "conflicting multi-claim update");
+    if (conflictingUpdate.status !== 3 || conflictingUpdateJson.code !== "CONTRADICTORY_CLAIM") {
+      fail("installed session update did not reject an internally conflicting desired claim set");
+    }
+    const claimsAfterConflict = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", secondCreated.session_id, "--json"], secondWorktree),
+      "claims after rejected update",
+    );
+    if (
+      claimsAfterConflict.ok !== true ||
+      claimsAfterConflict.claims?.length !== 2 ||
+      !claimsAfterConflict.claims?.some((entry) => entry.resource === "multi-claim-a.txt") ||
+      !claimsAfterConflict.claims?.some((entry) => entry.resource === "multi-claim-b.txt")
+    ) {
+      fail("a rejected multi-claim update mutated the persisted pre-update claim set");
+    }
+
+    const repeatedUpdate = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "update",
+          "--session",
+          secondCreated.session_id,
+          "--resource",
+          "multi-claim-a.txt",
+          "--mode",
+          "exclusive-write",
+          "--resource",
+          "multi-claim-b.txt",
+          "--mode",
+          "exclusive-write",
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "idempotent multi-claim update repeat",
+    );
+    if (
+      repeatedUpdate.ok !== true ||
+      repeatedUpdate.idempotent !== true ||
+      repeatedUpdate.added?.length !== 0 ||
+      repeatedUpdate.released?.length !== 0
+    ) {
+      fail("repeating the same desired multi-claim set was not idempotent with empty added/released evidence");
+    }
+
     const secondClosed = invokeInstalled(
       ["session", "close", "--session", secondCreated.session_id, "--json"],
       lifecycleRepository,
