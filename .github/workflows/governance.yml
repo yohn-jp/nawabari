@@ -1,5 +1,9 @@
 name: Governance
 
+# Canonical wrapper distributed via .github/sync.yml (SKIP_PR: true, direct
+# push) — do not hand-edit in a consumer repository; edit this file in
+# yohn-jp/.github instead.
+
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
@@ -13,19 +17,6 @@ permissions:
 
 jobs:
   validate-pr:
-    name: validate-pr
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout base governance validator
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          persist-credentials: false
-
-      - name: Validate branch name
-        env:
-          HEAD_REF: ${{ github.head_ref }}
-        run: node scripts/validate-branch-name.mjs --branch "$HEAD_REF"
-
-      - name: Validate PR contract
-        run: node scripts/validate-pr.mjs --event "$GITHUB_EVENT_PATH"
+    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@main
+    permissions:
+      contents: read
