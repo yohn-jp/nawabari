@@ -769,25 +769,39 @@ export class SessionRegistry {
         this.writeUnsafe([...state.sessions, record], state.claims);
         return cloneSessionRecord(record);
       } catch (error: unknown) {
-        if (gitProvisioned) {
-          // A durability-uncertain write failure means the rename may have
-          // already committed this session as the registry's visible
-          // ownership record. Reconcile against the physical registry
-          // before deciding: rolling back the worktree/branch here would
-          // strand a registry entry that points at resources we just
-          // deleted, which is worse than the unproven-durability failure
-          // itself. Only roll back when the record is not actually visible.
-          const durabilityUncertain =
-            error instanceof SessionRegistryError && error.code === "REGISTRY_DURABILITY_UNCERTAIN";
-          const recordVisible =
-            durabilityUncertain && this.readUnsafe().some((candidate) => candidate.sessionId === sessionId);
-          if (!recordVisible) {
-            rollbackProvisionedResources(this.git, this.repository.worktreePath, resources);
-          }
+        if (gitProvisioned && this.absenceProvenAfterProvisioningFailure(error, sessionId)) {
+          rollbackProvisionedResources(this.git, this.repository.worktreePath, resources);
         }
         throw classifyProvisioningFailure(error, this.git, this.repository.worktreePath, resources);
       }
     });
+  }
+
+  /**
+   * Decide whether it is safe to destroy the just-created worktree/branch
+   * after a provisioning failure. Only an ordinary (non-durability-uncertain)
+   * failure, or a durability-uncertain failure whose registry re-read
+   * positively proves the session record absent, licenses a rollback.
+   *
+   * A durability-uncertain write means the rename may have already
+   * committed this session as the registry's visible ownership record:
+   * rolling back the worktree/branch would then strand a registry entry
+   * pointing at resources we just deleted. Absence must be *proven*, not
+   * merely unconfirmed — if the reconciliation read itself cannot complete
+   * (I/O failure, corrupt registry state, or any other exception), that is
+   * not proof of absence, so no rollback happens and the original
+   * durability-uncertain outcome propagates unchanged.
+   */
+  private absenceProvenAfterProvisioningFailure(error: unknown, sessionId: string): boolean {
+    const durabilityUncertain = error instanceof SessionRegistryError && error.code === "REGISTRY_DURABILITY_UNCERTAIN";
+    if (!durabilityUncertain) {
+      return true;
+    }
+    try {
+      return !this.readUnsafe().some((candidate) => candidate.sessionId === sessionId);
+    } catch {
+      return false;
+    }
   }
 
   provisionSession(options: ProvisionSessionOptions = {}): SessionRecord {

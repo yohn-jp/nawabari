@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { RegistryError } from "./errors.js";
-import { isPostRenameFailure, writeJsonAtomicallySync } from "./atomic.js";
+import {
+  AtomicWritePostRenameFailure,
+  isPostRenameFailure,
+  writeJsonAtomically,
+  writeJsonAtomicallySync,
+} from "./atomic.js";
 
 async function withRegistryDirectory<T>(callback: (directory: string) => Promise<T> | T): Promise<T> {
   const directory = await mkdtemp(join(tmpdir(), "nawabari-atomic-"));
@@ -94,8 +99,11 @@ test("an unexpected post-rename directory-sync failure is durability-uncertain, 
         writeJsonAtomicallySync(registryPath, { hello: "world" });
       }),
       (error: unknown) => {
-        assert.equal((error as NodeJS.ErrnoException).code, "EIO");
+        assert.ok(error instanceof RegistryError);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
         assert.equal(isPostRenameFailure(error), true);
+        // The original EIO failure is preserved verbatim as the cause chain.
+        assert.equal((error.cause as NodeJS.ErrnoException | undefined)?.code, "EIO");
         return true;
       },
     );
@@ -106,9 +114,71 @@ test("an unexpected post-rename directory-sync failure is durability-uncertain, 
   });
 });
 
+test("a frozen, non-extensible object thrown after rename is still classified durability-uncertain", async () => {
+  await withRegistryDirectory(async (directory) => {
+    const registryPath = join(directory, "registry.json");
+    const frozenFailure = Object.freeze({ marker: "frozen-post-rename-failure" });
+    await assert.rejects(
+      writeJsonAtomically(
+        registryPath,
+        { hello: "world" },
+        {
+          hooks: {
+            afterRename: () => {
+              throw frozenFailure;
+            },
+          },
+        },
+      ),
+      (error: unknown) => {
+        // Classification never depends on writing a property onto the
+        // thrown value: it would silently no-op on a frozen object.
+        assert.ok(isPostRenameFailure(error));
+        assert.ok(error instanceof AtomicWritePostRenameFailure);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        assert.equal(error.cause, frozenFailure);
+        assert.ok(Object.isFrozen(frozenFailure));
+        return true;
+      },
+    );
+    assert.deepEqual(JSON.parse(await readFile(registryPath, "utf8")), { hello: "world" });
+  });
+});
+
+test("a primitive value thrown after rename is still classified durability-uncertain", async () => {
+  await withRegistryDirectory(async (directory) => {
+    const registryPath = join(directory, "registry.json");
+    await assert.rejects(
+      writeJsonAtomically(
+        registryPath,
+        { hello: "world" },
+        {
+          hooks: {
+            afterRename: () => {
+              throw "a bare string failure";
+            },
+          },
+        },
+      ),
+      (error: unknown) => {
+        // A primitive has no properties to mark at all: classification
+        // must not depend on reading anything off the thrown value itself.
+        assert.ok(isPostRenameFailure(error));
+        assert.ok(error instanceof AtomicWritePostRenameFailure);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        assert.equal(error.cause, "a bare string failure");
+        return true;
+      },
+    );
+    assert.deepEqual(JSON.parse(await readFile(registryPath, "utf8")), { hello: "world" });
+  });
+});
+
 test("isPostRenameFailure is false for unrelated errors", () => {
   assert.equal(isPostRenameFailure(new Error("unrelated")), false);
   assert.equal(isPostRenameFailure(new RegistryError("REGISTRY_IO_ERROR", "unrelated")), false);
+  assert.equal(isPostRenameFailure(new RegistryError("REGISTRY_DURABILITY_UNCERTAIN", "unrelated")), false);
   assert.equal(isPostRenameFailure(undefined), false);
   assert.equal(isPostRenameFailure("not-an-object"), false);
+  assert.equal(isPostRenameFailure(Object.freeze({ code: "REGISTRY_DURABILITY_UNCERTAIN" })), false);
 });
