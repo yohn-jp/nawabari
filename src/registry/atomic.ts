@@ -35,6 +35,31 @@ function isUnsupportedDirectorySync(error: unknown): boolean {
   return code === "EINVAL" || code === "ENOTSUP" || code === "EISDIR";
 }
 
+/**
+ * Marks an error as having occurred after the target file was already
+ * renamed into place. Callers must not read this marker as "the write
+ * succeeded" — durability past that point is unproven — but they must also
+ * not treat it as an ordinary pre-effect failure: the renamed document may
+ * already be the one readers observe.
+ */
+const RENAMED_BEFORE_FAILURE = Symbol("nawabari.atomicWrite.renamedBeforeFailure");
+
+function markRenamedBeforeFailure(error: unknown): void {
+  if (error !== null && typeof error === "object") {
+    Reflect.set(error, RENAMED_BEFORE_FAILURE, true);
+  }
+}
+
+/**
+ * True when `writeJsonAtomically`/`writeJsonAtomicallySync` failed only
+ * after the rename had already committed the new document. Recovery must
+ * reconcile authoritative state instead of assuming the mutation never
+ * happened.
+ */
+export function isPostRenameFailure(error: unknown): boolean {
+  return error !== null && typeof error === "object" && Reflect.get(error, RENAMED_BEFORE_FAILURE) === true;
+}
+
 async function syncDirectory(directory: string): Promise<void> {
   let handle: FileHandle | undefined;
   try {
@@ -111,6 +136,8 @@ export async function writeJsonAtomically(
     }
     if (!renamed) {
       await rm(temporaryPath, { force: true });
+    } else {
+      markRenamedBeforeFailure(error);
     }
     throw error;
   }
@@ -153,6 +180,8 @@ export function writeJsonAtomicallySync(
     }
     if (!renamed) {
       fs.rmSync(temporaryPath, { force: true });
+    } else {
+      markRenamedBeforeFailure(error);
     }
     throw error;
   }

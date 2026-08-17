@@ -246,6 +246,49 @@ test("a Git provisioning failure leaves no active registry ownership or worktree
   }
 });
 
+test("a durability-uncertain registry write after provisioning does not roll back the already-committed worktree", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-durability-uncertain");
+  const branchName = "feature/durability-uncertain";
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+
+    let session: ReturnType<typeof registry.provision> | undefined;
+    assert.throws(
+      () => {
+        session = withDirectoryFsyncFailure(registry.paths.directory, "EIO", () =>
+          registry.provision({ worktreePath, branchName }),
+        );
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        return true;
+      },
+    );
+    assert.equal(session, undefined);
+
+    // The rename that commits the registry document already succeeded; only
+    // the post-rename directory fsync could not be proven. Rolling back the
+    // matching physical worktree/branch here would strand a registry entry
+    // pointing at resources that no longer exist, so both must remain.
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], fixture.repositoryPath),
+      true,
+    );
+    const reread = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const records = reread.list();
+    assert.equal(records.length, 1);
+    assert.equal(records[0].worktreePath, fs.realpathSync.native(worktreePath));
+    assert.equal(records[0].branchName, branchName);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
 test("simultaneous provisioning serializes ownership and creates distinct worktrees", { timeout: 30_000 }, async () => {
   const fixture = createRepositoryFixture();
   const worktreePaths = Array.from({ length: 4 }, (_, index) =>
@@ -291,6 +334,39 @@ function createRepositoryFixture(): RepositoryFixture {
       fs.rmSync(repositoryPath, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * Fails only the directory fsync targeting `directory` (never a temporary
+ * file fsync, and never a directory fsync for an unrelated directory such
+ * as the lock's own owner.json write), so the fault deterministically lands
+ * on the atomic-write post-rename directory sync under test.
+ */
+function withDirectoryFsyncFailure<T>(directory: string, code: string, run: () => T): T {
+  const originalOpenSync = fs.openSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const directoryDescriptors = new Set<number>();
+  fs.openSync = ((...args: Parameters<typeof fs.openSync>) => {
+    const fd = originalOpenSync(...args);
+    if (args[0] === directory) {
+      directoryDescriptors.add(fd);
+    }
+    return fd;
+  }) as typeof fs.openSync;
+  fs.fsyncSync = ((fd: number) => {
+    if (directoryDescriptors.has(fd)) {
+      const error = new Error(`Simulated ${code}`) as NodeJS.ErrnoException;
+      error.code = code;
+      throw error;
+    }
+    return originalFsyncSync(fd);
+  }) as typeof fs.fsyncSync;
+  try {
+    return run();
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
 }
 
 function removeWorktree(repositoryPath: string, worktreePath: string): void {

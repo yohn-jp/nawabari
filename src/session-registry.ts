@@ -21,6 +21,7 @@ import {
 } from "./git.js";
 import { SessionRegistryError, type RegistryErrorCode, type RegistryErrorDetails } from "./errors.js";
 import { generateSessionId, isSessionId } from "./session-id.js";
+import { isPostRenameFailure, writeJsonAtomicallySync } from "./registry/atomic.js";
 import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
 import {
   assertCanonicalClaimResource,
@@ -769,7 +770,20 @@ export class SessionRegistry {
         return cloneSessionRecord(record);
       } catch (error: unknown) {
         if (gitProvisioned) {
-          rollbackProvisionedResources(this.git, this.repository.worktreePath, resources);
+          // A durability-uncertain write failure means the rename may have
+          // already committed this session as the registry's visible
+          // ownership record. Reconcile against the physical registry
+          // before deciding: rolling back the worktree/branch here would
+          // strand a registry entry that points at resources we just
+          // deleted, which is worse than the unproven-durability failure
+          // itself. Only roll back when the record is not actually visible.
+          const durabilityUncertain =
+            error instanceof SessionRegistryError && error.code === "REGISTRY_DURABILITY_UNCERTAIN";
+          const recordVisible =
+            durabilityUncertain && this.readUnsafe().some((candidate) => candidate.sessionId === sessionId);
+          if (!recordVisible) {
+            rollbackProvisionedResources(this.git, this.repository.worktreePath, resources);
+          }
         }
         throw classifyProvisioningFailure(error, this.git, this.repository.worktreePath, resources);
       }
@@ -2408,6 +2422,15 @@ export class SessionRegistry {
     return this.readStateUnsafe().sessions;
   }
 
+  /**
+   * The single authoritative persistence path for session/claim registry
+   * state, sharing its durability policy with `registry/atomic.ts`: the
+   * temporary file and target directory are fsynced around an atomic
+   * rename, and only known unsupported-directory-fsync conditions are
+   * tolerated. A failure observed after rename is reported as a distinct
+   * durability-uncertain outcome rather than an ordinary write failure,
+   * since the renamed document may already be the one readers observe.
+   */
   private writeUnsafe(records: readonly SessionRecord[], claims: readonly ResourceClaim[]): void {
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
@@ -2416,24 +2439,24 @@ export class SessionRegistry {
       claims_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
       claims: sortResourceClaims(claims).map((claim) => toPersistedResourceClaim(claim, this.repository.repositoryId)),
     };
-    const contents = `${JSON.stringify(registry, null, 2)}\n`;
-    const temporaryPath = `${this.paths.registry}.tmp-${process.pid}-${generateSessionId()}`;
-    let descriptor: number | undefined;
 
     try {
-      fs.mkdirSync(this.paths.directory, { recursive: true, mode: 0o700 });
-      descriptor = fs.openSync(temporaryPath, "wx", 0o600);
-      fs.writeFileSync(descriptor, contents, "utf8");
-      fs.fsyncSync(descriptor);
-      fs.closeSync(descriptor);
-      descriptor = undefined;
-      fs.renameSync(temporaryPath, this.paths.registry);
-      syncDirectory(this.paths.directory);
+      writeJsonAtomicallySync(this.paths.registry, registry);
     } catch (error: unknown) {
-      if (descriptor !== undefined) {
-        closeQuietly(descriptor);
+      if (isPostRenameFailure(error)) {
+        throw new SessionRegistryError(
+          "REGISTRY_DURABILITY_UNCERTAIN",
+          `Registry rename to ${this.paths.registry} may have already committed, but durable persistence could not be proven`,
+          {
+            path: this.paths.registry,
+            recoveryHints: [
+              "Re-read the registry to check whether the mutation is already visible before retrying.",
+              "Do not assume this operation did not happen.",
+            ],
+          },
+          error,
+        );
       }
-      unlinkQuietly(temporaryPath);
       throw new SessionRegistryError(
         "REGISTRY_IO_FAILURE",
         `Could not atomically write ${this.paths.registry}`,
@@ -4194,35 +4217,4 @@ function toSessionRegistryLockError(error: unknown, lockPath: string): SessionRe
   }
 
   return new SessionRegistryError("REGISTRY_IO_FAILURE", `Could not operate on ${lockPath}`, { path: lockPath }, error);
-}
-
-function closeQuietly(descriptor: number): void {
-  try {
-    fs.closeSync(descriptor);
-  } catch {
-    // The original operation's error is more useful than a best-effort close error.
-  }
-}
-
-function unlinkQuietly(filePath: string): void {
-  try {
-    fs.unlinkSync(filePath);
-  } catch {
-    // A missing temporary file is already the desired state.
-  }
-}
-
-function syncDirectory(directory: string): void {
-  let descriptor: number | undefined;
-  try {
-    descriptor = fs.openSync(directory, "r");
-    fs.fsyncSync(descriptor);
-  } catch {
-    // Directory fsync is not available on every supported filesystem. The
-    // file itself was fsynced before rename, so continue on that limitation.
-  } finally {
-    if (descriptor !== undefined) {
-      closeQuietly(descriptor);
-    }
-  }
 }

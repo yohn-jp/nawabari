@@ -332,6 +332,92 @@ test("does not resolve a closed record as the current owner", () => {
   }
 });
 
+test("an unexpected post-rename directory-sync failure is reported durability-uncertain, not an ordinary IO failure", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    assert.throws(
+      () => withDirectoryFsyncFailure(registry.paths.directory, "EIO", () => registry.create()),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        return true;
+      },
+    );
+    // The rename already committed the document; the failure only means
+    // directory durability could not be proven, not that nothing happened.
+    assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).list().length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a known unsupported directory-fsync condition does not fail an ordinary mutation", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = withDirectoryFsyncFailure(registry.paths.directory, "EINVAL", () => registry.create());
+    assert.equal(registry.list().length, 1);
+    assert.equal(registry.get(session.sessionId)?.sessionId, session.sessionId);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("an unexpected pre-rename write failure never produces a successful mutation", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const original = fs.fsyncSync;
+    fs.fsyncSync = (() => {
+      const error = new Error("Simulated EIO") as NodeJS.ErrnoException;
+      error.code = "EIO";
+      throw error;
+    }) as typeof fs.fsyncSync;
+    try {
+      assertRegistryError(() => registry.create(), "REGISTRY_IO_FAILURE");
+    } finally {
+      fs.fsyncSync = original;
+    }
+    assert.deepEqual(registry.list(), []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+/**
+ * Fails only the directory fsync targeting `directory` (never a temporary
+ * file fsync, and never a directory fsync for an unrelated directory such
+ * as the lock's own owner.json write), so the fault deterministically lands
+ * on the atomic-write post-rename directory sync under test.
+ */
+function withDirectoryFsyncFailure<T>(directory: string, code: string, run: () => T): T {
+  const originalOpenSync = fs.openSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const directoryDescriptors = new Set<number>();
+  fs.openSync = ((...args: Parameters<typeof fs.openSync>) => {
+    const fd = originalOpenSync(...args);
+    if (args[0] === directory) {
+      directoryDescriptors.add(fd);
+    }
+    return fd;
+  }) as typeof fs.openSync;
+  fs.fsyncSync = ((fd: number) => {
+    if (directoryDescriptors.has(fd)) {
+      const error = new Error(`Simulated ${code}`) as NodeJS.ErrnoException;
+      error.code = code;
+      throw error;
+    }
+    return originalFsyncSync(fd);
+  }) as typeof fs.fsyncSync;
+  try {
+    return run();
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+}
+
 interface RepositoryFixture {
   readonly repositoryPath: string;
   readonly linkedWorktreePath: string;
