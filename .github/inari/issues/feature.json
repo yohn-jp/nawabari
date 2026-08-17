@@ -5,9 +5,7 @@
   "name": "Feature",
   "description": "New capability or extension to an existing capability",
   "title": "feat: ",
-  "labels": [
-    "enhancement"
-  ],
+  "labels": ["enhancement"],
   "sections": [
     {
       "id": "problem",

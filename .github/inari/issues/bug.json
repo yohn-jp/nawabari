@@ -5,9 +5,7 @@
   "name": "Bug",
   "description": "Reproducible defect",
   "title": "fix: ",
-  "labels": [
-    "bug"
-  ],
+  "labels": ["bug"],
   "sections": [
     {
       "id": "summary",
