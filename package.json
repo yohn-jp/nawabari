@@ -24,7 +24,8 @@
     "smoke-test": "node scripts/smoke-test.mjs",
     "test:package": "pnpm run build && node scripts/run-package-suite.mjs",
     "governance:actions": "node scripts/validate-actions.mjs",
-    "verify": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm test && pnpm run governance:actions && pnpm run test:package",
+    "governance:workflows": "node scripts/validate-workflows.mjs",
+    "verify": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm test && pnpm run governance:actions && pnpm run governance:workflows && pnpm run test:package",
     "prepack": "pnpm run build",
     "prepublishOnly": "pnpm run typecheck && pnpm test"
   },
