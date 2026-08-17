@@ -8,6 +8,8 @@ const ACTION_ROOTS = Object.freeze([".github/workflows", ".github/actions"]);
 const USES_LINE_PATTERN = /^\s*(?:-\s+)?uses:\s*(.*)$/u;
 const VALUE_PATTERN = /^(\S+)(?:\s+#.*)?$/u;
 const IMMUTABLE_EXTERNAL_ACTION_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$/u;
+const TRUSTED_REUSABLE_WORKFLOW_PATTERN =
+  /^yohn-jp\/\.github\/\.github\/workflows\/(?:pr-governance|issue-governance)\.yml@main$/u;
 
 export function validateActionText(source, filePath = "<text>") {
   const references = [];
@@ -32,8 +34,10 @@ export function validateActionText(source, filePath = "<text>") {
 
     const reference = valueMatch[1];
     const local = reference.startsWith("./");
-    references.push({ file: filePath, line: lineNumber, reference, local });
-    if (!local && !IMMUTABLE_EXTERNAL_ACTION_PATTERN.test(reference)) {
+    const indentation = line.match(/^\s*/u)?.[0].length ?? 0;
+    const trustedReusableWorkflow = indentation === 4 && TRUSTED_REUSABLE_WORKFLOW_PATTERN.test(reference);
+    references.push({ file: filePath, line: lineNumber, reference, local, trustedReusableWorkflow });
+    if (!local && !trustedReusableWorkflow && !IMMUTABLE_EXTERNAL_ACTION_PATTERN.test(reference)) {
       errors.push(
         filePath + ":" + lineNumber + ": external GitHub Action must use a full 40-character commit SHA: " + reference,
       );

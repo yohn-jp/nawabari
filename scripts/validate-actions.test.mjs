@@ -23,6 +23,19 @@ test("accepts immutable external actions and repository-local actions", () => {
   assert.equal(result.references.filter((reference) => reference.local).length, 1);
 });
 
+test("accepts the pinned canonical reusable governance workflows", () => {
+  const result = validateActionText(
+    [
+      "    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@main",
+      "    uses: yohn-jp/.github/.github/workflows/issue-governance.yml@main",
+    ].join("\n"),
+    ".github/workflows/example.yml",
+  );
+
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.references.filter((reference) => reference.trustedReusableWorkflow).length, 2);
+});
+
 test("rejects mutable, incomplete, and missing external action refs", () => {
   const result = validateActionText(
     ["      uses: actions/checkout@v4", "      uses: actions/setup-node@1234", "      uses:"].join("\n"),
