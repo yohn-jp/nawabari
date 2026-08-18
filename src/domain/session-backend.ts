@@ -33,6 +33,8 @@ import {
   type SessionCloseResult,
   type SessionContext,
   type SessionCreateOptions,
+  type SessionDiagnostic,
+  type SessionDiagnosticOptions,
   type SessionListResult,
   type SessionListOptions,
   type SessionRecord,
@@ -366,6 +368,23 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
+  public sessionDiagnostic(
+    context: SessionContext,
+    options: SessionDiagnosticOptions,
+  ): Promise<DomainResult<SessionDiagnostic>> {
+    try {
+      const registry = this.registryFor(context);
+      const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
+      const diagnostic = registry.diagnose({
+        sessionId,
+        integratedRevision: options.integrated_revision ?? undefined,
+      });
+      return Promise.resolve(success(toDomainSessionDiagnostic(diagnostic)));
+    } catch (error: unknown) {
+      return Promise.resolve(failure(toDomainError(error, "NO_CURRENT_SESSION")));
+    }
+  }
+
   public garbageCollect(
     context: SessionContext,
     options: GarbageCollectOptions,
@@ -637,6 +656,47 @@ function toDomainGarbageCollectResult(result: RegistryGarbageCollectResult): Gar
       details: { ...blocked.details },
       recovery_hints: [...blocked.recoveryHints],
     })),
+  };
+}
+
+function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").SessionDiagnostic): SessionDiagnostic {
+  return {
+    schema_version: diagnostic.schemaVersion,
+    session_id: diagnostic.session.sessionId,
+    repository: diagnostic.repositoryId,
+    worktree: diagnostic.worktreePath,
+    branch: diagnostic.branchName,
+    session: toDomainRecord(diagnostic.session),
+    claims: diagnostic.claims.map(toDomainClaim),
+    physical_state: diagnostic.physicalState,
+    close_readiness: diagnostic.closeReadiness,
+    cleanup_readiness: diagnostic.cleanupReadiness,
+    result_state: diagnostic.resultState,
+    idempotent: diagnostic.idempotent,
+    blockers: diagnostic.blockers.map((blocker) => ({
+      code: REGISTRY_ERROR_CODE_MAP[blocker.code],
+      message: blocker.message,
+      details: { ...blocker.details },
+      safe_actions: [...blocker.safeActions],
+    })),
+    safe_actions: [...diagnostic.safeActions],
+    integration_evidence: {
+      supplied: diagnostic.integrationEvidence.supplied,
+      ...(diagnostic.integrationEvidence.integratedRevision === undefined
+        ? {}
+        : { integrated_revision: diagnostic.integrationEvidence.integratedRevision }),
+      ...(diagnostic.integrationEvidence.proof === undefined
+        ? {}
+        : {
+            proof: {
+              method: diagnostic.integrationEvidence.proof.method,
+              ...(diagnostic.integrationEvidence.proof.integratedRevision === undefined
+                ? {}
+                : { integrated_revision: diagnostic.integrationEvidence.proof.integratedRevision }),
+            },
+          }),
+    },
+    generated_at: diagnostic.generatedAt,
   };
 }
 
