@@ -99,6 +99,7 @@ export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
 export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
 export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
+export const SESSION_DIAGNOSTIC_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
 /** Bounds a caller-declared commit-message pattern before it is compiled. */
 export const MAX_MESSAGE_PATTERN_LENGTH = 512 as const;
@@ -210,6 +211,49 @@ export interface CleanupDecision {
   readonly physicalState: string;
   readonly blockers: readonly CleanupBlocker[];
   readonly recoveryHints: readonly string[];
+}
+
+/**
+ * Explicit close/cleanup readiness states. `external_evidence_required`
+ * marks the #123 non-ancestry-integration case: ancestry alone could not
+ * prove the branch safe to reclaim, and a caller-supplied integration
+ * revision (independently re-verified, never trusted blindly) may resolve
+ * it. `not_due` only applies to cleanup readiness: the session is otherwise
+ * safely closable but has not yet met the garbage-collection staleness
+ * threshold.
+ */
+export type ReadinessState = "ready" | "not_due" | "blocked" | "external_evidence_required" | "ambiguous";
+
+/** How complete/certain this diagnostic snapshot is, independent of readiness. */
+export type DiagnosticCompleteness = "complete" | "ambiguous" | "stale" | "external_evidence_required";
+
+export interface SessionDiagnosticBlocker extends CleanupBlocker {
+  /** Stable, kebab-case next-action identifiers; reusable by orchestrators. */
+  readonly safeActions: readonly string[];
+}
+
+export interface SessionDiagnosticIntegrationEvidence {
+  readonly supplied: boolean;
+  readonly integratedRevision?: string;
+  readonly proof?: IntegrationProof;
+}
+
+export interface SessionDiagnostic {
+  readonly schemaVersion: typeof SESSION_DIAGNOSTIC_SCHEMA_VERSION;
+  readonly operation: "diagnostic";
+  readonly repositoryId: string;
+  readonly worktreePath: string;
+  readonly branchName: string;
+  readonly session: SessionRecord;
+  readonly claims: readonly ResourceClaim[];
+  readonly physicalState: string;
+  readonly closeReadiness: ReadinessState;
+  readonly cleanupReadiness: ReadinessState;
+  readonly resultState: DiagnosticCompleteness;
+  readonly idempotent: boolean;
+  readonly blockers: readonly SessionDiagnosticBlocker[];
+  readonly safeActions: readonly string[];
+  readonly integrationEvidence: SessionDiagnosticIntegrationEvidence;
 }
 
 export type ReconciliationSessionStatus = "healthy" | "candidate" | "drift" | "closed";
@@ -1723,6 +1767,34 @@ export class SessionRegistry {
   }
 
   /**
+   * Side-effect-free close/cleanup readiness diagnostic for one session. This
+   * observes the exact same authoritative Git/session/claim truth `close()`
+   * uses (including the #123 non-ancestry integration proof contract when
+   * `integratedRevision` evidence is supplied) without mutating any session,
+   * claim, Git, or registry state.
+   */
+  diagnose(sessionIdOrOptions?: string | null | CloseSessionOptions): SessionDiagnostic {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const requestedSessionId = isCloseSessionOptions(sessionIdOrOptions)
+        ? (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id)
+        : sessionIdOrOptions;
+      const sessionId = requestedSessionId ?? this.resolveOwnerSession(state.sessions).sessionId;
+      assertSessionId(sessionId);
+      const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+      if (record === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      const integratedRevision = isCloseSessionOptions(sessionIdOrOptions)
+        ? (sessionIdOrOptions.integratedRevision ?? sessionIdOrOptions.integrated_revision ?? null)
+        : null;
+      const evidence: IntegrationEvidenceInput | undefined =
+        integratedRevision === null || integratedRevision === undefined ? undefined : { integratedRevision };
+      return this.diagnoseUnsafe(record, state, evidence);
+    });
+  }
+
+  /**
    * Reconcile registry ownership with Git's physical worktree inventory.
    * This is deliberately diagnostic-only: no stale metadata is repaired and
    * no physical resource is removed by this method.
@@ -2222,6 +2294,90 @@ export class SessionRegistry {
       physicalState,
       blockers: Object.freeze(blockers),
       recoveryHints: Object.freeze(recoveryHints),
+    });
+  }
+
+  private diagnoseUnsafe(
+    record: SessionRecord,
+    state: RegistryState,
+    evidence?: IntegrationEvidenceInput,
+  ): SessionDiagnostic {
+    const claims = state.claims.filter((claim) => claim.sessionId === record.sessionId).map(cloneResourceClaim);
+    // Used only to evaluate staleness below; deliberately not part of the
+    // returned diagnostic so repeated inspection of unchanged state is
+    // byte-identical, not just semantically equivalent.
+    const now = toTimestamp(this.clock());
+    const integrationEvidence: SessionDiagnosticIntegrationEvidence = {
+      supplied: evidence !== undefined,
+      ...(evidence === undefined ? {} : { integratedRevision: evidence.integratedRevision }),
+    };
+
+    if (record.state === "closed") {
+      return Object.freeze({
+        schemaVersion: SESSION_DIAGNOSTIC_SCHEMA_VERSION,
+        operation: "diagnostic" as const,
+        repositoryId: this.repository.repositoryId,
+        worktreePath: record.worktreePath,
+        branchName: record.branchName,
+        session: cloneSessionRecord(record),
+        claims: Object.freeze(claims),
+        physicalState: "closed",
+        closeReadiness: "ready" as const,
+        cleanupReadiness: "ready" as const,
+        resultState: "complete" as const,
+        idempotent: true,
+        blockers: Object.freeze([]),
+        safeActions: Object.freeze([]),
+        integrationEvidence: Object.freeze(integrationEvidence),
+      });
+    }
+
+    let physicalState = "unavailable";
+    let blockers: readonly SessionDiagnosticBlocker[] = [];
+    let integrationProof: IntegrationProof | undefined;
+    let staleCandidate = false;
+    try {
+      const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
+      physicalState = inspectWorktreeState(record.worktreePath, worktrees).kind;
+      staleCandidate = isStaleCandidate(record, now, this.staleAfterMs, worktrees);
+      const resources = this.inspectCleanupResources(record, worktrees, evidence);
+      integrationProof = resources.integrationProof;
+    } catch (error: unknown) {
+      blockers = [toDiagnosticBlocker(error)];
+    }
+
+    const closeReadiness = closeReadinessForBlockers(blockers);
+    const cleanupReadiness: ReadinessState =
+      closeReadiness !== "ready" ? closeReadiness : staleCandidate ? "ready" : "not_due";
+    const resultState = resultStateForDiagnostic(closeReadiness, blockers);
+    const safeActions =
+      blockers.length > 0
+        ? sortStrings(Array.from(new Set(blockers.flatMap((blocker) => blocker.safeActions))))
+        : closeReadiness === "ready"
+          ? cleanupReadiness === "ready"
+            ? ["close-session", "run-garbage-collect"]
+            : ["close-session"]
+          : [];
+
+    return Object.freeze({
+      schemaVersion: SESSION_DIAGNOSTIC_SCHEMA_VERSION,
+      operation: "diagnostic" as const,
+      repositoryId: this.repository.repositoryId,
+      worktreePath: record.worktreePath,
+      branchName: record.branchName,
+      session: cloneSessionRecord(record),
+      claims: Object.freeze(claims),
+      physicalState,
+      closeReadiness,
+      cleanupReadiness,
+      resultState,
+      idempotent: false,
+      blockers: Object.freeze(blockers),
+      safeActions: Object.freeze(safeActions),
+      integrationEvidence: Object.freeze({
+        ...integrationEvidence,
+        ...(integrationProof === undefined ? {} : { proof: integrationProof }),
+      }),
     });
   }
 
@@ -2812,6 +2968,97 @@ function toCleanupBlocker(error: unknown): CleanupBlocker {
     details: error.details,
     recoveryHints: Object.freeze(recoveryHints),
   });
+}
+
+function toDiagnosticBlocker(error: unknown): SessionDiagnosticBlocker {
+  const blocker = toCleanupBlocker(error);
+  return Object.freeze({
+    ...blocker,
+    safeActions: Object.freeze(safeActionsForCode(blocker.code, blocker.details)),
+  });
+}
+
+/**
+ * Stable, kebab-case next-action identifiers per blocker code. This is the
+ * one place that maps a registry blocker to actionable next steps, so a
+ * later actionable-error surface (e.g. for RESOURCE_CLAIM_CONFLICT) can
+ * extend the same table instead of diverging from it.
+ */
+function safeActionsForCode(code: RegistryErrorCode, details: RegistryErrorDetails): readonly string[] {
+  switch (code) {
+    case "DIRTY_WORKTREE":
+      return ["commit-or-discard-changes", "retain-session"];
+    case "NESTED_REPOSITORY":
+      return ["resolve-nested-repository", "retain-session"];
+    case "RECOVERABLE_COMMITS":
+      return details.proofMethod === "tree-equivalence"
+        ? ["retain-session", "supply-different-integrated-revision"]
+        : ["provide-integration-evidence", "merge-or-retain-branch", "retain-session"];
+    case "RECOVERABLE_STASHES":
+      return ["apply-or-export-stash", "retain-session"];
+    case "MISSING_WORKTREE":
+      return ["run-garbage-collect"];
+    case "OWNERSHIP_MISMATCH":
+    case "DUPLICATE_WORKTREE_OWNERSHIP":
+    case "DUPLICATE_BRANCH_OWNERSHIP":
+      return ["reconcile-ownership", "retain-session"];
+    case "PROTECTED_WORKTREE":
+    case "PROTECTED_BRANCH":
+      return ["retain-session"];
+    case "GIT_STATE_AMBIGUOUS":
+    case "PHYSICAL_OBSERVATION_UNAVAILABLE":
+    case "REPOSITORY_IDENTITY_AMBIGUOUS":
+    case "WORKTREE_IDENTITY_AMBIGUOUS":
+    case "GIT_COMMAND_FAILED":
+    case "GIT_SPAWN_FAILED":
+    case "GIT_TIMEOUT":
+    case "GIT_OUTPUT_LIMIT":
+      return ["stabilize-repository-state", "retry-diagnostic"];
+    case "STALE_REGISTRY":
+    case "RECONCILIATION_DRIFT":
+      return ["retry-diagnostic"];
+    default:
+      return ["retry-diagnostic"];
+  }
+}
+
+function isAmbiguousObservationCode(code: RegistryErrorCode): boolean {
+  return (
+    code === "GIT_STATE_AMBIGUOUS" ||
+    code === "PHYSICAL_OBSERVATION_UNAVAILABLE" ||
+    code === "REPOSITORY_IDENTITY_AMBIGUOUS" ||
+    code === "WORKTREE_IDENTITY_AMBIGUOUS" ||
+    code === "GIT_COMMAND_FAILED" ||
+    code === "GIT_SPAWN_FAILED" ||
+    code === "GIT_TIMEOUT" ||
+    code === "GIT_OUTPUT_LIMIT"
+  );
+}
+
+/** #123 non-ancestry integration: RECOVERABLE_COMMITS with no ancestry proof and no evidence attempted yet. */
+function isExternalEvidenceEligible(blocker: SessionDiagnosticBlocker): boolean {
+  return blocker.code === "RECOVERABLE_COMMITS" && blocker.details.proofMethod === "ancestry";
+}
+
+function closeReadinessForBlockers(blockers: readonly SessionDiagnosticBlocker[]): ReadinessState {
+  const blocker = blockers[0];
+  if (blocker === undefined) return "ready";
+  if (isAmbiguousObservationCode(blocker.code)) return "ambiguous";
+  if (isExternalEvidenceEligible(blocker)) return "external_evidence_required";
+  return "blocked";
+}
+
+function resultStateForDiagnostic(
+  closeReadiness: ReadinessState,
+  blockers: readonly SessionDiagnosticBlocker[],
+): DiagnosticCompleteness {
+  if (closeReadiness === "ambiguous") return "ambiguous";
+  if (closeReadiness === "external_evidence_required") return "external_evidence_required";
+  const blocker = blockers[0];
+  if (blocker !== undefined && (blocker.code === "STALE_REGISTRY" || blocker.code === "RECONCILIATION_DRIFT")) {
+    return "stale";
+  }
+  return "complete";
 }
 
 function toGarbageCollectBlocked(sessionId: string, error: unknown): GarbageCollectBlocked {

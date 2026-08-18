@@ -13,6 +13,8 @@ import type {
   SessionCloseResult,
   SessionContext,
   SessionCreateOptions,
+  SessionDiagnostic,
+  SessionDiagnosticOptions,
   SessionRecord,
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
@@ -226,6 +228,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session create",
       "session id",
       "session show",
+      "session inspect",
       "session run",
       "session list",
       "session claim",
@@ -257,11 +260,11 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--base",
       "--label",
       "--session",
+      "--integrated-revision",
       "--resource",
       "--mode",
       "--repository",
       "--claim-id",
-      "--integrated-revision",
     ],
     authorization_options: ["--session", "--operation", "--resource"],
     checkpoint_options: ["--session"],
@@ -354,6 +357,61 @@ test("session id resolves from the current worktree without an explicit id", asy
     command: "session id",
     session_id: sampleSession.session_id,
   });
+});
+
+test("session inspect forwards --session and --integrated-revision to the diagnostic backend", async () => {
+  let receivedOptions: SessionDiagnosticOptions | null = null;
+  const diagnosticResult: SessionDiagnostic = {
+    schema_version: 1,
+    session_id: sampleSession.session_id,
+    repository: sampleSession.repository,
+    worktree: sampleSession.worktree,
+    branch: sampleSession.branch,
+    session: sampleSession,
+    claims: [],
+    physical_state: "healthy",
+    close_readiness: "ready",
+    cleanup_readiness: "not_due",
+    result_state: "complete",
+    idempotent: false,
+    blockers: [],
+    safe_actions: ["close-session"],
+    integration_evidence: { supplied: false },
+  };
+  const backend = backendForTests({
+    sessionDiagnostic: async (_context: SessionContext, options: SessionDiagnosticOptions) => {
+      receivedOptions = options;
+      return success(diagnosticResult);
+    },
+  });
+  const output = capture();
+  const exitCode = await runCli(
+    ["session", "inspect", "--session", sampleSession.session_id, "--integrated-revision", "deadbeef", "--json"],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.deepEqual(receivedOptions, {
+    session_id: sampleSession.session_id,
+    integrated_revision: "deadbeef",
+  });
+  assert.deepEqual(JSON.parse(output.stdout[0]), {
+    ok: true,
+    command: "session inspect",
+    ...diagnosticResult,
+  });
+});
+
+test("session inspect fails closed with BACKEND_UNAVAILABLE when the backend does not implement diagnostics", async () => {
+  const backend = backendForTests();
+  const output = capture();
+  const exitCode = await runCli(["session", "inspect", "--json"], { backend, io: output.io });
+
+  assert.equal(exitCode, 4);
+  const response = JSON.parse(output.stdout[0]) as { ok: boolean; code: string; command: string };
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "BACKEND_UNAVAILABLE");
+  assert.equal(response.command, "session inspect");
 });
 
 test("capabilities discovery is available outside a Git repository and exposes the standalone contract", async () => {

@@ -11,6 +11,7 @@ import {
   type SessionCloseOptions,
   type SessionContext,
   type SessionCreateOptions,
+  type SessionDiagnosticOptions,
   type SessionListOptions,
   MAX_SESSION_LIST_LIMIT,
 } from "./domain/session.js";
@@ -97,6 +98,24 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     summary: "Show the current or selected session",
     usage: `${CLI_NAME} session show [--session <id>]`,
     options: [option("--session", "Select a session instead of the current worktree owner", { value: "<id>" })],
+  },
+  {
+    name: "session inspect",
+    summary: "Report side-effect-free close/cleanup readiness for a session",
+    usage: `${CLI_NAME} session inspect [--session <id>] [--integrated-revision <rev>]`,
+    options: [
+      option("--session", "Select a session instead of the current worktree owner", { value: "<id>" }),
+      option(
+        "--integrated-revision",
+        "Externally evidenced revision to test for non-ancestry (squash/rebase) integration; independently re-verified via exact Git tree-object equivalence, never trusted blindly",
+        { value: "<rev>" },
+      ),
+    ],
+    notes: [
+      "Read-only: never mutates session, claim, Git, worktree, branch, or registry state. Repeated calls are idempotent.",
+      "Derived from the same authoritative close/cleanup Git evidence as session close; does not duplicate or diverge from that logic.",
+      "Nawabari never queries GitHub or any remote provider; --integrated-revision only names a local revision for Nawabari to independently verify.",
+    ],
   },
   {
     name: "session run",
@@ -931,6 +950,17 @@ async function executeCommand(
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
+    if (subcommand === "inspect") {
+      const parsed = parseOptions(rest, new Set(["--session", "--integrated-revision"]));
+      if (!parsed.ok) return parsed;
+      if (dependencies.backend.sessionDiagnostic === undefined) return sessionDiagnosticCapabilityUnavailable();
+      const options: SessionDiagnosticOptions = {
+        session_id: parsed.value.session_id,
+        integrated_revision: parsed.value.integrated_revision,
+      };
+      const result = await dependencies.backend.sessionDiagnostic(context, options);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
     if (subcommand === "id" || subcommand === "show" || subcommand === "close") {
       if (subcommand === "id") {
         const parsed = noOptions(rest);
@@ -1277,6 +1307,14 @@ function checkpointCapabilityUnavailable(): DomainResult<JsonObject> {
   return failure(
     new DomainError("BACKEND_UNAVAILABLE", "Checkpoint evidence capability is not available.", {
       operation: "checkpoint",
+    }),
+  );
+}
+
+function sessionDiagnosticCapabilityUnavailable(): DomainResult<JsonObject> {
+  return failure(
+    new DomainError("BACKEND_UNAVAILABLE", "Session diagnostic capability is not available.", {
+      operation: "session.inspect",
     }),
   );
 }

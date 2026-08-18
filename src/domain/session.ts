@@ -91,6 +91,56 @@ export type IntegrationProof = {
   integrated_revision?: string;
 };
 
+export type SessionDiagnosticOptions = {
+  session_id: string | null;
+  /** Same non-ancestry integration evidence accepted by session close; independently re-verified, never trusted blindly. */
+  integrated_revision?: string | null;
+};
+
+/**
+ * Explicit close/cleanup readiness states. `external_evidence_required`
+ * marks the #123 non-ancestry-integration case rather than a generic
+ * permanent blocker. `not_due` only applies to cleanup readiness: the
+ * session is safely closable but has not yet met the GC staleness
+ * threshold.
+ */
+export type ReadinessState = "ready" | "not_due" | "blocked" | "external_evidence_required" | "ambiguous";
+
+/** How complete/certain a diagnostic snapshot is, independent of readiness. */
+export type DiagnosticCompleteness = "complete" | "ambiguous" | "stale" | "external_evidence_required";
+
+export type SessionDiagnosticBlocker = {
+  code: ErrorCode;
+  message: string;
+  details: JsonObject;
+  /** Stable, kebab-case next-action identifiers; reusable by orchestrators. */
+  safe_actions: string[];
+};
+
+export type SessionDiagnosticIntegrationEvidence = {
+  supplied: boolean;
+  integrated_revision?: string;
+  proof?: IntegrationProof;
+};
+
+export type SessionDiagnostic = {
+  schema_version: number;
+  session_id: string;
+  repository: string;
+  worktree: string;
+  branch: string;
+  session: SessionRecord;
+  claims: ResourceClaim[];
+  physical_state: string;
+  close_readiness: ReadinessState;
+  cleanup_readiness: ReadinessState;
+  result_state: DiagnosticCompleteness;
+  idempotent: boolean;
+  blockers: SessionDiagnosticBlocker[];
+  safe_actions: string[];
+  integration_evidence: SessionDiagnosticIntegrationEvidence;
+};
+
 export type GuardOptions = {
   session_id: string | null;
 };
@@ -412,6 +462,10 @@ export interface SessionBackend {
   listSessions(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<SessionListResult>>;
   status(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
+  sessionDiagnostic?(
+    context: SessionContext,
+    options: SessionDiagnosticOptions,
+  ): Promise<DomainResult<SessionDiagnostic>>;
   garbageCollect(context: SessionContext, options: GarbageCollectOptions): Promise<DomainResult<GarbageCollectResult>>;
   claimResources?(context: SessionContext, options: ClaimResourcesOptions): Promise<DomainResult<ClaimResourcesResult>>;
   updateClaims?(context: SessionContext, options: UpdateClaimsOptions): Promise<DomainResult<ClaimResourcesResult>>;
