@@ -340,7 +340,6 @@ export class LocalSessionBackend implements SessionBackend {
       const result = registry.close({
         sessionId,
         integratedRevision: options.integrated_revision ?? undefined,
-        integratedBase: options.integrated_base ?? undefined,
       });
       return Promise.resolve(
         success({
@@ -356,9 +355,6 @@ export class LocalSessionBackend implements SessionBackend {
                   ...(result.integrationProof.integratedRevision === undefined
                     ? {}
                     : { integrated_revision: result.integrationProof.integratedRevision }),
-                  ...(result.integrationProof.integratedBase === undefined
-                    ? {}
-                    : { integrated_base: result.integrationProof.integratedBase }),
                 },
               }),
         }),

@@ -80,16 +80,13 @@ export type ReleaseClaimsResult = {
 
 export type SessionCloseOptions = {
   session_id: string | null;
-  /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently verified; never trusted blindly. */
+  /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently re-verified by exact Git tree-object equivalence; never trusted blindly. */
   integrated_revision?: string | null;
-  /** Base of the integrated diff range; defaults to `${integrated_revision}^`. */
-  integrated_base?: string | null;
 };
 
 export type IntegrationProof = {
-  method: "ancestor" | "patch-id-equivalence";
+  method: "ancestor" | "tree-equivalence";
   integrated_revision?: string;
-  integrated_base?: string;
 };
 
 export type GuardOptions = {

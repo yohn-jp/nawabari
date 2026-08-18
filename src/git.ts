@@ -1055,53 +1055,104 @@ function canonicalDirectory(
   }
 }
 
+/** A Git tree entry's exact identity: file mode, object type, and content-addressed blob/tree SHA. */
+export interface GitTreeEntry {
+  readonly mode: string;
+  readonly type: string;
+  readonly sha: string;
+}
+
 /**
- * Compute the sorted, stable per-file `git patch-id` set for the content
- * change between two revisions. This is a deterministic, Git-native proof
- * of "these two diffs introduce the same net content change" that is
- * independent of commit ancestry, blob SHAs, and surrounding context —
- * the mechanism used to prove a squash/rebase-integrated branch is safe to
- * reclaim even though its original commit is not an ancestor of the
- * integration branch.
+ * Read the exact repository-root-relative paths that differ between two
+ * revisions (added, modified, deleted, or type-changed). Renames are
+ * reported as a delete plus an add so no path is ever collapsed away.
  */
-export function computeRangePatchIds(git: GitCommandRunner, cwd: string, from: string, to: string): readonly string[] {
-  let diffText: string;
+export function readChangedPathNames(git: GitCommandRunner, cwd: string, from: string, to: string): readonly string[] {
+  let output: string;
   try {
     const run = git.runRaw ?? git.run;
-    diffText = run(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames=100%", from, to], cwd);
+    output = run(
+      ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", from, to],
+      cwd,
+    );
   } catch (error: unknown) {
     if (error instanceof SessionRegistryError) throw error;
     throw new SessionRegistryError(
       "PHYSICAL_OBSERVATION_UNAVAILABLE",
-      "Could not observe the integration comparison diff",
+      "Could not observe the integration comparison changed paths",
       { cwd, from, to },
       error,
     );
   }
-  if (diffText.trim().length === 0) return Object.freeze([]);
+  const paths = output.split("\u0000").filter((entry) => entry.length > 0);
+  for (const resource of paths) {
+    if (resource.includes("\u0000")) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid changed path", { cwd });
+    }
+  }
+  return Object.freeze(paths);
+}
 
-  let patchIdOutput: string;
+/**
+ * Read the exact tree-level identity (mode, type, blob/tree SHA) of an
+ * explicit set of paths at one revision. A path absent from the returned
+ * map does not exist at that revision. Because blob SHAs are content
+ * hashes, this is a byte-exact comparison mechanism — content, file mode,
+ * and binary-ness are all captured, and no textual normalization (e.g.
+ * whitespace-only differences) can ever be mistaken for a match. Submodule
+ * gitlinks and other non-blob entries are captured by type+sha as well, so
+ * they cannot be misread as an absent path.
+ */
+export function readTreePathStates(
+  git: GitCommandRunner,
+  cwd: string,
+  revision: string,
+  paths: readonly string[],
+): ReadonlyMap<string, GitTreeEntry> {
+  const result = new Map<string, GitTreeEntry>();
+  if (paths.length === 0) return result;
+  let output: string;
   try {
-    patchIdOutput = String(
-      execFileSync("git", ["patch-id", "--stable"], {
-        input: diffText,
-        encoding: "utf8",
-        maxBuffer: GIT_COMMAND_MAX_OUTPUT_BYTES,
-        timeout: GIT_COMMAND_TIMEOUT_MS,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-      }),
+    const run = git.runRaw ?? git.run;
+    output = run(
+      ["ls-tree", "-r", "-z", "--full-tree", revision, "--", ...paths.map((resource) => `:(literal)${resource}`)],
+      cwd,
     );
   } catch (error: unknown) {
-    throw gitProcessError(error, "patch-id --stable", cwd);
+    if (error instanceof SessionRegistryError) throw error;
+    throw new SessionRegistryError(
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      "Could not observe the integration comparison tree state",
+      { cwd, revision },
+      error,
+    );
   }
+  const records = output.split("\u0000").filter((record) => record.length > 0);
+  for (const record of records) {
+    const tab = record.indexOf("\t");
+    if (tab <= 0) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid ls-tree record", {
+        cwd,
+        revision,
+      });
+    }
+    const meta = record.slice(0, tab).split(" ");
+    const path = record.slice(tab + 1);
+    if (meta.length < 3 || meta[0].length === 0 || meta[1].length === 0 || meta[2].length === 0) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid ls-tree metadata record", {
+        cwd,
+        revision,
+      });
+    }
+    result.set(path, Object.freeze({ mode: meta[0], type: meta[1], sha: meta[2] }));
+  }
+  return result;
+}
 
-  const ids = patchIdOutput
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => line.split(/\s+/u)[0])
-    .filter((id): id is string => id !== undefined && /^[0-9a-f]{40,64}$/u.test(id));
-  return Object.freeze([...ids].sort());
+/** Exact tree-entry equality: both absent, or identical mode, type, and blob/tree SHA. */
+export function treeEntriesEqual(a: GitTreeEntry | undefined, b: GitTreeEntry | undefined): boolean {
+  if (a === undefined || b === undefined) return a === undefined && b === undefined;
+  return a.mode === b.mode && a.type === b.type && a.sha === b.sha;
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

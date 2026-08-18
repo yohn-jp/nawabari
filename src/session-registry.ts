@@ -4,16 +4,18 @@ import path from "node:path";
 import {
   defaultGit,
   captureGitCheckpoint,
-  computeRangePatchIds,
   listGitWorktrees,
   normalizeBranchId,
   observeGitCheckpoint,
   observeGitMutationPaths,
   readBoundedGitDiff,
   readCanonicalCommitChangedPaths,
+  readChangedPathNames,
   readGitPathStats,
   readCurrentHead,
+  readTreePathStates,
   resolveRepositoryContext,
+  treeEntriesEqual,
   verifyPhysicalExecutionContext,
   type GitCommandRunner,
   type GitWorktreeInfo,
@@ -147,12 +149,9 @@ export interface CloseSessionResult {
 export interface CloseSessionOptions {
   readonly sessionId?: string | null;
   readonly session_id?: string | null;
-  /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently verified; never trusted blindly. */
+  /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently re-verified by exact Git tree-object equivalence; never trusted blindly. */
   readonly integratedRevision?: string | null;
   readonly integrated_revision?: string | null;
-  /** Base of the integrated diff range; defaults to `${integratedRevision}^`. */
-  readonly integratedBase?: string | null;
-  readonly integrated_base?: string | null;
 }
 
 function isCloseSessionOptions(value: unknown): value is CloseSessionOptions {
@@ -162,14 +161,12 @@ function isCloseSessionOptions(value: unknown): value is CloseSessionOptions {
 /** Caller-supplied non-ancestry integration evidence, already normalized to camelCase. */
 export interface IntegrationEvidenceInput {
   readonly integratedRevision: string;
-  readonly integratedBase?: string;
 }
 
 /** Deterministic Git-native evidence proving a branch is safely reclaimable. */
 export interface IntegrationProof {
-  readonly method: "ancestor" | "patch-id-equivalence";
+  readonly method: "ancestor" | "tree-equivalence";
   readonly integratedRevision?: string;
-  readonly integratedBase?: string;
 }
 
 export interface GarbageCollectOptions {
@@ -1800,16 +1797,8 @@ export class SessionRegistry {
       const integratedRevision = isCloseSessionOptions(sessionIdOrOptions)
         ? (sessionIdOrOptions.integratedRevision ?? sessionIdOrOptions.integrated_revision ?? null)
         : null;
-      const integratedBase = isCloseSessionOptions(sessionIdOrOptions)
-        ? (sessionIdOrOptions.integratedBase ?? sessionIdOrOptions.integrated_base ?? null)
-        : null;
       const evidence: IntegrationEvidenceInput | undefined =
-        integratedRevision === null || integratedRevision === undefined
-          ? undefined
-          : {
-              integratedRevision,
-              ...(integratedBase === null || integratedBase === undefined ? {} : { integratedBase }),
-            };
+        integratedRevision === null || integratedRevision === undefined ? undefined : { integratedRevision };
       return this.closeUnsafe(selectedSessionId, evidence);
     });
   }
@@ -2109,9 +2098,9 @@ export class SessionRegistry {
       assertSameCleanupObservation(branchResources, branchRevalidated, "branch-remove");
       if (branchRevalidated.branchPresent && branchRevalidated.removeBranch) {
         // Git's own "-d" safety check is ancestry-only and cannot see a
-        // patch-id equivalence proof. Force deletion is only ever selected
-        // after Nawabari has independently re-derived that proof itself.
-        const forceDelete = branchRevalidated.integrationProof?.method === "patch-id-equivalence";
+        // tree-equivalence proof. Force deletion is only ever selected after
+        // Nawabari has independently re-derived that proof itself.
+        const forceDelete = branchRevalidated.integrationProof?.method === "tree-equivalence";
         removeSessionBranch(this.git, branchRevalidated.gitCwd, record.branchName, forceDelete);
         branchRemoved = true;
         integrationProof = branchRevalidated.integrationProof;
@@ -2346,8 +2335,8 @@ export class SessionRegistry {
    * cheap/default path. When ancestry fails, a caller may supply bounded
    * non-ancestry integration evidence (e.g. a squash/rebase-merge commit);
    * Nawabari never trusts that assertion blindly and instead independently
-   * re-derives a deterministic Git-native equivalence proof (patch-id) before
-   * treating the branch as safely integrated.
+   * re-derives a deterministic, byte-exact Git tree-object equivalence proof
+   * before treating the branch as safely integrated.
    */
   private branchIsReachableFromIntegration(
     record: SessionRecord,
@@ -2379,7 +2368,7 @@ export class SessionRegistry {
           {
             branch: record.branchName,
             integrationBranch: defaultBranchName,
-            proofMethod: "patch-id-equivalence",
+            proofMethod: "tree-equivalence",
             proofResult: "unproven",
             integratedRevision: evidence.integratedRevision,
             recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
@@ -2404,9 +2393,15 @@ export class SessionRegistry {
 
   /**
    * Independently verify caller-supplied non-ancestry integration evidence.
-   * The caller's assertion only selects which revisions to compare; the
-   * proof itself is re-derived from local Git truth (patch-id equivalence
-   * between the branch's own diff and the integrated commit's diff).
+   * The caller's assertion only selects which revision to compare; the
+   * proof itself is re-derived from local Git truth. For every path the
+   * session branch touched relative to its own base, the exact tree-object
+   * identity (file mode, object type, and content-addressed blob/tree SHA)
+   * at the branch head must match the same path's identity at the supplied
+   * integrated revision — both absent, or byte-identical. Blob SHAs are
+   * content hashes, so this can never mistake a whitespace-only or other
+   * textual difference for equivalence the way a patch/diff comparison
+   * could; it is exact Git tree semantics, not textual normalization.
    * Returns undefined, never false, so a missing proof always falls through
    * to a fail-closed RECOVERABLE_COMMITS at the call site.
    */
@@ -2418,8 +2413,6 @@ export class SessionRegistry {
   ): IntegrationProof | undefined {
     const git = this.git;
     const integratedRevision = resolveBaseRef(git, gitCwd, evidence.integratedRevision).revision;
-    const integratedBase = resolveBaseRef(git, gitCwd, evidence.integratedBase ?? `${evidence.integratedRevision}^`)
-      .revision;
 
     let branchBase: string;
     try {
@@ -2429,15 +2422,16 @@ export class SessionRegistry {
       throw error;
     }
 
-    const branchPatchIds = computeRangePatchIds(git, gitCwd, branchBase, record.branchId);
-    const integratedPatchIds = computeRangePatchIds(git, gitCwd, integratedBase, integratedRevision);
+    const changedPaths = readChangedPathNames(git, gitCwd, branchBase, record.branchId);
+    if (changedPaths.length === 0) return undefined;
 
-    const proven =
-      branchPatchIds.length > 0 &&
-      branchPatchIds.length === integratedPatchIds.length &&
-      branchPatchIds.every((id, index) => id === integratedPatchIds[index]);
+    const branchStates = readTreePathStates(git, gitCwd, record.branchId, changedPaths);
+    const integratedStates = readTreePathStates(git, gitCwd, integratedRevision, changedPaths);
+    const proven = changedPaths.every((changedPath) =>
+      treeEntriesEqual(branchStates.get(changedPath), integratedStates.get(changedPath)),
+    );
 
-    return proven ? { method: "patch-id-equivalence", integratedRevision, integratedBase } : undefined;
+    return proven ? { method: "tree-equivalence", integratedRevision } : undefined;
   }
 
   private resolveProvisioningResources(options: ProvisionSessionOptions, sessionId: string): ProvisioningResources {

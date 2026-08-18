@@ -212,17 +212,14 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "session close",
     summary: "Close the current or selected session",
-    usage: `${CLI_NAME} session close [--session <id>] [--integrated-revision <rev> [--integrated-base <rev>]]`,
+    usage: `${CLI_NAME} session close [--session <id>] [--integrated-revision <rev>]`,
     options: [
       option("--session", "Select a session instead of the current worktree owner", { value: "<id>" }),
       option(
         "--integrated-revision",
-        "Externally evidenced revision proving non-ancestry (squash/rebase) integration; independently verified via patch-id equivalence, never trusted blindly",
+        "Externally evidenced revision proving non-ancestry (squash/rebase) integration; independently re-verified via exact Git tree-object equivalence, never trusted blindly",
         { value: "<rev>" },
       ),
-      option("--integrated-base", "Base of the integrated diff range; defaults to <integrated-revision>^", {
-        value: "<rev>",
-      }),
     ],
     notes: [
       "Ordinary ancestry-based close remains the cheap/default path and requires no flags.",
@@ -503,7 +500,6 @@ type ParsedOptions = {
   max_bytes: string | null;
   max_hunks: string | null;
   integrated_revision: string | null;
-  integrated_base: string | null;
 };
 
 function usageError(
@@ -588,7 +584,6 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     max_bytes: null,
     max_hunks: null,
     integrated_revision: null,
-    integrated_base: null,
   };
   let dryRun = false;
 
@@ -650,7 +645,6 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--max-bytes") options.max_bytes = value;
     else if (name === "--max-hunks") options.max_hunks = value;
     else if (name === "--integrated-revision") options.integrated_revision = value;
-    else if (name === "--integrated-base") options.integrated_base = value;
   }
 
   if (options.apply && dryRun) {
@@ -933,16 +927,13 @@ async function executeCommand(
 
       const parsed = parseOptions(
         rest,
-        new Set(
-          subcommand === "close" ? ["--session", "--integrated-revision", "--integrated-base"] : ["--session"],
-        ),
+        new Set(subcommand === "close" ? ["--session", "--integrated-revision"] : ["--session"]),
       );
       if (!parsed.ok) return parsed;
       if (subcommand === "close") {
         const closeOptions: SessionCloseOptions = {
           session_id: parsed.value.session_id,
           integrated_revision: parsed.value.integrated_revision,
-          integrated_base: parsed.value.integrated_base,
         };
         const selected = await dependencies.backend.closeSession(context, closeOptions);
         return selected.ok ? { ok: true, value: selected.value } : selected;
