@@ -696,7 +696,6 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
             },
           }),
     },
-    generated_at: diagnostic.generatedAt,
   };
 }
 

@@ -377,7 +377,6 @@ test("session inspect forwards --session and --integrated-revision to the diagno
     blockers: [],
     safe_actions: ["close-session"],
     integration_evidence: { supplied: false },
-    generated_at: "2026-08-10T00:00:00.000Z",
   };
   const backend = backendForTests({
     sessionDiagnostic: async (_context: SessionContext, options: SessionDiagnosticOptions) => {

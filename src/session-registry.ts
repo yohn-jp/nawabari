@@ -254,7 +254,6 @@ export interface SessionDiagnostic {
   readonly blockers: readonly SessionDiagnosticBlocker[];
   readonly safeActions: readonly string[];
   readonly integrationEvidence: SessionDiagnosticIntegrationEvidence;
-  readonly generatedAt: string;
 }
 
 export type ReconciliationSessionStatus = "healthy" | "candidate" | "drift" | "closed";
@@ -2304,7 +2303,10 @@ export class SessionRegistry {
     evidence?: IntegrationEvidenceInput,
   ): SessionDiagnostic {
     const claims = state.claims.filter((claim) => claim.sessionId === record.sessionId).map(cloneResourceClaim);
-    const generatedAt = toTimestamp(this.clock());
+    // Used only to evaluate staleness below; deliberately not part of the
+    // returned diagnostic so repeated inspection of unchanged state is
+    // byte-identical, not just semantically equivalent.
+    const now = toTimestamp(this.clock());
     const integrationEvidence: SessionDiagnosticIntegrationEvidence = {
       supplied: evidence !== undefined,
       ...(evidence === undefined ? {} : { integratedRevision: evidence.integratedRevision }),
@@ -2327,7 +2329,6 @@ export class SessionRegistry {
         blockers: Object.freeze([]),
         safeActions: Object.freeze([]),
         integrationEvidence: Object.freeze(integrationEvidence),
-        generatedAt,
       });
     }
 
@@ -2338,7 +2339,7 @@ export class SessionRegistry {
     try {
       const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
       physicalState = inspectWorktreeState(record.worktreePath, worktrees).kind;
-      staleCandidate = isStaleCandidate(record, generatedAt, this.staleAfterMs, worktrees);
+      staleCandidate = isStaleCandidate(record, now, this.staleAfterMs, worktrees);
       const resources = this.inspectCleanupResources(record, worktrees, evidence);
       integrationProof = resources.integrationProof;
     } catch (error: unknown) {
@@ -2377,7 +2378,6 @@ export class SessionRegistry {
         ...integrationEvidence,
         ...(integrationProof === undefined ? {} : { proof: integrationProof }),
       }),
-      generatedAt,
     });
   }
 

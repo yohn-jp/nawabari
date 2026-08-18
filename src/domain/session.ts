@@ -139,7 +139,6 @@ export type SessionDiagnostic = {
   blockers: SessionDiagnosticBlocker[];
   safe_actions: string[];
   integration_evidence: SessionDiagnosticIntegrationEvidence;
-  generated_at: string;
 };
 
 export type GuardOptions = {

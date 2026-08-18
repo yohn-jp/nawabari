@@ -26,12 +26,12 @@ test("diagnose reports ready close readiness and not-due cleanup readiness for a
     assert.equal(diagnostic.session.sessionId, session.sessionId);
     assert.equal(diagnostic.integrationEvidence.supplied, false);
 
-    // Purely observational: repeated inspection changes nothing.
+    // Purely observational: repeated inspection of unchanged state returns
+    // the exact same payload (no observation-time field to drift on).
     assert.equal(registry.get(session.sessionId)?.state, "active");
     assert.equal(fs.existsSync(fixture.worktree), true);
     const repeated = registry.diagnose(session.sessionId);
-    assert.equal(repeated.closeReadiness, "ready");
-    assert.equal(repeated.cleanupReadiness, "not_due");
+    assert.deepEqual(repeated, diagnostic);
 
     // Parity: the actual close authority reaches the same conclusion.
     const closed = registry.close(session.sessionId);
@@ -253,7 +253,7 @@ test("diagnose on an already-closed session is idempotent and reports ready with
     assert.deepEqual(diagnostic.blockers, []);
 
     const repeated = registry.diagnose(session.sessionId);
-    assert.deepEqual({ ...repeated, generatedAt: null }, { ...diagnostic, generatedAt: null });
+    assert.deepEqual(repeated, diagnostic);
   } finally {
     fixture.cleanup();
   }
