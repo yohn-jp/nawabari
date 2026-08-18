@@ -222,10 +222,7 @@ test("provision places the worktree under a caller-selected root while Nawabari 
     assert.equal(path.dirname(first.worktreePath), fs.realpathSync.native(customRoot));
     assert.equal(path.dirname(second.worktreePath), fs.realpathSync.native(customRoot));
     assert.notEqual(first.worktreePath, second.worktreePath);
-    assert.equal(
-      path.basename(first.worktreePath),
-      `${path.basename(fixture.repositoryPath)}-${first.sessionId}`,
-    );
+    assert.equal(path.basename(first.worktreePath), `${path.basename(fixture.repositoryPath)}-${first.sessionId}`);
   } finally {
     runGitQuiet(["worktree", "prune"], fixture.repositoryPath);
     fs.rmSync(customRoot, { recursive: true, force: true });

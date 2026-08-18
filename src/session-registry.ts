@@ -2332,8 +2332,7 @@ export class SessionRegistry {
           ? resolveManagedWorktreeRoot(options.worktreeRoot)
           : this.worktreeRoot;
     const requestedWorktreePath = resolveProvisionedWorktreePath(
-      options.worktreePath ??
-        path.join(effectiveRoot, `${path.basename(this.repository.worktreePath)}-${sessionId}`),
+      options.worktreePath ?? path.join(effectiveRoot, `${path.basename(this.repository.worktreePath)}-${sessionId}`),
       effectiveRoot,
     );
     const defaultWorktreePath =

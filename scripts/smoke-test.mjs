@@ -430,10 +430,134 @@ async function main() {
       createHelp.ok !== true ||
       createHelp.help_for !== "session create" ||
       createHelp.required_options?.length !== 0 ||
-      createHelp.optional_options?.join(",") !== "--branch,--worktree,--base,--label" ||
+      createHelp.optional_options?.join(",") !== "--branch,--worktree,--worktree-root,--base,--label" ||
       createHelp.defaults?.["--base"] !== "HEAD"
     ) {
       fail("installed session create help did not expose the optional/defaulted contract");
+    }
+
+    console.log("verifying default-root, caller-selected --worktree-root, exact --worktree placement...");
+
+    const statusBeforeRootChecks = parseInstalledJson(
+      invokeInstalled(["status", "--json"], lifecycleRepository),
+      "status before worktree-root checks",
+    );
+    const managedRoot = statusBeforeRootChecks.managed_worktree_root;
+    if (typeof managedRoot !== "string" || managedRoot.length === 0) {
+      fail("status did not expose managed_worktree_root before worktree-root checks");
+    }
+
+    const defaultRootCreated = parseInstalledJson(
+      invokeInstalled(["session", "create", "--branch", "feature/default-root-smoke", "--json"], lifecycleRepository),
+      "default-root session create",
+    );
+    if (
+      defaultRootCreated.ok !== true ||
+      defaultRootCreated.worktree_root !== managedRoot ||
+      path.dirname(defaultRootCreated.worktree) !== managedRoot
+    ) {
+      fail("session create with no override did not place the worktree under managed_worktree_root");
+    }
+    const defaultRootClose = invokeInstalled(
+      ["session", "close", "--session", defaultRootCreated.session_id, "--json"],
+      lifecycleRepository,
+    );
+    const defaultRootCloseJson = parseInstalledJson(defaultRootClose, "default-root session close");
+    if (
+      defaultRootClose.status !== 0 ||
+      defaultRootCloseJson.ok !== true ||
+      defaultRootCloseJson.worktree_removed !== true ||
+      fs.existsSync(defaultRootCreated.worktree)
+    ) {
+      fail("default-root session close did not remove its worktree");
+    }
+
+    const customWorktreeRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(installDirectory, "custom-root-")));
+    const customRootCreated = parseInstalledJson(
+      invokeInstalled(
+        ["session", "create", "--branch", "feature/custom-root-smoke", "--worktree-root", customWorktreeRoot, "--json"],
+        lifecycleRepository,
+      ),
+      "custom-root session create",
+    );
+    if (
+      customRootCreated.ok !== true ||
+      customRootCreated.worktree_root !== customWorktreeRoot ||
+      path.dirname(customRootCreated.worktree) !== customWorktreeRoot ||
+      customRootCreated.worktree === customWorktreeRoot ||
+      !fs.existsSync(customRootCreated.worktree)
+    ) {
+      fail("session create --worktree-root did not place a Nawabari-derived worktree beneath the caller-selected root");
+    }
+
+    const exactWorktreeOverride = path.join(installDirectory, "exact-worktree-smoke");
+    const exactCreated = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "create",
+          "--branch",
+          "feature/exact-worktree-smoke",
+          "--worktree",
+          exactWorktreeOverride,
+          "--json",
+        ],
+        lifecycleRepository,
+      ),
+      "exact --worktree session create",
+    );
+    if (exactCreated.ok !== true || exactCreated.worktree !== fs.realpathSync.native(exactWorktreeOverride)) {
+      fail("session create --worktree did not honor the exact-path override");
+    }
+
+    const conflictWorktree = path.join(installDirectory, "conflict-worktree");
+    const conflictAttemptResult = invokeInstalled(
+      [
+        "session",
+        "create",
+        "--branch",
+        "feature/conflict-smoke",
+        "--worktree",
+        conflictWorktree,
+        "--worktree-root",
+        customWorktreeRoot,
+        "--json",
+      ],
+      lifecycleRepository,
+    );
+    const conflictAttempt = parseInstalledJson(conflictAttemptResult, "--worktree/--worktree-root conflict");
+    if (
+      conflictAttemptResult.status !== 2 ||
+      conflictAttempt.ok !== false ||
+      conflictAttempt.code !== "INVALID_ARGUMENT"
+    ) {
+      fail("session create did not reject --worktree combined with --worktree-root before mutation");
+    }
+    if (fs.existsSync(conflictWorktree)) {
+      fail("--worktree/--worktree-root conflict mutated the filesystem before being rejected");
+    }
+
+    const customRootClose = invokeInstalled(
+      ["session", "close", "--session", customRootCreated.session_id, "--json"],
+      lifecycleRepository,
+    );
+    const customRootCloseJson = parseInstalledJson(customRootClose, "custom-root session close");
+    if (
+      customRootClose.status !== 0 ||
+      customRootCloseJson.ok !== true ||
+      customRootCloseJson.worktree_removed !== true ||
+      fs.existsSync(customRootCreated.worktree)
+    ) {
+      fail("custom-root session close did not remove the worktree beneath the caller-selected root");
+    }
+
+    const exactClose = invokeInstalled(
+      ["session", "close", "--session", exactCreated.session_id, "--json"],
+      lifecycleRepository,
+    );
+    const exactCloseJson = parseInstalledJson(exactClose, "exact --worktree session close");
+    if (exactClose.status !== 0 || exactCloseJson.ok !== true || exactCloseJson.worktree_removed !== true) {
+      fail("exact --worktree session close did not remove its worktree");
     }
 
     const invalidBase = parseInstalledJson(
@@ -1091,8 +1215,8 @@ async function main() {
       boundedList.status !== 0 ||
       boundedStatusJson.sessions?.length !== 0 ||
       boundedListJson.sessions?.length !== 0 ||
-      boundedStatusJson.closed_count !== 512 + 8 ||
-      boundedListJson.closed_count !== 512 + 8 ||
+      boundedStatusJson.closed_count !== 512 + 11 ||
+      boundedListJson.closed_count !== 512 + 11 ||
       boundedStatusJson.history_available !== true ||
       boundedListJson.history_available !== true ||
       boundedStatus.stdout.length > 4_000 ||
