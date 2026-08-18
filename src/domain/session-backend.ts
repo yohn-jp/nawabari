@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
   SessionRegistry,
   type GarbageCollectResult as RegistryGarbageCollectResult,
@@ -155,6 +156,7 @@ export class LocalSessionBackend implements SessionBackend {
       const record = registry.provision({
         branchName: options.branch ?? undefined,
         worktreePath: options.worktree ?? undefined,
+        worktreeRoot: options.worktree_root ?? undefined,
         label: options.label ?? undefined,
         baseRef: options.base ?? undefined,
       });
@@ -441,6 +443,7 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
     session_id: record.sessionId,
     repository: record.repositoryId,
     worktree: record.worktreePath,
+    worktree_root: path.dirname(record.worktreePath),
     branch: record.branchName,
     state: record.state,
     created_at: record.createdAt,

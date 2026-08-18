@@ -69,14 +69,22 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
         value: "<name>",
         default: "nawabari/session/<session_id>",
       }),
-      option("--worktree", "Managed worktree path; omitted uses the resolved repository-local root", {
+      option("--worktree", "Exact managed worktree path override; mutually exclusive with --worktree-root", {
         value: "<path>",
         default: "<managed_worktree_root>/<repository>-<session_id>",
       }),
+      option(
+        "--worktree-root",
+        "Managed root to place the worktree under; Nawabari derives the final path. Mutually exclusive with --worktree",
+        { value: "<path>", default: "resolved repository-local root" },
+      ),
       option("--base", "Commit-resolving base ref for the new worktree", { value: "<ref>", default: "HEAD" }),
       option("--label", "Optional display label; never used as an identity", { value: "<text>", default: "omitted" }),
     ],
-    notes: ["All create options are optional. Use status --json to discover managed_worktree_root."],
+    notes: [
+      "All create options are optional. Use status --json to discover managed_worktree_root.",
+      "--worktree and --worktree-root cannot be combined.",
+    ],
   },
   {
     name: "session id",
@@ -463,6 +471,7 @@ type ParsedOptions = {
   session_id: string | null;
   branch: string | null;
   worktree: string | null;
+  worktree_root: string | null;
   base: string | null;
   label: string | null;
   resource: string | null;
@@ -546,6 +555,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     session_id: null,
     branch: null,
     worktree: null,
+    worktree_root: null,
     base: null,
     label: null,
     resource: null,
@@ -611,6 +621,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     if (name === "--session") options.session_id = value;
     else if (name === "--branch") options.branch = value;
     else if (name === "--worktree") options.worktree = value;
+    else if (name === "--worktree-root") options.worktree_root = value;
     else if (name === "--base") options.base = value;
     else if (name === "--label") options.label = value;
     else if (name === "--resource") {
@@ -865,11 +876,15 @@ async function executeCommand(
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "create") {
-      const parsed = parseOptions(rest, new Set(["--branch", "--worktree", "--base", "--label"]));
+      const parsed = parseOptions(rest, new Set(["--branch", "--worktree", "--worktree-root", "--base", "--label"]));
       if (!parsed.ok) return parsed;
+      if (parsed.value.worktree !== null && parsed.value.worktree_root !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--worktree and --worktree-root cannot be used together."));
+      }
       const options: SessionCreateOptions = {
         branch: parsed.value.branch,
         worktree: parsed.value.worktree,
+        worktree_root: parsed.value.worktree_root,
         base: parsed.value.base,
         label: parsed.value.label,
       };

@@ -9,6 +9,7 @@ export type SessionRecord = {
   session_id: string;
   repository: string;
   worktree: string;
+  worktree_root?: string;
   branch: string;
   state: SessionState;
   created_at: string;
@@ -24,6 +25,7 @@ export type SessionContext = {
 export type SessionCreateOptions = {
   branch: string | null;
   worktree: string | null;
+  worktree_root?: string | null;
   label: string | null;
   base?: string | null;
 };

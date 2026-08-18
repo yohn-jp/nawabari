@@ -174,10 +174,11 @@ test("command-specific help is projected from one spec and marks session create 
   assert.equal(response.command, "help");
   assert.equal(response.help_for, "session create");
   assert.deepEqual(response.required_options, []);
-  assert.deepEqual(response.optional_options, ["--branch", "--worktree", "--base", "--label"]);
+  assert.deepEqual(response.optional_options, ["--branch", "--worktree", "--worktree-root", "--base", "--label"]);
   assert.deepEqual(response.defaults, {
     "--branch": "nawabari/session/<session_id>",
     "--worktree": "<managed_worktree_root>/<repository>-<session_id>",
+    "--worktree-root": "resolved repository-local root",
     "--base": "HEAD",
     "--label": "omitted",
   });
@@ -252,6 +253,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
     session_options: [
       "--branch",
       "--worktree",
+      "--worktree-root",
       "--base",
       "--label",
       "--session",
@@ -457,6 +459,51 @@ test("human session create, show, and close output avoids inline structured JSON
     assert.doesNotMatch(text, /\{"schema_version"/u);
     assert.doesNotMatch(text, /\[object Object\]/u);
   }
+});
+
+test("session create rejects --worktree combined with --worktree-root before touching the backend", async () => {
+  let backendCalled = false;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, _options: SessionCreateOptions) => {
+      backendCalled = true;
+      return success(sampleSession);
+    },
+  });
+
+  const output = capture();
+  const exitCode = await runCli(
+    ["--json", "session", "create", "--worktree", "/tmp/exact", "--worktree-root", "/tmp/root"],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 2);
+  const response = JSON.parse(output.stdout[0]) as { code: string };
+  assert.equal(response.code, "INVALID_ARGUMENT");
+  assert.equal(backendCalled, false);
+});
+
+test("session create forwards --worktree-root to the backend as the caller-selected root", async () => {
+  let observedOptions: SessionCreateOptions | null = null;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, options: SessionCreateOptions) => {
+      observedOptions = options;
+      return success(sampleSession);
+    },
+  });
+
+  const exitCode = await runCli(["--json", "session", "create", "--worktree-root", "/managed/root"], {
+    backend,
+    io: capture().io,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(observedOptions, {
+    branch: null,
+    worktree: null,
+    worktree_root: "/managed/root",
+    base: null,
+    label: null,
+  });
 });
 
 function sampleClaim(resource: string, mode: "read" | "write" | "exclusive-write"): ResourceClaim {
