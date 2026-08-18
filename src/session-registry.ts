@@ -127,6 +127,7 @@ export interface CreateSessionOptions {
 
 export interface ProvisionSessionOptions {
   readonly worktreePath?: string;
+  readonly worktreeRoot?: string;
   readonly branchName?: string;
   readonly baseRef?: string;
   readonly label?: string;
@@ -2324,10 +2325,16 @@ export class SessionRegistry {
   private resolveProvisioningResources(options: ProvisionSessionOptions, sessionId: string): ProvisioningResources {
     const git = this.git;
     const worktrees = listGitWorktrees(git, this.repository.worktreePath);
+    const effectiveRoot =
+      options.worktreePath !== undefined
+        ? this.worktreeRoot
+        : options.worktreeRoot !== undefined
+          ? resolveManagedWorktreeRoot(options.worktreeRoot)
+          : this.worktreeRoot;
     const requestedWorktreePath = resolveProvisionedWorktreePath(
       options.worktreePath ??
-        path.join(this.worktreeRoot, `${path.basename(this.repository.worktreePath)}-${sessionId}`),
-      this.worktreeRoot,
+        path.join(effectiveRoot, `${path.basename(this.repository.worktreePath)}-${sessionId}`),
+      effectiveRoot,
     );
     const defaultWorktreePath =
       worktrees.find((worktree) => !worktree.prunable)?.worktreePath ?? this.repository.worktreePath;

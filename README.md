@@ -171,9 +171,15 @@ git nawabari doctor --json
 ```
 
 `status --json` reports the resolved `managed_worktree_root` used when
-`session create` omits `--worktree`. `session create --help --json` describes
-all four create options as optional and reports defaults for branch, worktree,
-base (`HEAD`), and label.
+`session create` omits `--worktree` and `--worktree-root`. `session create
+--help --json` describes all create options as optional and reports defaults
+for branch, worktree, worktree root, base (`HEAD`), and label.
+
+`--worktree-root` selects only the parent directory for a new session
+worktree; Nawabari still derives the final worktree basename from its own
+session-naming contract. It is mutually exclusive with `--worktree`, the
+exact-path override. Every session record's `worktree_root` field reports
+the resolved parent of that session's worktree.
 
 `session create` provisions a dedicated worktree and mutable branch atomically
 under the repository-scoped mutation lock. The default/integration worktree

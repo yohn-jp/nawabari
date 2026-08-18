@@ -210,6 +210,58 @@ test("provision rejects managed-root traversal and intermediate symlink escapes"
   }
 });
 
+test("provision places the worktree under a caller-selected root while Nawabari derives the basename", () => {
+  const fixture = createRepositoryFixture();
+  const customRoot = path.join(path.dirname(fixture.repositoryPath), "nawabari-custom-root");
+  try {
+    fs.mkdirSync(customRoot);
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const first = registry.provision({ worktreeRoot: customRoot, branchName: "feature/custom-root-one" });
+    const second = registry.provision({ worktreeRoot: customRoot, branchName: "feature/custom-root-two" });
+
+    assert.equal(path.dirname(first.worktreePath), fs.realpathSync.native(customRoot));
+    assert.equal(path.dirname(second.worktreePath), fs.realpathSync.native(customRoot));
+    assert.notEqual(first.worktreePath, second.worktreePath);
+    assert.equal(
+      path.basename(first.worktreePath),
+      `${path.basename(fixture.repositoryPath)}-${first.sessionId}`,
+    );
+  } finally {
+    runGitQuiet(["worktree", "prune"], fixture.repositoryPath);
+    fs.rmSync(customRoot, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("provision rejects a caller-selected root that is missing, not a directory, or a symlink", () => {
+  const fixture = createRepositoryFixture();
+  const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+  const missingRoot = path.join(path.dirname(fixture.repositoryPath), "nawabari-missing-root");
+  const fileRoot = path.join(path.dirname(fixture.repositoryPath), "nawabari-file-root");
+  const linkedRoot = path.join(path.dirname(fixture.repositoryPath), "nawabari-linked-root");
+  try {
+    fs.writeFileSync(fileRoot, "not a directory");
+    fs.symlinkSync(path.dirname(fixture.repositoryPath), linkedRoot, "dir");
+
+    assertRegistryError(
+      () => registry.provision({ worktreeRoot: missingRoot, branchName: "feature/missing-root" }),
+      "INVALID_WORKTREE_PATH",
+    );
+    assertRegistryError(
+      () => registry.provision({ worktreeRoot: fileRoot, branchName: "feature/file-root" }),
+      "INVALID_WORKTREE_PATH",
+    );
+    assertRegistryError(
+      () => registry.provision({ worktreeRoot: linkedRoot, branchName: "feature/linked-root" }),
+      "INVALID_WORKTREE_PATH",
+    );
+  } finally {
+    fs.unlinkSync(fileRoot);
+    fs.unlinkSync(linkedRoot);
+    fixture.cleanup();
+  }
+});
+
 test("a Git provisioning failure leaves no active registry ownership or worktree", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-failure");
