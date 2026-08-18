@@ -82,6 +82,13 @@ export type ReleaseClaimsResult = {
 
 export type SessionCloseOptions = {
   session_id: string | null;
+  /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently re-verified by exact Git tree-object equivalence; never trusted blindly. */
+  integrated_revision?: string | null;
+};
+
+export type IntegrationProof = {
+  method: "ancestor" | "tree-equivalence";
+  integrated_revision?: string;
 };
 
 export type GuardOptions = {
@@ -364,6 +371,7 @@ export type SessionCloseResult = {
   worktree_removed: boolean;
   branch_removed: boolean;
   idempotent?: boolean;
+  integration_proof?: IntegrationProof;
 };
 
 export type GarbageCollectBlocked = {

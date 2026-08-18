@@ -327,6 +327,140 @@ test("close succeeds when multiple prunable worktree entries exist alongside the
   }
 });
 
+test("close proves a squash-merged session branch integrated via exact tree equivalence and safely closes", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-squash-merge`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feat/squash-merge" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "squash content\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "add feature"], worktreePath);
+
+    // Ordinary ancestry-based close remains blocked: the original session
+    // commit is not, and never will be, an ancestor of main after a squash.
+    assertRegistryError(() => registry.close(session.sessionId), "RECOVERABLE_COMMITS");
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+
+    // Simulate the squash-merge landing on main: same net content, unrelated commit SHA.
+    fs.writeFileSync(path.join(fixture.repositoryPath, "feature.txt"), "squash content\n");
+    runGit(["add", "feature.txt"], fixture.repositoryPath);
+    runGit(["commit", "-m", "squash-merge feat/squash-merge (#1)"], fixture.repositoryPath);
+    const integratedRevision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+
+    const result = registry.close({ sessionId: session.sessionId, integratedRevision });
+    assert.equal(result.session.state, "closed");
+    assert.equal(result.worktreeRemoved, true);
+    assert.equal(result.branchRemoved, true);
+    assert.equal(result.idempotent, false);
+    assert.equal(result.integrationProof?.method, "tree-equivalence");
+    assert.equal(result.integrationProof?.integratedRevision, integratedRevision);
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+
+    const repeated = registry.close({ sessionId: session.sessionId, integratedRevision });
+    assert.equal(repeated.idempotent, true);
+    assert.equal(repeated.session.state, "closed");
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("close does not trust caller-asserted integration evidence that fails to prove equivalence", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-unproven-evidence`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feat/unproven-evidence" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "recoverable session work\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "add feature"], worktreePath);
+
+    // A revision on main that shares no content with the session branch's diff.
+    fs.writeFileSync(path.join(fixture.repositoryPath, "unrelated.txt"), "unrelated change\n");
+    runGit(["add", "unrelated.txt"], fixture.repositoryPath);
+    runGit(["commit", "-m", "unrelated change"], fixture.repositoryPath);
+    const integratedRevision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+
+    assert.throws(
+      () => registry.close({ sessionId: session.sessionId, integratedRevision }),
+      (error: unknown) => {
+        if (!(error instanceof SessionRegistryError) || error.code !== "RECOVERABLE_COMMITS") return false;
+        assert.equal(error.details.proofMethod, "tree-equivalence");
+        assert.equal(error.details.proofResult, "unproven");
+        return true;
+      },
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("close does not treat a whitespace-only-differing integration revision as proven equivalent", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-whitespace-evidence`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feat/whitespace-evidence" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "recoverable session work\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "add feature"], worktreePath);
+
+    // Same content, but with a trailing-whitespace-only difference. A
+    // patch/diff-based proof (e.g. git patch-id) can consider this
+    // equivalent to the branch's own change; exact Git tree-object identity
+    // (a distinct blob SHA) must not.
+    fs.writeFileSync(path.join(fixture.repositoryPath, "feature.txt"), "recoverable session work \n");
+    runGit(["add", "feature.txt"], fixture.repositoryPath);
+    runGit(["commit", "-m", "squash-merge feat/whitespace-evidence (#1)"], fixture.repositoryPath);
+    const integratedRevision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+
+    assert.throws(
+      () => registry.close({ sessionId: session.sessionId, integratedRevision }),
+      (error: unknown) => {
+        if (!(error instanceof SessionRegistryError) || error.code !== "RECOVERABLE_COMMITS") return false;
+        assert.equal(error.details.proofMethod, "tree-equivalence");
+        assert.equal(error.details.proofResult, "unproven");
+        return true;
+      },
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("close rejects an unresolvable integrated-revision evidence reference before touching cleanup state", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-unresolved-evidence`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feat/unresolved-evidence" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "recoverable session work\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "add feature"], worktreePath);
+
+    assertRegistryError(
+      () => registry.close({ sessionId: session.sessionId, integratedRevision: "0".repeat(40) }),
+      "INVALID_BASE_REF",
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 interface RepositoryFixture {
   readonly repositoryPath: string;
   cleanup(): void;

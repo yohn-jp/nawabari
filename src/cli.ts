@@ -220,8 +220,19 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "session close",
     summary: "Close the current or selected session",
-    usage: `${CLI_NAME} session close [--session <id>]`,
-    options: [option("--session", "Select a session instead of the current worktree owner", { value: "<id>" })],
+    usage: `${CLI_NAME} session close [--session <id>] [--integrated-revision <rev>]`,
+    options: [
+      option("--session", "Select a session instead of the current worktree owner", { value: "<id>" }),
+      option(
+        "--integrated-revision",
+        "Externally evidenced revision proving non-ancestry (squash/rebase) integration; independently re-verified via exact Git tree-object equivalence, never trusted blindly",
+        { value: "<rev>" },
+      ),
+    ],
+    notes: [
+      "Ordinary ancestry-based close remains the cheap/default path and requires no flags.",
+      "Nawabari never queries GitHub or any remote provider; --integrated-revision only names a local revision for Nawabari to independently verify.",
+    ],
   },
   {
     name: "authorize",
@@ -497,6 +508,7 @@ type ParsedOptions = {
   patch: boolean;
   max_bytes: string | null;
   max_hunks: string | null;
+  integrated_revision: string | null;
 };
 
 function usageError(
@@ -581,6 +593,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     patch: false,
     max_bytes: null,
     max_hunks: null,
+    integrated_revision: null,
   };
   let dryRun = false;
 
@@ -642,6 +655,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--to") options.to_revision = value;
     else if (name === "--max-bytes") options.max_bytes = value;
     else if (name === "--max-hunks") options.max_hunks = value;
+    else if (name === "--integrated-revision") options.integrated_revision = value;
   }
 
   if (options.apply && dryRun) {
@@ -926,10 +940,16 @@ async function executeCommand(
         return { ok: true, value: { session_id: selected.value.session_id } };
       }
 
-      const parsed = parseOptions(rest, new Set(["--session"]));
+      const parsed = parseOptions(
+        rest,
+        new Set(subcommand === "close" ? ["--session", "--integrated-revision"] : ["--session"]),
+      );
       if (!parsed.ok) return parsed;
       if (subcommand === "close") {
-        const closeOptions: SessionCloseOptions = { session_id: parsed.value.session_id };
+        const closeOptions: SessionCloseOptions = {
+          session_id: parsed.value.session_id,
+          integrated_revision: parsed.value.integrated_revision,
+        };
         const selected = await dependencies.backend.closeSession(context, closeOptions);
         return selected.ok ? { ok: true, value: selected.value } : selected;
       }
