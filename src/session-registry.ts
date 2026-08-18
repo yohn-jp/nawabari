@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   defaultGit,
   captureGitCheckpoint,
+  computeRangePatchIds,
   listGitWorktrees,
   normalizeBranchId,
   observeGitCheckpoint,
@@ -140,11 +141,35 @@ export interface CloseSessionResult {
   readonly worktreeRemoved: boolean;
   readonly branchRemoved: boolean;
   readonly idempotent: boolean;
+  readonly integrationProof?: IntegrationProof;
 }
 
 export interface CloseSessionOptions {
   readonly sessionId?: string | null;
   readonly session_id?: string | null;
+  /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently verified; never trusted blindly. */
+  readonly integratedRevision?: string | null;
+  readonly integrated_revision?: string | null;
+  /** Base of the integrated diff range; defaults to `${integratedRevision}^`. */
+  readonly integratedBase?: string | null;
+  readonly integrated_base?: string | null;
+}
+
+function isCloseSessionOptions(value: unknown): value is CloseSessionOptions {
+  return typeof value === "object" && value !== null;
+}
+
+/** Caller-supplied non-ancestry integration evidence, already normalized to camelCase. */
+export interface IntegrationEvidenceInput {
+  readonly integratedRevision: string;
+  readonly integratedBase?: string;
+}
+
+/** Deterministic Git-native evidence proving a branch is safely reclaimable. */
+export interface IntegrationProof {
+  readonly method: "ancestor" | "patch-id-equivalence";
+  readonly integratedRevision?: string;
+  readonly integratedBase?: string;
 }
 
 export interface GarbageCollectOptions {
@@ -1767,13 +1792,25 @@ export class SessionRegistry {
   /** Close one session only after its ownership and recoverability are proven safe. */
   close(sessionIdOrOptions?: string | null | CloseSessionOptions): CloseSessionResult {
     return this.withLock(() => {
-      const sessionId =
-        typeof sessionIdOrOptions === "object" && sessionIdOrOptions !== null
-          ? (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id)
-          : sessionIdOrOptions;
+      const sessionId = isCloseSessionOptions(sessionIdOrOptions)
+        ? (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id)
+        : sessionIdOrOptions;
       const selectedSessionId = sessionId ?? this.resolveCurrentSession().sessionId;
       assertSessionId(selectedSessionId);
-      return this.closeUnsafe(selectedSessionId);
+      const integratedRevision = isCloseSessionOptions(sessionIdOrOptions)
+        ? (sessionIdOrOptions.integratedRevision ?? sessionIdOrOptions.integrated_revision ?? null)
+        : null;
+      const integratedBase = isCloseSessionOptions(sessionIdOrOptions)
+        ? (sessionIdOrOptions.integratedBase ?? sessionIdOrOptions.integrated_base ?? null)
+        : null;
+      const evidence: IntegrationEvidenceInput | undefined =
+        integratedRevision === null || integratedRevision === undefined
+          ? undefined
+          : {
+              integratedRevision,
+              ...(integratedBase === null || integratedBase === undefined ? {} : { integratedBase }),
+            };
+      return this.closeUnsafe(selectedSessionId, evidence);
     });
   }
 
@@ -2021,7 +2058,7 @@ export class SessionRegistry {
     return candidates;
   }
 
-  private closeUnsafe(sessionId: string): CloseSessionResult {
+  private closeUnsafe(sessionId: string, evidence?: IntegrationEvidenceInput): CloseSessionResult {
     const state = this.readStateUnsafe();
     const records = state.sessions;
     const record = records.find((candidate) => candidate.sessionId === sessionId);
@@ -2039,7 +2076,7 @@ export class SessionRegistry {
       };
     }
 
-    const resources = this.inspectCleanupResources(record);
+    const resources = this.inspectCleanupResources(record, undefined, evidence);
     const closingRecord = record.state === "closing" ? record : transitionSessionState(record, "closing", this.clock);
     let closingRecords = replaceRecord(records, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
@@ -2047,9 +2084,10 @@ export class SessionRegistry {
 
     let worktreeRemoved = false;
     let branchRemoved = false;
+    let integrationProof: IntegrationProof | undefined;
 
     if (resources.removeWorktree) {
-      const revalidated = this.inspectCleanupResources(record);
+      const revalidated = this.inspectCleanupResources(record, undefined, evidence);
       assertSameCleanupObservation(resources, revalidated, "worktree-remove");
       if (revalidated.removeWorktree) {
         removeSessionWorktree(this.git, revalidated.gitCwd, record.worktreePath);
@@ -2061,16 +2099,22 @@ export class SessionRegistry {
     // no longer exist. Reobserve Git from the stable integration/peer cwd that
     // was selected during the authoritative preflight.
     const branchWorktrees = listGitWorktrees(this.git, resources.gitCwd);
-    const branchResources = this.inspectCleanupResources(record, branchWorktrees);
+    const branchResources = this.inspectCleanupResources(record, branchWorktrees, evidence);
     if (branchResources.branchPresent && branchResources.removeBranch) {
       const branchRevalidated = this.inspectCleanupResources(
         record,
         listGitWorktrees(this.git, branchResources.gitCwd),
+        evidence,
       );
       assertSameCleanupObservation(branchResources, branchRevalidated, "branch-remove");
       if (branchRevalidated.branchPresent && branchRevalidated.removeBranch) {
-        removeSessionBranch(this.git, branchRevalidated.gitCwd, record.branchName);
+        // Git's own "-d" safety check is ancestry-only and cannot see a
+        // patch-id equivalence proof. Force deletion is only ever selected
+        // after Nawabari has independently re-derived that proof itself.
+        const forceDelete = branchRevalidated.integrationProof?.method === "patch-id-equivalence";
+        removeSessionBranch(this.git, branchRevalidated.gitCwd, record.branchName, forceDelete);
         branchRemoved = true;
+        integrationProof = branchRevalidated.integrationProof;
       }
     }
 
@@ -2087,12 +2131,14 @@ export class SessionRegistry {
       worktreeRemoved,
       branchRemoved,
       idempotent: false,
+      ...(integrationProof === undefined ? {} : { integrationProof }),
     };
   }
 
   private inspectCleanupResources(
     record: SessionRecord,
     observedWorktrees: readonly GitWorktreeInfo[] = listGitWorktrees(this.git, this.repository.worktreePath),
+    evidence?: IntegrationEvidenceInput,
   ): CleanupResources {
     const git = this.git;
     const worktrees = observedWorktrees;
@@ -2140,7 +2186,12 @@ export class SessionRegistry {
 
     const worktreeProtection = this.protectedWorktree(record.worktreePath, worktrees);
     const branchProtection = this.protectedBranch(record.branchName, worktrees, gitCwd);
-    const removeBranch = branchPresent && !branchProtection && this.branchIsReachableFromIntegration(record, gitCwd);
+    let removeBranch = false;
+    let integrationProof: IntegrationProof | undefined;
+    if (branchPresent && !branchProtection) {
+      integrationProof = this.branchIsReachableFromIntegration(record, gitCwd, evidence);
+      removeBranch = true;
+    }
 
     return {
       gitCwd,
@@ -2152,6 +2203,7 @@ export class SessionRegistry {
       branchPresent,
       removeWorktree: registeredWorktree !== undefined && !worktreeProtection,
       removeBranch,
+      integrationProof,
     };
   }
 
@@ -2289,7 +2341,19 @@ export class SessionRegistry {
     return protectedBranchIds.includes(normalizeBranchId(branchName));
   }
 
-  private branchIsReachableFromIntegration(record: SessionRecord, gitCwd = this.repository.worktreePath): boolean {
+  /**
+   * Prove a session branch is safe to reclaim. Ordinary ancestry is the
+   * cheap/default path. When ancestry fails, a caller may supply bounded
+   * non-ancestry integration evidence (e.g. a squash/rebase-merge commit);
+   * Nawabari never trusts that assertion blindly and instead independently
+   * re-derives a deterministic Git-native equivalence proof (patch-id) before
+   * treating the branch as safely integrated.
+   */
+  private branchIsReachableFromIntegration(
+    record: SessionRecord,
+    gitCwd = this.repository.worktreePath,
+    evidence?: IntegrationEvidenceInput,
+  ): IntegrationProof {
     const git = this.git;
     const worktrees = listGitWorktrees(git, gitCwd);
     const defaultBranchName = resolveDefaultBranchName(git, gitCwd, worktrees, this.defaultBranchName);
@@ -2300,25 +2364,80 @@ export class SessionRegistry {
         { branch: record.branchName, recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS") },
       );
     }
-    if (normalizeBranchId(defaultBranchName) === record.branchId) return true;
+    if (normalizeBranchId(defaultBranchName) === record.branchId) return { method: "ancestor" };
     try {
       git.run(["merge-base", "--is-ancestor", record.branchId, normalizeBranchId(defaultBranchName)], gitCwd);
-      return true;
+      return { method: "ancestor" };
     } catch (error: unknown) {
-      if (isExpectedGitLookupFailure(error)) {
+      if (!isExpectedGitLookupFailure(error)) throw error;
+      if (evidence !== undefined) {
+        const proof = this.proveNonAncestryIntegration(record, gitCwd, defaultBranchName, evidence);
+        if (proof !== undefined) return proof;
         throw new SessionRegistryError(
           "RECOVERABLE_COMMITS",
-          `Commits on ${record.branchName} are not proven reachable from ${defaultBranchName}`,
+          `Commits on ${record.branchName} could not be proven integrated via the supplied non-ancestry evidence`,
           {
             branch: record.branchName,
             integrationBranch: defaultBranchName,
+            proofMethod: "patch-id-equivalence",
+            proofResult: "unproven",
+            integratedRevision: evidence.integratedRevision,
             recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
           },
           error,
         );
       }
+      throw new SessionRegistryError(
+        "RECOVERABLE_COMMITS",
+        `Commits on ${record.branchName} are not proven reachable from ${defaultBranchName}`,
+        {
+          branch: record.branchName,
+          integrationBranch: defaultBranchName,
+          proofMethod: "ancestry",
+          proofResult: "unproven",
+          recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
+        },
+        error,
+      );
+    }
+  }
+
+  /**
+   * Independently verify caller-supplied non-ancestry integration evidence.
+   * The caller's assertion only selects which revisions to compare; the
+   * proof itself is re-derived from local Git truth (patch-id equivalence
+   * between the branch's own diff and the integrated commit's diff).
+   * Returns undefined, never false, so a missing proof always falls through
+   * to a fail-closed RECOVERABLE_COMMITS at the call site.
+   */
+  private proveNonAncestryIntegration(
+    record: SessionRecord,
+    gitCwd: string,
+    defaultBranchName: string,
+    evidence: IntegrationEvidenceInput,
+  ): IntegrationProof | undefined {
+    const git = this.git;
+    const integratedRevision = resolveBaseRef(git, gitCwd, evidence.integratedRevision).revision;
+    const integratedBase = resolveBaseRef(git, gitCwd, evidence.integratedBase ?? `${evidence.integratedRevision}^`)
+      .revision;
+
+    let branchBase: string;
+    try {
+      branchBase = git.run(["merge-base", record.branchId, normalizeBranchId(defaultBranchName)], gitCwd);
+    } catch (error: unknown) {
+      if (isExpectedGitLookupFailure(error)) return undefined;
       throw error;
     }
+
+    const branchPatchIds = computeRangePatchIds(git, gitCwd, branchBase, record.branchId);
+    const integratedPatchIds = computeRangePatchIds(git, gitCwd, integratedBase, integratedRevision);
+
+    const proven =
+      branchPatchIds.length > 0 &&
+      branchPatchIds.length === integratedPatchIds.length &&
+      branchPatchIds.every((id, index) => id === integratedPatchIds[index]);
+
+    return proven ? { method: "patch-id-equivalence", integratedRevision, integratedBase } : undefined;
   }
 
   private resolveProvisioningResources(options: ProvisionSessionOptions, sessionId: string): ProvisioningResources {
@@ -2558,6 +2677,7 @@ interface CleanupResources {
   readonly branchPresent: boolean;
   readonly removeWorktree: boolean;
   readonly removeBranch: boolean;
+  readonly integrationProof?: IntegrationProof;
 }
 
 function assertStaleAfterMs(value: number): void {
@@ -2657,7 +2777,10 @@ function recoveryHintsForCode(code: RegistryErrorCode): string[] {
     case "NESTED_REPOSITORY":
       return ["Inspect and explicitly preserve or remove the nested repository before retrying cleanup."];
     case "RECOVERABLE_COMMITS":
-      return ["Retain or merge the session branch commits into an authoritative local branch before retrying cleanup."];
+      return [
+        "Retain or merge the session branch commits into an authoritative local branch before retrying cleanup.",
+        "If the branch was integrated via squash/rebase merge, retry close with an --integrated-revision proof instead.",
+      ];
     case "RECOVERABLE_STASHES":
       return ["Inspect and explicitly apply, export, or drop the session stash before retrying cleanup."];
     case "MISSING_WORKTREE":
@@ -3268,8 +3391,8 @@ function removeSessionWorktree(git: GitCommandRunner, cwd: string, worktreePath:
   git.run(["worktree", "remove", ...(force ? ["--force"] : []), worktreePath], cwd);
 }
 
-function removeSessionBranch(git: GitCommandRunner, cwd: string, branchName: string): void {
-  git.run(["branch", "-d", "--", branchName], cwd);
+function removeSessionBranch(git: GitCommandRunner, cwd: string, branchName: string, force = false): void {
+  git.run(["branch", force ? "-D" : "-d", "--", branchName], cwd);
 }
 
 function generateUniqueSessionId(records: readonly SessionRecord[], idGenerator: () => string): string {

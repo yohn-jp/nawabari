@@ -1055,6 +1055,55 @@ function canonicalDirectory(
   }
 }
 
+/**
+ * Compute the sorted, stable per-file `git patch-id` set for the content
+ * change between two revisions. This is a deterministic, Git-native proof
+ * of "these two diffs introduce the same net content change" that is
+ * independent of commit ancestry, blob SHAs, and surrounding context —
+ * the mechanism used to prove a squash/rebase-integrated branch is safe to
+ * reclaim even though its original commit is not an ancestor of the
+ * integration branch.
+ */
+export function computeRangePatchIds(git: GitCommandRunner, cwd: string, from: string, to: string): readonly string[] {
+  let diffText: string;
+  try {
+    const run = git.runRaw ?? git.run;
+    diffText = run(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames=100%", from, to], cwd);
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw new SessionRegistryError(
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      "Could not observe the integration comparison diff",
+      { cwd, from, to },
+      error,
+    );
+  }
+  if (diffText.trim().length === 0) return Object.freeze([]);
+
+  let patchIdOutput: string;
+  try {
+    patchIdOutput = String(
+      execFileSync("git", ["patch-id", "--stable"], {
+        input: diffText,
+        encoding: "utf8",
+        maxBuffer: GIT_COMMAND_MAX_OUTPUT_BYTES,
+        timeout: GIT_COMMAND_TIMEOUT_MS,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      }),
+    );
+  } catch (error: unknown) {
+    throw gitProcessError(error, "patch-id --stable", cwd);
+  }
+
+  const ids = patchIdOutput
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => line.split(/\s+/u)[0])
+    .filter((id): id is string => id !== undefined && /^[0-9a-f]{40,64}$/u.test(id));
+  return Object.freeze([...ids].sort());
+}
+
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error && typeof error.code === "string";
 }

@@ -259,6 +259,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--mode",
       "--repository",
       "--claim-id",
+      "--integrated-revision",
+      "--integrated-base",
     ],
     authorization_options: ["--session", "--operation", "--resource"],
     checkpoint_options: ["--session"],

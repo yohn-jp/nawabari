@@ -337,13 +337,30 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const registry = this.registryFor(context);
       const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
-      const result = registry.close(sessionId);
+      const result = registry.close({
+        sessionId,
+        integratedRevision: options.integrated_revision ?? undefined,
+        integratedBase: options.integrated_base ?? undefined,
+      });
       return Promise.resolve(
         success({
           session: toDomainRecord(result.session),
           worktree_removed: result.worktreeRemoved,
           branch_removed: result.branchRemoved,
           idempotent: result.idempotent,
+          ...(result.integrationProof === undefined
+            ? {}
+            : {
+                integration_proof: {
+                  method: result.integrationProof.method,
+                  ...(result.integrationProof.integratedRevision === undefined
+                    ? {}
+                    : { integrated_revision: result.integrationProof.integratedRevision }),
+                  ...(result.integrationProof.integratedBase === undefined
+                    ? {}
+                    : { integrated_base: result.integrationProof.integratedBase }),
+                },
+              }),
         }),
       );
     } catch (error: unknown) {
