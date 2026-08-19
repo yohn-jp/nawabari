@@ -73,6 +73,24 @@ test("guard denies cross-session claims and the protected integration worktree",
     const protectedDecision = new SessionRegistry({ cwd: fixture }).guard();
     assert.equal(protectedDecision.allowed, false);
     assert.equal(protectedDecision.code, "PROTECTED_WORKTREE");
+
+    // Regression (#125 dogfood): invoking a governed command from the
+    // protected/default worktree while targeting a managed session must
+    // distinguish "where you are" from "where the session actually lives"
+    // and name a bounded safe next action, not just the bare code.
+    const protectedWithTarget = new SessionRegistry({ cwd: fixture }).guard({ sessionId: second.sessionId });
+    assert.equal(protectedWithTarget.allowed, false);
+    assert.equal(protectedWithTarget.code, "PROTECTED_WORKTREE");
+    assert.equal(protectedWithTarget.details.phase, "execution");
+    assert.equal(protectedWithTarget.details.worktree, fs.realpathSync.native(fixture));
+    assert.equal(protectedWithTarget.details.requestedSessionId, second.sessionId);
+    assert.equal(protectedWithTarget.details.targetWorktree, fs.realpathSync.native(secondWorktree));
+    assert.equal(protectedWithTarget.details.targetBranch, "feature/guard-second");
+    assert.equal(protectedWithTarget.details.targetState, "active");
+    assert.ok(Array.isArray(protectedWithTarget.details.safeActions));
+    assert.ok((protectedWithTarget.details.safeActions as string[]).includes("run-from-managed-session-worktree"));
+    assert.ok(Array.isArray(protectedWithTarget.details.recoveryHints));
+    assert.ok((protectedWithTarget.details.recoveryHints as string[]).length > 0);
   } finally {
     removeWorktree(fixture, firstWorktree);
     removeWorktree(fixture, secondWorktree);

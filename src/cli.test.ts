@@ -359,6 +359,98 @@ test("session id resolves from the current worktree without an explicit id", asy
   });
 });
 
+// Regression (#125 dogfood): passing a visible session `label` to
+// `--session` produced a bare INVALID_SESSION_ID even though the label
+// uniquely identified the active record to a human. `--session` stays
+// machine-ID based (the label is never accepted as identity), but a unique
+// active-label match must expose the canonical session_id as a bounded,
+// non-authoritative hint.
+test("an invalid --session value that uniquely matches an active label exposes a canonical session_id hint", async () => {
+  const labeled: SessionRecord = {
+    ...sampleSession,
+    session_id: "0190f1e0-0000-7000-8000-0000000000aa",
+    label: "fix-lint",
+  };
+  const backend = backendForTests({
+    getSession: async (_context, sessionId) =>
+      failure(new DomainError("INVALID_SESSION_ID", `Invalid session ID: ${sessionId}`, { sessionId })),
+    listSessions: async (_context) => success({ sessions: [labeled] }),
+  });
+
+  const jsonOutput = capture();
+  const jsonExitCode = await runCli(["session", "show", "--session", "fix-lint", "--json"], {
+    backend,
+    io: jsonOutput.io,
+  });
+  assert.equal(jsonExitCode, 3);
+  const response = JSON.parse(jsonOutput.stdout[0]) as {
+    ok: boolean;
+    code: string;
+    details: {
+      sessionId: string;
+      session_label_query: string;
+      session_label_match: string;
+      session_id_hint: string;
+      safe_actions: string[];
+    };
+  };
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "INVALID_SESSION_ID");
+  assert.equal(response.details.sessionId, "fix-lint");
+  assert.equal(response.details.session_label_query, "fix-lint");
+  assert.equal(response.details.session_label_match, "unique");
+  assert.equal(response.details.session_id_hint, labeled.session_id);
+  assert.deepEqual(response.details.safe_actions, ["retry-with-session-id-hint"]);
+
+  // Human and JSON derive from the identical enriched DomainError.
+  const humanOutput = capture();
+  const humanExitCode = await runCli(["session", "show", "--session", "fix-lint"], { backend, io: humanOutput.io });
+  assert.equal(humanExitCode, 3);
+  const humanText = humanOutput.stderr.join("\n");
+  assert.match(humanText, /code: INVALID_SESSION_ID/u);
+  assert.match(humanText, /session_label_match: unique/u);
+  assert.match(humanText, new RegExp(`session_id_hint: ${labeled.session_id}`, "u"));
+});
+
+test("ambiguous or absent label matches for an invalid --session value do not guess a session_id", async () => {
+  const first: SessionRecord = { ...sampleSession, session_id: "0190f1e0-0000-7000-8000-0000000000bb", label: "dup" };
+  const second: SessionRecord = { ...sampleSession, session_id: "0190f1e0-0000-7000-8000-0000000000cc", label: "dup" };
+  const ambiguousBackend = backendForTests({
+    getSession: async (_context, sessionId) =>
+      failure(new DomainError("INVALID_SESSION_ID", `Invalid session ID: ${sessionId}`, { sessionId })),
+    listSessions: async (_context) => success({ sessions: [first, second] }),
+  });
+  const ambiguousOutput = capture();
+  const ambiguousExit = await runCli(["session", "show", "--session", "dup", "--json"], {
+    backend: ambiguousBackend,
+    io: ambiguousOutput.io,
+  });
+  assert.equal(ambiguousExit, 3);
+  const ambiguousResponse = JSON.parse(ambiguousOutput.stdout[0]) as {
+    details: { session_label_match: string; session_label_match_count: number; session_id_hint?: string };
+  };
+  assert.equal(ambiguousResponse.details.session_label_match, "ambiguous");
+  assert.equal(ambiguousResponse.details.session_label_match_count, 2);
+  assert.equal(ambiguousResponse.details.session_id_hint, undefined);
+
+  const noMatchBackend = backendForTests({
+    getSession: async (_context, sessionId) =>
+      failure(new DomainError("INVALID_SESSION_ID", `Invalid session ID: ${sessionId}`, { sessionId })),
+    listSessions: async (_context) => success({ sessions: [sampleSession] }),
+  });
+  const noMatchOutput = capture();
+  const noMatchExit = await runCli(["session", "show", "--session", "no-such-label", "--json"], {
+    backend: noMatchBackend,
+    io: noMatchOutput.io,
+  });
+  assert.equal(noMatchExit, 3);
+  const noMatchResponse = JSON.parse(noMatchOutput.stdout[0]) as {
+    details: { session_label_match: string; session_id_hint?: string };
+  };
+  assert.equal(noMatchResponse.details.session_label_match, "none");
+  assert.equal(noMatchResponse.details.session_id_hint, undefined);
+});
+
 test("session inspect forwards --session and --integrated-revision to the diagnostic backend", async () => {
   let receivedOptions: SessionDiagnosticOptions | null = null;
   const diagnosticResult: SessionDiagnostic = {

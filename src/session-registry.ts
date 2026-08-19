@@ -666,6 +666,7 @@ export class SessionRegistry {
         requested.map((input) => createResourceClaim(input, owner, timestamp)),
         owner,
         state.claims.filter((claim) => claim.sessionId !== sessionId),
+        state.sessions,
       );
       const nextIds = new Set(next.map((claim) => claim.claimId));
       const released = current.filter((claim) => !nextIds.has(claim.claimId));
@@ -978,17 +979,62 @@ export class SessionRegistry {
         git: this.git,
       });
     if (this.protectedWorktree(this.repository.worktreePath, physical.worktrees)) {
-      throw new SessionRegistryError("PROTECTED_WORKTREE", "The current worktree is protected", {
-        worktree: this.repository.worktreePath,
-      });
+      throw this.protectedExecutionContextError(
+        "PROTECTED_WORKTREE",
+        "The current worktree is protected",
+        { worktree: this.repository.worktreePath },
+        requestedSessionId,
+      );
     }
     if (this.protectedBranch(physical.branchName, physical.worktrees)) {
-      throw new SessionRegistryError("PROTECTED_BRANCH", "The current branch is protected", {
-        branch: physical.branchName,
-      });
+      throw this.protectedExecutionContextError(
+        "PROTECTED_BRANCH",
+        "The current branch is protected",
+        { branch: physical.branchName },
+        requestedSessionId,
+      );
     }
     const session = this.resolveSessionOwnership(physical, requestedSessionId);
     return Object.freeze({ ...physical, session: cloneSessionRecord(session) });
+  }
+
+  /**
+   * Distinguish the current (protected) command execution context from the
+   * referenced/target session, so a caller does not have to separately
+   * re-discover where the operation should actually run. `phase: "execution"`
+   * marks this live-command rejection distinctly from the cleanup-time
+   * PROTECTED_WORKTREE/PROTECTED_BRANCH block, which `safeActionsForCode`
+   * and `recoveryHintsForCode` key on for a different, non-mutating safe
+   * action set.
+   */
+  private protectedExecutionContextError(
+    code: "PROTECTED_WORKTREE" | "PROTECTED_BRANCH",
+    message: string,
+    contextDetails: RegistryErrorDetails,
+    requestedSessionId: string | null,
+  ): SessionRegistryError {
+    const target =
+      requestedSessionId === null
+        ? undefined
+        : this.readUnsafe().find((record) => record.sessionId === requestedSessionId);
+    const details: RegistryErrorDetails = {
+      ...contextDetails,
+      phase: "execution",
+      ...(requestedSessionId === null ? {} : { requestedSessionId }),
+      ...(target === undefined
+        ? {}
+        : {
+            targetWorktree: target.worktreePath,
+            targetBranch: target.branchName,
+            targetState: target.state,
+            ...(target.label === undefined ? {} : { targetLabel: target.label }),
+          }),
+    };
+    return new SessionRegistryError(code, message, {
+      ...details,
+      safeActions: [...safeActionsForCode(code, details)],
+      recoveryHints: recoveryHintsForCode(code, details),
+    });
   }
 
   private resolveSessionOwnership(
@@ -1257,12 +1303,15 @@ export class SessionRegistry {
               resourceClaimConflictsWithAccess(claim, resource, requiredAccess),
           );
           if (conflictingClaim !== undefined) {
+            const conflictDetails = resourceClaimConflictDetails(
+              { resource, mode: requiredAccess },
+              conflictingClaim,
+              state.sessions,
+            );
             return deniedOperation("RESOURCE_CLAIM_CONFLICT", verified, {
-              resource,
-              ownerSessionId: conflictingClaim.sessionId,
-              ownerClaimId: conflictingClaim.claimId,
-              ownerResource: conflictingClaim.resource,
-              ownerMode: conflictingClaim.mode,
+              ...conflictDetails,
+              safeActions: [...safeActionsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails)],
+              recoveryHints: recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
             });
           }
           if (ownClaims.length > 0) {
@@ -2054,7 +2103,7 @@ export class SessionRegistry {
     const candidates = requested.map((input) => createResourceClaim(input, owner, timestamp));
     const existing = state.claims.filter((claim) => claim.sessionId !== owner.sessionId);
     const current = state.claims.filter((claim) => claim.sessionId === owner.sessionId);
-    const added = this.validateRequestedClaims(candidates, owner, [...existing, ...current]);
+    const added = this.validateRequestedClaims(candidates, owner, [...existing, ...current], state.sessions);
     const nextClaims = sortResourceClaims([
       ...state.claims,
       ...added.filter((candidate) => !current.some((claim) => claim.claimId === candidate.claimId)),
@@ -2071,6 +2120,7 @@ export class SessionRegistry {
     candidates: readonly ResourceClaim[],
     owner: ClaimOwner,
     existing: readonly ResourceClaim[],
+    sessions: readonly SessionRecord[] = [],
   ): readonly ResourceClaim[] {
     for (const candidate of candidates) {
       const exact = existing.find((claim) => claim.claimId === candidate.claimId);
@@ -2105,14 +2155,12 @@ export class SessionRegistry {
           });
         }
         if (claimsConflict(candidate, current)) {
+          const conflictDetails = resourceClaimConflictDetails(candidate, current, sessions);
           throw claimError("RESOURCE_CLAIM_CONFLICT", "Resource claim conflicts with an active session claim", {
             claimId: candidate.claimId,
-            resource: candidate.resource,
-            mode: candidate.mode,
-            ownerSessionId: current.sessionId,
-            ownerClaimId: current.claimId,
-            ownerResource: current.resource,
-            ownerMode: current.mode,
+            ...conflictDetails,
+            safeActions: [...safeActionsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails)],
+            recoveryHints: recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
           });
         }
       }
@@ -2138,7 +2186,12 @@ export class SessionRegistry {
       };
     }
 
-    const resources = this.inspectCleanupResources(record, undefined, evidence);
+    let resources: CleanupResources;
+    try {
+      resources = this.inspectCleanupResources(record, undefined, evidence);
+    } catch (error: unknown) {
+      throw enrichCloseBlockerError(error);
+    }
     const closingRecord = record.state === "closing" ? record : transitionSessionState(record, "closing", this.clock);
     let closingRecords = replaceRecord(records, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
@@ -2906,6 +2959,37 @@ function replaceRecord(records: readonly SessionRecord[], replacement: SessionRe
   return records.map((record) => (record.sessionId === replacement.sessionId ? replacement : record));
 }
 
+/**
+ * Bounded, deterministic RESOURCE_CLAIM_CONFLICT evidence: the blocking
+ * session's canonical identity plus the exact conflicting claim/overlap.
+ * Every RESOURCE_CLAIM_CONFLICT throw site builds its details through this
+ * one function so a caller never has to run a second repository-wide scan
+ * just to identify the owner.
+ */
+function resourceClaimConflictDetails(
+  requested: { resource: string; mode: ResourceClaimMode },
+  owner: { claimId: string; sessionId: string; resource: string; mode: ResourceClaimMode },
+  sessions: readonly SessionRecord[],
+): RegistryErrorDetails {
+  const ownerSession = sessions.find((record) => record.sessionId === owner.sessionId);
+  return {
+    resource: requested.resource,
+    mode: requested.mode,
+    ownerSessionId: owner.sessionId,
+    ownerClaimId: owner.claimId,
+    ownerResource: owner.resource,
+    ownerMode: owner.mode,
+    ...(ownerSession === undefined
+      ? {}
+      : {
+          ownerWorktree: ownerSession.worktreePath,
+          ownerBranch: ownerSession.branchName,
+          ownerState: ownerSession.state,
+          ...(ownerSession.label === undefined ? {} : { ownerLabel: ownerSession.label }),
+        }),
+  };
+}
+
 function transitionSessionState(record: SessionRecord, state: SessionState, clock: () => Date): SessionRecord {
   const clockTimestamp = toTimestamp(clock());
   const updatedAt = new Date(Math.max(Date.parse(record.updatedAt), Date.parse(clockTimestamp))).toISOString();
@@ -2926,7 +3010,7 @@ function ownershipMismatch(
   });
 }
 
-function recoveryHintsForCode(code: RegistryErrorCode): string[] {
+function recoveryHintsForCode(code: RegistryErrorCode, details: RegistryErrorDetails = {}): string[] {
   switch (code) {
     case "DIRTY_WORKTREE":
       return ["Preserve, commit, or explicitly recover tracked and untracked changes, then retry cleanup."];
@@ -2948,7 +3032,17 @@ function recoveryHintsForCode(code: RegistryErrorCode): string[] {
       return ["Restore a stable, observable Git/worktree state and rerun reconciliation before cleanup."];
     case "PROTECTED_WORKTREE":
     case "PROTECTED_BRANCH":
-      return ["Use the owner of the protected integration resource; do not delete it as a session resource."];
+      return details.phase === "execution"
+        ? [
+            "Run this command from the managed session worktree it targets, or pass --session to select it explicitly.",
+            "Use `session list` or `status` to find the managed worktree for the intended session.",
+          ]
+        : ["Use the owner of the protected integration resource; do not delete it as a session resource."];
+    case "RESOURCE_CLAIM_CONFLICT":
+      return [
+        "Inspect the blocking session's conflicting claim, then either wait for its release or coordinate with its owner.",
+        "Do not force-release another session's claim; claim release is scoped to the owning session only.",
+      ];
     case "STALE_REGISTRY":
       return ["Reconcile the lifecycle record under the repository mutation lock before retrying cleanup."];
     default:
@@ -3004,7 +3098,11 @@ function safeActionsForCode(code: RegistryErrorCode, details: RegistryErrorDetai
       return ["reconcile-ownership", "retain-session"];
     case "PROTECTED_WORKTREE":
     case "PROTECTED_BRANCH":
-      return ["retain-session"];
+      return details.phase === "execution"
+        ? ["run-from-managed-session-worktree", "select-target-session-explicitly"]
+        : ["retain-session"];
+    case "RESOURCE_CLAIM_CONFLICT":
+      return ["inspect-blocking-session", "wait-for-conflicting-claim-release", "retain-session"];
     case "GIT_STATE_AMBIGUOUS":
     case "PHYSICAL_OBSERVATION_UNAVAILABLE":
     case "REPOSITORY_IDENTITY_AMBIGUOUS":
@@ -3059,6 +3157,33 @@ function resultStateForDiagnostic(
     return "stale";
   }
   return "complete";
+}
+
+/**
+ * Enrich a direct `close()` rejection with the exact same #124 diagnostic
+ * classification `session inspect` would report for the identical blocked
+ * state (readiness, result state, stable safe actions), so a raw close
+ * failure and the diagnostic authority can never drift apart. This never
+ * mutates session/claim/Git/worktree state; it only reclassifies an error
+ * that `inspectCleanupResources` already raised before any mutation ran.
+ */
+function enrichCloseBlockerError(error: unknown): SessionRegistryError {
+  if (!(error instanceof SessionRegistryError)) throw error;
+  const blocker = toDiagnosticBlocker(error);
+  const closeReadiness = closeReadinessForBlockers([blocker]);
+  const resultState = resultStateForDiagnostic(closeReadiness, [blocker]);
+  return new SessionRegistryError(
+    error.code,
+    error.message,
+    {
+      ...blocker.details,
+      safeActions: [...blocker.safeActions],
+      recoveryHints: [...blocker.recoveryHints],
+      closeReadiness,
+      resultState,
+    },
+    error.cause,
+  );
 }
 
 function toGarbageCollectBlocked(sessionId: string, error: unknown): GarbageCollectBlocked {
@@ -4277,10 +4402,12 @@ function validateRegistryClaims(
         );
       }
       if (!claimsConflict(current, prior)) continue;
+      const conflictDetails = resourceClaimConflictDetails(current, prior, records);
       throw claimError("RESOURCE_CLAIM_CONFLICT", "Persisted claims contain an unresolved conflict", {
         claimId: current.claimId,
-        ownerClaimId: prior.claimId,
-        ownerSessionId: prior.sessionId,
+        ...conflictDetails,
+        safeActions: [...safeActionsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails)],
+        recoveryHints: recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
       });
     }
   }
