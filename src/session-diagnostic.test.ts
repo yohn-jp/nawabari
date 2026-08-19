@@ -104,6 +104,63 @@ test("diagnose represents unmerged commits as an explicit external-evidence-requ
   }
 });
 
+// Regression (#125 dogfood): a squash/rebase merge landed on the integration
+// branch, and the caller ran a plain `close()` without --integrated-revision
+// yet. The raw close rejection must carry the exact same #124 readiness
+// classification `diagnose()` reports for the identical state, so a caller
+// can tell "supply integration evidence" apart from "actually unintegrated"
+// or "ambiguous" without a second diagnostic round trip and without the two
+// authorities drifting apart.
+test("close on a squash-merged session without evidence reports the same external-evidence-required classification as diagnose", () => {
+  const fixture = createFixture("squash-merge-no-evidence-yet");
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repository });
+    const session = registry.provision({ worktreePath: fixture.worktree, branchName: "feat/squash-no-evidence" });
+    fs.writeFileSync(path.join(fixture.worktree, "feature.txt"), "squash content\n");
+    runGit(["add", "feature.txt"], fixture.worktree);
+    runGit(["commit", "-m", "add feature"], fixture.worktree);
+
+    // Simulate the squash-merge landing on main: same net content, unrelated SHA.
+    fs.writeFileSync(path.join(fixture.repository, "feature.txt"), "squash content\n");
+    runGit(["add", "feature.txt"], fixture.repository);
+    runGit(["commit", "-m", "squash-merge feat/squash-no-evidence (#1)"], fixture.repository);
+
+    const diagnostic = registry.diagnose(session.sessionId);
+    assert.equal(diagnostic.closeReadiness, "external_evidence_required");
+    assert.equal(diagnostic.resultState, "external_evidence_required");
+    const diagnosticBlocker = diagnostic.blockers[0];
+    assert.equal(diagnosticBlocker?.code, "RECOVERABLE_COMMITS");
+    assert.equal(diagnosticBlocker?.details.proofMethod, "ancestry");
+
+    assert.throws(
+      () => registry.close(session.sessionId),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "RECOVERABLE_COMMITS");
+        // Same #124 authority, not a second/independent judgment: identical
+        // readiness, result state, and safe actions as diagnose() reported.
+        assert.equal(error.details.closeReadiness, diagnostic.closeReadiness);
+        assert.equal(error.details.resultState, diagnostic.resultState);
+        assert.deepEqual(
+          [...(error.details.safeActions as string[])].sort(),
+          [...diagnosticBlocker!.safeActions].sort(),
+        );
+        assert.equal(error.details.proofMethod, "ancestry");
+        assert.ok((error.details.safeActions as string[]).includes("provide-integration-evidence"));
+        assert.notEqual(error.details.closeReadiness, "blocked");
+        assert.notEqual(error.details.closeReadiness, "ambiguous");
+        return true;
+      },
+    );
+    // Fail-closed and non-mutating: the session is untouched by the rejected close.
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(fixture.worktree), true);
+    assert.equal(hasLocalBranch(fixture.repository, session.branchName), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("diagnose reuses the #123 tree-equivalence proof and reports ready for a squash-merged session", () => {
   const fixture = createFixture("tree-equivalence-ready");
   try {
@@ -233,6 +290,52 @@ test("diagnose reports an ambiguous result state, fail-closed, when Git worktree
     // The fault-injected observation never touched real state.
     assert.equal(registry.get(session.sessionId)?.state, "active");
     assert.equal(fs.existsSync(fixture.worktree), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// Regression (#125 acceptance criteria): an unavailable/ambiguous Git
+// observation must never be misreported as a deterministic RECOVERABLE_COMMITS
+// external-evidence-required block. The raw close() rejection reuses the
+// same #124 ambiguity classification diagnose() reports for the identical
+// fault, fails closed, and performs no mutation.
+test("close reports the same ambiguous classification as diagnose, fail-closed, when Git observation is unavailable", () => {
+  const fixture = createFixture("close-ambiguous");
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repository });
+    const session = registry.provision({ worktreePath: fixture.worktree, branchName: "feature/close-ambiguous" });
+
+    const failingGit = {
+      run(args: readonly string[], cwd: string): string {
+        if (args[0] === "worktree" && args[1] === "list") {
+          throw new SessionRegistryError("GIT_COMMAND_FAILED", "Simulated Git worktree observation failure");
+        }
+        return defaultGit.run(args, cwd);
+      },
+    };
+    const guarded = new SessionRegistry({ repository: registry.repository, git: failingGit });
+
+    const diagnostic = guarded.diagnose(session.sessionId);
+    assert.equal(diagnostic.closeReadiness, "ambiguous");
+
+    assert.throws(
+      () => guarded.close(session.sessionId),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "GIT_COMMAND_FAILED");
+        assert.equal(error.details.closeReadiness, "ambiguous");
+        assert.equal(error.details.resultState, "ambiguous");
+        assert.notEqual(error.details.closeReadiness, "external_evidence_required");
+        assert.notEqual(error.details.closeReadiness, "blocked");
+        return true;
+      },
+    );
+
+    // Fail-closed and non-mutating: no session/worktree/branch state changed.
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(fixture.worktree), true);
+    assert.equal(hasLocalBranch(fixture.repository, session.branchName), true);
   } finally {
     fixture.cleanup();
   }

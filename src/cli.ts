@@ -1367,6 +1367,61 @@ function emitFailure(mode: CliMode, command: string, error: DomainError, io: Cli
   return error.exitCode;
 }
 
+/** Extract the raw `--session` value a rejected INVALID_SESSION_ID carried, regardless of which command path threw it. */
+function invalidSessionIdQuery(error: DomainError): string | null {
+  const details = error.details;
+  if (details === null) return null;
+  if (typeof details.sessionId === "string") return details.sessionId;
+  const nested = details.details;
+  if (nested === null || typeof nested !== "object" || Array.isArray(nested)) return null;
+  const nestedSessionId = (nested as JsonObject).sessionId;
+  return typeof nestedSessionId === "string" ? nestedSessionId : null;
+}
+
+/**
+ * `--session` stays machine-ID based: an invalid value is never silently
+ * reinterpreted as a label. But when it exactly and unambiguously matches
+ * one active session's label, expose that session's canonical ID as a
+ * bounded, non-authoritative hint instead of forcing a separate `session
+ * list` round trip. Ambiguous or absent matches never guess.
+ */
+async function enrichInvalidSessionIdError(
+  error: DomainError,
+  backend: SessionBackend,
+  context: SessionContext,
+): Promise<DomainError> {
+  if (error.code !== "INVALID_SESSION_ID") return error;
+  const query = invalidSessionIdQuery(error);
+  if (query === null || query.length === 0) return error;
+
+  const listing = await backend.listSessions(context, { include_closed: false, limit: MAX_SESSION_LIST_LIMIT });
+  if (!listing.ok) return error;
+  const matches = listing.value.sessions.filter((session) => session.state === "active" && session.label === query);
+
+  const hint: JsonObject =
+    matches.length === 1
+      ? {
+          session_label_query: query,
+          session_label_match: "unique",
+          session_id_hint: matches[0].session_id,
+          safe_actions: ["retry-with-session-id-hint"],
+        }
+      : matches.length > 1
+        ? {
+            session_label_query: query,
+            session_label_match: "ambiguous",
+            session_label_match_count: matches.length,
+            safe_actions: ["disambiguate-session-label", "list-sessions"],
+          }
+        : {
+            session_label_query: query,
+            session_label_match: "none",
+            safe_actions: ["list-sessions"],
+          };
+
+  return new DomainError(error.code, error.message, { ...error.details, ...hint }, error.exitCode);
+}
+
 export async function runCli(argv: string[], dependencies: CliDependencies = {}): Promise<number> {
   const io = dependencies.io ?? defaultCliIO();
   const delimiter = argv.indexOf("--");
@@ -1415,7 +1470,10 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       sandboxProbe: dependencies.sandboxProbe,
       sandboxRuntimeLayout: dependencies.sandboxRuntimeLayout,
     });
-    if (!result.ok) return emitFailure(mode, command, result.error, io);
+    if (!result.ok) {
+      const enriched = await enrichInvalidSessionIdError(result.error, backend, sessionContext(cwd));
+      return emitFailure(mode, command, enriched, io);
+    }
     io.stdout(renderSuccess(mode, command, result.value));
     if (
       (command === "session run" || command === "session exec") &&

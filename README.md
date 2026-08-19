@@ -327,6 +327,48 @@ Detached, corrupt, missing, or conflicting state fails closed. The guard does
 not install hooks and does not prevent direct filesystem writes outside
 Nawabari.
 
+## Actionable lifecycle rejections
+
+Stable codes are necessary but not sufficient for a caller to pick a safe
+next step without a second, separate inspection. For the codes below,
+Nawabari's `details` carry bounded, deterministic evidence and a
+`safeActions`/`safe_actions` list of stable, kebab-case next-action
+identifiers, in addition to the human-readable `message`. JSON and human
+output always render the identical underlying result; only the formatting
+differs.
+
+- **`RESOURCE_CLAIM_CONFLICT`** (`session claim`/`session update`,
+  `authorize`, `guard --operation`) reports the blocking claim
+  (`ownerClaimId`, `ownerResource`, `ownerMode`) and the blocking session's
+  canonical identity (`ownerSessionId`, `ownerWorktree`, `ownerBranch`, and
+  `ownerLabel` when the session has one) in the same result, so a caller
+  never needs a second `session list` scan to find the owner.
+- **`PROTECTED_WORKTREE`**/**`PROTECTED_BRANCH`** raised by a live command
+  (not by cleanup) add `phase: "execution"` and distinguish the current
+  (protected) execution context from the referenced `--session` target:
+  `requestedSessionId`, `targetWorktree`, `targetBranch`, and `targetState`
+  when that session exists. `safeActions` names the deterministic fix
+  (`run-from-managed-session-worktree`, `select-target-session-explicitly`)
+  instead of the unrelated cleanup-time hint.
+- **`INVALID_SESSION_ID`** stays machine-ID based: an invalid `--session`
+  value is never silently reinterpreted as a label. When it exactly and
+  unambiguously matches one active session's label, the result adds
+  `session_id_hint` (the canonical session ID) and
+  `session_label_match: "unique"` as a non-authoritative hint. An ambiguous
+  or absent label match never guesses: `session_label_match` reports
+  `"ambiguous"` (with `session_label_match_count`) or `"none"` instead.
+- **`RECOVERABLE_COMMITS`** raised by `session close` carries the same
+  `close_readiness`/`result_state` classification `session inspect` reports
+  for the identical state — `external_evidence_required` when ancestry alone
+  could not prove the branch safe and a `--integrated-revision` proof might
+  resolve it (e.g. after a squash/rebase merge), versus `blocked` when
+  supplied evidence failed to prove equivalence, versus `ambiguous` when Git
+  observation itself was inconclusive. Both surfaces reuse one authority, so
+  a raw close rejection and `session inspect` never drift apart.
+
+None of the above weakens fail-closed behavior, changes an error code's
+meaning, or performs any mutation while producing the rejection.
+
 ## Orchestrator integration
 
 An external orchestrator can create a session, capture the returned

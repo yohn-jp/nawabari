@@ -473,6 +473,65 @@ test("canonicalizeConcretePath treats wildcard characters as literal filename ch
   }
 });
 
+// Regression: dogfood RESOURCE_CLAIM_CONFLICT observed only the conflicting
+// claim, forcing a second repository-wide scan to identify the blocking
+// session. #125 requires the blocking session's canonical identity,
+// worktree/branch/label, the exact conflicting resource/mode, and stable
+// safe_actions in the primary result.
+test("RESOURCE_CLAIM_CONFLICT exposes the blocking session identity, claim, and safe actions without a second scan", () => {
+  const fixture = createRepositoryFixture(true);
+  try {
+    const firstRegistry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const first = firstRegistry.create({ label: "reviewer-fix" });
+    const secondRegistry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const second = secondRegistry.create();
+
+    firstRegistry.claimResources({
+      sessionId: first.sessionId,
+      claims: [{ resource: "src/file.ts", mode: "exclusive-write" }],
+    });
+
+    assert.throws(
+      () =>
+        secondRegistry.claimResources({
+          sessionId: second.sessionId,
+          claims: [{ resource: "src/file.ts", mode: "write" }],
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "RESOURCE_CLAIM_CONFLICT");
+        assert.equal(error.details.resource, "src/file.ts");
+        assert.equal(error.details.ownerSessionId, first.sessionId);
+        assert.equal(error.details.ownerMode, "exclusive-write");
+        assert.equal(error.details.ownerWorktree, first.worktreePath);
+        assert.equal(error.details.ownerBranch, first.branchName);
+        assert.equal(error.details.ownerLabel, "reviewer-fix");
+        assert.ok(Array.isArray(error.details.safeActions));
+        assert.ok((error.details.safeActions as string[]).includes("inspect-blocking-session"));
+        assert.ok(Array.isArray(error.details.recoveryHints));
+        assert.ok((error.details.recoveryHints as string[]).length > 0);
+        return true;
+      },
+    );
+
+    // authorizeOperation reaches the identical blocking-session evidence
+    // through the independent guard/authorize decision path.
+    const decision = secondRegistry.authorizeOperation({
+      operation: "source-write",
+      resources: ["src/file.ts"],
+      sessionId: second.sessionId,
+    });
+    assert.equal(decision.allowed, false);
+    assert.equal(decision.code, "RESOURCE_CLAIM_CONFLICT");
+    assert.equal(decision.details.ownerSessionId, first.sessionId);
+    assert.equal(decision.details.ownerWorktree, first.worktreePath);
+    assert.equal(decision.details.ownerLabel, "reviewer-fix");
+    assert.ok((decision.details.safeActions as string[]).includes("inspect-blocking-session"));
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 interface RepositoryFixture {
   readonly repositoryPath: string;
   readonly linkedWorktreePath: string;
