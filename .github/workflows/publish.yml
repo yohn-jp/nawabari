@@ -177,9 +177,6 @@ jobs:
       - name: Lint
         run: pnpm run lint
 
-      - name: Provision sandbox-launcher test capability
-        uses: ./.workflow-source/.github/actions/provision-sandbox-launcher-test-capability
-
       - name: Typecheck
         run: pnpm run typecheck
 

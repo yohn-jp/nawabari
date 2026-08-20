@@ -26,6 +26,11 @@ pnpm run lint
 pnpm run verify
 ```
 
+`pnpm test` and `pnpm run verify` create the controlled sandbox-launcher
+fixture in a temporary unprivileged directory. No `sudo`, machine-global
+executable, or preinstalled bubblewrap is required. The separate real-isolation
+tests run only when genuine bubblewrap and kernel support are available.
+
 ## Making changes
 
 1. Create a branch off `main` using the Issue number.

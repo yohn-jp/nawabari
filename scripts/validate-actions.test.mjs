@@ -65,28 +65,23 @@ test("all repository-owned workflow and composite-action refs are pinned", () =>
   assert.ok(result.references.some((reference) => !reference.local));
 });
 
-test("all workflows running the required test suite provision the shared capability first", () => {
+test("required test workflows do not use machine-global sandbox provisioning", () => {
   const workflowFiles = repositoryActionFiles(repositoryRoot).filter((file) => file.startsWith(".github/workflows/"));
-  const provisionPattern = /uses:\s+\.\/[^\s]*\.github\/actions\/provision-sandbox-launcher-test-capability/u;
+  const forbiddenPattern = /provision-sandbox-launcher-test-capability|nawabari-sandbox-test-stub/u;
   const violations = [];
   let testWorkflowCount = 0;
 
   for (const file of workflowFiles) {
     const source = fs.readFileSync(path.join(repositoryRoot, file), "utf8");
-    const testIndex = source.indexOf("pnpm test");
-    if (testIndex === -1) continue;
+    if (!source.includes("pnpm test")) continue;
     testWorkflowCount += 1;
-    const provisionIndex = source.search(provisionPattern);
-    if (provisionIndex === -1 || provisionIndex > testIndex) violations.push(file);
+    if (forbiddenPattern.test(source)) violations.push(file);
   }
 
   assert.ok(testWorkflowCount > 0);
   assert.deepEqual(violations, []);
-  assert.match(
-    fs.readFileSync(
-      path.join(repositoryRoot, ".github/actions/provision-sandbox-launcher-test-capability/action.yml"),
-      "utf8",
-    ),
-    /sandbox-launcher-test-stub\.sh/u,
+  assert.equal(
+    fs.existsSync(path.join(repositoryRoot, ".github/actions/provision-sandbox-launcher-test-capability/action.yml")),
+    false,
   );
 });

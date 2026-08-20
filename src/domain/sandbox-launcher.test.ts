@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { LocalSessionBackend } from "./session-backend.js";
 import {
@@ -15,25 +16,43 @@ import {
 } from "./sandbox.js";
 
 /**
- * CI-declared, controlled/fake bubblewrap substitute (see
- * scripts/test-fixtures/sandbox-launcher-test-stub.sh and the workflow step
- * that installs it). It forwards the argv following the compiled `--`
- * separator to exec without establishing any sandbox isolation.
+ * Repository-owned, controlled/fake bubblewrap substitute. Each controlled
+ * test copies it into a temporary unprivileged user-tool directory and injects
+ * that directory through discoverSandboxRuntimeLayout(). It forwards the argv
+ * following the compiled `--` separator to exec without establishing any
+ * sandbox isolation.
  *
- * Tests below prefer real bubblewrap when the host genuinely has it
- * (`discoverSandboxRuntimeLayout()` resolves it), so this fallback never
- * masks real capability. When real bubblewrap is absent, it keeps
- * argv-construction, topology-validation, and output/timeout-bounding
- * coverage deterministic instead of depending on undeclared ambient host
- * state. It must never be presented as evidence of real bubblewrap
- * sandboxing; only the dedicated real-isolation test below claims that,
- * and only when it finds genuine bubblewrap.
+ * The controlled tests never depend on real bubblewrap or machine-global
+ * setup. They must never be presented as evidence of real bubblewrap
+ * sandboxing; only the dedicated real-isolation test below claims that, and
+ * only when it finds genuine bubblewrap.
  */
-const CONTROLLED_TEST_SANDBOX_EXECUTABLE = "/usr/local/bin/nawabari-sandbox-test-stub";
+const CONTROLLED_TEST_FIXTURE_SOURCE = fileURLToPath(
+  new URL("../../scripts/test-fixtures/sandbox-launcher-test-stub.sh", import.meta.url),
+);
 
-function resolveTestSandboxExecutable(discovered: string | null): string | null {
-  if (discovered !== null) return discovered;
-  return fs.existsSync(CONTROLLED_TEST_SANDBOX_EXECUTABLE) ? CONTROLLED_TEST_SANDBOX_EXECUTABLE : null;
+type ControlledSandboxFixture = {
+  readonly executable: string;
+  readonly layout: ReturnType<typeof discoverSandboxRuntimeLayout>;
+  readonly cleanup: () => void;
+};
+
+function createControlledSandboxFixture(): ControlledSandboxFixture {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-sandbox-launcher-fixture-"));
+  const home = path.join(root, "home");
+  const bin = path.join(home, ".local", "bin");
+  fs.mkdirSync(bin, { recursive: true, mode: 0o700 });
+  const executable = path.join(bin, "bwrap");
+  fs.copyFileSync(CONTROLLED_TEST_FIXTURE_SOURCE, executable);
+  fs.chmodSync(executable, 0o700);
+
+  const layout = discoverSandboxRuntimeLayout({ ...process.env, HOME: home, PATH: bin });
+  assert.equal(layout.bubblewrap, executable);
+  return {
+    executable,
+    layout,
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
 }
 
 function readyProbe(): SandboxProbe {
@@ -73,7 +92,7 @@ function runGit(args: readonly string[], cwd: string, throwOnError = true): stri
   });
 }
 
-async function resolvedRequest(repository: string, worktree: string) {
+async function resolvedRequest(repository: string, worktree: string, runtimeLayout = discoverSandboxRuntimeLayout()) {
   const backend = new LocalSessionBackend();
   const created = await backend.createSession(
     { cwd: repository },
@@ -85,17 +104,19 @@ async function resolvedRequest(repository: string, worktree: string) {
     { cwd: worktree },
     { session_id: created.value.session_id, enforce: true },
     readyProbe(),
-    discoverSandboxRuntimeLayout(),
+    runtimeLayout,
   );
   if (!request.ok) throw request.error;
-  return { ...request.value, sandbox_executable: resolveTestSandboxExecutable(request.value.sandbox_executable) };
+  return request.value;
 }
 
 test("compileSandboxInvocation emits fixed namespace/topology argv and terminates before command argv", async () => {
   const repository = createRepository();
   const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
   try {
-    const request = await resolvedRequest(repository, worktree);
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    assert.equal(request.sandbox_executable, fixture.executable);
     const compiled = compileSandboxInvocation(request, {
       command: "printf",
       args: ["%s", "literal; not shell syntax"],
@@ -117,6 +138,7 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
     assert.deepEqual(compiled.value.args.slice(terminator), ["--", "printf", "%s", "literal; not shell syntax"]);
     assert.ok(compiled.value.args.includes(worktree));
   } finally {
+    fixture.cleanup();
     removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
   }
@@ -125,8 +147,9 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
 test("compileSandboxInvocation rejects a path outside the fixed system profile", async () => {
   const repository = createRepository();
   const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
   try {
-    const request = await resolvedRequest(repository, worktree);
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
     const invalid = {
       ...request,
       filesystem: {
@@ -138,6 +161,7 @@ test("compileSandboxInvocation rejects a path outside the fixed system profile",
     assert.equal(compiled.ok, false);
     if (!compiled.ok) assert.equal(compiled.error.code, "SANDBOX_TOPOLOGY_INVALID");
   } finally {
+    fixture.cleanup();
     removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
   }
@@ -147,8 +171,9 @@ test("protected launcher fails closed when bubblewrap is unavailable or the work
   const repository = createRepository();
   const worktree = `${repository}-owned`;
   const alias = `${worktree}-alias`;
+  const fixture = createControlledSandboxFixture();
   try {
-    const request = await resolvedRequest(repository, worktree);
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
     const missingExecutable = compileSandboxInvocation({ ...request, sandbox_executable: null }, { command: "true" });
     assert.equal(missingExecutable.ok, false);
     if (!missingExecutable.ok) assert.equal(missingExecutable.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
@@ -163,6 +188,7 @@ test("protected launcher fails closed when bubblewrap is unavailable or the work
     assert.equal(rejected.ok, false);
     if (!rejected.ok) assert.equal(rejected.error.code, "SANDBOX_TOPOLOGY_INVALID");
   } finally {
+    fixture.cleanup();
     fs.rmSync(alias, { recursive: true, force: true });
     removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
@@ -172,8 +198,9 @@ test("protected launcher fails closed when bubblewrap is unavailable or the work
 test("sandboxed child limits are bounded and fail with stable errors", async () => {
   const repository = createRepository();
   const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
   try {
-    const request = await resolvedRequest(repository, worktree);
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
     const output = await runSandboxedCommand(
       request,
       { command: "node", args: ["-e", "process.stdout.write('0123456789')"] },
@@ -186,6 +213,7 @@ test("sandboxed child limits are bounded and fail with stable errors", async () 
     assert.equal(timeout.ok, false);
     if (!timeout.ok) assert.equal(timeout.error.code, "SANDBOX_EXECUTION_TIMEOUT");
   } finally {
+    fixture.cleanup();
     removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
   }

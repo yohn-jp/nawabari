@@ -232,9 +232,9 @@ function allowedUserToolPath(
   if (home === undefined || home === null) return null;
   if (!path.isAbsolute(home) || home.includes("\0")) return null;
   const normalized = path.normalize(candidate);
-  if (normalized === path.join(home, ".local", "bin")) return "local_bin";
-  if (normalized === path.join(home, ".local", "lib")) return "local_lib";
-  if (normalized === path.join(home, ".local", "share", "pnpm")) return "pnpm_bin";
+  if (pathMatches(normalized, path.join(home, ".local", "bin"))) return "local_bin";
+  if (pathMatches(normalized, path.join(home, ".local", "lib"))) return "local_lib";
+  if (pathMatches(normalized, path.join(home, ".local", "share", "pnpm"))) return "pnpm_bin";
   return null;
 }
 
