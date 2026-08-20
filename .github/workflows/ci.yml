@@ -132,9 +132,6 @@ jobs:
       - name: Lint
         run: pnpm run lint
 
-      - name: Provision sandbox-launcher test capability
-        uses: ./.github/actions/provision-sandbox-launcher-test-capability
-
       - name: Test
         run: pnpm test
 

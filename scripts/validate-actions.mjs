@@ -48,11 +48,15 @@ export function validateActionText(source, filePath = "<text>") {
 }
 
 export function repositoryActionFiles(root) {
+  const resolvedRoot = path.resolve(root);
   const output = execFileSync("git", ["ls-files", "--", ...ACTION_ROOTS], {
-    cwd: path.resolve(root),
+    cwd: resolvedRoot,
     encoding: "utf8",
   });
-  return output.split(/\r?\n/u).filter(Boolean);
+  return output
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .filter((file) => fs.existsSync(path.join(resolvedRoot, file)));
 }
 
 export function validateRepositoryActions(root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")) {
