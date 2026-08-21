@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { SessionRegistryError } from "./errors.js";
 import { defaultGit } from "./git.js";
 import { SessionRegistry } from "./session-registry.js";
+import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
 
 test("close removes a clean provisioned worktree and merged branch, and repeats idempotently", () => {
   const fixture = createRepositoryFixture();
@@ -201,6 +202,165 @@ test("discard converges after branch deletion failure without invoking close pro
     assert.equal(registry.discard(session.sessionId).idempotent, true);
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("discard converges after the final registry write fails once both worktree and branch are already gone", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-final-write-crash`;
+  const siblingWorktree = `${fixture.repositoryPath}-discard-final-write-sibling`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-final-write-crash" });
+    const sibling = registry.provision({
+      worktreePath: siblingWorktree,
+      branchName: "feature/discard-final-write-sibling",
+    });
+    registry.claim({
+      sessionId: session.sessionId,
+      claims: [{ resource: "final-write.txt", mode: "exclusive-write" }],
+    });
+    registry.claim({
+      sessionId: sibling.sessionId,
+      claims: [{ resource: "sibling-final-write.txt", mode: "exclusive-write" }],
+    });
+
+    fs.writeFileSync(path.join(worktreePath, "final-write.txt"), "discard final write crash\n");
+    runGit(["add", "final-write.txt"], worktreePath);
+    runGit(["commit", "-m", "discard final write crash candidate"], worktreePath);
+    const previousHead = runGit(["rev-parse", "HEAD"], worktreePath);
+
+    // First interrupt branch removal so terminal_operation=discard is
+    // durably persisted and the worktree is gone, but the session is still
+    // "closing" — this reaches the resuming path (both deletions become
+    // no-ops) so the fault below can target only the final write.
+    let failBranchRemoval = true;
+    const interruptedGit = {
+      run(args: readonly string[], cwd: string): string {
+        if (failBranchRemoval && args[0] === "branch" && args[1] === "-D") {
+          failBranchRemoval = false;
+          throw new Error("simulated branch deletion failure");
+        }
+        return defaultGit.run(args, cwd);
+      },
+    };
+    assert.throws(
+      () => new SessionRegistry({ repository: registry.repository, git: interruptedGit }).discard(session.sessionId),
+      /simulated branch deletion failure/u,
+    );
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+    assert.equal(registry.get(session.sessionId)?.state, "closing");
+
+    assert.throws(
+      () =>
+        withRegistryTempFileFsyncFailure(registry.paths.directory, "EIO", () =>
+          new SessionRegistry({ repository: registry.repository }).discard(session.sessionId),
+        ),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_IO_FAILURE",
+    );
+
+    // Both physical deletions already committed before the crash; only the
+    // final registry write (closed state + claim release) failed.
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+    assert.equal(registry.get(session.sessionId)?.state, "closing");
+    assert.equal(registry.get(session.sessionId)?.terminalOperation, "discard");
+    assert.equal(registry.get(session.sessionId)?.discardedHead, previousHead);
+    assert.equal(registry.listClaims(session.sessionId).length, 1);
+
+    assert.equal(registry.get(sibling.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(siblingWorktree), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, sibling.branchName), true);
+    assert.equal(registry.listClaims(sibling.sessionId).length, 1);
+
+    const retried = registry.discard(session.sessionId);
+    assert.equal(retried.session.state, "closed");
+    assert.equal(retried.session.terminalOperation, "discard");
+    assert.equal(retried.previousHead, previousHead);
+    assert.equal(retried.worktreeRemoved, true);
+    assert.equal(retried.branchRemoved, true);
+    assert.equal(retried.releasedClaims.length, 1);
+    assert.equal(retried.idempotent, false);
+    assert.deepEqual(registry.listClaims(session.sessionId), []);
+
+    assert.equal(registry.get(sibling.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(siblingWorktree), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, sibling.branchName), true);
+    assert.equal(registry.listClaims(sibling.sessionId).length, 1);
+
+    assert.equal(registry.discard(session.sessionId).idempotent, true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    removeWorktree(fixture.repositoryPath, siblingWorktree);
+    fixture.cleanup();
+  }
+});
+
+test("discard converges after the terminal-state write's durability is uncertain immediately after persisting", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-preflight-crash`;
+  const siblingWorktree = `${fixture.repositoryPath}-discard-preflight-sibling`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-preflight-crash" });
+    const sibling = registry.provision({
+      worktreePath: siblingWorktree,
+      branchName: "feature/discard-preflight-sibling",
+    });
+    registry.claim({ sessionId: session.sessionId, claims: [{ resource: "preflight.txt", mode: "exclusive-write" }] });
+    registry.claim({
+      sessionId: sibling.sessionId,
+      claims: [{ resource: "sibling-preflight.txt", mode: "exclusive-write" }],
+    });
+
+    fs.writeFileSync(path.join(worktreePath, "preflight.txt"), "discard preflight crash\n");
+    runGit(["add", "preflight.txt"], worktreePath);
+    runGit(["commit", "-m", "discard preflight crash candidate"], worktreePath);
+    const previousHead = runGit(["rev-parse", "HEAD"], worktreePath);
+
+    // The directory-fsync fault lands after the rename has already
+    // committed: the write that records terminal_operation=discard may have
+    // already taken effect even though the call throws, so recovery must
+    // not assume it did not happen.
+    assert.throws(
+      () =>
+        withDirectoryFsyncFailure(registry.paths.directory, "EIO", () =>
+          new SessionRegistry({ repository: registry.repository }).discard(session.sessionId),
+        ),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_DURABILITY_UNCERTAIN",
+    );
+
+    assert.equal(registry.get(session.sessionId)?.state, "closing");
+    assert.equal(registry.get(session.sessionId)?.terminalOperation, "discard");
+    assert.equal(registry.get(session.sessionId)?.discardedHead, previousHead);
+
+    assert.equal(registry.get(sibling.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(siblingWorktree), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, sibling.branchName), true);
+    assert.equal(registry.listClaims(sibling.sessionId).length, 1);
+
+    const retried = registry.discard(session.sessionId);
+    assert.equal(retried.session.state, "closed");
+    assert.equal(retried.session.terminalOperation, "discard");
+    assert.equal(retried.previousHead, previousHead);
+    assert.equal(retried.worktreeRemoved, true);
+    assert.equal(retried.branchRemoved, true);
+    assert.equal(retried.releasedClaims.length, 1);
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+    assert.deepEqual(registry.listClaims(session.sessionId), []);
+
+    assert.equal(registry.get(sibling.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(siblingWorktree), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, sibling.branchName), true);
+    assert.equal(registry.listClaims(sibling.sessionId).length, 1);
+
+    assert.equal(registry.discard(session.sessionId).idempotent, true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    removeWorktree(fixture.repositoryPath, siblingWorktree);
     fixture.cleanup();
   }
 });
