@@ -9,7 +9,7 @@
       "kind": "input",
       "type": "string",
       "label": "Release PR",
-      "placeholder": "Release PRs use a `release/*` head branch. This naming convention is an\noperational classification only; it is not an authorization or security\nboundary.",
+      "placeholder": "Release PRs use a `release/<semver>` head branch, for example\n`release/1.2.3`. This naming convention is an operational classification only;\nit is not an authorization or security boundary.",
       "headingLevel": 1
     },
     {
