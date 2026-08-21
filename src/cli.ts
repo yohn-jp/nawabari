@@ -96,13 +96,16 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "session show",
     summary: "Show the current or selected session",
-    usage: `${CLI_NAME} session show [--session <id>]`,
+    usage: `${CLI_NAME} session show [<session-id>|--session <id>]`,
     options: [option("--session", "Select a session instead of the current worktree owner", { value: "<id>" })],
+    notes: [
+      "Target grammar is consistent: an optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+    ],
   },
   {
     name: "session inspect",
     summary: "Report side-effect-free close/cleanup readiness for a session",
-    usage: `${CLI_NAME} session inspect [--session <id>] [--integrated-revision <rev>]`,
+    usage: `${CLI_NAME} session inspect [<session-id>|--session <id>] [--integrated-revision <rev>]`,
     options: [
       option("--session", "Select a session instead of the current worktree owner", { value: "<id>" }),
       option(
@@ -115,6 +118,7 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
       "Read-only: never mutates session, claim, Git, worktree, branch, or registry state. Repeated calls are idempotent.",
       "Derived from the same authoritative close/cleanup Git evidence as session close; does not duplicate or diverge from that logic.",
       "Nawabari never queries GitHub or any remote provider; --integrated-revision only names a local revision for Nawabari to independently verify.",
+      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
   },
   {
@@ -140,18 +144,21 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "session claim",
     summary: "Add a canonical resource claim",
-    usage: `${CLI_NAME} session claim --resource <path-or-glob> --mode <read|write|exclusive-write> [--session <id>]`,
+    usage: `${CLI_NAME} session claim [<session-id>] --resource <path-or-glob> --mode <read|write|exclusive-write>`,
     options: [
       option("--resource", "Repository-relative resource", { value: "<path-or-glob>", required: true }),
       option("--mode", "Granted claim mode", { value: "<read|write|exclusive-write>", required: true }),
       option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
       option("--repository", "Expected repository identity", { value: "<id>" }),
     ],
+    notes: [
+      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+    ],
   },
   {
     name: "session update",
     summary: "Atomically replace a session's complete resource claim set",
-    usage: `${CLI_NAME} session update --resource <path-or-glob> --mode <read|write|exclusive-write> [--resource <path-or-glob> --mode <read|write|exclusive-write> ...] [--session <id>]`,
+    usage: `${CLI_NAME} session update [<session-id>] --resource <path-or-glob> --mode <read|write|exclusive-write> [--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
     options: [
       option(
         "--resource",
@@ -172,33 +179,43 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
       "The desired claim set fully replaces the session's current claims in one updateClaims() transaction; " +
         "on any invalid or conflicting claim the prior set is left unchanged.",
       "Each --resource must be immediately followed by its own --mode; pairing is positional adjacency, not flag order.",
+      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
   },
   {
     name: "session claims",
     summary: "List canonical resource claims",
-    usage: `${CLI_NAME} session claims [--session <id>]`,
+    usage: `${CLI_NAME} session claims [<session-id>|--session <id>]`,
     options: [option("--session", "Select a session; omitted lists all claims", { value: "<id>" })],
+    notes: [
+      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+    ],
   },
   {
     name: "session release",
     summary: "Release resource claims",
-    usage: `${CLI_NAME} session release [--session <id>] [--claim-id <id>]`,
+    usage: `${CLI_NAME} session release [<session-id>|--session <id>] [--claim-id <id>]`,
     options: [
       option("--session", "Target session; omitted resolves the current owner", { value: "<id>" }),
       option("--claim-id", "Release only one claim; omitted releases all owned claims", { value: "<id>" }),
+    ],
+    notes: [
+      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
   },
   {
     name: "resource claim",
     summary: "Add a canonical resource claim (alias)",
-    usage: `${CLI_NAME} resource claim --resource <path-or-glob> --mode <read|write|exclusive-write>`,
+    usage: `${CLI_NAME} resource claim [<session-id>|--session <id>] --resource <path-or-glob> --mode <read|write|exclusive-write>`,
     options: [],
+    notes: [
+      "Target grammar matches session claim: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+    ],
   },
   {
     name: "resource update",
     summary: "Atomically replace a session's complete resource claim set (alias)",
-    usage: `${CLI_NAME} resource update --resource <path-or-glob> --mode <read|write|exclusive-write> [--resource <path-or-glob> --mode <read|write|exclusive-write> ...] [--session <id>]`,
+    usage: `${CLI_NAME} resource update [<session-id>|--session <id>] --resource <path-or-glob> --mode <read|write|exclusive-write> [--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
     options: [
       option(
         "--resource",
@@ -219,27 +236,34 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
       "The desired claim set fully replaces the session's current claims in one updateClaims() transaction; " +
         "on any invalid or conflicting claim the prior set is left unchanged.",
       "Each --resource must be immediately followed by its own --mode; pairing is positional adjacency, not flag order.",
+      "Target grammar matches session update: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
   },
   {
     name: "resource list",
     summary: "List canonical resource claims (alias)",
-    usage: `${CLI_NAME} resource list [--session <id>]`,
+    usage: `${CLI_NAME} resource list [<session-id>|--session <id>]`,
     options: [option("--session", "Select a session; omitted lists all claims", { value: "<id>" })],
+    notes: [
+      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+    ],
   },
   {
     name: "resource release",
     summary: "Release resource claims (alias)",
-    usage: `${CLI_NAME} resource release [--session <id>] [--claim-id <id>]`,
+    usage: `${CLI_NAME} resource release [<session-id>|--session <id>] [--claim-id <id>]`,
     options: [
       option("--session", "Target session; omitted resolves the current owner", { value: "<id>" }),
       option("--claim-id", "Release only one claim; omitted releases all owned claims", { value: "<id>" }),
+    ],
+    notes: [
+      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
   },
   {
     name: "session close",
     summary: "Close the current or selected session",
-    usage: `${CLI_NAME} session close [--session <id>] [--integrated-revision <rev>]`,
+    usage: `${CLI_NAME} session close [<session-id>|--session <id>] [--integrated-revision <rev>]`,
     options: [
       option("--session", "Select a session instead of the current worktree owner", { value: "<id>" }),
       option(
@@ -251,6 +275,24 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     notes: [
       "Ordinary ancestry-based close remains the cheap/default path and requires no flags.",
       "Nawabari never queries GitHub or any remote provider; --integrated-revision only names a local revision for Nawabari to independently verify.",
+      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+    ],
+  },
+  {
+    name: "session discard",
+    summary: "Explicitly discard one selected session and its owned resources",
+    usage: `${CLI_NAME} session discard <session-id>|--session <id>`,
+    options: [
+      option("--session", "Required explicit target; the current session is never inferred", {
+        value: "<id>",
+        required: true,
+      }),
+    ],
+    notes: [
+      "Destructive and explicit: unintegrated commits and uncommitted work in the selected owned worktree may be destroyed.",
+      "Discard never changes close, gc, doctor, reconciliation, or integration-lineage proof behavior.",
+      "Use exactly one target form: positional <session-id> or --session <id>; do not supply both.",
+      "Machine JSON mode is non-interactive and deterministic.",
     ],
   },
   {
@@ -417,6 +459,13 @@ function helpPayload(spec: HelpCommandSpec): JsonObject {
       commit_options: optionsFor("commit"),
       push_options: optionsFor("push"),
       gc_options: optionsFor("gc"),
+      session_targeting: {
+        canonical: "--session <id>",
+        positional_alias: "<session-id> as the first argument after a session-scoped subcommand",
+        commands: ["show", "inspect", "claim", "claims", "release", "update", "close", "discard"],
+        ambiguity: "supplying both positional and --session is rejected",
+        discard_requires_explicit_target: true,
+      },
     };
   }
   const options = spec.options.map((candidate) => ({
@@ -688,6 +737,47 @@ function noOptions(arguments_: string[]): DomainResult<ParsedOptions> {
   return parseOptions(arguments_, new Set());
 }
 
+type PositionalSessionTarget = {
+  readonly sessionId: string | null;
+  readonly arguments: string[];
+};
+
+/** One unambiguous positional alias shared by every session-targeted command. */
+function splitPositionalSessionTarget(arguments_: string[]): DomainResult<PositionalSessionTarget> {
+  const first = arguments_[0];
+  if (first === undefined || first.startsWith("-")) {
+    return { ok: true, value: { sessionId: null, arguments: arguments_ } };
+  }
+  return { ok: true, value: { sessionId: first, arguments: arguments_.slice(1) } };
+}
+
+function parseTargetedOptions(
+  arguments_: string[],
+  allowed: ReadonlySet<string>,
+  required = false,
+): DomainResult<ParsedOptions> {
+  const positional = splitPositionalSessionTarget(arguments_);
+  if (!positional.ok) return positional;
+  const parsed = parseOptions(positional.value.arguments, allowed);
+  if (!parsed.ok) return parsed;
+  if (positional.value.sessionId !== null && parsed.value.session_id !== null) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "Specify a session target either positionally or with --session, not both.", {
+        option: "--session",
+      }),
+    );
+  }
+  parsed.value.session_id = positional.value.sessionId ?? parsed.value.session_id;
+  if (required && parsed.value.session_id === null) {
+    return failure(
+      usageError("MISSING_ARGUMENT", "An explicit session target is required; use <session-id> or --session <id>.", {
+        option: "--session",
+      }),
+    );
+  }
+  return parsed;
+}
+
 type ClaimReplacementPairs = {
   session_id: string | null;
   repository: string | null;
@@ -703,13 +793,17 @@ type ClaimReplacementPairs = {
  * with the wrong mode.
  */
 function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimReplacementPairs> {
+  const positional = splitPositionalSessionTarget(arguments_);
+  if (!positional.ok) return positional;
   let sessionId: string | null = null;
   let repository: string | null = null;
   const pairs: Array<{ resource: string; mode: string }> = [];
   let pendingResource: string | null = null;
 
-  for (let index = 0; index < arguments_.length; index += 1) {
-    const { name, inlineValue } = optionParts(arguments_[index]);
+  sessionId = positional.value.sessionId;
+  const targetArguments = positional.value.arguments;
+  for (let index = 0; index < targetArguments.length; index += 1) {
+    const { name, inlineValue } = optionParts(targetArguments[index]);
     if (name !== "--session" && name !== "--repository" && name !== "--resource" && name !== "--mode") {
       return failure(usageError("INVALID_ARGUMENT", `Unknown option: ${name}.`, { option: name }));
     }
@@ -723,14 +817,20 @@ function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimRep
       );
     }
 
-    const value = inlineValue ?? arguments_[index + 1];
+    const value = inlineValue ?? targetArguments[index + 1];
     if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-"))) {
       return failure(usageError("MISSING_ARGUMENT", `${name} requires a value.`, { option: name }));
     }
     if (inlineValue === null) index += 1;
 
-    if (name === "--session") sessionId = value;
-    else if (name === "--repository") repository = value;
+    if (name === "--session") {
+      if (sessionId !== null) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "Specify a session target either positionally or with --session, not both."),
+        );
+      }
+      sessionId = value;
+    } else if (name === "--repository") repository = value;
     else if (name === "--resource") pendingResource = value;
     else {
       if (pendingResource === null) {
@@ -892,14 +992,14 @@ async function executeCommand(
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "claims") {
-      const parsed = parseOptions(rest, new Set(["--session"]));
+      const parsed = parseTargetedOptions(rest, new Set(["--session"]));
       if (!parsed.ok) return parsed;
       if (dependencies.backend.listClaims === undefined) return claimCapabilityUnavailable("claims");
       const result = await dependencies.backend.listClaims(context, parsed.value.session_id);
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "release") {
-      const parsed = parseOptions(rest, new Set(["--session", "--claim-id"]));
+      const parsed = parseTargetedOptions(rest, new Set(["--session", "--claim-id"]));
       if (!parsed.ok) return parsed;
       if (dependencies.backend.releaseClaims === undefined) return claimCapabilityUnavailable("release");
       const result = await dependencies.backend.releaseClaims(context, {
@@ -951,7 +1051,7 @@ async function executeCommand(
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "inspect") {
-      const parsed = parseOptions(rest, new Set(["--session", "--integrated-revision"]));
+      const parsed = parseTargetedOptions(rest, new Set(["--session", "--integrated-revision"]));
       if (!parsed.ok) return parsed;
       if (dependencies.backend.sessionDiagnostic === undefined) return sessionDiagnosticCapabilityUnavailable();
       const options: SessionDiagnosticOptions = {
@@ -959,6 +1059,13 @@ async function executeCommand(
         integrated_revision: parsed.value.integrated_revision,
       };
       const result = await dependencies.backend.sessionDiagnostic(context, options);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (subcommand === "discard") {
+      const parsed = parseTargetedOptions(rest, new Set(["--session"]), true);
+      if (!parsed.ok) return parsed;
+      if (dependencies.backend.discardSession === undefined) return sessionDiscardCapabilityUnavailable();
+      const result = await dependencies.backend.discardSession(context, parsed.value.session_id as string);
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "id" || subcommand === "show" || subcommand === "close") {
@@ -970,7 +1077,7 @@ async function executeCommand(
         return { ok: true, value: { session_id: selected.value.session_id } };
       }
 
-      const parsed = parseOptions(
+      const parsed = parseTargetedOptions(
         rest,
         new Set(subcommand === "close" ? ["--session", "--integrated-revision"] : ["--session"]),
       );
@@ -1025,14 +1132,14 @@ async function executeCommand(
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (resourceSubcommand === "list" || resourceSubcommand === "claims") {
-      const parsed = parseOptions(rest, new Set(["--session"]));
+      const parsed = parseTargetedOptions(rest, new Set(["--session"]));
       if (!parsed.ok) return parsed;
       if (dependencies.backend.listClaims === undefined) return claimCapabilityUnavailable("list");
       const result = await dependencies.backend.listClaims(context, parsed.value.session_id);
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (resourceSubcommand === "release") {
-      const parsed = parseOptions(rest, new Set(["--session", "--claim-id"]));
+      const parsed = parseTargetedOptions(rest, new Set(["--session", "--claim-id"]));
       if (!parsed.ok) return parsed;
       if (dependencies.backend.releaseClaims === undefined) return claimCapabilityUnavailable("release");
       const result = await dependencies.backend.releaseClaims(context, {
@@ -1315,6 +1422,14 @@ function sessionDiagnosticCapabilityUnavailable(): DomainResult<JsonObject> {
   return failure(
     new DomainError("BACKEND_UNAVAILABLE", "Session diagnostic capability is not available.", {
       operation: "session.inspect",
+    }),
+  );
+}
+
+function sessionDiscardCapabilityUnavailable(): DomainResult<JsonObject> {
+  return failure(
+    new DomainError("BACKEND_UNAVAILABLE", "Session discard capability is not available.", {
+      operation: "session.discard",
     }),
   );
 }

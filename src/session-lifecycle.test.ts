@@ -104,6 +104,137 @@ test("close refuses a clean branch containing commits not retained by the integr
   }
 });
 
+test("explicit discard destroys only the selected recoverable session and is idempotent", () => {
+  const fixture = createRepositoryFixture();
+  const discardWorktree = `${fixture.repositoryPath}-explicit-discard`;
+  const siblingWorktree = `${fixture.repositoryPath}-discard-sibling`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const discarded = registry.provision({ worktreePath: discardWorktree, branchName: "feature/explicit-discard" });
+    const sibling = registry.provision({ worktreePath: siblingWorktree, branchName: "feature/discard-sibling" });
+    registry.claim({ sessionId: discarded.sessionId, claims: [{ resource: "discard.txt", mode: "exclusive-write" }] });
+    registry.claim({ sessionId: sibling.sessionId, claims: [{ resource: "sibling.txt", mode: "exclusive-write" }] });
+
+    fs.writeFileSync(path.join(discardWorktree, "discard.txt"), "intentionally disposable\n");
+    runGit(["add", "discard.txt"], discardWorktree);
+    runGit(["commit", "-m", "unintegrated disposable work"], discardWorktree);
+    const previousHead = runGit(["rev-parse", "HEAD"], discardWorktree);
+
+    assertRegistryError(() => registry.close(discarded.sessionId), "RECOVERABLE_COMMITS");
+    const gc = registry.garbageCollect({ apply: false, staleAfterMs: 0 });
+    assert.equal(gc.cleaned.length, 0);
+    assert.equal(gc.blocked[0]?.sessionId, discarded.sessionId);
+    assert.equal(gc.blocked[0]?.code, "RECOVERABLE_COMMITS");
+    assert.equal(registry.get(discarded.sessionId)?.state, "active");
+    const diagnostic = registry.diagnose(discarded.sessionId);
+    assert.ok(diagnostic.safeActions.includes("discard-session"));
+    assert.equal(diagnostic.blockers[0]?.details.currentSessionHead, previousHead);
+    assert.equal(diagnostic.blockers[0]?.details.suppliedIntegratedRevision, "<none>");
+    assert.equal(diagnostic.blockers[0]?.details.lineageProof, "unproven");
+    assert.equal(diagnostic.blockers[0]?.details.contentProof, "not-attempted");
+
+    const result = registry.discard({ sessionId: discarded.sessionId });
+    assert.equal(result.operation, "discard");
+    assert.equal(result.previousHead, previousHead);
+    assert.equal(result.worktreeRemoved, true);
+    assert.equal(result.branchRemoved, true);
+    assert.equal(result.releasedClaims.length, 1);
+    assert.equal(result.session.state, "closed");
+    assert.equal(result.session.terminalOperation, "discard");
+    assert.equal(result.session.discardedHead, previousHead);
+    assert.equal(result.idempotent, false);
+    assert.equal(fs.existsSync(discardWorktree), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, discarded.branchName), false);
+    assert.deepEqual(registry.listClaims(discarded.sessionId), []);
+
+    assert.equal(registry.get(sibling.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(siblingWorktree), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, sibling.branchName), true);
+    assert.equal(registry.listClaims(sibling.sessionId).length, 1);
+
+    const repeated = registry.discard(discarded.sessionId);
+    assert.equal(repeated.idempotent, true);
+    assert.equal(repeated.previousHead, previousHead);
+    assert.equal(repeated.session.terminalOperation, "discard");
+  } finally {
+    removeWorktree(fixture.repositoryPath, discardWorktree);
+    removeWorktree(fixture.repositoryPath, siblingWorktree);
+    fixture.cleanup();
+  }
+});
+
+test("discard converges after branch deletion failure without invoking close proof", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-retry`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-retry" });
+    fs.writeFileSync(path.join(worktreePath, "retry.txt"), "discard retry\n");
+    runGit(["add", "retry.txt"], worktreePath);
+    runGit(["commit", "-m", "discard retry candidate"], worktreePath);
+    let failBranchRemoval = true;
+    const interruptedGit = {
+      run(args: readonly string[], cwd: string): string {
+        if (failBranchRemoval && args[0] === "branch" && args[1] === "-D") {
+          failBranchRemoval = false;
+          throw new Error("simulated branch deletion failure");
+        }
+        return defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () => new SessionRegistry({ repository: registry.repository, git: interruptedGit }).discard(session.sessionId),
+      /simulated branch deletion failure/u,
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "closing");
+    assert.equal(registry.get(session.sessionId)?.terminalOperation, "discard");
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+
+    const retried = registry.discard(session.sessionId);
+    assert.equal(retried.session.state, "closed");
+    assert.equal(retried.session.terminalOperation, "discard");
+    assert.equal(retried.worktreeRemoved, true);
+    assert.equal(retried.branchRemoved, true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+    assert.equal(registry.discard(session.sessionId).idempotent, true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("discard fails closed for wrong branch and missing physical ownership", () => {
+  const fixture = createRepositoryFixture();
+  const wrongBranchWorktree = `${fixture.repositoryPath}-discard-wrong-branch`;
+  const missingWorktree = `${fixture.repositoryPath}-discard-missing`;
+  const detachedWorktree = `${fixture.repositoryPath}-discard-detached`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const wrongBranch = registry.provision({ worktreePath: wrongBranchWorktree, branchName: "feature/discard-wrong" });
+    runGit(["checkout", "-b", "feature/discard-hijacked"], wrongBranchWorktree);
+    assertRegistryError(() => registry.discard(wrongBranch.sessionId), "OWNERSHIP_MISMATCH");
+    assert.equal(registry.get(wrongBranch.sessionId)?.state, "active");
+
+    const missing = registry.provision({ worktreePath: missingWorktree, branchName: "feature/discard-missing" });
+    fs.rmSync(missingWorktree, { recursive: true, force: true });
+    assertRegistryError(() => registry.discard(missing.sessionId), "OWNERSHIP_MISMATCH");
+    assert.equal(registry.get(missing.sessionId)?.state, "active");
+    assert.equal(hasLocalBranch(fixture.repositoryPath, missing.branchName), true);
+
+    const detached = registry.provision({ worktreePath: detachedWorktree, branchName: "feature/discard-detached" });
+    runGit(["checkout", "--detach", "HEAD"], detachedWorktree);
+    assertRegistryError(() => registry.discard(detached.sessionId), "OWNERSHIP_MISMATCH");
+    assert.equal(registry.get(detached.sessionId)?.state, "active");
+  } finally {
+    removeWorktree(fixture.repositoryPath, wrongBranchWorktree);
+    removeWorktree(fixture.repositoryPath, missingWorktree);
+    removeWorktree(fixture.repositoryPath, detachedWorktree);
+    fixture.cleanup();
+  }
+});
+
 test("close fails closed when Git moved the owned branch to another worktree", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = `${fixture.repositoryPath}-mismatched-close`;

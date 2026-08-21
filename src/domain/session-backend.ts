@@ -31,6 +31,7 @@ import {
   type SessionBackend,
   type SessionCloseOptions,
   type SessionCloseResult,
+  type SessionDiscardResult,
   type SessionContext,
   type SessionCreateOptions,
   type SessionDiagnostic,
@@ -364,6 +365,15 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
+  public discardSession(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardResult>> {
+    try {
+      const result = this.registryFor(context).discard({ sessionId });
+      return Promise.resolve(success(toDomainSessionDiscardResult(result)));
+    } catch (error: unknown) {
+      return Promise.resolve(failure(toDomainError(error)));
+    }
+  }
+
   public sessionDiagnostic(
     context: SessionContext,
     options: SessionDiagnosticOptions,
@@ -478,6 +488,8 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
     updated_at: record.updatedAt,
     ...(record.baseRevision === undefined ? {} : { base_revision: record.baseRevision }),
     ...(record.label === undefined ? {} : { label: record.label }),
+    ...(record.terminalOperation === undefined ? {} : { terminal_operation: record.terminalOperation }),
+    ...(record.discardedHead === undefined ? {} : { discarded_head: record.discardedHead }),
   };
 }
 
@@ -687,6 +699,26 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
             proof: toDomainIntegrationProof(diagnostic.integrationEvidence.proof),
           }),
     },
+  };
+}
+
+function toDomainSessionDiscardResult(
+  result: import("../session-registry.js").DiscardSessionResult,
+): SessionDiscardResult {
+  return {
+    schema_version: result.schemaVersion,
+    operation: result.operation,
+    session: toDomainRecord(result.session),
+    final_state: result.finalState,
+    previous_head: result.previousHead,
+    worktree_path: result.worktreePath,
+    branch_name: result.branchName,
+    worktree_removed: result.worktreeRemoved,
+    branch_removed: result.branchRemoved,
+    released_claims: result.releasedClaims.map(toDomainClaim),
+    released_claim_count: result.releasedClaimCount,
+    released_claims_truncated: result.releasedClaimsTruncated,
+    idempotent: result.idempotent,
   };
 }
 

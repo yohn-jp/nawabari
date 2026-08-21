@@ -15,6 +15,7 @@ import type {
   SessionCreateOptions,
   SessionDiagnostic,
   SessionDiagnosticOptions,
+  SessionDiscardResult,
   SessionRecord,
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
@@ -240,6 +241,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "resource list",
       "resource release",
       "session close",
+      "session discard",
       "authorize",
       "checkpoint",
       "evidence snapshot",
@@ -279,6 +281,13 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--create-upstream",
     ],
     gc_options: ["--apply", "--dry-run"],
+    session_targeting: {
+      canonical: "--session <id>",
+      positional_alias: "<session-id> as the first argument after a session-scoped subcommand",
+      commands: ["show", "inspect", "claim", "claims", "release", "update", "close", "discard"],
+      ambiguity: "supplying both positional and --session is rejected",
+      discard_requires_explicit_target: true,
+    },
   });
 });
 
@@ -492,6 +501,134 @@ test("session inspect forwards --session and --integrated-revision to the diagno
     command: "session inspect",
     ...diagnosticResult,
   });
+});
+
+test("session-scoped commands accept one consistent positional target and discard requires it", async () => {
+  let discardedSessionId: string | null = null;
+  const discardedResult: SessionDiscardResult = {
+    schema_version: 1,
+    operation: "discard",
+    session: { ...sampleSession, state: "closed", terminal_operation: "discard", discarded_head: "a".repeat(40) },
+    final_state: "closed",
+    previous_head: "a".repeat(40),
+    worktree_path: sampleSession.worktree,
+    branch_name: sampleSession.branch,
+    worktree_removed: true,
+    branch_removed: true,
+    released_claims: [],
+    released_claim_count: 0,
+    released_claims_truncated: false,
+    idempotent: false,
+  };
+  const backend = backendForTests({
+    discardSession: async (_context: SessionContext, sessionId: string) => {
+      discardedSessionId = sessionId;
+      return success(discardedResult);
+    },
+  });
+  const output = capture();
+  const positionalExit = await runCli(["session", "discard", sampleSession.session_id, "--json"], {
+    backend,
+    io: output.io,
+  });
+  assert.equal(positionalExit, 0);
+  assert.equal(discardedSessionId, sampleSession.session_id);
+  assert.deepEqual(JSON.parse(output.stdout[0]), { ok: true, command: "session discard", ...discardedResult });
+
+  const missingOutput = capture();
+  const missingExit = await runCli(["session", "discard", "--json"], { backend, io: missingOutput.io });
+  assert.equal(missingExit, 2);
+  assert.equal(JSON.parse(missingOutput.stdout[0]).code, "MISSING_ARGUMENT");
+
+  const ambiguousOutput = capture();
+  const ambiguousExit = await runCli(
+    ["session", "discard", sampleSession.session_id, "--session", sampleSession.session_id, "--json"],
+    { backend, io: ambiguousOutput.io },
+  );
+  assert.equal(ambiguousExit, 2);
+  assert.equal(JSON.parse(ambiguousOutput.stdout[0]).code, "INVALID_ARGUMENT");
+});
+
+test("discard help JSON makes explicit targeting and destructive semantics discoverable", async () => {
+  const output = capture();
+  const exitCode = await runCli(["session", "discard", "--help", "--json"], { io: output.io });
+  assert.equal(exitCode, 0);
+  const response = JSON.parse(output.stdout[0]);
+  assert.deepEqual(response.required_options, ["--session"]);
+  assert.match(response.usage, /<session-id>\|--session <id>/u);
+  assert.ok(response.notes.some((note: string) => note.includes("exactly one target form")));
+});
+
+test("all session target aliases carry the same positional session identity", async () => {
+  const seen: string[] = [];
+  const backend = backendForTests({
+    getSession: async (_context: SessionContext, sessionId: string) => {
+      seen.push(`show:${sessionId}`);
+      return success(sampleSession);
+    },
+    sessionDiagnostic: async (_context: SessionContext, options: SessionDiagnosticOptions) => {
+      seen.push(`inspect:${options.session_id}`);
+      return success({
+        schema_version: 1,
+        session_id: sampleSession.session_id,
+        repository: sampleSession.repository,
+        worktree: sampleSession.worktree,
+        branch: sampleSession.branch,
+        session: sampleSession,
+        claims: [],
+        physical_state: "healthy",
+        close_readiness: "ready",
+        cleanup_readiness: "not_due",
+        result_state: "complete",
+        idempotent: false,
+        blockers: [],
+        safe_actions: ["close-session"],
+        integration_evidence: { supplied: false },
+      } satisfies SessionDiagnostic);
+    },
+    closeSession: async (_context: SessionContext, options) => {
+      seen.push(`close:${options.session_id}`);
+      return success({ session: sampleSession, worktree_removed: true, branch_removed: true });
+    },
+    claimResources: async (_context: SessionContext, options: ClaimResourcesOptions) => {
+      seen.push(`claim:${options.session_id}`);
+      return success({ session: sampleSession, claims: [], added: [], released: [], idempotent: false });
+    },
+    updateClaims: async (_context: SessionContext, options: ClaimResourcesOptions) => {
+      seen.push(`update:${options.session_id}`);
+      return success({ session: sampleSession, claims: [], added: [], released: [], idempotent: false });
+    },
+    listClaims: async (_context: SessionContext, sessionId: string | null) => {
+      seen.push(`claims:${sessionId}`);
+      return success({ claims: [] });
+    },
+    releaseClaims: async (_context: SessionContext, options) => {
+      seen.push(`release:${options.session_id}`);
+      return success({ session_id: options.session_id ?? "", released: [], remaining: [], idempotent: false });
+    },
+  });
+  const commands = [
+    ["session", "show", sampleSession.session_id, "--json"],
+    ["session", "inspect", sampleSession.session_id, "--json"],
+    ["session", "claim", sampleSession.session_id, "--resource", "a.txt", "--mode", "read", "--json"],
+    ["session", "update", sampleSession.session_id, "--resource", "a.txt", "--mode", "read", "--json"],
+    ["session", "claims", sampleSession.session_id, "--json"],
+    ["session", "release", sampleSession.session_id, "--json"],
+    ["session", "close", sampleSession.session_id, "--json"],
+  ];
+  for (const command of commands) {
+    const output = capture();
+    assert.equal(await runCli(command, { backend, io: output.io }), 0, output.stderr.join("\n"));
+  }
+  assert.deepEqual(seen, [
+    `show:${sampleSession.session_id}`,
+    `inspect:${sampleSession.session_id}`,
+    `claim:${sampleSession.session_id}`,
+    `update:${sampleSession.session_id}`,
+    `claims:${sampleSession.session_id}`,
+    `release:${sampleSession.session_id}`,
+    `close:${sampleSession.session_id}`,
+  ]);
 });
 
 test("session inspect fails closed with BACKEND_UNAVAILABLE when the backend does not implement diagnostics", async () => {
@@ -1123,4 +1260,7 @@ test("capabilities --json exposes a machine-readable multi-claim replacement con
   const lifecycle = response.capabilities.find((capability) => capability.id === "session-lifecycle");
   assert.ok(lifecycle, "session-lifecycle capability must be discoverable");
   assert.equal("claim_set_replacement" in lifecycle, false);
+  const discard = response.capabilities.find((capability) => capability.id === "session-discard");
+  assert.ok(discard, "session-discard capability must be discoverable");
+  assert.ok(discard?.commands.includes("session discard"));
 });

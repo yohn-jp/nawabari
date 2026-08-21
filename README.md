@@ -94,6 +94,7 @@ The supported standalone sequence is:
 ```text
 session create -> session claim(s) -> authorize/checkpoint
 -> commit/push -> doctor (reconciliation) -> session close/gc
+-> explicit session discard only when the selected work is intentionally disposable
 ```
 
 The JSON envelope is one document on stdout. Success has `ok: true`, a
@@ -106,16 +107,17 @@ failure. Consumers must use these fields and codes, never human presentation.
 
 The result schemas expose the following identities:
 
-| Surface                | Versioned identities                                                             |
-| ---------------------- | -------------------------------------------------------------------------------- |
-| session lifecycle      | `session_id`, `repository`, `worktree`, `branch`, `state`                        |
-| claims                 | `claim_id`, `session_id`, `resource`, `mode`                                     |
-| authorization          | `operation`, `allowed`, `code`, `claim_ids`                                      |
-| checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim` |
-| repository evidence    | `session_id`, `base_revision`, `head`, `clean`, `paths.stats`, `evidence_hash`   |
-| bounded diff           | `from_revision`, `to_revision`, `paths`, `stats`, `patch`, `evidence_hash`       |
-| commit/push            | `commit_sha`, `remote`, `branch`, `target`, `relation`                           |
-| reconciliation/cleanup | `clean`, `issues`, `candidates`, `cleaned`, `blocked`, `recovery_hints`          |
+| Surface                | Versioned identities                                                                                                                |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| session lifecycle      | `session_id`, `repository`, `worktree`, `branch`, `state`                                                                           |
+| explicit discard       | `previous_head`, `worktree_removed`, `branch_removed`, `released_claims`, `final_state`, final `session.state`/`terminal_operation` |
+| claims                 | `claim_id`, `session_id`, `resource`, `mode`                                                                                        |
+| authorization          | `operation`, `allowed`, `code`, `claim_ids`                                                                                         |
+| checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim`                                                    |
+| repository evidence    | `session_id`, `base_revision`, `head`, `clean`, `paths.stats`, `evidence_hash`                                                      |
+| bounded diff           | `from_revision`, `to_revision`, `paths`, `stats`, `patch`, `evidence_hash`                                                          |
+| commit/push            | `commit_sha`, `remote`, `branch`, `target`, `relation`                                                                              |
+| reconciliation/cleanup | `clean`, `issues`, `candidates`, `cleaned`, `blocked`, `recovery_hints`                                                             |
 
 Git subprocesses are bounded at 10 seconds and 64 KiB of output; checkpoint
 evidence is bounded to 4,096 paths. `GIT_SPAWN_FAILED`, `GIT_TIMEOUT`,
@@ -162,10 +164,12 @@ machine identities; labels and branch names are separate display metadata.
 git nawabari session create --branch feature/example --worktree ../example-worktree --json
 git nawabari session id --json
 git nawabari session show --json
+git nawabari session show <session-id> --json
 git nawabari session list --json
 git nawabari status --json
 git nawabari guard --json
 git nawabari session close --json
+git nawabari session discard --session <session-id> --json
 git nawabari gc --dry-run --json
 git nawabari doctor --json
 ```
@@ -185,7 +189,14 @@ the resolved parent of that session's worktree.
 under the repository-scoped mutation lock. The default/integration worktree
 and its protected branch cannot be session resources. `session id` and the
 other current-session commands resolve ownership from the current worktree;
-callers do not need to repeat the session ID.
+callers do not need to repeat the session ID for current-owner operations.
+
+Session-scoped commands use one target grammar: the canonical `--session <id>`
+option is accepted everywhere, and `show`, `inspect`, `claim`, `claims`,
+`release`, `update`, `close`, and `discard` also accept one positional
+`<session-id>` immediately after the subcommand. Supplying both forms is
+rejected as ambiguous. `session discard` always requires one explicit target
+and never infers the current worktree owner.
 
 Close is conservative. Dirty worktrees, ambiguous ownership, mismatched Git
 state, and commits not proven reachable from the integration branch block
@@ -197,6 +208,17 @@ cleanup preflight and includes stable blocker codes and `recovery_hints` for
 every candidate that is not safe. Cleanup revalidates the physical worktree,
 branch, and `HEAD` observations immediately before each destructive Git
 operation.
+
+`session discard` is the sole explicit destructive abandonment path. It
+revalidates repository identity, the selected session, exact worktree/branch
+ownership, and session/worktree `HEAD` immediately before each Git mutation.
+It may destroy the selected session's unintegrated commits and uncommitted
+worktree contents, removes only that session's worktree/branch, releases only
+its claims, and records `terminal_operation: "discard"` plus the pre-discard
+`HEAD`. It never acts as an implicit fallback for `close`, `gc`, `doctor`, or
+reconciliation; sibling sessions remain untouched. A partial failure leaves a
+retryable closing record and a repeated discard converges or returns an
+explicit terminal idempotent result.
 
 Routine `session list` and `status` output excludes `closed` history and is
 limited to 64 records. Use `--all` (or `--history`) for an explicit complete
@@ -365,7 +387,11 @@ differs.
   supplied evidence failed to prove equivalence, versus `ambiguous` when Git
   observation itself was inconclusive. For supplied evidence, bounded
   `proofFailure` details distinguish an unauthoritative revision from a
-  tree-equivalence failure. Both surfaces reuse one authority, so a raw close
+  tree-equivalence failure. The bounded evidence also includes
+  `currentSessionHead`, `suppliedIntegratedRevision`, `resolvedIntegrationSha`,
+  `lineageProof`/`authorityProof`, and `contentProof`. `safe_actions` includes
+  `discard-session` only as an explicit user choice; it does not authorize an
+  implicit cleanup fallback. Both surfaces reuse one authority, so a raw close
   rejection and `session inspect` never drift apart.
 
 None of the above weakens fail-closed behavior, changes an error code's
