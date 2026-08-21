@@ -89,6 +89,14 @@ export type SessionCloseOptions = {
 export type IntegrationProof = {
   method: "ancestor" | "tree-equivalence";
   integrated_revision?: string;
+  lineage?: {
+    method: "integration-branch-ancestor";
+    integration_branch: string;
+    integrated_revision: string;
+  };
+  content?: {
+    method: "tree-equivalence";
+  };
 };
 
 export type SessionDiagnosticOptions = {

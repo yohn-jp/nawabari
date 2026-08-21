@@ -363,8 +363,10 @@ differs.
   could not prove the branch safe and a `--integrated-revision` proof might
   resolve it (e.g. after a squash/rebase merge), versus `blocked` when
   supplied evidence failed to prove equivalence, versus `ambiguous` when Git
-  observation itself was inconclusive. Both surfaces reuse one authority, so
-  a raw close rejection and `session inspect` never drift apart.
+  observation itself was inconclusive. For supplied evidence, bounded
+  `proofFailure` details distinguish an unauthoritative revision from a
+  tree-equivalence failure. Both surfaces reuse one authority, so a raw close
+  rejection and `session inspect` never drift apart.
 
 None of the above weakens fail-closed behavior, changes an error code's
 meaning, or performs any mutation while producing the rejection.

@@ -896,6 +896,80 @@ async function main() {
     );
     if (hazardClosed.status !== 0) fail("close did not retry after the recoverable commit became retained");
 
+    const selfReferenceWorktree = path.join(installDirectory, "packed-self-reference-worktree");
+    const selfReferenceCreated = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "create",
+          "--branch",
+          "feature/packed-self-reference",
+          "--worktree",
+          selfReferenceWorktree,
+          "--json",
+        ],
+        lifecycleRepository,
+      ),
+      "packed self-reference session create",
+    );
+    fs.writeFileSync(path.join(selfReferenceWorktree, "packed-self-reference.txt"), "must remain recoverable\n");
+    run("git", ["add", "packed-self-reference.txt"], { cwd: selfReferenceWorktree, env: gitEnvironment });
+    run("git", ["commit", "-m", "packed self-reference candidate"], {
+      cwd: selfReferenceWorktree,
+      env: gitEnvironment,
+    });
+    const selfReferenceInspect = invokeInstalled(
+      [
+        "session",
+        "inspect",
+        "--session",
+        selfReferenceCreated.session_id,
+        "--integrated-revision",
+        "feature/packed-self-reference",
+        "--json",
+      ],
+      lifecycleRepository,
+    );
+    const selfReferenceInspectJson = parseInstalledJson(selfReferenceInspect, "packed self-reference inspect");
+    if (
+      selfReferenceInspect.status !== 0 ||
+      selfReferenceInspectJson.close_readiness !== "blocked" ||
+      selfReferenceInspectJson.blockers?.[0]?.code !== "RECOVERABLE_COMMITS" ||
+      selfReferenceInspectJson.blockers?.[0]?.details?.proofFailure !== "integration-revision-not-authoritative"
+    ) {
+      fail("packed session inspect accepted self-referential integration evidence");
+    }
+    const selfReferenceClose = invokeInstalled(
+      [
+        "session",
+        "close",
+        "--session",
+        selfReferenceCreated.session_id,
+        "--integrated-revision",
+        "feature/packed-self-reference",
+        "--json",
+      ],
+      lifecycleRepository,
+    );
+    const selfReferenceCloseJson = parseInstalledJson(selfReferenceClose, "packed self-reference close");
+    if (
+      selfReferenceClose.status !== 3 ||
+      selfReferenceCloseJson.code !== "RECOVERABLE_COMMITS" ||
+      selfReferenceCloseJson.details?.proofFailure !== "integration-revision-not-authoritative"
+    ) {
+      fail("packed session close accepted self-referential integration evidence");
+    }
+    run("git", ["merge", "--ff-only", "feature/packed-self-reference"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+    const selfReferenceClosed = invokeInstalled(
+      ["session", "close", "--session", selfReferenceCreated.session_id, "--json"],
+      lifecycleRepository,
+    );
+    if (selfReferenceClosed.status !== 0)
+      fail("packed self-reference session did not close after ordinary integration");
+
     fs.writeFileSync(path.join(lifecycleWorktree, "recoverable.txt"), "keep until close is safe\n");
     for (let index = 0; index < 64; index += 1) {
       fs.writeFileSync(path.join(lifecycleWorktree, `dirty-${index}.txt`), "preserve\n");
@@ -1215,8 +1289,8 @@ async function main() {
       boundedList.status !== 0 ||
       boundedStatusJson.sessions?.length !== 0 ||
       boundedListJson.sessions?.length !== 0 ||
-      boundedStatusJson.closed_count !== 512 + 11 ||
-      boundedListJson.closed_count !== 512 + 11 ||
+      boundedStatusJson.closed_count !== 512 + 12 ||
+      boundedListJson.closed_count !== 512 + 12 ||
       boundedStatusJson.history_available !== true ||
       boundedListJson.history_available !== true ||
       boundedStatus.stdout.length > 4_000 ||

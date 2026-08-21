@@ -355,12 +355,170 @@ test("close proves a squash-merged session branch integrated via exact tree equi
     assert.equal(result.idempotent, false);
     assert.equal(result.integrationProof?.method, "tree-equivalence");
     assert.equal(result.integrationProof?.integratedRevision, integratedRevision);
+    assert.deepEqual(result.integrationProof?.lineage, {
+      method: "integration-branch-ancestor",
+      integrationBranch: "main",
+      integratedRevision,
+    });
+    assert.deepEqual(result.integrationProof?.content, { method: "tree-equivalence" });
     assert.equal(fs.existsSync(worktreePath), false);
     assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
 
     const repeated = registry.close({ sessionId: session.sessionId, integratedRevision });
     assert.equal(repeated.idempotent, true);
     assert.equal(repeated.session.state, "closed");
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("close rejects self-referential integration evidence and inspect reports the same blocker", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-self-reference`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feat/self-reference" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "self-reference must remain recoverable\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "self-reference candidate"], worktreePath);
+
+    const diagnostic = registry.diagnose({
+      sessionId: session.sessionId,
+      integratedRevision: session.branchName,
+    });
+    const diagnosticBlocker = diagnostic.blockers[0];
+    assert.equal(diagnostic.closeReadiness, "blocked");
+    assert.equal(diagnostic.resultState, "complete");
+    assert.equal(diagnosticBlocker?.code, "RECOVERABLE_COMMITS");
+    assert.equal(diagnosticBlocker?.details.proofMethod, "integration-lineage");
+    assert.equal(diagnosticBlocker?.details.proofStage, "lineage");
+    assert.equal(diagnosticBlocker?.details.proofFailure, "integration-revision-not-authoritative");
+
+    assert.throws(
+      () => registry.close({ sessionId: session.sessionId, integratedRevision: session.branchName }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "RECOVERABLE_COMMITS");
+        assert.equal(error.details.proofMethod, "integration-lineage");
+        assert.equal(error.details.proofFailure, "integration-revision-not-authoritative");
+        assert.equal(error.details.closeReadiness, diagnostic.closeReadiness);
+        assert.equal(error.details.resultState, diagnostic.resultState);
+        assert.deepEqual(
+          [...(error.details.safeActions as string[])].sort(),
+          [...diagnosticBlocker!.safeActions].sort(),
+        );
+        return true;
+      },
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("close rejects a same-tree sibling branch as non-authoritative evidence", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-sibling-session`;
+  const siblingWorktreePath = `${fixture.repositoryPath}-sibling-evidence`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feat/sibling-session" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "same tree, different branch\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "session equivalent content"], worktreePath);
+
+    runGit(["worktree", "add", "-b", "feat/sibling-evidence", siblingWorktreePath, "main"], fixture.repositoryPath);
+    fs.writeFileSync(path.join(siblingWorktreePath, "feature.txt"), "same tree, different branch\n");
+    runGit(["add", "feature.txt"], siblingWorktreePath);
+    runGit(["commit", "-m", "sibling equivalent content"], siblingWorktreePath);
+    const siblingRevision = runGit(["rev-parse", "feat/sibling-evidence"], fixture.repositoryPath);
+
+    const sessionRevision = runGit(["rev-parse", session.branchName], fixture.repositoryPath);
+    assert.equal(
+      runGit(["rev-parse", `${sessionRevision}^{tree}`], fixture.repositoryPath),
+      runGit(["rev-parse", `${siblingRevision}^{tree}`], fixture.repositoryPath),
+    );
+    assert.throws(
+      () => registry.close({ sessionId: session.sessionId, integratedRevision: "feat/sibling-evidence" }),
+      (error: unknown) => {
+        if (!(error instanceof SessionRegistryError)) return false;
+        assert.equal(error.code, "RECOVERABLE_COMMITS");
+        assert.equal(error.details.proofFailure, "integration-revision-not-authoritative");
+        assert.equal(error.details.integrationBranch, "main");
+        return true;
+      },
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    removeWorktree(fixture.repositoryPath, siblingWorktreePath);
+    runGitQuiet(["branch", "-D", "feat/sibling-evidence"], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
+test("close rejects an unreferenced equivalent commit even when its tree matches the session branch", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-detached-evidence`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feat/detached-evidence" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "detached equivalent content\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "session content"], worktreePath);
+    const sessionRevision = runGit(["rev-parse", session.branchName], fixture.repositoryPath);
+    const sessionTree = runGit(["rev-parse", `${sessionRevision}^{tree}`], fixture.repositoryPath);
+    const detachedRevision = runGit(
+      ["commit-tree", sessionTree, "-p", session.baseRevision!, "-m", "unreferenced equivalent content"],
+      fixture.repositoryPath,
+    );
+
+    assert.equal(runGit(["rev-parse", `${detachedRevision}^{tree}`], fixture.repositoryPath), sessionTree);
+    assert.throws(
+      () => registry.close({ sessionId: session.sessionId, integratedRevision: detachedRevision }),
+      (error: unknown) => {
+        if (!(error instanceof SessionRegistryError)) return false;
+        assert.equal(error.code, "RECOVERABLE_COMMITS");
+        assert.equal(error.details.proofFailure, "integration-revision-not-authoritative");
+        assert.equal(error.details.proofStage, "lineage");
+        return true;
+      },
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("close accepts a cherry-pick-equivalent revision anchored in integration history", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-cherry-pick`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feat/cherry-pick" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "cherry-pick content\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "original session change"], worktreePath);
+    const sessionRevision = runGit(["rev-parse", session.branchName], fixture.repositoryPath);
+
+    fs.writeFileSync(path.join(fixture.repositoryPath, "unrelated.txt"), "integration branch change\n");
+    runGit(["add", "unrelated.txt"], fixture.repositoryPath);
+    runGit(["commit", "-m", "unrelated integration change"], fixture.repositoryPath);
+    runGit(["cherry-pick", sessionRevision], fixture.repositoryPath);
+    const integratedRevision = runGit(["rev-parse", "main"], fixture.repositoryPath);
+
+    const result = registry.close({ sessionId: session.sessionId, integratedRevision });
+    assert.equal(result.session.state, "closed");
+    assert.equal(result.integrationProof?.method, "tree-equivalence");
+    assert.equal(result.integrationProof?.lineage?.method, "integration-branch-ancestor");
+    assert.equal(result.integrationProof?.lineage?.integrationBranch, "main");
+    assert.equal(result.integrationProof?.content?.method, "tree-equivalence");
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
     fixture.cleanup();
