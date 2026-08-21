@@ -165,10 +165,26 @@ export interface IntegrationEvidenceInput {
   readonly integratedRevision: string;
 }
 
+/** Git-native proof that the supplied revision belongs to authoritative integration history. */
+export interface IntegrationLineageProof {
+  readonly method: "integration-branch-ancestor";
+  readonly integrationBranch: string;
+  readonly integratedRevision: string;
+}
+
+/** Exact content proof performed only after the supplied revision is authoritative. */
+export interface IntegrationContentProof {
+  readonly method: "tree-equivalence";
+}
+
 /** Deterministic Git-native evidence proving a branch is safely reclaimable. */
 export interface IntegrationProof {
   readonly method: "ancestor" | "tree-equivalence";
   readonly integratedRevision?: string;
+  /** Additive proof detail for non-ancestry integration evidence. */
+  readonly lineage?: IntegrationLineageProof;
+  /** Additive proof detail for the exact changed-path comparison. */
+  readonly content?: IntegrationContentProof;
 }
 
 export interface GarbageCollectOptions {
@@ -2543,10 +2559,10 @@ export class SessionRegistry {
   /**
    * Prove a session branch is safe to reclaim. Ordinary ancestry is the
    * cheap/default path. When ancestry fails, a caller may supply bounded
-   * non-ancestry integration evidence (e.g. a squash/rebase-merge commit);
-   * Nawabari never trusts that assertion blindly and instead independently
-   * re-derives a deterministic, byte-exact Git tree-object equivalence proof
-   * before treating the branch as safely integrated.
+   * non-ancestry integration evidence (e.g. a squash/rebase-merge commit).
+   * Nawabari first anchors that revision to authoritative local integration
+   * history, then independently re-derives a deterministic, byte-exact Git
+   * tree-object equivalence proof before treating the branch as integrated.
    */
   private branchIsReachableFromIntegration(
     record: SessionRecord,
@@ -2579,7 +2595,9 @@ export class SessionRegistry {
             branch: record.branchName,
             integrationBranch: defaultBranchName,
             proofMethod: "tree-equivalence",
+            proofStage: "content",
             proofResult: "unproven",
+            proofFailure: "tree-equivalence-unproven",
             integratedRevision: evidence.integratedRevision,
             recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
           },
@@ -2604,10 +2622,11 @@ export class SessionRegistry {
   /**
    * Independently verify caller-supplied non-ancestry integration evidence.
    * The caller's assertion only selects which revision to compare; the
-   * proof itself is re-derived from local Git truth. For every path the
-   * session branch touched relative to its own base, the exact tree-object
-   * identity (file mode, object type, and content-addressed blob/tree SHA)
-   * at the branch head must match the same path's identity at the supplied
+   * proof itself is re-derived from local Git truth in two independent
+   * stages: the revision must first be an ancestor of the authoritative
+   * integration branch, then every path the session branch touched relative
+   * to its own base must match by exact tree-object identity (file mode,
+   * object type, and content-addressed blob/tree SHA) at the supplied
    * integrated revision — both absent, or byte-identical. Blob SHAs are
    * content hashes, so this can never mistake a whitespace-only or other
    * textual difference for equivalence the way a patch/diff comparison
@@ -2623,6 +2642,23 @@ export class SessionRegistry {
   ): IntegrationProof | undefined {
     const git = this.git;
     const integratedRevision = resolveBaseRef(git, gitCwd, evidence.integratedRevision).revision;
+    const lineage = proveIntegrationRevisionLineage(git, gitCwd, defaultBranchName, integratedRevision);
+    if (lineage === undefined) {
+      throw new SessionRegistryError(
+        "RECOVERABLE_COMMITS",
+        `The supplied integration revision is not part of authoritative ${defaultBranchName} history`,
+        {
+          branch: record.branchName,
+          integrationBranch: defaultBranchName,
+          integratedRevision,
+          proofMethod: "integration-lineage",
+          proofStage: "lineage",
+          proofResult: "unproven",
+          proofFailure: "integration-revision-not-authoritative",
+          recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
+        },
+      );
+    }
 
     let branchBase: string;
     try {
@@ -2641,7 +2677,14 @@ export class SessionRegistry {
       treeEntriesEqual(branchStates.get(changedPath), integratedStates.get(changedPath)),
     );
 
-    return proven ? { method: "tree-equivalence", integratedRevision } : undefined;
+    return proven
+      ? {
+          method: "tree-equivalence",
+          integratedRevision,
+          lineage,
+          content: { method: "tree-equivalence" },
+        }
+      : undefined;
   }
 
   private resolveProvisioningResources(options: ProvisionSessionOptions, sessionId: string): ProvisioningResources {
@@ -3933,6 +3976,31 @@ function resolveDefaultBranchName(
     // A local repository may not have an origin or a symbolic remote HEAD.
   }
   return undefined;
+}
+
+/**
+ * Prove that a caller-selected revision is in the configured integration
+ * branch's local commit history. This is deliberately separate from the
+ * later changed-path tree comparison: matching content cannot establish
+ * integration authority by itself.
+ */
+function proveIntegrationRevisionLineage(
+  git: GitCommandRunner,
+  cwd: string,
+  integrationBranch: string,
+  integratedRevision: string,
+): IntegrationLineageProof | undefined {
+  try {
+    git.run(["merge-base", "--is-ancestor", integratedRevision, normalizeBranchId(integrationBranch)], cwd);
+    return {
+      method: "integration-branch-ancestor",
+      integrationBranch,
+      integratedRevision,
+    };
+  } catch (error: unknown) {
+    if (isExpectedGitLookupFailure(error)) return undefined;
+    throw error;
+  }
 }
 
 function localBranchExists(git: GitCommandRunner, cwd: string, branchId: string): boolean {

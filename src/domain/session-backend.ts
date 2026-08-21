@@ -38,6 +38,7 @@ import {
   type SessionListResult,
   type SessionListOptions,
   type SessionRecord,
+  type IntegrationProof as DomainIntegrationProof,
   boundedSessionListing,
   type ReleaseClaimsOptions,
   type ReleaseClaimsResult,
@@ -354,12 +355,7 @@ export class LocalSessionBackend implements SessionBackend {
           ...(result.integrationProof === undefined
             ? {}
             : {
-                integration_proof: {
-                  method: result.integrationProof.method,
-                  ...(result.integrationProof.integratedRevision === undefined
-                    ? {}
-                    : { integrated_revision: result.integrationProof.integratedRevision }),
-                },
+                integration_proof: toDomainIntegrationProof(result.integrationProof),
               }),
         }),
       );
@@ -688,14 +684,26 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
       ...(diagnostic.integrationEvidence.proof === undefined
         ? {}
         : {
-            proof: {
-              method: diagnostic.integrationEvidence.proof.method,
-              ...(diagnostic.integrationEvidence.proof.integratedRevision === undefined
-                ? {}
-                : { integrated_revision: diagnostic.integrationEvidence.proof.integratedRevision }),
-            },
+            proof: toDomainIntegrationProof(diagnostic.integrationEvidence.proof),
           }),
     },
+  };
+}
+
+function toDomainIntegrationProof(proof: import("../session-registry.js").IntegrationProof): DomainIntegrationProof {
+  return {
+    method: proof.method,
+    ...(proof.integratedRevision === undefined ? {} : { integrated_revision: proof.integratedRevision }),
+    ...(proof.lineage === undefined
+      ? {}
+      : {
+          lineage: {
+            method: proof.lineage.method,
+            integration_branch: proof.lineage.integrationBranch,
+            integrated_revision: proof.lineage.integratedRevision,
+          },
+        }),
+    ...(proof.content === undefined ? {} : { content: { method: proof.content.method } }),
   };
 }
 
