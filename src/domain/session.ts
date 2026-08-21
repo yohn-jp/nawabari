@@ -16,6 +16,8 @@ export type SessionRecord = {
   updated_at: string;
   base_revision?: string;
   label?: string;
+  terminal_operation?: "discard";
+  discarded_head?: string;
 };
 
 export type SessionContext = {
@@ -432,6 +434,22 @@ export type SessionCloseResult = {
   integration_proof?: IntegrationProof;
 };
 
+export type SessionDiscardResult = {
+  schema_version: number;
+  operation: "discard";
+  session: SessionRecord;
+  final_state: SessionState;
+  previous_head: string | null;
+  worktree_path: string;
+  branch_name: string;
+  worktree_removed: boolean;
+  branch_removed: boolean;
+  released_claims: ResourceClaim[];
+  released_claim_count: number;
+  released_claims_truncated: boolean;
+  idempotent: boolean;
+};
+
 export type GarbageCollectBlocked = {
   session_id: string;
   code: ErrorCode;
@@ -470,6 +488,7 @@ export interface SessionBackend {
   listSessions(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<SessionListResult>>;
   status(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
+  discardSession?(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardResult>>;
   sessionDiagnostic?(
     context: SessionContext,
     options: SessionDiagnosticOptions,
@@ -543,6 +562,10 @@ class UnavailableSessionBackend implements SessionBackend {
 
   closeSession(_context: SessionContext, _options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>> {
     return this.unavailable("session.close");
+  }
+
+  discardSession(_context: SessionContext, _sessionId: string): Promise<DomainResult<SessionDiscardResult>> {
+    return this.unavailable("session.discard");
   }
 
   garbageCollect(

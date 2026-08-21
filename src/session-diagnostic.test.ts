@@ -216,6 +216,12 @@ test("diagnose reports a deterministic block, not evidence-required, when suppli
     assert.equal(diagnostic.blockers[0]?.code, "RECOVERABLE_COMMITS");
     assert.equal(diagnostic.blockers[0]?.details.proofMethod, "tree-equivalence");
     assert.equal(diagnostic.blockers[0]?.details.proofResult, "unproven");
+    assert.equal(diagnostic.blockers[0]?.details.currentSessionHead, runGit(["rev-parse", "HEAD"], fixture.worktree));
+    assert.equal(diagnostic.blockers[0]?.details.suppliedIntegratedRevision, integratedRevision);
+    assert.equal(diagnostic.blockers[0]?.details.resolvedIntegrationSha, integratedRevision);
+    assert.equal(diagnostic.blockers[0]?.details.lineageProof, "proven");
+    assert.equal(diagnostic.blockers[0]?.details.authorityProof, "proven");
+    assert.equal(diagnostic.blockers[0]?.details.contentProof, "unproven");
     assert.ok(diagnostic.blockers[0]?.safeActions.includes("supply-different-integrated-revision"));
 
     assert.throws(

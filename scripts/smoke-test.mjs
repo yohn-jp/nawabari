@@ -896,6 +896,94 @@ async function main() {
     );
     if (hazardClosed.status !== 0) fail("close did not retry after the recoverable commit became retained");
 
+    // Packed dogfood regression: an obsolete intermediate execution has a
+    // clean but unintegrated commit while the eventual integration branch has
+    // moved to a different final head. Ordinary close remains protected;
+    // explicit discard releases only this session's physical resources and
+    // claims.
+    const obsoleteWorktree = path.join(installDirectory, "packed-obsolete-intermediate-worktree");
+    const obsoleteCreated = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "create",
+          "--branch",
+          "feature/packed-obsolete-intermediate",
+          "--worktree",
+          obsoleteWorktree,
+          "--json",
+        ],
+        lifecycleRepository,
+      ),
+      "packed obsolete session create",
+    );
+    fs.writeFileSync(path.join(obsoleteWorktree, "obsolete-intermediate.txt"), "superseded execution\n");
+    run("git", ["add", "obsolete-intermediate.txt"], { cwd: obsoleteWorktree, env: gitEnvironment });
+    run("git", ["commit", "-m", "obsolete intermediate execution"], {
+      cwd: obsoleteWorktree,
+      env: gitEnvironment,
+    });
+    const obsoleteHead = run("git", ["rev-parse", "HEAD"], {
+      cwd: obsoleteWorktree,
+      env: gitEnvironment,
+    }).stdout.trim();
+    const obsoleteClaim = invokeInstalled(
+      [
+        "session",
+        "claim",
+        "--session",
+        obsoleteCreated.session_id,
+        "--resource",
+        "obsolete-intermediate.txt",
+        "--mode",
+        "exclusive-write",
+        "--json",
+      ],
+      obsoleteWorktree,
+    );
+    if (obsoleteClaim.status !== 0) fail("packed obsolete session claim setup failed");
+    fs.writeFileSync(path.join(lifecycleRepository, "eventual-final-pr-head.txt"), "final integration head\n");
+    run("git", ["add", "eventual-final-pr-head.txt"], { cwd: lifecycleRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "eventual final integration head"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+    const obsoleteClose = invokeInstalled(
+      ["session", "close", obsoleteCreated.session_id, "--json"],
+      lifecycleRepository,
+    );
+    const obsoleteCloseJson = parseInstalledJson(obsoleteClose, "packed obsolete close");
+    if (obsoleteClose.status !== 3 || obsoleteCloseJson.code !== "RECOVERABLE_COMMITS") {
+      fail("ordinary close did not reject the obsolete intermediate session");
+    }
+    if (obsoleteCloseJson.details?.currentSessionHead !== obsoleteHead) {
+      fail("obsolete close did not expose the bounded current session HEAD evidence");
+    }
+    const obsoleteDiscard = invokeInstalled(
+      ["session", "discard", "--session", obsoleteCreated.session_id, "--json"],
+      lifecycleRepository,
+    );
+    const obsoleteDiscardJson = parseInstalledJson(obsoleteDiscard, "packed obsolete discard");
+    if (
+      obsoleteDiscard.status !== 0 ||
+      obsoleteDiscardJson.operation !== "discard" ||
+      obsoleteDiscardJson.previous_head !== obsoleteHead ||
+      obsoleteDiscardJson.worktree_removed !== true ||
+      obsoleteDiscardJson.branch_removed !== true ||
+      obsoleteDiscardJson.released_claim_count !== 1 ||
+      obsoleteDiscardJson.final_state !== "closed" ||
+      obsoleteDiscardJson.session?.terminal_operation !== "discard"
+    ) {
+      fail("explicit packed discard did not return complete typed lifecycle evidence");
+    }
+    const obsoleteShown = parseInstalledJson(
+      invokeInstalled(["session", "show", obsoleteCreated.session_id, "--json"], lifecycleRepository),
+      "packed discarded session show",
+    );
+    if (obsoleteShown.terminal_operation !== "discard") {
+      fail("positional session target did not expose the discarded terminal record");
+    }
+
     const selfReferenceWorktree = path.join(installDirectory, "packed-self-reference-worktree");
     const selfReferenceCreated = parseInstalledJson(
       invokeInstalled(
@@ -1289,8 +1377,8 @@ async function main() {
       boundedList.status !== 0 ||
       boundedStatusJson.sessions?.length !== 0 ||
       boundedListJson.sessions?.length !== 0 ||
-      boundedStatusJson.closed_count !== 512 + 12 ||
-      boundedListJson.closed_count !== 512 + 12 ||
+      boundedStatusJson.closed_count !== 512 + 13 ||
+      boundedListJson.closed_count !== 512 + 13 ||
       boundedStatusJson.history_available !== true ||
       boundedListJson.history_available !== true ||
       boundedStatus.stdout.length > 4_000 ||

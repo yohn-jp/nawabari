@@ -100,6 +100,7 @@ export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
 export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
 export const SESSION_DIAGNOSTIC_SCHEMA_VERSION = 1 as const;
+export const DISCARD_RESULT_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
 /** Bounds a caller-declared commit-message pattern before it is compiled. */
 export const MAX_MESSAGE_PATTERN_LENGTH = 512 as const;
@@ -121,6 +122,10 @@ export interface SessionRecord {
   /** Exact revision observed at session creation, when the registry can prove it. */
   readonly baseRevision?: string;
   readonly label?: string;
+  /** Terminal lifecycle intent for an explicitly discarded session. */
+  readonly terminalOperation?: "discard";
+  /** HEAD captured before an explicit discard began; retained for retry/audit. */
+  readonly discardedHead?: string;
 }
 
 export interface CreateSessionOptions {
@@ -148,12 +153,33 @@ export interface CloseSessionResult {
   readonly integrationProof?: IntegrationProof;
 }
 
+export interface DiscardSessionResult {
+  readonly schemaVersion: typeof DISCARD_RESULT_SCHEMA_VERSION;
+  readonly operation: "discard";
+  readonly session: SessionRecord;
+  readonly finalState: SessionState;
+  readonly previousHead: string | null;
+  readonly worktreePath: string;
+  readonly branchName: string;
+  readonly worktreeRemoved: boolean;
+  readonly branchRemoved: boolean;
+  readonly releasedClaims: readonly ResourceClaim[];
+  readonly releasedClaimCount: number;
+  readonly releasedClaimsTruncated: boolean;
+  readonly idempotent: boolean;
+}
+
 export interface CloseSessionOptions {
   readonly sessionId?: string | null;
   readonly session_id?: string | null;
   /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently re-verified by exact Git tree-object equivalence; never trusted blindly. */
   readonly integratedRevision?: string | null;
   readonly integrated_revision?: string | null;
+}
+
+export interface DiscardSessionOptions {
+  readonly sessionId?: string | null;
+  readonly session_id?: string | null;
 }
 
 function isCloseSessionOptions(value: unknown): value is CloseSessionOptions {
@@ -469,6 +495,8 @@ export interface PersistedSessionRecord {
   readonly updated_at: string;
   readonly base_revision?: string;
   readonly label?: string;
+  readonly terminal_operation?: "discard";
+  readonly discarded_head?: string;
 }
 
 export interface PersistedResourceClaim {
@@ -1945,6 +1973,28 @@ export class SessionRegistry {
     return this.close(sessionIdOrOptions);
   }
 
+  /** Explicitly discard exactly one selected session; never resolves the current owner implicitly. */
+  discard(sessionIdOrOptions: string | DiscardSessionOptions): DiscardSessionResult {
+    return this.withLock(() => {
+      const requestedSessionId =
+        typeof sessionIdOrOptions === "string"
+          ? sessionIdOrOptions
+          : (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id ?? null);
+      if (requestedSessionId === null) {
+        throw new SessionRegistryError(
+          "SESSION_NOT_FOUND",
+          "Explicit session identity is required for discard; the current session is never inferred",
+        );
+      }
+      assertSessionId(requestedSessionId);
+      return this.discardUnsafe(requestedSessionId);
+    });
+  }
+
+  discardSession(sessionIdOrOptions: string | DiscardSessionOptions): DiscardSessionResult {
+    return this.discard(sessionIdOrOptions);
+  }
+
   /** Detect stale sessions, optionally applying only cleanup that passes close preflight. */
   garbageCollect(options: GarbageCollectOptions = {}): GarbageCollectResult {
     const apply = options.apply ?? false;
@@ -2201,6 +2251,13 @@ export class SessionRegistry {
         idempotent: true,
       };
     }
+    if (record.terminalOperation === "discard") {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "An explicit discard is already in progress; retry session discard to complete it",
+        { sessionId, state: record.state, terminalOperation: "discard", safeActions: ["retry-discard"] },
+      );
+    }
 
     let resources: CleanupResources;
     try {
@@ -2266,11 +2323,131 @@ export class SessionRegistry {
     };
   }
 
+  private discardUnsafe(sessionId: string): DiscardSessionResult {
+    const state = this.readStateUnsafe();
+    const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+    if (record === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    if (record.state === "closed") {
+      if (record.terminalOperation !== "discard") {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "The selected session was already closed normally; discard cannot be retroactively applied",
+          { sessionId, state: record.state, terminalOperation: "close" },
+        );
+      }
+      return discardResult(record, record.discardedHead ?? null, [], false, false, true);
+    }
+    if (record.state === "closing" && record.terminalOperation !== "discard") {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "The selected session has an ordinary close in progress; retry close before choosing discard",
+        { sessionId, state: record.state, safeActions: ["retry-close", "retain-session"] },
+      );
+    }
+    if (record.state !== "active" && record.state !== "stale" && record.state !== "closing") {
+      throw new SessionRegistryError("STALE_REGISTRY", `Session cannot be discarded while ${record.state}`, {
+        sessionId,
+        state: record.state,
+      });
+    }
+
+    const resuming = record.state === "closing" && record.terminalOperation === "discard";
+    let resources: CleanupResources;
+    try {
+      resources = this.inspectCleanupResources(record, undefined, undefined, "discard");
+    } catch (error: unknown) {
+      throw enrichCloseBlockerError(error);
+    }
+    if (
+      !resuming &&
+      (resources.physicalState !== "healthy" || !resources.worktreePresent || !resources.branchPresent)
+    ) {
+      throw ownershipMismatch(record, "Discard requires an unambiguous, currently owned worktree and branch", {
+        physicalState: resources.physicalState,
+        worktreePresent: resources.worktreePresent,
+        branchPresent: resources.branchPresent,
+        phase: "discard-preflight",
+      });
+    }
+
+    const previousHead = record.discardedHead ?? resources.worktreeHead ?? resources.branchHead;
+    if (previousHead === null || previousHead === undefined) {
+      throw ownershipMismatch(record, "Discard could not capture the selected session HEAD before mutation", {
+        physicalState: resources.physicalState,
+        phase: "discard-preflight",
+      });
+    }
+
+    const closingRecord = resuming
+      ? record
+      : transitionSessionState(
+          freezeSessionRecord({ ...record, terminalOperation: "discard", discardedHead: previousHead }),
+          "closing",
+          this.clock,
+        );
+    let closingRecords = resuming ? state.sessions : replaceRecord(state.sessions, closingRecord);
+    validateRecords(closingRecords, this.repository.repositoryId);
+    if (!resuming) this.writeUnsafe(closingRecords, state.claims);
+
+    let worktreeRemoved = resuming && !resources.worktreePresent;
+    let branchRemoved = resuming && !resources.branchPresent;
+    if (resources.removeWorktree) {
+      const revalidated = this.inspectCleanupResources(record, undefined, undefined, "discard");
+      assertSameCleanupObservation(resources, revalidated, "worktree-remove");
+      if (revalidated.removeWorktree) {
+        removeSessionWorktree(this.git, revalidated.gitCwd, record.worktreePath, true);
+        worktreeRemoved = revalidated.worktreePresent;
+      }
+    }
+
+    const branchWorktrees = listGitWorktrees(this.git, resources.gitCwd);
+    const branchResources = this.inspectCleanupResources(record, branchWorktrees, undefined, "discard");
+    if (branchResources.branchPresent && branchResources.removeBranch) {
+      const branchRevalidated = this.inspectCleanupResources(
+        record,
+        listGitWorktrees(this.git, branchResources.gitCwd),
+        undefined,
+        "discard",
+      );
+      assertSameCleanupObservation(branchResources, branchRevalidated, "branch-remove");
+      if (branchRevalidated.branchPresent && branchRevalidated.removeBranch) {
+        removeSessionBranch(this.git, branchRevalidated.gitCwd, record.branchName, true);
+        branchRemoved = true;
+      }
+    }
+
+    const closedRecord = transitionSessionState(closingRecord, "closed", this.clock);
+    closingRecords = replaceRecord(closingRecords, closedRecord);
+    validateRecords(closingRecords, this.repository.repositoryId);
+    const releasedClaims = state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim);
+    this.writeUnsafe(
+      closingRecords,
+      state.claims.filter((claim) => claim.sessionId !== sessionId),
+    );
+
+    return discardResult(closedRecord, previousHead, releasedClaims, worktreeRemoved, branchRemoved, false);
+  }
+
   private inspectCleanupResources(
     record: SessionRecord,
     observedWorktrees: readonly GitWorktreeInfo[] = listGitWorktrees(this.git, this.repository.worktreePath),
     evidence?: IntegrationEvidenceInput,
+    intent: "close" | "discard" = "close",
   ): CleanupResources {
+    if (intent === "close" && record.terminalOperation === "discard") {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "An explicit discard is already in progress; retry session discard to complete it",
+        {
+          sessionId: record.sessionId,
+          state: record.state,
+          terminalOperation: "discard",
+          safeActions: ["retry-discard"],
+        },
+      );
+    }
     const git = this.git;
     const worktrees = observedWorktrees;
     const gitCwd =
@@ -2310,7 +2487,7 @@ export class SessionRegistry {
       if (!branchPresent || registeredWorktree?.branchName !== record.branchName) {
         throw ownershipMismatch(record, "The registered worktree no longer has the owned local branch");
       }
-      assertWorktreeClean(git, record.worktreePath);
+      if (intent === "close") assertWorktreeClean(git, record.worktreePath);
     }
 
     assertNoRecoverableStashes(git, gitCwd, record.branchName);
@@ -2320,8 +2497,12 @@ export class SessionRegistry {
     let removeBranch = false;
     let integrationProof: IntegrationProof | undefined;
     if (branchPresent && !branchProtection) {
-      integrationProof = this.branchIsReachableFromIntegration(record, gitCwd, evidence);
-      removeBranch = true;
+      if (intent === "discard") {
+        removeBranch = true;
+      } else {
+        integrationProof = this.branchIsReachableFromIntegration(record, gitCwd, evidence);
+        removeBranch = true;
+      }
     }
 
     return {
@@ -2330,6 +2511,7 @@ export class SessionRegistry {
       registeredBranch: registeredWorktree?.branchName ?? null,
       branchWorktree: branchWorktree?.worktreePath ?? null,
       worktreeHead: worktreePresent ? readCurrentHead(git, record.worktreePath) : null,
+      branchHead: branchPresent ? readLocalBranchHead(git, gitCwd, record.branchId) : null,
       worktreePresent,
       branchPresent,
       removeWorktree: registeredWorktree !== undefined && !worktreeProtection,
@@ -2576,7 +2758,19 @@ export class SessionRegistry {
       throw new SessionRegistryError(
         "RECOVERABLE_COMMITS",
         `Cannot prove that commits on ${record.branchName} are safely retained: no integration branch is known`,
-        { branch: record.branchName, recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS") },
+        {
+          branch: record.branchName,
+          currentSessionHead: readSessionHeadForProof(git, gitCwd, record),
+          suppliedIntegratedRevision: evidence?.integratedRevision ?? "<none>",
+          resolvedIntegrationSha: "<none>",
+          lineageProof: "unproven",
+          authorityProof: "unproven",
+          contentProof: "not-attempted",
+          proofMethod: "integration-lineage",
+          proofStage: "lineage",
+          proofResult: "unproven",
+          recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
+        },
       );
     }
     if (normalizeBranchId(defaultBranchName) === record.branchId) return { method: "ancestor" };
@@ -2594,8 +2788,12 @@ export class SessionRegistry {
           {
             branch: record.branchName,
             integrationBranch: defaultBranchName,
+            ...proofObservationDetails(git, gitCwd, record, defaultBranchName, evidence),
             proofMethod: "tree-equivalence",
             proofStage: "content",
+            lineageProof: "proven",
+            authorityProof: "proven",
+            contentProof: "unproven",
             proofResult: "unproven",
             proofFailure: "tree-equivalence-unproven",
             integratedRevision: evidence.integratedRevision,
@@ -2610,7 +2808,12 @@ export class SessionRegistry {
         {
           branch: record.branchName,
           integrationBranch: defaultBranchName,
+          ...proofObservationDetails(git, gitCwd, record, defaultBranchName),
           proofMethod: "ancestry",
+          proofStage: "lineage",
+          lineageProof: "unproven",
+          authorityProof: "unproven",
+          contentProof: "not-attempted",
           proofResult: "unproven",
           recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
         },
@@ -2650,9 +2853,13 @@ export class SessionRegistry {
         {
           branch: record.branchName,
           integrationBranch: defaultBranchName,
+          ...proofObservationDetails(git, gitCwd, record, defaultBranchName, evidence, integratedRevision),
           integratedRevision,
           proofMethod: "integration-lineage",
           proofStage: "lineage",
+          lineageProof: "unproven",
+          authorityProof: "unproven",
+          contentProof: "not-attempted",
           proofResult: "unproven",
           proofFailure: "integration-revision-not-authoritative",
           recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
@@ -2925,11 +3132,67 @@ interface CleanupResources {
   readonly registeredBranch: string | null;
   readonly branchWorktree: string | null;
   readonly worktreeHead: string | null;
+  readonly branchHead: string | null;
   readonly worktreePresent: boolean;
   readonly branchPresent: boolean;
   readonly removeWorktree: boolean;
   readonly removeBranch: boolean;
   readonly integrationProof?: IntegrationProof;
+}
+
+function readSessionHeadForProof(git: GitCommandRunner, gitCwd: string, record: SessionRecord): string {
+  const pathEntry = lstatIfPresent(record.worktreePath);
+  if (pathEntry !== undefined && pathEntry.isDirectory() && !pathEntry.isSymbolicLink()) {
+    return readCurrentHead(git, record.worktreePath);
+  }
+  return readLocalBranchHead(git, gitCwd, record.branchId);
+}
+
+function proofObservationDetails(
+  git: GitCommandRunner,
+  gitCwd: string,
+  record: SessionRecord,
+  defaultBranchName: string,
+  evidence?: IntegrationEvidenceInput,
+  resolvedIntegratedRevision?: string,
+): RegistryErrorDetails {
+  return {
+    currentSessionHead: readSessionHeadForProof(git, gitCwd, record),
+    suppliedIntegratedRevision: evidence?.integratedRevision ?? "<none>",
+    resolvedIntegrationSha:
+      resolvedIntegratedRevision ??
+      (evidence === undefined
+        ? readLocalBranchHead(git, gitCwd, normalizeBranchId(defaultBranchName))
+        : resolveBaseRef(git, gitCwd, evidence.integratedRevision).revision),
+  };
+}
+
+const MAX_DISCARD_CLAIMS = 4_096 as const;
+
+function discardResult(
+  session: SessionRecord,
+  previousHead: string | null,
+  releasedClaims: readonly ResourceClaim[],
+  worktreeRemoved: boolean,
+  branchRemoved: boolean,
+  idempotent: boolean,
+): DiscardSessionResult {
+  const boundedClaims = releasedClaims.slice(0, MAX_DISCARD_CLAIMS).map(cloneResourceClaim);
+  return {
+    schemaVersion: DISCARD_RESULT_SCHEMA_VERSION,
+    operation: "discard",
+    session: cloneSessionRecord(session),
+    finalState: session.state,
+    previousHead,
+    worktreePath: session.worktreePath,
+    branchName: session.branchName,
+    worktreeRemoved,
+    branchRemoved,
+    releasedClaims: Object.freeze(boundedClaims),
+    releasedClaimCount: releasedClaims.length,
+    releasedClaimsTruncated: releasedClaims.length > boundedClaims.length,
+    idempotent,
+  };
 }
 
 function assertStaleAfterMs(value: number): void {
@@ -3063,6 +3326,7 @@ function recoveryHintsForCode(code: RegistryErrorCode, details: RegistryErrorDet
       return [
         "Retain or merge the session branch commits into an authoritative local branch before retrying cleanup.",
         "If the branch was integrated via squash/rebase merge, retry close with an --integrated-revision proof instead.",
+        "If the selected session is intentionally disposable, use the explicit session discard operation with its exact session ID.",
       ];
     case "RECOVERABLE_STASHES":
       return ["Inspect and explicitly apply, export, or drop the session stash before retrying cleanup."];
@@ -3129,8 +3393,8 @@ function safeActionsForCode(code: RegistryErrorCode, details: RegistryErrorDetai
       return ["resolve-nested-repository", "retain-session"];
     case "RECOVERABLE_COMMITS":
       return details.proofMethod === "tree-equivalence"
-        ? ["retain-session", "supply-different-integrated-revision"]
-        : ["provide-integration-evidence", "merge-or-retain-branch", "retain-session"];
+        ? ["retain-session", "supply-different-integrated-revision", "discard-session"]
+        : ["provide-integration-evidence", "merge-or-retain-branch", "retain-session", "discard-session"];
     case "RECOVERABLE_STASHES":
       return ["apply-or-export-stash", "retain-session"];
     case "MISSING_WORKTREE":
@@ -3158,6 +3422,8 @@ function safeActionsForCode(code: RegistryErrorCode, details: RegistryErrorDetai
     case "STALE_REGISTRY":
     case "RECONCILIATION_DRIFT":
       return ["retry-diagnostic"];
+    case "OPERATION_REJECTED":
+      return details.terminalOperation === "discard" ? ["retry-discard"] : ["retry-diagnostic"];
     default:
       return ["retry-diagnostic"];
   }
@@ -3250,6 +3516,7 @@ function assertSameCleanupObservation(
     expected.registeredBranch !== actual.registeredBranch ||
     expected.branchWorktree !== actual.branchWorktree ||
     expected.worktreeHead !== actual.worktreeHead ||
+    expected.branchHead !== actual.branchHead ||
     expected.worktreePresent !== actual.worktreePresent ||
     expected.branchPresent !== actual.branchPresent ||
     expected.removeWorktree !== actual.removeWorktree ||
@@ -3266,6 +3533,8 @@ function assertSameCleanupObservation(
         actualWorktree: actual.branchWorktree ?? "<none>",
         expectedHead: expected.worktreeHead ?? "<none>",
         actualHead: actual.worktreeHead ?? "<none>",
+        expectedBranchHead: expected.branchHead ?? "<none>",
+        actualBranchHead: actual.branchHead ?? "<none>",
         recoveryHints: recoveryHintsForCode("GIT_STATE_AMBIGUOUS"),
       },
     );
@@ -3801,8 +4070,19 @@ function assertNoRecoverableStashes(git: GitCommandRunner, cwd: string, branchNa
   });
 }
 
-function removeSessionWorktree(git: GitCommandRunner, cwd: string, worktreePath: string): void {
-  const force = !fs.existsSync(worktreePath);
+function readLocalBranchHead(git: GitCommandRunner, cwd: string, branchId: string): string {
+  const head = git.run(["rev-parse", "--verify", `${branchId}^{commit}`], cwd);
+  if (!isRevision(head)) {
+    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid owned branch HEAD", {
+      branch: branchId,
+      head,
+    });
+  }
+  return head;
+}
+
+function removeSessionWorktree(git: GitCommandRunner, cwd: string, worktreePath: string, force = false): void {
+  force ||= !fs.existsSync(worktreePath);
   git.run(["worktree", "remove", ...(force ? ["--force"] : []), worktreePath], cwd);
 }
 
@@ -4243,6 +4523,8 @@ export function toPersistedSessionRecord(
     updated_at: validated.updatedAt,
     ...(validated.baseRevision === undefined ? {} : { base_revision: validated.baseRevision }),
     ...(validated.label === undefined ? {} : { label: validated.label }),
+    ...(validated.terminalOperation === undefined ? {} : { terminal_operation: validated.terminalOperation }),
+    ...(validated.discardedHead === undefined ? {} : { discarded_head: validated.discardedHead }),
   };
 }
 
@@ -4499,7 +4781,7 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
       "created_at",
       "updated_at",
     ],
-    ["base_revision", "label"],
+    ["base_revision", "label", "terminal_operation", "discarded_head"],
     index,
   );
 
@@ -4532,6 +4814,12 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
       ? {}
       : { baseRevision: requireRevision(value.base_revision, index, "base_revision") }),
     ...(value.label === undefined ? {} : { label: requireString(value.label, index, "label") }),
+    ...(value.terminal_operation === undefined
+      ? {}
+      : { terminalOperation: requireTerminalOperation(value.terminal_operation, index) }),
+    ...(value.discarded_head === undefined
+      ? {}
+      : { discardedHead: requireRevision(value.discarded_head, index, "discarded_head") }),
   };
 
   return validateSessionRecord(record, expectedRepositoryId, index);
@@ -4589,6 +4877,18 @@ function validateSessionRecord(record: SessionRecord, expectedRepositoryId: stri
   }
   if (record.label !== undefined && (typeof record.label !== "string" || record.label.length === 0)) {
     throw invalidRecord(index, "label must be a non-empty string");
+  }
+  if (record.terminalOperation !== undefined && record.terminalOperation !== "discard") {
+    throw invalidRecord(index, "terminal_operation is invalid");
+  }
+  if (record.discardedHead !== undefined && !isRevision(record.discardedHead)) {
+    throw invalidRecord(index, "discarded_head must be a full hexadecimal Git revision");
+  }
+  if (record.terminalOperation === undefined && record.discardedHead !== undefined) {
+    throw invalidRecord(index, "discarded_head requires terminal_operation=discard");
+  }
+  if (record.state !== "closed" && record.state !== "closing" && record.terminalOperation !== undefined) {
+    throw invalidRecord(index, "terminal_operation is only valid for a closing or closed session");
   }
 
   return freezeSessionRecord({ ...record });
@@ -4722,6 +5022,13 @@ function requireState(value: unknown, index: number): SessionState {
     throw invalidRecord(index, `state is invalid: ${stringifyDetail(value)}`);
   }
   return value as SessionState;
+}
+
+function requireTerminalOperation(value: unknown, index: number): "discard" {
+  if (value !== "discard") {
+    throw invalidRecord(index, `terminal_operation is invalid: ${stringifyDetail(value)}`);
+  }
+  return "discard";
 }
 
 function requireClaimMode(value: unknown, index: number): ResourceClaimMode {
