@@ -2,9 +2,9 @@
 
 # Release PR
 
-Release PRs use a `release/*` head branch. This naming convention is an
-operational classification only; it is not an authorization or security
-boundary.
+Release PRs use a `release/<semver>` head branch, for example
+`release/1.2.3`. This naming convention is an operational classification only;
+it is not an authorization or security boundary.
 
 ## Version
 
