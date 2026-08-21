@@ -17,7 +17,7 @@ export function resolvePullRequestTemplate({ branch, template } = {}) {
     return {
       classification: "unclassified",
       ...(template === undefined ? {} : { template }),
-      errors: [],
+      errors: []
     };
   }
 
@@ -25,7 +25,7 @@ export function resolvePullRequestTemplate({ branch, template } = {}) {
   if (release?.kind === "invalid-release") {
     return {
       classification: release.kind,
-      errors: release.errors,
+      errors: release.errors
     };
   }
   if (release?.kind === "release") {
@@ -33,12 +33,12 @@ export function resolvePullRequestTemplate({ branch, template } = {}) {
       classification: release.kind,
       template: "release",
       version: release.version,
-      errors: [],
+      errors: []
     };
   }
   return {
     classification: "ordinary",
     ...(template === undefined ? {} : { template }),
-    errors: [],
+    errors: []
   };
 }
