@@ -18,6 +18,7 @@ import {
   MAX_SESSION_LIST_LIMIT,
 } from "./domain/session.js";
 import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS, EVIDENCE_MAX_DIFF_PATHS } from "./repository-evidence.js";
+import { isResourceClaimMode } from "./resource-claims.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
@@ -888,7 +889,102 @@ type ClaimDeltaMutation = {
   force: boolean;
 };
 
-const CLAIM_MODES = new Set(["read", "write", "exclusive-write"]);
+type ClaimConcurrencyOption = "--if-generation" | "--force";
+
+type ClaimConcurrencyState = {
+  expected_claim_set_generation: number | null;
+  force: boolean;
+};
+
+type ClaimConcurrencyConsumption = {
+  state: ClaimConcurrencyState;
+  consumed_next_value: boolean;
+};
+
+const CLAIM_CONCURRENCY_OPTION_NAMES: ReadonlySet<ClaimConcurrencyOption> = new Set(["--if-generation", "--force"]);
+
+function isClaimConcurrencyOption(name: string): name is ClaimConcurrencyOption {
+  return CLAIM_CONCURRENCY_OPTION_NAMES.has(name as ClaimConcurrencyOption);
+}
+
+/** Shared #176 CAS/force option vocabulary and value consumption. */
+function consumeClaimConcurrencyOption(
+  name: ClaimConcurrencyOption,
+  inlineValue: string | null,
+  nextValue: string | undefined,
+  state: ClaimConcurrencyState,
+): DomainResult<ClaimConcurrencyConsumption> {
+  if (name === "--force") {
+    if (inlineValue !== null) {
+      return failure(usageError("INVALID_ARGUMENT", "--force does not accept a value.", { option: name }));
+    }
+    if (state.force) {
+      return failure(usageError("INVALID_ARGUMENT", "--force may be supplied only once.", { option: name }));
+    }
+    return { ok: true, value: { state: { ...state, force: true }, consumed_next_value: false } };
+  }
+
+  const value = inlineValue ?? nextValue;
+  const negativeGeneration = /^-\d+$/u.test(value ?? "");
+  if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-") && !negativeGeneration)) {
+    return failure(usageError("MISSING_ARGUMENT", `${name} requires a value.`, { option: name }));
+  }
+  if (state.expected_claim_set_generation !== null) {
+    return failure(usageError("INVALID_ARGUMENT", "--if-generation may be supplied only once.", { option: name }));
+  }
+  if (!/^\d+$/u.test(value)) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
+        option: name,
+        value,
+      }),
+    );
+  }
+  const parsedGeneration = Number(value);
+  if (!Number.isSafeInteger(parsedGeneration)) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
+        option: name,
+        value,
+      }),
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      state: { ...state, expected_claim_set_generation: parsedGeneration },
+      consumed_next_value: inlineValue === null,
+    },
+  };
+}
+
+function finalizeClaimConcurrency(
+  state: ClaimConcurrencyState,
+  requireConcurrencyIntent: boolean,
+): DomainResult<ClaimConcurrencyState> {
+  if (!requireConcurrencyIntent && (state.force || state.expected_claim_set_generation !== null)) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "session claim does not accept --if-generation or --force.", {
+        options: ["--if-generation", "--force"],
+      }),
+    );
+  }
+  if (requireConcurrencyIntent && state.force && state.expected_claim_set_generation !== null) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "Specify exactly one of --if-generation or --force, not both.", {
+        options: ["--if-generation", "--force"],
+      }),
+    );
+  }
+  if (requireConcurrencyIntent && !state.force && state.expected_claim_set_generation === null) {
+    return failure(
+      usageError("MISSING_ARGUMENT", "Exactly one of --if-generation or --force is required.", {
+        options: ["--if-generation", "--force"],
+      }),
+    );
+  }
+  return { ok: true, value: state };
+}
 
 /**
  * Parse the public atomic delta grammar without interpreting resource identity.
@@ -903,16 +999,17 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
   let repository: string | null = null;
   const deltas: ResourceClaimDelta[] = [];
   let pendingUpsertResource: string | null = null;
-  let expectedClaimSetGeneration: number | null = null;
-  let force = false;
+  let concurrencyState: ClaimConcurrencyState = {
+    expected_claim_set_generation: null,
+    force: false,
+  };
   const recognized = new Set([
     "--session",
     "--repository",
     "--upsert-resource",
     "--mode",
     "--release-resource",
-    "--if-generation",
-    "--force",
+    ...CLAIM_CONCURRENCY_OPTION_NAMES,
   ]);
 
   const rejectPending = (name: string): DomainResult<ClaimDeltaMutation> =>
@@ -933,20 +1030,16 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
     }
     if (pendingUpsertResource !== null && name !== "--mode") return rejectPending(name);
 
-    if (name === "--force") {
-      if (inlineValue !== null) {
-        return failure(usageError("INVALID_ARGUMENT", "--force does not accept a value.", { option: name }));
-      }
-      if (force) {
-        return failure(usageError("INVALID_ARGUMENT", "--force may be supplied only once.", { option: name }));
-      }
-      force = true;
+    if (isClaimConcurrencyOption(name)) {
+      const consumed = consumeClaimConcurrencyOption(name, inlineValue, targetArguments[index + 1], concurrencyState);
+      if (!consumed.ok) return consumed;
+      concurrencyState = consumed.value.state;
+      if (consumed.value.consumed_next_value) index += 1;
       continue;
     }
 
     const value = inlineValue ?? targetArguments[index + 1];
-    const negativeGeneration = name === "--if-generation" && /^-\d+$/u.test(value ?? "");
-    if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-") && !negativeGeneration)) {
+    if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-"))) {
       return failure(usageError("MISSING_ARGUMENT", `${name} requires a value.`, { option: name }));
     }
     if (inlineValue === null) index += 1;
@@ -966,28 +1059,6 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
       pendingUpsertResource = value;
     } else if (name === "--release-resource") {
       deltas.push({ kind: "release", resource: value });
-    } else if (name === "--if-generation") {
-      if (expectedClaimSetGeneration !== null) {
-        return failure(usageError("INVALID_ARGUMENT", "--if-generation may be supplied only once.", { option: name }));
-      }
-      if (!/^\d+$/u.test(value)) {
-        return failure(
-          usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
-            option: name,
-            value,
-          }),
-        );
-      }
-      const parsedGeneration = Number(value);
-      if (!Number.isSafeInteger(parsedGeneration)) {
-        return failure(
-          usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
-            option: name,
-            value,
-          }),
-        );
-      }
-      expectedClaimSetGeneration = parsedGeneration;
     } else {
       if (pendingUpsertResource === null) {
         return failure(
@@ -996,7 +1067,7 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
           }),
         );
       }
-      if (!CLAIM_MODES.has(value)) {
+      if (!isResourceClaimMode(value)) {
         return failure(
           usageError("INVALID_ARGUMENT", "--mode requires read, write, or exclusive-write.", {
             option: "--mode",
@@ -1007,7 +1078,7 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
       deltas.push({
         kind: "upsert",
         resource: pendingUpsertResource,
-        mode: value as "read" | "write" | "exclusive-write",
+        mode: value,
       });
       pendingUpsertResource = null;
     }
@@ -1027,28 +1098,16 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
       }),
     );
   }
-  if (force && expectedClaimSetGeneration !== null) {
-    return failure(
-      usageError("INVALID_ARGUMENT", "Specify exactly one of --if-generation or --force, not both.", {
-        options: ["--if-generation", "--force"],
-      }),
-    );
-  }
-  if (!force && expectedClaimSetGeneration === null) {
-    return failure(
-      usageError("MISSING_ARGUMENT", "Exactly one of --if-generation or --force is required.", {
-        options: ["--if-generation", "--force"],
-      }),
-    );
-  }
+  const concurrency = finalizeClaimConcurrency(concurrencyState, true);
+  if (!concurrency.ok) return concurrency;
   return {
     ok: true,
     value: {
       session_id: sessionId,
       repository,
       deltas,
-      expected_claim_set_generation: expectedClaimSetGeneration,
-      force,
+      expected_claim_set_generation: concurrency.value.expected_claim_set_generation,
+      force: concurrency.value.force,
     },
   };
 }
@@ -1071,14 +1130,16 @@ function parseClaimReplacementPairs(
   let repository: string | null = null;
   const pairs: Array<{ resource: string; mode: string }> = [];
   let pendingResource: string | null = null;
-  let expectedClaimSetGeneration: number | null = null;
-  let force = false;
+  let concurrencyState: ClaimConcurrencyState = {
+    expected_claim_set_generation: null,
+    force: false,
+  };
 
   sessionId = positional.value.sessionId;
   const targetArguments = positional.value.arguments;
   for (let index = 0; index < targetArguments.length; index += 1) {
     const { name, inlineValue } = optionParts(targetArguments[index]);
-    const isConcurrencyOption = name === "--if-generation" || name === "--force";
+    const isConcurrencyOption = isClaimConcurrencyOption(name);
     if (
       name !== "--session" &&
       name !== "--repository" &&
@@ -1098,20 +1159,16 @@ function parseClaimReplacementPairs(
       );
     }
 
-    if (name === "--force") {
-      if (inlineValue !== null) {
-        return failure(usageError("INVALID_ARGUMENT", "--force does not accept a value.", { option: name }));
-      }
-      if (force) {
-        return failure(usageError("INVALID_ARGUMENT", "--force may be supplied only once.", { option: name }));
-      }
-      force = true;
+    if (requireConcurrencyIntent && isConcurrencyOption) {
+      const consumed = consumeClaimConcurrencyOption(name, inlineValue, targetArguments[index + 1], concurrencyState);
+      if (!consumed.ok) return consumed;
+      concurrencyState = consumed.value.state;
+      if (consumed.value.consumed_next_value) index += 1;
       continue;
     }
 
     const value = inlineValue ?? targetArguments[index + 1];
-    const negativeGeneration = name === "--if-generation" && /^-\d+$/u.test(value ?? "");
-    if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-") && !negativeGeneration)) {
+    if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-"))) {
       return failure(usageError("MISSING_ARGUMENT", `${name} requires a value.`, { option: name }));
     }
     if (inlineValue === null) index += 1;
@@ -1125,29 +1182,7 @@ function parseClaimReplacementPairs(
       sessionId = value;
     } else if (name === "--repository") repository = value;
     else if (name === "--resource") pendingResource = value;
-    else if (name === "--if-generation") {
-      if (expectedClaimSetGeneration !== null) {
-        return failure(usageError("INVALID_ARGUMENT", "--if-generation may be supplied only once.", { option: name }));
-      }
-      if (!/^\d+$/u.test(value)) {
-        return failure(
-          usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
-            option: name,
-            value,
-          }),
-        );
-      }
-      const parsedGeneration = Number(value);
-      if (!Number.isSafeInteger(parsedGeneration)) {
-        return failure(
-          usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
-            option: name,
-            value,
-          }),
-        );
-      }
-      expectedClaimSetGeneration = parsedGeneration;
-    } else {
+    else {
       if (pendingResource === null) {
         return failure(
           usageError("INVALID_ARGUMENT", "--mode must be immediately preceded by its own --resource.", {
@@ -1168,35 +1203,16 @@ function parseClaimReplacementPairs(
   if (pairs.length === 0) {
     return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
   }
-  if (!requireConcurrencyIntent && (force || expectedClaimSetGeneration !== null)) {
-    return failure(
-      usageError("INVALID_ARGUMENT", "session claim does not accept --if-generation or --force.", {
-        options: ["--if-generation", "--force"],
-      }),
-    );
-  }
-  if (requireConcurrencyIntent && force && expectedClaimSetGeneration !== null) {
-    return failure(
-      usageError("INVALID_ARGUMENT", "Specify exactly one of --if-generation or --force, not both.", {
-        options: ["--if-generation", "--force"],
-      }),
-    );
-  }
-  if (requireConcurrencyIntent && !force && expectedClaimSetGeneration === null) {
-    return failure(
-      usageError("MISSING_ARGUMENT", "Exactly one of --if-generation or --force is required.", {
-        options: ["--if-generation", "--force"],
-      }),
-    );
-  }
+  const concurrency = finalizeClaimConcurrency(concurrencyState, requireConcurrencyIntent);
+  if (!concurrency.ok) return concurrency;
   return {
     ok: true,
     value: {
       session_id: sessionId,
       repository,
       pairs,
-      expected_claim_set_generation: expectedClaimSetGeneration,
-      force,
+      expected_claim_set_generation: concurrency.value.expected_claim_set_generation,
+      force: concurrency.value.force,
     },
   };
 }

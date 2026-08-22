@@ -1119,6 +1119,10 @@ test("claim delta malformed grammar and concurrency ambiguity fail before backen
     ["--release-resource", "src/a.ts", "--if-generation", "1", "--force"],
     ["--release-resource", "src/a.ts", "--if-generation", "1", "--if-generation", "2"],
     ["--upsert-resource", "src/a.ts", "--mode", "invalid", "--force"],
+    ["--release-resource", "src/a.ts", "--if-generation", "not-an-integer"],
+    ["--release-resource", "src/a.ts", "--if-generation", "-1"],
+    ["--release-resource", "src/a.ts", "--if-generation", "9007199254740992"],
+    ["--release-resource", "src/a.ts", "--force=unexpected"],
   ];
 
   for (const arguments_ of invalidCommands) {
