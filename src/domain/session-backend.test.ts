@@ -188,6 +188,138 @@ test("resource claims expose canonical machine fields through the backend and CL
   }
 });
 
+test("additive contradictory claims expose one projected recovery action that the public transition executes", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-recovery-action`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/recovery-action", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const initial = await backend.claimResources(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        claims: [
+          { resource: "README.md", mode: "write" },
+          { resource: "unrelated.txt", mode: "read" },
+        ],
+      },
+    );
+    assert.equal(initial.ok, true);
+    if (!initial.ok) return;
+
+    const rejected = await backend.claimResources(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        claims: [{ resource: "README.md", mode: "exclusive-write" }],
+      },
+    );
+    assert.equal(rejected.ok, false);
+    if (rejected.ok) return;
+    assert.equal(rejected.error.code, "CONTRADICTORY_CLAIM");
+    const action = rejected.error.details?.recoveryAction as {
+      actionId: string;
+      command: string;
+      resource: string;
+      mode: string;
+      claimSetGeneration: number;
+    };
+    assert.equal(action.actionId, "transition-exact-resource");
+    assert.equal(action.resource, "README.md");
+    assert.equal(action.mode, "exclusive-write");
+    assert.equal(action.claimSetGeneration, initial.value.claim_set_generation);
+    assert.match(action.command, /session transition/u);
+    assert.match(action.command, /--if-generation 1\b/u);
+
+    const jsonOutput: string[] = [];
+    const jsonExitCode = await runCli(
+      [
+        "--json",
+        "session",
+        "claim",
+        "--session",
+        created.value.session_id,
+        "--resource",
+        "README.md",
+        "--mode",
+        "exclusive-write",
+      ],
+      { cwd: worktreePath, io: { stdout: (line) => jsonOutput.push(line), stderr: () => undefined } },
+    );
+    assert.equal(jsonExitCode, 3);
+    const machine = JSON.parse(jsonOutput[0] ?? "") as {
+      code: string;
+      details: { recoveryAction: typeof action };
+    };
+    assert.equal(machine.code, "CONTRADICTORY_CLAIM");
+    assert.deepEqual(machine.details.recoveryAction, action);
+
+    const humanOutput: string[] = [];
+    const humanExitCode = await runCli(
+      [
+        "session",
+        "claim",
+        "--session",
+        created.value.session_id,
+        "--resource",
+        "README.md",
+        "--mode",
+        "exclusive-write",
+      ],
+      { cwd: worktreePath, io: { stdout: () => undefined, stderr: (line) => humanOutput.push(line) } },
+    );
+    assert.equal(humanExitCode, 3);
+    const human = humanOutput.join("\n");
+    assert.match(human, /recoveryAction:/u);
+    assert.match(human, /actionId: transition-exact-resource/u);
+    assert.match(human, /claimSetGeneration: 1/u);
+
+    const transitioned = await runCli(
+      [
+        "--json",
+        "session",
+        "transition",
+        "--session",
+        created.value.session_id,
+        "--resource",
+        action.resource,
+        "--mode",
+        action.mode,
+        "--if-generation",
+        String(action.claimSetGeneration),
+      ],
+      { cwd: worktreePath, io: { stdout: (line) => jsonOutput.push(line), stderr: () => undefined } },
+    );
+    assert.equal(transitioned, 0);
+    const transitionResult = JSON.parse(jsonOutput.at(-1) ?? "") as {
+      changed: Array<{ resource: string; after: { mode: string } }>;
+      claims: Array<{ resource: string; mode: string }>;
+      claim_set_generation: number;
+    };
+    assert.equal(transitionResult.changed[0]?.resource, "README.md");
+    assert.equal(transitionResult.changed[0]?.after.mode, "exclusive-write");
+    assert.deepEqual(
+      transitionResult.claims.map((claim) => [claim.resource, claim.mode]),
+      [
+        ["README.md", "exclusive-write"],
+        ["unrelated.txt", "read"],
+      ],
+    );
+    assert.equal(transitionResult.claim_set_generation, 2);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("backend release exposes selected resources and explicit all with CAS", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-selected-release`;

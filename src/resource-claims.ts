@@ -25,6 +25,23 @@ export type ResourceClaimTransitionMode = (typeof RESOURCE_CLAIM_TRANSITION_MODE
 export const RESOURCE_CLAIM_TRANSITIONS = ["acquire", "no-op", "change", "release"] as const;
 export type ResourceClaimTransition = (typeof RESOURCE_CLAIM_TRANSITIONS)[number];
 
+/** Stable identity for the one safe recovery operation exposed by additive claim rejection. */
+export const RESOURCE_CLAIM_RECOVERY_ACTION_ID = "transition-exact-resource" as const;
+
+/**
+ * A typed, non-mutating recovery projection for one deterministic additive
+ * contradiction. The generation is the authoritative observation taken
+ * before the rejected write and is therefore suitable for `--if-generation`.
+ */
+export interface ResourceClaimRecoveryAction {
+  readonly [key: string]: string | number;
+  readonly actionId: typeof RESOURCE_CLAIM_RECOVERY_ACTION_ID;
+  readonly command: string;
+  readonly resource: string;
+  readonly mode: ResourceClaimMode;
+  readonly claimSetGeneration: number;
+}
+
 /**
  * Normative exact-resource transition matrix. Rows are the currently
  * observed mode and columns are the requested mode. The matrix classifies
