@@ -31,23 +31,23 @@ const OPERATION_AUTHORIZATION_POLICY_RECORD = {
   "source-write": Object.freeze({
     requiredAccess: "write",
     isolationRationale:
-      "Source mutation needs ordinary write authority and may coexist with a non-mutating read declaration.",
+      "Source-write changes working-tree content path by path; ordinary write permits read declarations while claim conflict checks prevent competing writes.",
     authorityRationale:
-      "Authorization vocabulary only; the resource-claim authority evaluates ownership and overlap when called.",
+      "No standalone public source-write executor exists; authorization reads this policy and resource-claims checks concrete ownership.",
     enforcement: "authorization-vocabulary",
   }),
   stage: Object.freeze({
     requiredAccess: "write",
     isolationRationale:
-      "Local index staging is an ordinary mutation and needs write authority without an operation-level exclusive lease.",
+      "Stage changes local Git index entries for selected paths; write is sufficient because index preparation does not finalize history and read declarations remain non-mutating.",
     authorityRationale:
-      "Authorization vocabulary only; the resource-claim authority evaluates ownership and overlap when called.",
+      "Stage has no standalone public executor; commit's staging phase is authorized as commit while this entry preserves the standalone vocabulary declaration.",
     enforcement: "authorization-vocabulary",
   }),
   commit: Object.freeze({
     requiredAccess: "exclusive-write",
     isolationRationale:
-      "Local commit changes repository history and the index, so overlapping declared access is excluded at its boundary.",
+      "Commit records selected staged paths in local history and changes the branch tip; overlapping declarations are excluded while those state changes are finalized.",
     authorityRationale:
       "SessionRegistry.commit invokes the shared operation authorization before staging and commit; resource-claims owns conflict evaluation.",
     enforcement: "public-execution",
@@ -55,25 +55,25 @@ const OPERATION_AUTHORIZATION_POLICY_RECORD = {
   "branch-mutation": Object.freeze({
     requiredAccess: "exclusive-write",
     isolationRationale:
-      "Local branch or ref mutation can alter shared repository state, so overlapping declared access is excluded.",
+      "Branch or ref mutation changes a repository pointer shared by worktrees; overlapping declarations are excluded while that pointer ownership changes.",
     authorityRationale:
-      "Authorization vocabulary only; no public branch-mutation executor currently routes through this entry.",
+      "No public branch-mutation executor routes here; branch/worktree lifecycle code retains its dedicated physical ownership checks.",
     enforcement: "authorization-vocabulary",
   }),
   push: Object.freeze({
     requiredAccess: "exclusive-write",
     isolationRationale:
-      "The local push operation boundary is an exclusive mutation boundary over its declared resources.",
+      "Local Git push selects and validates a fixed revision plus explicit resource-scoped input; overlapping declarations are excluded while that basis is checked and sent.",
     authorityRationale:
-      "SessionRegistry.push invokes the shared operation authorization before the Git mutation; resource-claims owns conflict evaluation.",
+      "SessionRegistry.push authorizes explicit resources before its Git mutation; resource-claims remains the sole owner of concrete overlap evaluation.",
     enforcement: "public-execution",
   }),
   cleanup: Object.freeze({
     requiredAccess: "exclusive-write",
     isolationRationale:
-      "Local cleanup removes session-owned worktree or branch state, so overlapping declared access is excluded.",
+      "Cleanup removes session-owned worktree and branch state after physical checks; overlapping declarations are excluded for the removal boundary.",
     authorityRationale:
-      "Authorization vocabulary only; cleanup currently uses its physical cleanup authority rather than this entry.",
+      "Cleanup currently reaches its dedicated physical cleanup authority rather than authorizeOperation, so this entry remains vocabulary-only.",
     enforcement: "authorization-vocabulary",
   }),
 } as const satisfies Readonly<Record<string, OperationAuthorizationPolicy>>;

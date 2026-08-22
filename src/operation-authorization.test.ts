@@ -38,6 +38,15 @@ test("the operation policy is the complete, keyed authority for vocabulary and a
     assert.match(policy.isolationRationale, /\S/u);
     assert.match(policy.authorityRationale, /\S/u);
   }
+
+  const isolationRationales = OPERATION_VOCABULARY.map(
+    (operation) => OPERATION_AUTHORIZATION_POLICY[operation].isolationRationale,
+  );
+  const authorityRationales = OPERATION_VOCABULARY.map(
+    (operation) => OPERATION_AUTHORIZATION_POLICY[operation].authorityRationale,
+  );
+  assert.equal(new Set(isolationRationales).size, OPERATION_VOCABULARY.length);
+  assert.equal(new Set(authorityRationales).size, OPERATION_VOCABULARY.length);
 });
 
 test("the policy records current public enforcement separately from vocabulary-only operations", () => {
