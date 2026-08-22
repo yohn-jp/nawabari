@@ -188,6 +188,61 @@ test("resource claims expose canonical machine fields through the backend and CL
   }
 });
 
+test("backend maps atomic claim deltas with typed before/after projections", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-delta-contract`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/delta-contract", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const acquired = await backend.claimResources(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        claims: [{ resource: "README.md", mode: "read" }],
+      },
+    );
+    assert.equal(acquired.ok, true);
+    if (!acquired.ok) return;
+
+    const changed = await backend.applyClaimDeltas(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        expected_claim_set_generation: acquired.value.claim_set_generation,
+        deltas: [
+          { kind: "upsert", resource: "README.md", mode: "write" },
+          { kind: "upsert", resource: "src/new.ts", mode: "read" },
+        ],
+      },
+    );
+    assert.equal(changed.ok, true, changed.ok ? "delta succeeded" : JSON.stringify(changed.error));
+    if (!changed.ok) return;
+    assert.equal(changed.value.previous_claim_set_generation, 1);
+    assert.equal(changed.value.claim_set_generation, 2);
+    assert.equal(changed.value.changed.length, 1);
+    assert.equal(changed.value.changed[0]?.before.mode, "read");
+    assert.equal(changed.value.changed[0]?.after.mode, "write");
+    assert.deepEqual(
+      changed.value.claims.map((claim) => [claim.resource, claim.mode]),
+      [
+        ["README.md", "write"],
+        ["src/new.ts", "read"],
+      ],
+    );
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("the CLI create command uses the local backend and emits stable JSON", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-cli-session`;

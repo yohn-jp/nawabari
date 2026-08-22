@@ -65,6 +65,17 @@ export type UpdateClaimsOptions = ClaimResourcesOptions & {
   force?: boolean;
 };
 
+export type ResourceClaimDelta =
+  { kind: "upsert"; resource: string; mode: ResourceClaimMode } | { kind: "release"; resource: string };
+
+export type ClaimDeltasOptions = {
+  session_id: string | null;
+  deltas: ResourceClaimDelta[];
+  repository?: string | null;
+  expected_claim_set_generation?: number | null;
+  force?: boolean;
+};
+
 export type ReleaseClaimsOptions = {
   session_id: string | null;
   claim_ids?: string[] | null;
@@ -87,6 +98,27 @@ export type ReleaseClaimsResult = {
   remaining: ResourceClaim[];
   idempotent: boolean;
   claim_set_generation: number;
+};
+
+export type ClaimModeChange = {
+  resource: string;
+  before: ResourceClaim;
+  after: ResourceClaim;
+};
+
+export type UnchangedClaimDelta =
+  { kind: "upsert"; resource: string; claim: ResourceClaim } | { kind: "release"; resource: string };
+
+export type ClaimDeltasResult = {
+  session: SessionRecord;
+  claims: ResourceClaim[];
+  previous_claim_set_generation: number;
+  claim_set_generation: number;
+  added: ResourceClaim[];
+  changed: ClaimModeChange[];
+  released: ResourceClaim[];
+  unchanged: UnchangedClaimDelta[];
+  idempotent: boolean;
 };
 
 export type SessionCloseOptions = {
@@ -509,6 +541,7 @@ export interface SessionBackend {
   garbageCollect(context: SessionContext, options: GarbageCollectOptions): Promise<DomainResult<GarbageCollectResult>>;
   claimResources?(context: SessionContext, options: ClaimResourcesOptions): Promise<DomainResult<ClaimResourcesResult>>;
   updateClaims?(context: SessionContext, options: UpdateClaimsOptions): Promise<DomainResult<ClaimResourcesResult>>;
+  applyClaimDeltas?(context: SessionContext, options: ClaimDeltasOptions): Promise<DomainResult<ClaimDeltasResult>>;
   releaseClaims?(context: SessionContext, options: ReleaseClaimsOptions): Promise<DomainResult<ReleaseClaimsResult>>;
   listClaims?(
     context: SessionContext,
