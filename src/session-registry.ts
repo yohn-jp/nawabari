@@ -917,14 +917,14 @@ export class SessionRegistry {
           if (before === undefined) {
             throw new SessionRegistryError("OPERATION_REJECTED", "Claim transition classification was inconsistent");
           }
-          released.push(before);
           changed.push({
             resource: delta.resource,
             before: cloneResourceClaim(before),
             after: cloneResourceClaim(after),
           });
+        } else {
+          added.push(after);
         }
-        added.push(after);
       }
 
       const nextSessionClaims = sortResourceClaims([...nextByResource.values()]);
@@ -2409,10 +2409,11 @@ export class SessionRegistry {
           mode: typeof delta.mode === "string" ? delta.mode : String(delta.mode),
         });
       }
-      const resource = canonicalizeConcretePath(delta.resource, owner.worktreePath);
       const normalized: ResourceClaimDelta =
-        delta.kind === "upsert" ? { kind: "upsert", resource, mode: delta.mode } : { kind: "release", resource };
-      const prior = seen.get(resource);
+        delta.kind === "upsert"
+          ? { kind: "upsert", ...canonicalizeClaimInput({ resource: delta.resource, mode: delta.mode }, owner) }
+          : { kind: "release", resource: canonicalizeClaimResource(delta.resource, owner.worktreePath) };
+      const prior = seen.get(normalized.resource);
       if (prior !== undefined) {
         const contradictory =
           prior.kind !== normalized.kind ||
@@ -2423,7 +2424,7 @@ export class SessionRegistry {
             ? "Request contains contradictory deltas for one exact resource"
             : "Request contains duplicate deltas for one exact resource",
           {
-            resource,
+            resource: normalized.resource,
             kind: normalized.kind,
             ...(normalized.kind === "upsert" ? { mode: normalized.mode } : {}),
             otherKind: prior.kind,
@@ -2431,7 +2432,7 @@ export class SessionRegistry {
           },
         );
       }
-      seen.set(resource, normalized);
+      seen.set(normalized.resource, normalized);
       canonical.push(normalized);
     }
     return canonical.sort((left, right) =>
@@ -2448,20 +2449,32 @@ export class SessionRegistry {
     externalClaims: readonly ResourceClaim[],
     sessions: readonly SessionRecord[],
   ): void {
-    for (let index = 0; index < candidates.length; index += 1) {
-      const current = candidates[index];
+    this.assertNoOverlappingClaims(candidates);
+    this.validateRequestedClaims(candidates, owner, externalClaims, sessions);
+  }
+
+  /** Single same-session overlap authority shared by additive and delta paths. */
+  private assertNoOverlappingClaims(claims: readonly ResourceClaim[]): void {
+    for (let index = 0; index < claims.length; index += 1) {
+      const current = claims[index];
       if (current === undefined) continue;
       for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
-        const prior = candidates[priorIndex];
+        const prior = claims[priorIndex];
         if (prior === undefined || !claimsOverlap(current, prior)) continue;
         throw claimError(
           current.mode === prior.mode ? "DUPLICATE_CLAIM" : "CONTRADICTORY_CLAIM",
-          "Resulting claim set contains overlapping claims for one session",
-          { claimId: current.claimId, ownerClaimId: prior.claimId },
+          "Claim set contains overlapping claims for one session",
+          {
+            claimId: current.claimId,
+            ownerClaimId: prior.claimId,
+            resource: current.resource,
+            mode: current.mode,
+            otherResource: prior.resource,
+            otherMode: prior.mode,
+          },
         );
       }
     }
-    this.validateRequestedClaims(candidates, owner, externalClaims, sessions);
   }
 
   private canonicalClaimInputs(
@@ -2479,25 +2492,7 @@ export class SessionRegistry {
       );
     const timestamp = toTimestamp(this.clock());
     const claims = canonical.map((input) => createResourceClaim(input, owner, timestamp));
-    for (let index = 0; index < claims.length; index += 1) {
-      const current = claims[index];
-      for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
-        const prior = claims[priorIndex];
-        if (!claimsOverlap(current, prior)) continue;
-        if (current.mode === prior.mode) {
-          throw claimError("DUPLICATE_CLAIM", "Request contains overlapping equivalent claims", {
-            resource: current.resource,
-            mode: current.mode,
-          });
-        }
-        throw claimError("CONTRADICTORY_CLAIM", "Request contains overlapping claims with different modes", {
-          resource: current.resource,
-          mode: current.mode,
-          otherResource: prior.resource,
-          otherMode: prior.mode,
-        });
-      }
-    }
+    this.assertNoOverlappingClaims(claims);
     return canonical;
   }
 
