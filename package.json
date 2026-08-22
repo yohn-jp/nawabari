@@ -1,6 +1,6 @@
 {
   "name": "nawabari",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "A stable local Git session CLI exposed as git nawabari.",
   "type": "module",
   "bin": {
