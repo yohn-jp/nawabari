@@ -6,6 +6,8 @@ import { test } from "node:test";
 import { runCli } from "./cli.js";
 import { DomainError, failure, success } from "./domain/errors.js";
 import type {
+  ClaimDeltasOptions,
+  ClaimDeltasResult,
   ClaimResourcesOptions,
   ClaimResourcesResult,
   ResourceClaim,
@@ -237,10 +239,12 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session list",
       "session claim",
       "session update",
+      "session mutate",
       "session claims",
       "session release",
       "resource claim",
       "resource update",
+      "resource mutate",
       "resource list",
       "resource release",
       "session close",
@@ -271,6 +275,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--repository",
       "--if-generation",
       "--force",
+      "--upsert-resource",
+      "--release-resource",
       "--claim-id",
       "--fetch-remote",
       "--fetch-branch",
@@ -291,7 +297,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
     session_targeting: {
       canonical: "--session <id>",
       positional_alias: "<session-id> as the first argument after a session-scoped subcommand",
-      commands: ["show", "inspect", "claim", "claims", "release", "update", "close", "discard"],
+      commands: ["show", "inspect", "claim", "claims", "release", "update", "mutate", "close", "discard"],
       ambiguity: "supplying both positional and --session is rejected",
       discard_requires_explicit_target: true,
     },
@@ -991,6 +997,188 @@ test("resource update alias submits the same multi-claim transaction as session 
     ],
     force: true,
   });
+});
+
+test("session mutate submits mixed ordered deltas in exactly one backend call", async () => {
+  let invocations = 0;
+  let observedOptions: ClaimDeltasOptions | null = null;
+  const added = sampleClaim("src/a.ts", "read");
+  const released = sampleClaim("src/old.ts", "write");
+  const result: ClaimDeltasResult = {
+    session: sampleSession,
+    claims: [added],
+    previous_claim_set_generation: 7,
+    claim_set_generation: 8,
+    added: [added],
+    changed: [],
+    released: [released],
+    unchanged: [],
+    idempotent: false,
+  };
+  const backend = backendForTests({
+    applyClaimDeltas: async (_context: SessionContext, options: ClaimDeltasOptions) => {
+      invocations += 1;
+      observedOptions = options;
+      return success(result);
+    },
+  });
+  const output = capture();
+  const exitCode = await runCli(
+    [
+      "--json",
+      "session",
+      "mutate",
+      sampleSession.session_id,
+      "--repository",
+      sampleSession.repository,
+      "--upsert-resource",
+      "src/a.ts",
+      "--mode",
+      "read",
+      "--release-resource",
+      "src/old.ts",
+      "--upsert-resource",
+      "src/c.ts",
+      "--mode",
+      "exclusive-write",
+      "--if-generation",
+      "7",
+    ],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
+  assert.equal(invocations, 1);
+  assert.deepEqual(observedOptions, {
+    session_id: sampleSession.session_id,
+    repository: sampleSession.repository,
+    deltas: [
+      { kind: "upsert", resource: "src/a.ts", mode: "read" },
+      { kind: "release", resource: "src/old.ts" },
+      { kind: "upsert", resource: "src/c.ts", mode: "exclusive-write" },
+    ],
+    expected_claim_set_generation: 7,
+  });
+  const response = JSON.parse(output.stdout[0] ?? "") as ClaimDeltasResult & { command: string; ok: boolean };
+  assert.equal(response.ok, true);
+  assert.equal(response.command, "session mutate");
+  assert.equal(response.claim_set_generation, 8);
+});
+
+test("resource mutate alias preserves the same delta semantics and force intent", async () => {
+  let observedOptions: ClaimDeltasOptions | null = null;
+  const backend = backendForTests({
+    applyClaimDeltas: async (_context: SessionContext, options: ClaimDeltasOptions) => {
+      observedOptions = options;
+      return success({
+        session: sampleSession,
+        claims: [],
+        previous_claim_set_generation: 0,
+        claim_set_generation: 0,
+        added: [],
+        changed: [],
+        released: [],
+        unchanged: [{ kind: "release", resource: "src/a.ts" }],
+        idempotent: true,
+      } satisfies ClaimDeltasResult);
+    },
+  });
+  const output = capture();
+  const exitCode = await runCli(["--json", "resource", "mutate", "--release-resource", "src/a.ts", "--force"], {
+    backend,
+    io: output.io,
+  });
+
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.deepEqual(observedOptions, {
+    session_id: null,
+    repository: null,
+    deltas: [{ kind: "release", resource: "src/a.ts" }],
+    force: true,
+  });
+  assert.equal((JSON.parse(output.stdout[0] ?? "") as { command: string }).command, "resource mutate");
+});
+
+test("claim delta malformed grammar and concurrency ambiguity fail before backend", async () => {
+  let invocations = 0;
+  const backend = backendForTests({
+    applyClaimDeltas: async () => {
+      invocations += 1;
+      return failure(new DomainError("INTERNAL_ERROR", "backend should not be called"));
+    },
+  });
+  const invalidCommands = [
+    ["--upsert-resource", "src/a.ts", "--force"],
+    ["--upsert-resource", "src/a.ts", "--session", sampleSession.session_id, "--mode", "read", "--force"],
+    ["--upsert-resource", "src/a.ts", "--repository", sampleSession.repository, "--mode", "read", "--force"],
+    ["--upsert-resource", "src/a.ts", "--if-generation", "1", "--mode", "read"],
+    ["--mode", "read", "--release-resource", "src/a.ts", "--force"],
+    ["--release-resource", "src/a.ts"],
+    ["--upsert-resource", "src/a.ts", "--mode", "read"],
+    ["--release-resource", "src/a.ts", "--force", "--force"],
+    ["--release-resource", "src/a.ts", "--if-generation", "1", "--force"],
+    ["--release-resource", "src/a.ts", "--if-generation", "1", "--if-generation", "2"],
+    ["--upsert-resource", "src/a.ts", "--mode", "invalid", "--force"],
+    ["--release-resource", "src/a.ts", "--if-generation", "not-an-integer"],
+    ["--release-resource", "src/a.ts", "--if-generation", "-1"],
+    ["--release-resource", "src/a.ts", "--if-generation", "9007199254740992"],
+    ["--release-resource", "src/a.ts", "--force=unexpected"],
+  ];
+
+  for (const arguments_ of invalidCommands) {
+    const output = capture();
+    const exitCode = await runCli(["--json", "session", "mutate", ...arguments_], { backend, io: output.io });
+    assert.equal(exitCode, 2, arguments_.join(" "));
+    const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string };
+    assert.equal(response.ok, false);
+    assert.ok(["INVALID_ARGUMENT", "MISSING_ARGUMENT"].includes(response.code));
+  }
+  assert.equal(invocations, 0);
+});
+
+test("claim delta backend unavailability is fail-closed after valid parsing", async () => {
+  const output = capture();
+  const exitCode = await runCli(["--json", "session", "mutate", "--release-resource", "src/a.ts", "--force"], {
+    backend: backendForTests(),
+    io: output.io,
+  });
+  assert.equal(exitCode, 4);
+  const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string; command: string };
+  assert.deepEqual(response, {
+    ok: false,
+    command: "session mutate",
+    code: "BACKEND_UNAVAILABLE",
+    message: "Resource claim capability is not available.",
+    details: { operation: "session mutate" },
+  });
+});
+
+test("claim delta human and JSON help expose the same grammar for canonical and alias commands", async () => {
+  const human = capture();
+  const json = capture();
+  const aliasJson = capture();
+  assert.equal(await runCli(["session", "mutate", "--help"], { io: human.io }), 0);
+  assert.equal(await runCli(["--json", "session", "mutate", "--help"], { io: json.io }), 0);
+  assert.equal(await runCli(["--json", "resource", "mutate", "--help"], { io: aliasJson.io }), 0);
+  const humanText = human.stdout.join("\n");
+  assert.match(humanText, /--upsert-resource <path-or-glob>/u);
+  assert.match(humanText, /--release-resource <path-or-glob>/u);
+  assert.match(humanText, /--if-generation <non-negative-safe-int>/u);
+  const canonical = JSON.parse(json.stdout[0] ?? "") as {
+    help_for: string;
+    usage: string;
+    options: Array<{ name: string }>;
+    notes: string[];
+  };
+  const alias = JSON.parse(aliasJson.stdout[0] ?? "") as typeof canonical;
+  assert.equal(canonical.help_for, "session mutate");
+  assert.equal(alias.help_for, "resource mutate");
+  assert.equal(alias.usage.replace("resource mutate", "session mutate"), canonical.usage);
+  assert.deepEqual(
+    alias.options.map((option) => option.name),
+    canonical.options.map((option) => option.name),
+  );
+  assert.deepEqual(alias.notes.slice(0, 2), canonical.notes.slice(0, 2));
 });
 
 test("session update forwards an explicit claim-set generation CAS guard", async () => {
