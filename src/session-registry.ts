@@ -426,12 +426,15 @@ export type {
   CheckpointEvidence,
   CheckpointOptions,
   OperationAuthorizationDecision,
+  OperationAuthorizationEnforcement,
   OperationAuthorizationOptions,
+  OperationAuthorizationPolicy,
 } from "./operation-authorization.js";
 export {
   CHECKPOINT_EVIDENCE_SCHEMA_VERSION,
   CHECKPOINT_MAX_PATHS,
   OPERATION_AUTHORIZATION_SCHEMA_VERSION,
+  OPERATION_AUTHORIZATION_POLICY,
   OPERATION_REQUIRED_ACCESS,
   OPERATION_VOCABULARY,
 } from "./operation-authorization.js";
