@@ -140,6 +140,7 @@ test("explicit discard destroys only the selected recoverable session and is ide
     assert.equal(result.worktreeRemoved, true);
     assert.equal(result.branchRemoved, true);
     assert.equal(result.releasedClaims.length, 1);
+    assert.equal(result.claimSetGeneration, 3);
     assert.equal(result.session.state, "closed");
     assert.equal(result.session.terminalOperation, "discard");
     assert.equal(result.session.discardedHead, previousHead);
@@ -155,6 +156,7 @@ test("explicit discard destroys only the selected recoverable session and is ide
 
     const repeated = registry.discard(discarded.sessionId);
     assert.equal(repeated.idempotent, true);
+    assert.equal(repeated.claimSetGeneration, 3);
     assert.equal(repeated.previousHead, previousHead);
     assert.equal(repeated.session.terminalOperation, "discard");
   } finally {

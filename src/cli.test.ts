@@ -18,6 +18,7 @@ import type {
   SessionDiagnosticOptions,
   SessionDiscardResult,
   SessionRecord,
+  UpdateClaimsOptions,
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
 import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
@@ -52,6 +53,7 @@ function backendForTests(overrides: Partial<SessionBackend> = {}): SessionBacken
     session: sampleSession,
     worktree_removed: true,
     branch_removed: true,
+    claim_set_generation: 0,
   };
   return {
     createSession: async (_context: SessionContext, _options: SessionCreateOptions) => success(sampleSession),
@@ -513,7 +515,7 @@ test("session close forwards explicit integration fetch metadata and rejects inc
     closeSession: async (_context: SessionContext, options: SessionCloseOptions) => {
       closeCalls += 1;
       receivedOptions = options;
-      return success({ session: sampleSession, worktree_removed: true, branch_removed: true });
+      return success({ session: sampleSession, worktree_removed: true, branch_removed: true, claim_set_generation: 0 });
     },
   });
   const output = capture();
@@ -578,6 +580,7 @@ test("session-scoped commands accept one consistent positional target and discar
     released_claim_count: 0,
     released_claims_truncated: false,
     idempotent: false,
+    claim_set_generation: 0,
   };
   const backend = backendForTests({
     discardSession: async (_context: SessionContext, sessionId: string) => {
@@ -647,23 +650,43 @@ test("all session target aliases carry the same positional session identity", as
     },
     closeSession: async (_context: SessionContext, options) => {
       seen.push(`close:${options.session_id}`);
-      return success({ session: sampleSession, worktree_removed: true, branch_removed: true });
+      return success({ session: sampleSession, worktree_removed: true, branch_removed: true, claim_set_generation: 0 });
     },
     claimResources: async (_context: SessionContext, options: ClaimResourcesOptions) => {
       seen.push(`claim:${options.session_id}`);
-      return success({ session: sampleSession, claims: [], added: [], released: [], idempotent: false });
+      return success({
+        session: sampleSession,
+        claims: [],
+        added: [],
+        released: [],
+        idempotent: false,
+        claim_set_generation: 0,
+      });
     },
-    updateClaims: async (_context: SessionContext, options: ClaimResourcesOptions) => {
+    updateClaims: async (_context: SessionContext, options: UpdateClaimsOptions) => {
       seen.push(`update:${options.session_id}`);
-      return success({ session: sampleSession, claims: [], added: [], released: [], idempotent: false });
+      return success({
+        session: sampleSession,
+        claims: [],
+        added: [],
+        released: [],
+        idempotent: false,
+        claim_set_generation: 0,
+      });
     },
     listClaims: async (_context: SessionContext, sessionId: string | null) => {
       seen.push(`claims:${sessionId}`);
-      return success({ claims: [] });
+      return success({ claims: [], claim_set_generation: 0 });
     },
     releaseClaims: async (_context: SessionContext, options) => {
       seen.push(`release:${options.session_id}`);
-      return success({ session_id: options.session_id ?? "", released: [], remaining: [], idempotent: false });
+      return success({
+        session_id: options.session_id ?? "",
+        released: [],
+        remaining: [],
+        idempotent: false,
+        claim_set_generation: 0,
+      });
     },
   });
   const commands = [
@@ -876,9 +899,10 @@ test("session update submits one atomic claims[] transaction built from repeated
     added: claims,
     released: [],
     idempotent: false,
+    claim_set_generation: 0,
   };
   const backend = backendForTests({
-    updateClaims: async (_context: SessionContext, options: ClaimResourcesOptions) => {
+    updateClaims: async (_context: SessionContext, options: UpdateClaimsOptions) => {
       observedOptions = options;
       return success(result);
     },
@@ -912,6 +936,7 @@ test("session update submits one atomic claims[] transaction built from repeated
       { resource: "src/a.ts", mode: "exclusive-write" },
       { resource: "src/b.ts", mode: "exclusive-write" },
     ],
+    force: true,
   });
   const response = JSON.parse(output.stdout[0]) as { claims: ResourceClaim[] };
   assert.equal(response.claims.length, 2);
@@ -926,9 +951,10 @@ test("resource update alias submits the same multi-claim transaction as session 
     added: claims,
     released: [],
     idempotent: false,
+    claim_set_generation: 0,
   };
   const backend = backendForTests({
-    updateClaims: async (_context: SessionContext, options: ClaimResourcesOptions) => {
+    updateClaims: async (_context: SessionContext, options: UpdateClaimsOptions) => {
       observedOptions = options;
       return success(result);
     },
@@ -959,6 +985,7 @@ test("resource update alias submits the same multi-claim transaction as session 
       { resource: "src/a.ts", mode: "read" },
       { resource: "src/b.ts", mode: "write" },
     ],
+    force: true,
   });
 });
 
@@ -1088,9 +1115,10 @@ test("session update accepts --session/--repository placed outside a pending --r
     added: claims,
     released: [],
     idempotent: false,
+    claim_set_generation: 0,
   };
   const backend = backendForTests({
-    updateClaims: async (_context: SessionContext, options: ClaimResourcesOptions) => {
+    updateClaims: async (_context: SessionContext, options: UpdateClaimsOptions) => {
       observedOptions = options;
       return success(result);
     },
@@ -1118,6 +1146,7 @@ test("session update accepts --session/--repository placed outside a pending --r
     session_id: sampleSession.session_id,
     repository: "/tmp/repo",
     claims: [{ resource: "src/a.ts", mode: "write" }],
+    force: true,
   });
 });
 
@@ -1130,6 +1159,7 @@ test("session claim submits exactly one --resource/--mode pair", async () => {
     added: claims,
     released: [],
     idempotent: false,
+    claim_set_generation: 0,
   };
   const backend = backendForTests({
     claimResources: async (_context: SessionContext, options: ClaimResourcesOptions) => {
@@ -1162,6 +1192,7 @@ test("session claim rejects a second --resource/--mode pair instead of silently 
         added: [],
         released: [],
         idempotent: false,
+        claim_set_generation: 0,
       } as ClaimResourcesResult);
     },
   });
@@ -1202,6 +1233,7 @@ test("resource claim alias rejects a second --resource/--mode pair instead of si
         added: [],
         released: [],
         idempotent: false,
+        claim_set_generation: 0,
       } as ClaimResourcesResult);
     },
   });

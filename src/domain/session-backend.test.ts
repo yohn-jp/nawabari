@@ -102,6 +102,56 @@ test("resource claims expose canonical machine fields through the backend and CL
     assert.match(claimed.value.claims[0]?.claim_id ?? "", /^claim-[0-9a-f]{64}$/u);
     assert.equal(claimed.value.claims[0]?.resource, "README.md");
     assert.equal(claimed.value.claims[0]?.mode, "read");
+    assert.equal(claimed.value.claim_set_generation, 1);
+
+    const omittedForce = await backend.updateClaims(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        claims: [{ resource: "README.md", mode: "write" }],
+      },
+    );
+    assert.equal(omittedForce.ok, false);
+    if (omittedForce.ok) return;
+    assert.equal(omittedForce.error.code, "INVALID_OPERATION");
+
+    const omittedRelease = await backend.releaseClaims(
+      { cwd: worktreePath },
+      { session_id: created.value.session_id, claim_ids: null },
+    );
+    assert.equal(omittedRelease.ok, false);
+    if (omittedRelease.ok) return;
+    assert.equal(omittedRelease.error.code, "INVALID_OPERATION");
+
+    const forcedUpdate = await backend.updateClaims(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        claims: [{ resource: "README.md", mode: "write" }],
+        force: true,
+      },
+    );
+    assert.equal(forcedUpdate.ok, true);
+    if (!forcedUpdate.ok) return;
+    assert.equal(forcedUpdate.value.claim_set_generation, 2);
+
+    const staleUpdate = await backend.updateClaims(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        claims: [],
+        expected_claim_set_generation: 1,
+      },
+    );
+    assert.equal(staleUpdate.ok, false);
+    if (staleUpdate.ok) return;
+    assert.equal(staleUpdate.error.code, "STALE_CLAIM_SET");
+    assert.ok(staleUpdate.error.details);
+    assert.equal(staleUpdate.error.details.expectedClaimSetGeneration, 1);
+    assert.equal(staleUpdate.error.details.actualClaimSetGeneration, 2);
 
     const stdout: string[] = [];
     const exitCode = await runCli(["session", "claims", "--session", created.value.session_id, "--json"], {
@@ -113,22 +163,25 @@ test("resource claims expose canonical machine fields through the backend and CL
       ok: boolean;
       command: string;
       claims: Array<{ resource: string; mode: string }>;
+      claim_set_generation: number;
     };
     assert.equal(listed.ok, true);
     assert.equal(listed.command, "session claims");
+    assert.equal(listed.claim_set_generation, 2);
     assert.deepEqual(
       listed.claims.map((claim) => [claim.resource, claim.mode]),
-      [["README.md", "read"]],
+      [["README.md", "write"]],
     );
 
     const released = await backend.releaseClaims(
       { cwd: worktreePath },
-      { session_id: created.value.session_id, claim_ids: null },
+      { session_id: created.value.session_id, claim_ids: null, expected_claim_set_generation: 2 },
     );
     assert.equal(released.ok, true);
     if (!released.ok) return;
     assert.equal(released.value.released.length, 1);
     assert.equal(released.value.remaining.length, 0);
+    assert.equal(released.value.claim_set_generation, 3);
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });

@@ -58,11 +58,12 @@ export type ClaimResourcesOptions = {
   session_id: string | null;
   claims: ResourceClaimInput[];
   repository?: string | null;
+};
+
+export type UpdateClaimsOptions = ClaimResourcesOptions & {
   expected_claim_set_generation?: number | null;
   force?: boolean;
 };
-
-export type UpdateClaimsOptions = ClaimResourcesOptions;
 
 export type ReleaseClaimsOptions = {
   session_id: string | null;
@@ -77,7 +78,7 @@ export type ClaimResourcesResult = {
   added: ResourceClaim[];
   released: ResourceClaim[];
   idempotent: boolean;
-  claim_set_generation?: number;
+  claim_set_generation: number;
 };
 
 export type ReleaseClaimsResult = {
@@ -85,7 +86,7 @@ export type ReleaseClaimsResult = {
   released: ResourceClaim[];
   remaining: ResourceClaim[];
   idempotent: boolean;
-  claim_set_generation?: number;
+  claim_set_generation: number;
 };
 
 export type SessionCloseOptions = {
@@ -442,7 +443,7 @@ export type SessionCloseResult = {
   branch_removed: boolean;
   idempotent?: boolean;
   integration_proof?: IntegrationProof;
-  claim_set_generation?: number;
+  claim_set_generation: number;
 };
 
 export type SessionDiscardResult = {
@@ -459,7 +460,7 @@ export type SessionDiscardResult = {
   released_claim_count: number;
   released_claims_truncated: boolean;
   idempotent: boolean;
-  claim_set_generation?: number;
+  claim_set_generation: number;
 };
 
 export type GarbageCollectBlocked = {
@@ -512,7 +513,7 @@ export interface SessionBackend {
   listClaims?(
     context: SessionContext,
     sessionId: string | null,
-  ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation?: number }>>;
+  ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation: number }>>;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {

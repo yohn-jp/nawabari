@@ -173,10 +173,12 @@ test("requires explicit migration before interpreting v1 claim semantics", () =>
 });
 
 test("persists a monotonic claim-set generation and rejects stale replacements without mutation", () => {
-  const fixture = createRepositoryFixture();
+  const fixture = createRepositoryFixture(true);
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const session = registry.create();
+    const siblingRegistry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const sibling = siblingRegistry.create();
     assert.equal(registry.getClaimSetGeneration(), 0);
     assert.equal(registry.listClaimsSnapshot().claimSetGeneration, 0);
 
@@ -192,33 +194,108 @@ test("persists a monotonic claim-set generation and rejects stale replacements w
       }).claimSetGeneration,
       1,
     );
+    const siblingAcquired = siblingRegistry.claimResources({
+      sessionId: sibling.sessionId,
+      claims: [{ resource: "src/file.ts", mode: "read" }],
+    });
+    assert.equal(siblingAcquired.claimSetGeneration, 2, "unrelated session mutation advances global generation");
 
     const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as Record<string, unknown>;
-    assert.equal(persisted.claim_set_generation, 1);
-    delete persisted.claim_set_generation;
-    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(persisted)}\n`);
-    assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).getClaimSetGeneration(), 0);
+    assert.equal(persisted.claim_set_generation, 2);
+    assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).getClaimSetGeneration(), 2);
 
-    const reopened = new SessionRegistry({ cwd: fixture.repositoryPath });
-    const before = reopened.listClaimsSnapshot();
-    assert.throws(
+    assertRegistryError(() => registry.updateClaims({ sessionId: session.sessionId, claims: [] }), "INVALID_OPERATION");
+    assertRegistryError(
       () =>
-        reopened.updateClaims({
+        registry.updateClaims({
           sessionId: session.sessionId,
           claims: [],
-          expectedClaimSetGeneration: 99,
+          expectedClaimSetGeneration: 2,
+          force: true,
+        }),
+      "INVALID_OPERATION",
+    );
+    assertRegistryError(
+      () => registry.updateClaims({ sessionId: session.sessionId, claims: [], expectedClaimSetGeneration: -1 }),
+      "INVALID_OPERATION",
+    );
+
+    const staleCaller = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const staleSnapshot = staleCaller.listClaimsSnapshot();
+    const replaced = registry.updateClaims({
+      sessionId: session.sessionId,
+      claims: [{ resource: "docs/**", mode: "write" }],
+      expectedClaimSetGeneration: 2,
+    });
+    assert.equal(replaced.claimSetGeneration, 3);
+    const beforeStale = registry.listClaimsSnapshot();
+    assert.throws(
+      () =>
+        staleCaller.updateClaims({
+          sessionId: session.sessionId,
+          claims: [],
+          expectedClaimSetGeneration: staleSnapshot.claimSetGeneration,
         }),
       (error: unknown) =>
         error instanceof SessionRegistryError &&
         error.code === "STALE_CLAIM_SET" &&
-        error.details.expectedClaimSetGeneration === 99 &&
-        error.details.actualClaimSetGeneration === 0,
+        error.details.expectedClaimSetGeneration === 2 &&
+        error.details.actualClaimSetGeneration === 3,
     );
-    assert.deepEqual(reopened.listClaimsSnapshot(), before);
+    assert.deepEqual(registry.listClaimsSnapshot(), beforeStale);
 
-    const replaced = reopened.updateClaims({ sessionId: session.sessionId, claims: [], force: true });
-    assert.equal(replaced.claimSetGeneration, 1);
-    assert.equal(reopened.releaseClaims({ sessionId: session.sessionId, force: true }).claimSetGeneration, 1);
+    const noOpRelease = registry.releaseClaims({
+      sessionId: session.sessionId,
+      claimIds: ["claim-nonexistent"],
+      force: true,
+    });
+    assert.equal(noOpRelease.claimSetGeneration, 3);
+    const released = registry.releaseClaims({
+      sessionId: session.sessionId,
+      claimIds: [replaced.claims[0]!.claimId],
+      expectedClaimSetGeneration: 3,
+    });
+    assert.equal(released.released.length, 1);
+    assert.equal(released.claimSetGeneration, 4);
+    const noOpSelectedRelease = registry.releaseClaims({
+      sessionId: session.sessionId,
+      claimIds: [replaced.claims[0]!.claimId],
+      expectedClaimSetGeneration: 4,
+    });
+    assert.equal(noOpSelectedRelease.claimSetGeneration, 4);
+
+    const reacquired = registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [
+        { resource: "src/a.ts", mode: "read" },
+        { resource: "src/b.ts", mode: "read" },
+      ],
+    });
+    assert.equal(reacquired.claimSetGeneration, 5);
+    const releasedAll = registry.releaseClaims({
+      sessionId: session.sessionId,
+      expectedClaimSetGeneration: 5,
+    });
+    assert.equal(releasedAll.released.length, 2);
+    assert.equal(releasedAll.claimSetGeneration, 6);
+    assert.equal(
+      registry.releaseClaims({ sessionId: session.sessionId, expectedClaimSetGeneration: 6 }).claimSetGeneration,
+      6,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("reads a registry without claim_set_generation as generation zero", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    registry.create();
+    const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as Record<string, unknown>;
+    delete persisted.claim_set_generation;
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(persisted)}\n`);
+    assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).getClaimSetGeneration(), 0);
   } finally {
     fixture.cleanup();
   }
@@ -477,9 +554,13 @@ test("close releases claims only after conservative cleanup succeeds", () => {
 
     const closed = registry.close(session.sessionId);
     assert.equal(closed.session.state, "closed");
+    assert.equal(closed.claimSetGeneration, 2);
+    assert.equal(registry.getClaimSetGeneration(), 2);
     assert.deepEqual(registry.listClaims(), []);
     assert.equal(closed.idempotent, false);
-    assert.equal(registry.close(session.sessionId).idempotent, true);
+    const repeated = registry.close(session.sessionId);
+    assert.equal(repeated.idempotent, true);
+    assert.equal(repeated.claimSetGeneration, 2);
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
     fixture.cleanup();
@@ -509,7 +590,26 @@ test("GC releases claims when a session worktree is externally pruned", () => {
       [session.sessionId],
     );
     assert.deepEqual(registry.listClaims(), []);
+    assert.equal(registry.getClaimSetGeneration(), 2);
     assert.equal(registry.get(session.sessionId)?.state, "closed");
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("lifecycle close without claims does not advance the claim-set generation", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(
+    path.dirname(fixture.repositoryPath),
+    `${path.basename(fixture.repositoryPath)}-claim-close-empty`,
+  );
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/claim-close-empty" });
+    const closed = registry.close(session.sessionId);
+    assert.equal(closed.claimSetGeneration, 0);
+    assert.equal(registry.getClaimSetGeneration(), 0);
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
     fixture.cleanup();

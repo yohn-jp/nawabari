@@ -417,7 +417,6 @@ export class LocalSessionBackend implements SessionBackend {
         sessionId: options.session_id ?? undefined,
         repositoryId: options.repository ?? undefined,
         claims: options.claims.map(toRegistryClaimInput),
-        expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
       });
       return success(toDomainClaimResult(result));
     } catch (error: unknown) {
@@ -435,7 +434,7 @@ export class LocalSessionBackend implements SessionBackend {
         repositoryId: options.repository ?? undefined,
         claims: options.claims.map(toRegistryClaimInput),
         expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
-        force: options.expected_claim_set_generation == null,
+        force: options.force === true,
       });
       return success(toDomainClaimResult(result));
     } catch (error: unknown) {
@@ -452,7 +451,7 @@ export class LocalSessionBackend implements SessionBackend {
         sessionId: options.session_id ?? undefined,
         claimIds: options.claim_ids ?? undefined,
         expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
-        force: options.expected_claim_set_generation == null,
+        force: options.force === true,
       });
       return success({
         session_id: result.sessionId,
@@ -469,7 +468,7 @@ export class LocalSessionBackend implements SessionBackend {
   public async listClaims(
     context: SessionContext,
     sessionId: string | null,
-  ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation?: number }>> {
+  ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation: number }>> {
     try {
       const snapshot = this.registryFor(context).listClaimsSnapshot(sessionId);
       return success({

@@ -373,14 +373,13 @@ export interface ClaimResourcesOptions {
   readonly claims: readonly ResourceClaimInput[];
   readonly repositoryId?: string;
   readonly repository_id?: string;
-  /** Additive claims do not require CAS; this is accepted for forward-compatible callers. */
-  readonly expectedClaimSetGeneration?: number | null;
-  readonly expected_claim_set_generation?: number | null;
-  /** Required for complete replacement when no expected generation is supplied. */
-  readonly force?: boolean;
 }
 
-export interface UpdateClaimsOptions extends ClaimResourcesOptions {}
+export interface UpdateClaimsOptions extends ClaimResourcesOptions {
+  readonly expectedClaimSetGeneration?: number | null;
+  readonly expected_claim_set_generation?: number | null;
+  readonly force?: boolean;
+}
 
 export interface ReleaseClaimsOptions {
   readonly sessionId?: string | null;
@@ -2217,14 +2216,14 @@ export class SessionRegistry {
     if (expected !== undefined && expected !== null && forced) {
       throw new SessionRegistryError(
         "INVALID_OPERATION",
-        "Claim-set replacement requires exactly one of expectedClaimSetGeneration or force",
+        "Claim-set mutation requires exactly one of expectedClaimSetGeneration or force",
       );
     }
     if (expected === undefined || expected === null) {
       if (forced) return;
       throw new SessionRegistryError(
         "INVALID_OPERATION",
-        "Claim-set replacement requires expectedClaimSetGeneration or force",
+        "Claim-set mutation requires expectedClaimSetGeneration or force",
       );
     }
     if (!Number.isSafeInteger(expected) || expected < 0) {
