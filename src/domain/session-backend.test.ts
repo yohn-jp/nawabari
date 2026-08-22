@@ -243,6 +243,88 @@ test("backend maps atomic claim deltas with typed before/after projections", asy
   }
 });
 
+test("backend exposes exact upsert transitions for every mode without rebuilding unrelated claims", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-transition-contract`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/transition-contract", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const unrelated = await backend.claimResources(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        claims: [{ resource: "unrelated.txt", mode: "read" }],
+      },
+    );
+    assert.equal(unrelated.ok, true);
+    if (!unrelated.ok) return;
+
+    const transition = async (mode: "read" | "write" | "exclusive-write", expected: number) =>
+      backend.applyClaimDeltas(
+        { cwd: worktreePath },
+        {
+          session_id: created.value.session_id,
+          repository: created.value.repository,
+          deltas: [{ kind: "upsert", resource: "target.txt", mode }],
+          expected_claim_set_generation: expected,
+        },
+      );
+
+    const acquired = await transition("read", unrelated.value.claim_set_generation);
+    assert.equal(acquired.ok, true);
+    if (!acquired.ok) return;
+    assert.equal(acquired.value.added[0]?.mode, "read");
+    assert.equal(acquired.value.claim_set_generation, 2);
+
+    const changedToWrite = await transition("write", acquired.value.claim_set_generation);
+    assert.equal(changedToWrite.ok, true);
+    if (!changedToWrite.ok) return;
+    assert.equal(changedToWrite.value.changed[0]?.before.mode, "read");
+    assert.equal(changedToWrite.value.changed[0]?.after.mode, "write");
+    assert.equal(changedToWrite.value.claim_set_generation, 3);
+
+    const changedToExclusive = await transition("exclusive-write", changedToWrite.value.claim_set_generation);
+    assert.equal(changedToExclusive.ok, true);
+    if (!changedToExclusive.ok) return;
+    assert.equal(changedToExclusive.value.changed[0]?.after.mode, "exclusive-write");
+    assert.equal(changedToExclusive.value.claim_set_generation, 4);
+
+    const sameMode = await transition("exclusive-write", changedToExclusive.value.claim_set_generation);
+    assert.equal(sameMode.ok, true);
+    if (!sameMode.ok) return;
+    assert.equal(sameMode.value.idempotent, true);
+    assert.equal(sameMode.value.unchanged[0]?.kind, "upsert");
+    assert.equal(sameMode.value.claim_set_generation, 4);
+
+    const stale = await transition("read", 0);
+    assert.equal(stale.ok, false);
+    if (stale.ok) return;
+    assert.equal(stale.error.code, "STALE_CLAIM_SET");
+
+    const listed = await backend.listClaims({ cwd: worktreePath }, created.value.session_id);
+    assert.equal(listed.ok, true);
+    if (!listed.ok) return;
+    assert.equal(listed.value.claim_set_generation, 4);
+    assert.deepEqual(
+      listed.value.claims.map((claim) => [claim.resource, claim.mode]),
+      [
+        ["target.txt", "exclusive-write"],
+        ["unrelated.txt", "read"],
+      ],
+    );
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("the CLI create command uses the local backend and emits stable JSON", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-cli-session`;
