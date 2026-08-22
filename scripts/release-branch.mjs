@@ -7,7 +7,7 @@ const SEMVER_BUILD_IDENTIFIER = "[0-9A-Za-z-]+";
 export const RELEASE_BRANCH_PATTERN = new RegExp(
   `^release/${SEMVER_NUMERIC_IDENTIFIER}\\.${SEMVER_NUMERIC_IDENTIFIER}\\.${SEMVER_NUMERIC_IDENTIFIER}` +
     `(?:-${SEMVER_PRERELEASE_IDENTIFIER}(?:\\.${SEMVER_PRERELEASE_IDENTIFIER})*)?` +
-    `(?:\\+${SEMVER_BUILD_IDENTIFIER}(?:\\.${SEMVER_BUILD_IDENTIFIER})*)?$`
+    `(?:\\+${SEMVER_BUILD_IDENTIFIER}(?:\\.${SEMVER_BUILD_IDENTIFIER})*)?$`,
 );
 
 /**
@@ -26,14 +26,14 @@ export function classifyReleaseBranch(branch) {
       kind: "release",
       valid: true,
       version: branch.slice("release/".length),
-      errors: []
+      errors: [],
     };
   }
   return {
     kind: "invalid-release",
     valid: false,
     errors: [
-      `release branch "${branch}" must match release/<semver> (for example release/1.2.3)`
-    ]
+      `release branch "${branch}" must match release/<semver> (for example release/1.2.3)`,
+    ],
   };
 }
