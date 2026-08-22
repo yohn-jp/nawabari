@@ -172,6 +172,58 @@ test("requires explicit migration before interpreting v1 claim semantics", () =>
   }
 });
 
+test("persists a monotonic claim-set generation and rejects stale replacements without mutation", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    assert.equal(registry.getClaimSetGeneration(), 0);
+    assert.equal(registry.listClaimsSnapshot().claimSetGeneration, 0);
+
+    const acquired = registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "README.md", mode: "read" }],
+    });
+    assert.equal(acquired.claimSetGeneration, 1);
+    assert.equal(
+      registry.claimResources({
+        sessionId: session.sessionId,
+        claims: [{ resource: "README.md", mode: "read" }],
+      }).claimSetGeneration,
+      1,
+    );
+
+    const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as Record<string, unknown>;
+    assert.equal(persisted.claim_set_generation, 1);
+    delete persisted.claim_set_generation;
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(persisted)}\n`);
+    assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).getClaimSetGeneration(), 0);
+
+    const reopened = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const before = reopened.listClaimsSnapshot();
+    assert.throws(
+      () =>
+        reopened.updateClaims({
+          sessionId: session.sessionId,
+          claims: [],
+          expectedClaimSetGeneration: 99,
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "STALE_CLAIM_SET" &&
+        error.details.expectedClaimSetGeneration === 99 &&
+        error.details.actualClaimSetGeneration === 0,
+    );
+    assert.deepEqual(reopened.listClaimsSnapshot(), before);
+
+    const replaced = reopened.updateClaims({ sessionId: session.sessionId, claims: [], force: true });
+    assert.equal(replaced.claimSetGeneration, 1);
+    assert.equal(reopened.releaseClaims({ sessionId: session.sessionId, force: true }).claimSetGeneration, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("failed claim persistence preserves the prior registry and permits a safe retry", () => {
   const fixture = createRepositoryFixture();
   const backupPath = `${fixture.repositoryPath}-registry-backup`;
@@ -256,6 +308,7 @@ test("applies the documented overlap matrix and makes retries idempotent", () =>
     const secondWrite = secondRegistry.updateClaims({
       sessionId: second.sessionId,
       claims: [{ resource: "src/file.ts", mode: "write" }],
+      force: true,
     });
     assert.equal(secondWrite.added.length, 1);
 
@@ -276,10 +329,11 @@ test("applies the documented overlap matrix and makes retries idempotent", () =>
       "CONTRADICTORY_CLAIM",
     );
     // Two ordinary writers still conflict.
-    secondRegistry.releaseClaims(second.sessionId);
+    secondRegistry.releaseClaims({ sessionId: second.sessionId, force: true });
     const firstWrite = firstRegistry.updateClaims({
       sessionId: first.sessionId,
       claims: [{ resource: "src/file.ts", mode: "write" }],
+      force: true,
     });
     assert.equal(firstWrite.added.length, 1);
     assertRegistryError(
@@ -292,7 +346,7 @@ test("applies the documented overlap matrix and makes retries idempotent", () =>
     );
 
     // Strong mutation excludes a reader even though ordinary mutation does not.
-    firstRegistry.releaseClaims(first.sessionId);
+    firstRegistry.releaseClaims({ sessionId: first.sessionId, force: true });
     secondRegistry.claimResources({
       sessionId: second.sessionId,
       claims: [{ resource: "src/file.ts", mode: "exclusive-write" }],
@@ -305,7 +359,7 @@ test("applies the documented overlap matrix and makes retries idempotent", () =>
         }),
       "RESOURCE_CLAIM_CONFLICT",
     );
-    secondRegistry.releaseClaims(second.sessionId);
+    secondRegistry.releaseClaims({ sessionId: second.sessionId, force: true });
     firstRegistry.claimResources({
       sessionId: first.sessionId,
       claims: [{ resource: "src/file.ts", mode: "read" }],
@@ -322,6 +376,7 @@ test("applies the documented overlap matrix and makes retries idempotent", () =>
     const update = firstRegistry.updateClaims({
       sessionId: first.sessionId,
       claims: [{ resource: "docs/**", mode: "write" }],
+      force: true,
     });
     assert.equal(update.released.length, 1);
     assert.equal(update.added.length, 1);
@@ -330,18 +385,26 @@ test("applies the documented overlap matrix and makes retries idempotent", () =>
       ["docs/**"],
     );
 
-    const released = firstRegistry.releaseClaims(first.sessionId);
+    const released = firstRegistry.releaseClaims({ sessionId: first.sessionId, force: true });
     assert.equal(released.released.length, 1);
     assert.equal(released.remaining.length, 0);
-    assert.equal(firstRegistry.releaseClaims(first.sessionId).idempotent, true);
+    assert.equal(firstRegistry.releaseClaims({ sessionId: first.sessionId, force: true }).idempotent, true);
 
     const retryClaim = firstRegistry.claimResources({
       sessionId: first.sessionId,
       claims: [{ resource: "src/retry.ts", mode: "write" }],
     }).added[0];
     assert.ok(retryClaim);
-    assert.equal(firstRegistry.releaseClaims(first.sessionId, [retryClaim.claimId]).idempotent, false);
-    assert.equal(firstRegistry.releaseClaims(first.sessionId, [retryClaim.claimId]).idempotent, true);
+    assert.equal(
+      firstRegistry.releaseClaims({ sessionId: first.sessionId, claimIds: [retryClaim.claimId], force: true })
+        .idempotent,
+      false,
+    );
+    assert.equal(
+      firstRegistry.releaseClaims({ sessionId: first.sessionId, claimIds: [retryClaim.claimId], force: true })
+        .idempotent,
+      true,
+    );
   } finally {
     fixture.cleanup();
   }

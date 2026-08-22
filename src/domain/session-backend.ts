@@ -76,6 +76,7 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   WORKTREE_MISMATCH: "WORKTREE_MISMATCH",
   BRANCH_MISMATCH: "BRANCH_MISMATCH",
   STALE_REGISTRY: "STALE_REGISTRY",
+  STALE_CLAIM_SET: "STALE_CLAIM_SET",
   GIT_STATE_AMBIGUOUS: "GIT_STATE_AMBIGUOUS",
   PHYSICAL_OBSERVATION_UNAVAILABLE: "PHYSICAL_OBSERVATION_UNAVAILABLE",
   INVALID_SESSION_ID: "INVALID_SESSION_ID",
@@ -356,6 +357,7 @@ export class LocalSessionBackend implements SessionBackend {
           worktree_removed: result.worktreeRemoved,
           branch_removed: result.branchRemoved,
           idempotent: result.idempotent,
+          claim_set_generation: result.claimSetGeneration,
           ...(result.integrationProof === undefined
             ? {}
             : {
@@ -415,6 +417,7 @@ export class LocalSessionBackend implements SessionBackend {
         sessionId: options.session_id ?? undefined,
         repositoryId: options.repository ?? undefined,
         claims: options.claims.map(toRegistryClaimInput),
+        expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
       });
       return success(toDomainClaimResult(result));
     } catch (error: unknown) {
@@ -431,6 +434,8 @@ export class LocalSessionBackend implements SessionBackend {
         sessionId: options.session_id ?? undefined,
         repositoryId: options.repository ?? undefined,
         claims: options.claims.map(toRegistryClaimInput),
+        expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+        force: options.expected_claim_set_generation == null,
       });
       return success(toDomainClaimResult(result));
     } catch (error: unknown) {
@@ -446,12 +451,15 @@ export class LocalSessionBackend implements SessionBackend {
       const result = this.registryFor(context).releaseClaims({
         sessionId: options.session_id ?? undefined,
         claimIds: options.claim_ids ?? undefined,
+        expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+        force: options.expected_claim_set_generation == null,
       });
       return success({
         session_id: result.sessionId,
         released: result.released.map(toDomainClaim),
         remaining: result.remaining.map(toDomainClaim),
         idempotent: result.idempotent,
+        claim_set_generation: result.claimSetGeneration,
       });
     } catch (error: unknown) {
       return failure(toDomainError(error));
@@ -461,9 +469,13 @@ export class LocalSessionBackend implements SessionBackend {
   public async listClaims(
     context: SessionContext,
     sessionId: string | null,
-  ): Promise<DomainResult<{ claims: ResourceClaim[] }>> {
+  ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation?: number }>> {
     try {
-      return success({ claims: this.registryFor(context).listClaims(sessionId).map(toDomainClaim) });
+      const snapshot = this.registryFor(context).listClaimsSnapshot(sessionId);
+      return success({
+        claims: snapshot.claims.map(toDomainClaim),
+        claim_set_generation: snapshot.claimSetGeneration,
+      });
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -722,6 +734,7 @@ function toDomainSessionDiscardResult(
     released_claim_count: result.releasedClaimCount,
     released_claims_truncated: result.releasedClaimsTruncated,
     idempotent: result.idempotent,
+    claim_set_generation: result.claimSetGeneration,
   };
 }
 
@@ -761,6 +774,7 @@ function toDomainClaimResult(result: import("../session-registry.js").ClaimResou
     added: result.added.map(toDomainClaim),
     released: result.released.map(toDomainClaim),
     idempotent: result.idempotent,
+    claim_set_generation: result.claimSetGeneration,
   };
 }
 
