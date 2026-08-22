@@ -172,12 +172,20 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
         value: "<read|write|exclusive-write>",
         required: true,
       }),
+      option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
+        value: "<non-negative-integer>",
+      }),
+      option(
+        "--force",
+        "Explicitly permit unconditional complete replacement; mutually exclusive with --if-generation",
+      ),
       option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
       option("--repository", "Expected repository identity", { value: "<id>" }),
     ],
     notes: [
-      "The desired claim set fully replaces the session's current claims in one updateClaims() transaction; " +
-        "on any invalid or conflicting claim the prior set is left unchanged.",
+      "The desired claim set is a full replacement performed atomically in one updateClaims() transaction; " +
+        "use exactly one concurrency intent: --if-generation <non-negative-integer> for claim-set generation CAS, " +
+        "or explicit --force for unconditional replacement. On any invalid, conflicting, or stale claim the prior set is left unchanged.",
       "Each --resource must be immediately followed by its own --mode; pairing is positional adjacency, not flag order.",
       "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
@@ -229,12 +237,20 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
         value: "<read|write|exclusive-write>",
         required: true,
       }),
+      option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
+        value: "<non-negative-integer>",
+      }),
+      option(
+        "--force",
+        "Explicitly permit unconditional complete replacement; mutually exclusive with --if-generation",
+      ),
       option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
       option("--repository", "Expected repository identity", { value: "<id>" }),
     ],
     notes: [
-      "The desired claim set fully replaces the session's current claims in one updateClaims() transaction; " +
-        "on any invalid or conflicting claim the prior set is left unchanged.",
+      "The desired claim set is a full replacement performed atomically in one updateClaims() transaction; " +
+        "use exactly one concurrency intent: --if-generation <non-negative-integer> for claim-set generation CAS, " +
+        "or explicit --force for unconditional replacement. On any invalid, conflicting, or stale claim the prior set is left unchanged.",
       "Each --resource must be immediately followed by its own --mode; pairing is positional adjacency, not flag order.",
       "Target grammar matches session update: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
@@ -794,6 +810,8 @@ type ClaimReplacementPairs = {
   session_id: string | null;
   repository: string | null;
   pairs: Array<{ resource: string; mode: string }>;
+  expected_claim_set_generation: number | null;
+  force: boolean;
 };
 
 /**
@@ -804,19 +822,31 @@ type ClaimReplacementPairs = {
  * parallel-array position, so argv order can never associate a resource
  * with the wrong mode.
  */
-function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimReplacementPairs> {
+function parseClaimReplacementPairs(
+  arguments_: string[],
+  requireConcurrencyIntent = true,
+): DomainResult<ClaimReplacementPairs> {
   const positional = splitPositionalSessionTarget(arguments_);
   if (!positional.ok) return positional;
   let sessionId: string | null = null;
   let repository: string | null = null;
   const pairs: Array<{ resource: string; mode: string }> = [];
   let pendingResource: string | null = null;
+  let expectedClaimSetGeneration: number | null = null;
+  let force = false;
 
   sessionId = positional.value.sessionId;
   const targetArguments = positional.value.arguments;
   for (let index = 0; index < targetArguments.length; index += 1) {
     const { name, inlineValue } = optionParts(targetArguments[index]);
-    if (name !== "--session" && name !== "--repository" && name !== "--resource" && name !== "--mode") {
+    const isConcurrencyOption = name === "--if-generation" || name === "--force";
+    if (
+      name !== "--session" &&
+      name !== "--repository" &&
+      name !== "--resource" &&
+      name !== "--mode" &&
+      !(requireConcurrencyIntent && isConcurrencyOption)
+    ) {
       return failure(usageError("INVALID_ARGUMENT", `Unknown option: ${name}.`, { option: name }));
     }
     if (pendingResource !== null && name !== "--mode") {
@@ -829,8 +859,20 @@ function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimRep
       );
     }
 
+    if (name === "--force") {
+      if (inlineValue !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--force does not accept a value.", { option: name }));
+      }
+      if (force) {
+        return failure(usageError("INVALID_ARGUMENT", "--force may be supplied only once.", { option: name }));
+      }
+      force = true;
+      continue;
+    }
+
     const value = inlineValue ?? targetArguments[index + 1];
-    if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-"))) {
+    const negativeGeneration = name === "--if-generation" && /^-\d+$/u.test(value ?? "");
+    if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-") && !negativeGeneration)) {
       return failure(usageError("MISSING_ARGUMENT", `${name} requires a value.`, { option: name }));
     }
     if (inlineValue === null) index += 1;
@@ -844,7 +886,29 @@ function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimRep
       sessionId = value;
     } else if (name === "--repository") repository = value;
     else if (name === "--resource") pendingResource = value;
-    else {
+    else if (name === "--if-generation") {
+      if (expectedClaimSetGeneration !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--if-generation may be supplied only once.", { option: name }));
+      }
+      if (!/^\d+$/u.test(value)) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
+            option: name,
+            value,
+          }),
+        );
+      }
+      const parsedGeneration = Number(value);
+      if (!Number.isSafeInteger(parsedGeneration)) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
+            option: name,
+            value,
+          }),
+        );
+      }
+      expectedClaimSetGeneration = parsedGeneration;
+    } else {
       if (pendingResource === null) {
         return failure(
           usageError("INVALID_ARGUMENT", "--mode must be immediately preceded by its own --resource.", {
@@ -865,7 +929,37 @@ function parseClaimReplacementPairs(arguments_: string[]): DomainResult<ClaimRep
   if (pairs.length === 0) {
     return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
   }
-  return { ok: true, value: { session_id: sessionId, repository, pairs } };
+  if (!requireConcurrencyIntent && (force || expectedClaimSetGeneration !== null)) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "session claim does not accept --if-generation or --force.", {
+        options: ["--if-generation", "--force"],
+      }),
+    );
+  }
+  if (requireConcurrencyIntent && force && expectedClaimSetGeneration !== null) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "Specify exactly one of --if-generation or --force, not both.", {
+        options: ["--if-generation", "--force"],
+      }),
+    );
+  }
+  if (requireConcurrencyIntent && !force && expectedClaimSetGeneration === null) {
+    return failure(
+      usageError("MISSING_ARGUMENT", "Exactly one of --if-generation or --force is required.", {
+        options: ["--if-generation", "--force"],
+      }),
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      session_id: sessionId,
+      repository,
+      pairs,
+      expected_claim_set_generation: expectedClaimSetGeneration,
+      force,
+    },
+  };
 }
 
 type SingleClaimPair = {
@@ -882,7 +976,7 @@ type SingleClaimPair = {
  * first pair (last-wins).
  */
 function parseSingleClaimPair(arguments_: string[]): DomainResult<SingleClaimPair> {
-  const parsed = parseClaimReplacementPairs(arguments_);
+  const parsed = parseClaimReplacementPairs(arguments_, false);
   if (!parsed.ok) return parsed;
   if (parsed.value.pairs.length > 1) {
     return failure(
@@ -993,6 +1087,9 @@ async function executeCommand(
       const parsed = parseClaimReplacementPairs(rest);
       if (!parsed.ok) return parsed;
       if (dependencies.backend.updateClaims === undefined) return claimCapabilityUnavailable(subcommand);
+      const concurrency = parsed.value.force
+        ? { force: true }
+        : { expected_claim_set_generation: parsed.value.expected_claim_set_generation };
       const result = await dependencies.backend.updateClaims(context, {
         session_id: parsed.value.session_id,
         repository: parsed.value.repository,
@@ -1000,7 +1097,7 @@ async function executeCommand(
           resource: pair.resource,
           mode: pair.mode as "read" | "write" | "exclusive-write",
         })),
-        force: true,
+        ...concurrency,
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
@@ -1158,6 +1255,9 @@ async function executeCommand(
       const parsed = parseClaimReplacementPairs(rest);
       if (!parsed.ok) return parsed;
       if (dependencies.backend.updateClaims === undefined) return claimCapabilityUnavailable(resourceSubcommand);
+      const concurrency = parsed.value.force
+        ? { force: true }
+        : { expected_claim_set_generation: parsed.value.expected_claim_set_generation };
       const result = await dependencies.backend.updateClaims(context, {
         session_id: parsed.value.session_id,
         repository: parsed.value.repository,
@@ -1165,7 +1265,7 @@ async function executeCommand(
           resource: pair.resource,
           mode: pair.mode as "read" | "write" | "exclusive-write",
         })),
-        force: true,
+        ...concurrency,
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
