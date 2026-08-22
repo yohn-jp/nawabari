@@ -13,6 +13,8 @@ import {
   type SessionCreateOptions,
   type SessionDiagnosticOptions,
   type SessionListOptions,
+  type ClaimDeltasOptions,
+  type ResourceClaimDelta,
   MAX_SESSION_LIST_LIMIT,
 } from "./domain/session.js";
 import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS, EVIDENCE_MAX_DIFF_PATHS } from "./repository-evidence.js";
@@ -191,6 +193,38 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     ],
   },
   {
+    name: "session mutate",
+    summary: "Atomically apply exact-resource claim additions, changes, and releases",
+    usage:
+      `${CLI_NAME} session mutate [<session>|--session <id>] [--repository <id>] ` +
+      `(--upsert-resource <path-or-glob> --mode <read|write|exclusive-write> | --release-resource <path-or-glob>)+ ` +
+      `(--if-generation <non-negative-safe-int> | --force)`,
+    options: [
+      option(
+        "--upsert-resource",
+        "Exact repository-relative resource to add or change; each occurrence must be immediately followed by --mode",
+        { value: "<path-or-glob>" },
+      ),
+      option("--mode", "Mode for the immediately preceding --upsert-resource", {
+        value: "<read|write|exclusive-write>",
+      }),
+      option("--release-resource", "Exact repository-relative resource to release; repeatable", {
+        value: "<path-or-glob>",
+      }),
+      option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
+        value: "<non-negative-safe-int>",
+      }),
+      option("--force", "Explicitly permit unconditional atomic mutation; mutually exclusive with --if-generation"),
+      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
+      option("--repository", "Expected repository identity", { value: "<id>" }),
+    ],
+    notes: [
+      "Apply one or more ordered upsert/release deltas in one backend transaction; exactly one concurrency intent is required.",
+      "Every --upsert-resource must be immediately followed by its own --mode; --release-resource takes exactly one value.",
+      "Target grammar: optional first positional <session> is an alias for --session <id>; do not supply both.",
+    ],
+  },
+  {
     name: "session claims",
     summary: "List canonical resource claims",
     usage: `${CLI_NAME} session claims [<session-id>|--session <id>]`,
@@ -253,6 +287,38 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
         "or explicit --force for unconditional replacement. On any invalid, conflicting, or stale claim the prior set is left unchanged.",
       "Each --resource must be immediately followed by its own --mode; pairing is positional adjacency, not flag order.",
       "Target grammar matches session update: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+    ],
+  },
+  {
+    name: "resource mutate",
+    summary: "Atomically apply exact-resource claim additions, changes, and releases (alias)",
+    usage:
+      `${CLI_NAME} resource mutate [<session>|--session <id>] [--repository <id>] ` +
+      `(--upsert-resource <path-or-glob> --mode <read|write|exclusive-write> | --release-resource <path-or-glob>)+ ` +
+      `(--if-generation <non-negative-safe-int> | --force)`,
+    options: [
+      option(
+        "--upsert-resource",
+        "Exact repository-relative resource to add or change; each occurrence must be immediately followed by --mode",
+        { value: "<path-or-glob>" },
+      ),
+      option("--mode", "Mode for the immediately preceding --upsert-resource", {
+        value: "<read|write|exclusive-write>",
+      }),
+      option("--release-resource", "Exact repository-relative resource to release; repeatable", {
+        value: "<path-or-glob>",
+      }),
+      option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
+        value: "<non-negative-safe-int>",
+      }),
+      option("--force", "Explicitly permit unconditional atomic mutation; mutually exclusive with --if-generation"),
+      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
+      option("--repository", "Expected repository identity", { value: "<id>" }),
+    ],
+    notes: [
+      "Apply one or more ordered upsert/release deltas in one backend transaction; exactly one concurrency intent is required.",
+      "Every --upsert-resource must be immediately followed by its own --mode; --release-resource takes exactly one value.",
+      "Target grammar matches session mutate: optional first positional <session> is an alias for --session <id>; do not supply both.",
     ],
   },
   {
@@ -484,7 +550,7 @@ function helpPayload(spec: HelpCommandSpec): JsonObject {
       session_targeting: {
         canonical: "--session <id>",
         positional_alias: "<session-id> as the first argument after a session-scoped subcommand",
-        commands: ["show", "inspect", "claim", "claims", "release", "update", "close", "discard"],
+        commands: ["show", "inspect", "claim", "claims", "release", "update", "mutate", "close", "discard"],
         ambiguity: "supplying both positional and --session is rejected",
         discard_requires_explicit_target: true,
       },
@@ -814,6 +880,179 @@ type ClaimReplacementPairs = {
   force: boolean;
 };
 
+type ClaimDeltaMutation = {
+  session_id: string | null;
+  repository: string | null;
+  deltas: ResourceClaimDelta[];
+  expected_claim_set_generation: number | null;
+  force: boolean;
+};
+
+const CLAIM_MODES = new Set(["read", "write", "exclusive-write"]);
+
+/**
+ * Parse the public atomic delta grammar without interpreting resource identity.
+ * Resource canonicalization, duplicate/conflict authority, and all mutation
+ * semantics remain in the domain/backend primitive.
+ */
+function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaMutation> {
+  const positional = splitPositionalSessionTarget(arguments_);
+  if (!positional.ok) return positional;
+
+  let sessionId = positional.value.sessionId;
+  let repository: string | null = null;
+  const deltas: ResourceClaimDelta[] = [];
+  let pendingUpsertResource: string | null = null;
+  let expectedClaimSetGeneration: number | null = null;
+  let force = false;
+  const recognized = new Set([
+    "--session",
+    "--repository",
+    "--upsert-resource",
+    "--mode",
+    "--release-resource",
+    "--if-generation",
+    "--force",
+  ]);
+
+  const rejectPending = (name: string): DomainResult<ClaimDeltaMutation> =>
+    failure(
+      usageError(
+        "INVALID_ARGUMENT",
+        `${name} cannot appear between --upsert-resource and its --mode; only --mode is permitted immediately after --upsert-resource.`,
+        { option: name },
+      ),
+    );
+
+  const targetArguments = positional.value.arguments;
+  for (let index = 0; index < targetArguments.length; index += 1) {
+    const { name, inlineValue } = optionParts(targetArguments[index]);
+    if (!recognized.has(name)) {
+      if (pendingUpsertResource !== null) return rejectPending(name);
+      return failure(usageError("INVALID_ARGUMENT", `Unknown option: ${name}.`, { option: name }));
+    }
+    if (pendingUpsertResource !== null && name !== "--mode") return rejectPending(name);
+
+    if (name === "--force") {
+      if (inlineValue !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--force does not accept a value.", { option: name }));
+      }
+      if (force) {
+        return failure(usageError("INVALID_ARGUMENT", "--force may be supplied only once.", { option: name }));
+      }
+      force = true;
+      continue;
+    }
+
+    const value = inlineValue ?? targetArguments[index + 1];
+    const negativeGeneration = name === "--if-generation" && /^-\d+$/u.test(value ?? "");
+    if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-") && !negativeGeneration)) {
+      return failure(usageError("MISSING_ARGUMENT", `${name} requires a value.`, { option: name }));
+    }
+    if (inlineValue === null) index += 1;
+
+    if (name === "--session") {
+      if (sessionId !== null) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "Specify a session target either positionally or with --session, not both.", {
+            option: "--session",
+          }),
+        );
+      }
+      sessionId = value;
+    } else if (name === "--repository") {
+      repository = value;
+    } else if (name === "--upsert-resource") {
+      pendingUpsertResource = value;
+    } else if (name === "--release-resource") {
+      deltas.push({ kind: "release", resource: value });
+    } else if (name === "--if-generation") {
+      if (expectedClaimSetGeneration !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--if-generation may be supplied only once.", { option: name }));
+      }
+      if (!/^\d+$/u.test(value)) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
+            option: name,
+            value,
+          }),
+        );
+      }
+      const parsedGeneration = Number(value);
+      if (!Number.isSafeInteger(parsedGeneration)) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--if-generation requires a non-negative safe integer.", {
+            option: name,
+            value,
+          }),
+        );
+      }
+      expectedClaimSetGeneration = parsedGeneration;
+    } else {
+      if (pendingUpsertResource === null) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--mode must be immediately preceded by its own --upsert-resource.", {
+            option: "--mode",
+          }),
+        );
+      }
+      if (!CLAIM_MODES.has(value)) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--mode requires read, write, or exclusive-write.", {
+            option: "--mode",
+            value,
+          }),
+        );
+      }
+      deltas.push({
+        kind: "upsert",
+        resource: pendingUpsertResource,
+        mode: value as "read" | "write" | "exclusive-write",
+      });
+      pendingUpsertResource = null;
+    }
+  }
+
+  if (pendingUpsertResource !== null) {
+    return failure(
+      usageError("MISSING_ARGUMENT", "--upsert-resource must be immediately followed by --mode.", {
+        option: "--mode",
+      }),
+    );
+  }
+  if (deltas.length === 0) {
+    return failure(
+      usageError("MISSING_ARGUMENT", "At least one --upsert-resource or --release-resource is required.", {
+        options: ["--upsert-resource", "--release-resource"],
+      }),
+    );
+  }
+  if (force && expectedClaimSetGeneration !== null) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "Specify exactly one of --if-generation or --force, not both.", {
+        options: ["--if-generation", "--force"],
+      }),
+    );
+  }
+  if (!force && expectedClaimSetGeneration === null) {
+    return failure(
+      usageError("MISSING_ARGUMENT", "Exactly one of --if-generation or --force is required.", {
+        options: ["--if-generation", "--force"],
+      }),
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      session_id: sessionId,
+      repository,
+      deltas,
+      expected_claim_set_generation: expectedClaimSetGeneration,
+      force,
+    },
+  };
+}
+
 /**
  * `update` accepts a complete desired claim set as repeated
  * `--resource <path> --mode <mode>` pairs. Pairing is by strict local
@@ -1060,6 +1299,27 @@ async function resolveSelectedSession(
   return sessionId === null ? backend.resolveCurrentSession(context) : backend.getSession(context, sessionId);
 }
 
+async function executeClaimDeltaMutation(
+  arguments_: string[],
+  backend: SessionBackend,
+  context: SessionContext,
+  operation: "session mutate" | "resource mutate",
+): Promise<DomainResult<JsonObject>> {
+  const parsed = parseClaimDeltaMutation(arguments_);
+  if (!parsed.ok) return parsed;
+  if (backend.applyClaimDeltas === undefined) return claimCapabilityUnavailable(operation);
+  const concurrency = parsed.value.force
+    ? { force: true }
+    : { expected_claim_set_generation: parsed.value.expected_claim_set_generation };
+  const result = await backend.applyClaimDeltas(context, {
+    session_id: parsed.value.session_id,
+    repository: parsed.value.repository,
+    deltas: parsed.value.deltas,
+    ...concurrency,
+  });
+  return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+}
+
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
@@ -1100,6 +1360,9 @@ async function executeCommand(
         ...concurrency,
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (subcommand === "mutate") {
+      return executeClaimDeltaMutation(rest, dependencies.backend, context, "session mutate");
     }
     if (subcommand === "claims") {
       const parsed = parseTargetedOptions(rest, new Set(["--session"]));
@@ -1268,6 +1531,9 @@ async function executeCommand(
         ...concurrency,
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (resourceSubcommand === "mutate") {
+      return executeClaimDeltaMutation(rest, dependencies.backend, context, "resource mutate");
     }
     if (resourceSubcommand === "list" || resourceSubcommand === "claims") {
       const parsed = parseTargetedOptions(rest, new Set(["--session"]));
