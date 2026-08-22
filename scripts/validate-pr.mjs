@@ -5,14 +5,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   validateExistingPullRequestArtifact,
-  validateRequiredMetadataString
+  validateRequiredMetadataString,
 } from "gh-inari/artifact";
 import { compileLocalGovernedContract } from "gh-inari/governance";
 import { resolvePullRequestTemplate } from "./pr-contract-routing.mjs";
 
 const REPOSITORY_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
-  ".."
+  "..",
 );
 
 /**
@@ -25,27 +25,27 @@ export async function validatePullRequest({
   body,
   root = REPOSITORY_ROOT,
   template,
-  branch
+  branch,
 }) {
   const routing = resolvePullRequestTemplate({ branch, template });
   if (routing.errors.length > 0) {
     const violations = routing.errors.map((message) => ({
       code: "GOVERNANCE_RELEASE_BRANCH_INVALID",
       path: "$.pull_request.head.ref",
-      message
+      message,
     }));
     return {
       valid: false,
       branchClassification: routing.classification,
       violations,
-      errors: violations.map((violation) => violation.message)
+      errors: violations.map((violation) => violation.message),
     };
   }
 
   const contracts = await candidateContracts(root, routing.template);
   const outcomes = contracts.map((contract) => ({
     contract,
-    result: validateExistingPullRequestArtifact(contract, body)
+    result: validateExistingPullRequestArtifact(contract, body),
   }));
   const valid = outcomes.filter(({ result }) => result.valid);
   if (valid.length === 1)
@@ -62,13 +62,13 @@ export async function validatePullRequest({
               code: "GOVERNANCE_TEMPLATE_AMBIGUOUS",
               path: "$.template",
               message:
-                "Pull-request body matches more than one repository-native PR template."
-            }
-          ]
-        }
+                "Pull-request body matches more than one repository-native PR template.",
+            },
+          ],
+        },
       },
       title,
-      routing.classification
+      routing.classification,
     );
   }
 
@@ -80,7 +80,7 @@ export async function validatePullRequest({
       return left.result.violations.length - right.result.violations.length;
     }
     return left.contract.templateIdentity.id.localeCompare(
-      right.contract.templateIdentity.id
+      right.contract.templateIdentity.id,
     );
   })[0];
 
@@ -92,9 +92,9 @@ export async function validatePullRequest({
           code: "GOVERNANCE_TEMPLATE_UNAVAILABLE",
           path: "$.template",
           message:
-            "No repository-native PR template is available for validation."
-        }
-      ]
+            "No repository-native PR template is available for validation.",
+        },
+      ],
     };
   }
   return report(selected, title, routing.classification);
@@ -112,8 +112,8 @@ async function candidateContracts(root, template) {
     .sort();
   return Promise.all(
     names.map((name) =>
-      compileLocalGovernedContract("pr", root, path.basename(name, ".json"))
-    )
+      compileLocalGovernedContract("pr", root, path.basename(name, ".json")),
+    ),
   );
 }
 
@@ -127,7 +127,7 @@ function report(outcome, title, branchClassification) {
     branchClassification,
     result: outcome.result,
     violations,
-    errors: violations.map((violation) => violation.message)
+    errors: violations.map((violation) => violation.message),
   };
 }
 
@@ -152,7 +152,7 @@ async function main() {
     body: pullRequest.body ?? "",
     root: process.cwd(),
     template,
-    branch
+    branch,
   });
   console.log(
     JSON.stringify({
@@ -166,8 +166,8 @@ async function main() {
       ...(result.result === undefined
         ? {}
         : { classification: result.result.classification }),
-      violations: result.violations
-    })
+      violations: result.violations,
+    }),
   );
   if (!result.valid) process.exitCode = 1;
 }
