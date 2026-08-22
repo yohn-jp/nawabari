@@ -33,6 +33,7 @@ import {
   canonicalizeClaimResource,
   canonicalizeConcretePath,
   claimError,
+  classifyResourceClaimTransition,
   claimsConflict,
   claimsOverlap,
   cloneResourceClaim,
@@ -379,6 +380,47 @@ export interface UpdateClaimsOptions extends ClaimResourcesOptions {
   readonly expectedClaimSetGeneration?: number | null;
   readonly expected_claim_set_generation?: number | null;
   readonly force?: boolean;
+}
+
+/** One exact-resource mutation in an atomic claim delta batch. */
+export type ResourceClaimDelta =
+  | { readonly kind: "upsert"; readonly resource: string; readonly mode: ResourceClaimMode }
+  | { readonly kind: "release"; readonly resource: string };
+
+/** An exact-resource delta batch. The whole batch is validated before one write. */
+export interface ClaimDeltasOptions {
+  readonly sessionId?: string | null;
+  readonly session_id?: string | null;
+  readonly repositoryId?: string;
+  readonly repository_id?: string;
+  readonly deltas: readonly ResourceClaimDelta[];
+  readonly expectedClaimSetGeneration?: number | null;
+  readonly expected_claim_set_generation?: number | null;
+  readonly force?: boolean;
+}
+
+export interface ClaimModeChange {
+  readonly resource: string;
+  readonly before: ResourceClaim;
+  readonly after: ResourceClaim;
+}
+
+export type UnchangedClaimDelta =
+  | { readonly kind: "upsert"; readonly resource: string; readonly claim: ResourceClaim }
+  | { readonly kind: "release"; readonly resource: string };
+
+export interface ClaimDeltasResult {
+  readonly session: SessionRecord;
+  /** The authoritative complete claim set for the target session after the batch. */
+  readonly claims: readonly ResourceClaim[];
+  readonly previousClaimSetGeneration: number;
+  readonly claimSetGeneration: number;
+  readonly added: readonly ResourceClaim[];
+  /** Mode changes expose both the removed and replacement claim in one result. */
+  readonly changed: readonly ClaimModeChange[];
+  readonly released: readonly ResourceClaim[];
+  readonly unchanged: readonly UnchangedClaimDelta[];
+  readonly idempotent: boolean;
 }
 
 export interface ReleaseClaimsOptions {
@@ -820,6 +862,101 @@ export class SessionRegistry {
         released: released.map(cloneResourceClaim),
         idempotent: unchanged,
         claimSetGeneration,
+      };
+    });
+  }
+
+  /**
+   * Apply exact-resource upserts and releases as one claim-set transaction.
+   * The CAS precondition is checked before any delta-specific validation while
+   * the repository lock is held. A mode change replaces the old claim and
+   * creates the new claim in the same persisted complete set.
+   */
+  applyClaimDeltas(options: ClaimDeltasOptions): ClaimDeltasResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
+      const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
+      const deltas = this.canonicalClaimDeltas(options.deltas, owner);
+      const current = state.claims.filter((claim) => claim.sessionId === sessionId);
+      const currentByResource = new Map(current.map((claim) => [claim.resource, claim]));
+      const nextByResource = new Map(currentByResource);
+      const added: ResourceClaim[] = [];
+      const released: ResourceClaim[] = [];
+      const changed: ClaimModeChange[] = [];
+      const unchanged: UnchangedClaimDelta[] = [];
+      const timestamp = toTimestamp(this.clock());
+
+      for (const delta of deltas) {
+        const before = currentByResource.get(delta.resource);
+        if (delta.kind === "release") {
+          classifyResourceClaimTransition(before?.mode ?? "none", "none");
+          if (before === undefined) {
+            unchanged.push({ kind: "release", resource: delta.resource });
+            continue;
+          }
+          nextByResource.delete(delta.resource);
+          released.push(before);
+          continue;
+        }
+
+        const transition = classifyResourceClaimTransition(before?.mode ?? "none", delta.mode);
+        if (transition === "no-op") {
+          // `before` is necessarily present for an upsert no-op.
+          if (before === undefined) {
+            throw new SessionRegistryError("OPERATION_REJECTED", "Claim transition classification was inconsistent");
+          }
+          unchanged.push({ kind: "upsert", resource: delta.resource, claim: cloneResourceClaim(before) });
+          continue;
+        }
+
+        const after = createResourceClaim({ resource: delta.resource, mode: delta.mode }, owner, timestamp);
+        nextByResource.set(delta.resource, after);
+        if (transition === "change") {
+          if (before === undefined) {
+            throw new SessionRegistryError("OPERATION_REJECTED", "Claim transition classification was inconsistent");
+          }
+          released.push(before);
+          changed.push({
+            resource: delta.resource,
+            before: cloneResourceClaim(before),
+            after: cloneResourceClaim(after),
+          });
+        }
+        added.push(after);
+      }
+
+      const nextSessionClaims = sortResourceClaims([...nextByResource.values()]);
+      const externalClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
+      // Validate the resulting complete set, including pairwise ownership
+      // invariants, before exposing any persistence side effect.
+      this.assertCompleteClaimSet(nextSessionClaims, owner, externalClaims, state.sessions);
+      const nextClaims = sortResourceClaims([...externalClaims, ...nextSessionClaims]);
+      const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+      if (claimSetGeneration !== state.claimSetGeneration) {
+        this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration);
+      }
+
+      const idempotent = claimSetGeneration === state.claimSetGeneration;
+      return {
+        session: cloneSessionRecord(owner.record),
+        claims: nextSessionClaims.map(cloneResourceClaim),
+        previousClaimSetGeneration: state.claimSetGeneration,
+        claimSetGeneration,
+        added: added.map(cloneResourceClaim),
+        changed: changed.map((entry) => ({
+          resource: entry.resource,
+          before: cloneResourceClaim(entry.before),
+          after: cloneResourceClaim(entry.after),
+        })),
+        released: released.map(cloneResourceClaim),
+        unchanged: unchanged.map((entry) =>
+          entry.kind === "upsert"
+            ? { kind: entry.kind, resource: entry.resource, claim: cloneResourceClaim(entry.claim) }
+            : { kind: entry.kind, resource: entry.resource },
+        ),
+        idempotent,
       };
     });
   }
@@ -2211,7 +2348,7 @@ export class SessionRegistry {
   }
 
   private assertClaimSetMutationIntent(
-    options: UpdateClaimsOptions | ReleaseClaimsOptions,
+    options: UpdateClaimsOptions | ReleaseClaimsOptions | ClaimDeltasOptions,
     actualGeneration: number,
   ): void {
     const expected = options.expectedClaimSetGeneration ?? options.expected_claim_set_generation;
@@ -2246,6 +2383,85 @@ export class SessionRegistry {
         },
       );
     }
+  }
+
+  private canonicalClaimDeltas(
+    deltas: readonly ResourceClaimDelta[],
+    owner: ClaimOwner,
+  ): readonly ResourceClaimDelta[] {
+    if (!Array.isArray(deltas) || deltas.length === 0) {
+      throw claimError("INVALID_CLAIM", "At least one claim delta is required");
+    }
+
+    const seen = new Map<string, ResourceClaimDelta>();
+    const canonical: ResourceClaimDelta[] = [];
+    for (const delta of deltas) {
+      if (typeof delta !== "object" || delta === null) {
+        throw claimError("INVALID_CLAIM", "A claim delta must be an object");
+      }
+      if (delta.kind !== "upsert" && delta.kind !== "release") {
+        throw claimError("INVALID_CLAIM", "Claim delta kind is unsupported", {
+          kind: typeof delta.kind === "string" ? delta.kind : String(delta.kind),
+        });
+      }
+      if (delta.kind === "upsert" && !isResourceClaimMode(delta.mode)) {
+        throw claimError("INVALID_CLAIM", "Claim delta mode is unsupported", {
+          mode: typeof delta.mode === "string" ? delta.mode : String(delta.mode),
+        });
+      }
+      const resource = canonicalizeConcretePath(delta.resource, owner.worktreePath);
+      const normalized: ResourceClaimDelta =
+        delta.kind === "upsert" ? { kind: "upsert", resource, mode: delta.mode } : { kind: "release", resource };
+      const prior = seen.get(resource);
+      if (prior !== undefined) {
+        const contradictory =
+          prior.kind !== normalized.kind ||
+          (prior.kind === "upsert" && normalized.kind === "upsert" && prior.mode !== normalized.mode);
+        throw claimError(
+          contradictory ? "CONTRADICTORY_CLAIM" : "DUPLICATE_CLAIM",
+          contradictory
+            ? "Request contains contradictory deltas for one exact resource"
+            : "Request contains duplicate deltas for one exact resource",
+          {
+            resource,
+            kind: normalized.kind,
+            ...(normalized.kind === "upsert" ? { mode: normalized.mode } : {}),
+            otherKind: prior.kind,
+            ...(prior.kind === "upsert" ? { otherMode: prior.mode } : {}),
+          },
+        );
+      }
+      seen.set(resource, normalized);
+      canonical.push(normalized);
+    }
+    return canonical.sort((left, right) =>
+      compareCodePointStrings(
+        `${left.resource}\u0000${left.kind}\u0000${left.kind === "upsert" ? left.mode : ""}`,
+        `${right.resource}\u0000${right.kind}\u0000${right.kind === "upsert" ? right.mode : ""}`,
+      ),
+    );
+  }
+
+  private assertCompleteClaimSet(
+    candidates: readonly ResourceClaim[],
+    owner: ClaimOwner,
+    externalClaims: readonly ResourceClaim[],
+    sessions: readonly SessionRecord[],
+  ): void {
+    for (let index = 0; index < candidates.length; index += 1) {
+      const current = candidates[index];
+      if (current === undefined) continue;
+      for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
+        const prior = candidates[priorIndex];
+        if (prior === undefined || !claimsOverlap(current, prior)) continue;
+        throw claimError(
+          current.mode === prior.mode ? "DUPLICATE_CLAIM" : "CONTRADICTORY_CLAIM",
+          "Resulting claim set contains overlapping claims for one session",
+          { claimId: current.claimId, ownerClaimId: prior.claimId },
+        );
+      }
+    }
+    this.validateRequestedClaims(candidates, owner, externalClaims, sessions);
   }
 
   private canonicalClaimInputs(

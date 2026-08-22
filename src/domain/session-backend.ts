@@ -20,6 +20,8 @@ import {
   type CommitResult,
   type ClaimResourcesOptions,
   type ClaimResourcesResult,
+  type ClaimDeltasOptions,
+  type ClaimDeltasResult,
   type GarbageCollectOptions,
   type GarbageCollectResult,
   type GuardDecision,
@@ -442,6 +444,24 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
+  public async applyClaimDeltas(
+    context: SessionContext,
+    options: ClaimDeltasOptions,
+  ): Promise<DomainResult<ClaimDeltasResult>> {
+    try {
+      const result = this.registryFor(context).applyClaimDeltas({
+        sessionId: options.session_id ?? undefined,
+        repositoryId: options.repository ?? undefined,
+        deltas: options.deltas,
+        expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+        force: options.force === true,
+      });
+      return success(toDomainClaimDeltasResult(result));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
   public async releaseClaims(
     context: SessionContext,
     options: ReleaseClaimsOptions,
@@ -774,6 +794,30 @@ function toDomainClaimResult(result: import("../session-registry.js").ClaimResou
     released: result.released.map(toDomainClaim),
     idempotent: result.idempotent,
     claim_set_generation: result.claimSetGeneration,
+  };
+}
+
+function toDomainClaimDeltasResult(
+  result: import("../session-registry.js").ClaimDeltasResult,
+): import("./session.js").ClaimDeltasResult {
+  return {
+    session: toDomainRecord(result.session),
+    claims: result.claims.map(toDomainClaim),
+    previous_claim_set_generation: result.previousClaimSetGeneration,
+    claim_set_generation: result.claimSetGeneration,
+    added: result.added.map(toDomainClaim),
+    changed: result.changed.map((change) => ({
+      resource: change.resource,
+      before: toDomainClaim(change.before),
+      after: toDomainClaim(change.after),
+    })),
+    released: result.released.map(toDomainClaim),
+    unchanged: result.unchanged.map((delta) =>
+      delta.kind === "upsert"
+        ? { kind: delta.kind, resource: delta.resource, claim: toDomainClaim(delta.claim) }
+        : { kind: delta.kind, resource: delta.resource },
+    ),
+    idempotent: result.idempotent,
   };
 }
 

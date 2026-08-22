@@ -301,6 +301,108 @@ test("reads a registry without claim_set_generation as generation zero", () => {
   }
 });
 
+test("applies mixed exact-resource claim deltas atomically and projects mode changes", () => {
+  const fixture = createRepositoryFixture(true);
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const siblingRegistry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const session = registry.create();
+    const sibling = siblingRegistry.create();
+    registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [
+        { resource: "README.md", mode: "read" },
+        { resource: "src/file.ts", mode: "write" },
+      ],
+    });
+    const before = registry.listClaimsSnapshot();
+
+    const result = registry.applyClaimDeltas({
+      sessionId: session.sessionId,
+      expectedClaimSetGeneration: before.claimSetGeneration,
+      deltas: [
+        { kind: "upsert", resource: "README.md", mode: "exclusive-write" },
+        { kind: "upsert", resource: "src/another.ts", mode: "read" },
+        { kind: "release", resource: "src/file.ts" },
+      ],
+    });
+    assert.equal(result.previousClaimSetGeneration, 1);
+    assert.equal(result.claimSetGeneration, 2);
+    assert.equal(result.idempotent, false);
+    assert.deepEqual(
+      result.claims.map((claim) => [claim.resource, claim.mode]),
+      [
+        ["README.md", "exclusive-write"],
+        ["src/another.ts", "read"],
+      ],
+    );
+    assert.equal(result.added.length, 2);
+    assert.equal(result.released.length, 2);
+    assert.equal(result.changed.length, 1);
+    assert.equal(result.changed[0]?.before.mode, "read");
+    assert.equal(result.changed[0]?.after.mode, "exclusive-write");
+
+    const retry = registry.applyClaimDeltas({
+      sessionId: session.sessionId,
+      expectedClaimSetGeneration: result.claimSetGeneration,
+      deltas: [
+        { kind: "upsert", resource: "README.md", mode: "exclusive-write" },
+        { kind: "upsert", resource: "src/another.ts", mode: "read" },
+        { kind: "release", resource: "src/file.ts" },
+      ],
+    });
+    assert.equal(retry.claimSetGeneration, result.claimSetGeneration);
+    assert.equal(retry.idempotent, true);
+    assert.equal(retry.added.length, 0);
+    assert.equal(retry.released.length, 0);
+    assert.equal(retry.unchanged.length, 3);
+
+    const stable = registry.listClaimsSnapshot();
+    assert.throws(
+      () =>
+        registry.applyClaimDeltas({
+          sessionId: session.sessionId,
+          expectedClaimSetGeneration: before.claimSetGeneration,
+          deltas: [{ kind: "release", resource: "README.md" }],
+        }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "STALE_CLAIM_SET",
+    );
+    assert.deepEqual(registry.listClaimsSnapshot(), stable);
+
+    assertRegistryError(
+      () =>
+        registry.applyClaimDeltas({
+          sessionId: session.sessionId,
+          force: true,
+          deltas: [
+            { kind: "release", resource: "README.md" },
+            { kind: "release", resource: "README.md" },
+          ],
+        }),
+      "DUPLICATE_CLAIM",
+    );
+    assert.deepEqual(registry.listClaimsSnapshot(), stable);
+
+    siblingRegistry.claimResources({
+      sessionId: sibling.sessionId,
+      claims: [{ resource: "docs/**", mode: "exclusive-write" }],
+    });
+    const beforeConflict = registry.listClaimsSnapshot();
+    assertRegistryError(
+      () =>
+        registry.applyClaimDeltas({
+          sessionId: session.sessionId,
+          expectedClaimSetGeneration: beforeConflict.claimSetGeneration,
+          deltas: [{ kind: "upsert", resource: "docs/new.md", mode: "read" }],
+        }),
+      "RESOURCE_CLAIM_CONFLICT",
+    );
+    assert.deepEqual(registry.listClaimsSnapshot(), beforeConflict);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("failed claim persistence preserves the prior registry and permits a safe retry", () => {
   const fixture = createRepositoryFixture();
   const backupPath = `${fixture.repositoryPath}-registry-backup`;
