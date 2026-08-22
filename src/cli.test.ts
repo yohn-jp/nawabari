@@ -1196,6 +1196,37 @@ test("resource transition alias preserves force intent and canonical delta proje
   assert.equal(response.claims[0]?.mode, "exclusive-write");
 });
 
+test("session transition accepts every public target mode", async () => {
+  const observedModes: string[] = [];
+  const backend = backendForTests({
+    applyClaimDeltas: async (_context: SessionContext, options: ClaimDeltasOptions) => {
+      const delta = options.deltas[0];
+      if (delta?.kind === "upsert") observedModes.push(delta.mode);
+      return success({
+        session: sampleSession,
+        claims: [],
+        previous_claim_set_generation: observedModes.length - 1,
+        claim_set_generation: observedModes.length,
+        added: [],
+        changed: [],
+        released: [],
+        unchanged: [],
+        idempotent: false,
+      } satisfies ClaimDeltasResult);
+    },
+  });
+
+  for (const mode of ["read", "write", "exclusive-write"] as const) {
+    const output = capture();
+    const exitCode = await runCli(
+      ["--json", "session", "transition", "--resource", "target.txt", "--mode", mode, "--force"],
+      { backend, io: output.io },
+    );
+    assert.equal(exitCode, 0, output.stderr.join("\n"));
+  }
+  assert.deepEqual(observedModes, ["read", "write", "exclusive-write"]);
+});
+
 test("claim transition rejects malformed pair/concurrency grammar before backend invocation", async () => {
   let invocations = 0;
   const backend = backendForTests({
