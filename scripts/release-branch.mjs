@@ -32,8 +32,6 @@ export function classifyReleaseBranch(branch) {
   return {
     kind: "invalid-release",
     valid: false,
-    errors: [
-      `release branch "${branch}" must match release/<semver> (for example release/1.2.3)`,
-    ],
+    errors: [`release branch "${branch}" must match release/<semver> (for example release/1.2.3)`],
   };
 }
