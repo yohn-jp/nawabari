@@ -10,6 +10,7 @@ import type {
   ClaimResourcesResult,
   ResourceClaim,
   SessionBackend,
+  SessionCloseOptions,
   SessionCloseResult,
   SessionContext,
   SessionCreateOptions,
@@ -267,6 +268,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--mode",
       "--repository",
       "--claim-id",
+      "--fetch-remote",
+      "--fetch-branch",
     ],
     authorization_options: ["--session", "--operation", "--resource"],
     checkpoint_options: ["--session"],
@@ -501,6 +504,62 @@ test("session inspect forwards --session and --integrated-revision to the diagno
     command: "session inspect",
     ...diagnosticResult,
   });
+});
+
+test("session close forwards explicit integration fetch metadata and rejects incomplete fetch options", async () => {
+  let receivedOptions: SessionCloseOptions | null = null;
+  let closeCalls = 0;
+  const backend = backendForTests({
+    closeSession: async (_context: SessionContext, options: SessionCloseOptions) => {
+      closeCalls += 1;
+      receivedOptions = options;
+      return success({ session: sampleSession, worktree_removed: true, branch_removed: true });
+    },
+  });
+  const output = capture();
+  const integratedRevision = "a".repeat(40);
+  const exitCode = await runCli(
+    [
+      "session",
+      "close",
+      "--session",
+      sampleSession.session_id,
+      "--integrated-revision",
+      integratedRevision,
+      "--fetch-remote",
+      "origin",
+      "--fetch-branch",
+      "main",
+      "--json",
+    ],
+    { backend, io: output.io },
+  );
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.deepEqual(receivedOptions, {
+    session_id: sampleSession.session_id,
+    integrated_revision: integratedRevision,
+    fetch_remote: "origin",
+    fetch_branch: "main",
+  });
+
+  const incompleteOutput = capture();
+  const incompleteExitCode = await runCli(["session", "close", "--fetch-remote", "origin", "--json"], {
+    backend,
+    io: incompleteOutput.io,
+  });
+  assert.equal(incompleteExitCode, 2);
+  assert.equal(closeCalls, 1);
+  assert.equal(JSON.parse(incompleteOutput.stdout[0]).code, "INVALID_ARGUMENT");
+});
+
+test("session close help distinguishes provider APIs from explicit Git remote fetch", async () => {
+  const output = capture();
+  const exitCode = await runCli(["session", "close", "--help", "--json"], { io: output.io });
+
+  assert.equal(exitCode, 0);
+  const response = JSON.parse(output.stdout[0] ?? "") as { notes: string[] };
+  assert.ok(response.notes.some((note) => note.includes("never calls provider APIs")));
+  assert.ok(response.notes.some((note) => note.includes("only explicit --fetch-remote/--fetch-branch")));
 });
 
 test("session-scoped commands accept one consistent positional target and discard requires it", async () => {

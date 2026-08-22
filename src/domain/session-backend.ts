@@ -134,6 +134,7 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   INVALID_REMOTE_BRANCH: "INVALID_REMOTE_BRANCH",
   PUSH_TARGET_MISMATCH: "PUSH_TARGET_MISMATCH",
   PUSH_REMOTE_INSPECTION_FAILED: "PUSH_REMOTE_INSPECTION_FAILED",
+  INTEGRATION_FETCH_FAILED: "INTEGRATION_FETCH_FAILED",
   PUSH_NO_UPSTREAM: "PUSH_NO_UPSTREAM",
   PUSH_BEHIND: "PUSH_BEHIND",
   PUSH_DIVERGED: "PUSH_DIVERGED",
@@ -346,6 +347,8 @@ export class LocalSessionBackend implements SessionBackend {
       const result = registry.close({
         sessionId,
         integratedRevision: options.integrated_revision ?? undefined,
+        fetchRemote: options.fetch_remote ?? undefined,
+        fetchBranch: options.fetch_branch ?? undefined,
       });
       return Promise.resolve(
         success({

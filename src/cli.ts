@@ -263,7 +263,7 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "session close",
     summary: "Close the current or selected session",
-    usage: `${CLI_NAME} session close [<session-id>|--session <id>] [--integrated-revision <rev>]`,
+    usage: `${CLI_NAME} session close [<session-id>|--session <id>] [--integrated-revision <rev>] [--fetch-remote <name> --fetch-branch <branch>]`,
     options: [
       option("--session", "Select a session instead of the current worktree owner", { value: "<id>" }),
       option(
@@ -271,10 +271,16 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
         "Externally evidenced revision proving non-ancestry (squash/rebase) integration; independently re-verified via exact Git tree-object equivalence, never trusted blindly",
         { value: "<rev>" },
       ),
+      option("--fetch-remote", "Explicitly fetch one remote integration branch into a disposable proof ref", {
+        value: "<name>",
+      }),
+      option("--fetch-branch", "Integration branch to fetch; requires --fetch-remote", { value: "<branch>" }),
     ],
     notes: [
       "Ordinary ancestry-based close remains the cheap/default path and requires no flags.",
-      "Nawabari never queries GitHub or any remote provider; --integrated-revision only names a local revision for Nawabari to independently verify.",
+      "Network access is never implicit; --fetch-remote and --fetch-branch are accepted only with a full lowercase --integrated-revision SHA.",
+      "Fetch updates only a disposable internal proof ref with no tags, FETCH_HEAD, tracking-ref, or local integration-branch changes; remote tip races fail closed.",
+      "Nawabari never calls provider APIs such as GitHub; only explicit --fetch-remote/--fetch-branch options connect to the configured Git remote.",
       "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
   },
@@ -577,6 +583,8 @@ type ParsedOptions = {
   max_bytes: string | null;
   max_hunks: string | null;
   integrated_revision: string | null;
+  fetch_remote: string | null;
+  fetch_branch: string | null;
 };
 
 function usageError(
@@ -662,6 +670,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     max_bytes: null,
     max_hunks: null,
     integrated_revision: null,
+    fetch_remote: null,
+    fetch_branch: null,
   };
   let dryRun = false;
 
@@ -724,6 +734,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--max-bytes") options.max_bytes = value;
     else if (name === "--max-hunks") options.max_hunks = value;
     else if (name === "--integrated-revision") options.integrated_revision = value;
+    else if (name === "--fetch-remote") options.fetch_remote = value;
+    else if (name === "--fetch-branch") options.fetch_branch = value;
   }
 
   if (options.apply && dryRun) {
@@ -1079,13 +1091,36 @@ async function executeCommand(
 
       const parsed = parseTargetedOptions(
         rest,
-        new Set(subcommand === "close" ? ["--session", "--integrated-revision"] : ["--session"]),
+        new Set(
+          subcommand === "close"
+            ? ["--session", "--integrated-revision", "--fetch-remote", "--fetch-branch"]
+            : ["--session"],
+        ),
       );
       if (!parsed.ok) return parsed;
       if (subcommand === "close") {
+        const hasFetchRemote = parsed.value.fetch_remote !== null;
+        const hasFetchBranch = parsed.value.fetch_branch !== null;
+        if (hasFetchRemote !== hasFetchBranch) {
+          return failure(
+            usageError(
+              "INVALID_ARGUMENT",
+              "--fetch-remote and --fetch-branch must be supplied together for an explicit integration fetch.",
+            ),
+          );
+        }
+        if ((hasFetchRemote || hasFetchBranch) && parsed.value.integrated_revision === null) {
+          return failure(
+            usageError("MISSING_ARGUMENT", "Explicit integration fetch requires --integrated-revision <full-sha>.", {
+              option: "--integrated-revision",
+            }),
+          );
+        }
         const closeOptions: SessionCloseOptions = {
           session_id: parsed.value.session_id,
           integrated_revision: parsed.value.integrated_revision,
+          fetch_remote: parsed.value.fetch_remote,
+          fetch_branch: parsed.value.fetch_branch,
         };
         const selected = await dependencies.backend.closeSession(context, closeOptions);
         return selected.ok ? { ok: true, value: selected.value } : selected;

@@ -86,6 +86,10 @@ export type SessionCloseOptions = {
   session_id: string | null;
   /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently re-verified by exact Git tree-object equivalence; never trusted blindly. */
   integrated_revision?: string | null;
+  /** Explicit opt-in remote used only to obtain missing integration-proof objects. */
+  fetch_remote?: string | null;
+  /** Explicit opt-in integration branch used only to obtain missing proof objects. */
+  fetch_branch?: string | null;
 };
 
 export type IntegrationProof = {

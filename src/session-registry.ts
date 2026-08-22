@@ -175,6 +175,12 @@ export interface CloseSessionOptions {
   /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently re-verified by exact Git tree-object equivalence; never trusted blindly. */
   readonly integratedRevision?: string | null;
   readonly integrated_revision?: string | null;
+  /** Explicit opt-in remote used only to obtain missing integration-proof objects. */
+  readonly fetchRemote?: string | null;
+  readonly fetch_remote?: string | null;
+  /** Explicit opt-in integration branch used only to obtain missing proof objects. */
+  readonly fetchBranch?: string | null;
+  readonly fetch_branch?: string | null;
 }
 
 export interface DiscardSessionOptions {
@@ -186,9 +192,42 @@ function isCloseSessionOptions(value: unknown): value is CloseSessionOptions {
   return typeof value === "object" && value !== null;
 }
 
+function closeIntegrationEvidence(
+  sessionIdOrOptions: string | null | CloseSessionOptions,
+): IntegrationEvidenceInput | undefined {
+  if (!isCloseSessionOptions(sessionIdOrOptions)) return undefined;
+
+  const integratedRevision = sessionIdOrOptions.integratedRevision ?? sessionIdOrOptions.integrated_revision ?? null;
+  const fetchRemote = sessionIdOrOptions.fetchRemote ?? sessionIdOrOptions.fetch_remote ?? null;
+  const fetchBranch = sessionIdOrOptions.fetchBranch ?? sessionIdOrOptions.fetch_branch ?? null;
+  const fetchRequested = fetchRemote !== null || fetchBranch !== null;
+  if (!fetchRequested) {
+    return integratedRevision === null || integratedRevision === undefined ? undefined : { integratedRevision };
+  }
+
+  if (typeof integratedRevision !== "string" || !isFullRevision(integratedRevision)) {
+    throw new SessionRegistryError(
+      "INVALID_BASE_REF",
+      "Explicit integration fetch requires a full lowercase commit SHA",
+      {
+        baseRef: typeof integratedRevision === "string" ? integratedRevision : "<missing>",
+        reason: "fetch-requires-full-sha",
+      },
+    );
+  }
+
+  return {
+    integratedRevision,
+    fetchRemote: explicitIntegrationRemote(fetchRemote),
+    fetchBranch: explicitIntegrationBranch(fetchBranch),
+  };
+}
+
 /** Caller-supplied non-ancestry integration evidence, already normalized to camelCase. */
 export interface IntegrationEvidenceInput {
   readonly integratedRevision: string;
+  readonly fetchRemote?: string;
+  readonly fetchBranch?: string;
 }
 
 /** Git-native proof that the supplied revision belongs to authoritative integration history. */
@@ -1960,11 +1999,7 @@ export class SessionRegistry {
         : sessionIdOrOptions;
       const selectedSessionId = sessionId ?? this.resolveCurrentSession().sessionId;
       assertSessionId(selectedSessionId);
-      const integratedRevision = isCloseSessionOptions(sessionIdOrOptions)
-        ? (sessionIdOrOptions.integratedRevision ?? sessionIdOrOptions.integrated_revision ?? null)
-        : null;
-      const evidence: IntegrationEvidenceInput | undefined =
-        integratedRevision === null || integratedRevision === undefined ? undefined : { integratedRevision };
+      const evidence = closeIntegrationEvidence(sessionIdOrOptions ?? null);
       return this.closeUnsafe(selectedSessionId, evidence);
     });
   }
@@ -2843,16 +2878,86 @@ export class SessionRegistry {
     defaultBranchName: string,
     evidence: IntegrationEvidenceInput,
   ): IntegrationProof | undefined {
+    if (evidence.fetchRemote !== undefined || evidence.fetchBranch !== undefined) {
+      if (evidence.fetchRemote === undefined || evidence.fetchBranch === undefined) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Explicit integration fetch requires both a remote and an integration branch",
+          {
+            sessionId: record.sessionId,
+            fetchRemote: evidence.fetchRemote ?? "<missing>",
+            fetchBranch: evidence.fetchBranch ?? "<missing>",
+          },
+        );
+      }
+      if (normalizeBranchId(evidence.fetchBranch) === record.branchId) {
+        throw new SessionRegistryError(
+          "RECOVERABLE_COMMITS",
+          "The explicit integration branch cannot be the session branch",
+          {
+            branch: record.branchName,
+            integrationBranch: evidence.fetchBranch,
+            currentSessionHead: readSessionHeadForProof(this.git, gitCwd, record),
+            suppliedIntegratedRevision: evidence.integratedRevision,
+            resolvedIntegrationSha: "<unavailable>",
+            proofMethod: "integration-lineage",
+            proofStage: "lineage",
+            lineageProof: "unproven",
+            authorityProof: "unproven",
+            contentProof: "not-attempted",
+            proofResult: "unproven",
+            proofFailure: "integration-branch-self-reference",
+            recoveryHints: recoveryHintsForCode("RECOVERABLE_COMMITS"),
+          },
+        );
+      }
+      return withFetchedIntegrationRef(this.git, gitCwd, record, evidence, (fetchedSha) =>
+        this.proveNonAncestryIntegrationAtRef(record, gitCwd, defaultBranchName, evidence, fetchedSha),
+      );
+    }
+
+    return this.proveNonAncestryIntegrationAtRef(record, gitCwd, defaultBranchName, evidence);
+  }
+
+  private proveNonAncestryIntegrationAtRef(
+    record: SessionRecord,
+    gitCwd: string,
+    defaultBranchName: string,
+    evidence: IntegrationEvidenceInput,
+    integrationRevision?: string,
+  ): IntegrationProof | undefined {
     const git = this.git;
-    const integratedRevision = resolveBaseRef(git, gitCwd, evidence.integratedRevision).revision;
-    const lineage = proveIntegrationRevisionLineage(git, gitCwd, defaultBranchName, integratedRevision);
+    const resolvedEvidence = resolveBaseRef(git, gitCwd, evidence.integratedRevision);
+    if (
+      (evidence.fetchRemote !== undefined || evidence.fetchBranch !== undefined) &&
+      (!isFullRevision(resolvedEvidence.revision) || resolvedEvidence.revision !== evidence.integratedRevision)
+    ) {
+      throw new SessionRegistryError(
+        "INVALID_BASE_REF",
+        "Explicit integration fetch requires Git's canonical full lowercase commit SHA",
+        {
+          baseRef: evidence.integratedRevision,
+          revision: resolvedEvidence.revision,
+          reason: "non-canonical-full-sha",
+        },
+      );
+    }
+    const integratedRevision = resolvedEvidence.revision;
+    const authoritativeIntegrationBranch = evidence.fetchBranch ?? defaultBranchName;
+    const lineage = proveIntegrationRevisionLineage(
+      git,
+      gitCwd,
+      authoritativeIntegrationBranch,
+      integratedRevision,
+      integrationRevision,
+    );
     if (lineage === undefined) {
       throw new SessionRegistryError(
         "RECOVERABLE_COMMITS",
-        `The supplied integration revision is not part of authoritative ${defaultBranchName} history`,
+        `The supplied integration revision is not part of authoritative ${authoritativeIntegrationBranch} history`,
         {
           branch: record.branchName,
-          integrationBranch: defaultBranchName,
+          integrationBranch: authoritativeIntegrationBranch,
           ...proofObservationDetails(git, gitCwd, record, defaultBranchName, evidence, integratedRevision),
           integratedRevision,
           proofMethod: "integration-lineage",
@@ -2869,7 +2974,10 @@ export class SessionRegistry {
 
     let branchBase: string;
     try {
-      branchBase = git.run(["merge-base", record.branchId, normalizeBranchId(defaultBranchName)], gitCwd);
+      branchBase = git.run(
+        ["merge-base", record.branchId, integrationRevision ?? normalizeBranchId(defaultBranchName)],
+        gitCwd,
+      );
     } catch (error: unknown) {
       if (isExpectedGitLookupFailure(error)) return undefined;
       throw error;
@@ -3140,12 +3248,76 @@ interface CleanupResources {
   readonly integrationProof?: IntegrationProof;
 }
 
+/**
+ * Physical session identity observed around an explicit integration-proof
+ * fetch.  The proof may only be used when the session still points at the
+ * same worktree/branch and the same HEAD after all remote Git I/O.
+ */
+interface SessionProofIdentity {
+  readonly worktreePath: string | null;
+  readonly worktreeBranch: string | null;
+  readonly worktreePrunable: boolean | null;
+  readonly branchWorktreePath: string | null;
+  readonly head: string;
+}
+
 function readSessionHeadForProof(git: GitCommandRunner, gitCwd: string, record: SessionRecord): string {
   const pathEntry = lstatIfPresent(record.worktreePath);
   if (pathEntry !== undefined && pathEntry.isDirectory() && !pathEntry.isSymbolicLink()) {
     return readCurrentHead(git, record.worktreePath);
   }
   return readLocalBranchHead(git, gitCwd, record.branchId);
+}
+
+function observeSessionProofIdentity(
+  git: GitCommandRunner,
+  gitCwd: string,
+  record: SessionRecord,
+): SessionProofIdentity {
+  const worktrees = listGitWorktrees(git, gitCwd);
+  const registeredWorktree = worktrees.find((worktree) => samePath(worktree.worktreePath, record.worktreePath));
+  const branchWorktree = worktrees.find((worktree) => worktree.branchName === record.branchName);
+  return {
+    worktreePath: registeredWorktree?.worktreePath ?? null,
+    worktreeBranch: registeredWorktree?.branchName ?? null,
+    worktreePrunable: registeredWorktree?.prunable ?? null,
+    branchWorktreePath: branchWorktree?.worktreePath ?? null,
+    head: readSessionHeadForProof(git, gitCwd, record),
+  };
+}
+
+function assertSameSessionProofIdentity(
+  expected: SessionProofIdentity,
+  actual: SessionProofIdentity,
+  record: SessionRecord,
+): void {
+  if (
+    expected.worktreePath !== actual.worktreePath ||
+    expected.worktreeBranch !== actual.worktreeBranch ||
+    expected.worktreePrunable !== actual.worktreePrunable ||
+    expected.branchWorktreePath !== actual.branchWorktreePath ||
+    expected.head !== actual.head
+  ) {
+    throw new SessionRegistryError(
+      "GIT_STATE_AMBIGUOUS",
+      "Session identity or HEAD changed while integration proof was being fetched",
+      {
+        phase: "integration-proof-reobserve",
+        sessionId: record.sessionId,
+        expectedWorktree: expected.worktreePath ?? "<none>",
+        actualWorktree: actual.worktreePath ?? "<none>",
+        expectedWorktreeBranch: expected.worktreeBranch ?? "<none>",
+        actualWorktreeBranch: actual.worktreeBranch ?? "<none>",
+        expectedWorktreePrunable: expected.worktreePrunable ?? "<none>",
+        actualWorktreePrunable: actual.worktreePrunable ?? "<none>",
+        expectedBranchWorktree: expected.branchWorktreePath ?? "<none>",
+        actualBranchWorktree: actual.branchWorktreePath ?? "<none>",
+        expectedHead: expected.head,
+        actualHead: actual.head,
+        recoveryHints: recoveryHintsForCode("GIT_STATE_AMBIGUOUS"),
+      },
+    );
+  }
 }
 
 function proofObservationDetails(
@@ -3330,6 +3502,8 @@ function recoveryHintsForCode(code: RegistryErrorCode, details: RegistryErrorDet
       ];
     case "RECOVERABLE_STASHES":
       return ["Inspect and explicitly apply, export, or drop the session stash before retrying cleanup."];
+    case "INTEGRATION_FETCH_FAILED":
+      return ["Retry the same explicit integration-proof close; fetch failure leaves session ownership intact."];
     case "MISSING_WORKTREE":
       return ["Run the authoritative GC apply path after confirming the Git worktree entry is prunable and missing."];
     case "OWNERSHIP_MISMATCH":
@@ -3410,6 +3584,8 @@ function safeActionsForCode(code: RegistryErrorCode, details: RegistryErrorDetai
         : ["retain-session"];
     case "RESOURCE_CLAIM_CONFLICT":
       return ["inspect-blocking-session", "wait-for-conflicting-claim-release", "retain-session"];
+    case "INTEGRATION_FETCH_FAILED":
+      return ["retry-close", "retain-session"];
     case "GIT_STATE_AMBIGUOUS":
     case "PHYSICAL_OBSERVATION_UNAVAILABLE":
     case "REPOSITORY_IDENTITY_AMBIGUOUS":
@@ -3672,6 +3848,46 @@ function explicitRemote(remote: string | null | undefined): string {
     });
   }
   return remote;
+}
+
+function explicitIntegrationRemote(remote: string | null | undefined): string {
+  if (
+    typeof remote !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(remote) ||
+    remote.includes("..") ||
+    remote.endsWith(".") ||
+    remote.endsWith(".lock") ||
+    remote.includes("@{")
+  ) {
+    throw new SessionRegistryError(
+      "INVALID_REMOTE",
+      "Integration proof fetch requires a strict local Git remote name",
+      {
+        remote: typeof remote === "string" ? remote : "<missing>",
+      },
+    );
+  }
+  return explicitRemote(remote);
+}
+
+function explicitIntegrationBranch(branch: string | null | undefined): string {
+  if (typeof branch !== "string" || branch.length === 0) {
+    throw new SessionRegistryError(
+      "INVALID_REMOTE_BRANCH",
+      "Integration proof fetch requires an explicit integration branch name",
+      { branch: "<missing>" },
+    );
+  }
+  try {
+    return normalizeBranchId(branch).slice("refs/heads/".length);
+  } catch (error: unknown) {
+    throw new SessionRegistryError(
+      "INVALID_REMOTE_BRANCH",
+      "Git rejected the explicit integration branch name",
+      { branch },
+      error,
+    );
+  }
 }
 
 function explicitRemoteBranch(branch: string | null | undefined, alias: string | null | undefined): string {
@@ -4269,9 +4485,13 @@ function proveIntegrationRevisionLineage(
   cwd: string,
   integrationBranch: string,
   integratedRevision: string,
+  integrationRevision?: string,
 ): IntegrationLineageProof | undefined {
   try {
-    git.run(["merge-base", "--is-ancestor", integratedRevision, normalizeBranchId(integrationBranch)], cwd);
+    git.run(
+      ["merge-base", "--is-ancestor", integratedRevision, integrationRevision ?? normalizeBranchId(integrationBranch)],
+      cwd,
+    );
     return {
       method: "integration-branch-ancestor",
       integrationBranch,
@@ -4281,6 +4501,199 @@ function proveIntegrationRevisionLineage(
     if (isExpectedGitLookupFailure(error)) return undefined;
     throw error;
   }
+}
+
+function withFetchedIntegrationRef<T>(
+  git: GitCommandRunner,
+  cwd: string,
+  record: SessionRecord,
+  evidence: IntegrationEvidenceInput,
+  prove: (fetchedSha: string) => T,
+): T {
+  const remote = evidence.fetchRemote;
+  const branch = evidence.fetchBranch;
+  if (remote === undefined || branch === undefined) {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "Explicit integration fetch requires both a remote and an integration branch",
+      { sessionId: record.sessionId },
+    );
+  }
+
+  const targetRef = normalizeBranchId(branch);
+  const temporaryRef = `refs/nawabari/session-close/${record.sessionId}/${generateSessionId()}`;
+  let fetchAttempted = false;
+  let result!: T;
+  let operationError: unknown;
+  let cleanupError: unknown;
+
+  try {
+    const sessionIdentityBeforeFetch = observeSessionProofIdentity(git, cwd, record);
+    const observedRemoteSha = observeIntegrationRemoteTip(git, cwd, remote, branch, targetRef);
+
+    fetchAttempted = true;
+    try {
+      git.run(
+        ["fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", remote, `+${targetRef}:${temporaryRef}`],
+        cwd,
+      );
+    } catch (error: unknown) {
+      throw integrationFetchFailure(
+        "Integration proof fetch failed",
+        {
+          phase: "fetch",
+          remote,
+          branch,
+          temporaryRef,
+          ...(error instanceof SessionRegistryError ? { gitCode: error.code, ...error.details } : {}),
+        },
+        error,
+      );
+    }
+
+    let fetchedSha: string;
+    try {
+      fetchedSha = git.run(["rev-parse", "--verify", `${temporaryRef}^{commit}`], cwd);
+    } catch (error: unknown) {
+      throw integrationFetchFailure(
+        "Fetched integration branch did not produce a verifiable commit",
+        {
+          phase: "resolve-fetched-ref",
+          remote,
+          branch,
+          temporaryRef,
+          ...(error instanceof SessionRegistryError ? { gitCode: error.code, ...error.details } : {}),
+        },
+        error,
+      );
+    }
+    if (!isFullRevision(fetchedSha)) {
+      throw integrationFetchFailure("Fetched integration branch returned an invalid commit SHA", {
+        phase: "resolve-fetched-ref",
+        remote,
+        branch,
+        temporaryRef,
+        fetchedSha,
+      });
+    }
+
+    const fetchedRemoteSha = observeIntegrationRemoteTip(git, cwd, remote, branch, targetRef);
+    if (observedRemoteSha !== fetchedRemoteSha || fetchedSha !== observedRemoteSha) {
+      throw integrationFetchFailure("The remote integration branch changed during the proof fetch", {
+        phase: "remote-race-check",
+        remote,
+        branch,
+        temporaryRef,
+        observedRemoteSha,
+        fetchedRemoteSha,
+        fetchedSha,
+      });
+    }
+
+    result = prove(fetchedSha);
+    const sessionIdentityAfterProof = observeSessionProofIdentity(git, cwd, record);
+    assertSameSessionProofIdentity(sessionIdentityBeforeFetch, sessionIdentityAfterProof, record);
+  } catch (error: unknown) {
+    operationError = error;
+  } finally {
+    if (fetchAttempted) {
+      try {
+        git.run(["update-ref", "-d", temporaryRef], cwd);
+      } catch (error: unknown) {
+        cleanupError = error;
+      }
+    }
+  }
+
+  if (cleanupError !== undefined) {
+    const cleanupFailure = integrationFetchFailure(
+      "Could not remove the temporary integration proof ref",
+      {
+        phase: "temporary-ref-cleanup",
+        remote,
+        branch,
+        temporaryRef,
+        ...(cleanupError instanceof SessionRegistryError
+          ? { gitCode: cleanupError.code, ...cleanupError.details }
+          : {}),
+      },
+      cleanupError,
+    );
+    if (operationError === undefined) throw cleanupFailure;
+    if (operationError instanceof SessionRegistryError) {
+      throw new SessionRegistryError(
+        operationError.code,
+        operationError.message,
+        {
+          ...operationError.details,
+          temporaryRefCleanupFailed: true,
+          temporaryRef,
+          cleanupErrorCode: cleanupFailure.code,
+        },
+        operationError,
+      );
+    }
+    throw cleanupFailure;
+  }
+
+  if (operationError !== undefined) throw operationError;
+  return result;
+}
+
+function observeIntegrationRemoteTip(
+  git: GitCommandRunner,
+  cwd: string,
+  remote: string,
+  branch: string,
+  targetRef: string,
+): string {
+  let output: string;
+  try {
+    output = git.run(["ls-remote", "--heads", remote, targetRef], cwd);
+  } catch (error: unknown) {
+    throw integrationFetchFailure(
+      "Could not observe the remote integration branch tip",
+      {
+        phase: "remote-tip-observation",
+        remote,
+        branch,
+        ...(error instanceof SessionRegistryError ? { gitCode: error.code, ...error.details } : {}),
+      },
+      error,
+    );
+  }
+
+  const records = output
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (records.length !== 1) {
+    throw integrationFetchFailure("The remote integration branch tip was absent or ambiguous", {
+      phase: "remote-tip-observation",
+      remote,
+      branch,
+      targetRef,
+      recordCount: records.length,
+    });
+  }
+  const fields = records[0]?.split(/\s+/u) ?? [];
+  if (fields.length !== 2 || fields[1] !== targetRef || !isFullRevision(fields[0] ?? "")) {
+    throw integrationFetchFailure("The remote integration branch tip was invalid", {
+      phase: "remote-tip-observation",
+      remote,
+      branch,
+      targetRef,
+    });
+  }
+  return fields[0] as string;
+}
+
+function integrationFetchFailure(
+  message: string,
+  details: RegistryErrorDetails,
+  cause?: unknown,
+): SessionRegistryError {
+  return new SessionRegistryError("INTEGRATION_FETCH_FAILED", message, details, cause);
 }
 
 function localBranchExists(git: GitCommandRunner, cwd: string, branchId: string): boolean {
@@ -5015,6 +5428,10 @@ function requireRevision(value: unknown, index: number, field: string): string {
 
 function isRevision(value: string): boolean {
   return /^[0-9a-f]{40,64}$/u.test(value);
+}
+
+function isFullRevision(value: string): boolean {
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(value);
 }
 
 function requireState(value: unknown, index: number): SessionState {

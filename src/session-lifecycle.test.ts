@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
-import { defaultGit } from "./git.js";
+import { defaultGit, type GitCommandRunner } from "./git.js";
 import { SessionRegistry } from "./session-registry.js";
 import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
 
@@ -904,6 +904,311 @@ test("close rejects an unresolvable integrated-revision evidence reference befor
     assert.equal(registry.get(session.sessionId)?.state, "active");
     assert.equal(fs.existsSync(worktreePath), true);
     assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("close explicitly fetches missing integration proof without changing local integration refs", () => {
+  const fixture = createRepositoryFixture();
+  const remotePath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-lifecycle-remote-"));
+  const clonePath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-lifecycle-clone-"));
+  const worktreePath = `${fixture.repositoryPath}-fetch-proof`;
+  try {
+    runGit(["init", "--bare", remotePath], path.dirname(remotePath));
+    runGit(["remote", "add", "origin", remotePath], fixture.repositoryPath);
+    runGit(["push", "origin", "main"], fixture.repositoryPath);
+    runGit(["fetch", "origin", "main"], fixture.repositoryPath);
+
+    const mainHeadBefore = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+    const trackingHeadBefore = runGit(["rev-parse", "refs/remotes/origin/main"], fixture.repositoryPath);
+    const fetchHeadPath = path.join(fixture.repositoryPath, ".git", "FETCH_HEAD");
+    const fetchHeadBefore = fs.readFileSync(fetchHeadPath, "utf8");
+
+    const observedCommands: string[][] = [];
+    let failNextFetch = true;
+    let failNextCleanup = true;
+    let replaceTemporaryRef = true;
+    const observingGit: GitCommandRunner = {
+      run(args, cwd): string {
+        observedCommands.push([...args]);
+        if (args[0] === "fetch" && failNextFetch) {
+          failNextFetch = false;
+          const fetchSpec = args[args.length - 1] ?? "";
+          const separator = fetchSpec.lastIndexOf(":");
+          const temporaryRef = separator < 0 ? "" : fetchSpec.slice(separator + 1);
+          if (temporaryRef.length > 0) {
+            runGit(
+              ["update-ref", temporaryRef, runGit(["rev-parse", "main"], fixture.repositoryPath)],
+              fixture.repositoryPath,
+            );
+          }
+          throw new SessionRegistryError("GIT_COMMAND_FAILED", "injected fetch failure");
+        }
+        if (args[0] === "update-ref" && args[1] === "-d" && failNextCleanup) {
+          failNextCleanup = false;
+          throw new SessionRegistryError("GIT_COMMAND_FAILED", "injected temporary-ref cleanup failure");
+        }
+        const output = defaultGit.run(args, cwd);
+        if (
+          replaceTemporaryRef &&
+          args[0] === "rev-parse" &&
+          args[1] === "--verify" &&
+          args[2]?.startsWith("refs/nawabari/session-close/") &&
+          args[2]?.endsWith("^{commit}")
+        ) {
+          replaceTemporaryRef = false;
+          const temporaryRef = args[2].slice(0, -"^{commit}".length);
+          runGit(
+            ["update-ref", temporaryRef, runGit(["rev-parse", "main"], fixture.repositoryPath)],
+            fixture.repositoryPath,
+          );
+        }
+        return output;
+      },
+      runRaw(args, cwd): string {
+        observedCommands.push([...args]);
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, git: observingGit });
+    const session = registry.provision({ worktreePath, branchName: "feat/fetch-proof" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "fetched integration proof\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "session feature"], worktreePath);
+
+    runGit(["clone", remotePath, clonePath], path.dirname(clonePath));
+    runGit(["checkout", "-b", "main", "origin/main"], clonePath);
+    runGit(["config", "user.email", "remote@example.invalid"], clonePath);
+    runGit(["config", "user.name", "Remote"], clonePath);
+    fs.writeFileSync(path.join(clonePath, "feature.txt"), "fetched integration proof\n");
+    runGit(["add", "feature.txt"], clonePath);
+    runGit(["commit", "-m", "squash merge session feature"], clonePath);
+    runGit(["push", "origin", "HEAD:refs/heads/main"], clonePath);
+    const integratedRevision = runGit(["rev-parse", "HEAD"], clonePath);
+
+    assert.equal(runGitQuiet(["cat-file", "-e", `${integratedRevision}^{commit}`], fixture.repositoryPath), false);
+    let failedTemporaryRef: string | null = null;
+    assert.throws(
+      () =>
+        registry.close({
+          sessionId: session.sessionId,
+          integratedRevision,
+          fetchRemote: "origin",
+          fetchBranch: "main",
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "INTEGRATION_FETCH_FAILED");
+        assert.equal(error.details.temporaryRefCleanupFailed, true);
+        assert.ok((error.details.safeActions as string[]).includes("retry-close"));
+        assert.ok((error.details.recoveryHints as string[]).length > 0);
+        failedTemporaryRef = error.details.temporaryRef as string;
+        return true;
+      },
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.ok(failedTemporaryRef !== null);
+    assert.equal(
+      runGit(["for-each-ref", "--format=%(refname)", "refs/nawabari/session-close"], fixture.repositoryPath),
+      failedTemporaryRef,
+    );
+    runGit(["update-ref", "-d", failedTemporaryRef], fixture.repositoryPath);
+    const result = registry.close({
+      sessionId: session.sessionId,
+      integratedRevision,
+      fetchRemote: "origin",
+      fetchBranch: "main",
+    });
+    assert.equal(result.session.state, "closed");
+    assert.equal(result.integrationProof?.method, "tree-equivalence");
+    assert.equal(result.integrationProof?.integratedRevision, integratedRevision);
+    assert.equal(runGit(["rev-parse", "HEAD"], fixture.repositoryPath), mainHeadBefore);
+    assert.equal(runGit(["rev-parse", "refs/remotes/origin/main"], fixture.repositoryPath), trackingHeadBefore);
+    assert.equal(fs.readFileSync(fetchHeadPath, "utf8"), fetchHeadBefore);
+    assert.equal(
+      runGit(["for-each-ref", "--format=%(refname)", "refs/nawabari/session-close"], fixture.repositoryPath),
+      "",
+    );
+    assert.equal(
+      runGit(["ls-remote", "origin", "refs/heads/main"], fixture.repositoryPath).split(/\s+/u)[0],
+      integratedRevision,
+    );
+    const fetchCommand = observedCommands.find((args) => args[0] === "fetch");
+    assert.ok(fetchCommand !== undefined);
+    assert.ok(fetchCommand.includes("--no-tags"));
+    assert.ok(fetchCommand.includes("--no-write-fetch-head"));
+    assert.ok(fetchCommand.includes("--refmap="));
+    assert.ok(fetchCommand.some((argument) => argument.startsWith("+refs/heads/main:refs/nawabari/session-close/")));
+    assert.ok(!fetchCommand.includes("--all"));
+    assert.ok(!fetchCommand.includes("--multiple"));
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fs.rmSync(clonePath, { recursive: true, force: true });
+    fs.rmSync(remotePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("close fails closed when session identity changes after explicit integration proof", () => {
+  const fixture = createRepositoryFixture();
+  const remotePath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-lifecycle-remote-"));
+  const clonePath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-lifecycle-clone-"));
+  const worktreePath = `${fixture.repositoryPath}-fetch-identity-race`;
+  let integratedRevision: string | null = null;
+  let identityChanged = false;
+  const racingGit: GitCommandRunner = {
+    run(args, cwd): string {
+      const output = defaultGit.run(args, cwd);
+      if (
+        !identityChanged &&
+        integratedRevision !== null &&
+        args[0] === "merge-base" &&
+        args[1] === "--is-ancestor" &&
+        args[2] === integratedRevision &&
+        args[3] !== undefined &&
+        args[3] === integratedRevision
+      ) {
+        runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
+        identityChanged = true;
+      }
+      return output;
+    },
+    runRaw(args, cwd): string {
+      return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+    },
+  };
+  try {
+    runGit(["init", "--bare", remotePath], path.dirname(remotePath));
+    runGit(["remote", "add", "origin", remotePath], fixture.repositoryPath);
+    runGit(["push", "origin", "main"], fixture.repositoryPath);
+    runGit(["fetch", "origin", "main"], fixture.repositoryPath);
+
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, git: racingGit });
+    const session = registry.provision({ worktreePath, branchName: "feat/fetch-identity-race" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "identity race proof\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "session feature"], worktreePath);
+
+    runGit(["clone", remotePath, clonePath], path.dirname(clonePath));
+    runGit(["checkout", "-b", "main", "origin/main"], clonePath);
+    runGit(["config", "user.email", "remote@example.invalid"], clonePath);
+    runGit(["config", "user.name", "Remote"], clonePath);
+    fs.writeFileSync(path.join(clonePath, "feature.txt"), "identity race proof\n");
+    runGit(["add", "feature.txt"], clonePath);
+    runGit(["commit", "-m", "squash merge session feature"], clonePath);
+    runGit(["push", "origin", "HEAD:refs/heads/main"], clonePath);
+    integratedRevision = runGit(["rev-parse", "HEAD"], clonePath);
+
+    assert.throws(
+      () =>
+        registry.close({
+          sessionId: session.sessionId,
+          integratedRevision,
+          fetchRemote: "origin",
+          fetchBranch: "main",
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "GIT_STATE_AMBIGUOUS");
+        assert.equal(error.details.phase, "integration-proof-reobserve");
+        return true;
+      },
+    );
+    assert.equal(identityChanged, true);
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(
+      runGit(["for-each-ref", "--format=%(refname)", "refs/nawabari/session-close"], fixture.repositoryPath),
+      "",
+    );
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fs.rmSync(clonePath, { recursive: true, force: true });
+    fs.rmSync(remotePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("close rejects an explicit integration branch that aliases the session branch", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-fetch-self-reference`;
+  const observedCommands: string[][] = [];
+  const observingGit: GitCommandRunner = {
+    run(args, cwd): string {
+      observedCommands.push([...args]);
+      return defaultGit.run(args, cwd);
+    },
+    runRaw(args, cwd): string {
+      observedCommands.push([...args]);
+      return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+    },
+  };
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, git: observingGit });
+    const session = registry.provision({ worktreePath, branchName: "feat/fetch-self-reference" });
+    fs.writeFileSync(path.join(worktreePath, "feature.txt"), "self-reference must remain recoverable\n");
+    runGit(["add", "feature.txt"], worktreePath);
+    runGit(["commit", "-m", "session feature"], worktreePath);
+    const integratedRevision = runGit(["rev-parse", session.branchName], fixture.repositoryPath);
+
+    for (const invalidRevision of ["a".repeat(39), "a".repeat(41), "A".repeat(40), "a".repeat(63)]) {
+      assert.throws(
+        () =>
+          registry.close({
+            sessionId: session.sessionId,
+            integratedRevision: invalidRevision,
+            fetchRemote: "origin",
+            fetchBranch: "main",
+          }),
+        (error: unknown) => error instanceof SessionRegistryError && error.code === "INVALID_BASE_REF",
+      );
+    }
+    for (const invalidRemote of ["origin..backup", "origin.", "origin.lock", "origin@{main}"]) {
+      assert.throws(
+        () =>
+          registry.close({
+            sessionId: session.sessionId,
+            integratedRevision,
+            fetchRemote: invalidRemote,
+            fetchBranch: "main",
+          }),
+        (error: unknown) => error instanceof SessionRegistryError && error.code === "INVALID_REMOTE",
+      );
+    }
+    for (const invalidBranch of ["main..backup", "main.", "main.lock", "main@{merge}"]) {
+      assert.throws(
+        () =>
+          registry.close({
+            sessionId: session.sessionId,
+            integratedRevision,
+            fetchRemote: "origin",
+            fetchBranch: invalidBranch,
+          }),
+        (error: unknown) => error instanceof SessionRegistryError && error.code === "INVALID_REMOTE_BRANCH",
+      );
+    }
+
+    assert.throws(
+      () =>
+        registry.close({
+          sessionId: session.sessionId,
+          integratedRevision,
+          fetchRemote: "origin",
+          fetchBranch: session.branchName,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "RECOVERABLE_COMMITS");
+        assert.equal(error.details.proofFailure, "integration-branch-self-reference");
+        return true;
+      },
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(
+      observedCommands.some((args) => args[0] === "ls-remote" || args[0] === "fetch"),
+      false,
+    );
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
     fixture.cleanup();
