@@ -150,6 +150,7 @@ export interface CloseSessionResult {
   readonly worktreeRemoved: boolean;
   readonly branchRemoved: boolean;
   readonly idempotent: boolean;
+  readonly claimSetGeneration: number;
   readonly integrationProof?: IntegrationProof;
 }
 
@@ -167,6 +168,7 @@ export interface DiscardSessionResult {
   readonly releasedClaimCount: number;
   readonly releasedClaimsTruncated: boolean;
   readonly idempotent: boolean;
+  readonly claimSetGeneration: number;
 }
 
 export interface CloseSessionOptions {
@@ -373,13 +375,20 @@ export interface ClaimResourcesOptions {
   readonly repository_id?: string;
 }
 
-export interface UpdateClaimsOptions extends ClaimResourcesOptions {}
+export interface UpdateClaimsOptions extends ClaimResourcesOptions {
+  readonly expectedClaimSetGeneration?: number | null;
+  readonly expected_claim_set_generation?: number | null;
+  readonly force?: boolean;
+}
 
 export interface ReleaseClaimsOptions {
   readonly sessionId?: string | null;
   readonly session_id?: string | null;
   readonly claimIds?: readonly string[];
   readonly claim_ids?: readonly string[];
+  readonly expectedClaimSetGeneration?: number | null;
+  readonly expected_claim_set_generation?: number | null;
+  readonly force?: boolean;
 }
 
 export interface ClaimResourcesResult {
@@ -388,6 +397,7 @@ export interface ClaimResourcesResult {
   readonly added: readonly ResourceClaim[];
   readonly released: readonly ResourceClaim[];
   readonly idempotent: boolean;
+  readonly claimSetGeneration: number;
 }
 
 export interface ReleaseClaimsResult {
@@ -395,6 +405,12 @@ export interface ReleaseClaimsResult {
   readonly released: readonly ResourceClaim[];
   readonly remaining: readonly ResourceClaim[];
   readonly idempotent: boolean;
+  readonly claimSetGeneration: number;
+}
+
+export interface ClaimSetSnapshot {
+  readonly claims: readonly ResourceClaim[];
+  readonly claimSetGeneration: number;
 }
 
 export interface RegistryMigrationResult {
@@ -561,11 +577,14 @@ export interface PersistedRegistry {
   readonly claims_schema_version?: typeof RESOURCE_CLAIM_SCHEMA_VERSION | typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
   /** Optional in the TypeScript shape so pre-claim fixtures remain readable. */
   readonly claims?: readonly PersistedResourceClaim[];
+  /** Monotonic authoritative claim-set generation; absent in pre-generation registries. */
+  readonly claim_set_generation?: number;
 }
 
 interface RegistryState {
   readonly sessions: readonly SessionRecord[];
   readonly claims: readonly ResourceClaim[];
+  readonly claimSetGeneration: number;
   readonly legacyClaimsAbsent: boolean;
   readonly legacyClaimsSchemaVersion?: typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
 }
@@ -672,6 +691,27 @@ export class SessionRegistry {
     return claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim);
   }
 
+  /** Return claims plus the registry-wide generation used for CAS mutations. */
+  listClaimsSnapshot(sessionId?: string | null): ClaimSetSnapshot {
+    const state = this.readStateUnsafe();
+    if (sessionId === undefined || sessionId === null) {
+      return { claims: state.claims.map(cloneResourceClaim), claimSetGeneration: state.claimSetGeneration };
+    }
+    assertSessionId(sessionId);
+    return {
+      claims: state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim),
+      claimSetGeneration: state.claimSetGeneration,
+    };
+  }
+
+  getClaimSetGeneration(): number {
+    return this.readStateUnsafe().claimSetGeneration;
+  }
+
+  claimSetGeneration(): number {
+    return this.getClaimSetGeneration();
+  }
+
   claims(sessionId?: string | null): readonly ResourceClaim[] {
     return this.listClaims(sessionId);
   }
@@ -693,7 +733,7 @@ export class SessionRegistry {
     return this.withLock(() => {
       const state = this.readStateUnsafe(true);
       const migrated = state.legacyClaimsAbsent || state.legacyClaimsSchemaVersion !== undefined;
-      if (migrated) this.writeUnsafe(state.sessions, state.claims);
+      if (migrated) this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration);
       return {
         migrated,
         registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
@@ -728,13 +768,15 @@ export class SessionRegistry {
       const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
       const requested = this.canonicalClaimInputs(options.claims, owner);
       const result = this.addClaimsUnsafe(state, owner, requested);
-      this.writeUnsafe(result.sessions, result.claims);
+      const claimSetGeneration = nextClaimSetGeneration(state, result.claims);
+      this.writeUnsafe(result.sessions, result.claims, claimSetGeneration);
       return {
         session: cloneSessionRecord(owner.record),
         claims: result.sessionClaims.map(cloneResourceClaim),
         added: result.added.map(cloneResourceClaim),
         released: [],
         idempotent: result.added.length === 0,
+        claimSetGeneration,
       };
     });
   }
@@ -742,6 +784,7 @@ export class SessionRegistry {
   updateClaims(options: UpdateClaimsOptions): ClaimResourcesResult {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
+      this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
       const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
       const requested = this.canonicalClaimInputs(options.claims, owner, true);
@@ -764,16 +807,19 @@ export class SessionRegistry {
           ? claim
           : cloneResourceClaim({ ...claim, createdAt: prior.createdAt, updatedAt: prior.updatedAt });
       });
-      this.writeUnsafe(
-        state.sessions,
-        sortResourceClaims([...state.claims.filter((claim) => claim.sessionId !== sessionId), ...materialized]),
-      );
+      const nextClaims = sortResourceClaims([
+        ...state.claims.filter((claim) => claim.sessionId !== sessionId),
+        ...materialized,
+      ]);
+      const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+      this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration);
       return {
         session: cloneSessionRecord(owner.record),
         claims: materialized.map(cloneResourceClaim),
         added: added.map(cloneResourceClaim),
         released: released.map(cloneResourceClaim),
         idempotent: unchanged,
+        claimSetGeneration,
       };
     });
   }
@@ -783,6 +829,7 @@ export class SessionRegistry {
       typeof sessionIdOrOptions === "string" ? { sessionId: sessionIdOrOptions, claimIds } : sessionIdOrOptions;
     return this.withLock(() => {
       const state = this.readStateUnsafe();
+      this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
       const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
       if (record === undefined) {
@@ -815,10 +862,9 @@ export class SessionRegistry {
       }
       const released = sessionClaims.filter((claim) => wanted.has(claim.claimId));
       const remaining = sessionClaims.filter((claim) => !wanted.has(claim.claimId));
-      this.writeUnsafe(
-        state.sessions,
-        state.claims.filter((claim) => claim.sessionId !== sessionId || !wanted.has(claim.claimId)),
-      );
+      const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId || !wanted.has(claim.claimId));
+      const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+      this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration);
       return {
         sessionId,
         released: released.map(cloneResourceClaim),
@@ -827,6 +873,7 @@ export class SessionRegistry {
         // explicitly stable no-op, which makes a retried release safe after a
         // process crash or timeout.
         idempotent: released.length === 0,
+        claimSetGeneration,
       };
     });
   }
@@ -920,7 +967,7 @@ export class SessionRegistry {
           branchName: resources.branchName,
           git: this.git,
         });
-        this.writeUnsafe([...state.sessions, record], state.claims);
+        this.writeUnsafe([...state.sessions, record], state.claims, state.claimSetGeneration);
         return cloneSessionRecord(record);
       } catch (error: unknown) {
         if (gitProvisioned && this.absenceProvenAfterProvisioningFailure(error, sessionId)) {
@@ -2043,6 +2090,7 @@ export class SessionRegistry {
       const state = this.readStateUnsafe();
       let records = [...state.sessions];
       let claims = state.claims;
+      let claimSetGeneration = state.claimSetGeneration;
       const now = toTimestamp(this.clock());
       const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
       const candidates = records
@@ -2077,7 +2125,7 @@ export class SessionRegistry {
           const staleRecord = transitionSessionState(current, "stale", this.clock);
           records = replaceRecord(records, staleRecord);
           validateRecords(records, this.repository.repositoryId);
-          this.writeUnsafe(records, claims);
+          this.writeUnsafe(records, claims, claimSetGeneration);
         }
 
         try {
@@ -2089,6 +2137,7 @@ export class SessionRegistry {
         const updatedState = this.readStateUnsafe();
         records = [...updatedState.sessions];
         claims = updatedState.claims;
+        claimSetGeneration = updatedState.claimSetGeneration;
       }
 
       return {
@@ -2159,6 +2208,44 @@ export class SessionRegistry {
       ...record,
       record,
     };
+  }
+
+  private assertClaimSetMutationIntent(
+    options: UpdateClaimsOptions | ReleaseClaimsOptions,
+    actualGeneration: number,
+  ): void {
+    const expected = options.expectedClaimSetGeneration ?? options.expected_claim_set_generation;
+    const forced = options.force === true;
+    if (expected !== undefined && expected !== null && forced) {
+      throw new SessionRegistryError(
+        "INVALID_OPERATION",
+        "Claim-set mutation requires exactly one of expectedClaimSetGeneration or force",
+      );
+    }
+    if (expected === undefined || expected === null) {
+      if (forced) return;
+      throw new SessionRegistryError(
+        "INVALID_OPERATION",
+        "Claim-set mutation requires expectedClaimSetGeneration or force",
+      );
+    }
+    if (!Number.isSafeInteger(expected) || expected < 0) {
+      throw new SessionRegistryError(
+        "INVALID_OPERATION",
+        "expectedClaimSetGeneration must be a non-negative safe integer",
+        { expectedClaimSetGeneration: typeof expected === "number" ? expected : String(expected) },
+      );
+    }
+    if (expected !== actualGeneration) {
+      throw new SessionRegistryError(
+        "STALE_CLAIM_SET",
+        "Claim-set generation does not match the current registry state",
+        {
+          expectedClaimSetGeneration: expected,
+          actualClaimSetGeneration: actualGeneration,
+        },
+      );
+    }
   }
 
   private canonicalClaimInputs(
@@ -2287,6 +2374,7 @@ export class SessionRegistry {
         worktreeRemoved: false,
         branchRemoved: false,
         idempotent: true,
+        claimSetGeneration: state.claimSetGeneration,
       };
     }
     if (record.terminalOperation === "discard") {
@@ -2306,7 +2394,7 @@ export class SessionRegistry {
     const closingRecord = record.state === "closing" ? record : transitionSessionState(record, "closing", this.clock);
     let closingRecords = replaceRecord(records, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
-    this.writeUnsafe(closingRecords, state.claims);
+    this.writeUnsafe(closingRecords, state.claims, state.claimSetGeneration);
 
     let worktreeRemoved = false;
     let branchRemoved = false;
@@ -2347,16 +2435,16 @@ export class SessionRegistry {
     const closedRecord = transitionSessionState(closingRecord, "closed", this.clock);
     closingRecords = replaceRecord(closingRecords, closedRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
-    this.writeUnsafe(
-      closingRecords,
-      state.claims.filter((claim) => claim.sessionId !== sessionId),
-    );
+    const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
+    const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+    this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration);
 
     return {
       session: cloneSessionRecord(closedRecord),
       worktreeRemoved,
       branchRemoved,
       idempotent: false,
+      claimSetGeneration,
       ...(integrationProof === undefined ? {} : { integrationProof }),
     };
   }
@@ -2375,7 +2463,7 @@ export class SessionRegistry {
           { sessionId, state: record.state, terminalOperation: "close" },
         );
       }
-      return discardResult(record, record.discardedHead ?? null, [], false, false, true);
+      return discardResult(record, record.discardedHead ?? null, [], false, false, true, state.claimSetGeneration);
     }
     if (record.state === "closing" && record.terminalOperation !== "discard") {
       throw new SessionRegistryError(
@@ -2427,7 +2515,7 @@ export class SessionRegistry {
         );
     let closingRecords = resuming ? state.sessions : replaceRecord(state.sessions, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
-    if (!resuming) this.writeUnsafe(closingRecords, state.claims);
+    if (!resuming) this.writeUnsafe(closingRecords, state.claims, state.claimSetGeneration);
 
     let worktreeRemoved = resuming && !resources.worktreePresent;
     let branchRemoved = resuming && !resources.branchPresent;
@@ -2460,12 +2548,19 @@ export class SessionRegistry {
     closingRecords = replaceRecord(closingRecords, closedRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
     const releasedClaims = state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim);
-    this.writeUnsafe(
-      closingRecords,
-      state.claims.filter((claim) => claim.sessionId !== sessionId),
-    );
+    const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
+    const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+    this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration);
 
-    return discardResult(closedRecord, previousHead, releasedClaims, worktreeRemoved, branchRemoved, false);
+    return discardResult(
+      closedRecord,
+      previousHead,
+      releasedClaims,
+      worktreeRemoved,
+      branchRemoved,
+      false,
+      claimSetGeneration,
+    );
   }
 
   private inspectCleanupResources(
@@ -3092,7 +3187,7 @@ export class SessionRegistry {
       contents = fs.readFileSync(this.paths.registry, "utf8");
     } catch (error: unknown) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        return { sessions: [], claims: [], legacyClaimsAbsent: false };
+        return { sessions: [], claims: [], claimSetGeneration: 0, legacyClaimsAbsent: false };
       }
       throw new SessionRegistryError(
         "REGISTRY_IO_FAILURE",
@@ -3134,13 +3229,18 @@ export class SessionRegistry {
    * durability-uncertain outcome rather than an ordinary write failure,
    * since the renamed document may already be the one readers observe.
    */
-  private writeUnsafe(records: readonly SessionRecord[], claims: readonly ResourceClaim[]): void {
+  private writeUnsafe(
+    records: readonly SessionRecord[],
+    claims: readonly ResourceClaim[],
+    claimSetGeneration: number,
+  ): void {
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
       repository_id: this.repository.repositoryId,
       sessions: records.map((record) => toPersistedSessionRecord(record, this.repository.repositoryId)),
       claims_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
       claims: sortResourceClaims(claims).map((claim) => toPersistedResourceClaim(claim, this.repository.repositoryId)),
+      claim_set_generation: claimSetGeneration,
     };
 
     try {
@@ -3176,7 +3276,7 @@ export class SessionRegistry {
       const state = this.readStateUnsafe();
       const { records: nextRecords, result } = mutation(state.sessions);
       validateRecords(nextRecords, this.repository.repositoryId);
-      this.writeUnsafe(nextRecords, state.claims);
+      this.writeUnsafe(nextRecords, state.claims, state.claimSetGeneration);
       return result;
     });
   }
@@ -3351,6 +3451,7 @@ function discardResult(
   worktreeRemoved: boolean,
   branchRemoved: boolean,
   idempotent: boolean,
+  claimSetGeneration: number,
 ): DiscardSessionResult {
   const boundedClaims = releasedClaims.slice(0, MAX_DISCARD_CLAIMS).map(cloneResourceClaim);
   return {
@@ -3367,6 +3468,7 @@ function discardResult(
     releasedClaimCount: releasedClaims.length,
     releasedClaimsTruncated: releasedClaims.length > boundedClaims.length,
     idempotent,
+    claimSetGeneration,
   };
 }
 
@@ -4978,7 +5080,11 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
     }
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry schema_version must be a number");
   }
-  assertExactKeys(value, ["schema_version", "repository_id", "sessions"], ["claims_schema_version", "claims"]);
+  assertExactKeys(
+    value,
+    ["schema_version", "repository_id", "sessions"],
+    ["claims_schema_version", "claims", "claim_set_generation"],
+  );
 
   if (typeof value.repository_id !== "string" || value.repository_id !== expectedRepositoryId) {
     throw new SessionRegistryError(
@@ -4990,6 +5096,8 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
   if (!Array.isArray(value.sessions)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry sessions must be an array");
   }
+
+  const claimSetGeneration = parseClaimSetGeneration(value.claim_set_generation);
 
   const records = value.sessions.map((candidate, index) => parseSessionRecord(candidate, index, expectedRepositoryId));
   validateRecords(records, expectedRepositoryId);
@@ -5004,7 +5112,7 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
   if (!hasClaimsSchema) {
     // v0.1.0 had no claim section. It is a deterministic empty claim set,
     // materialized on the next locked mutation or via migrate().
-    return { sessions: records, claims: [], legacyClaimsAbsent: true };
+    return { sessions: records, claims: [], claimSetGeneration, legacyClaimsAbsent: true };
   }
   const claimSchemaVersion = value.claims_schema_version;
   const isLegacyClaimSchema = claimSchemaVersion === LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
@@ -5037,9 +5145,54 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
   return {
     sessions: records,
     claims: sortResourceClaims(claims),
+    claimSetGeneration,
     legacyClaimsAbsent: false,
     ...(isLegacyClaimSchema ? { legacyClaimsSchemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION } : {}),
   };
+}
+
+function parseClaimSetGeneration(value: unknown): number {
+  if (value === undefined) return 0;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new SessionRegistryError(
+      "REGISTRY_CORRUPT",
+      "Registry claim_set_generation must be a non-negative safe integer",
+      { claimSetGeneration: typeof value === "number" ? value : stringifyDetail(value) },
+    );
+  }
+  return value as number;
+}
+
+function nextClaimSetGeneration(state: RegistryState, nextClaims: readonly ResourceClaim[]): number {
+  if (sameClaimSet(state.claims, nextClaims)) return state.claimSetGeneration;
+  if (state.claimSetGeneration >= Number.MAX_SAFE_INTEGER) {
+    throw new SessionRegistryError("OPERATION_REJECTED", "Claim-set generation exhausted");
+  }
+  return state.claimSetGeneration + 1;
+}
+
+function sameClaimSet(left: readonly ResourceClaim[], right: readonly ResourceClaim[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index];
+    const b = right[index];
+    if (
+      a === undefined ||
+      b === undefined ||
+      a.schemaVersion !== b.schemaVersion ||
+      a.claimId !== b.claimId ||
+      a.sessionId !== b.sessionId ||
+      a.repositoryId !== b.repositoryId ||
+      a.worktreePath !== b.worktreePath ||
+      a.resource !== b.resource ||
+      a.mode !== b.mode ||
+      a.createdAt !== b.createdAt ||
+      a.updatedAt !== b.updatedAt
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function parseResourceClaim(

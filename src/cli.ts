@@ -1000,6 +1000,7 @@ async function executeCommand(
           resource: pair.resource,
           mode: pair.mode as "read" | "write" | "exclusive-write",
         })),
+        force: true,
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
@@ -1017,6 +1018,7 @@ async function executeCommand(
       const result = await dependencies.backend.releaseClaims(context, {
         session_id: parsed.value.session_id,
         claim_ids: parsed.value.claim_id === null ? null : [parsed.value.claim_id],
+        force: true,
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
@@ -1163,6 +1165,7 @@ async function executeCommand(
           resource: pair.resource,
           mode: pair.mode as "read" | "write" | "exclusive-write",
         })),
+        force: true,
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
@@ -1180,6 +1183,7 @@ async function executeCommand(
       const result = await dependencies.backend.releaseClaims(context, {
         session_id: parsed.value.session_id,
         claim_ids: parsed.value.claim_id === null ? null : [parsed.value.claim_id],
+        force: true,
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
