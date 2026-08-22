@@ -10,6 +10,8 @@ import type {
   ClaimDeltasResult,
   ClaimResourcesOptions,
   ClaimResourcesResult,
+  ReleaseClaimsOptions,
+  ReleaseClaimsResult,
   ResourceClaim,
   SessionBackend,
   SessionCloseOptions,
@@ -705,7 +707,7 @@ test("all session target aliases carry the same positional session identity", as
     ["session", "claim", sampleSession.session_id, "--resource", "a.txt", "--mode", "read", "--json"],
     ["session", "update", sampleSession.session_id, "--resource", "a.txt", "--mode", "read", "--force", "--json"],
     ["session", "claims", sampleSession.session_id, "--json"],
-    ["session", "release", sampleSession.session_id, "--json"],
+    ["session", "release", sampleSession.session_id, "--all", "--force", "--json"],
     ["session", "close", sampleSession.session_id, "--json"],
   ];
   for (const command of commands) {
@@ -1368,6 +1370,158 @@ test("claim delta human and JSON help expose the same grammar for canonical and 
     canonical.options.map((option) => option.name),
   );
   assert.deepEqual(alias.notes.slice(0, 2), canonical.notes.slice(0, 2));
+});
+
+test("selected release forwards repeated exact resources and CAS in one backend call", async () => {
+  let invocations = 0;
+  let observed: ReleaseClaimsOptions | null = null;
+  const released = sampleClaim("src/a.ts", "write");
+  const remaining = sampleClaim("src/keep.ts", "read");
+  const backend = backendForTests({
+    releaseClaims: async (_context: SessionContext, options: ReleaseClaimsOptions) => {
+      invocations += 1;
+      observed = options;
+      const result: ReleaseClaimsResult = {
+        session_id: sampleSession.session_id,
+        released: [released],
+        remaining: [remaining],
+        idempotent: false,
+        claim_set_generation: 8,
+      };
+      return success(result);
+    },
+  });
+  const output = capture();
+  const exitCode = await runCli(
+    [
+      "--json",
+      "session",
+      "release",
+      sampleSession.session_id,
+      "--resource",
+      "src/a.ts",
+      "--resource",
+      "src/missing.ts",
+      "--if-generation",
+      "7",
+    ],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.equal(invocations, 1);
+  assert.deepEqual(observed, {
+    session_id: sampleSession.session_id,
+    resources: ["src/a.ts", "src/missing.ts"],
+    claim_ids: null,
+    all: false,
+    expected_claim_set_generation: 7,
+  });
+  const response = JSON.parse(output.stdout[0] ?? "") as ReleaseClaimsResult & { command: string; ok: boolean };
+  assert.equal(response.ok, true);
+  assert.equal(response.command, "session release");
+  assert.equal(response.released.length, 1);
+  assert.equal(response.remaining.length, 1);
+});
+
+test("explicit all release and resource alias preserve selector/concurrency semantics", async () => {
+  let observed: ReleaseClaimsOptions | null = null;
+  const backend = backendForTests({
+    releaseClaims: async (_context: SessionContext, options: ReleaseClaimsOptions) => {
+      observed = options;
+      return success({
+        session_id: sampleSession.session_id,
+        released: [],
+        remaining: [],
+        idempotent: true,
+        claim_set_generation: 7,
+      } satisfies ReleaseClaimsResult);
+    },
+  });
+  const output = capture();
+  assert.equal(
+    await runCli(["--json", "resource", "release", "--session", sampleSession.session_id, "--all", "--force"], {
+      backend,
+      io: output.io,
+    }),
+    0,
+  );
+  assert.deepEqual(observed, {
+    session_id: sampleSession.session_id,
+    resources: null,
+    claim_ids: null,
+    all: true,
+    force: true,
+  });
+  const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; command: string; idempotent: boolean };
+  assert.deepEqual(response, {
+    ok: true,
+    command: "resource release",
+    session_id: sampleSession.session_id,
+    released: [],
+    remaining: [],
+    idempotent: true,
+    claim_set_generation: 7,
+  });
+});
+
+test("release selector and concurrency ambiguity fail before backend invocation", async () => {
+  let invocations = 0;
+  const backend = backendForTests({
+    releaseClaims: async () => {
+      invocations += 1;
+      return failure(new DomainError("INTERNAL_ERROR", "backend should not be called"));
+    },
+  });
+  const invalidCommands = [
+    ["--all", "--force", "--resource", "src/a.ts"],
+    ["--claim-id", "claim-a", "--all", "--force"],
+    ["--resource", "src/a.ts", "--claim-id", "claim-a", "--force"],
+    ["--force"],
+    ["--all"],
+    ["--all", "--force", "--if-generation", "1"],
+    ["--all", "--force", "--force"],
+    ["--all", "--if-generation", "1", "--if-generation", "2"],
+    ["--all", "--if-generation", "not-an-integer"],
+  ];
+  for (const arguments_ of invalidCommands) {
+    const output = capture();
+    const exitCode = await runCli(["--json", "session", "release", ...arguments_], { backend, io: output.io });
+    assert.equal(exitCode, 2, arguments_.join(" "));
+    const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string };
+    assert.equal(response.ok, false);
+    assert.ok(["INVALID_ARGUMENT", "MISSING_ARGUMENT"].includes(response.code));
+  }
+  assert.equal(invocations, 0);
+});
+
+test("release human and JSON help expose the same selected/all grammar", async () => {
+  const human = capture();
+  const json = capture();
+  const aliasJson = capture();
+  assert.equal(await runCli(["session", "release", "--help"], { io: human.io }), 0);
+  assert.equal(await runCli(["--json", "session", "release", "--help"], { io: json.io }), 0);
+  assert.equal(await runCli(["--json", "resource", "release", "--help"], { io: aliasJson.io }), 0);
+  assert.match(human.stdout.join("\n"), /--resource <path-or-glob>/u);
+  assert.match(human.stdout.join("\n"), /--claim-id <id>/u);
+  assert.match(human.stdout.join("\n"), /--all/u);
+  assert.match(human.stdout.join("\n"), /--if-generation <non-negative-safe-int>/u);
+  const canonical = JSON.parse(json.stdout[0] ?? "") as {
+    help_for: string;
+    usage: string;
+    options: Array<{ name: string }>;
+    notes: string[];
+  };
+  const alias = JSON.parse(aliasJson.stdout[0] ?? "") as typeof canonical;
+  assert.equal(canonical.help_for, "session release");
+  assert.equal(alias.help_for, "resource release");
+  assert.equal(alias.usage.replace("resource release", "session release"), canonical.usage);
+  assert.deepEqual(
+    alias.options.map((option) => option.name),
+    canonical.options.map((option) => option.name),
+  );
+  assert.match(canonical.notes.join("\n"), /exactly one selector family/iu);
+  assert.match(canonical.notes.join("\n"), /exactly one destructive concurrency intent/iu);
 });
 
 test("session update forwards an explicit claim-set generation CAS guard", async () => {

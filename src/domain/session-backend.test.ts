@@ -188,6 +188,78 @@ test("resource claims expose canonical machine fields through the backend and CL
   }
 });
 
+test("backend release exposes selected resources and explicit all with CAS", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-selected-release`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/selected-release", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const claimed = await backend.claimResources(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        repository: created.value.repository,
+        claims: [
+          { resource: "selected.txt", mode: "write" },
+          { resource: "unrelated.txt", mode: "read" },
+        ],
+      },
+    );
+    assert.equal(claimed.ok, true);
+    if (!claimed.ok) return;
+
+    const selected = await backend.releaseClaims(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        resources: ["selected.txt", "missing.txt"],
+        expected_claim_set_generation: claimed.value.claim_set_generation,
+      },
+    );
+    assert.equal(selected.ok, true, selected.ok ? "selected release succeeded" : JSON.stringify(selected.error));
+    if (!selected.ok) return;
+    assert.deepEqual(
+      selected.value.released.map((claim) => claim.resource),
+      ["selected.txt"],
+    );
+    assert.deepEqual(
+      selected.value.remaining.map((claim) => claim.resource),
+      ["unrelated.txt"],
+    );
+    assert.equal(selected.value.claim_set_generation, 2);
+
+    const stale = await backend.releaseClaims(
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        resources: ["unrelated.txt"],
+        expected_claim_set_generation: 1,
+      },
+    );
+    assert.equal(stale.ok, false);
+    if (!stale.ok) assert.equal(stale.error.code, "STALE_CLAIM_SET");
+
+    const all = await backend.releaseClaims(
+      { cwd: worktreePath },
+      { session_id: created.value.session_id, all: true, force: true },
+    );
+    assert.equal(all.ok, true, all.ok ? "all release succeeded" : JSON.stringify(all.error));
+    if (!all.ok) return;
+    assert.equal(all.value.released.length, 1);
+    assert.equal(all.value.remaining.length, 0);
+    assert.equal(all.value.claim_set_generation, 3);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("backend maps atomic claim deltas with typed before/after projections", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-delta-contract`;

@@ -255,7 +255,7 @@ git nawabari session claim --session "$NAWABARI_SESSION_ID" \
 git nawabari session claims --session "$NAWABARI_SESSION_ID" --json
 git nawabari session update --session "$NAWABARI_SESSION_ID" \
   --resource 'src/**/*.ts' --mode write --json
-git nawabari session release --session "$NAWABARI_SESSION_ID" --json
+git nawabari session release --session "$NAWABARI_SESSION_ID" --all --force --json
 ```
 
 `session update` (and its `resource update` alias) atomically replaces a

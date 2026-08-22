@@ -14,6 +14,7 @@ import {
   type SessionDiagnosticOptions,
   type SessionListOptions,
   type ClaimDeltasOptions,
+  type ReleaseClaimsOptions,
   type ResourceClaimDelta,
   MAX_SESSION_LIST_LIMIT,
 } from "./domain/session.js";
@@ -266,13 +267,21 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "session release",
     summary: "Release resource claims",
-    usage: `${CLI_NAME} session release [<session-id>|--session <id>] [--claim-id <id>]`,
+    usage: `${CLI_NAME} session release [<session-id>|--session <id>] (--resource <path-or-glob> ... | --claim-id <id> ... | --all) (--if-generation <n> | --force)`,
     options: [
       option("--session", "Target session; omitted resolves the current owner", { value: "<id>" }),
-      option("--claim-id", "Release only one claim; omitted releases all owned claims", { value: "<id>" }),
+      option("--resource", "Release one exact canonical resource; repeatable", { value: "<path-or-glob>" }),
+      option("--claim-id", "Release one owned claim ID; repeatable", { value: "<id>" }),
+      option("--all", "Explicitly release all claims owned by the target session"),
+      option("--if-generation", "Require the expected claim-set generation; mutually exclusive with --force", {
+        value: "<non-negative-safe-int>",
+      }),
+      option("--force", "Explicitly allow unconditional release; mutually exclusive with --if-generation"),
     ],
     notes: [
       "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+      "Exactly one selector family is required: repeated --resource, repeated --claim-id, or explicit --all.",
+      "Exactly one destructive concurrency intent is required: --if-generation <non-negative-safe-int> or --force.",
     ],
   },
   {
@@ -392,13 +401,21 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "resource release",
     summary: "Release resource claims (alias)",
-    usage: `${CLI_NAME} resource release [<session-id>|--session <id>] [--claim-id <id>]`,
+    usage: `${CLI_NAME} resource release [<session-id>|--session <id>] (--resource <path-or-glob> ... | --claim-id <id> ... | --all) (--if-generation <n> | --force)`,
     options: [
       option("--session", "Target session; omitted resolves the current owner", { value: "<id>" }),
-      option("--claim-id", "Release only one claim; omitted releases all owned claims", { value: "<id>" }),
+      option("--resource", "Release one exact canonical resource; repeatable", { value: "<path-or-glob>" }),
+      option("--claim-id", "Release one owned claim ID; repeatable", { value: "<id>" }),
+      option("--all", "Explicitly release all claims owned by the target session"),
+      option("--if-generation", "Require the expected claim-set generation; mutually exclusive with --force", {
+        value: "<non-negative-safe-int>",
+      }),
+      option("--force", "Explicitly allow unconditional release; mutually exclusive with --if-generation"),
     ],
     notes: [
       "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+      "Exactly one selector family is required: repeated --resource, repeated --claim-id, or explicit --all.",
+      "Exactly one destructive concurrency intent is required: --if-generation <non-negative-safe-int> or --force.",
     ],
   },
   {
@@ -967,6 +984,15 @@ type ClaimTransition = {
   force: boolean;
 };
 
+type ReleaseSelection = {
+  session_id: string | null;
+  resources: string[];
+  claim_ids: string[];
+  all: boolean;
+  expected_claim_set_generation: number | null;
+  force: boolean;
+};
+
 type ClaimConcurrencyOption = "--if-generation" | "--force";
 
 type ClaimConcurrencyState = {
@@ -1062,6 +1088,112 @@ function finalizeClaimConcurrency(
     );
   }
   return { ok: true, value: state };
+}
+
+/**
+ * Parse the selected-release grammar. A release has one and only one selector
+ * family: exact resources, claim IDs, or explicit --all. Concurrency intent
+ * is independently required and remains exactly one CAS/force option.
+ */
+function parseReleaseSelection(arguments_: string[]): DomainResult<ReleaseSelection> {
+  const positional = splitPositionalSessionTarget(arguments_);
+  if (!positional.ok) return positional;
+
+  let sessionId = positional.value.sessionId;
+  const resources: string[] = [];
+  const claimIds: string[] = [];
+  let all = false;
+  let concurrencyState: ClaimConcurrencyState = {
+    expected_claim_set_generation: null,
+    force: false,
+  };
+  const recognized = new Set(["--session", "--resource", "--claim-id", "--all", ...CLAIM_CONCURRENCY_OPTION_NAMES]);
+
+  const targetArguments = positional.value.arguments;
+  for (let index = 0; index < targetArguments.length; index += 1) {
+    const { name, inlineValue } = optionParts(targetArguments[index]);
+    if (!recognized.has(name)) {
+      return failure(usageError("INVALID_ARGUMENT", `Unknown option: ${name}.`, { option: name }));
+    }
+
+    if (name === "--all") {
+      if (inlineValue !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--all does not accept a value.", { option: name }));
+      }
+      if (all) {
+        return failure(usageError("INVALID_ARGUMENT", "--all may be supplied only once.", { option: name }));
+      }
+      all = true;
+      continue;
+    }
+
+    if (isClaimConcurrencyOption(name)) {
+      const consumed = consumeClaimConcurrencyOption(name, inlineValue, targetArguments[index + 1], concurrencyState);
+      if (!consumed.ok) return consumed;
+      concurrencyState = consumed.value.state;
+      if (consumed.value.consumed_next_value) index += 1;
+      continue;
+    }
+
+    const value = inlineValue ?? targetArguments[index + 1];
+    if (value === undefined || value === "" || (inlineValue === null && value.startsWith("-"))) {
+      return failure(usageError("MISSING_ARGUMENT", `${name} requires a value.`, { option: name }));
+    }
+    if (inlineValue === null) index += 1;
+
+    if (name === "--session") {
+      if (sessionId !== null) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "Specify a session target either positionally or with --session, not both.", {
+            option: "--session",
+          }),
+        );
+      }
+      sessionId = value;
+    } else if (name === "--resource") {
+      resources.push(value);
+    } else {
+      claimIds.push(value);
+    }
+  }
+
+  const selectorFamilies = Number(resources.length > 0) + Number(claimIds.length > 0) + Number(all);
+  if (selectorFamilies === 0) {
+    return failure(
+      usageError(
+        "MISSING_ARGUMENT",
+        "Exactly one release selector family is required: --resource, --claim-id, or --all.",
+        {
+          options: ["--resource", "--claim-id", "--all"],
+        },
+      ),
+    );
+  }
+  if (selectorFamilies !== 1) {
+    return failure(
+      usageError(
+        "INVALID_ARGUMENT",
+        "Release selectors are mutually exclusive: use --resource, --claim-id, or --all.",
+        {
+          options: ["--resource", "--claim-id", "--all"],
+        },
+      ),
+    );
+  }
+
+  const concurrency = finalizeClaimConcurrency(concurrencyState, true);
+  if (!concurrency.ok) return concurrency;
+  return {
+    ok: true,
+    value: {
+      session_id: sessionId,
+      resources,
+      claim_ids: claimIds,
+      all,
+      expected_claim_set_generation: concurrency.value.expected_claim_set_generation,
+      force: concurrency.value.force,
+    },
+  };
 }
 
 /**
@@ -1472,6 +1604,29 @@ async function executeClaimTransition(
   return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
 }
 
+async function executeRelease(
+  arguments_: string[],
+  backend: SessionBackend,
+  context: SessionContext,
+  operation: "session release" | "resource release",
+): Promise<DomainResult<JsonObject>> {
+  const parsed = parseReleaseSelection(arguments_);
+  if (!parsed.ok) return parsed;
+  if (backend.releaseClaims === undefined) return claimCapabilityUnavailable(operation);
+
+  const options: ReleaseClaimsOptions = {
+    session_id: parsed.value.session_id,
+    resources: parsed.value.resources.length === 0 ? null : parsed.value.resources,
+    claim_ids: parsed.value.claim_ids.length === 0 ? null : parsed.value.claim_ids,
+    all: parsed.value.all,
+    ...(parsed.value.force
+      ? { force: true }
+      : { expected_claim_set_generation: parsed.value.expected_claim_set_generation }),
+  };
+  const result = await backend.releaseClaims(context, options);
+  return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+}
+
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
@@ -1527,15 +1682,7 @@ async function executeCommand(
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "release") {
-      const parsed = parseTargetedOptions(rest, new Set(["--session", "--claim-id"]));
-      if (!parsed.ok) return parsed;
-      if (dependencies.backend.releaseClaims === undefined) return claimCapabilityUnavailable("release");
-      const result = await dependencies.backend.releaseClaims(context, {
-        session_id: parsed.value.session_id,
-        claim_ids: parsed.value.claim_id === null ? null : [parsed.value.claim_id],
-        force: true,
-      });
-      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+      return executeRelease(rest, dependencies.backend, context, "session release");
     }
     if (subcommand === "create") {
       const parsed = parseOptions(rest, new Set(["--branch", "--worktree", "--worktree-root", "--base", "--label"]));
@@ -1701,15 +1848,7 @@ async function executeCommand(
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (resourceSubcommand === "release") {
-      const parsed = parseTargetedOptions(rest, new Set(["--session", "--claim-id"]));
-      if (!parsed.ok) return parsed;
-      if (dependencies.backend.releaseClaims === undefined) return claimCapabilityUnavailable("release");
-      const result = await dependencies.backend.releaseClaims(context, {
-        session_id: parsed.value.session_id,
-        claim_ids: parsed.value.claim_id === null ? null : [parsed.value.claim_id],
-        force: true,
-      });
-      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+      return executeRelease(rest, dependencies.backend, context, "resource release");
     }
     return failure(
       new DomainError("UNKNOWN_COMMAND", `Unknown resource subcommand: ${resourceSubcommand}.`, {

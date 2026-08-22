@@ -441,6 +441,111 @@ test("delta transitions and releases use canonical glob identity without expansi
   }
 });
 
+test("selected release delegates to atomic deltas and explicit all preserves foreign claims", () => {
+  const fixture = createRepositoryFixture(true);
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const siblingRegistry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const session = registry.create();
+    const sibling = siblingRegistry.create();
+    const acquired = registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [
+        { resource: "src/selected.ts", mode: "write" },
+        { resource: "src/keep.ts", mode: "read" },
+      ],
+    });
+    assert.equal(acquired.claimSetGeneration, 1);
+
+    const selected = registry.releaseClaims({
+      sessionId: session.sessionId,
+      resources: ["src/selected.ts"],
+      expectedClaimSetGeneration: acquired.claimSetGeneration,
+    });
+    assert.equal(selected.released.length, 1);
+    assert.equal(selected.released[0]?.resource, "src/selected.ts");
+    assert.deepEqual(
+      selected.remaining.map((claim) => claim.resource),
+      ["src/keep.ts"],
+    );
+    assert.equal(selected.claimSetGeneration, 2);
+
+    const missing = registry.releaseClaims({
+      sessionId: session.sessionId,
+      resources: ["src/does-not-exist.ts"],
+      expectedClaimSetGeneration: selected.claimSetGeneration,
+    });
+    assert.equal(missing.released.length, 0);
+    assert.equal(missing.idempotent, true);
+    assert.equal(missing.claimSetGeneration, selected.claimSetGeneration);
+
+    const foreign = siblingRegistry.claimResources({
+      sessionId: sibling.sessionId,
+      claims: [{ resource: "src/foreign.ts", mode: "read" }],
+    }).added[0];
+    assert.ok(foreign);
+    const beforeForeignRejection = registry.listClaimsSnapshot();
+    assertRegistryError(
+      () =>
+        registry.releaseClaims({
+          sessionId: session.sessionId,
+          claimIds: [foreign.claimId],
+          force: true,
+        }),
+      "CLAIM_SESSION_MISMATCH",
+    );
+    assert.deepEqual(registry.listClaimsSnapshot(), beforeForeignRejection);
+
+    const all = registry.releaseClaims({
+      sessionId: session.sessionId,
+      all: true,
+      expectedClaimSetGeneration: beforeForeignRejection.claimSetGeneration,
+    });
+    assert.equal(all.released.length, 1);
+    assert.equal(all.remaining.length, 0);
+    assert.equal(all.claimSetGeneration, beforeForeignRejection.claimSetGeneration + 1);
+    assert.deepEqual(
+      registry.listClaims().map((claim) => claim.claimId),
+      [foreign.claimId],
+      "explicit all releases only the target session's claims",
+    );
+    assert.equal(registry.releaseClaims({ sessionId: session.sessionId, all: true, force: true }).idempotent, true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("selected release rejects stale CAS without mutating claims or generation", () => {
+  const fixture = createRepositoryFixture(true);
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const siblingRegistry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const session = registry.create();
+    const sibling = siblingRegistry.create();
+    registry.claimResources({ sessionId: session.sessionId, claims: [{ resource: "src/stale.ts", mode: "write" }] });
+    const stale = registry.listClaimsSnapshot();
+    siblingRegistry.claimResources({
+      sessionId: sibling.sessionId,
+      claims: [{ resource: "src/other.ts", mode: "read" }],
+    });
+    const before = registry.listClaimsSnapshot();
+    assert.equal(before.claimSetGeneration, stale.claimSetGeneration + 1);
+
+    assertRegistryError(
+      () =>
+        registry.releaseClaims({
+          sessionId: session.sessionId,
+          resources: ["src/stale.ts", "src/missing.ts"],
+          expectedClaimSetGeneration: stale.claimSetGeneration,
+        }),
+      "STALE_CLAIM_SET",
+    );
+    assert.deepEqual(registry.listClaimsSnapshot(), before);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("delta batches reject same-session glob/exact overlap and contradictory targets unchanged", () => {
   const fixture = createRepositoryFixture();
   try {

@@ -78,7 +78,11 @@ export type ClaimDeltasOptions = {
 
 export type ReleaseClaimsOptions = {
   session_id: string | null;
+  /** Exact canonical resources to release; repeatable and mutually exclusive with claim_ids/all. */
+  resources?: string[] | null;
   claim_ids?: string[] | null;
+  /** Explicitly release every claim owned by the target session. */
+  all?: boolean;
   expected_claim_set_generation?: number | null;
   force?: boolean;
 };
