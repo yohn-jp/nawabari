@@ -9,26 +9,91 @@ export const OPERATION_AUTHORIZATION_SCHEMA_VERSION = 1 as const;
  * local mutation class only; they do not encode GitHub, Mottainai, or task
  * semantics.
  */
-export const OPERATION_VOCABULARY = Object.freeze([
-  "source-write",
-  "stage",
-  "commit",
-  "branch-mutation",
-  "push",
-  "cleanup",
-] as const);
+export type OperationAuthorizationEnforcement = "public-execution" | "authorization-vocabulary";
 
-export type OperationName = (typeof OPERATION_VOCABULARY)[number];
+export interface OperationAuthorizationPolicy {
+  /** Claim strength required at this operation's local boundary. */
+  readonly requiredAccess: ResourceClaimMode;
+  /** Why this strength provides the required local isolation. */
+  readonly isolationRationale: string;
+  /** Which implementation authority currently enforces this declaration. */
+  readonly authorityRationale: string;
+  /** Whether a public mutating operation currently routes through this entry. */
+  readonly enforcement: OperationAuthorizationEnforcement;
+}
 
-/** The one authoritative operation-to-claim-access mapping. */
-export const OPERATION_REQUIRED_ACCESS: Readonly<Record<OperationName, ResourceClaimMode>> = Object.freeze({
-  "source-write": "write",
-  stage: "write",
-  commit: "exclusive-write",
-  "branch-mutation": "exclusive-write",
-  push: "exclusive-write",
-  cleanup: "exclusive-write",
-});
+/**
+ * The single implementation-owned policy authority for every governed local
+ * operation. Keep these fields local and capability-shaped: they do not
+ * describe provider, task, or remote-service semantics.
+ */
+const OPERATION_AUTHORIZATION_POLICY_RECORD = {
+  "source-write": Object.freeze({
+    requiredAccess: "write",
+    isolationRationale:
+      "Source-write changes working-tree content path by path; ordinary write permits read declarations while claim conflict checks prevent competing writes.",
+    authorityRationale:
+      "No standalone public source-write executor exists; authorization reads this policy and resource-claims checks concrete ownership.",
+    enforcement: "authorization-vocabulary",
+  }),
+  stage: Object.freeze({
+    requiredAccess: "write",
+    isolationRationale:
+      "Stage changes local Git index entries for selected paths; write is sufficient because index preparation does not finalize history and read declarations remain non-mutating.",
+    authorityRationale:
+      "Stage has no standalone public executor; commit's staging phase is authorized as commit while this entry preserves the standalone vocabulary declaration.",
+    enforcement: "authorization-vocabulary",
+  }),
+  commit: Object.freeze({
+    requiredAccess: "exclusive-write",
+    isolationRationale:
+      "Commit records selected staged paths in local history and changes the branch tip; overlapping declarations are excluded while those state changes are finalized.",
+    authorityRationale:
+      "SessionRegistry.commit invokes the shared operation authorization before staging and commit; resource-claims owns conflict evaluation.",
+    enforcement: "public-execution",
+  }),
+  "branch-mutation": Object.freeze({
+    requiredAccess: "exclusive-write",
+    isolationRationale:
+      "Branch or ref mutation changes a repository pointer shared by worktrees; overlapping declarations are excluded while that pointer ownership changes.",
+    authorityRationale:
+      "No public branch-mutation executor routes here; branch/worktree lifecycle code retains its dedicated physical ownership checks.",
+    enforcement: "authorization-vocabulary",
+  }),
+  push: Object.freeze({
+    requiredAccess: "exclusive-write",
+    isolationRationale:
+      "Local Git push selects and validates a fixed revision plus explicit resource-scoped input; overlapping declarations are excluded while that basis is checked and sent.",
+    authorityRationale:
+      "SessionRegistry.push authorizes explicit resources before its Git mutation; resource-claims remains the sole owner of concrete overlap evaluation.",
+    enforcement: "public-execution",
+  }),
+  cleanup: Object.freeze({
+    requiredAccess: "exclusive-write",
+    isolationRationale:
+      "Cleanup removes session-owned worktree and branch state after physical checks; overlapping declarations are excluded for the removal boundary.",
+    authorityRationale:
+      "Cleanup currently reaches its dedicated physical cleanup authority rather than authorizeOperation, so this entry remains vocabulary-only.",
+    enforcement: "authorization-vocabulary",
+  }),
+} as const satisfies Readonly<Record<string, OperationAuthorizationPolicy>>;
+
+export type OperationName = keyof typeof OPERATION_AUTHORIZATION_POLICY_RECORD;
+
+/** Public projection of the policy's keys; the policy record remains the authority. */
+export const OPERATION_VOCABULARY = Object.freeze(
+  Object.keys(OPERATION_AUTHORIZATION_POLICY_RECORD) as readonly OperationName[],
+);
+
+/** Public operation policy consumed by authorization and machine-facing audits. */
+export const OPERATION_AUTHORIZATION_POLICY = Object.freeze(OPERATION_AUTHORIZATION_POLICY_RECORD);
+
+/** Compatibility projection of required access from the policy authority. */
+export const OPERATION_REQUIRED_ACCESS: Readonly<Record<OperationName, ResourceClaimMode>> = Object.freeze(
+  Object.fromEntries(
+    OPERATION_VOCABULARY.map((operation) => [operation, OPERATION_AUTHORIZATION_POLICY[operation].requiredAccess]),
+  ) as Record<OperationName, ResourceClaimMode>,
+);
 
 /**
  * Complete decision vocabulary: the operation-authorization-specific codes
@@ -42,7 +107,7 @@ export function isOperationName(value: unknown): value is OperationName {
 }
 
 export function requiredAccessForOperation(operation: OperationName): ResourceClaimMode {
-  return OPERATION_REQUIRED_ACCESS[operation];
+  return OPERATION_AUTHORIZATION_POLICY[operation].requiredAccess;
 }
 
 /**

@@ -11,6 +11,7 @@ import { defaultGit, type GitCommandRunner } from "./git.js";
 import {
   CHECKPOINT_MAX_PATHS,
   claimModeGrantsAccess,
+  OPERATION_AUTHORIZATION_POLICY,
   OPERATION_REQUIRED_ACCESS,
   OPERATION_VOCABULARY,
   requiredAccessForOperation,
@@ -22,17 +23,44 @@ import {
   RESOURCE_CLAIM_SCHEMA_VERSION,
 } from "./session-registry.js";
 
-test("the versioned operation vocabulary has an explicit access mapping", () => {
+test("the operation policy is the complete, keyed authority for vocabulary and access", () => {
   assert.deepEqual(OPERATION_VOCABULARY, ["source-write", "stage", "commit", "branch-mutation", "push", "cleanup"]);
+  const policyKeys = Object.keys(OPERATION_AUTHORIZATION_POLICY).sort();
+  const vocabularyKeys = [...OPERATION_VOCABULARY].sort();
+  const accessKeys = Object.keys(OPERATION_REQUIRED_ACCESS).sort();
+  assert.deepEqual(policyKeys, vocabularyKeys);
+  assert.deepEqual(accessKeys, vocabularyKeys);
+
   for (const operation of OPERATION_VOCABULARY) {
-    assert.equal(requiredAccessForOperation(operation), OPERATION_REQUIRED_ACCESS[operation]);
+    const policy = OPERATION_AUTHORIZATION_POLICY[operation];
+    assert.equal(requiredAccessForOperation(operation), policy.requiredAccess);
+    assert.equal(OPERATION_REQUIRED_ACCESS[operation], policy.requiredAccess);
+    assert.match(policy.isolationRationale, /\S/u);
+    assert.match(policy.authorityRationale, /\S/u);
   }
-  assert.equal(OPERATION_REQUIRED_ACCESS["source-write"], "write");
-  assert.equal(OPERATION_REQUIRED_ACCESS.stage, "write");
-  assert.equal(OPERATION_REQUIRED_ACCESS.commit, "exclusive-write");
-  assert.equal(OPERATION_REQUIRED_ACCESS["branch-mutation"], "exclusive-write");
-  assert.equal(OPERATION_REQUIRED_ACCESS.push, "exclusive-write");
-  assert.equal(OPERATION_REQUIRED_ACCESS.cleanup, "exclusive-write");
+
+  const isolationRationales = OPERATION_VOCABULARY.map(
+    (operation) => OPERATION_AUTHORIZATION_POLICY[operation].isolationRationale,
+  );
+  const authorityRationales = OPERATION_VOCABULARY.map(
+    (operation) => OPERATION_AUTHORIZATION_POLICY[operation].authorityRationale,
+  );
+  assert.equal(new Set(isolationRationales).size, OPERATION_VOCABULARY.length);
+  assert.equal(new Set(authorityRationales).size, OPERATION_VOCABULARY.length);
+});
+
+test("the policy records current public enforcement separately from vocabulary-only operations", () => {
+  const publicExecution = OPERATION_VOCABULARY.filter(
+    (operation) => OPERATION_AUTHORIZATION_POLICY[operation].enforcement === "public-execution",
+  );
+  const vocabularyOnly = OPERATION_VOCABULARY.filter(
+    (operation) => OPERATION_AUTHORIZATION_POLICY[operation].enforcement === "authorization-vocabulary",
+  );
+
+  // The only public mutating entry points that currently call the shared
+  // operation authorization are SessionRegistry.commit and .push.
+  assert.deepEqual(publicExecution, ["commit", "push"]);
+  assert.deepEqual(vocabularyOnly, ["source-write", "stage", "branch-mutation", "cleanup"]);
 });
 
 test("one registry authority authorizes every operation class against concrete claims", () => {
