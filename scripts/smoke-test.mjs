@@ -644,6 +644,129 @@ async function main() {
     ) {
       fail("installed authorization did not distinguish insufficient claim mode");
     }
+
+    // #174: prove that the exact typed recovery action emitted by an
+    // additive contradiction is executable through the installed package.
+    // The action's observed generation is passed back verbatim as its CAS;
+    // no registry file or complete claim-set reconstruction is involved.
+    const recoveryResource = "recovery-transition.txt";
+    const recoveryUnrelatedResource = "recovery-unrelated.txt";
+    const recoveryWrite = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "claim",
+          "--session",
+          created.session_id,
+          "--resource",
+          recoveryResource,
+          "--mode",
+          "write",
+          "--json",
+        ],
+        lifecycleWorktree,
+      ),
+      "recovery source claim",
+    );
+    const recoveryUnrelated = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "claim",
+          "--session",
+          created.session_id,
+          "--resource",
+          recoveryUnrelatedResource,
+          "--mode",
+          "read",
+          "--json",
+        ],
+        lifecycleWorktree,
+      ),
+      "recovery unrelated claim",
+    );
+    if (
+      recoveryWrite.ok !== true ||
+      recoveryUnrelated.ok !== true ||
+      typeof recoveryUnrelated.claim_set_generation !== "number"
+    ) {
+      fail("installed recovery fixture claims could not be created");
+    }
+    const recoveryRejectedResult = invokeInstalled(
+      [
+        "session",
+        "claim",
+        "--session",
+        created.session_id,
+        "--resource",
+        recoveryResource,
+        "--mode",
+        "exclusive-write",
+        "--json",
+      ],
+      lifecycleWorktree,
+    );
+    const recoveryRejected = parseInstalledJson(recoveryRejectedResult, "recovery contradiction");
+    const recoveryAction = recoveryRejected.details?.recoveryAction;
+    if (
+      recoveryRejectedResult.status !== 3 ||
+      recoveryRejected.code !== "CONTRADICTORY_CLAIM" ||
+      recoveryAction?.actionId !== "transition-exact-resource" ||
+      recoveryAction?.resource !== recoveryResource ||
+      recoveryAction?.mode !== "exclusive-write" ||
+      recoveryAction?.claimSetGeneration !== recoveryUnrelated.claim_set_generation ||
+      typeof recoveryAction?.command !== "string"
+    ) {
+      fail("installed contradictory claim did not expose the typed exact-transition recovery action");
+    }
+    if (!recoveryAction.command.includes("--if-generation")) {
+      fail("installed recovery action did not include its observed generation CAS");
+    }
+    const rejectedClaims = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", created.session_id, "--json"], lifecycleWorktree),
+      "claims after rejected recovery",
+    );
+    if (
+      rejectedClaims.ok !== true ||
+      rejectedClaims.claim_set_generation !== recoveryAction.claimSetGeneration ||
+      !rejectedClaims.claims?.some(
+        (listedClaim) => listedClaim.resource === recoveryResource && listedClaim.mode === "write",
+      ) ||
+      !rejectedClaims.claims?.some(
+        (listedClaim) => listedClaim.resource === recoveryUnrelatedResource && listedClaim.mode === "read",
+      )
+    ) {
+      fail("rejected installed recovery claim mutated the claim set");
+    }
+    const recoveryTransitionResult = invokeInstalled(
+      [
+        "--json",
+        "session",
+        "transition",
+        "--session",
+        created.session_id,
+        "--resource",
+        recoveryAction.resource,
+        "--mode",
+        recoveryAction.mode,
+        "--if-generation",
+        String(recoveryAction.claimSetGeneration),
+      ],
+      lifecycleWorktree,
+    );
+    const recovered = parseInstalledJson(recoveryTransitionResult, "installed recovery transition");
+    if (
+      recoveryTransitionResult.status !== 0 ||
+      recovered.ok !== true ||
+      recovered.changed?.[0]?.resource !== recoveryResource ||
+      recovered.changed?.[0]?.after?.mode !== "exclusive-write" ||
+      !recovered.claims?.some(
+        (listedClaim) => listedClaim.resource === recoveryUnrelatedResource && listedClaim.mode === "read",
+      )
+    ) {
+      fail("installed recovery action did not execute the requested transition while preserving unrelated claims");
+    }
+
     const claims = parseInstalledJson(
       invokeInstalled(["session", "claims", "--session", created.session_id, "--json"], lifecycleWorktree),
       "resource claims",
