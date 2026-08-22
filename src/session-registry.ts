@@ -2454,24 +2454,40 @@ export class SessionRegistry {
   }
 
   /** Single same-session overlap authority shared by additive and delta paths. */
-  private assertNoOverlappingClaims(claims: readonly ResourceClaim[]): void {
+  private assertNoOverlappingClaims(claims: readonly ResourceClaim[], context: "request" | "result" = "result"): void {
     for (let index = 0; index < claims.length; index += 1) {
       const current = claims[index];
       if (current === undefined) continue;
       for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
         const prior = claims[priorIndex];
         if (prior === undefined || !claimsOverlap(current, prior)) continue;
+        const requestContext = context === "request";
         throw claimError(
           current.mode === prior.mode ? "DUPLICATE_CLAIM" : "CONTRADICTORY_CLAIM",
-          "Claim set contains overlapping claims for one session",
-          {
-            claimId: current.claimId,
-            ownerClaimId: prior.claimId,
-            resource: current.resource,
-            mode: current.mode,
-            otherResource: prior.resource,
-            otherMode: prior.mode,
-          },
+          current.mode === prior.mode
+            ? requestContext
+              ? "Request contains overlapping equivalent claims"
+              : "Claim set contains overlapping claims for one session"
+            : requestContext
+              ? "Request contains overlapping claims with different modes"
+              : "Claim set contains overlapping claims for one session",
+          requestContext
+            ? current.mode === prior.mode
+              ? { resource: current.resource, mode: current.mode }
+              : {
+                  resource: current.resource,
+                  mode: current.mode,
+                  otherResource: prior.resource,
+                  otherMode: prior.mode,
+                }
+            : {
+                claimId: current.claimId,
+                ownerClaimId: prior.claimId,
+                resource: current.resource,
+                mode: current.mode,
+                otherResource: prior.resource,
+                otherMode: prior.mode,
+              },
         );
       }
     }
@@ -2492,7 +2508,7 @@ export class SessionRegistry {
       );
     const timestamp = toTimestamp(this.clock());
     const claims = canonical.map((input) => createResourceClaim(input, owner, timestamp));
-    this.assertNoOverlappingClaims(claims);
+    this.assertNoOverlappingClaims(claims, "request");
     return canonical;
   }
 
