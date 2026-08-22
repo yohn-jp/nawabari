@@ -18,6 +18,9 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "BRANCH_ALREADY_EXISTS",
       "INVALID_SESSION_ID",
       "INVALID_BASE_REF",
+      "INVALID_REMOTE",
+      "INVALID_REMOTE_BRANCH",
+      "INTEGRATION_FETCH_FAILED",
       "INVALID_BRANCH",
       "INVALID_WORKTREE",
       "WORKTREE_OWNED_BY_OTHER_SESSION",
@@ -395,6 +398,17 @@ export function machineContract(packageVersion: string): JsonObject {
       mottainai: false,
       llm: false,
       agent_runtime: false,
+    },
+    explicit_network: {
+      default: false,
+      operations: [
+        {
+          command: "session close",
+          options: ["--integrated-revision", "--fetch-remote", "--fetch-branch"],
+          requires: ["--integrated-revision", "--fetch-remote", "--fetch-branch"],
+          scope: "one named remote branch into one disposable internal proof ref",
+        },
+      ],
     },
   };
 }
