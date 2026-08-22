@@ -269,6 +269,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--resource",
       "--mode",
       "--repository",
+      "--if-generation",
+      "--force",
       "--claim-id",
       "--fetch-remote",
       "--fetch-branch",
@@ -693,7 +695,7 @@ test("all session target aliases carry the same positional session identity", as
     ["session", "show", sampleSession.session_id, "--json"],
     ["session", "inspect", sampleSession.session_id, "--json"],
     ["session", "claim", sampleSession.session_id, "--resource", "a.txt", "--mode", "read", "--json"],
-    ["session", "update", sampleSession.session_id, "--resource", "a.txt", "--mode", "read", "--json"],
+    ["session", "update", sampleSession.session_id, "--resource", "a.txt", "--mode", "read", "--force", "--json"],
     ["session", "claims", sampleSession.session_id, "--json"],
     ["session", "release", sampleSession.session_id, "--json"],
     ["session", "close", sampleSession.session_id, "--json"],
@@ -924,6 +926,7 @@ test("session update submits one atomic claims[] transaction built from repeated
       "src/b.ts",
       "--mode",
       "exclusive-write",
+      "--force",
     ],
     { backend, io: output.io },
   );
@@ -973,6 +976,7 @@ test("resource update alias submits the same multi-claim transaction as session 
       "src/b.ts",
       "--mode",
       "write",
+      "--force",
     ],
     { backend, io: capture().io },
   );
@@ -986,6 +990,110 @@ test("resource update alias submits the same multi-claim transaction as session 
       { resource: "src/b.ts", mode: "write" },
     ],
     force: true,
+  });
+});
+
+test("session update forwards an explicit claim-set generation CAS guard", async () => {
+  let observedOptions: UpdateClaimsOptions | null = null;
+  const claims = [sampleClaim("src/a.ts", "write")];
+  const result: ClaimResourcesResult = {
+    session: sampleSession,
+    claims,
+    added: claims,
+    released: [],
+    idempotent: false,
+    claim_set_generation: 8,
+  };
+  const backend = backendForTests({
+    updateClaims: async (_context: SessionContext, options: UpdateClaimsOptions) => {
+      observedOptions = options;
+      return success(result);
+    },
+  });
+
+  const output = capture();
+  const exitCode = await runCli(
+    [
+      "--json",
+      "session",
+      "update",
+      "--session",
+      sampleSession.session_id,
+      "--if-generation",
+      "7",
+      "--resource",
+      "src/a.ts",
+      "--mode",
+      "write",
+    ],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.deepEqual(observedOptions, {
+    session_id: sampleSession.session_id,
+    repository: null,
+    claims: [{ resource: "src/a.ts", mode: "write" }],
+    expected_claim_set_generation: 7,
+  });
+});
+
+test("claim replacement guards reject malformed or absent concurrency intent before backend invocation", async () => {
+  let invocations = 0;
+  const backend = backendForTests({
+    updateClaims: async () => {
+      invocations += 1;
+      return failure(new DomainError("INTERNAL_ERROR", "backend should not be called"));
+    },
+  });
+  const invalidCommands = [
+    ["--resource", "src/a.ts", "--mode", "write"],
+    ["--if-generation", "1", "--if-generation", "2", "--resource", "src/a.ts", "--mode", "write"],
+    ["--if-generation", "--resource", "src/a.ts", "--mode", "write"],
+    ["--if-generation", "not-an-integer", "--resource", "src/a.ts", "--mode", "write"],
+    ["--if-generation", "-1", "--resource", "src/a.ts", "--mode", "write"],
+    ["--if-generation", "9007199254740992", "--resource", "src/a.ts", "--mode", "write"],
+    ["--force=unexpected", "--resource", "src/a.ts", "--mode", "write"],
+    ["--if-generation", "1", "--force", "--resource", "src/a.ts", "--mode", "write"],
+  ];
+
+  for (const replacementArguments of invalidCommands) {
+    const output = capture();
+    const exitCode = await runCli(["--json", "session", "update", ...replacementArguments], {
+      backend,
+      io: output.io,
+    });
+    assert.equal(exitCode, 2, replacementArguments.join(" "));
+    const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string };
+    assert.equal(response.ok, false);
+    assert.ok(["INVALID_ARGUMENT", "MISSING_ARGUMENT"].includes(response.code));
+  }
+  assert.equal(invocations, 0);
+});
+
+test("stale replacement errors are projected unchanged by the canonical CLI", async () => {
+  const backend = backendForTests({
+    updateClaims: async () =>
+      failure(
+        new DomainError("STALE_CLAIM_SET", "Claim-set generation is stale.", {
+          expectedClaimSetGeneration: 2,
+          actualClaimSetGeneration: 3,
+        }),
+      ),
+  });
+  const output = capture();
+  const exitCode = await runCli(
+    ["--json", "session", "update", "--if-generation", "2", "--resource", "src/a.ts", "--mode", "write"],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 3);
+  assert.deepEqual(JSON.parse(output.stdout[0] ?? ""), {
+    ok: false,
+    command: "session update",
+    code: "STALE_CLAIM_SET",
+    message: "Claim-set generation is stale.",
+    details: { expectedClaimSetGeneration: 2, actualClaimSetGeneration: 3 },
   });
 });
 
@@ -1015,6 +1123,7 @@ test("session update rejects a conflicting desired claim set without touching th
       "src/a.ts",
       "--mode",
       "exclusive-write",
+      "--force",
     ],
     { backend, io: output.io },
   );
@@ -1137,6 +1246,7 @@ test("session update accepts --session/--repository placed outside a pending --r
       "src/a.ts",
       "--mode",
       "write",
+      "--force",
     ],
     { backend, io: capture().io },
   );
@@ -1301,11 +1411,13 @@ test("resource update --help exposes the same option contract as session update"
   const sessionHelp = JSON.parse(sessionOutput.stdout[0]) as {
     options: Array<{ name: string }>;
     optional_options: string[];
+    notes: string[];
   };
   const resourceHelp = JSON.parse(resourceOutput.stdout[0]) as {
     help_for: string;
     options: Array<{ name: string }>;
     optional_options: string[];
+    notes: string[];
   };
 
   assert.equal(resourceHelp.help_for, "resource update");
@@ -1315,8 +1427,16 @@ test("resource update --help exposes the same option contract as session update"
   );
   assert.ok(resourceHelp.options.some((option) => option.name === "--session"));
   assert.ok(resourceHelp.options.some((option) => option.name === "--repository"));
+  assert.ok(resourceHelp.options.some((option) => option.name === "--if-generation"));
+  assert.ok(resourceHelp.options.some((option) => option.name === "--force"));
   assert.ok(resourceHelp.optional_options.includes("--session"));
   assert.ok(resourceHelp.optional_options.includes("--repository"));
+  assert.equal(resourceHelp.notes[0], sessionHelp.notes[0]);
+  assert.match(resourceHelp.notes.join("\n"), /full replacement/u);
+  assert.match(resourceHelp.notes.join("\n"), /atomically/u);
+  assert.match(resourceHelp.notes.join("\n"), /--if-generation/u);
+  assert.match(resourceHelp.notes.join("\n"), /claim-set generation CAS/u);
+  assert.match(resourceHelp.notes.join("\n"), /--force/u);
 });
 
 test("capabilities --json exposes a machine-readable multi-claim replacement contract", async () => {
