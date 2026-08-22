@@ -226,6 +226,35 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     ],
   },
   {
+    name: "session transition",
+    summary: "Atomically transition one exact resource claim mode",
+    usage:
+      `${CLI_NAME} session transition [<session>|--session <id>] [--repository <id>] ` +
+      `--resource <path-or-glob> --mode <read|write|exclusive-write> ` +
+      `(--if-generation <non-negative-safe-int> | --force)`,
+    options: [
+      option("--resource", "Exact repository-relative resource to acquire or change", {
+        value: "<path-or-glob>",
+        required: true,
+      }),
+      option("--mode", "Target mode for the immediately preceding --resource", {
+        value: "<read|write|exclusive-write>",
+        required: true,
+      }),
+      option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
+        value: "<non-negative-safe-int>",
+      }),
+      option("--force", "Explicitly permit unconditional atomic mutation; mutually exclusive with --if-generation"),
+      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
+      option("--repository", "Expected repository identity", { value: "<id>" }),
+    ],
+    notes: [
+      "Exactly one resource/mode pair is projected as one atomic upsert delta; same mode is an idempotent no-op.",
+      "Use exactly one concurrency intent: --if-generation <non-negative-safe-int> or explicit --force.",
+      "The target grammar accepts an optional first positional <session> or --session <id>, but not both.",
+    ],
+  },
+  {
     name: "session claims",
     summary: "List canonical resource claims",
     usage: `${CLI_NAME} session claims [<session-id>|--session <id>]`,
@@ -320,6 +349,35 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
       "Apply one or more ordered upsert/release deltas in one backend transaction; exactly one concurrency intent is required.",
       "Every --upsert-resource must be immediately followed by its own --mode; --release-resource takes exactly one value.",
       "Target grammar matches session mutate: optional first positional <session> is an alias for --session <id>; do not supply both.",
+    ],
+  },
+  {
+    name: "resource transition",
+    summary: "Atomically transition one exact resource claim mode (alias)",
+    usage:
+      `${CLI_NAME} resource transition [<session>|--session <id>] [--repository <id>] ` +
+      `--resource <path-or-glob> --mode <read|write|exclusive-write> ` +
+      `(--if-generation <non-negative-safe-int> | --force)`,
+    options: [
+      option("--resource", "Exact repository-relative resource to acquire or change", {
+        value: "<path-or-glob>",
+        required: true,
+      }),
+      option("--mode", "Target mode for the immediately preceding --resource", {
+        value: "<read|write|exclusive-write>",
+        required: true,
+      }),
+      option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
+        value: "<non-negative-safe-int>",
+      }),
+      option("--force", "Explicitly permit unconditional atomic mutation; mutually exclusive with --if-generation"),
+      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
+      option("--repository", "Expected repository identity", { value: "<id>" }),
+    ],
+    notes: [
+      "Exactly one resource/mode pair is projected as one atomic upsert delta; same mode is an idempotent no-op.",
+      "Use exactly one concurrency intent: --if-generation <non-negative-safe-int> or explicit --force.",
+      "The target grammar accepts an optional first positional <session> or --session <id>, but not both.",
     ],
   },
   {
@@ -551,7 +609,18 @@ function helpPayload(spec: HelpCommandSpec): JsonObject {
       session_targeting: {
         canonical: "--session <id>",
         positional_alias: "<session-id> as the first argument after a session-scoped subcommand",
-        commands: ["show", "inspect", "claim", "claims", "release", "update", "mutate", "close", "discard"],
+        commands: [
+          "show",
+          "inspect",
+          "claim",
+          "claims",
+          "release",
+          "update",
+          "mutate",
+          "transition",
+          "close",
+          "discard",
+        ],
         ambiguity: "supplying both positional and --session is rejected",
         discard_requires_explicit_target: true,
       },
@@ -889,6 +958,15 @@ type ClaimDeltaMutation = {
   force: boolean;
 };
 
+type ClaimTransition = {
+  session_id: string | null;
+  repository: string | null;
+  resource: string;
+  mode: "read" | "write" | "exclusive-write";
+  expected_claim_set_generation: number | null;
+  force: boolean;
+};
+
 type ClaimConcurrencyOption = "--if-generation" | "--force";
 
 type ClaimConcurrencyState = {
@@ -1108,6 +1186,43 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
       deltas,
       expected_claim_set_generation: concurrency.value.expected_claim_set_generation,
       force: concurrency.value.force,
+    },
+  };
+}
+
+/**
+ * Parse the one-resource transition convenience grammar. The underlying
+ * mutation remains the canonical multi-delta primitive; this parser only
+ * constrains its public projection to exactly one upsert pair.
+ */
+function parseClaimTransition(arguments_: string[]): DomainResult<ClaimTransition> {
+  const parsed = parseClaimReplacementPairs(arguments_);
+  if (!parsed.ok) return parsed;
+  if (parsed.value.pairs.length !== 1) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "transition accepts exactly one --resource/--mode pair.", {
+        pair_count: parsed.value.pairs.length,
+      }),
+    );
+  }
+  const pair = parsed.value.pairs[0];
+  if (pair === undefined || !isResourceClaimMode(pair.mode)) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "--mode requires read, write, or exclusive-write.", {
+        option: "--mode",
+        value: pair?.mode ?? null,
+      }),
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      session_id: parsed.value.session_id,
+      repository: parsed.value.repository,
+      resource: pair.resource,
+      mode: pair.mode,
+      expected_claim_set_generation: parsed.value.expected_claim_set_generation,
+      force: parsed.value.force,
     },
   };
 }
@@ -1336,6 +1451,27 @@ async function executeClaimDeltaMutation(
   return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
 }
 
+async function executeClaimTransition(
+  arguments_: string[],
+  backend: SessionBackend,
+  context: SessionContext,
+  operation: "session transition" | "resource transition",
+): Promise<DomainResult<JsonObject>> {
+  const parsed = parseClaimTransition(arguments_);
+  if (!parsed.ok) return parsed;
+  if (backend.applyClaimDeltas === undefined) return claimCapabilityUnavailable(operation);
+  const concurrency = parsed.value.force
+    ? { force: true }
+    : { expected_claim_set_generation: parsed.value.expected_claim_set_generation };
+  const result = await backend.applyClaimDeltas(context, {
+    session_id: parsed.value.session_id,
+    repository: parsed.value.repository,
+    deltas: [{ kind: "upsert", resource: parsed.value.resource, mode: parsed.value.mode }],
+    ...concurrency,
+  });
+  return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+}
+
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
@@ -1379,6 +1515,9 @@ async function executeCommand(
     }
     if (subcommand === "mutate") {
       return executeClaimDeltaMutation(rest, dependencies.backend, context, "session mutate");
+    }
+    if (subcommand === "transition") {
+      return executeClaimTransition(rest, dependencies.backend, context, "session transition");
     }
     if (subcommand === "claims") {
       const parsed = parseTargetedOptions(rest, new Set(["--session"]));
@@ -1550,6 +1689,9 @@ async function executeCommand(
     }
     if (resourceSubcommand === "mutate") {
       return executeClaimDeltaMutation(rest, dependencies.backend, context, "resource mutate");
+    }
+    if (resourceSubcommand === "transition") {
+      return executeClaimTransition(rest, dependencies.backend, context, "resource transition");
     }
     if (resourceSubcommand === "list" || resourceSubcommand === "claims") {
       const parsed = parseTargetedOptions(rest, new Set(["--session"]));
