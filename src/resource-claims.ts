@@ -16,6 +16,35 @@ export const RESOURCE_CLAIM_MODES = ["read", "write", "exclusive-write"] as cons
 export type ResourceClaimMode = (typeof RESOURCE_CLAIM_MODES)[number];
 
 /**
+ * Transition-only modes. `none` represents the absence of an exact-resource
+ * claim and is never a persisted `ResourceClaimMode`.
+ */
+export const RESOURCE_CLAIM_TRANSITION_MODES = ["none", ...RESOURCE_CLAIM_MODES] as const;
+export type ResourceClaimTransitionMode = (typeof RESOURCE_CLAIM_TRANSITION_MODES)[number];
+
+export const RESOURCE_CLAIM_TRANSITIONS = ["acquire", "no-op", "change", "release"] as const;
+export type ResourceClaimTransition = (typeof RESOURCE_CLAIM_TRANSITIONS)[number];
+
+/**
+ * Normative exact-resource transition matrix. Rows are the currently
+ * observed mode and columns are the requested mode. The matrix classifies
+ * intent only; it does not canonicalize resources or mutate registry state.
+ */
+export const RESOURCE_CLAIM_TRANSITION_MATRIX: Readonly<
+  Record<ResourceClaimTransitionMode, Readonly<Record<ResourceClaimTransitionMode, ResourceClaimTransition>>>
+> = Object.freeze({
+  none: Object.freeze({ none: "no-op", read: "acquire", write: "acquire", "exclusive-write": "acquire" }),
+  read: Object.freeze({ none: "release", read: "no-op", write: "change", "exclusive-write": "change" }),
+  write: Object.freeze({ none: "release", read: "change", write: "no-op", "exclusive-write": "change" }),
+  "exclusive-write": Object.freeze({
+    none: "release",
+    read: "change",
+    write: "change",
+    "exclusive-write": "no-op",
+  }),
+});
+
+/**
  * Normative mode definitions:
  * - read is a non-mutating access declaration, not a consistency lease;
  * - write is ordinary mutation authority and may coexist with read;
@@ -85,6 +114,24 @@ const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 export function isResourceClaimMode(value: unknown): value is ResourceClaimMode {
   return typeof value === "string" && (RESOURCE_CLAIM_MODES as readonly string[]).includes(value);
+}
+
+export function isResourceClaimTransitionMode(value: unknown): value is ResourceClaimTransitionMode {
+  return typeof value === "string" && (RESOURCE_CLAIM_TRANSITION_MODES as readonly string[]).includes(value);
+}
+
+/** Classify an exact-resource transition without canonicalizing or mutating any state. */
+export function classifyResourceClaimTransition(
+  source: ResourceClaimTransitionMode,
+  target: ResourceClaimTransitionMode,
+): ResourceClaimTransition {
+  if (!isResourceClaimTransitionMode(source) || !isResourceClaimTransitionMode(target)) {
+    throw claimError("INVALID_CLAIM", "Resource claim transition mode is unsupported", {
+      sourceMode: stringifyDetail(source),
+      targetMode: stringifyDetail(target),
+    });
+  }
+  return RESOURCE_CLAIM_TRANSITION_MATRIX[source][target];
 }
 
 export function claimModeGrantsAccess(granted: ResourceClaimMode, required: ResourceClaimMode): boolean {

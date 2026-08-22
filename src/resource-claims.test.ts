@@ -9,8 +9,11 @@ import { test } from "node:test";
 import { SessionRegistryError } from "./errors.js";
 import {
   canonicalizeConcretePath,
+  classifyResourceClaimTransition,
   claimsConflict,
   createResourceClaim,
+  RESOURCE_CLAIM_TRANSITION_MATRIX,
+  RESOURCE_CLAIM_TRANSITION_MODES,
   resourceClaimConflictsWithAccess,
   RESOURCE_CLAIM_COMPATIBILITY_MATRIX,
   RESOURCE_CLAIM_MODES,
@@ -71,6 +74,44 @@ test("defines every overlapping mode combination in the compatibility matrix", (
   );
   assert.equal(claimsConflict(starA, starB), true, "* write vs * write");
   assert.equal(claimsConflict(starA, starExclusive), true, "* write vs * exclusive-write");
+});
+
+test("classifies every exact-resource transition without adding none to persisted modes", () => {
+  assert.deepEqual(RESOURCE_CLAIM_MODES, ["read", "write", "exclusive-write"]);
+  assert.deepEqual(RESOURCE_CLAIM_TRANSITION_MODES, ["none", "read", "write", "exclusive-write"]);
+  assert.deepEqual(RESOURCE_CLAIM_TRANSITION_MATRIX, {
+    none: { none: "no-op", read: "acquire", write: "acquire", "exclusive-write": "acquire" },
+    read: { none: "release", read: "no-op", write: "change", "exclusive-write": "change" },
+    write: { none: "release", read: "change", write: "no-op", "exclusive-write": "change" },
+    "exclusive-write": {
+      none: "release",
+      read: "change",
+      write: "change",
+      "exclusive-write": "no-op",
+    },
+  });
+
+  const expected = {
+    none: { none: "no-op", read: "acquire", write: "acquire", "exclusive-write": "acquire" },
+    read: { none: "release", read: "no-op", write: "change", "exclusive-write": "change" },
+    write: { none: "release", read: "change", write: "no-op", "exclusive-write": "change" },
+    "exclusive-write": {
+      none: "release",
+      read: "change",
+      write: "change",
+      "exclusive-write": "no-op",
+    },
+  } as const;
+  for (const source of RESOURCE_CLAIM_TRANSITION_MODES) {
+    for (const target of RESOURCE_CLAIM_TRANSITION_MODES) {
+      assert.equal(classifyResourceClaimTransition(source, target), expected[source][target], `${source} -> ${target}`);
+    }
+  }
+});
+
+test("fails closed for runtime values outside the transition mode type", () => {
+  assertRegistryError(() => classifyResourceClaimTransition("invalid" as never, "read"), "INVALID_CLAIM");
+  assertRegistryError(() => classifyResourceClaimTransition("read", "invalid" as never), "INVALID_CLAIM");
 });
 
 test("migrates a v0.1.0 registry to the canonical claim section", () => {
