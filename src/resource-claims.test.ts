@@ -452,6 +452,7 @@ test("selected release delegates to atomic deltas and explicit all preserves for
       sessionId: session.sessionId,
       claims: [
         { resource: "src/selected.ts", mode: "write" },
+        { resource: "src/selected-two.ts", mode: "write" },
         { resource: "src/keep.ts", mode: "read" },
       ],
     });
@@ -459,11 +460,14 @@ test("selected release delegates to atomic deltas and explicit all preserves for
 
     const selected = registry.releaseClaims({
       sessionId: session.sessionId,
-      resources: ["src/selected.ts"],
+      resources: ["src/selected.ts", "src/selected-two.ts"],
       expectedClaimSetGeneration: acquired.claimSetGeneration,
     });
-    assert.equal(selected.released.length, 1);
-    assert.equal(selected.released[0]?.resource, "src/selected.ts");
+    assert.equal(selected.released.length, 2);
+    assert.deepEqual(
+      selected.released.map((claim) => claim.resource).sort(),
+      ["src/selected.ts", "src/selected-two.ts"].sort(),
+    );
     assert.deepEqual(
       selected.remaining.map((claim) => claim.resource),
       ["src/keep.ts"],

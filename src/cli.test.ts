@@ -1424,6 +1424,70 @@ test("selected release forwards repeated exact resources and CAS in one backend 
   assert.equal(response.remaining.length, 1);
 });
 
+test("release human success projects the same selected result as JSON", async () => {
+  const released = sampleClaim("src/a.ts", "write");
+  const remaining = sampleClaim("src/keep.ts", "read");
+  const backend = backendForTests({
+    releaseClaims: async () =>
+      success({
+        session_id: sampleSession.session_id,
+        released: [released],
+        remaining: [remaining],
+        idempotent: false,
+        claim_set_generation: 8,
+      } satisfies ReleaseClaimsResult),
+  });
+  const output = capture();
+  const exitCode = await runCli(["session", "release", sampleSession.session_id, "--resource", "src/a.ts", "--force"], {
+    backend,
+    io: output.io,
+  });
+
+  assert.equal(exitCode, 0);
+  const human = output.stdout.join("\n");
+  assert.match(human, /^session release: ok/m);
+  assert.match(human, /released:/u);
+  assert.match(human, /src\/a\.ts/u);
+  assert.match(human, /remaining:/u);
+  assert.match(human, /src\/keep\.ts/u);
+});
+
+test("release human stale rejection projects the structured failure code and details", async () => {
+  const stale = () =>
+    failure<ReleaseClaimsResult>(
+      new DomainError("STALE_CLAIM_SET", "Claim-set generation is stale.", {
+        expectedClaimSetGeneration: 2,
+        actualClaimSetGeneration: 3,
+      }),
+    );
+  const backend = backendForTests({ releaseClaims: async () => stale() });
+  const jsonOutput = capture();
+  const humanOutput = capture();
+  const jsonExitCode = await runCli(
+    ["--json", "session", "release", sampleSession.session_id, "--all", "--if-generation", "2"],
+    { backend, io: jsonOutput.io },
+  );
+  const humanExitCode = await runCli(
+    ["session", "release", sampleSession.session_id, "--all", "--if-generation", "2"],
+    { backend, io: humanOutput.io },
+  );
+
+  assert.equal(jsonExitCode, 3);
+  assert.equal(humanExitCode, 3);
+  const structured = JSON.parse(jsonOutput.stdout[0] ?? "") as {
+    ok: boolean;
+    code: string;
+    details: { expectedClaimSetGeneration: number; actualClaimSetGeneration: number };
+  };
+  assert.equal(structured.ok, false);
+  assert.equal(structured.code, "STALE_CLAIM_SET");
+  const human = humanOutput.stderr.join("\n");
+  assert.match(human, /session release: rejected/u);
+  assert.match(human, new RegExp(`code: ${structured.code}`, "u"));
+  assert.match(human, /expectedClaimSetGeneration: 2/u);
+  assert.match(human, /actualClaimSetGeneration: 3/u);
+});
+
 test("explicit all release and resource alias preserve selector/concurrency semantics", async () => {
   let observed: ReleaseClaimsOptions | null = null;
   const backend = backendForTests({
@@ -1462,6 +1526,49 @@ test("explicit all release and resource alias preserve selector/concurrency sema
     remaining: [],
     idempotent: true,
     claim_set_generation: 7,
+  });
+});
+
+test("repeated claim-id release remains one selector family and one backend call", async () => {
+  let invocations = 0;
+  let observed: ReleaseClaimsOptions | null = null;
+  const backend = backendForTests({
+    releaseClaims: async (_context: SessionContext, options: ReleaseClaimsOptions) => {
+      invocations += 1;
+      observed = options;
+      return success({
+        session_id: sampleSession.session_id,
+        released: [],
+        remaining: [],
+        idempotent: true,
+        claim_set_generation: 4,
+      } satisfies ReleaseClaimsResult);
+    },
+  });
+  const output = capture();
+  const exitCode = await runCli(
+    [
+      "--json",
+      "session",
+      "release",
+      sampleSession.session_id,
+      "--claim-id",
+      "claim-a",
+      "--claim-id",
+      "claim-b",
+      "--force",
+    ],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.equal(invocations, 1);
+  assert.deepEqual(observed, {
+    session_id: sampleSession.session_id,
+    resources: null,
+    claim_ids: ["claim-a", "claim-b"],
+    all: false,
+    force: true,
   });
 });
 
