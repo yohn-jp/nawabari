@@ -89,6 +89,18 @@ The `resource-claims` capability additionally exposes a machine-readable
 surface documented above, so a caller can discover this contract instead of
 assuming it from the CLI help text.
 
+Resource-claim semantics are generation `nawabari.resource-claims.v2` with
+claim-record schema `2`. The standalone envelope deliberately remains
+`nawabari.standalone-execution.v1`: this is a meaning-compatible top-level
+identity, while callers select the child resource-claim generation before
+operating. A future meaning-changing claim authorization, conflict, transition,
+release, or required-mode change must publish a new resource-claim generation
+and identity; the package version alone is never a compatibility decision.
+The capability binds every lifecycle command and alias to its result schema,
+implementation-owned stable failure vocabulary, transition-matrix identity,
+CAS/force and rejected-non-mutation guarantees, and deterministic recovery
+action schema.
+
 The supported standalone sequence is:
 
 ```text
@@ -111,7 +123,7 @@ The result schemas expose the following identities:
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | session lifecycle      | `session_id`, `repository`, `worktree`, `branch`, `state`                                                                           |
 | explicit discard       | `previous_head`, `worktree_removed`, `branch_removed`, `released_claims`, `final_state`, final `session.state`/`terminal_operation` |
-| claims                 | `claim_id`, `session_id`, `resource`, `mode`                                                                                        |
+| claims                 | `claim_id`, `session_id`, `resource`, `mode`, `claim_set_generation`, `previous_claim_set_generation`                               |
 | authorization          | `operation`, `allowed`, `code`, `claim_ids`                                                                                         |
 | checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim`                                                    |
 | repository evidence    | `session_id`, `base_revision`, `head`, `clean`, `paths.stats`, `evidence_hash`                                                      |
@@ -254,7 +266,7 @@ git nawabari session claim --session "$NAWABARI_SESSION_ID" \
   --resource 'src/**/*.ts' --mode read --json
 git nawabari session claims --session "$NAWABARI_SESSION_ID" --json
 git nawabari session update --session "$NAWABARI_SESSION_ID" \
-  --resource 'src/**/*.ts' --mode write --json
+  --resource 'src/**/*.ts' --mode write --force --json
 git nawabari session release --session "$NAWABARI_SESSION_ID" --all --force --json
 ```
 
@@ -279,6 +291,24 @@ or empty intermediate claim state is ever observable. Submitting the same
 complete desired set again is idempotent. A successful replacement's JSON
 exposes the resulting `claims` together with machine-readable `added` and
 `released` claims.
+
+The complete public claim lifecycle is:
+
+```text
+session claim/resource claim (additive acquire)
+-> session transition/resource transition (one exact-resource mode change)
+-> session mutate/resource mutate (atomic exact-resource deltas)
+-> session release/resource release (--resource, --claim-id, or explicit --all)
+-> session update/resource update (atomic complete-set replacement)
+```
+
+All destructive mutations require exactly one `--if-generation` CAS or
+explicit `--force`. A stale CAS returns `STALE_CLAIM_SET` without changing
+claims or generation. Additive claim is not replacement; selected release
+preserves unrelated claims; `--all` is the unambiguous all-claims selector.
+An exact contradictory additive claim remains rejected with
+`CONTRADICTORY_CLAIM` and may carry the typed `transition-exact-resource`
+recovery action, whose generation is directly usable as the transition CAS.
 
 The modes have these normative meanings:
 

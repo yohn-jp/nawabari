@@ -209,7 +209,10 @@ async function main() {
       fail("installed capabilities did not enumerate the governed lifecycle");
     }
     if (capabilitiesResult.stderr.trim().length > 0) fail("capabilities --json wrote decorative output to stderr");
-    if (capabilitiesResult.stdout.length > 12_000) fail("capabilities --json exceeded its fixed discovery budget");
+    // The v2 resource-claim capability publishes lifecycle result mappings,
+    // transition/recovery identities, and operation-mode rationale in one
+    // bounded document.
+    if (capabilitiesResult.stdout.length > 20_000) fail("capabilities --json exceeded its fixed discovery budget");
 
     const helpJsonResult = spawnSync(installedBinary, ["--help", "--json"], {
       cwd: installDirectory,
@@ -1240,6 +1243,249 @@ async function main() {
     if (preSeedRelease.status !== 0) {
       fail("installed session release did not clear residual claims before the deterministic multi-claim setup");
     }
+
+    // #175: exercise the advertised resource-claim machine contract through
+    // the packed dispatcher only.  The sequence deliberately carries the
+    // authoritative generation from one public result into the next; no
+    // registry file or source-level algorithm is used by this fixture.
+    const contractAcquireResource = "contract-acquire.txt";
+    const contractUnrelatedResource = "contract-unrelated.txt";
+    const contractDeltaResource = "contract-delta.txt";
+    const contractReplacementResource = "contract-replacement.txt";
+    const contractRecoveryResource = "contract-recovery.txt";
+    const contractClaim = (resource, mode, label) =>
+      parseInstalledJson(
+        invokeInstalled(
+          ["session", "claim", "--session", secondCreated.session_id, "--resource", resource, "--mode", mode, "--json"],
+          secondWorktree,
+        ),
+        label,
+      );
+    const contractAcquire = contractClaim(contractAcquireResource, "read", "contract acquire");
+    if (contractAcquire.ok !== true || typeof contractAcquire.claim_set_generation !== "number") {
+      fail("packed contract acquire did not expose claim-set generation");
+    }
+    const contractUnrelated = contractClaim(contractUnrelatedResource, "read", "contract unrelated acquire");
+    if (contractUnrelated.ok !== true || typeof contractUnrelated.claim_set_generation !== "number") {
+      fail("packed contract unrelated claim did not expose claim-set generation");
+    }
+    const staleContractTransition = invokeInstalled(
+      [
+        "session",
+        "transition",
+        "--session",
+        secondCreated.session_id,
+        "--resource",
+        contractAcquireResource,
+        "--mode",
+        "exclusive-write",
+        "--if-generation",
+        String(contractUnrelated.claim_set_generation - 1),
+        "--json",
+      ],
+      secondWorktree,
+    );
+    const staleContractJson = parseInstalledJson(staleContractTransition, "contract stale transition");
+    const staleContractClaims = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", secondCreated.session_id, "--json"], secondWorktree),
+      "claims after contract stale transition",
+    );
+    if (
+      staleContractTransition.status !== 3 ||
+      staleContractJson.code !== "STALE_CLAIM_SET" ||
+      staleContractClaims.claim_set_generation !== contractUnrelated.claim_set_generation ||
+      staleContractClaims.claims?.length !== 2 ||
+      !staleContractClaims.claims?.some(
+        (entry) => entry.resource === contractAcquireResource && entry.mode === "read",
+      ) ||
+      !staleContractClaims.claims?.some(
+        (entry) => entry.resource === contractUnrelatedResource && entry.mode === "read",
+      )
+    ) {
+      fail("packed contract stale CAS was not rejected without mutating claims");
+    }
+    const contractTransition = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "transition",
+          "--session",
+          secondCreated.session_id,
+          "--resource",
+          contractAcquireResource,
+          "--mode",
+          "write",
+          "--if-generation",
+          String(contractUnrelated.claim_set_generation),
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "contract transition",
+    );
+    if (
+      contractTransition.ok !== true ||
+      typeof contractTransition.claim_set_generation !== "number" ||
+      !contractTransition.changed?.some(
+        (entry) => entry.resource === contractAcquireResource && entry.after?.mode === "write",
+      ) ||
+      !contractTransition.claims?.some((entry) => entry.resource === contractUnrelatedResource)
+    ) {
+      fail("packed contract transition did not preserve the unrelated claim");
+    }
+    const contractDelta = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "mutate",
+          "--session",
+          secondCreated.session_id,
+          "--upsert-resource",
+          contractDeltaResource,
+          "--mode",
+          "exclusive-write",
+          "--release-resource",
+          contractAcquireResource,
+          "--if-generation",
+          String(contractTransition.claim_set_generation),
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "contract atomic delta",
+    );
+    if (
+      contractDelta.ok !== true ||
+      typeof contractDelta.claim_set_generation !== "number" ||
+      !contractDelta.added?.some((entry) => entry.resource === contractDeltaResource) ||
+      !contractDelta.released?.some((entry) => entry.resource === contractAcquireResource) ||
+      !contractDelta.claims?.some((entry) => entry.resource === contractUnrelatedResource)
+    ) {
+      fail("packed contract atomic delta did not preserve unrelated claims");
+    }
+    const contractSelectedRelease = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "release",
+          "--session",
+          secondCreated.session_id,
+          "--resource",
+          contractDeltaResource,
+          "--if-generation",
+          String(contractDelta.claim_set_generation),
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "contract selected release",
+    );
+    if (
+      contractSelectedRelease.ok !== true ||
+      typeof contractSelectedRelease.claim_set_generation !== "number" ||
+      !contractSelectedRelease.released?.some((entry) => entry.resource === contractDeltaResource) ||
+      !contractSelectedRelease.remaining?.some((entry) => entry.resource === contractUnrelatedResource)
+    ) {
+      fail("packed contract selected release did not preserve unrelated claims");
+    }
+    const contractReplacement = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "update",
+          "--session",
+          secondCreated.session_id,
+          "--resource",
+          contractUnrelatedResource,
+          "--mode",
+          "read",
+          "--resource",
+          contractReplacementResource,
+          "--mode",
+          "read",
+          "--force",
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "contract complete replacement",
+    );
+    if (
+      contractReplacement.ok !== true ||
+      typeof contractReplacement.claim_set_generation !== "number" ||
+      contractReplacement.claims?.length !== 2 ||
+      !contractReplacement.claims?.some((entry) => entry.resource === contractReplacementResource)
+    ) {
+      fail("packed contract complete replacement did not expose the requested complete set");
+    }
+    const contractRecoveryClaim = contractClaim(contractRecoveryResource, "write", "contract recovery source claim");
+    if (contractRecoveryClaim.ok !== true || typeof contractRecoveryClaim.claim_set_generation !== "number") {
+      fail("packed contract recovery source claim did not expose generation");
+    }
+    const contractRecoveryRejectedResult = invokeInstalled(
+      [
+        "session",
+        "claim",
+        "--session",
+        secondCreated.session_id,
+        "--resource",
+        contractRecoveryResource,
+        "--mode",
+        "exclusive-write",
+        "--json",
+      ],
+      secondWorktree,
+    );
+    const contractRecoveryRejected = parseInstalledJson(contractRecoveryRejectedResult, "contract recovery rejection");
+    const contractRecoveryAction = contractRecoveryRejected.details?.recoveryAction;
+    if (
+      contractRecoveryRejectedResult.status !== 3 ||
+      contractRecoveryRejected.code !== "CONTRADICTORY_CLAIM" ||
+      contractRecoveryAction?.actionId !== "transition-exact-resource" ||
+      contractRecoveryAction?.resource !== contractRecoveryResource ||
+      contractRecoveryAction?.mode !== "exclusive-write" ||
+      contractRecoveryAction?.claimSetGeneration !== contractRecoveryClaim.claim_set_generation
+    ) {
+      fail("packed contract recovery did not expose a deterministic CAS transition action");
+    }
+    const contractRecovered = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "transition",
+          "--session",
+          secondCreated.session_id,
+          "--resource",
+          contractRecoveryAction.resource,
+          "--mode",
+          contractRecoveryAction.mode,
+          "--if-generation",
+          String(contractRecoveryAction.claimSetGeneration),
+          "--json",
+        ],
+        secondWorktree,
+      ),
+      "contract safe recovery",
+    );
+    if (
+      contractRecovered.ok !== true ||
+      !contractRecovered.claims?.some(
+        (entry) => entry.resource === contractUnrelatedResource && entry.mode === "read",
+      ) ||
+      !contractRecovered.claims?.some(
+        (entry) => entry.resource === contractReplacementResource && entry.mode === "read",
+      ) ||
+      !contractRecovered.claims?.some(
+        (entry) => entry.resource === contractRecoveryResource && entry.mode === "exclusive-write",
+      )
+    ) {
+      fail("packed contract safe recovery did not preserve the complete replacement claims");
+    }
+    const contractReset = invokeInstalled(
+      ["session", "release", "--session", secondCreated.session_id, "--all", "--force", "--json"],
+      secondWorktree,
+    );
+    if (contractReset.status !== 0) fail("packed contract fixture could not reset claims before update coverage");
 
     const seedResource = "multi-claim-seed.txt";
     const seedClaim = parseInstalledJson(
