@@ -78,7 +78,16 @@ export type RegistryErrorCode =
   | "PUSH_DIRTY_WORKTREE"
   | "PUSH_FAILED";
 
-export type RegistryErrorDetails = Readonly<Record<string, boolean | number | string | string[]>>;
+/**
+ * JSON-safe, recursively structured evidence attached to a registry error.
+ *
+ * Recovery actions are deliberately represented as data at this boundary so
+ * the CLI can project the exact same object in machine and human modes.
+ */
+export type RegistryErrorDetailValue =
+  boolean | number | string | string[] | { readonly [key: string]: RegistryErrorDetailValue };
+
+export type RegistryErrorDetails = Readonly<Record<string, RegistryErrorDetailValue>>;
 
 export class SessionRegistryError extends Error {
   readonly code: RegistryErrorCode;

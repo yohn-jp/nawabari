@@ -47,8 +47,10 @@ import {
   sortResourceClaims,
   type ClaimOwnerContext,
   type ResourceClaim,
+  type ResourceClaimRecoveryAction,
   type ResourceClaimInput,
   type ResourceClaimMode,
+  RESOURCE_CLAIM_RECOVERY_ACTION_ID,
 } from "./resource-claims.js";
 import {
   CHECKPOINT_EVIDENCE_SCHEMA_VERSION,
@@ -75,7 +77,7 @@ import {
   type RepositoryEvidenceSnapshot,
 } from "./repository-evidence.js";
 
-export type { ResourceClaim } from "./resource-claims.js";
+export type { ResourceClaim, ResourceClaimRecoveryAction } from "./resource-claims.js";
 export type {
   RepositoryDiffEvidence,
   RepositoryDiffOptions,
@@ -2574,7 +2576,13 @@ export class SessionRegistry {
     const candidates = requested.map((input) => createResourceClaim(input, owner, timestamp));
     const existing = state.claims.filter((claim) => claim.sessionId !== owner.sessionId);
     const current = state.claims.filter((claim) => claim.sessionId === owner.sessionId);
-    const added = this.validateRequestedClaims(candidates, owner, [...existing, ...current], state.sessions);
+    const added = this.validateRequestedClaims(
+      candidates,
+      owner,
+      [...existing, ...current],
+      state.sessions,
+      state.claimSetGeneration,
+    );
     const nextClaims = sortResourceClaims([
       ...state.claims,
       ...added.filter((candidate) => !current.some((claim) => claim.claimId === candidate.claimId)),
@@ -2592,6 +2600,7 @@ export class SessionRegistry {
     owner: ClaimOwner,
     existing: readonly ResourceClaim[],
     sessions: readonly SessionRecord[] = [],
+    additiveClaimSetGeneration?: number,
   ): readonly ResourceClaim[] {
     for (const candidate of candidates) {
       const exact = existing.find((claim) => claim.claimId === candidate.claimId);
@@ -2609,8 +2618,8 @@ export class SessionRegistry {
         }
         continue;
       }
-      for (const current of existing) {
-        if (!claimsOverlap(candidate, current)) continue;
+      const overlapping = existing.filter((current) => claimsOverlap(candidate, current));
+      for (const current of overlapping) {
         if (current.sessionId === owner.sessionId) {
           if (current.mode === candidate.mode) {
             throw claimError("DUPLICATE_CLAIM", "Session already owns an overlapping claim", {
@@ -2619,10 +2628,29 @@ export class SessionRegistry {
               mode: current.mode,
             });
           }
+          const recoveryAction =
+            additiveClaimSetGeneration !== undefined &&
+            candidates.length === 1 &&
+            overlapping.length === 1 &&
+            current.resource === candidate.resource &&
+            isExactCanonicalClaimResource(candidate.resource)
+              ? claimTransitionRecoveryAction(
+                  owner.sessionId,
+                  candidate.resource,
+                  candidate.mode,
+                  additiveClaimSetGeneration,
+                )
+              : undefined;
           throw claimError("CONTRADICTORY_CLAIM", "Session already owns an overlapping claim with another mode", {
             claimId: current.claimId,
             resource: current.resource,
             mode: current.mode,
+            ...(recoveryAction === undefined
+              ? {}
+              : {
+                  recoveryAction,
+                  safeActions: [recoveryAction.actionId],
+                }),
           });
         }
         if (claimsConflict(candidate, current)) {
@@ -3851,6 +3879,32 @@ function resourceClaimConflictDetails(
           ...(ownerSession.label === undefined ? {} : { ownerLabel: ownerSession.label }),
         }),
   };
+}
+
+/** A wildcard claim does not identify one deterministic transition target. */
+function isExactCanonicalClaimResource(resource: string): boolean {
+  return !/[?*]/u.test(resource);
+}
+
+/**
+ * Build the sole safe recovery action for an additive exact-resource
+ * contradiction. The command is shell-executable while quoting all
+ * caller-derived values, and its generation is the pre-rejection CAS token.
+ */
+function claimTransitionRecoveryAction(
+  sessionId: string,
+  resource: string,
+  mode: ResourceClaimMode,
+  claimSetGeneration: number,
+): ResourceClaimRecoveryAction {
+  const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\"'\"'")}'`;
+  return Object.freeze({
+    actionId: RESOURCE_CLAIM_RECOVERY_ACTION_ID,
+    command: `nawabari session transition --session ${shellQuote(sessionId)} --resource ${shellQuote(resource)} --mode ${shellQuote(mode)} --if-generation ${claimSetGeneration}`,
+    resource,
+    mode,
+    claimSetGeneration,
+  });
 }
 
 function transitionSessionState(record: SessionRecord, state: SessionState, clock: () => Date): SessionRecord {

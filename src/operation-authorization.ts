@@ -1,5 +1,5 @@
 import { claimModeGrantsAccess as resourceClaimModeGrantsAccess, type ResourceClaimMode } from "./resource-claims.js";
-import type { RegistryErrorCode } from "./errors.js";
+import type { RegistryErrorCode, RegistryErrorDetails } from "./errors.js";
 
 /** Version of the local operation vocabulary and its access policy. */
 export const OPERATION_AUTHORIZATION_SCHEMA_VERSION = 1 as const;
@@ -143,7 +143,7 @@ export interface OperationAuthorizationDecision {
   readonly requestedSessionId: string | null;
   readonly state: string | null;
   readonly resources: readonly AuthorizedResource[];
-  readonly details: Readonly<Record<string, boolean | number | string | readonly string[]>>;
+  readonly details: RegistryErrorDetails;
 }
 
 export const CHECKPOINT_EVIDENCE_SCHEMA_VERSION = 1 as const;

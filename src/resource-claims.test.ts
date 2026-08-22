@@ -109,6 +109,152 @@ test("classifies every exact-resource transition without adding none to persiste
   }
 });
 
+test("projects deterministic exact claim-transition recovery without mutating rejected additive claims", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "src/file.ts", mode: "write" }],
+    });
+    registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "docs/keep.md", mode: "read" }],
+    });
+
+    const before = registry.listClaimsSnapshot();
+    let rejected: SessionRegistryError | undefined;
+    try {
+      registry.claimResources({
+        sessionId: session.sessionId,
+        claims: [{ resource: "src/file.ts", mode: "exclusive-write" }],
+      });
+    } catch (error: unknown) {
+      rejected = error instanceof SessionRegistryError ? error : undefined;
+    }
+    assert.ok(rejected);
+    assert.equal(rejected.code, "CONTRADICTORY_CLAIM");
+    const action = rejected.details.recoveryAction as {
+      actionId: string;
+      command: string;
+      resource: string;
+      mode: string;
+      claimSetGeneration: number;
+    };
+    assert.deepEqual(action, {
+      actionId: "transition-exact-resource",
+      command: action.command,
+      resource: "src/file.ts",
+      mode: "exclusive-write",
+      claimSetGeneration: before.claimSetGeneration,
+    });
+    assert.match(action.command, /nawabari session transition/u);
+    assert.match(action.command, /--resource 'src\/file\.ts'/u);
+    assert.match(action.command, /--mode 'exclusive-write'/u);
+    assert.match(action.command, new RegExp(`--if-generation ${before.claimSetGeneration}\\b`, "u"));
+    assert.deepEqual(rejected.details.safeActions, ["transition-exact-resource"]);
+    assert.deepEqual(registry.listClaimsSnapshot(), before);
+
+    // The emitted action maps to the canonical transition authority and keeps
+    // the unrelated claim in place while changing only the selected resource.
+    const transitioned = registry.applyClaimDeltas({
+      sessionId: session.sessionId,
+      deltas: [{ kind: "upsert", resource: action.resource, mode: "exclusive-write" }],
+      expectedClaimSetGeneration: action.claimSetGeneration,
+    });
+    assert.equal(transitioned.changed.length, 1);
+    assert.deepEqual(
+      registry.listClaims(session.sessionId).map((claim) => [claim.resource, claim.mode]),
+      [
+        ["docs/keep.md", "read"],
+        ["src/file.ts", "exclusive-write"],
+      ],
+    );
+
+    // A second exact contradictory pair receives the same stable action shape.
+    assert.throws(
+      () =>
+        registry.claimResources({
+          sessionId: session.sessionId,
+          claims: [{ resource: "src/file.ts", mode: "read" }],
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "CONTRADICTORY_CLAIM");
+        assert.equal((error.details.recoveryAction as { actionId: string }).actionId, "transition-exact-resource");
+        assert.equal(
+          (error.details.recoveryAction as { claimSetGeneration: number }).claimSetGeneration,
+          transitioned.claimSetGeneration,
+        );
+        return true;
+      },
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("omits exact-transition recovery for glob, multi-claim, and non-contradictory additive paths", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "src/*.ts", mode: "write" }],
+    });
+    assert.throws(
+      () =>
+        registry.claimResources({
+          sessionId: session.sessionId,
+          claims: [{ resource: "src/file.ts", mode: "exclusive-write" }],
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "CONTRADICTORY_CLAIM");
+        assert.equal(error.details.recoveryAction, undefined);
+        return true;
+      },
+    );
+    registry.releaseClaims({ sessionId: session.sessionId, all: true, force: true });
+
+    registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [
+        { resource: "src/first.ts", mode: "write" },
+        { resource: "src/second.ts", mode: "write" },
+      ],
+    });
+    assert.throws(
+      () =>
+        registry.claimResources({
+          sessionId: session.sessionId,
+          claims: [
+            { resource: "src/first.ts", mode: "exclusive-write" },
+            { resource: "src/second.ts", mode: "exclusive-write" },
+          ],
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "CONTRADICTORY_CLAIM");
+        assert.equal(error.details.recoveryAction, undefined);
+        return true;
+      },
+    );
+    registry.releaseClaims({ sessionId: session.sessionId, all: true, force: true });
+
+    assert.doesNotThrow(() =>
+      registry.claimResources({
+        sessionId: session.sessionId,
+        claims: [{ resource: "new/resource.ts", mode: "write" }],
+      }),
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("fails closed for runtime values outside the transition mode type", () => {
   assertRegistryError(() => classifyResourceClaimTransition("invalid" as never, "read"), "INVALID_CLAIM");
   assertRegistryError(() => classifyResourceClaimTransition("read", "invalid" as never), "INVALID_CLAIM");
