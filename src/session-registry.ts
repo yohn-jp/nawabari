@@ -426,8 +426,12 @@ export interface ClaimDeltasResult {
 export interface ReleaseClaimsOptions {
   readonly sessionId?: string | null;
   readonly session_id?: string | null;
+  /** Exact canonical resources to release through the atomic delta authority. */
+  readonly resources?: readonly string[] | null;
   readonly claimIds?: readonly string[];
   readonly claim_ids?: readonly string[];
+  /** Explicitly release every claim owned by the target session. */
+  readonly all?: boolean;
   readonly expectedClaimSetGeneration?: number | null;
   readonly expected_claim_set_generation?: number | null;
   readonly force?: boolean;
@@ -964,6 +968,45 @@ export class SessionRegistry {
   releaseClaims(sessionIdOrOptions: string | ReleaseClaimsOptions, claimIds?: readonly string[]): ReleaseClaimsResult {
     const options: ReleaseClaimsOptions =
       typeof sessionIdOrOptions === "string" ? { sessionId: sessionIdOrOptions, claimIds } : sessionIdOrOptions;
+
+    // Exact-resource release is deliberately projected through the canonical
+    // delta authority. That keeps resource canonicalization, duplicate
+    // detection, conflict validation, CAS ordering, and one-write atomicity
+    // in the same implementation as session mutate/transition.
+    const selectedResources = options.resources;
+    if (selectedResources !== undefined && selectedResources !== null) {
+      if (selectedResources.length === 0) {
+        throw claimError("INVALID_CLAIM", "At least one exact resource is required for selected release");
+      }
+      const selectedClaimIds = options.claimIds ?? options.claim_ids;
+      if (selectedClaimIds !== undefined && selectedClaimIds !== null) {
+        throw new SessionRegistryError(
+          "INVALID_OPERATION",
+          "Release selector families are mutually exclusive: resources, claim IDs, or all",
+        );
+      }
+      if (options.all === true) {
+        throw new SessionRegistryError(
+          "INVALID_OPERATION",
+          "Release selector families are mutually exclusive: resources, claim IDs, or all",
+        );
+      }
+      const result = this.applyClaimDeltas({
+        sessionId: options.sessionId ?? options.session_id,
+        deltas: selectedResources.map((resource) => ({ kind: "release", resource })),
+        expectedClaimSetGeneration: options.expectedClaimSetGeneration,
+        expected_claim_set_generation: options.expected_claim_set_generation,
+        force: options.force,
+      });
+      return {
+        sessionId: result.session.sessionId,
+        released: result.released.map(cloneResourceClaim),
+        remaining: result.claims.map(cloneResourceClaim),
+        idempotent: result.idempotent,
+        claimSetGeneration: result.claimSetGeneration,
+      };
+    }
+
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
@@ -973,7 +1016,13 @@ export class SessionRegistry {
         throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
       }
       const selectedIds = options.claimIds ?? options.claim_ids;
-      if (selectedIds !== undefined) {
+      if (options.all === true && selectedIds !== undefined && selectedIds !== null) {
+        throw new SessionRegistryError(
+          "INVALID_OPERATION",
+          "Release selector families are mutually exclusive: resources, claim IDs, or all",
+        );
+      }
+      if (selectedIds !== undefined && selectedIds !== null) {
         for (const claimId of selectedIds) {
           if (typeof claimId !== "string" || claimId.length === 0) {
             throw claimError("CLAIM_NOT_FOUND", "Claim ID must be a non-empty string", {
@@ -984,8 +1033,10 @@ export class SessionRegistry {
       }
       const sessionClaims = state.claims.filter((claim) => claim.sessionId === sessionId);
       const wanted =
-        selectedIds === undefined ? new Set(sessionClaims.map((claim) => claim.claimId)) : new Set(selectedIds);
-      if (selectedIds !== undefined) {
+        selectedIds === undefined || selectedIds === null || options.all === true
+          ? new Set(sessionClaims.map((claim) => claim.claimId))
+          : new Set(selectedIds);
+      if (selectedIds !== undefined && selectedIds !== null) {
         for (const claimId of wanted) {
           const existing = state.claims.find((claim) => claim.claimId === claimId);
           if (existing !== undefined && existing.sessionId !== sessionId) {
@@ -1001,7 +1052,9 @@ export class SessionRegistry {
       const remaining = sessionClaims.filter((claim) => !wanted.has(claim.claimId));
       const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId || !wanted.has(claim.claimId));
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
-      this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration);
+      if (claimSetGeneration !== state.claimSetGeneration) {
+        this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration);
+      }
       return {
         sessionId,
         released: released.map(cloneResourceClaim),
@@ -1016,7 +1069,7 @@ export class SessionRegistry {
   }
 
   releaseSessionClaims(sessionId: string): ReleaseClaimsResult {
-    return this.releaseClaims(sessionId);
+    return this.releaseClaims({ sessionId, all: true, force: true });
   }
 
   create(options: CreateSessionOptions = {}): SessionRecord {

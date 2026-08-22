@@ -469,7 +469,9 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const result = this.registryFor(context).releaseClaims({
         sessionId: options.session_id ?? undefined,
+        resources: options.resources ?? undefined,
         claimIds: options.claim_ids ?? undefined,
+        all: options.all === true,
         expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
         force: options.force === true,
       });

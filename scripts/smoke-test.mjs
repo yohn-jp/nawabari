@@ -1111,7 +1111,7 @@ async function main() {
     }
 
     const preSeedRelease = invokeInstalled(
-      ["session", "release", "--session", secondCreated.session_id, "--json"],
+      ["session", "release", "--session", secondCreated.session_id, "--all", "--force", "--json"],
       secondWorktree,
     );
     if (preSeedRelease.status !== 0) {
