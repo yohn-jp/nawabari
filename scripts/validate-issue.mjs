@@ -6,12 +6,12 @@ import { fileURLToPath } from "node:url";
 import { validateExistingIssueArtifact } from "gh-inari/artifact";
 import {
   compileLocalGovernedContract,
-  compileLocalIssueFormContracts
+  compileLocalIssueFormContracts,
 } from "gh-inari/governance";
 
 const REPOSITORY_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
-  ".."
+  "..",
 );
 
 /** Validate an Issue event against the checked-out repository's Inari snapshot. */
@@ -19,7 +19,7 @@ export async function validateIssue({
   body,
   root = REPOSITORY_ROOT,
   template,
-  contract
+  contract,
 }) {
   const contracts =
     contract === undefined
@@ -29,7 +29,7 @@ export async function validateIssue({
       : [contract];
   const outcomes = contracts.map((candidate) => ({
     contract: candidate,
-    result: validateExistingIssueArtifact(candidate, body)
+    result: validateExistingIssueArtifact(candidate, body),
   }));
   const valid = outcomes.filter(({ result }) => result.valid);
   if (valid.length === 1) return report(valid[0]);
@@ -44,10 +44,10 @@ export async function validateIssue({
             code: "GOVERNANCE_TEMPLATE_AMBIGUOUS",
             path: "$.template",
             message:
-              "Issue body matches more than one repository-native Issue Form."
-          }
-        ]
-      }
+              "Issue body matches more than one repository-native Issue Form.",
+          },
+        ],
+      },
     });
   }
 
@@ -59,7 +59,7 @@ export async function validateIssue({
       return left.result.violations.length - right.result.violations.length;
     }
     return left.contract.templateIdentity.id.localeCompare(
-      right.contract.templateIdentity.id
+      right.contract.templateIdentity.id,
     );
   })[0];
   if (selected === undefined) {
@@ -70,9 +70,9 @@ export async function validateIssue({
           code: "GOVERNANCE_TEMPLATE_UNAVAILABLE",
           path: "$.template",
           message:
-            "No repository-native Issue Form is available for validation."
-        }
-      ]
+            "No repository-native Issue Form is available for validation.",
+        },
+      ],
     };
   }
   return report(selected);
@@ -85,7 +85,7 @@ function report(outcome) {
     contract: outcome.contract,
     result: outcome.result,
     violations,
-    errors: violations.map((violation) => violation.message)
+    errors: violations.map((violation) => violation.message),
   };
 }
 
@@ -105,7 +105,7 @@ async function main() {
   const result = await validateIssue({
     body: event.issue.body ?? "",
     root: process.cwd(),
-    template
+    template,
   });
   console.log(
     JSON.stringify({
@@ -116,8 +116,8 @@ async function main() {
       ...(result.result === undefined
         ? {}
         : { classification: result.result.classification }),
-      violations: result.violations
-    })
+      violations: result.violations,
+    }),
   );
   if (!result.valid) {
     if (
@@ -129,12 +129,12 @@ async function main() {
         "",
         ...result.violations.map(
           (violation) =>
-            `- [${violation.code}] ${violation.path}: ${violation.message}`
-        )
+            `- [${violation.code}] ${violation.path}: ${violation.message}`,
+        ),
       ];
       fs.writeFileSync(
         process.argv[reportPathIndex + 1],
-        `${lines.join("\n")}\n`
+        `${lines.join("\n")}\n`,
       );
     }
     process.exitCode = 1;
