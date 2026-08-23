@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateExistingPullRequestArtifact, validateRequiredMetadataString } from "gh-inari/artifact";
 import { compileLocalGovernedContract } from "gh-inari/governance";
+import { compilePullRequestTemplate } from "gh-inari/pull-request-template";
 import { resolvePullRequestTemplate } from "./pr-contract-routing.mjs";
 
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -30,7 +31,7 @@ export async function validatePullRequest({ title, body, root = REPOSITORY_ROOT,
     };
   }
 
-  const contracts = await candidateContracts(root, routing.template);
+  const contracts = await candidateContracts(root, routing.template, routing.classification);
   const outcomes = contracts.map((contract) => ({
     contract,
     result: validateExistingPullRequestArtifact(contract, body),
@@ -83,8 +84,15 @@ export async function validatePullRequest({ title, body, root = REPOSITORY_ROOT,
   return report(selected, title, routing.classification);
 }
 
-async function candidateContracts(root, template) {
+async function candidateContracts(root, template, classification) {
   if (template !== undefined && template.length > 0) {
+    // release/<semver> is already an explicit, deterministic template route.
+    // Repository pr-policy.yml commonly targets the ordinary `default`
+    // template and must not be projected onto the independent release
+    // contract merely because both are pull-request artifacts.
+    if (classification === "release") {
+      return [await compilePullRequestTemplate(root, template)];
+    }
     return [await compileLocalGovernedContract("pr", root, template)];
   }
 
