@@ -91,7 +91,19 @@ async function candidateContracts(root, template, classification) {
     // template and must not be projected onto the independent release
     // contract merely because both are pull-request artifacts.
     if (classification === "release") {
-      return [await compilePullRequestTemplate(root, template)];
+      const contract = await compilePullRequestTemplate(root, template);
+      // gh-inari's native compiler derives an identity from the filesystem
+      // path. Branch routing, however, selects the repository's canonical
+      // contract id (the local Inari snapshot uses `release`).
+      return [
+        {
+          ...contract,
+          templateIdentity: {
+            ...contract.templateIdentity,
+            id: template,
+          },
+        },
+      ];
     }
     return [await compileLocalGovernedContract("pr", root, template)];
   }
