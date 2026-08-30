@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { validateExistingPullRequestArtifact, validateRequiredMetadataString } from "gh-inari/artifact";
 import { compileLocalGovernedContract } from "gh-inari/governance";
 import { compilePullRequestTemplate } from "gh-inari/pull-request-template";
+import { PullRequestPolicyError } from "gh-inari/pr-policy";
 import { resolvePullRequestTemplate } from "./pr-contract-routing.mjs";
 
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -113,7 +114,26 @@ async function candidateContracts(root, template, classification) {
     .readdirSync(directory)
     .filter((name) => name.endsWith(".json"))
     .sort();
-  return Promise.all(names.map((name) => compileLocalGovernedContract("pr", root, path.basename(name, ".json"))));
+  const outcomes = await Promise.all(
+    names.map(async (name) => {
+      try {
+        return { compiled: await compileLocalGovernedContract("pr", root, path.basename(name, ".json")) };
+      } catch (error) {
+        // A repository PR policy commonly binds to one native template (e.g.
+        // `template: default`). During auto-detection every native template is
+        // a candidate, so an unrelated candidate this policy does not target
+        // is expected and must not abort discovery of the applicable one; it
+        // is simply not a candidate. Any other failure (including a policy
+        // mismatch against the template it *does* target) still propagates,
+        // preserving fail-closed behavior for genuine misconfiguration.
+        if (error instanceof PullRequestPolicyError && error.code === "PR_POLICY_TEMPLATE_MISMATCH") {
+          return { compiled: undefined };
+        }
+        throw error;
+      }
+    }),
+  );
+  return outcomes.flatMap(({ compiled }) => (compiled === undefined ? [] : [compiled]));
 }
 
 function report(outcome, title, branchClassification) {
