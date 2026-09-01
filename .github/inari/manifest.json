@@ -5,7 +5,7 @@
     "repository": "yohn-jp/.github",
     "directory": ".github/inari"
   },
-  "revision": "sha256:c30d197a8352ee736bd894171dda79d4bbb77514af353f39331cc2179d6df41c",
+  "revision": "sha256:3186d41c63190c57e027481a4eeb9133d06f37ae3544e1d4f3279fd2cd1fd0ad",
   "files": [
     {
       "path": ".github/inari/issues/architecture.json",
@@ -34,13 +34,18 @@
     },
     {
       "path": ".github/inari/pull-requests/default.json",
-      "sha256": "21e80ef2aaf79bbea2d4725cfbbbcde07ceae191651a67d9a5981dda46288eee",
-      "bytes": 1315
+      "sha256": "bd33763255b5498cb86a66596b4bba16a717e626c435ecdf93f1ca7e0d3e7435",
+      "bytes": 1659
     },
     {
       "path": ".github/inari/pull-requests/release.json",
       "sha256": "324f8a7cfde491a4c74effdab264ae1cfe971d4b3d685618bc8423b64b5c8441",
       "bytes": 1839
+    },
+    {
+      "path": ".github/inari/pr-policy.yml",
+      "sha256": "da5ac5663b75025fe6d9aa647ea849f732f97fa0ceb4f8563810d46a0513b444",
+      "bytes": 382
     }
   ]
 }

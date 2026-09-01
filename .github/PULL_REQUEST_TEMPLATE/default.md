@@ -17,6 +17,10 @@ Closes #
 <!-- Commands or targeted checks actually run. CI remains authoritative for
 automated validation state; do not reproduce full CI evidence matrices. -->
 
+- [ ] Typecheck
+- [ ] Tests
+- [ ] Build
+
 ## Review focus
 
 <!-- Optional. Areas requiring reviewer attention, including any material
