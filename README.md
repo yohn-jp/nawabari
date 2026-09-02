@@ -126,7 +126,7 @@ The result schemas expose the following identities:
 | claims                 | `claim_id`, `session_id`, `resource`, `mode`, `claim_set_generation`, `previous_claim_set_generation`                               |
 | authorization          | `operation`, `allowed`, `code`, `claim_ids`                                                                                         |
 | checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim`                                                    |
-| repository evidence    | `session_id`, `base_revision`, `head`, `clean`, `paths.stats`, `evidence_hash`                                                      |
+| repository evidence    | `session_id`, `session_updated_at`, `base_revision`, `head`, `clean`, `paths.stats`, `evidence_hash`                                |
 | bounded diff           | `from_revision`, `to_revision`, `paths`, `stats`, `patch`, `evidence_hash`                                                          |
 | commit/push            | `commit_sha`, `remote`, `branch`, `target`, `relation`                                                                              |
 | reconciliation/cleanup | `clean`, `issues`, `candidates`, `cleaned`, `blocked`, `recovery_hints`                                                             |
@@ -158,6 +158,13 @@ stats, `clean`, the current `head`, session state, and an `evidence_hash`.
 New sessions persist the exact creation/base revision as `base_revision`;
 legacy records that lack this field report `base_revision: null` and
 `base_revision_proven: false` rather than inferring it from a mutable ref.
+
+`session_updated_at` is the UTC timestamp of the last authoritative
+session-state mutation, not a general Git filesystem mtime. A successful
+Nawabari-managed `commit` is such a mutation, so the registry timestamp is
+persisted before the command returns and a subsequent snapshot reports it with
+the resulting `head`. Git changes made outside Nawabari do not advance this
+field; consumers must use the Git-observed fields for those changes.
 
 `diff` requires at least one explicit concrete path and never accepts a glob or
 an empty repository-wide selection. Stats are returned by default. Patch text

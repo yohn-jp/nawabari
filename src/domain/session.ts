@@ -13,6 +13,7 @@ export type SessionRecord = {
   branch: string;
   state: SessionState;
   created_at: string;
+  /** Last authoritative session-state mutation; includes Nawabari-managed commits. */
   updated_at: string;
   base_revision?: string;
   label?: string;
@@ -289,6 +290,7 @@ export type RepositoryEvidence = {
   session_id: string;
   session_state: SessionState;
   session_created_at: string;
+  /** Last authoritative session-state mutation; includes Nawabari-managed commits. */
   session_updated_at: string;
   base_revision: string | null;
   base_revision_proven: boolean;

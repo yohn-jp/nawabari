@@ -51,6 +51,43 @@ test("captures a deterministic session-addressed snapshot and bounded diff", () 
   }
 });
 
+test("managed commit advances session_updated_at before the resulting evidence snapshot", () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-worktree`;
+  let now = new Date("2026-01-01T00:00:00.000Z");
+  try {
+    runGit(["worktree", "add", "--quiet", "-b", "feature/evidence-commit", worktreePath, "HEAD"], repositoryPath);
+    const registry = new SessionRegistry({ cwd: worktreePath, clock: () => now });
+    const session = registry.create();
+    registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "README.md", mode: "exclusive-write" }],
+    });
+    fs.appendFileSync(path.join(worktreePath, "README.md"), "managed commit\n");
+    now = new Date("2026-01-01T00:00:01.000Z");
+
+    const result = registry.commit({
+      sessionId: session.sessionId,
+      message: "record managed evidence",
+      resources: ["README.md"],
+    });
+    const snapshot = registry.evidenceSnapshot({ sessionId: session.sessionId });
+
+    assert.equal(snapshot.headId, result.commitSha);
+    assert.equal(snapshot.sessionUpdatedAt, "2026-01-01T00:00:01.000Z");
+    assert.equal(snapshot.sessionUpdatedAt, registry.get(session.sessionId)?.updatedAt);
+    assert.equal(snapshot.clean, true);
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", worktreePath], repositoryPath);
+    } catch {
+      // The repository cleanup below remains sufficient after an idempotent removal.
+    }
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("marks untracked stat evidence incomplete without dropping the path", () => {
   const repositoryPath = createRepository();
   try {
