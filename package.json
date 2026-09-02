@@ -32,7 +32,7 @@
   "devDependencies": {
     "@types/node": "^26.1.2",
     "eslint": "10.8.1",
-    "gh-inari": "0.7.0",
+    "gh-inari": "0.8.0",
     "prettier": "3.9.6",
     "tsx": "^4.19.4",
     "typescript": "^6.0.3",

@@ -15,8 +15,8 @@ importers:
         specifier: 10.8.1
         version: 10.8.1(supports-color@7.2.0)
       gh-inari:
-        specifier: 0.7.0
-        version: 0.7.0
+        specifier: 0.8.0
+        version: 0.8.0
       prettier:
         specifier: 3.9.6
         version: 3.9.6
@@ -435,8 +435,8 @@ packages:
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
 
-  gh-inari@0.7.0:
-    resolution: {integrity: sha512-auwZETe6mSIpSN8bhT7BVDmvLbqEgY6vkha0F8Ts2PJl1C5zyiYDZsHH5Tuq7du7vcF9VKngPGHxhvLK47D32g==}
+  gh-inari@0.8.0:
+    resolution: {integrity: sha512-QCBFiByGb6r3TcNKh4CZpcStvnywf3Qh3QIPDIDJJ7dGEPPwEtMed/d0XeFhXm0a/SVgqOp0N1AOTG3G3oYKGA==}
     engines: {node: '>=22.13'}
     hasBin: true
 
@@ -994,7 +994,7 @@ snapshots:
   fsevents@2.3.3:
     optional: true
 
-  gh-inari@0.7.0:
+  gh-inari@0.8.0:
     dependencies:
       yaml: 2.9.0
 
