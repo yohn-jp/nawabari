@@ -123,6 +123,7 @@ export interface CanonicalResourceClaimInput {
 
 const CLAIM_ID_PREFIX = "claim-";
 const MAX_SYMLINK_SCAN_ENTRIES = 20_000;
+const MAX_PHYSICAL_IDENTITY_ENTRIES = 20_000;
 const WINDOWS_ABSOLUTE_PATH = /^[A-Za-z]:[\\/]/u;
 const WINDOWS_DRIVE_RELATIVE_PATH = /^[A-Za-z]:/u;
 const UNSUPPORTED_GLOB_SYNTAX = /[\[\]{}()]/u;
@@ -231,9 +232,10 @@ export function canonicalizeClaimResource(resource: string, worktreePath: string
     // A glob can select a symlink that does not exist yet. Inspect all current
     // candidates below the first wildcard and reject the whole claim when
     // physical ambiguity is observable. Future callers must still revalidate.
-    assertNoSymlinkCandidates(staticPath, segments.slice(wildcardIndex).includes("**"), canonical);
+    assertNoSymlinkCandidates(staticPath.path, segments.slice(wildcardIndex).includes("**"), canonical);
+    return joinCanonicalResource(root, staticPath.path, segments.slice(staticPath.consumed));
   } else {
-    const candidate = path.resolve(root, ...segments);
+    const candidate = path.resolve(staticPath.path, ...segments.slice(staticPath.consumed));
     assertWithinRoot(root, candidate, canonical);
     const entry = lstatIfPresent(candidate);
     if (entry?.isSymbolicLink()) {
@@ -249,9 +251,8 @@ export function canonicalizeClaimResource(resource: string, worktreePath: string
         });
       }
     }
+    return joinCanonicalResource(root, staticPath.path, segments.slice(staticPath.consumed));
   }
-
-  return canonical;
 }
 
 /**
@@ -268,22 +269,9 @@ export function canonicalizeConcretePath(resource: string, worktreePath: string)
   const root = canonicalWorktreeRoot(worktreePath);
   const segments = canonical.split("/");
   const candidate = walkStaticPath(root, segments, canonical);
-  assertWithinRoot(root, candidate, canonical);
-  const entry = lstatIfPresent(candidate);
-  if (entry?.isSymbolicLink()) {
-    throw claimError("CLAIM_SYMLINK_ESCAPE", "Resource path is a symbolic link", { resource: canonical });
-  }
-  if (entry !== undefined) {
-    try {
-      assertWithinRoot(root, fs.realpathSync.native(candidate), canonical);
-    } catch (error: unknown) {
-      if (error instanceof SessionRegistryError) throw error;
-      throw claimError("CLAIM_SYMLINK_ESCAPE", "Resource path escapes its owning worktree", {
-        resource: canonical,
-      });
-    }
-  }
-  return canonical;
+  const resolved = path.resolve(candidate.path, ...segments.slice(candidate.consumed));
+  assertWithinRoot(root, resolved, canonical);
+  return joinCanonicalResource(root, candidate.path, segments.slice(candidate.consumed));
 }
 
 /** Validate a resource already persisted as canonical without requiring its worktree to exist. */
@@ -326,17 +314,21 @@ export function cloneResourceClaim(claim: ResourceClaim): ResourceClaim {
 }
 
 export function claimsOverlap(left: ResourceClaim, right: ResourceClaim): boolean {
-  return globPatternsOverlap(left.resource, right.resource);
+  if (left.resource === right.resource) return true;
+  return globPatternsOverlap(canonicalClaimResourceForComparison(left), canonicalClaimResourceForComparison(right));
 }
 
 /** Match a canonical concrete repository resource against a persisted claim. */
-export function resourceMatchesClaim(claim: Pick<ResourceClaim, "resource">, resource: string): boolean {
-  return globPatternsOverlap(claim.resource, resource);
+export function resourceMatchesClaim(
+  claim: Pick<ResourceClaim, "resource"> & Partial<Pick<ResourceClaim, "worktreePath">>,
+  resource: string,
+): boolean {
+  return globPatternsOverlap(canonicalClaimResourceForComparison(claim), resource);
 }
 
 /** Apply the existing claim compatibility matrix to one concrete resource. */
 export function resourceClaimConflictsWithAccess(
-  claim: Pick<ResourceClaim, "resource" | "mode">,
+  claim: Pick<ResourceClaim, "resource" | "mode"> & Partial<Pick<ResourceClaim, "worktreePath">>,
   resource: string,
   requiredMode: ResourceClaimMode,
 ): boolean {
@@ -344,6 +336,27 @@ export function resourceClaimConflictsWithAccess(
     resourceMatchesClaim(claim, resource) &&
     RESOURCE_CLAIM_COMPATIBILITY_MATRIX[claim.mode][requiredMode] === "conflict"
   );
+}
+
+/**
+ * Re-observe an existing persisted claim when comparing identities. Claims
+ * created before physical alias canonicalization may still contain an alias;
+ * resolving it here keeps persisted conflict and concrete authorization
+ * checks compatible. Missing worktrees are deliberately left lexical because
+ * future/non-existent resources cannot safely be case-folded.
+ */
+function canonicalClaimResourceForComparison(
+  claim: Pick<ResourceClaim, "resource"> & Partial<Pick<ResourceClaim, "worktreePath">>,
+): string {
+  if (claim.worktreePath === undefined) return claim.resource;
+  try {
+    return canonicalizeClaimResource(claim.resource, claim.worktreePath);
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError && error.code === "WORKTREE_IDENTITY_AMBIGUOUS") {
+      return claim.resource;
+    }
+    throw error;
+  }
 }
 
 export function claimsConflict(left: ResourceClaim, right: ResourceClaim): boolean {
@@ -461,22 +474,90 @@ function canonicalWorktreeRoot(worktreePath: string): string {
   return realpath;
 }
 
-function walkStaticPath(root: string, segments: readonly string[], resource: string): string {
+interface StaticPath {
+  readonly path: string;
+  readonly consumed: number;
+}
+
+/**
+ * Resolve only path entries that physically exist. Directory enumeration is
+ * used when the requested spelling is an alias: unlike global lowercasing it
+ * preserves the filesystem's own case-sensitive behavior and handles names
+ * whose equivalence is not expressible as JavaScript case folding. If an
+ * existing alias cannot be mapped to exactly one directory entry, fail
+ * closed instead of guessing.
+ */
+function walkStaticPath(root: string, segments: readonly string[], resource: string): StaticPath {
   let current = root;
   for (let index = 0; index < segments.length; index += 1) {
     const segment = segments[index];
     current = path.join(current, segment);
     assertWithinRoot(root, current, resource);
     const entry = lstatIfPresent(current);
-    if (entry?.isSymbolicLink()) {
+    if (entry === undefined) return { path: path.dirname(current), consumed: index };
+    if (entry.isSymbolicLink()) {
       throw claimError("CLAIM_SYMLINK_ESCAPE", "Claim path contains a symbolic link", { resource });
     }
     if (entry !== undefined && !entry.isDirectory() && index !== segments.length - 1) {
       throw claimError("INVALID_CLAIM_RESOURCE", "Claim path traverses a non-directory", { resource });
     }
-    if (entry === undefined) break;
+    const physicalName = resolvePhysicalEntryName(path.dirname(current), segment, entry, resource);
+    current = path.join(path.dirname(current), physicalName);
   }
-  return current;
+  return { path: current, consumed: segments.length };
+}
+
+function resolvePhysicalEntryName(
+  parent: string,
+  requestedName: string,
+  requested: fs.Stats,
+  resource: string,
+): string {
+  // An exact directory entry is already the canonical spelling on both
+  // case-sensitive and case-insensitive filesystems.
+  if (requestedName.length === 0) return requestedName;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(parent, { withFileTypes: true });
+  } catch (error: unknown) {
+    throw claimError("CLAIM_AMBIGUOUS_PATH", "Could not inspect physical path identity", { resource });
+  }
+  if (entries.length > MAX_PHYSICAL_IDENTITY_ENTRIES) {
+    throw claimError("CLAIM_AMBIGUOUS_PATH", "Directory is too large to validate physical path identity", { resource });
+  }
+  const exact = entries.find((entry) => entry.name === requestedName);
+  if (exact !== undefined) return exact.name;
+
+  const matches: string[] = [];
+  for (const entry of entries) {
+    let candidate: fs.Stats;
+    try {
+      candidate = fs.lstatSync(path.join(parent, entry.name));
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === "ENOENT") continue;
+      throw claimError("CLAIM_AMBIGUOUS_PATH", "Could not inspect physical path identity", { resource });
+    }
+    if (samePhysicalEntry(requested, candidate)) matches.push(entry.name);
+  }
+  if (matches.length !== 1) {
+    throw claimError("CLAIM_AMBIGUOUS_PATH", "Could not establish a unique physical path identity", {
+      resource,
+    });
+  }
+  return matches[0] as string;
+}
+
+function samePhysicalEntry(left: fs.Stats, right: fs.Stats): boolean {
+  // A zero inode is not a reliable identity on some platforms. In that case
+  // the caller must retain the lexical spelling rather than infer an alias.
+  return left.ino !== 0 && right.ino !== 0 && left.dev === right.dev && left.ino === right.ino;
+}
+
+function joinCanonicalResource(root: string, existingPrefix: string, unresolved: readonly string[]): string {
+  const resolved = path.resolve(existingPrefix, ...unresolved);
+  const relative = path.relative(root, resolved);
+  const physicalSegments = relative.length === 0 ? [] : relative.split(path.sep);
+  return physicalSegments.join("/");
 }
 
 function assertNoSymlinkCandidates(root: string, recursive: boolean, resource: string): void {
