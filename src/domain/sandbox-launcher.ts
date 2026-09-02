@@ -13,6 +13,15 @@ import {
   type SandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
+import {
+  attachProcessToCgroup,
+  cleanupCgroupScope,
+  cgroupLimitEvents,
+  createCgroupScope,
+  readCgroupAccounting,
+  type CgroupAccounting,
+  type CgroupScope,
+} from "./cgroups-v2.js";
 
 const SANDBOX_HOME = "/home/nawabari";
 const SANDBOX_CONFIG_HOME = `${SANDBOX_HOME}/.config`;
@@ -49,6 +58,12 @@ export type SandboxExecutionResult = {
   readonly duration_ms: number;
   /** Applied policy identity, retained as bounded machine-readable evidence. */
   readonly seccomp_profile?: SandboxSeccompProfileMetadata;
+  readonly resources?: {
+    readonly cgroup_contract_id: string;
+    readonly scope: string;
+    readonly accounting: CgroupAccounting;
+    readonly limit_events: readonly string[];
+  };
 };
 
 export type SandboxLauncherOptions = {
@@ -769,6 +784,19 @@ export function runSandboxedCommand(
   const started = Date.now();
   const profile = openSeccompProfile(invocation.value.seccomp_profile);
   if (!profile.ok) return Promise.resolve(profile);
+  let cgroupScope: CgroupScope | null = null;
+  const cgroupConfig = request.cgroups;
+  if (cgroupConfig !== undefined && (cgroupConfig.required || cgroupConfig.limits !== undefined)) {
+    const scope = createCgroupScope(
+      { session_id: request.session_id, execution_id: cgroupConfig.execution_id },
+      { root: cgroupConfig.root, limits: cgroupConfig.limits },
+    );
+    if (!scope.ok) {
+      profile.value.close();
+      return Promise.resolve(scope);
+    }
+    cgroupScope = scope.value;
+  }
   let child;
   try {
     child = spawn(invocation.value.executable, [...invocation.value.args], {
@@ -780,6 +808,7 @@ export function runSandboxedCommand(
     profile.value.close();
   } catch (error: unknown) {
     profile.value.close();
+    if (cgroupScope !== null) cleanupCgroupScope(cgroupScope);
     return Promise.resolve(
       failure(
         new DomainError("SANDBOX_EXECUTION_FAILED", "Bubblewrap could not be started.", {
@@ -787,6 +816,29 @@ export function runSandboxedCommand(
         }),
       ),
     );
+  }
+
+  if (cgroupScope !== null) {
+    const childPid = child.pid;
+    if (typeof childPid !== "number" || !Number.isSafeInteger(childPid) || childPid < 1) {
+      child.kill("SIGKILL");
+      cleanupCgroupScope(cgroupScope);
+      return Promise.resolve(
+        failure(
+          new DomainError(
+            "SANDBOX_CGROUP_SETUP_FAILED",
+            "The protected process did not expose a valid process id.",
+            {},
+          ),
+        ),
+      );
+    }
+    const attached = attachProcessToCgroup(cgroupScope, childPid);
+    if (!attached.ok) {
+      child.kill("SIGKILL");
+      cleanupCgroupScope(cgroupScope);
+      return Promise.resolve(attached);
+    }
   }
 
   return new Promise((resolve) => {
@@ -807,11 +859,28 @@ export function runSandboxedCommand(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      const accounting = cgroupScope === null ? null : readCgroupAccounting(cgroupScope);
+      if (cgroupScope !== null) {
+        const cleaned = cleanupCgroupScope(cgroupScope);
+        if (!cleaned.ok) {
+          resolve(cleaned);
+          return;
+        }
+      }
+      const resourceDetails: JsonObject =
+        cgroupScope === null || accounting === null
+          ? {}
+          : {
+              cgroup_scope: cgroupScope.name,
+              cgroup_accounting: accounting as unknown as JsonObject,
+              cgroup_limit_events: cgroupLimitEvents(accounting),
+            };
       if (spawnError !== null) {
         resolve(
           failure(
             new DomainError("SANDBOX_EXECUTION_FAILED", "Bubblewrap failed before the command could run.", {
               reason: spawnError.message.slice(0, 200),
+              ...resourceDetails,
             }),
           ),
         );
@@ -822,6 +891,7 @@ export function runSandboxedCommand(
           failure(
             new DomainError("SANDBOX_EXECUTION_TIMEOUT", "The sandboxed command exceeded its execution timeout.", {
               timeout_ms: timeoutMs,
+              ...resourceDetails,
             }),
           ),
         );
@@ -832,6 +902,7 @@ export function runSandboxedCommand(
           failure(
             new DomainError("SANDBOX_OUTPUT_LIMIT", "The sandboxed command exceeded its output limit.", {
               max_output_bytes: maxOutputBytes,
+              ...resourceDetails,
             }),
           ),
         );
@@ -865,6 +936,16 @@ export function runSandboxedCommand(
           stderr: stderr.join(""),
           duration_ms: Date.now() - started,
           seccomp_profile: invocation.value.seccomp_profile_metadata,
+          ...(cgroupScope === null || accounting === null
+            ? {}
+            : {
+                resources: {
+                  cgroup_contract_id: cgroupScope.contract_id,
+                  scope: cgroupScope.name,
+                  accounting,
+                  limit_events: cgroupLimitEvents(accounting),
+                },
+              }),
         }),
       );
     };

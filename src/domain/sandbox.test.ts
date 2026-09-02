@@ -183,6 +183,43 @@ test("resolveSandboxExecutionRequest fails closed instead of falling back when a
   }
 });
 
+test("resolveSandboxExecutionRequest treats cgroups as a profile requirement, not session lifecycle authority", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-sandbox-cgroups-required`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/sandbox-cgroups-required", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const unavailable = await resolveSandboxExecutionRequest(
+      backend,
+      { cwd: worktreePath },
+      { session_id: created.value.session_id, enforce: true, cgroups: { required: true, execution_id: "run-1" } },
+      readyProbe({ hasCgroupsV2: () => false }),
+    );
+    assert.equal(unavailable.ok, false);
+    if (!unavailable.ok) assert.equal(unavailable.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+
+    const available = await resolveSandboxExecutionRequest(
+      backend,
+      { cwd: worktreePath },
+      { session_id: created.value.session_id, enforce: true, cgroups: { required: true, execution_id: "run-1" } },
+      readyProbe(),
+    );
+    assert.equal(available.ok, true);
+    if (!available.ok) return;
+    assert.deepEqual(available.value.required_capabilities.at(-1), "cgroups_v2");
+    assert.equal(available.value.cgroups?.execution_id, "run-1");
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("resolveSandboxExecutionRequest fails closed on an unsupported platform when enforcement is requested", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-sandbox-unsupported`;

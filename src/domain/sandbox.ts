@@ -18,6 +18,7 @@ import {
   sandboxSeccompArchitectureSupported,
   sandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
+import type { CgroupLimitProfile } from "./cgroups-v2.js";
 
 /**
  * Versioned identity for the Linux sandbox execution contract (Issue #81).
@@ -151,12 +152,26 @@ export type SandboxExecutionRequest = {
   required_capabilities: SandboxCapabilityId[];
   seccomp_profile: ReturnType<typeof sandboxSeccompProfileMetadata>;
   capability_baseline: typeof sandboxCapabilityBaseline;
+  /** Optional cgroups v2 control/evidence below the session authority. */
+  cgroups?: SandboxCgroupConfig;
+};
+
+export type SandboxCgroupConfig = {
+  /** A required profile fails closed when cgroups v2 is unavailable. */
+  readonly required: boolean;
+  /** Stable execution identity; never a human/display label. */
+  readonly execution_id: string;
+  readonly limits?: CgroupLimitProfile;
+  /** Test/runtime injection; production uses the unified hierarchy. */
+  readonly root?: string;
 };
 
 export type SandboxExecutionOptions = {
   session_id: string | null;
   /** When true, resolution fails closed instead of returning an unsandboxed request. */
   enforce: boolean;
+  /** Canonical protected profile's cgroups policy, when selected. */
+  cgroups?: Omit<SandboxCgroupConfig, "execution_id"> & { readonly execution_id?: string };
 };
 
 /** Injectable capability probe so doctor/resolution logic stays host-independent and testable. */
@@ -593,6 +608,21 @@ export async function resolveSandboxExecutionRequest(
     );
   }
 
+  const requestedCgroups = options.cgroups;
+  const cgroupsRequired = requestedCgroups?.required === true || requestedCgroups?.limits !== undefined;
+  if (options.enforce && cgroupsRequired && !probe.hasCgroupsV2()) {
+    return failure(
+      new DomainError(
+        "SANDBOX_CAPABILITY_UNAVAILABLE",
+        "The protected execution profile requires cgroups v2, but it is unavailable.",
+        {
+          session_id: decision.session_id,
+          capability: "cgroups_v2",
+        },
+      ),
+    );
+  }
+
   return success({
     schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
     contract_id: SANDBOX_CONTRACT_ID,
@@ -605,9 +635,19 @@ export async function resolveSandboxExecutionRequest(
     sandbox_executable: runtimeLayout.bubblewrap,
     identity: resolveIdentity(probe),
     filesystem: deriveFilesystemTopology(decision.repository, decision.worktree, decision.session_id, runtimeLayout),
-    required_capabilities: [...SANDBOX_REQUIRED_CAPABILITIES],
+    required_capabilities: [...SANDBOX_REQUIRED_CAPABILITIES, ...(cgroupsRequired ? (["cgroups_v2"] as const) : [])],
     seccomp_profile: sandboxSeccompProfileMetadata(),
     capability_baseline: sandboxCapabilityBaseline,
+    ...(requestedCgroups === undefined
+      ? {}
+      : {
+          cgroups: {
+            required: cgroupsRequired,
+            execution_id: requestedCgroups.execution_id ?? "default",
+            ...(requestedCgroups.limits === undefined ? {} : { limits: requestedCgroups.limits }),
+            ...(requestedCgroups.root === undefined ? {} : { root: requestedCgroups.root }),
+          },
+    }),
   });
 }
 
@@ -637,3 +677,20 @@ export {
   type SandboxInvocation,
   type SandboxLauncherOptions,
 } from "./sandbox-launcher.js";
+export {
+  CGROUPS_V2_CONTRACT_ID,
+  CGROUPS_V2_ROOT,
+  attachProcessToCgroup,
+  cleanupCgroupScope,
+  cgroupLimitEvents,
+  createCgroupScope,
+  deriveCgroupScopeName,
+  readCgroupAccounting,
+  type CgroupAccounting,
+  type CgroupExecutionIdentity,
+  type CgroupFileSystem,
+  type CgroupLimitEvent,
+  type CgroupLimitProfile,
+  type CgroupScope,
+  type CgroupScopeOptions,
+} from "./cgroups-v2.js";
