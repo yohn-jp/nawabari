@@ -16,6 +16,12 @@ import {
   SESSION_LIFECYCLE_STATES,
   SESSION_LIFECYCLE_TRANSITION_TABLE,
 } from "./session-lifecycle-classification.js";
+import {
+  SANDBOX_CONTRACT_ID,
+  SANDBOX_CONTRACT_SCHEMA_VERSION,
+  SANDBOX_OPTIONAL_CAPABILITIES,
+  SANDBOX_REQUIRED_CAPABILITIES,
+} from "./domain/sandbox.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -38,6 +44,46 @@ export const RESOURCE_CLAIM_RECOVERY_SCHEMA = "resource-claim-recovery.v1" as co
  */
 export const REGISTRY_LOCK_RECOVERY_CONTRACT_ID = "nawabari.registry-lock-recovery.v1" as const;
 export const REGISTRY_LOCK_RECOVERY_CONTRACT_VERSION = 1 as const;
+
+/** Public discovery projection of the authoritative protected-execution contract. */
+const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
+  id: "protected-execution",
+  contract_id: SANDBOX_CONTRACT_ID,
+  schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
+  commands: ["session run", "session exec"],
+  command_aliases: [{ alias: "session exec", canonical: "session run" }],
+  result_schema: "sandbox-execution.v1",
+  identities: ["session_id", "repository", "worktree", "branch", "network_mode"],
+  required_capabilities: SANDBOX_REQUIRED_CAPABILITIES,
+  optional_capabilities: SANDBOX_OPTIONAL_CAPABILITIES,
+  network_mode: "inherited",
+  fail_closed: true,
+  ambient_fallback: false,
+  readiness: {
+    command: "doctor",
+    report_field: "sandbox",
+    authority: "sandboxDoctorReport",
+    fields: ["platform", "platform_supported", "capabilities", "ready", "missing_required", "network_mode"],
+  },
+  failure_codes: [
+    "SANDBOX_UNSUPPORTED_PLATFORM",
+    "SANDBOX_CAPABILITY_UNAVAILABLE",
+    "SANDBOX_TOPOLOGY_INVALID",
+    "SANDBOX_EXECUTION_FAILED",
+    "SANDBOX_EXECUTION_TIMEOUT",
+    "SANDBOX_OUTPUT_LIMIT",
+    "OPERATION_REJECTED",
+    "SESSION_NOT_FOUND",
+    "SESSION_NOT_ACTIVE",
+    "NO_CURRENT_SESSION",
+    "STALE_REGISTRY",
+    "REGISTRY_CORRUPT",
+    "REGISTRY_UNREADABLE",
+    "WORKTREE_MISMATCH",
+    "BRANCH_MISMATCH",
+    "OWNERSHIP_MISMATCH",
+  ],
+});
 
 /** Public lifecycle names are projections of the existing dispatcher/help identities. */
 const RESOURCE_CLAIM_COMMANDS = Object.freeze([
@@ -167,6 +213,7 @@ function jsonClone(value: unknown): JsonValue {
 }
 
 const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
+  PROTECTED_EXECUTION_CAPABILITY,
   {
     id: "session-lifecycle",
     commands: ["session create", "session id", "session show", "session list", "status", "session close"],
@@ -658,6 +705,19 @@ export function machineContract(packageVersion: string): JsonObject {
         : {}),
       ...(capability.id === "session-lifecycle"
         ? { registry_lock_recovery: jsonClone(capability.registry_lock_recovery) }
+        : {}),
+      ...(capability.id === "protected-execution"
+        ? {
+            contract_id: capability.contract_id,
+            schema_version: capability.schema_version,
+            command_aliases: jsonClone(capability.command_aliases),
+            required_capabilities: [...capability.required_capabilities],
+            optional_capabilities: [...capability.optional_capabilities],
+            network_mode: capability.network_mode,
+            fail_closed: capability.fail_closed,
+            ambient_fallback: capability.ambient_fallback,
+            readiness: jsonClone(capability.readiness),
+          }
         : {}),
     })),
     json: {

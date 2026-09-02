@@ -167,11 +167,16 @@ test("resolveSandboxExecutionRequest fails closed instead of falling back when a
     assert.equal(created.ok, true);
     if (!created.ok) return;
 
+    const probe = readyProbe({ hasBubblewrap: () => false });
+    const report = sandboxDoctorReport(probe);
+    assert.equal(report.ready, false);
+    assert.deepEqual(report.missing_required, ["bubblewrap"]);
+
     const result = await resolveSandboxExecutionRequest(
       backend,
       { cwd: worktreePath },
       { session_id: created.value.session_id, enforce: true },
-      readyProbe({ hasBubblewrap: () => false }),
+      probe,
     );
 
     assert.equal(result.ok, false);

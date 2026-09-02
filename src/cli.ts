@@ -2075,13 +2075,14 @@ async function executeCommand(
   if (command === "doctor") {
     const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
     if (!parsed.ok) return parsed;
-    const report = await runDoctor(dependencies.cwd);
+    const report = await runDoctor(dependencies.cwd, dependencies.sandboxProbe);
     if (!report.ok) return report;
     if (report.value.ok) return { ok: true, value: report.value as JsonObject };
     return failure(
       new DomainError("DOCTOR_FAILED", "One or more local Nawabari checks failed.", {
         checks: report.value.checks,
         repository: report.value.repository,
+        sandbox: report.value.sandbox,
       }),
     );
   }
