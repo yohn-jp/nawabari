@@ -776,6 +776,27 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
             proof: toDomainIntegrationProof(diagnostic.integrationEvidence.proof),
           }),
     },
+    ...(diagnostic.lifecycle === undefined
+      ? {}
+      : {
+          lifecycle_state: diagnostic.lifecycle.state,
+          lifecycle: {
+            schema_version: diagnostic.lifecycle.schemaVersion,
+            state: diagnostic.lifecycle.state,
+            session_state: diagnostic.lifecycle.sessionState,
+            physical_state: diagnostic.lifecycle.physicalState,
+            close_readiness: diagnostic.lifecycle.closeReadiness,
+            blockers: diagnostic.lifecycle.blockers.map((blocker) => ({
+              code: blocker.code,
+              ...(blocker.classification === undefined ? {} : { classification: blocker.classification }),
+            })),
+            recoverability: diagnostic.lifecycle.recoverability,
+            age_suspicious: diagnostic.lifecycle.ageSuspicious,
+            gc_authorized: diagnostic.lifecycle.gcAuthorized,
+            destructive_cleanup_eligible: diagnostic.lifecycle.destructiveCleanupEligible,
+            transitions: diagnostic.lifecycle.transitions.map((transition) => ({ ...transition })),
+          },
+        }),
     garbage_collection: toDomainGarbageCollectCandidate(diagnostic.garbageCollection),
   };
 }
