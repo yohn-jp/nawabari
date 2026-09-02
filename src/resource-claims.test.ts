@@ -8,6 +8,7 @@ import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
 import {
+  canonicalizeClaimResource,
   canonicalizeConcretePath,
   classifyResourceClaimTransition,
   claimsConflict,
@@ -1162,6 +1163,58 @@ test("canonicalizeConcretePath treats wildcard characters as literal filename ch
     );
   } finally {
     fs.rmSync(outside, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("canonicalizes existing case aliases by physical entry while preserving future and Linux lexical case", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const actual = path.join(fixture.repositoryPath, "README.md");
+    fs.writeFileSync(actual, "claim identity\n");
+    const aliasExists = fs.existsSync(path.join(fixture.repositoryPath, "readme.md"));
+    const canonicalActual = canonicalizeClaimResource("README.md", fixture.repositoryPath);
+    const canonicalAlias = canonicalizeClaimResource("readme.md", fixture.repositoryPath);
+    const concreteAlias = canonicalizeConcretePath("readme.md", fixture.repositoryPath);
+    const owner = {
+      sessionId: "0190f1e0-0000-7000-8000-000000000001",
+      repositoryId: fixture.repositoryPath,
+      worktreePath: fixture.repositoryPath,
+      state: "active",
+    };
+    const persistedActual = createResourceClaim(
+      { resource: "README.md", mode: "exclusive-write" },
+      owner,
+      "2026-01-01T00:00:00.000Z",
+    );
+    const persistedAlias = createResourceClaim(
+      { resource: "readme.md", mode: "exclusive-write" },
+      { ...owner, sessionId: "0190f1e0-0000-7000-8000-000000000002" },
+      "2026-01-01T00:00:00.000Z",
+    );
+
+    assert.equal(canonicalActual, "README.md");
+    assert.equal(concreteAlias, canonicalAlias);
+    if (aliasExists) {
+      // A case-insensitive filesystem exposes one physical directory entry for
+      // both spellings, so claim and concrete authorization identities agree.
+      assert.equal(canonicalAlias, canonicalActual);
+      assert.equal(claimsConflict(persistedActual, persistedAlias), true);
+      assert.equal(resourceClaimConflictsWithAccess(persistedAlias, canonicalActual, "exclusive-write"), true);
+    } else {
+      // On Linux/ext4 the alias is a non-existent future path. Do not globally
+      // lowercase it: a later creation of `readme.md` is a distinct resource.
+      assert.equal(canonicalAlias, "readme.md");
+      assert.notEqual(canonicalAlias, canonicalActual);
+      assert.equal(claimsConflict(persistedActual, persistedAlias), false);
+    }
+
+    const futureUpper = canonicalizeClaimResource("future/Thing.ts", fixture.repositoryPath);
+    const futureLower = canonicalizeClaimResource("future/thing.ts", fixture.repositoryPath);
+    assert.equal(futureUpper, "future/Thing.ts");
+    assert.equal(futureLower, "future/thing.ts");
+    assert.notEqual(futureUpper, futureLower);
+  } finally {
     fixture.cleanup();
   }
 });

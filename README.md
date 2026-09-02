@@ -337,6 +337,14 @@ garbage-collecting a session releases its claims; no separate claim registry
 or claim lock exists. Claims describe ownership state only and do not provide
 OS-level filesystem observation or a filesystem sandbox.
 
+For an existing path, canonicalization follows the physical directory entry,
+so a case-insensitive filesystem cannot give `README.md` and `readme.md`
+independent claim identities. This is determined from the filesystem entry
+itself; paths that do not exist yet, and wildcard portions of a claim, retain
+their exact lexical case because their future physical identity is unknown.
+On a case-sensitive filesystem an alternate-case spelling is therefore a
+distinct (possibly future) path, and no global lowercasing is applied.
+
 An ordinary source change uses `write` and can proceed while another session
 holds a `read` declaration:
 
