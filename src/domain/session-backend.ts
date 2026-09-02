@@ -670,6 +670,18 @@ function toDomainCommitResult(result: import("../session-registry.js").CommitRes
     commit_sha: result.commitSha,
     message: result.message,
     resources: [...result.resources],
+    ...(result.reconciliation === undefined
+      ? {}
+      : {
+          reconciliation: {
+            outcome: result.reconciliation.outcome,
+            retry_safe: result.reconciliation.retrySafe,
+            expected_head: result.reconciliation.expectedHead,
+            observed_head: result.reconciliation.observedHead,
+            expected_resources: [...result.reconciliation.expectedResources],
+            observed_resources: [...result.reconciliation.observedResources],
+          },
+        }),
   };
 }
 

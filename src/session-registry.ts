@@ -532,6 +532,21 @@ export interface CommitResult {
   readonly message: string;
   /** The commit's actual changed paths, read back from Git and proven to be within the authorized/staged set. */
   readonly resources: readonly string[];
+  /** Present only when Git reported a transport failure after the commit may have taken effect. */
+  readonly reconciliation?: CommitReconciliation;
+}
+
+export type CommitOutcome = "proven-absent" | "proven-committed" | "unresolved";
+
+/** Bounded local evidence used to classify a commit transport failure. */
+export interface CommitReconciliation {
+  readonly outcome: CommitOutcome;
+  /** A retry is safe only when the pre-commit HEAD is proven unchanged. */
+  readonly retrySafe: boolean;
+  readonly expectedHead: string;
+  readonly observedHead: string | null;
+  readonly expectedResources: readonly string[];
+  readonly observedResources: readonly string[];
 }
 
 export type PushRelation = "no-upstream" | "up-to-date" | "ahead" | "behind" | "diverged";
@@ -1749,7 +1764,24 @@ export class SessionRegistry {
         });
       }
 
-      runMutationGit(this.git, ["commit", "-m", options.message], initial.worktreePath, "commit", "COMMIT_FAILED");
+      try {
+        runMutationGit(this.git, ["commit", "-m", options.message], initial.worktreePath, "commit", "COMMIT_FAILED");
+      } catch (error: unknown) {
+        if (
+          error instanceof SessionRegistryError &&
+          (isBoundedGitFailure(error.code) || error.code === "COMMIT_FAILED")
+        ) {
+          return reconcileCommitTransportFailure(
+            this.git,
+            initial.worktreePath,
+            initial.headId,
+            stageResources,
+            options.message,
+            error,
+          );
+        }
+        throw error;
+      }
 
       let commitSha: string;
       try {
@@ -4407,6 +4439,29 @@ function isBoundedGitFailure(code: RegistryErrorCode): boolean {
   return code === "GIT_SPAWN_FAILED" || code === "GIT_TIMEOUT" || code === "GIT_OUTPUT_LIMIT";
 }
 
+function readCommitParent(git: GitCommandRunner, cwd: string, commitSha: string): string {
+  let output: string;
+  try {
+    output = git.run(["rev-list", "--parents", "-n", "1", commitSha], cwd).trim();
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw new SessionRegistryError(
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      "Could not observe the resulting commit's parent",
+      { cwd, commitSha },
+      error,
+    );
+  }
+  const fields = output.split(/\s+/u).filter((field) => field.length > 0);
+  if (fields.length < 2 || fields.some((field) => !/^[0-9a-f]{40,64}$/u.test(field))) {
+    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git returned an invalid resulting commit parent", {
+      cwd,
+      commitSha,
+    });
+  }
+  return fields[1];
+}
+
 function runMutationGit(
   git: GitCommandRunner,
   args: readonly string[],
@@ -4436,6 +4491,156 @@ function runMutationGit(
     };
     throw new SessionRegistryError(failureCode, `${phase} Git operation failed`, details, error);
   }
+}
+
+/**
+ * Reconcile a bounded commit transport failure against the only authoritative
+ * local commit evidence: HEAD and the paths recorded by that HEAD.  A
+ * transport failure is deliberately not treated as a normal commit failure
+ * until this bounded read has classified its effect.
+ */
+function reconcileCommitTransportFailure(
+  git: GitCommandRunner,
+  cwd: string,
+  expectedHead: string,
+  expectedResources: readonly string[],
+  message: string,
+  failure: SessionRegistryError,
+): CommitResult {
+  let observedHead: string;
+  try {
+    observedHead = readCurrentHead(git, cwd);
+  } catch (error: unknown) {
+    throw commitReconciliationFailure(failure, {
+      outcome: "unresolved",
+      retrySafe: false,
+      expectedHead,
+      expectedResources,
+      observedResources: [],
+      reconciliationError: error,
+    });
+  }
+
+  if (observedHead === expectedHead) {
+    throw commitReconciliationFailure(failure, {
+      outcome: "proven-absent",
+      retrySafe: true,
+      expectedHead,
+      observedHead,
+      expectedResources,
+      observedResources: [],
+    });
+  }
+
+  let parentHead: string;
+  try {
+    parentHead = readCommitParent(git, cwd, observedHead);
+  } catch (error: unknown) {
+    throw commitReconciliationFailure(failure, {
+      outcome: "unresolved",
+      retrySafe: false,
+      expectedHead,
+      observedHead,
+      expectedResources,
+      observedResources: [],
+      reconciliationError: error,
+    });
+  }
+
+  let observedResources: readonly string[];
+  try {
+    observedResources = readCanonicalCommitChangedPaths(git, cwd, observedHead);
+  } catch (error: unknown) {
+    throw commitReconciliationFailure(failure, {
+      outcome: "unresolved",
+      retrySafe: false,
+      expectedHead,
+      observedHead,
+      expectedResources,
+      observedResources: [],
+      reconciliationError: error,
+    });
+  }
+
+  if (parentHead !== expectedHead) {
+    throw commitReconciliationFailure(failure, {
+      outcome: "unresolved",
+      retrySafe: false,
+      expectedHead,
+      observedHead,
+      expectedResources,
+      observedResources,
+      reconciliationReason: "observed-head-parent-mismatch",
+    });
+  }
+
+  const expectedSet = new Set(expectedResources);
+  const divergentResources = observedResources.filter((resource) => !expectedSet.has(resource));
+  if (observedResources.length === 0 || divergentResources.length > 0) {
+    throw commitReconciliationFailure(failure, {
+      outcome: "unresolved",
+      retrySafe: false,
+      expectedHead,
+      observedHead,
+      expectedResources,
+      observedResources,
+      divergentResources,
+    });
+  }
+
+  const reconciliation: CommitReconciliation = Object.freeze({
+    outcome: "proven-committed",
+    retrySafe: false,
+    expectedHead,
+    observedHead,
+    expectedResources: Object.freeze([...expectedResources]),
+    observedResources: Object.freeze([...observedResources]),
+  });
+  return Object.freeze({
+    schemaVersion: GOVERNED_GIT_OPERATION_SCHEMA_VERSION,
+    commitSha: observedHead,
+    message,
+    resources: observedResources,
+    reconciliation,
+  });
+}
+
+type CommitReconciliationEvidence = Omit<CommitReconciliation, "observedHead"> & {
+  readonly observedHead?: string;
+  readonly reconciliationError?: unknown;
+  readonly divergentResources?: readonly string[];
+  readonly reconciliationReason?: string;
+};
+
+function commitReconciliationFailure(
+  failure: SessionRegistryError,
+  evidence: CommitReconciliationEvidence,
+): SessionRegistryError {
+  const details: RegistryErrorDetails = {
+    ...failure.details,
+    outcome: evidence.outcome,
+    retrySafe: evidence.retrySafe,
+    expectedHead: evidence.expectedHead,
+    expectedResources: [...evidence.expectedResources],
+    observedResources: [...evidence.observedResources],
+    ...(evidence.observedHead === undefined ? {} : { observedHead: evidence.observedHead }),
+    reconciliation: {
+      outcome: evidence.outcome,
+      retrySafe: evidence.retrySafe,
+      expectedHead: evidence.expectedHead,
+      expectedResources: [...evidence.expectedResources],
+      observedResources: [...evidence.observedResources],
+      ...(evidence.observedHead === undefined ? {} : { observedHead: evidence.observedHead }),
+    },
+    ...(evidence.divergentResources === undefined ? {} : { divergentResources: [...evidence.divergentResources] }),
+    ...(evidence.reconciliationReason === undefined ? {} : { reconciliationReason: evidence.reconciliationReason }),
+    ...(evidence.reconciliationError instanceof SessionRegistryError
+      ? {
+          reconciliationErrorCode: evidence.reconciliationError.code,
+        }
+      : {}),
+  };
+  return new SessionRegistryError(failure.code, failure.message, details, failure);
 }
 
 function inspectPushTarget(

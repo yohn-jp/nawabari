@@ -314,6 +314,135 @@ test("commit reports partial staging and commit failures and can be retried", ()
   }
 });
 
+test("commit reconciles a transport failure after Git already committed", () => {
+  const fixture = createFixture();
+  try {
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "post-effect\n");
+    const expectedHead = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    let injected = false;
+    const postEffectFailureGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "commit" && !injected) {
+          injected = true;
+          defaultGit.run(args, cwd);
+          throw new SessionRegistryError("GIT_TIMEOUT", "injected post-effect timeout");
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    const result = new SessionRegistry({ cwd: fixture.worktree, git: postEffectFailureGit }).commit({
+      sessionId: fixture.session.sessionId,
+      message: "post-effect",
+      resources: ["file.txt"],
+    });
+    assert.equal(result.reconciliation?.outcome, "proven-committed");
+    assert.equal(result.reconciliation?.retrySafe, false);
+    assert.equal(result.reconciliation?.expectedHead, expectedHead);
+    assert.equal(result.reconciliation?.observedHead, result.commitSha);
+    assert.deepEqual(result.reconciliation?.expectedResources, ["file.txt"]);
+    assert.deepEqual(result.reconciliation?.observedResources, ["file.txt"]);
+    assert.equal(runGit(["rev-parse", "HEAD"], fixture.worktree), result.commitSha);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("commit classifies a transport failure without a Git effect as safely retryable", () => {
+  const fixture = createFixture();
+  try {
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "pre-effect\n");
+    const expectedHead = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    let injected = false;
+    const preEffectFailureGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "commit" && !injected) {
+          injected = true;
+          throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "injected pre-effect output limit");
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () =>
+        new SessionRegistry({ cwd: fixture.worktree, git: preEffectFailureGit }).commit({
+          sessionId: fixture.session.sessionId,
+          message: "pre-effect",
+          resources: ["file.txt"],
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "GIT_OUTPUT_LIMIT" &&
+        error.details.outcome === "proven-absent" &&
+        error.details.retrySafe === true &&
+        error.details.expectedHead === expectedHead &&
+        error.details.observedHead === expectedHead,
+    );
+
+    const retry = new SessionRegistry({ cwd: fixture.worktree, git: preEffectFailureGit }).commit({
+      sessionId: fixture.session.sessionId,
+      message: "pre-effect retry",
+      resources: ["file.txt"],
+    });
+    assert.equal(retry.reconciliation, undefined);
+    assert.notEqual(retry.commitSha, expectedHead);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("commit keeps retry safety false when post-effect path reconciliation is unavailable", () => {
+  const fixture = createFixture();
+  try {
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "unresolved\n");
+    let injected = false;
+    const unresolvedGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "commit" && !injected) {
+          injected = true;
+          defaultGit.run(args, cwd);
+          throw new SessionRegistryError("GIT_TIMEOUT", "injected post-effect timeout");
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        if (args[0] === "diff-tree") {
+          throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "injected reconciliation output limit");
+        }
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () =>
+        new SessionRegistry({ cwd: fixture.worktree, git: unresolvedGit }).commit({
+          sessionId: fixture.session.sessionId,
+          message: "unresolved",
+          resources: ["file.txt"],
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "GIT_TIMEOUT" &&
+        error.details.outcome === "unresolved" &&
+        error.details.retrySafe === false &&
+        typeof error.details.observedHead === "string" &&
+        error.details.reconciliationErrorCode === "GIT_OUTPUT_LIMIT",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("commit aborts when HEAD changes between verification and staging", () => {
   const fixture = createFixture();
   try {

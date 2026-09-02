@@ -357,6 +357,18 @@ export type CommitResult = {
   commit_sha: string;
   message: string;
   resources: string[];
+  reconciliation?: CommitReconciliation;
+};
+
+export type CommitOutcome = "proven-absent" | "proven-committed" | "unresolved";
+
+export type CommitReconciliation = {
+  outcome: CommitOutcome;
+  retry_safe: boolean;
+  expected_head: string;
+  observed_head: string | null;
+  expected_resources: string[];
+  observed_resources: string[];
 };
 
 export type PushOptions = {
