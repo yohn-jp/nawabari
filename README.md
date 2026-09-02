@@ -610,11 +610,18 @@ ID, canonical worktree and branch identities, lifecycle state, and timestamps.
 
 Ownership-changing writes use an exclusive repository-local lock and a synced
 temporary file followed by atomic replacement. Concurrent creation cannot
-silently duplicate an active worktree or branch. Lock recovery is conservative:
-the lock records a random token, PID, host, and process-start identity; an
-owner is reclaimed only when the same host proves that exact process identity
-is dead. Invalid, remote, or otherwise unverifiable lock metadata is never
-stolen and fails closed so an operator can inspect or remove it deliberately.
+silently duplicate an active worktree or branch. Lock recovery is conservative
+and platform-qualified: stale-lock reclamation is supported only on Linux,
+where the lock records a random token, PID, host, and the exact process-start
+token from `/proc/<pid>/stat`. An owner is reclaimed only when the same host
+proves that exact process identity is dead; elapsed age and PID liveness alone
+are never reclaim authority. On non-Linux platforms, Node can run ordinary
+Nawabari operations but does not provide a safe process-generation identity,
+so stale local locks remain `LOCK_STALE` and require deliberate operator
+remediation. Invalid, remote, or otherwise unverifiable lock metadata is never
+stolen and fails closed. The same limitation is machine-readable under
+`capabilities --json` at the `session-lifecycle.registry_lock_recovery`
+contract.
 
 ### Conformance and extraction boundary
 

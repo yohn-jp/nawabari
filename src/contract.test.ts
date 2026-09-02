@@ -89,6 +89,29 @@ test("resource-claim capability publishes the current semantic generation withou
   assert.equal(capability.result_schema_version, RESOURCE_CLAIM_MACHINE_CONTRACT_VERSION);
 });
 
+test("session lifecycle capability truthfully publishes Linux-only stale-lock recovery", () => {
+  const contract = machineContract("test-version");
+  assert.ok(Array.isArray(contract.capabilities));
+  const lifecycle = contract.capabilities.find(
+    (candidate) =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      !Array.isArray(candidate) &&
+      candidate.id === "session-lifecycle",
+  ) as JsonRecord | undefined;
+  assert.ok(lifecycle);
+  const recovery = lifecycle?.registry_lock_recovery as JsonRecord;
+  assert.equal(recovery.contract_id, "nawabari.registry-lock-recovery.v1");
+  assert.equal(recovery.contract_version, 1);
+  assert.deepEqual(recovery.supported_platforms, ["linux"]);
+  assert.equal(recovery.unsupported_platforms, "non-linux");
+  assert.deepEqual(recovery.owner_identity, ["hostname", "pid", "processStartTime"]);
+  const staleRecovery = recovery.stale_recovery as JsonRecord;
+  assert.equal(staleRecovery.live_owner, "never-reclaim-by-age");
+  assert.equal(staleRecovery.unknown_or_remote_owner, "fail-closed");
+  assert.equal(staleRecovery.pid_only_identity, "not-sufficient");
+});
+
 test("every advertised resource lifecycle command has a result mapping and resolves through help", async () => {
   const capability = resourceCapability();
   const commands = capability.commands;

@@ -10,6 +10,13 @@ import { LOCK_SCHEMA_VERSION, type LockOwnerRecord } from "./types.js";
 
 export type LockFailureCode = "LOCK_BUSY" | "LOCK_STALE" | "LOCK_INVALID" | "LOCK_IO_ERROR" | "LOCK_RELEASE_FAILED";
 
+/**
+ * Stale-lock recovery is safe only where Nawabari can compare an exact
+ * process-generation identity.  The current implementation provides that
+ * identity through Linux /proc start-time ticks.
+ */
+export const REGISTRY_LOCK_RECOVERY_SUPPORTED_PLATFORMS = ["linux"] as const;
+
 export class RegistryLockError extends RegistryError {
   public readonly lockPath: string;
   public readonly owner?: LockOwnerRecord;
@@ -36,6 +43,8 @@ export interface RepositoryLockOptions {
   metadataGraceMs?: number;
   hostname?: string;
   processStartTime?: string | null;
+  /** Test seam for deterministic platform-specific lock behavior. */
+  platform?: NodeJS.Platform;
   clock?: () => number;
   /** Test seam used to exercise the reclaim/create race deterministically. */
   beforeReclaimRemove?: () => void | Promise<void>;
@@ -72,6 +81,7 @@ interface LockOptionsResolved {
   metadataGraceMs: number;
   hostname: string;
   processStartTime: string | null | undefined;
+  platform: NodeJS.Platform;
   clock: () => number;
   beforeReclaimRemove?: () => void | Promise<void>;
   onReclaimMarkerObserved?: () => void;
@@ -176,7 +186,9 @@ async function createOwner(options: LockOptionsResolved, now: number): Promise<L
     pid: process.pid,
     hostname: options.hostname,
     processStartTime:
-      options.processStartTime === undefined ? await readProcessStartTime(process.pid) : options.processStartTime,
+      options.processStartTime === undefined
+        ? await readProcessStartTimeForPlatform(process.pid, options.platform)
+        : options.processStartTime,
     acquiredAt: new Date(now).toISOString(),
   };
 }
@@ -188,7 +200,9 @@ function createOwnerSync(options: LockOptionsResolved, now: number): LockOwnerRe
     pid: process.pid,
     hostname: options.hostname,
     processStartTime:
-      options.processStartTime === undefined ? readProcessStartTimeSync(process.pid) : options.processStartTime,
+      options.processStartTime === undefined
+        ? readProcessStartTimeSyncForPlatform(process.pid, options.platform)
+        : options.processStartTime,
     acquiredAt: new Date(now).toISOString(),
   };
 }
@@ -210,7 +224,11 @@ async function sleep(milliseconds: number): Promise<void> {
  * stale-lock recovery because the operating system can reuse a PID.
  */
 export async function readProcessStartTime(pid: number): Promise<string | null> {
-  if (process.platform !== "linux") {
+  return readProcessStartTimeForPlatform(pid, process.platform);
+}
+
+async function readProcessStartTimeForPlatform(pid: number, platform: NodeJS.Platform): Promise<string | null> {
+  if (platform !== "linux") {
     return null;
   }
 
@@ -236,7 +254,11 @@ function parseProcessStartTime(raw: string): string | null {
 }
 
 function readProcessStartTimeSync(pid: number): string | null {
-  if (process.platform !== "linux") {
+  return readProcessStartTimeSyncForPlatform(pid, process.platform);
+}
+
+function readProcessStartTimeSyncForPlatform(pid: number, platform: NodeJS.Platform): string | null {
+  if (platform !== "linux") {
     return null;
   }
 
@@ -247,15 +269,19 @@ function readProcessStartTimeSync(pid: number): string | null {
   }
 }
 
-async function ownerLiveness(owner: LockOwnerRecord, localHostname: string): Promise<OwnerLiveness> {
-  if (owner.hostname !== localHostname || owner.processStartTime === null) {
+async function ownerLiveness(
+  owner: LockOwnerRecord,
+  localHostname: string,
+  platform: NodeJS.Platform,
+): Promise<OwnerLiveness> {
+  if (owner.hostname !== localHostname || owner.processStartTime === null || platform !== "linux") {
     return "unknown";
   }
-  if (process.platform === "linux" && !/^\d+$/.test(owner.processStartTime)) {
+  if (!/^\d+$/.test(owner.processStartTime)) {
     return "unknown";
   }
 
-  const currentStartTime = await readProcessStartTime(owner.pid);
+  const currentStartTime = await readProcessStartTimeForPlatform(owner.pid, platform);
   if (currentStartTime !== null) {
     return currentStartTime === owner.processStartTime ? "alive" : "dead";
   }
@@ -268,15 +294,15 @@ async function ownerLiveness(owner: LockOwnerRecord, localHostname: string): Pro
   }
 }
 
-function ownerLivenessSync(owner: LockOwnerRecord, localHostname: string): OwnerLiveness {
-  if (owner.hostname !== localHostname || owner.processStartTime === null) {
+function ownerLivenessSync(owner: LockOwnerRecord, localHostname: string, platform: NodeJS.Platform): OwnerLiveness {
+  if (owner.hostname !== localHostname || owner.processStartTime === null || platform !== "linux") {
     return "unknown";
   }
-  if (process.platform === "linux" && !/^\d+$/.test(owner.processStartTime)) {
+  if (!/^\d+$/.test(owner.processStartTime)) {
     return "unknown";
   }
 
-  const currentStartTime = readProcessStartTimeSync(owner.pid);
+  const currentStartTime = readProcessStartTimeSyncForPlatform(owner.pid, platform);
   if (currentStartTime !== null) {
     return currentStartTime === owner.processStartTime ? "alive" : "dead";
   }
@@ -363,6 +389,7 @@ export class RepositoryLock {
       metadataGraceMs,
       hostname: options.hostname ?? getHostname(),
       processStartTime: options.processStartTime,
+      platform: options.platform ?? process.platform,
       clock: options.clock ?? Date.now,
       beforeReclaimRemove: options.beforeReclaimRemove,
       onReclaimMarkerObserved: options.onReclaimMarkerObserved,
@@ -550,7 +577,7 @@ export class RepositoryLock {
       return { kind: "wait", owner };
     }
 
-    const liveness = await ownerLiveness(owner, this.options.hostname);
+    const liveness = await ownerLiveness(owner, this.options.hostname, this.options.platform);
     if (liveness === "alive") {
       return { kind: "wait", owner };
     }
@@ -605,7 +632,7 @@ export class RepositoryLock {
       return { kind: "wait", owner };
     }
 
-    const liveness = ownerLivenessSync(owner, this.options.hostname);
+    const liveness = ownerLivenessSync(owner, this.options.hostname, this.options.platform);
     if (liveness === "alive") {
       return { kind: "wait", owner };
     }
@@ -657,7 +684,7 @@ export class RepositoryLock {
         return false;
       }
 
-      const currentLiveness = await ownerLiveness(currentOwner, this.options.hostname);
+      const currentLiveness = await ownerLiveness(currentOwner, this.options.hostname, this.options.platform);
       const currentAge = this.options.clock() - Date.parse(currentOwner.acquiredAt);
       if (currentLiveness !== "dead" || currentAge < this.options.staleAfterMs) {
         return false;
@@ -669,7 +696,7 @@ export class RepositoryLock {
       }
       const finalAge = this.options.clock() - Date.parse(finalOwner.acquiredAt);
       if (
-        (await ownerLiveness(finalOwner, this.options.hostname)) !== "dead" ||
+        (await ownerLiveness(finalOwner, this.options.hostname, this.options.platform)) !== "dead" ||
         !Number.isFinite(finalAge) ||
         finalAge < this.options.staleAfterMs ||
         !(await this.reclaimMarkerExists())
@@ -731,7 +758,10 @@ export class RepositoryLock {
         return false;
       }
       const currentAge = this.options.clock() - Date.parse(currentOwner.acquiredAt);
-      if (ownerLivenessSync(currentOwner, this.options.hostname) !== "dead" || currentAge < this.options.staleAfterMs) {
+      if (
+        ownerLivenessSync(currentOwner, this.options.hostname, this.options.platform) !== "dead" ||
+        currentAge < this.options.staleAfterMs
+      ) {
         return false;
       }
 
@@ -740,7 +770,7 @@ export class RepositoryLock {
       if (
         finalOwner === undefined ||
         finalOwner.token !== owner.token ||
-        ownerLivenessSync(finalOwner, this.options.hostname) !== "dead" ||
+        ownerLivenessSync(finalOwner, this.options.hostname, this.options.platform) !== "dead" ||
         !Number.isFinite(finalAge) ||
         finalAge < this.options.staleAfterMs ||
         !this.reclaimMarkerExistsSync()
@@ -790,7 +820,7 @@ export class RepositoryLock {
     }
 
     const age = this.options.clock() - Date.parse(reclaimer.acquiredAt);
-    const liveness = await ownerLiveness(reclaimer, this.options.hostname);
+    const liveness = await ownerLiveness(reclaimer, this.options.hostname, this.options.platform);
     if (liveness !== "dead" || age < this.options.staleAfterMs) {
       throw new RegistryLockError(
         "LOCK_STALE",
@@ -822,7 +852,7 @@ export class RepositoryLock {
     }
 
     const age = this.options.clock() - Date.parse(reclaimer.acquiredAt);
-    const liveness = ownerLivenessSync(reclaimer, this.options.hostname);
+    const liveness = ownerLivenessSync(reclaimer, this.options.hostname, this.options.platform);
     if (liveness !== "dead" || age < this.options.staleAfterMs) {
       throw new RegistryLockError(
         "LOCK_STALE",
