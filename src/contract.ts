@@ -465,6 +465,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     result_schema: "commit.v1 / push.v1",
     identities: [
       "commit_sha",
+      "reconciliation",
       "source_sha",
       "remote",
       "branch",

@@ -529,6 +529,16 @@ successful commit — it fails with `COMMIT_RESULT_DIVERGED`, which retains the
 resulting `commitSha` (the Git commit already happened) alongside the
 authorized, actual, and divergent path sets for recovery/reconciliation.
 
+If Git reports a bounded transport failure (timeout, output limit, or spawn
+failure) after the commit invocation, Nawabari re-reads the local `HEAD` and
+that commit's bounded changed-path set before classifying the outcome. A
+failure whose `HEAD` is unchanged is reported with `outcome: "proven-absent"`
+and `retrySafe: true`; a matching new commit is returned as a successful
+result with `reconciliation.outcome: "proven-committed"` and its resulting
+SHA; if either observation is unavailable or does not match the authorized
+paths, the failure carries `outcome: "unresolved"` and `retrySafe: false`.
+Unresolved outcomes never authorize a blind retry.
+
 ```bash
 git nawabari commit --session "$NAWABARI_SESSION_ID" \
   --message 'record the local change' --resource src/example.ts --json
