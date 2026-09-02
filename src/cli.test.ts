@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { runCli } from "./cli.js";
+import { CLI_COMMAND_REGISTRY, publicCliCommandDefinitions, resolveCliCommandDefinition, runCli } from "./cli.js";
 import { DomainError, failure, success } from "./domain/errors.js";
 import type {
   ClaimDeltasOptions,
@@ -223,6 +223,141 @@ test("resource list help displays only resource-list options and does not inheri
   assert.ok(!response.options.some((option) => option.name === "--history"));
 });
 
+test("canonical command registry resolves aliases without duplicating option definitions", () => {
+  const publicDefinitions = publicCliCommandDefinitions();
+  const publicNames = publicDefinitions.map((definition) => definition.name);
+  assert.equal(new Set(publicNames).size, publicNames.length);
+
+  for (const canonical of CLI_COMMAND_REGISTRY) {
+    for (const alias of canonical.aliases ?? []) {
+      const resolved = resolveCliCommandDefinition(alias);
+      assert.ok(resolved, `${alias} should resolve through the registry`);
+      assert.deepEqual(resolved.options, canonical.options);
+      assert.equal(resolved.usage, canonical.usage.replace(canonical.name, alias));
+    }
+  }
+
+  assert.deepEqual(publicNames, [
+    "session create",
+    "session id",
+    "session show",
+    "session inspect",
+    "session run",
+    "session exec",
+    "session list",
+    "session claim",
+    "resource claim",
+    "session update",
+    "resource update",
+    "session mutate",
+    "resource mutate",
+    "session transition",
+    "resource transition",
+    "session claims",
+    "resource list",
+    "resource claims",
+    "session release",
+    "resource release",
+    "session close",
+    "session discard",
+    "authorize",
+    "checkpoint",
+    "evidence snapshot",
+    "diff",
+    "commit",
+    "push",
+    "status",
+    "guard",
+    "gc",
+    "doctor",
+    "migrate",
+    "capabilities",
+  ]);
+});
+
+test("session list discovery describes the implemented bounded pagination and history semantics", async () => {
+  const human = capture();
+  const json = capture();
+  assert.equal(await runCli(["session", "list", "--help"], { io: human.io }), 0);
+  assert.equal(await runCli(["--json", "session", "list", "--help"], { io: json.io }), 0);
+
+  const response = JSON.parse(json.stdout[0] ?? "") as {
+    help_for: string;
+    usage: string;
+    optional_options: string[];
+    defaults: Record<string, string>;
+    options: Array<{ name: string; description: string; minimum?: number; maximum?: number }>;
+    notes: string[];
+  };
+  assert.equal(response.help_for, "session list");
+  assert.match(response.usage, /--limit <n>/u);
+  assert.match(response.usage, /--offset <n>/u);
+  assert.deepEqual(response.optional_options, ["--all", "--history", "--limit", "--offset"]);
+  assert.deepEqual(response.defaults, { "--limit": "32", "--offset": "0" });
+  const limit = response.options.find((option) => option.name === "--limit");
+  const offset = response.options.find((option) => option.name === "--offset");
+  assert.equal(limit?.minimum, 1);
+  assert.equal(limit?.maximum, 128);
+  assert.equal(offset?.minimum, 0);
+  assert.match(limit?.description ?? "", /1 and 128/u);
+  assert.match(response.notes.join("\n"), /bounded/u);
+  assert.match(response.notes.join("\n"), /maximum 128/u);
+  assert.match(human.stdout.join("\n"), /--limit <n>/u);
+  assert.match(human.stdout.join("\n"), /--offset <n>/u);
+});
+
+test("resource claim discovery projects the required canonical options through its alias", async () => {
+  const canonicalOutput = capture();
+  const aliasOutput = capture();
+  assert.equal(await runCli(["--json", "session", "claim", "--help"], { io: canonicalOutput.io }), 0);
+  assert.equal(await runCli(["--json", "resource", "claim", "--help"], { io: aliasOutput.io }), 0);
+
+  const canonical = JSON.parse(canonicalOutput.stdout[0] ?? "") as {
+    help_for: string;
+    required_options: string[];
+    optional_options: string[];
+    options: Array<{ name: string; required: boolean }>;
+  };
+  const alias = JSON.parse(aliasOutput.stdout[0] ?? "") as typeof canonical & { canonical_command: string };
+  assert.equal(canonical.help_for, "session claim");
+  assert.equal(alias.help_for, "resource claim");
+  assert.equal(alias.canonical_command, "session claim");
+  assert.deepEqual(canonical.required_options, ["--resource", "--mode"]);
+  assert.deepEqual(canonical.optional_options, ["--session", "--repository"]);
+  assert.deepEqual(
+    alias.options.map((option) => option.name),
+    canonical.options.map((option) => option.name),
+  );
+  assert.deepEqual(
+    alias.options.map((option) => option.required),
+    canonical.options.map((option) => option.required),
+  );
+});
+
+test("registry-generated human and JSON help retain specialized parser surfaces", async () => {
+  const updateHuman = capture();
+  const updateJson = capture();
+  const runJson = capture();
+  assert.equal(await runCli(["session", "update", "--help"], { io: updateHuman.io }), 0);
+  assert.equal(await runCli(["--json", "session", "update", "--help"], { io: updateJson.io }), 0);
+  assert.equal(await runCli(["--json", "session", "run", "--help"], { io: runJson.io }), 0);
+
+  const update = JSON.parse(updateJson.stdout[0] ?? "") as {
+    usage: string;
+    options: Array<{ name: string }>;
+    notes: string[];
+  };
+  const run = JSON.parse(runJson.stdout[0] ?? "") as { usage: string; notes: string[] };
+  assert.match(update.usage, /--resource <path-or-glob>/u);
+  assert.match(update.usage, /--mode <read\|write\|exclusive-write>/u);
+  assert.match(update.notes.join("\n"), /immediately followed/u);
+  assert.match(update.notes.join("\n"), /adjacency/u);
+  assert.ok(update.options.some((option) => option.name === "--resource"));
+  assert.match(run.usage, / -- <command> \[args\.\.\.\]$/u);
+  assert.match(run.notes.join("\n"), /terminator is mandatory/u);
+  assert.match(updateHuman.stdout.join("\n"), /immediately followed/u);
+});
+
 test("JSON help separates global, session, and garbage-collection options", async () => {
   const output = capture();
   const exitCode = await runCli(["--help", "--json"], { io: output.io });
@@ -238,18 +373,20 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session show",
       "session inspect",
       "session run",
+      "session exec",
       "session list",
       "session claim",
-      "session update",
-      "session mutate",
-      "session transition",
-      "session claims",
-      "session release",
       "resource claim",
+      "session update",
       "resource update",
+      "session mutate",
       "resource mutate",
+      "session transition",
       "resource transition",
+      "session claims",
       "resource list",
+      "resource claims",
+      "session release",
       "resource release",
       "session close",
       "session discard",
@@ -275,6 +412,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--label",
       "--session",
       "--integrated-revision",
+      "--limit",
+      "--offset",
       "--resource",
       "--mode",
       "--repository",
@@ -302,7 +441,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
     session_targeting: {
       canonical: "--session <id>",
       positional_alias: "<session-id> as the first argument after a session-scoped subcommand",
-      commands: ["show", "inspect", "claim", "claims", "release", "update", "mutate", "transition", "close", "discard"],
+      commands: ["show", "inspect", "claim", "update", "mutate", "transition", "claims", "release", "close", "discard"],
       ambiguity: "supplying both positional and --session is rejected",
       discard_requires_explicit_target: true,
     },
