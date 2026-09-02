@@ -19,7 +19,9 @@ execution request; it does not create a second session identity. A
 machine-readable capability/doctor report distinguishes required Linux
 primitives (bubblewrap, user/mount/PID/IPC/UTS namespaces, the versioned
 seccomp baseline, and capability reduction) from optional defense-in-depth
-primitives (cgroups v2 and Landlock). When protected execution is requested and a required capability
+primitives (cgroups v2 and Landlock). The sandbox report exposes Landlock's
+observed ABI, support, and effective state (`available`, `enforced`,
+`reduced-defense`, `incompatible`, or `error`). When protected execution is requested and a required capability
 is unavailable or the platform is unsupported, resolution fails closed and
 never returns a request that claims the legacy unsandboxed path is
 protected. The lower-level contract remains responsible only for capability
@@ -43,6 +45,14 @@ shared between sessions. Selected host user-tool directories (`~/.local/bin`
 and pnpm's user bin when present) are read-only; credentials and the rest of
 the host HOME are not mounted. `/dev`, system certificates/configuration, and
 the detected runtime are explicit read-only/runtime inputs.
+
+When the host exposes a compatible Landlock ABI, the protected launcher applies
+a rule set derived from this same topology inside bubblewrap. An unavailable
+or incompatible optional ABI leaves bubblewrap active and reports
+`reduced-defense`; an adapter setup failure fails closed, and a profile that
+explicitly requires Landlock also fails closed when its adapter cannot be
+established. Setup diagnostics are bounded and no ambient/unsandboxed retry is
+attempted.
 
 On standalone Linux the profile uses existing `/usr`, `/bin`, `/lib*` and
 selected `/etc` paths only when present. On NixOS it additionally selects
