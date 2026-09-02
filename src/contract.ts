@@ -278,6 +278,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "blockers",
       "safe_actions",
       "integration_evidence",
+      "garbage_collection",
     ],
     failure_codes: [
       "INVALID_SESSION_ID",
@@ -529,7 +530,17 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "reconciliation-and-cleanup",
     commands: ["doctor", "gc"],
     result_schema: "reconciliation.v1 / cleanup.v1",
-    identities: ["clean", "issues", "candidates", "cleaned", "blocked", "recovery_hints"],
+    identities: [
+      "clean",
+      "issues",
+      "candidates",
+      "eligible",
+      "cleaned",
+      "blocked",
+      "recovery_hints",
+      "suspicion",
+      "destructive_eligibility",
+    ],
     failure_codes: [
       "RECONCILIATION_DRIFT",
       "DOCTOR_FAILED",

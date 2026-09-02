@@ -41,7 +41,7 @@ test("diagnose reports ready close readiness and not-due cleanup readiness for a
   }
 });
 
-test("diagnose reports ready cleanup readiness once the session is a stale GC candidate", () => {
+test("diagnose reports age suspicion without destructive GC eligibility for a healthy session", () => {
   const fixture = createFixture("stale-candidate");
   try {
     const registry = new SessionRegistry({ cwd: fixture.repository, staleAfterMs: 0 });
@@ -49,8 +49,10 @@ test("diagnose reports ready cleanup readiness once the session is a stale GC ca
 
     const diagnostic = registry.diagnose(session.sessionId);
     assert.equal(diagnostic.closeReadiness, "ready");
-    assert.equal(diagnostic.cleanupReadiness, "ready");
-    assert.deepEqual([...diagnostic.safeActions].sort(), ["close-session", "run-garbage-collect"]);
+    assert.equal(diagnostic.cleanupReadiness, "not_due");
+    assert.equal(diagnostic.garbageCollection.suspicion, "age");
+    assert.equal(diagnostic.garbageCollection.destructiveEligibility, "ineligible");
+    assert.deepEqual([...diagnostic.safeActions].sort(), ["close-session"]);
   } finally {
     fixture.cleanup();
   }

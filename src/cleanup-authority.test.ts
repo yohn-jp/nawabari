@@ -29,8 +29,11 @@ test("cleanup decision and dry-run expose stable dirty blockers without mutation
 
     const dryRun = registry.garbageCollect({ apply: false, staleAfterMs: 0 });
     assert.equal(dryRun.candidates.length, 1);
-    assert.equal(dryRun.blocked[0]?.code, "DIRTY_WORKTREE");
-    assert.ok(dryRun.blocked[0]?.recoveryHints.length);
+    assert.equal(dryRun.candidates[0]?.suspicion, "age");
+    assert.equal(dryRun.candidates[0]?.destructiveEligibility, "ineligible");
+    assert.equal(dryRun.candidates[0]?.destructiveEligibilityReason, "age-only");
+    assert.equal(dryRun.eligible.length, 0);
+    assert.deepEqual(dryRun.blocked, []);
     assert.equal(registry.get(session.sessionId)?.state, "active");
     assert.equal(fs.existsSync(fixture.worktree), true);
   } finally {

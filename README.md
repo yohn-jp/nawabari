@@ -216,8 +216,9 @@ destructive cleanup. A clean close releases only the owned worktree and
 branch, and repeating close is idempotent. `gc` detects stale or interrupted
 sessions; `--apply` uses the same close safety checks and reports blocked
 sessions instead of guessing. `gc --dry-run` performs the same non-mutating
-cleanup preflight and includes stable blocker codes and `recovery_hints` for
-every candidate that is not safe. Cleanup revalidates the physical worktree,
+cleanup preflight, reports age/physical/lifecycle suspicion separately from
+destructive eligibility, and includes stable blocker codes and
+`recovery_hints` for every eligible candidate that is not safe. Cleanup revalidates the physical worktree,
 branch, and `HEAD` observations immediately before each destructive Git
 operation.
 
@@ -238,12 +239,15 @@ history view; closed records remain persisted and are never silently deleted
 by listing or cleanup.
 
 `gc` stale eligibility is separate from closed-history retention. Its default
-threshold is 24 hours (`86,400,000` ms), measured from persisted `updated_at`;
-records already in `stale` or `closing` state are eligible, and an otherwise
-live record is also eligible when Git reports its registered worktree as
-missing or prunable. Physical Git/worktree state is authoritative for that
-check. `gc --dry-run` and `gc --apply` do not treat a closed record as a stale
-cleanup candidate.
+threshold is 24 hours (`86,400,000` ms), measured from persisted `updated_at`.
+Elapsed age is diagnostic suspicion only: it never authorizes destructive
+cleanup for a physically healthy active session. Records already in `stale` or
+`closing` state are eligible, as is an otherwise live record when Git reports
+its registered worktree as safely prunable and missing. Ambiguous physical
+state remains ineligible and fail-closed. `gc --dry-run` exposes suspicion and
+destructive eligibility/reason separately for each candidate; `gc --apply`
+uses only eligible candidates. Closed records are never stale cleanup
+candidates.
 
 `doctor` includes a non-destructive `reconciliation` check. It reports
 registry/Git ownership drift, including missing or prunable worktrees and

@@ -663,7 +663,15 @@ test("the CLI gc path recovers a prunable worktree before branch reuse", async (
       ok: boolean;
       command: string;
       apply: boolean;
-      candidates: Array<{ session_id: string }>;
+      candidates: Array<{
+        session_id: string;
+        suspicion: string;
+        suspicion_reason: string;
+        destructive_eligibility: string;
+        destructive_eligibility_reason: string;
+        physical_state: string;
+      }>;
+      eligible: Array<{ session_id: string }>;
       cleaned: unknown[];
       blocked: unknown[];
     }>(repositoryPath, ["gc", "--dry-run"]);
@@ -674,6 +682,15 @@ test("the CLI gc path recovers a prunable worktree before branch reuse", async (
       dryRun.candidates.map((candidate) => candidate.session_id),
       [created.session_id],
     );
+    assert.equal(dryRun.candidates[0]?.suspicion, "physical");
+    assert.equal(dryRun.candidates[0]?.suspicion_reason, "missing-worktree");
+    assert.equal(dryRun.candidates[0]?.destructive_eligibility, "eligible");
+    assert.equal(dryRun.candidates[0]?.destructive_eligibility_reason, "prunable-missing-worktree");
+    assert.equal(dryRun.candidates[0]?.physical_state, "prunable-missing");
+    assert.deepEqual(
+      dryRun.eligible.map((candidate) => candidate.session_id),
+      [created.session_id],
+    );
     assert.deepEqual(dryRun.cleaned, []);
     assert.deepEqual(dryRun.blocked, []);
 
@@ -682,6 +699,7 @@ test("the CLI gc path recovers a prunable worktree before branch reuse", async (
       command: string;
       apply: boolean;
       candidates: Array<{ session_id: string; state: string }>;
+      eligible: Array<{ session_id: string }>;
       cleaned: Array<{ session_id: string; state: string }>;
       blocked: unknown[];
     }>(repositoryPath, ["gc", "--apply"]);
@@ -690,6 +708,10 @@ test("the CLI gc path recovers a prunable worktree before branch reuse", async (
     assert.equal(applied.apply, true);
     assert.deepEqual(
       applied.candidates.map((candidate) => candidate.session_id),
+      [created.session_id],
+    );
+    assert.deepEqual(
+      applied.eligible.map((candidate) => candidate.session_id),
       [created.session_id],
     );
     assert.equal(applied.cleaned.length, 1);
@@ -775,6 +797,7 @@ test("the local backend exposes close and gc as stable automation results", asyn
       command: "gc",
       apply: false,
       candidates: [],
+      eligible: [],
       cleaned: [],
       blocked: [],
     });
