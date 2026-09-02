@@ -6,6 +6,18 @@ import process from "node:process";
 
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import type { SessionBackend, SessionContext } from "./session.js";
+import {
+  SANDBOX_CAPABILITY_BASELINE_ID,
+  SANDBOX_CAPABILITY_BASELINE_VERSION,
+  SANDBOX_SECCOMP_DEFAULT_ACTION,
+  SANDBOX_SECCOMP_DENIAL_ACTION,
+  SANDBOX_SECCOMP_DENIED_SYSCALLS,
+  SANDBOX_SECCOMP_PROFILE_ID,
+  SANDBOX_SECCOMP_PROFILE_VERSION,
+  sandboxCapabilityBaseline,
+  sandboxSeccompArchitectureSupported,
+  sandboxSeccompProfileMetadata,
+} from "./sandbox-seccomp.js";
 
 /**
  * Versioned identity for the Linux sandbox execution contract (Issue #81).
@@ -44,15 +56,12 @@ export const SANDBOX_REQUIRED_CAPABILITIES: readonly SandboxCapabilityId[] = Obj
   "pid_namespace",
   "ipc_namespace",
   "uts_namespace",
-]);
-
-/** Defense-in-depth capabilities that strengthen but do not gate readiness. */
-export const SANDBOX_OPTIONAL_CAPABILITIES: readonly SandboxCapabilityId[] = Object.freeze([
-  "cgroups_v2",
-  "landlock",
   "seccomp",
   "capabilities",
 ]);
+
+/** Defense-in-depth capabilities that strengthen but do not gate readiness. */
+export const SANDBOX_OPTIONAL_CAPABILITIES: readonly SandboxCapabilityId[] = Object.freeze(["cgroups_v2", "landlock"]);
 
 export type SandboxCapabilityRequirement = "required" | "optional";
 export type SandboxCapabilityStatus = "available" | "unavailable" | "not_applicable";
@@ -81,6 +90,8 @@ export type SandboxDoctorReport = {
   capabilities: SandboxCapabilityCheck[];
   ready: boolean;
   missing_required: SandboxCapabilityId[];
+  seccomp_profile: ReturnType<typeof sandboxSeccompProfileMetadata>;
+  capability_baseline: typeof sandboxCapabilityBaseline;
 };
 
 /**
@@ -138,6 +149,8 @@ export type SandboxExecutionRequest = {
   identity: SandboxIdentity;
   filesystem: SandboxFilesystemTopology;
   required_capabilities: SandboxCapabilityId[];
+  seccomp_profile: ReturnType<typeof sandboxSeccompProfileMetadata>;
+  capability_baseline: typeof sandboxCapabilityBaseline;
 };
 
 export type SandboxExecutionOptions = {
@@ -336,14 +349,35 @@ function capabilityCheck(
       details: {},
     };
   }
-  const available = NAMESPACE_CAPABILITIES.has(id) ? namespaceSupport : CAPABILITY_PROBE[id](probe);
+  const available = NAMESPACE_CAPABILITIES.has(id)
+    ? namespaceSupport
+    : id === "seccomp"
+      ? CAPABILITY_PROBE[id](probe) && sandboxSeccompArchitectureSupported()
+      : CAPABILITY_PROBE[id](probe);
+  const details: JsonObject =
+    id === "seccomp"
+      ? {
+          profile_id: SANDBOX_SECCOMP_PROFILE_ID,
+          profile_version: SANDBOX_SECCOMP_PROFILE_VERSION,
+          default_action: SANDBOX_SECCOMP_DEFAULT_ACTION,
+          denial_action: SANDBOX_SECCOMP_DENIAL_ACTION,
+          denied_syscalls: [...SANDBOX_SECCOMP_DENIED_SYSCALLS],
+        }
+      : id === "capabilities"
+        ? {
+            baseline_id: SANDBOX_CAPABILITY_BASELINE_ID,
+            baseline_version: SANDBOX_CAPABILITY_BASELINE_VERSION,
+            ambient_capabilities: [...sandboxCapabilityBaseline.ambient_capabilities],
+            enforcement: sandboxCapabilityBaseline.enforcement,
+          }
+        : {};
   return {
     id,
     requirement,
     status: available ? "available" : "unavailable",
     code: available ? null : "SANDBOX_CAPABILITY_UNAVAILABLE",
     message: available ? `${label} is available.` : `${label} is not available.`,
-    details: {},
+    details,
   };
 }
 
@@ -376,6 +410,8 @@ export function sandboxDoctorReport(probe: SandboxProbe = defaultSandboxProbe): 
     capabilities,
     ready: platformSupported && missingRequired.length === 0,
     missing_required: missingRequired,
+    seccomp_profile: sandboxSeccompProfileMetadata(),
+    capability_baseline: sandboxCapabilityBaseline,
   };
 }
 
@@ -570,8 +606,28 @@ export async function resolveSandboxExecutionRequest(
     identity: resolveIdentity(probe),
     filesystem: deriveFilesystemTopology(decision.repository, decision.worktree, decision.session_id, runtimeLayout),
     required_capabilities: [...SANDBOX_REQUIRED_CAPABILITIES],
+    seccomp_profile: sandboxSeccompProfileMetadata(),
+    capability_baseline: sandboxCapabilityBaseline,
   });
 }
+
+export {
+  compileSandboxSeccompProfile,
+  sandboxCapabilityBaseline,
+  sandboxSeccompProfileMetadata,
+  sandboxSeccompArchitectureSupported,
+  SANDBOX_AMBIENT_CAPABILITIES,
+  SANDBOX_CAPABILITY_BASELINE_ID,
+  SANDBOX_CAPABILITY_BASELINE_VERSION,
+  SANDBOX_SECCOMP_DEFAULT_ACTION,
+  SANDBOX_SECCOMP_DENIAL_ACTION,
+  SANDBOX_SECCOMP_DENIED_SYSCALLS,
+  SANDBOX_SECCOMP_PROFILE_ID,
+  SANDBOX_SECCOMP_PROFILE_VERSION,
+  SANDBOX_SECCOMP_PROFILE,
+  type SandboxCapabilityBaseline,
+  type SandboxSeccompProfileMetadata,
+} from "./sandbox-seccomp.js";
 
 export {
   compileSandboxInvocation,

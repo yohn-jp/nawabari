@@ -4,6 +4,14 @@ import path from "node:path";
 import process from "node:process";
 
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
+import {
+  compileSandboxSeccompProfile,
+  SANDBOX_CAPABILITY_BASELINE_ID,
+  SANDBOX_CAPABILITY_BASELINE_VERSION,
+  SANDBOX_SECCOMP_PROFILE_ID,
+  SANDBOX_SECCOMP_PROFILE_VERSION,
+  type SandboxSeccompProfileMetadata,
+} from "./sandbox-seccomp.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 
 const SANDBOX_HOME = "/home/nawabari";
@@ -28,6 +36,9 @@ export type SandboxInvocation = {
   readonly args: readonly string[];
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
+  /** Raw sock_filter bytes supplied to bubblewrap through inherited fd 3. */
+  readonly seccomp_profile: Uint8Array;
+  readonly seccomp_profile_metadata: SandboxSeccompProfileMetadata;
 };
 
 export type SandboxExecutionResult = {
@@ -36,6 +47,8 @@ export type SandboxExecutionResult = {
   readonly stdout: string;
   readonly stderr: string;
   readonly duration_ms: number;
+  /** Applied policy identity, retained as bounded machine-readable evidence. */
+  readonly seccomp_profile?: SandboxSeccompProfileMetadata;
 };
 
 export type SandboxLauncherOptions = {
@@ -508,6 +521,24 @@ export function compileSandboxInvocation(
   if (!topology.ok) return topology;
   const profilePaths = validateProfilePaths(request);
   if (!profilePaths.ok) return profilePaths;
+  if (
+    request.seccomp_profile.id !== SANDBOX_SECCOMP_PROFILE_ID ||
+    request.seccomp_profile.version !== SANDBOX_SECCOMP_PROFILE_VERSION ||
+    request.capability_baseline.id !== SANDBOX_CAPABILITY_BASELINE_ID ||
+    request.capability_baseline.version !== SANDBOX_CAPABILITY_BASELINE_VERSION ||
+    request.capability_baseline.ambient_capabilities.length !== 0
+  ) {
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The protected execution security baseline is incompatible.", {
+        seccomp_profile_id: request.seccomp_profile.id,
+        seccomp_profile_version: request.seccomp_profile.version,
+        capability_baseline_id: request.capability_baseline.id,
+        capability_baseline_version: request.capability_baseline.version,
+      }),
+    );
+  }
+  const seccompProfile = compileSandboxSeccompProfile(request.seccomp_profile.architecture);
+  if (!seccompProfile.ok) return seccompProfile;
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
   const pathValue = pathEntriesForEnvironment(request).join(":");
@@ -526,6 +557,8 @@ export function compileSandboxInvocation(
     "0",
     "--cap-drop",
     "ALL",
+    "--seccomp",
+    "3",
     "--clearenv",
     "--setenv",
     "HOME",
@@ -616,7 +649,76 @@ export function compileSandboxInvocation(
     LOGNAME: "nawabari",
     NAWABARI_SESSION_ID: request.session_id,
   };
-  return success({ executable: executable.value, args, cwd: topology.value.worktree, env });
+  return success({
+    executable: executable.value,
+    args,
+    cwd: topology.value.worktree,
+    env,
+    seccomp_profile: seccompProfile.value,
+    seccomp_profile_metadata: request.seccomp_profile,
+  });
+}
+
+type SeccompProfileHandle = {
+  readonly fd: number;
+  readonly close: () => void;
+};
+
+/**
+ * Give bubblewrap an unlinked, read-only profile file.  The descriptor stays
+ * open only for the launch; no profile pathname is exposed inside the child.
+ */
+function openSeccompProfile(profile: Uint8Array): DomainResult<SeccompProfileHandle> {
+  let directory: string | null = null;
+  let fd: number | null = null;
+  try {
+    directory = fs.mkdtempSync(path.join(requirementTempDirectory(), "nawabari-seccomp-"));
+    const profilePath = path.join(directory, "profile.bpf");
+    fs.writeFileSync(profilePath, profile, { mode: 0o600 });
+    fd = fs.openSync(profilePath, fs.constants.O_RDONLY);
+    fs.unlinkSync(profilePath);
+    fs.rmdirSync(directory);
+    directory = null;
+    return success({
+      fd,
+      close: () => {
+        try {
+          fs.closeSync(fd as number);
+        } catch {
+          // Closing an already-closed descriptor is harmless cleanup.
+        }
+      },
+    });
+  } catch (error: unknown) {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Preserve the original setup failure.
+      }
+    }
+    if (directory !== null) {
+      try {
+        fs.rmSync(directory, { recursive: true, force: true });
+      } catch {
+        // Best-effort cleanup; the profile is never used after setup failure.
+      }
+    }
+    return failure(
+      new DomainError(
+        "SANDBOX_EXECUTION_FAILED",
+        "The seccomp baseline could not be prepared for protected execution.",
+        {
+          profile_id: SANDBOX_SECCOMP_PROFILE_ID,
+          reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+        },
+      ),
+    );
+  }
+}
+
+function requirementTempDirectory(): string {
+  return process.env.TMPDIR !== undefined && path.isAbsolute(process.env.TMPDIR) ? process.env.TMPDIR : "/tmp";
 }
 
 function boundedOutput(
@@ -665,15 +767,19 @@ export function runSandboxedCommand(
   }
 
   const started = Date.now();
+  const profile = openSeccompProfile(invocation.value.seccomp_profile);
+  if (!profile.ok) return Promise.resolve(profile);
   let child;
   try {
     child = spawn(invocation.value.executable, [...invocation.value.args], {
       cwd: invocation.value.cwd,
       env: { ...invocation.value.env },
       shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe", profile.value.fd],
     });
+    profile.value.close();
   } catch (error: unknown) {
+    profile.value.close();
     return Promise.resolve(
       failure(
         new DomainError("SANDBOX_EXECUTION_FAILED", "Bubblewrap could not be started.", {
@@ -731,6 +837,26 @@ export function runSandboxedCommand(
         );
         return;
       }
+      const diagnostic = stderr.join("");
+      if (code !== 0 && /^bwrap:/mu.test(diagnostic)) {
+        const seccompFailure = /seccomp/u.test(diagnostic);
+        resolve(
+          failure(
+            new DomainError(
+              seccompFailure ? "SANDBOX_CAPABILITY_UNAVAILABLE" : "SANDBOX_EXECUTION_FAILED",
+              seccompFailure
+                ? "The required seccomp baseline could not be applied by bubblewrap."
+                : "Bubblewrap could not establish the protected execution boundary.",
+              {
+                profile_id: invocation.value.seccomp_profile_metadata.id,
+                profile_version: invocation.value.seccomp_profile_metadata.version,
+                stderr: diagnostic.slice(0, maxOutputBytes),
+              },
+            ),
+          ),
+        );
+        return;
+      }
       resolve(
         success({
           exit_code: code,
@@ -738,6 +864,7 @@ export function runSandboxedCommand(
           stdout: stdout.join(""),
           stderr: stderr.join(""),
           duration_ms: Date.now() - started,
+          seccomp_profile: invocation.value.seccomp_profile_metadata,
         }),
       );
     };

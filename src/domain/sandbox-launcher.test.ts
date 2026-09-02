@@ -9,11 +9,23 @@ import { fileURLToPath } from "node:url";
 import { LocalSessionBackend } from "./session-backend.js";
 import {
   compileSandboxInvocation,
+  compileSandboxSeccompProfile,
   discoverSandboxRuntimeLayout,
   resolveSandboxExecutionRequest,
   runSandboxedCommand,
   type SandboxProbe,
 } from "./sandbox.js";
+
+test("the seccomp baseline is versioned, deterministic, and uses bounded EPERM denials", () => {
+  const first = compileSandboxSeccompProfile("x64");
+  const second = compileSandboxSeccompProfile("x64");
+  assert.equal(first.ok, true, first.ok ? "" : JSON.stringify(first.error));
+  assert.equal(second.ok, true, second.ok ? "" : JSON.stringify(second.error));
+  if (!first.ok || !second.ok) return;
+  assert.deepEqual([...first.value], [...second.value]);
+  assert.equal(first.value.byteLength % 8, 0);
+  assert.ok(first.value.byteLength > 0);
+});
 
 /**
  * Repository-owned, controlled/fake bubblewrap substitute. Each controlled
@@ -132,6 +144,10 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
     assert.ok(compiled.value.args.includes("--unshare-pid"));
     assert.ok(compiled.value.args.includes("--unshare-ipc"));
     assert.ok(compiled.value.args.includes("--unshare-uts"));
+    assert.deepEqual(
+      compiled.value.args.slice(compiled.value.args.indexOf("--seccomp"), compiled.value.args.indexOf("--seccomp") + 2),
+      ["--seccomp", "3"],
+    );
     assert.ok(!compiled.value.args.includes("--unshare-net"));
     const terminator = compiled.value.args.indexOf("--");
     assert.ok(terminator > 0);
@@ -160,6 +176,26 @@ test("compileSandboxInvocation rejects a path outside the fixed system profile",
     const compiled = compileSandboxInvocation(invalid, { command: "true" });
     assert.equal(compiled.ok, false);
     if (!compiled.ok) assert.equal(compiled.error.code, "SANDBOX_TOPOLOGY_INVALID");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("protected execution rejects an incompatible seccomp architecture without fallback", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const incompatible = {
+      ...request,
+      seccomp_profile: { ...request.seccomp_profile, architecture: "mips64" },
+    };
+    const result = compileSandboxInvocation(incompatible, { command: "true" });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
@@ -276,6 +312,18 @@ test("a protected session runs with a private root/tmp/proc view and only its ow
     const pnpm = await runSandboxedCommand(request, { command: "pnpm", args: ["--version"] });
     assert.equal(pnpm.ok, true, pnpm.ok ? "" : JSON.stringify(pnpm.error));
     if (pnpm.ok) assert.match(pnpm.value.stdout.trim(), /^\d+\.\d+\.\d+$/u, JSON.stringify(pnpm.value));
+
+    const denied = await runSandboxedCommand(request, {
+      command: "sh",
+      args: ["-ceu", "unshare -Ur true"],
+    });
+    assert.equal(denied.ok, true, denied.ok ? "" : JSON.stringify(denied.error));
+    if (denied.ok) {
+      assert.equal(denied.value.exit_code, 1, JSON.stringify(denied.value));
+      assert.match(denied.value.stderr, /[Pp]ermission denied|Operation not permitted/u);
+      assert.equal(denied.value.seccomp_profile?.id, "nawabari.seccomp.v1");
+      assert.equal(denied.value.seccomp_profile?.version, 1);
+    }
   } finally {
     removeWorktree(repository, worktree);
     fs.rmSync(sibling, { recursive: true, force: true });

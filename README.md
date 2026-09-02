@@ -17,9 +17,9 @@ authority (`src/domain/sandbox.ts`, contract
 resolved through the authoritative registry/guard path to a typed sandbox
 execution request; it does not create a second session identity. A
 machine-readable capability/doctor report distinguishes required Linux
-primitives (bubblewrap, user/mount/PID/IPC/UTS namespaces) from optional
-defense-in-depth primitives (cgroups v2, Landlock, seccomp, capability
-inspection). When protected execution is requested and a required capability
+primitives (bubblewrap, user/mount/PID/IPC/UTS namespaces, the versioned
+seccomp baseline, and capability reduction) from optional defense-in-depth
+primitives (cgroups v2 and Landlock). When protected execution is requested and a required capability
 is unavailable or the platform is unsupported, resolution fails closed and
 never returns a request that claims the legacy unsandboxed path is
 protected. The lower-level contract remains responsible only for capability
@@ -48,8 +48,11 @@ On standalone Linux the profile uses existing `/usr`, `/bin`, `/lib*` and
 selected `/etc` paths only when present. On NixOS it additionally selects
 `/nix/store`, `/run/current-system`, `/run/wrappers`, and the per-user profile
 when present; no `/usr` layout is assumed. Missing required paths or namespace
-support produces a stable capability/topology error. Network remains
-inherited by design.
+support produces a stable capability/topology error. The protected child uses
+`nawabari.seccomp.v1`, a compatibility-first deny-list whose policy denials
+return `EPERM` rather than hanging or terminating ordinary development
+subprocess trees. Ambient capabilities are empty (`--cap-drop ALL`). Network
+remains inherited by design.
 
 ## Install
 
