@@ -1883,7 +1883,11 @@ export class SessionRegistry {
       const leaseValue = inspection.observedRemoteSha ?? "";
       const pushArguments = [
         "push",
-        ...(force ? [`--force-with-lease=${targetRef}:${leaseValue}`] : ["--no-force"]),
+        // Exact-generation CAS is required for every push mutation. The
+        // force authorization check above remains independent: force is only
+        // allowed for the behind/diverged relations, while the lease binds
+        // either kind of push to the generation observed during inspection.
+        `--force-with-lease=${targetRef}:${leaseValue}`,
         ...(createUpstream ? ["--set-upstream"] : []),
         remote,
         `${finalContext.headId}:${targetRef}`,

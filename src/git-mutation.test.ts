@@ -772,12 +772,45 @@ test("push sends the captured source SHA and exact observed remote lease", () =>
     const pushCommand = commands.find((args) => args[0] === "push");
     assert.ok(pushCommand !== undefined);
     assert.ok(!pushCommand.some((argument) => argument.includes("HEAD:")));
-    assert.ok(!pushCommand.some((argument) => argument.includes("--force-with-lease")));
-    assert.ok(pushCommand.includes("--no-force"));
+    assert.ok(pushCommand.includes(`--force-with-lease=refs/heads/${fixture.session.branchName}:${initial.sourceSha}`));
     assert.ok(pushCommand.includes(`${sourceSha}:refs/heads/${fixture.session.branchName}`));
     assert.equal(result.sourceSha, sourceSha);
     assert.equal(result.targetRef, `refs/heads/${fixture.session.branchName}`);
     assert.equal(result.observedRemoteSha, initial.sourceSha);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("new remote refs use an empty exact-generation lease when unchanged", () => {
+  const fixture = createFixture(true);
+  try {
+    claim(fixture);
+    const options = {
+      sessionId: fixture.session.sessionId,
+      resources: ["file.txt"],
+      remote: "origin",
+      branch: fixture.session.branchName,
+      createUpstream: true,
+    } as const;
+    const commands: string[][] = [];
+    const observingGit: GitCommandRunner = {
+      run(args, cwd): string {
+        commands.push([...args]);
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        commands.push([...args]);
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    const result = new SessionRegistry({ cwd: fixture.worktree, git: observingGit }).push(options);
+    const pushCommand = commands.find((args) => args[0] === "push");
+    assert.ok(pushCommand !== undefined);
+    assert.ok(pushCommand.includes(`--force-with-lease=refs/heads/${fixture.session.branchName}:`));
+    assert.equal(result.observedRemoteSha, null);
+    assert.equal(result.upstreamCreated, true);
   } finally {
     fixture.cleanup();
   }
@@ -836,6 +869,125 @@ test("push rejects a remote race after inspection with the exact lease", () => {
     assert.equal(
       runGit(["rev-parse", `refs/heads/${fixture.session.branchName}`], fixture.remote as string),
       runGit(["rev-parse", "HEAD"], clone),
+    );
+  } finally {
+    fs.rmSync(clone, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("ordinary push rejects a remote advance even when the new tip is an ancestor of the source", () => {
+  const fixture = createFixture(true);
+  const clone = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-mutation-ordinary-race-"));
+  try {
+    claim(fixture);
+    const options = {
+      sessionId: fixture.session.sessionId,
+      resources: ["file.txt"],
+      remote: "origin",
+      branch: fixture.session.branchName,
+    } as const;
+    const initial = fixture.current.push({ ...options, createUpstream: true });
+    runGit(["clone", "--branch", fixture.session.branchName, fixture.remote as string, clone], clone);
+    runGit(["config", "user.email", "race@example.invalid"], clone);
+    runGit(["config", "user.name", "Race"], clone);
+    fs.appendFileSync(path.join(clone, "file.txt"), "remote-advance\n");
+    runGit(["commit", "-am", "remote advance"], clone);
+    const remoteAdvanceSha = runGit(["rev-parse", "HEAD"], clone);
+
+    // Put the same remote advance into the local source before inspection.
+    // The remote itself remains at initial.sourceSha until the race hook runs,
+    // making remoteAdvanceSha an ancestor of the intended local source.
+    runGit(["fetch", clone, `HEAD:refs/nawabari/push-test/${remoteAdvanceSha}`], fixture.worktree);
+    runGit(["merge", "--ff-only", `refs/nawabari/push-test/${remoteAdvanceSha}`], fixture.worktree);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "local-source\n");
+    runGit(["commit", "-am", "local source"], fixture.worktree);
+
+    let raced = false;
+    const raceGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "push" && !raced) {
+          raced = true;
+          runGit(["push", "origin", `HEAD:refs/heads/${fixture.session.branchName}`], clone);
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () =>
+        new SessionRegistry({ cwd: fixture.worktree, git: raceGit }).push({
+          ...options,
+          createUpstream: false,
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "PUSH_FAILED" &&
+        typeof error.details.command === "string" &&
+        error.details.command.includes(
+          `--force-with-lease=refs/heads/${fixture.session.branchName}:${initial.sourceSha}`,
+        ),
+    );
+    assert.equal(raced, true);
+    assert.equal(
+      runGit(["rev-parse", `refs/heads/${fixture.session.branchName}`], fixture.remote as string),
+      remoteAdvanceSha,
+    );
+  } finally {
+    fs.rmSync(clone, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("new remote refs use an empty lease and reject creation races", () => {
+  const fixture = createFixture(true);
+  const clone = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-mutation-new-ref-race-"));
+  try {
+    claim(fixture);
+    const options = {
+      sessionId: fixture.session.sessionId,
+      resources: ["file.txt"],
+      remote: "origin",
+      branch: fixture.session.branchName,
+      createUpstream: true,
+    } as const;
+    runGit(["clone", fixture.remote as string, clone], clone);
+    runGit(["config", "user.email", "race@example.invalid"], clone);
+    runGit(["config", "user.name", "Race"], clone);
+    runGit(["checkout", "-b", fixture.session.branchName, "origin/main"], clone);
+    fs.appendFileSync(path.join(clone, "file.txt"), "remote-creation\n");
+    runGit(["commit", "-am", "remote creation"], clone);
+    const remoteCreationSha = runGit(["rev-parse", "HEAD"], clone);
+
+    let raced = false;
+    const raceGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "push" && !raced) {
+          raced = true;
+          runGit(["push", "origin", `HEAD:refs/heads/${fixture.session.branchName}`], clone);
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () => new SessionRegistry({ cwd: fixture.worktree, git: raceGit }).push(options),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "PUSH_FAILED" &&
+        typeof error.details.command === "string" &&
+        error.details.command.includes(`--force-with-lease=refs/heads/${fixture.session.branchName}:`),
+    );
+    assert.equal(raced, true);
+    assert.equal(
+      runGit(["rev-parse", `refs/heads/${fixture.session.branchName}`], fixture.remote as string),
+      remoteCreationSha,
     );
   } finally {
     fs.rmSync(clone, { recursive: true, force: true });
