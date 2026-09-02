@@ -55,6 +55,10 @@ export interface RepositoryEvidenceSnapshot {
   readonly sessionId: string;
   readonly sessionState: string;
   readonly sessionCreatedAt: string;
+  /**
+   * UTC timestamp of the last authoritative session-state mutation. Managed
+   * commits advance this value; arbitrary external Git changes do not.
+   */
   readonly sessionUpdatedAt: string;
   readonly baseRevision: string | null;
   readonly baseRevisionProven: boolean;

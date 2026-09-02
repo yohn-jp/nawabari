@@ -121,6 +121,11 @@ export interface SessionRecord {
   readonly branchName: string;
   readonly state: SessionState;
   readonly createdAt: string;
+  /**
+   * UTC timestamp of the last authoritative session-state mutation. A
+   * Nawabari-managed commit is a session/evidence mutation and advances this
+   * timestamp; arbitrary Git changes made outside Nawabari do not.
+   */
   readonly updatedAt: string;
   /** Exact revision observed at session creation, when the registry can prove it. */
   readonly baseRevision?: string;
@@ -1797,6 +1802,8 @@ export class SessionRegistry {
         );
       }
 
+      this.persistManagedCommitTimestamp(initial, commitSha);
+
       return Object.freeze({
         schemaVersion: GOVERNED_GIT_OPERATION_SCHEMA_VERSION,
         commitSha,
@@ -1808,6 +1815,56 @@ export class SessionRegistry {
 
   commitSession(options: CommitOptions): CommitResult {
     return this.commit(options);
+  }
+
+  /**
+   * Persist the session/evidence generation produced by a managed commit.
+   * Git and registry observations remain under the same repository lock so a
+   * following evidence snapshot cannot combine the new HEAD with stale
+   * session freshness metadata.
+   */
+  private persistManagedCommitTimestamp(initial: VerifiedExecutionContext, commitSha: string): void {
+    try {
+      const state = this.readStateUnsafe();
+      const current = state.sessions.find((record) => record.sessionId === initial.session.sessionId);
+      if (
+        current === undefined ||
+        current.state !== initial.session.state ||
+        current.repositoryId !== initial.session.repositoryId ||
+        current.worktreeId !== initial.session.worktreeId ||
+        current.branchId !== initial.session.branchId
+      ) {
+        throw new SessionRegistryError(
+          "STALE_REGISTRY",
+          "The managed commit completed but the session registry changed before evidence metadata could be persisted",
+          {
+            sessionId: initial.session.sessionId,
+            commitSha,
+            phase: "persist-session-updated-at",
+          },
+        );
+      }
+
+      const updated = transitionSessionState(current, current.state, this.clock);
+      const records = replaceRecord(state.sessions, updated);
+      validateRecords(records, this.repository.repositoryId);
+      this.writeUnsafe(records, state.claims, state.claimSetGeneration);
+    } catch (error: unknown) {
+      if (error instanceof SessionRegistryError) {
+        throw new SessionRegistryError(
+          error.code,
+          error.message,
+          { ...error.details, commitSha, phase: "persist-session-updated-at" },
+          error,
+        );
+      }
+      throw new SessionRegistryError(
+        "REGISTRY_IO_FAILURE",
+        "The managed commit completed but session evidence metadata could not be persisted",
+        { commitSha, phase: "persist-session-updated-at" },
+        error,
+      );
+    }
   }
 
   /** Push the currently owned branch to an explicit remote/branch target. */
