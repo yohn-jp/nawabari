@@ -585,7 +585,12 @@ remain absent. Nawabari fetches only the explicit remote branch into a
 disposable ref when local ancestry is missing; it does not update tracking
 refs or fetch unrelated branches/tags.
 The JSON result includes the immutable `source_sha`, explicit `target_ref`,
-observed `observed_remote_sha`, and relation.
+observed `observed_remote_sha`, and relation. If a bounded transport failure
+may have happened after the remote mutation, Nawabari re-observes only that
+exact remote ref. It reports `reconciliation.outcome` as `proven-pushed`,
+`proven-absent`, or `unresolved`, with the exact precondition and post-failure
+generation evidence. Only a proven-absent outcome is retry-safe; unresolved
+outcomes never authorize a blind retry.
 
 ```bash
 git nawabari push --session "$NAWABARI_SESSION_ID" \
