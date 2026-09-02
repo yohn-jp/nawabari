@@ -16,6 +16,7 @@ import {
   type ClaimDeltasOptions,
   type ReleaseClaimsOptions,
   type ResourceClaimDelta,
+  DEFAULT_SESSION_LIST_LIMIT,
   MAX_SESSION_LIST_LIMIT,
 } from "./domain/session.js";
 import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS, EVIDENCE_MAX_DIFF_PATHS } from "./repository-evidence.js";
@@ -36,35 +37,51 @@ const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
 const VERSION = packageMetadata.version;
 
-type HelpOptionSpec = {
+export type CliHelpOptionSpec = {
   readonly name: string;
+  readonly aliases?: readonly string[];
+  readonly alias_of?: string;
   readonly value?: string;
   readonly required?: boolean;
   readonly default?: string;
+  readonly minimum?: number;
+  readonly maximum?: number;
+  readonly repeatable?: boolean;
   readonly description: string;
 };
 
-type HelpCommandSpec = {
+export type CliCommandDefinition = {
   readonly name: string;
+  readonly aliases?: readonly string[];
   readonly summary: string;
   readonly usage: string;
-  readonly options: readonly HelpOptionSpec[];
+  readonly options: readonly CliHelpOptionSpec[];
   readonly notes?: readonly string[];
 };
 
-const GLOBAL_HELP_OPTIONS: readonly HelpOptionSpec[] = [
+const GLOBAL_HELP_OPTIONS: readonly CliHelpOptionSpec[] = [
   { name: "--json", description: "Emit one stable JSON document on stdout" },
-  { name: "--help", description: "Show command-specific help" },
+  { name: "--help", aliases: ["-h"], description: "Show command-specific help" },
   { name: "--version", description: "Print the installed version" },
 ];
 
 const option = (
   name: string,
   description: string,
-  options: Pick<HelpOptionSpec, "value" | "required" | "default"> = {},
-): HelpOptionSpec => ({ name, description, ...options });
+  options: Pick<
+    CliHelpOptionSpec,
+    "aliases" | "alias_of" | "value" | "required" | "default" | "minimum" | "maximum" | "repeatable"
+  > = {},
+): CliHelpOptionSpec => ({ name, description, ...options });
 
-const HELP_COMMANDS: readonly HelpCommandSpec[] = [
+/**
+ * Canonical public command/discovery registry.
+ *
+ * Dispatcher implementation deliberately remains below in this module.  This
+ * registry only describes the public discovery surface; aliases point at the
+ * canonical command so option metadata cannot drift between projections.
+ */
+export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
   {
     name: "session create",
     summary: "Request a new Nawabari session",
@@ -127,6 +144,7 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   },
   {
     name: "session run",
+    aliases: ["session exec"],
     summary: "Run one command inside the protected session sandbox",
     usage: `${CLI_NAME} session run [--session <id>] -- <command> [args...]`,
     options: [option("--session", "Select the active owned session", { value: "<id>" })],
@@ -138,17 +156,31 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "session list",
     summary: "List bounded repository session records",
-    usage: `${CLI_NAME} session list [--all|--history]`,
+    usage: `${CLI_NAME} session list [--all|--history] [--limit <n>] [--offset <n>]`,
     options: [
-      option("--all", "Include closed history; explicit unbounded history view"),
-      option("--history", "Alias for --all"),
+      option("--all", "Include closed history in the bounded result"),
+      option("--history", "Alias for --all", { alias_of: "--all" }),
+      option("--limit", `Maximum records per page; must be between 1 and ${MAX_SESSION_LIST_LIMIT}`, {
+        value: "<n>",
+        default: String(DEFAULT_SESSION_LIST_LIMIT),
+        minimum: 1,
+        maximum: MAX_SESSION_LIST_LIMIT,
+      }),
+      option("--offset", "Number of visible records to skip; must be a non-negative integer", {
+        value: "<n>",
+        default: "0",
+        minimum: 0,
+      }),
     ],
-    notes: ["Default output excludes closed records and is limited to 64 records."],
+    notes: [
+      `Default output excludes closed records; --all and --history include closed history. Both views are bounded by --limit (default ${DEFAULT_SESSION_LIST_LIMIT}, maximum ${MAX_SESSION_LIST_LIMIT}) and --offset (default 0).`,
+    ],
   },
   {
     name: "session claim",
+    aliases: ["resource claim"],
     summary: "Add a canonical resource claim",
-    usage: `${CLI_NAME} session claim [<session-id>] --resource <path-or-glob> --mode <read|write|exclusive-write>`,
+    usage: `${CLI_NAME} session claim [<session-id>|--session <id>] [--repository <id>] --resource <path-or-glob> --mode <read|write|exclusive-write>`,
     options: [
       option("--resource", "Repository-relative resource", { value: "<path-or-glob>", required: true }),
       option("--mode", "Granted claim mode", { value: "<read|write|exclusive-write>", required: true }),
@@ -156,13 +188,15 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
       option("--repository", "Expected repository identity", { value: "<id>" }),
     ],
     notes: [
+      "Exactly one --resource/--mode pair is required; --mode must immediately follow its own --resource.",
       "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
   },
   {
     name: "session update",
+    aliases: ["resource update"],
     summary: "Atomically replace a session's complete resource claim set",
-    usage: `${CLI_NAME} session update [<session-id>] --resource <path-or-glob> --mode <read|write|exclusive-write> [--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
+    usage: `${CLI_NAME} session update [<session-id>|--session <id>] [--repository <id>] --resource <path-or-glob> --mode <read|write|exclusive-write> [--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
     options: [
       option(
         "--resource",
@@ -170,11 +204,13 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
         {
           value: "<path-or-glob>",
           required: true,
+          repeatable: true,
         },
       ),
       option("--mode", "Mode for the --resource immediately before it; repeatable", {
         value: "<read|write|exclusive-write>",
         required: true,
+        repeatable: true,
       }),
       option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
         value: "<non-negative-integer>",
@@ -196,6 +232,7 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   },
   {
     name: "session mutate",
+    aliases: ["resource mutate"],
     summary: "Atomically apply exact-resource claim additions, changes, and releases",
     usage:
       `${CLI_NAME} session mutate [<session>|--session <id>] [--repository <id>] ` +
@@ -205,13 +242,15 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
       option(
         "--upsert-resource",
         "Exact repository-relative resource to add or change; each occurrence must be immediately followed by --mode",
-        { value: "<path-or-glob>" },
+        { value: "<path-or-glob>", repeatable: true },
       ),
       option("--mode", "Mode for the immediately preceding --upsert-resource", {
         value: "<read|write|exclusive-write>",
+        repeatable: true,
       }),
       option("--release-resource", "Exact repository-relative resource to release; repeatable", {
         value: "<path-or-glob>",
+        repeatable: true,
       }),
       option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
         value: "<non-negative-safe-int>",
@@ -228,6 +267,7 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   },
   {
     name: "session transition",
+    aliases: ["resource transition"],
     summary: "Atomically transition one exact resource claim mode",
     usage:
       `${CLI_NAME} session transition [<session>|--session <id>] [--repository <id>] ` +
@@ -257,6 +297,7 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   },
   {
     name: "session claims",
+    aliases: ["resource list", "resource claims"],
     summary: "List canonical resource claims",
     usage: `${CLI_NAME} session claims [<session-id>|--session <id>]`,
     options: [option("--session", "Select a session; omitted lists all claims", { value: "<id>" })],
@@ -266,146 +307,16 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   },
   {
     name: "session release",
+    aliases: ["resource release"],
     summary: "Release resource claims",
     usage: `${CLI_NAME} session release [<session-id>|--session <id>] (--resource <path-or-glob> ... | --claim-id <id> ... | --all) (--if-generation <n> | --force)`,
     options: [
       option("--session", "Target session; omitted resolves the current owner", { value: "<id>" }),
-      option("--resource", "Release one exact canonical resource; repeatable", { value: "<path-or-glob>" }),
-      option("--claim-id", "Release one owned claim ID; repeatable", { value: "<id>" }),
-      option("--all", "Explicitly release all claims owned by the target session"),
-      option("--if-generation", "Require the expected claim-set generation; mutually exclusive with --force", {
-        value: "<non-negative-safe-int>",
-      }),
-      option("--force", "Explicitly allow unconditional release; mutually exclusive with --if-generation"),
-    ],
-    notes: [
-      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
-      "Exactly one selector family is required: repeated --resource, repeated --claim-id, or explicit --all.",
-      "Exactly one destructive concurrency intent is required: --if-generation <non-negative-safe-int> or --force.",
-    ],
-  },
-  {
-    name: "resource claim",
-    summary: "Add a canonical resource claim (alias)",
-    usage: `${CLI_NAME} resource claim [<session-id>|--session <id>] --resource <path-or-glob> --mode <read|write|exclusive-write>`,
-    options: [],
-    notes: [
-      "Target grammar matches session claim: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
-    ],
-  },
-  {
-    name: "resource update",
-    summary: "Atomically replace a session's complete resource claim set (alias)",
-    usage: `${CLI_NAME} resource update [<session-id>|--session <id>] --resource <path-or-glob> --mode <read|write|exclusive-write> [--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
-    options: [
-      option(
-        "--resource",
-        "Repository-relative resource; repeatable, each paired with the --mode immediately after it",
-        {
-          value: "<path-or-glob>",
-          required: true,
-        },
-      ),
-      option("--mode", "Mode for the --resource immediately before it; repeatable", {
-        value: "<read|write|exclusive-write>",
-        required: true,
-      }),
-      option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
-        value: "<non-negative-integer>",
-      }),
-      option(
-        "--force",
-        "Explicitly permit unconditional complete replacement; mutually exclusive with --if-generation",
-      ),
-      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
-      option("--repository", "Expected repository identity", { value: "<id>" }),
-    ],
-    notes: [
-      "The desired claim set is a full replacement performed atomically in one updateClaims() transaction; " +
-        "use exactly one concurrency intent: --if-generation <non-negative-integer> for claim-set generation CAS, " +
-        "or explicit --force for unconditional replacement. On any invalid, conflicting, or stale claim the prior set is left unchanged.",
-      "Each --resource must be immediately followed by its own --mode; pairing is positional adjacency, not flag order.",
-      "Target grammar matches session update: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
-    ],
-  },
-  {
-    name: "resource mutate",
-    summary: "Atomically apply exact-resource claim additions, changes, and releases (alias)",
-    usage:
-      `${CLI_NAME} resource mutate [<session>|--session <id>] [--repository <id>] ` +
-      `(--upsert-resource <path-or-glob> --mode <read|write|exclusive-write> | --release-resource <path-or-glob>)+ ` +
-      `(--if-generation <non-negative-safe-int> | --force)`,
-    options: [
-      option(
-        "--upsert-resource",
-        "Exact repository-relative resource to add or change; each occurrence must be immediately followed by --mode",
-        { value: "<path-or-glob>" },
-      ),
-      option("--mode", "Mode for the immediately preceding --upsert-resource", {
-        value: "<read|write|exclusive-write>",
-      }),
-      option("--release-resource", "Exact repository-relative resource to release; repeatable", {
+      option("--resource", "Release one exact canonical resource; repeatable", {
         value: "<path-or-glob>",
+        repeatable: true,
       }),
-      option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
-        value: "<non-negative-safe-int>",
-      }),
-      option("--force", "Explicitly permit unconditional atomic mutation; mutually exclusive with --if-generation"),
-      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
-      option("--repository", "Expected repository identity", { value: "<id>" }),
-    ],
-    notes: [
-      "Apply one or more ordered upsert/release deltas in one backend transaction; exactly one concurrency intent is required.",
-      "Every --upsert-resource must be immediately followed by its own --mode; --release-resource takes exactly one value.",
-      "Target grammar matches session mutate: optional first positional <session> is an alias for --session <id>; do not supply both.",
-    ],
-  },
-  {
-    name: "resource transition",
-    summary: "Atomically transition one exact resource claim mode (alias)",
-    usage:
-      `${CLI_NAME} resource transition [<session>|--session <id>] [--repository <id>] ` +
-      `--resource <path-or-glob> --mode <read|write|exclusive-write> ` +
-      `(--if-generation <non-negative-safe-int> | --force)`,
-    options: [
-      option("--resource", "Exact repository-relative resource to acquire or change", {
-        value: "<path-or-glob>",
-        required: true,
-      }),
-      option("--mode", "Target mode for the immediately preceding --resource", {
-        value: "<read|write|exclusive-write>",
-        required: true,
-      }),
-      option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
-        value: "<non-negative-safe-int>",
-      }),
-      option("--force", "Explicitly permit unconditional atomic mutation; mutually exclusive with --if-generation"),
-      option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
-      option("--repository", "Expected repository identity", { value: "<id>" }),
-    ],
-    notes: [
-      "Exactly one resource/mode pair is projected as one atomic upsert delta; same mode is an idempotent no-op.",
-      "Use exactly one concurrency intent: --if-generation <non-negative-safe-int> or explicit --force.",
-      "The target grammar accepts an optional first positional <session> or --session <id>, but not both.",
-    ],
-  },
-  {
-    name: "resource list",
-    summary: "List canonical resource claims (alias)",
-    usage: `${CLI_NAME} resource list [<session-id>|--session <id>]`,
-    options: [option("--session", "Select a session; omitted lists all claims", { value: "<id>" })],
-    notes: [
-      "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
-    ],
-  },
-  {
-    name: "resource release",
-    summary: "Release resource claims (alias)",
-    usage: `${CLI_NAME} resource release [<session-id>|--session <id>] (--resource <path-or-glob> ... | --claim-id <id> ... | --all) (--if-generation <n> | --force)`,
-    options: [
-      option("--session", "Target session; omitted resolves the current owner", { value: "<id>" }),
-      option("--resource", "Release one exact canonical resource; repeatable", { value: "<path-or-glob>" }),
-      option("--claim-id", "Release one owned claim ID; repeatable", { value: "<id>" }),
+      option("--claim-id", "Release one owned claim ID; repeatable", { value: "<id>", repeatable: true }),
       option("--all", "Explicitly release all claims owned by the target session"),
       option("--if-generation", "Require the expected claim-set generation; mutually exclusive with --force", {
         value: "<non-negative-safe-int>",
@@ -466,7 +377,11 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     options: [
       option("--session", "Assert the current session identity", { value: "<id>" }),
       option("--operation", "Operation vocabulary entry", { value: "<name>", required: true }),
-      option("--resource", "Concrete repository-relative path; repeatable", { value: "<path>", required: true }),
+      option("--resource", "Concrete repository-relative path; repeatable", {
+        value: "<path>",
+        required: true,
+        repeatable: true,
+      }),
     ],
   },
   {
@@ -488,12 +403,26 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     usage: `${CLI_NAME} diff --session <id> --path <path> [options]`,
     options: [
       option("--session", "Explicit owned session to observe", { value: "<id>", required: true }),
-      option("--path", "Concrete repository-relative path; repeatable", { value: "<path>", required: true }),
+      option("--path", "Concrete repository-relative path; repeatable", {
+        value: "<path>",
+        required: true,
+        repeatable: true,
+      }),
       option("--from", "Commit/ref at the start of the range", { value: "<ref>", default: "HEAD" }),
       option("--to", "Commit/ref at the end of the range; omitted means worktree", { value: "<ref>" }),
       option("--patch", "Include patch text; requires the bounded byte/hunk limits"),
-      option("--max-bytes", "Maximum UTF-8 patch bytes", { value: "<n>", default: String(EVIDENCE_MAX_DIFF_BYTES) }),
-      option("--max-hunks", "Maximum patch hunks", { value: "<n>", default: String(EVIDENCE_MAX_DIFF_HUNKS) }),
+      option("--max-bytes", "Maximum UTF-8 patch bytes", {
+        value: "<n>",
+        default: String(EVIDENCE_MAX_DIFF_BYTES),
+        minimum: 1,
+        maximum: EVIDENCE_MAX_DIFF_BYTES,
+      }),
+      option("--max-hunks", "Maximum patch hunks", {
+        value: "<n>",
+        default: String(EVIDENCE_MAX_DIFF_HUNKS),
+        minimum: 1,
+        maximum: EVIDENCE_MAX_DIFF_HUNKS,
+      }),
     ],
   },
   {
@@ -503,7 +432,11 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     options: [
       option("--session", "Assert the current session identity", { value: "<id>" }),
       option("--message", "Caller-decided final commit message", { value: "<final-message>", required: true }),
-      option("--resource", "Claim-covered concrete path; repeatable", { value: "<path>", required: true }),
+      option("--resource", "Claim-covered concrete path; repeatable", {
+        value: "<path>",
+        required: true,
+        repeatable: true,
+      }),
       option("--message-pattern", "Caller-declared commit-message rule; validated only when supplied", {
         value: "<regex>",
       }),
@@ -515,10 +448,21 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     usage: `${CLI_NAME} push --remote <name> --branch <name> --resource <path> [options]`,
     options: [
       option("--session", "Assert the current session identity", { value: "<id>" }),
-      option("--resource", "Claim-covered concrete path; repeatable", { value: "<path>", required: true }),
+      option("--resource", "Claim-covered concrete path; repeatable", {
+        value: "<path>",
+        required: true,
+        repeatable: true,
+      }),
       option("--remote", "Explicit Git remote", { value: "<name>", required: true }),
-      option("--branch", "Explicit target branch", { value: "<name>", required: true }),
-      option("--remote-branch", "Explicit remote branch alias for --branch", { value: "<name>" }),
+      option("--branch", "Explicit target branch", {
+        value: "<name>",
+        required: true,
+        aliases: ["--remote-branch"],
+      }),
+      option("--remote-branch", "Explicit remote branch alias for --branch", {
+        value: "<name>",
+        alias_of: "--branch",
+      }),
       option("--force", "Allow force-with-lease when relation requires it"),
       option("--create-upstream", "Allow creation of a missing upstream"),
     ],
@@ -526,12 +470,25 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   {
     name: "status",
     summary: "Show repository context and bounded session status",
-    usage: `${CLI_NAME} status [--all|--history]`,
+    usage: `${CLI_NAME} status [--all|--history] [--limit <n>] [--offset <n>]`,
     options: [
-      option("--all", "Include closed history; explicit unbounded history view"),
-      option("--history", "Alias for --all"),
+      option("--all", "Include closed history in the bounded result"),
+      option("--history", "Alias for --all", { alias_of: "--all" }),
+      option("--limit", `Maximum records per page; must be between 1 and ${MAX_SESSION_LIST_LIMIT}`, {
+        value: "<n>",
+        default: String(DEFAULT_SESSION_LIST_LIMIT),
+        minimum: 1,
+        maximum: MAX_SESSION_LIST_LIMIT,
+      }),
+      option("--offset", "Number of visible records to skip; must be a non-negative integer", {
+        value: "<n>",
+        default: "0",
+        minimum: 0,
+      }),
     ],
-    notes: ["The default machine result exposes managed_worktree_root for session-create path discovery."],
+    notes: [
+      `The default machine result exposes managed_worktree_root for session-create path discovery. Session rows are bounded by --limit (default ${DEFAULT_SESSION_LIST_LIMIT}, maximum ${MAX_SESSION_LIST_LIMIT}) and --offset (default 0); --all and --history include closed history.`,
+    ],
   },
   {
     name: "guard",
@@ -579,52 +536,79 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
   },
 ];
 
-const ROOT_HELP_SPEC: HelpCommandSpec = {
+const ROOT_HELP_SPEC: CliCommandDefinition = {
   name: "root",
   summary: "Standalone local Git/session ownership CLI",
   usage: `${CLI_NAME} <command> [options]`,
   options: GLOBAL_HELP_OPTIONS,
 };
 
-function helpSpecFor(commandArguments: readonly string[]): HelpCommandSpec {
-  if (commandArguments.length === 0) return ROOT_HELP_SPEC;
-  let key =
-    commandArguments[0] === "resource"
-      ? `resource ${commandArguments[1] ?? "list"}`
-      : commandArguments[0] === "session" && commandArguments[1] === "exec"
-        ? "session run"
-        : commandArguments.slice(0, 2).join(" ");
-  if (key === "resource claims") key = "resource list";
-  const direct = HELP_COMMANDS.find((spec) => spec.name === key);
-  if (direct !== undefined && !direct.name.startsWith("resource ")) return direct;
-  const aliasTarget = direct?.name.replace(/^resource /u, "session ");
-  const target = aliasTarget === undefined ? undefined : HELP_COMMANDS.find((spec) => spec.name === aliasTarget);
-  if (direct !== undefined && target !== undefined) {
-    return {
-      name: direct.name,
-      summary: direct.summary,
-      usage: direct.usage,
-      options: direct.options,
-      notes: direct.notes,
-    };
-  }
-  return HELP_COMMANDS.find((spec) => spec.name === commandArguments[0]) ?? ROOT_HELP_SPEC;
+/** Resolve a public name through the one canonical registry. */
+function canonicalCommandForName(name: string): CliCommandDefinition | undefined {
+  return CLI_COMMAND_REGISTRY.find((definition) => definition.name === name || definition.aliases?.includes(name));
 }
 
-function helpPayload(spec: HelpCommandSpec): JsonObject {
+/**
+ * Materialize public names for projections without copying option metadata.
+ * Alias entries are generated from their canonical definition, including the
+ * usage, options, and parser notes.
+ */
+export function publicCliCommandDefinitions(): readonly CliCommandDefinition[] {
+  return CLI_COMMAND_REGISTRY.flatMap((definition) => [
+    definition,
+    ...(definition.aliases ?? []).map((alias): CliCommandDefinition => ({
+      name: alias,
+      summary: `${definition.summary} (alias)`,
+      usage: definition.usage.replace(definition.name, alias),
+      options: definition.options,
+      ...(definition.notes === undefined ? {} : { notes: definition.notes }),
+    })),
+  ]);
+}
+
+/** Stable alias for consumers such as the future dispatcher parity layer. */
+export const COMMAND_REGISTRY = CLI_COMMAND_REGISTRY;
+
+/** Resolve either a canonical command or one of its public aliases. */
+export function resolveCliCommandDefinition(name: string): CliCommandDefinition | undefined {
+  const canonical = canonicalCommandForName(name);
+  if (canonical === undefined) return undefined;
+  if (canonical.name === name) return canonical;
+  return publicCliCommandDefinitions().find((definition) => definition.name === name);
+}
+
+/** Return the complete public discovery name list in registry order. */
+export function publicCliCommandNames(): readonly string[] {
+  return publicCliCommandDefinitions().map((definition) => definition.name);
+}
+
+function helpSpecFor(commandArguments: readonly string[]): CliCommandDefinition {
+  if (commandArguments.length === 0) return ROOT_HELP_SPEC;
+  const key =
+    commandArguments[0] === "resource"
+      ? `resource ${commandArguments[1] ?? "list"}`
+      : commandArguments.slice(0, 2).join(" ");
+  return resolveCliCommandDefinition(key) ?? resolveCliCommandDefinition(commandArguments[0]) ?? ROOT_HELP_SPEC;
+}
+
+function helpPayload(spec: CliCommandDefinition): JsonObject {
   if (spec.name === "root") {
-    const optionNames = (options: readonly HelpOptionSpec[]): string[] => options.map((candidate) => candidate.name);
-    const sessionOptions = HELP_COMMANDS.filter((command) => command.name.startsWith("session ")).flatMap(
-      (command) => command.options,
-    );
+    const publicCommands = publicCliCommandDefinitions();
+    const optionNames = (options: readonly CliHelpOptionSpec[]): string[] => options.map((candidate) => candidate.name);
+    const sessionOptions = publicCommands
+      .filter((command) => command.name.startsWith("session "))
+      .flatMap((command) => command.options);
     const unique = (values: string[]): string[] => values.filter((value, index) => values.indexOf(value) === index);
     const sessionListOnlyOptions = new Set(["--all", "--history"]);
+    const sessionTargetingCommands = CLI_COMMAND_REGISTRY.filter(
+      (command) => command.name.startsWith("session ") && command.usage.includes("<session"),
+    ).map((command) => command.name.slice("session ".length));
     const optionsFor = (name: string): string[] =>
-      optionNames(HELP_COMMANDS.find((command) => command.name === name)?.options ?? []);
+      optionNames(publicCommands.find((command) => command.name === name)?.options ?? []);
     return {
       usage: `Usage: ${spec.usage}`,
-      commands: HELP_COMMANDS.map((command) => command.name),
-      options: ["--json", "--help", "--version"],
+      commands: publicCommands.map((command) => command.name),
+      options: GLOBAL_HELP_OPTIONS.map((candidate) => candidate.name),
       session_options: unique(
         sessionOptions.map((option) => option.name).filter((name) => !sessionListOnlyOptions.has(name)),
       ),
@@ -636,18 +620,7 @@ function helpPayload(spec: HelpCommandSpec): JsonObject {
       session_targeting: {
         canonical: "--session <id>",
         positional_alias: "<session-id> as the first argument after a session-scoped subcommand",
-        commands: [
-          "show",
-          "inspect",
-          "claim",
-          "claims",
-          "release",
-          "update",
-          "mutate",
-          "transition",
-          "close",
-          "discard",
-        ],
+        commands: sessionTargetingCommands,
         ambiguity: "supplying both positional and --session is rejected",
         discard_requires_explicit_target: true,
       },
@@ -655,13 +628,21 @@ function helpPayload(spec: HelpCommandSpec): JsonObject {
   }
   const options = spec.options.map((candidate) => ({
     name: candidate.name,
+    ...(candidate.aliases === undefined ? {} : { aliases: [...candidate.aliases] }),
+    ...(candidate.alias_of === undefined ? {} : { alias_of: candidate.alias_of }),
     ...(candidate.value === undefined ? {} : { value: candidate.value }),
     required: candidate.required === true,
+    ...(candidate.repeatable === undefined ? {} : { repeatable: candidate.repeatable }),
     ...(candidate.default === undefined ? {} : { default: candidate.default }),
+    ...(candidate.minimum === undefined ? {} : { minimum: candidate.minimum }),
+    ...(candidate.maximum === undefined ? {} : { maximum: candidate.maximum }),
     description: candidate.description,
   }));
+  const canonical = canonicalCommandForName(spec.name);
   return {
     help_for: spec.name,
+    ...(canonical === undefined || canonical.name === spec.name ? {} : { canonical_command: canonical.name }),
+    ...(canonical?.aliases === undefined || canonical.name !== spec.name ? {} : { aliases: [...canonical.aliases] }),
     usage: spec.usage,
     summary: spec.summary,
     required_options: spec.options
@@ -680,11 +661,13 @@ function helpPayload(spec: HelpCommandSpec): JsonObject {
   };
 }
 
-function helpText(spec: HelpCommandSpec): string {
+function helpText(spec: CliCommandDefinition): string {
   const lines = [`Usage: ${spec.usage}`, "", spec.summary];
   if (spec.name === "root") {
     lines.push("", "Commands:");
-    for (const command of HELP_COMMANDS) lines.push(`  ${command.name.padEnd(20)} ${command.summary}`);
+    for (const command of publicCliCommandDefinitions()) {
+      lines.push(`  ${command.name.padEnd(20)} ${command.summary}`);
+    }
     lines.push("", "Global options:");
     for (const candidate of GLOBAL_HELP_OPTIONS) {
       const label = candidate.name === "--help" ? "-h, --help" : candidate.name;
@@ -699,7 +682,11 @@ function helpText(spec: HelpCommandSpec): string {
         candidate.required === true
           ? "required"
           : `optional${candidate.default === undefined ? "" : `; default: ${candidate.default}`}`;
-      lines.push(`  ${label.padEnd(38)} ${qualifier}; ${candidate.description}`);
+      const bounds =
+        candidate.minimum === undefined && candidate.maximum === undefined
+          ? ""
+          : `; bounds: ${candidate.minimum ?? "-∞"}..${candidate.maximum ?? "∞"}`;
+      lines.push(`  ${label.padEnd(38)} ${qualifier}${bounds}; ${candidate.description}`);
     }
     if (spec.notes !== undefined) {
       lines.push("", "Notes:");
