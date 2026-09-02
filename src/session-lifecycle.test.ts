@@ -120,13 +120,14 @@ test("explicit discard destroys only the selected recoverable session and is ide
     runGit(["add", "discard.txt"], discardWorktree);
     runGit(["commit", "-m", "unintegrated disposable work"], discardWorktree);
     const previousHead = runGit(["rev-parse", "HEAD"], discardWorktree);
+    setPersistedSessionState(registry, discarded.sessionId, "stale");
 
     assertRegistryError(() => registry.close(discarded.sessionId), "RECOVERABLE_COMMITS");
     const gc = registry.garbageCollect({ apply: false, staleAfterMs: 0 });
     assert.equal(gc.cleaned.length, 0);
     assert.equal(gc.blocked[0]?.sessionId, discarded.sessionId);
     assert.equal(gc.blocked[0]?.code, "RECOVERABLE_COMMITS");
-    assert.equal(registry.get(discarded.sessionId)?.state, "active");
+    assert.equal(registry.get(discarded.sessionId)?.state, "stale");
     const diagnostic = registry.diagnose(discarded.sessionId);
     assert.ok(diagnostic.safeActions.includes("discard-session"));
     assert.equal(diagnostic.blockers[0]?.details.currentSessionHead, previousHead);
@@ -471,7 +472,7 @@ test("an interrupted close remains retryable from the explicit closing state", (
   }
 });
 
-test("gc detects stale metadata without mutation and applies only safe cleanup", () => {
+test("gc reports age suspicion without granting destructive authority to a healthy active session", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = `${fixture.repositoryPath}-stale-cleanup`;
   let now = new Date("2026-01-01T00:00:00.000Z");
@@ -487,16 +488,70 @@ test("gc detects stale metadata without mutation and applies only safe cleanup",
     const detected = registry.garbageCollect({ apply: false });
     assert.equal(detected.candidates.length, 1);
     assert.equal(detected.candidates[0].sessionId, session.sessionId);
+    assert.equal(detected.candidates[0].suspicion, "age");
+    assert.equal(detected.candidates[0].destructiveEligibility, "ineligible");
+    assert.equal(detected.candidates[0].destructiveEligibilityReason, "age-only");
+    assert.equal(detected.eligible.length, 0);
     assert.equal(detected.cleaned.length, 0);
     assert.equal(registry.get(session.sessionId)?.state, "active");
     assert.equal(fs.existsSync(worktreePath), true);
 
     const applied = registry.garbageCollect({ apply: true });
     assert.equal(applied.candidates.length, 1);
-    assert.equal(applied.cleaned.length, 1);
+    assert.equal(applied.eligible.length, 0);
+    assert.equal(applied.cleaned.length, 0);
     assert.equal(applied.blocked.length, 0);
-    assert.equal(applied.cleaned[0].state, "closed");
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("gc cleans a healthy worktree only when stale lifecycle state is explicit", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-explicit-stale`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, staleAfterMs: 24 * 60 * 60 * 1_000 });
+    const session = registry.provision({ worktreePath, branchName: "feature/explicit-stale" });
+    setPersistedSessionState(registry, session.sessionId, "stale");
+
+    const dryRun = registry.garbageCollect({ apply: false });
+    assert.equal(dryRun.candidates[0]?.suspicion, "lifecycle");
+    assert.equal(dryRun.candidates[0]?.destructiveEligibility, "eligible");
+    assert.equal(dryRun.candidates[0]?.destructiveEligibilityReason, "explicit-stale-state");
+    assert.equal(dryRun.eligible.length, 1);
+    assert.deepEqual(dryRun.blocked, []);
+
+    const applied = registry.garbageCollect({ apply: true });
+    assert.equal(applied.cleaned.length, 1);
+    assert.equal(applied.cleaned[0]?.state, "closed");
     assert.equal(fs.existsSync(worktreePath), false);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("gc keeps ambiguous physical ownership non-destructive even when lifecycle state is stale", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-ambiguous-gc`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, staleAfterMs: 0 });
+    const session = registry.provision({ worktreePath, branchName: "feature/ambiguous-gc" });
+    runGit(["checkout", "-b", "feature/ambiguous-gc-hijacked"], worktreePath);
+    setPersistedSessionState(registry, session.sessionId, "stale");
+
+    const result = registry.garbageCollect({ apply: true });
+    assert.equal(result.candidates[0]?.suspicion, "physical");
+    assert.equal(result.candidates[0]?.destructiveEligibility, "ambiguous");
+    assert.equal(result.candidates[0]?.destructiveEligibilityReason, "physical-state-ambiguous");
+    assert.equal(result.eligible.length, 0);
+    assert.deepEqual(result.cleaned, []);
+    assert.deepEqual(result.blocked, []);
+    assert.equal(registry.get(session.sessionId)?.state, "stale");
+    assert.equal(fs.existsSync(worktreePath), true);
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
     fixture.cleanup();
@@ -515,6 +570,7 @@ test("gc marks stale dirty sessions but does not remove recoverable work", () =>
     });
     const session = registry.provision({ worktreePath, branchName: "feature/stale-dirty" });
     fs.writeFileSync(path.join(worktreePath, "dirty.txt"), "keep me\n");
+    setPersistedSessionState(registry, session.sessionId, "stale");
     now = new Date("2026-01-01T00:00:02.000Z");
 
     const result = registry.garbageCollect({ apply: true });
@@ -1249,6 +1305,20 @@ function hasLocalBranch(repositoryPath: string, branchName: string): boolean {
 
 function assertRegistryError(operation: () => unknown, code: SessionRegistryError["code"]): void {
   assert.throws(operation, (error: unknown) => error instanceof SessionRegistryError && error.code === code);
+}
+
+function setPersistedSessionState(
+  registry: SessionRegistry,
+  sessionId: string,
+  state: "active" | "stale" | "closing",
+): void {
+  const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
+    sessions: Array<Record<string, unknown>>;
+  };
+  persisted.sessions = persisted.sessions.map((session) =>
+    session.session_id === sessionId ? { ...session, state } : session,
+  );
+  fs.writeFileSync(registry.paths.registry, JSON.stringify(persisted));
 }
 
 function runGit(args: readonly string[], cwd: string): string {

@@ -691,7 +691,8 @@ function toDomainPushResult(result: import("../session-registry.js").PushResult)
 function toDomainGarbageCollectResult(result: RegistryGarbageCollectResult): GarbageCollectResult {
   return {
     apply: result.apply,
-    candidates: result.candidates.map(toDomainRecord),
+    candidates: result.candidates.map(toDomainGarbageCollectCandidate),
+    eligible: result.eligible?.map(toDomainGarbageCollectCandidate) ?? [],
     cleaned: result.cleaned.map(toDomainRecord),
     blocked: result.blocked.map((blocked) => ({
       session_id: blocked.sessionId,
@@ -700,6 +701,19 @@ function toDomainGarbageCollectResult(result: RegistryGarbageCollectResult): Gar
       details: { ...blocked.details },
       recovery_hints: [...blocked.recoveryHints],
     })),
+  };
+}
+
+function toDomainGarbageCollectCandidate(
+  candidate: import("../session-registry.js").GarbageCollectCandidate,
+): import("./session.js").GarbageCollectCandidate {
+  return {
+    ...toDomainRecord(candidate),
+    physical_state: candidate.physicalState,
+    suspicion: candidate.suspicion,
+    suspicion_reason: candidate.suspicionReason,
+    destructive_eligibility: candidate.destructiveEligibility,
+    destructive_eligibility_reason: candidate.destructiveEligibilityReason,
   };
 }
 
@@ -735,6 +749,7 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
             proof: toDomainIntegrationProof(diagnostic.integrationEvidence.proof),
           }),
     },
+    garbage_collection: toDomainGarbageCollectCandidate(diagnostic.garbageCollection),
   };
 }
 

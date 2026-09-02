@@ -196,6 +196,7 @@ export type SessionDiagnostic = {
   blockers: SessionDiagnosticBlocker[];
   safe_actions: string[];
   integration_evidence: SessionDiagnosticIntegrationEvidence;
+  garbage_collection?: GarbageCollectCandidate;
 };
 
 export type GuardOptions = {
@@ -387,6 +388,21 @@ export type GarbageCollectOptions = {
   apply: boolean;
 };
 
+export type GarbageCollectCandidate = SessionRecord & {
+  physical_state: string;
+  suspicion: "none" | "age" | "lifecycle" | "physical";
+  suspicion_reason:
+    "none" | "elapsed-age" | "explicit-lifecycle-state" | "missing-worktree" | "ambiguous-physical-state";
+  destructive_eligibility: "eligible" | "ineligible" | "ambiguous";
+  destructive_eligibility_reason:
+    | "not-suspected"
+    | "age-only"
+    | "explicit-stale-state"
+    | "explicit-closing-state"
+    | "prunable-missing-worktree"
+    | "physical-state-ambiguous";
+};
+
 export type BackendCapabilities = {
   session_registry: boolean;
   provisioning: boolean;
@@ -509,7 +525,8 @@ export type GarbageCollectBlocked = {
 
 export type GarbageCollectResult = {
   apply: boolean;
-  candidates: SessionRecord[];
+  candidates: GarbageCollectCandidate[];
+  eligible?: GarbageCollectCandidate[];
   cleaned: SessionRecord[];
   blocked?: GarbageCollectBlocked[];
 };

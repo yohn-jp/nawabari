@@ -552,7 +552,7 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
       option("--dry-run", "Preflight eligible stale cleanup without mutation"),
     ],
     notes: [
-      "Default stale threshold is 24 hours (86,400,000 ms). Eligibility uses persisted state age or missing/prunable Git worktree physical state; closed history is not a stale candidate.",
+      "Default stale threshold is 24 hours (86,400,000 ms). Elapsed age is diagnostic suspicion only; destructive eligibility requires explicit stale/closing state or a safely prunable missing worktree. Closed history is not a candidate.",
     ],
   },
   {

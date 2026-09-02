@@ -262,6 +262,32 @@ export interface GarbageCollectOptions {
   readonly staleAfterMs?: number;
 }
 
+/** Why a session was surfaced by garbage-collection inspection. */
+export type GarbageCollectSuspicion = "none" | "age" | "lifecycle" | "physical";
+
+/** Destructive GC authority, deliberately independent from age suspicion. */
+export type GarbageCollectEligibility = "eligible" | "ineligible" | "ambiguous";
+
+export type GarbageCollectSuspicionReason =
+  "none" | "elapsed-age" | "explicit-lifecycle-state" | "missing-worktree" | "ambiguous-physical-state";
+
+export type GarbageCollectEligibilityReason =
+  | "not-suspected"
+  | "age-only"
+  | "explicit-stale-state"
+  | "explicit-closing-state"
+  | "prunable-missing-worktree"
+  | "physical-state-ambiguous";
+
+/** Bounded machine-readable GC assessment. Session identity stays flat for API compatibility. */
+export interface GarbageCollectCandidate extends SessionRecord {
+  readonly physicalState: string;
+  readonly suspicion: GarbageCollectSuspicion;
+  readonly suspicionReason: GarbageCollectSuspicionReason;
+  readonly destructiveEligibility: GarbageCollectEligibility;
+  readonly destructiveEligibilityReason: GarbageCollectEligibilityReason;
+}
+
 export interface GarbageCollectBlocked {
   readonly sessionId: string;
   readonly code: RegistryErrorCode;
@@ -272,7 +298,10 @@ export interface GarbageCollectBlocked {
 
 export interface GarbageCollectResult {
   readonly apply: boolean;
-  readonly candidates: readonly SessionRecord[];
+  /** All suspicious sessions, including age-only observations that are not destructive candidates. */
+  readonly candidates: readonly GarbageCollectCandidate[];
+  /** The subset whose lifecycle/physical evidence authorizes destructive cleanup. */
+  readonly eligible: readonly GarbageCollectCandidate[];
   readonly cleaned: readonly SessionRecord[];
   readonly blocked: readonly GarbageCollectBlocked[];
 }
@@ -340,6 +369,7 @@ export interface SessionDiagnostic {
   readonly blockers: readonly SessionDiagnosticBlocker[];
   readonly safeActions: readonly string[];
   readonly integrationEvidence: SessionDiagnosticIntegrationEvidence;
+  readonly garbageCollection: GarbageCollectCandidate;
 }
 
 export type ReconciliationSessionStatus = "healthy" | "candidate" | "drift" | "closed";
@@ -2285,13 +2315,15 @@ export class SessionRegistry {
       let claimSetGeneration = state.claimSetGeneration;
       const now = toTimestamp(this.clock());
       const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
-      const candidates = records
-        .filter((record) => isStaleCandidate(record, now, staleAfterMs, worktrees))
-        .map(cloneSessionRecord);
+      const assessments = records
+        .filter((record) => record.state !== "closed")
+        .map((record) => assessGarbageCollection(record, now, staleAfterMs, worktrees));
+      const candidates = assessments.filter((assessment) => assessment.suspicion !== "none");
+      const eligible = candidates.filter((assessment) => assessment.destructiveEligibility === "eligible");
 
       const blocked: GarbageCollectBlocked[] = [];
       if (!apply) {
-        for (const candidate of candidates) {
+        for (const candidate of eligible) {
           const current = records.find((record) => record.sessionId === candidate.sessionId);
           if (current === undefined || current.state === "closed") continue;
           try {
@@ -2303,13 +2335,14 @@ export class SessionRegistry {
         return {
           apply,
           candidates,
+          eligible,
           cleaned: [],
           blocked,
         };
       }
 
       const cleaned: SessionRecord[] = [];
-      for (const candidate of candidates) {
+      for (const candidate of eligible) {
         const current = records.find((record) => record.sessionId === candidate.sessionId);
         if (current === undefined || current.state === "closed") continue;
 
@@ -2335,6 +2368,7 @@ export class SessionRegistry {
       return {
         apply,
         candidates,
+        eligible,
         cleaned: cleaned.map(cloneSessionRecord),
         blocked,
       };
@@ -3005,6 +3039,7 @@ export class SessionRegistry {
     };
 
     if (record.state === "closed") {
+      const garbageCollection = closedGarbageCollectionAssessment(record, now);
       return Object.freeze({
         schemaVersion: SESSION_DIAGNOSTIC_SCHEMA_VERSION,
         operation: "diagnostic" as const,
@@ -3021,6 +3056,7 @@ export class SessionRegistry {
         blockers: Object.freeze([]),
         safeActions: Object.freeze([]),
         integrationEvidence: Object.freeze(integrationEvidence),
+        garbageCollection,
       });
     }
 
@@ -3028,10 +3064,12 @@ export class SessionRegistry {
     let blockers: readonly SessionDiagnosticBlocker[] = [];
     let integrationProof: IntegrationProof | undefined;
     let staleCandidate = false;
+    let garbageCollection = assessGarbageCollection(record, now, this.staleAfterMs, []);
     try {
       const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
       physicalState = inspectWorktreeState(record.worktreePath, worktrees).kind;
-      staleCandidate = isStaleCandidate(record, now, this.staleAfterMs, worktrees);
+      garbageCollection = assessGarbageCollection(record, now, this.staleAfterMs, worktrees);
+      staleCandidate = garbageCollection.destructiveEligibility === "eligible";
       const resources = this.inspectCleanupResources(record, worktrees, evidence);
       integrationProof = resources.integrationProof;
     } catch (error: unknown) {
@@ -3070,6 +3108,7 @@ export class SessionRegistry {
         ...integrationEvidence,
         ...(integrationProof === undefined ? {} : { proof: integrationProof }),
       }),
+      garbageCollection,
     });
   }
 
@@ -3141,7 +3180,7 @@ export class SessionRegistry {
       }
       return {
         session: cloneSessionRecord(record),
-        status: isStaleCandidate(record, now, this.staleAfterMs, worktrees) ? "candidate" : "healthy",
+        status: isDestructiveGcEligible(record, worktrees) ? "candidate" : "healthy",
         physicalState: physical.kind,
         blockers: [],
       };
@@ -3786,21 +3825,90 @@ function assertStaleAfterMs(value: number): void {
   }
 }
 
-function isStaleCandidate(
+function assessGarbageCollection(
   record: SessionRecord,
   now: string,
   staleAfterMs: number,
   worktrees: readonly GitWorktreeInfo[],
-): boolean {
-  if (record.state === "closed") return false;
-  if (record.state === "stale" || record.state === "closing") return true;
-  const age = Date.parse(now) - Date.parse(record.updatedAt);
+): GarbageCollectCandidate {
+  const ageMs = Math.max(0, Date.parse(now) - Date.parse(record.updatedAt));
   const worktreeState = inspectWorktreeState(record.worktreePath, worktrees);
-  const physicallyMissing =
-    worktreeState.kind === "prunable-missing" ||
+  const branchIdentityAmbiguous =
+    (worktreeState.entry !== undefined && worktreeState.entry.branchName !== record.branchName) ||
+    worktrees.some(
+      (worktree) => worktree.branchName === record.branchName && !samePath(worktree.worktreePath, record.worktreePath),
+    );
+  const physicalAmbiguous =
+    worktreeState.kind === "invalid" ||
+    worktreeState.kind === "prunable-present" ||
+    worktreeState.kind === "unregistered-present" ||
     worktreeState.kind === "registered-missing" ||
-    worktreeState.kind === "unregistered-missing";
-  return age >= staleAfterMs || physicallyMissing;
+    worktreeState.kind === "unregistered-missing" ||
+    branchIdentityAmbiguous;
+
+  let suspicion: GarbageCollectSuspicion = "none";
+  let suspicionReason: GarbageCollectSuspicionReason = "none";
+  let destructiveEligibility: GarbageCollectEligibility = "ineligible";
+  let destructiveEligibilityReason: GarbageCollectEligibilityReason = "not-suspected";
+
+  if (physicalAmbiguous) {
+    suspicion = "physical";
+    suspicionReason = "ambiguous-physical-state";
+    destructiveEligibility = "ambiguous";
+    destructiveEligibilityReason = "physical-state-ambiguous";
+  } else if (record.state === "stale" || record.state === "closing") {
+    suspicion = "lifecycle";
+    suspicionReason = "explicit-lifecycle-state";
+    destructiveEligibility = "eligible";
+    destructiveEligibilityReason = record.state === "stale" ? "explicit-stale-state" : "explicit-closing-state";
+  } else if (worktreeState.kind === "prunable-missing") {
+    suspicion = "physical";
+    suspicionReason = "missing-worktree";
+    destructiveEligibility = "eligible";
+    destructiveEligibilityReason = "prunable-missing-worktree";
+  } else if (ageMs >= staleAfterMs) {
+    // Wall-clock age is useful for diagnosis, but is never a destructive
+    // authority for a physically healthy active session.
+    suspicion = "age";
+    suspicionReason = "elapsed-age";
+    destructiveEligibility = "ineligible";
+    destructiveEligibilityReason = "age-only";
+  }
+
+  return Object.freeze({
+    ...cloneSessionRecord(record),
+    physicalState: worktreeState.kind,
+    suspicion,
+    suspicionReason,
+    destructiveEligibility,
+    destructiveEligibilityReason,
+  });
+}
+
+function closedGarbageCollectionAssessment(record: SessionRecord, now: string): GarbageCollectCandidate {
+  return Object.freeze({
+    ...cloneSessionRecord(record),
+    physicalState: "closed",
+    suspicion: "none",
+    suspicionReason: "none",
+    destructiveEligibility: "ineligible",
+    destructiveEligibilityReason: "not-suspected",
+  });
+}
+
+function isDestructiveGcEligible(record: SessionRecord, worktrees: readonly GitWorktreeInfo[]): boolean {
+  if (record.state === "closed") return false;
+  const inspection = inspectWorktreeState(record.worktreePath, worktrees);
+  const branchIdentityAmbiguous =
+    (inspection.entry !== undefined && inspection.entry.branchName !== record.branchName) ||
+    worktrees.some(
+      (worktree) => worktree.branchName === record.branchName && !samePath(worktree.worktreePath, record.worktreePath),
+    );
+  if (branchIdentityAmbiguous) return false;
+  const physical = inspection.kind;
+  if (physical === "invalid" || physical === "prunable-present" || physical === "unregistered-present") return false;
+  if (physical === "registered-missing" || physical === "unregistered-missing") return false;
+  return record.state === "stale" || record.state === "closing" || physical === "prunable-missing";
 }
 
 type WorktreePhysicalState =
