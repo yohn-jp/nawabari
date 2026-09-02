@@ -546,10 +546,12 @@ Governed push requires explicit claim-covered resources and an explicit
 `--remote`/`--branch` target. Existing upstream and local/remote relation are
 inspected before mutation. A missing upstream requires `--create-upstream`;
 behind or diverged history requires explicit `--force`. Force pushes use an
-exact `--force-with-lease` bound to the observed remote branch SHA; non-force
-pushes rely on `--no-force` without any lease option. Nawabari fetches only
-the explicit remote branch into a disposable ref when local ancestry is
-missing; it does not update tracking refs or fetch unrelated branches/tags.
+exact `--force-with-lease` bound to the observed remote branch SHA. Ordinary
+pushes use the same exact-generation lease, while force authorization remains
+separate. A new remote branch uses an empty lease, requiring the target ref to
+remain absent. Nawabari fetches only the explicit remote branch into a
+disposable ref when local ancestry is missing; it does not update tracking
+refs or fetch unrelated branches/tags.
 The JSON result includes the immutable `source_sha`, explicit `target_ref`,
 observed `observed_remote_sha`, and relation.
 
