@@ -35,7 +35,7 @@ test("sandbox doctor reports ready when every required and optional capability i
   assert.equal(report.ready, true);
   assert.deepEqual(report.missing_required, []);
   assert.equal(report.network_mode, "inherited");
-  assert.equal(report.capabilities.length, SANDBOX_REQUIRED_CAPABILITIES.length + 4);
+  assert.equal(report.capabilities.length, SANDBOX_REQUIRED_CAPABILITIES.length + 2);
   assert.equal(
     report.capabilities.every((check) => check.status === "available"),
     true,
@@ -49,6 +49,18 @@ test("sandbox doctor fails closed when bubblewrap itself is missing", () => {
   const bwrap = report.capabilities.find((check) => check.id === "bubblewrap");
   assert.equal(bwrap?.status, "unavailable");
   assert.equal(bwrap?.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+});
+
+test("sandbox doctor treats seccomp and capability reduction as required baseline capabilities", () => {
+  const report = sandboxDoctorReport(readyProbe({ hasSeccomp: () => false, hasCapabilities: () => false }));
+  assert.equal(report.ready, false);
+  assert.deepEqual(report.missing_required, ["seccomp", "capabilities"]);
+  const seccomp = report.capabilities.find((check) => check.id === "seccomp");
+  assert.equal(seccomp?.requirement, "required");
+  assert.equal(seccomp?.details.profile_id, "nawabari.seccomp.v1");
+  const capabilities = report.capabilities.find((check) => check.id === "capabilities");
+  assert.equal(capabilities?.requirement, "required");
+  assert.deepEqual(capabilities?.details.ambient_capabilities, []);
 });
 
 test("sandbox doctor fails closed when bubblewrap cannot actually establish the required namespaces", () => {
