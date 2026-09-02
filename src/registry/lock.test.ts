@@ -87,6 +87,48 @@ test("an old remote-owner lock is reported stale without unsafe stealing", async
   });
 });
 
+test("non-Linux local stale locks fail closed without PID-only reclamation", async () => {
+  await withLockPath(async (lockPath) => {
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(
+      join(lockPath, "owner.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        token: "non-linux-owner",
+        // This PID is intentionally not live on supported CI hosts. A
+        // non-Linux implementation must not use that fact as a reclaim proof.
+        pid: 2_147_483_647,
+        hostname: hostname(),
+        processStartTime: "portable-token-without-provider",
+        acquiredAt: new Date(Date.now() - 10_000).toISOString(),
+      }),
+      "utf8",
+    );
+
+    const lock = new RepositoryLock({
+      lockPath,
+      platform: "darwin",
+      staleAfterMs: 1,
+      metadataGraceMs: 0,
+      acquireTimeoutMs: 0,
+      hostname: hostname(),
+    });
+    await assert.rejects(lock.acquire(), (error: unknown) => {
+      return error instanceof RegistryLockError && error.code === "LOCK_STALE";
+    });
+    assert.equal(await readFile(join(lockPath, "owner.json")).then((raw) => raw.includes("non-linux-owner")), true);
+  });
+});
+
+test("non-Linux lock owners publish no process-generation identity", async () => {
+  await withLockPath(async (lockPath) => {
+    const lock = new RepositoryLock({ lockPath, platform: "win32" });
+    const lease = await lock.acquire();
+    assert.equal(lease.owner.processStartTime, null);
+    await lease.release();
+  });
+});
+
 test("a parallel reclaimer cannot remove a lock acquired after the final token check", async () => {
   await withLockPath(async (lockPath) => {
     await mkdir(lockPath, { recursive: true });

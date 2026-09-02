@@ -26,6 +26,13 @@ export const RESOURCE_CLAIM_RESULT_SCHEMA = "resource-claim.v2" as const;
 export const RESOURCE_CLAIM_TRANSITION_MATRIX_ID = "resource-claim-transition-matrix.v1" as const;
 export const RESOURCE_CLAIM_RECOVERY_SCHEMA = "resource-claim-recovery.v1" as const;
 
+/**
+ * Registry-lock recovery has a separate public platform contract because a
+ * package can run on more platforms than it can safely reclaim stale locks.
+ */
+export const REGISTRY_LOCK_RECOVERY_CONTRACT_ID = "nawabari.registry-lock-recovery.v1" as const;
+export const REGISTRY_LOCK_RECOVERY_CONTRACT_VERSION = 1 as const;
+
 /** Public lifecycle names are projections of the existing dispatcher/help identities. */
 const RESOURCE_CLAIM_COMMANDS = Object.freeze([
   "session claim",
@@ -184,6 +191,20 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "GIT_TIMEOUT",
       "GIT_OUTPUT_LIMIT",
     ],
+    registry_lock_recovery: {
+      contract_id: REGISTRY_LOCK_RECOVERY_CONTRACT_ID,
+      contract_version: REGISTRY_LOCK_RECOVERY_CONTRACT_VERSION,
+      supported_platforms: ["linux"],
+      unsupported_platforms: "non-linux",
+      owner_identity: ["hostname", "pid", "processStartTime"],
+      process_generation_provider: "linux:/proc/<pid>/stat:starttime",
+      stale_recovery: {
+        live_owner: "never-reclaim-by-age",
+        unknown_or_remote_owner: "fail-closed",
+        pid_only_identity: "not-sufficient",
+        unsupported_platform: "LOCK_STALE; deliberate operator remediation required",
+      },
+    },
   },
   {
     id: "session-discard",
@@ -580,6 +601,9 @@ export function machineContract(packageVersion: string): JsonObject {
               unchanged_on_rejection: true,
             },
           }
+        : {}),
+      ...(capability.id === "session-lifecycle"
+        ? { registry_lock_recovery: jsonClone(capability.registry_lock_recovery) }
         : {}),
     })),
     json: {
