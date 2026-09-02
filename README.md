@@ -258,8 +258,18 @@ code. Claim JSON exposes `schema_version`, `claim_id`, `session_id`, the
 repository/worktree identities, canonical `resource`, `mode`, and timestamps.
 The claim schema version is `2` and supports `read`, `write`, and
 `exclusive-write`. Schema v1 records use different overlap semantics and are
-not interpreted implicitly: an embedding caller must explicitly run
-`SessionRegistry.migrate()` before using them.
+not interpreted implicitly. If an upgraded repository reports
+`UNSUPPORTED_CLAIM_SCHEMA_VERSION`, run the public migration command:
+
+```bash
+git nawabari migrate --json
+```
+
+Migration validates the complete legacy registry under the registry lock and
+rewrites it with an atomic replace. It is idempotent and retry-safe; ambiguous
+or corrupt state is rejected with bounded diagnostics. Do not hand-edit or
+delete the registry. Embedding callers may use the same authority through
+`SessionRegistry.migrate()`.
 
 ```bash
 git nawabari session claim --session "$NAWABARI_SESSION_ID" \

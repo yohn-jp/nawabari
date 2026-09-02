@@ -514,6 +514,13 @@ export type GarbageCollectResult = {
   blocked?: GarbageCollectBlocked[];
 };
 
+/** Result of explicitly upgrading the persisted resource-claim schema. */
+export type RegistryMigrationResult = {
+  migrated: boolean;
+  registry_schema_version: number;
+  claim_schema_version: number;
+};
+
 export interface SessionBackend {
   createSession(context: SessionContext, options: SessionCreateOptions): Promise<DomainResult<SessionRecord>>;
   resolveCurrentSession(context: SessionContext): Promise<DomainResult<SessionRecord>>;
@@ -551,6 +558,7 @@ export interface SessionBackend {
     context: SessionContext,
     sessionId: string | null,
   ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation: number }>>;
+  migrate?(context: SessionContext): Promise<DomainResult<RegistryMigrationResult>>;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {

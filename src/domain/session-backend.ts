@@ -46,6 +46,7 @@ import {
   type ReleaseClaimsOptions,
   type ReleaseClaimsResult,
   type ResourceClaim,
+  type RegistryMigrationResult,
   type StatusResult,
   type UpdateClaimsOptions,
 } from "./session.js";
@@ -496,6 +497,20 @@ export class LocalSessionBackend implements SessionBackend {
       return success({
         claims: snapshot.claims.map(toDomainClaim),
         claim_set_generation: snapshot.claimSetGeneration,
+      });
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  /** Explicitly migrate legacy claim state through the registry authority. */
+  public async migrate(context: SessionContext): Promise<DomainResult<RegistryMigrationResult>> {
+    try {
+      const result = this.registryFor(context).migrate();
+      return success({
+        migrated: result.migrated,
+        registry_schema_version: result.registrySchemaVersion,
+        claim_schema_version: result.claimSchemaVersion,
       });
     } catch (error: unknown) {
       return failure(toDomainError(error));

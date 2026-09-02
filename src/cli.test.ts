@@ -263,6 +263,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "guard",
       "gc",
       "doctor",
+      "migrate",
       "capabilities",
     ],
     options: ["--json", "--help", "--version"],
@@ -305,6 +306,58 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       ambiguity: "supplying both positional and --session is rejected",
       discard_requires_explicit_target: true,
     },
+  });
+});
+
+test("migrate exposes the explicit legacy claim-schema upgrade through the public CLI", async () => {
+  const output = capture();
+  let calls = 0;
+  const exitCode = await runCli(["migrate", "--json"], {
+    backend: backendForTests({
+      migrate: async () => {
+        calls += 1;
+        return success({
+          migrated: true,
+          registry_schema_version: 1,
+          claim_schema_version: 2,
+        });
+      },
+    }),
+    io: output.io,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(calls, 1);
+  assert.deepEqual(JSON.parse(output.stdout[0] ?? ""), {
+    ok: true,
+    command: "migrate",
+    migrated: true,
+    registry_schema_version: 1,
+    claim_schema_version: 2,
+  });
+});
+
+test("migrate rejects options before invoking a backend", async () => {
+  const output = capture();
+  let calls = 0;
+  const exitCode = await runCli(["migrate", "--unexpected", "--json"], {
+    backend: backendForTests({
+      migrate: async () => {
+        calls += 1;
+        return success({ migrated: false, registry_schema_version: 1, claim_schema_version: 2 });
+      },
+    }),
+    io: output.io,
+  });
+
+  assert.equal(exitCode, 2);
+  assert.equal(calls, 0);
+  assert.deepEqual(JSON.parse(output.stdout[0] ?? ""), {
+    ok: false,
+    command: "migrate",
+    code: "INVALID_ARGUMENT",
+    message: "Unknown option: --unexpected.",
+    details: { option: "--unexpected" },
   });
 });
 

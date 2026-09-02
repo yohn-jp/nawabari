@@ -562,6 +562,16 @@ const HELP_COMMANDS: readonly HelpCommandSpec[] = [
     options: [],
   },
   {
+    name: "migrate",
+    summary: "Migrate legacy resource-claim registry state",
+    usage: `${CLI_NAME} migrate`,
+    options: [],
+    notes: [
+      "Explicitly upgrades claim-schema-v1 (and pre-claim registries) to the current schema under the registry lock.",
+      "Migration is atomic, idempotent, and fail-closed; do not edit or delete the registry manually.",
+    ],
+  },
+  {
     name: "capabilities",
     summary: "Describe the standalone CLI/JSON contract",
     usage: `${CLI_NAME} capabilities`,
@@ -2089,6 +2099,14 @@ async function executeCommand(
     );
   }
 
+  if (command === "migrate") {
+    const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
+    if (!parsed.ok) return parsed;
+    if (dependencies.backend.migrate === undefined) return migrationCapabilityUnavailable();
+    const result = await dependencies.backend.migrate(context);
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  }
+
   if (command === undefined) return failure(new DomainError("NO_COMMAND", "A command is required."));
   return failure(new DomainError("UNKNOWN_COMMAND", `Unknown command: ${command}.`, { command }));
 }
@@ -2102,6 +2120,14 @@ function commandName(commandArguments: string[]): string {
 
 function claimCapabilityUnavailable(operation: string): DomainResult<JsonObject> {
   return failure(new DomainError("BACKEND_UNAVAILABLE", "Resource claim capability is not available.", { operation }));
+}
+
+function migrationCapabilityUnavailable(): DomainResult<JsonObject> {
+  return failure(
+    new DomainError("BACKEND_UNAVAILABLE", "Registry migration capability is not available.", {
+      operation: "migrate",
+    }),
+  );
 }
 
 function authorizationCapabilityUnavailable(): DomainResult<JsonObject> {

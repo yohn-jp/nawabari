@@ -107,6 +107,10 @@ export const DISCARD_RESULT_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
 /** Bounds a caller-declared commit-message pattern before it is compiled. */
 export const MAX_MESSAGE_PATTERN_LENGTH = 512 as const;
+const MIGRATION_RECOVERY_HINTS = Object.freeze([
+  "Resolve the reported legacy registry ambiguity or corruption before retrying migration.",
+  "Do not hand-edit or delete the registry; retry `nawabari migrate --json` after authoritative state is restored.",
+]);
 
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
 export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
@@ -779,7 +783,12 @@ export class SessionRegistry {
    */
   migrate(): RegistryMigrationResult {
     return this.withLock(() => {
-      const state = this.readStateUnsafe(true);
+      let state: RegistryState;
+      try {
+        state = this.readStateUnsafe(true);
+      } catch (error: unknown) {
+        throw migrationReadError(error);
+      }
       const migrated = state.legacyClaimsAbsent || state.legacyClaimsSchemaVersion !== undefined;
       if (migrated) this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration);
       return {
@@ -5461,7 +5470,11 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
     throw new SessionRegistryError(
       "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
       "Resource claim schema v1 requires explicit migration before use",
-      { schemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION, migrationRequired: true },
+      {
+        schemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
+        migrationRequired: true,
+        recoveryHints: [...MIGRATION_RECOVERY_HINTS],
+      },
     );
   }
   if (!Array.isArray(value.claims)) {
@@ -5475,7 +5488,7 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
       isLegacyClaimSchema ? LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION : undefined,
     ),
   );
-  validateRegistryClaims(records, claims, expectedRepositoryId);
+  validateRegistryClaims(records, claims, expectedRepositoryId, isLegacyClaimSchema);
   return {
     sessions: records,
     claims: sortResourceClaims(claims),
@@ -5495,6 +5508,24 @@ function parseClaimSetGeneration(value: unknown): number {
     );
   }
   return value as number;
+}
+
+function migrationReadError(error: unknown): SessionRegistryError {
+  if (!(error instanceof SessionRegistryError)) throw error;
+  const suppliedHints = error.details.recoveryHints;
+  const recoveryHints = Array.isArray(suppliedHints)
+    ? suppliedHints.filter((hint): hint is string => typeof hint === "string")
+    : [...MIGRATION_RECOVERY_HINTS];
+  return new SessionRegistryError(
+    error.code,
+    error.message,
+    {
+      ...error.details,
+      migrationRequired: true,
+      recoveryHints,
+    },
+    error,
+  );
 }
 
 function nextClaimSetGeneration(state: RegistryState, nextClaims: readonly ResourceClaim[]): number {
@@ -5611,6 +5642,7 @@ function validateRegistryClaims(
   records: readonly SessionRecord[],
   claims: readonly ResourceClaim[],
   expectedRepositoryId: string,
+  legacySemantics = false,
 ): void {
   const sessions = new Map(records.map((record) => [record.sessionId, record]));
   const claimIds = new Set<string>();
@@ -5654,7 +5686,7 @@ function validateRegistryClaims(
           { claimId: current.claimId, ownerClaimId: prior.claimId },
         );
       }
-      if (!claimsConflict(current, prior)) continue;
+      if (!(legacySemantics ? legacyClaimsConflict(current, prior) : claimsConflict(current, prior))) continue;
       const conflictDetails = resourceClaimConflictDetails(current, prior, records);
       throw claimError("RESOURCE_CLAIM_CONFLICT", "Persisted claims contain an unresolved conflict", {
         claimId: current.claimId,
@@ -5664,6 +5696,17 @@ function validateRegistryClaims(
       });
     }
   }
+}
+
+/**
+ * Schema-v1 claims used the conservative overlap rule where every
+ * overlapping pair except read/read conflicted. Validate that rule before
+ * converting a legacy registry to v2 so migration never silently changes the
+ * authority represented by an otherwise invalid legacy state.
+ */
+function legacyClaimsConflict(left: ResourceClaim, right: ResourceClaim): boolean {
+  if (!claimsOverlap(left, right)) return false;
+  return left.mode !== "read" || right.mode !== "read";
 }
 
 function parseSessionRecord(value: unknown, index: number, expectedRepositoryId: string): SessionRecord {
