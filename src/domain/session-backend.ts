@@ -712,6 +712,21 @@ function toDomainPushResult(result: import("../session-registry.js").PushResult)
     relation: result.relation,
     force: result.force,
     upstream_created: result.upstreamCreated,
+    ...(result.reconciliation === undefined
+      ? {}
+      : {
+          reconciliation: {
+            outcome: result.reconciliation.outcome,
+            retry_safe: result.reconciliation.retrySafe,
+            repository: result.reconciliation.repositoryId,
+            remote: result.reconciliation.remote,
+            branch: result.reconciliation.branch,
+            target_ref: result.reconciliation.targetRef,
+            precondition_sha: result.reconciliation.preconditionSha,
+            intended_source_sha: result.reconciliation.intendedSourceSha,
+            observed_remote_sha: result.reconciliation.observedRemoteSha,
+          },
+        }),
   };
 }
 

@@ -85,7 +85,7 @@ export type RegistryErrorCode =
  * the CLI can project the exact same object in machine and human modes.
  */
 export type RegistryErrorDetailValue =
-  boolean | number | string | string[] | { readonly [key: string]: RegistryErrorDetailValue };
+  null | boolean | number | string | string[] | { readonly [key: string]: RegistryErrorDetailValue };
 
 export type RegistryErrorDetails = Readonly<Record<string, RegistryErrorDetailValue>>;
 

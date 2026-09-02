@@ -383,6 +383,20 @@ export type PushOptions = {
 
 export type PushRelation = "no-upstream" | "up-to-date" | "ahead" | "behind" | "diverged";
 
+export type PushOutcome = "proven-absent" | "proven-pushed" | "unresolved";
+
+export type PushReconciliation = {
+  outcome: PushOutcome;
+  retry_safe: boolean;
+  repository: string;
+  remote: string;
+  branch: string;
+  target_ref: string;
+  precondition_sha: string | null;
+  intended_source_sha: string;
+  observed_remote_sha: string | null;
+};
+
 export type PushResult = {
   schema_version: number;
   source_sha: string;
@@ -394,6 +408,7 @@ export type PushResult = {
   relation: PushRelation;
   force: boolean;
   upstream_created: boolean;
+  reconciliation?: PushReconciliation;
 };
 
 export type GarbageCollectOptions = {

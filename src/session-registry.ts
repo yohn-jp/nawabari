@@ -585,6 +585,25 @@ export interface CommitReconciliation {
 
 export type PushRelation = "no-upstream" | "up-to-date" | "ahead" | "behind" | "diverged";
 
+export type PushOutcome = "proven-absent" | "proven-pushed" | "unresolved";
+
+/** Bounded exact-remote evidence used to classify an ambiguous push failure. */
+export interface PushReconciliation {
+  readonly outcome: PushOutcome;
+  /** A retry is safe only when the target ref is proven at its precondition generation. */
+  readonly retrySafe: boolean;
+  readonly repositoryId: string;
+  readonly remote: string;
+  readonly branch: string;
+  readonly targetRef: string;
+  /** The exact remote generation captured before the push mutation. */
+  readonly preconditionSha: string | null;
+  /** The immutable local SHA supplied as the push source. */
+  readonly intendedSourceSha: string;
+  /** The exact target ref generation observed after the push failure. */
+  readonly observedRemoteSha: string | null;
+}
+
 export interface PushOptions {
   readonly sessionId?: string | null;
   readonly session_id?: string | null;
@@ -613,6 +632,8 @@ export interface PushResult {
   readonly relation: PushRelation;
   readonly force: boolean;
   readonly upstreamCreated: boolean;
+  /** Present only when a push transport failure was reconciled against the exact target ref. */
+  readonly reconciliation?: PushReconciliation;
 }
 
 export interface SessionRegistryOptions {
@@ -1963,7 +1984,36 @@ export class SessionRegistry {
         remote,
         `${finalContext.headId}:${targetRef}`,
       ];
-      runMutationGit(this.git, pushArguments, initial.worktreePath, "push", "PUSH_FAILED");
+      const result = {
+        schemaVersion: GOVERNED_GIT_OPERATION_SCHEMA_VERSION,
+        sourceSha: finalContext.headId,
+        remote,
+        branch,
+        target: `${remote}/${branch}`,
+        targetRef,
+        observedRemoteSha: inspection.observedRemoteSha,
+        relation: inspection.relation,
+        force,
+        upstreamCreated: createUpstream,
+      } as const;
+      let reconciledResult: PushResult | undefined;
+      try {
+        runMutationGit(this.git, pushArguments, initial.worktreePath, "push", "PUSH_FAILED");
+      } catch (error: unknown) {
+        if (
+          error instanceof SessionRegistryError &&
+          (isBoundedGitFailure(error.code) || error.code === "PUSH_FAILED")
+        ) {
+          reconciledResult = reconcilePushTransportFailure(
+            this.git,
+            initial.worktreePath,
+            initial.repositoryId,
+            result,
+            error,
+          );
+        }
+        if (reconciledResult === undefined) throw error;
+      }
       if (createUpstream) {
         // A SHA:ref refspec is intentional: it cannot be redirected by a
         // mutable symbolic HEAD. Git does not consistently infer the current
@@ -1978,18 +2028,7 @@ export class SessionRegistry {
         );
       }
 
-      return Object.freeze({
-        schemaVersion: GOVERNED_GIT_OPERATION_SCHEMA_VERSION,
-        sourceSha: finalContext.headId,
-        remote,
-        branch,
-        target: `${remote}/${branch}`,
-        targetRef,
-        observedRemoteSha: inspection.observedRemoteSha,
-        relation: inspection.relation,
-        force,
-        upstreamCreated: createUpstream,
-      });
+      return reconciledResult ?? Object.freeze(result);
     });
   }
 
@@ -4762,6 +4801,151 @@ function commitReconciliationFailure(
       : {}),
   };
   return new SessionRegistryError(failure.code, failure.message, details, failure);
+}
+
+type PushResultWithoutReconciliation = Omit<PushResult, "reconciliation">;
+
+type PushReconciliationEvidence = Omit<PushReconciliation, "observedRemoteSha"> & {
+  readonly observedRemoteSha?: string | null;
+  readonly reconciliationError?: unknown;
+  readonly reconciliationReason?: string;
+};
+
+/**
+ * Reconcile a push failure against the only authoritative post-effect state:
+ * the exact remote ref named by the attempted SHA:ref update.  No ancestry,
+ * tracking-ref, or other-remote-ref observation is part of this decision.
+ */
+function reconcilePushTransportFailure(
+  git: GitCommandRunner,
+  cwd: string,
+  repositoryId: string,
+  result: PushResultWithoutReconciliation,
+  failure: SessionRegistryError,
+): PushResult {
+  let observedRemoteSha: string | null;
+  try {
+    observedRemoteSha = readExactRemoteGeneration(git, cwd, result.remote, result.targetRef);
+  } catch (error: unknown) {
+    throw pushReconciliationFailure(failure, {
+      outcome: "unresolved",
+      retrySafe: false,
+      repositoryId,
+      remote: result.remote,
+      branch: result.branch,
+      targetRef: result.targetRef,
+      preconditionSha: result.observedRemoteSha,
+      intendedSourceSha: result.sourceSha,
+      reconciliationError: error,
+    });
+  }
+
+  const outcome: PushOutcome =
+    observedRemoteSha === result.observedRemoteSha
+      ? "proven-absent"
+      : observedRemoteSha === result.sourceSha
+        ? "proven-pushed"
+        : "unresolved";
+  if (outcome === "proven-pushed") {
+    const reconciliation: PushReconciliation = Object.freeze({
+      outcome,
+      retrySafe: false,
+      repositoryId,
+      remote: result.remote,
+      branch: result.branch,
+      targetRef: result.targetRef,
+      preconditionSha: result.observedRemoteSha,
+      intendedSourceSha: result.sourceSha,
+      observedRemoteSha,
+    });
+    return Object.freeze({ ...result, reconciliation });
+  }
+
+  throw pushReconciliationFailure(failure, {
+    outcome,
+    retrySafe: outcome === "proven-absent",
+    repositoryId,
+    remote: result.remote,
+    branch: result.branch,
+    targetRef: result.targetRef,
+    preconditionSha: result.observedRemoteSha,
+    intendedSourceSha: result.sourceSha,
+    observedRemoteSha,
+    ...(outcome === "unresolved" ? { reconciliationReason: "remote-generation-mismatch" } : {}),
+  });
+}
+
+function pushReconciliationFailure(
+  failure: SessionRegistryError,
+  evidence: PushReconciliationEvidence,
+): SessionRegistryError {
+  const identity: RegistryErrorDetails = {
+    repository: evidence.repositoryId,
+    remote: evidence.remote,
+    branch: evidence.branch,
+    target: `${evidence.remote}/${evidence.branch}`,
+    targetRef: evidence.targetRef,
+    preconditionSha: evidence.preconditionSha,
+    intendedSourceSha: evidence.intendedSourceSha,
+  };
+  const details: RegistryErrorDetails = {
+    ...failure.details,
+    ...identity,
+    outcome: evidence.outcome,
+    retrySafe: evidence.retrySafe,
+    ...(evidence.observedRemoteSha === undefined ? {} : { observedRemoteSha: evidence.observedRemoteSha }),
+    reconciliation: {
+      ...identity,
+      outcome: evidence.outcome,
+      retrySafe: evidence.retrySafe,
+      ...(evidence.observedRemoteSha === undefined ? {} : { observedRemoteSha: evidence.observedRemoteSha }),
+    },
+    ...(evidence.reconciliationReason === undefined ? {} : { reconciliationReason: evidence.reconciliationReason }),
+    ...(evidence.reconciliationError instanceof SessionRegistryError
+      ? { reconciliationErrorCode: evidence.reconciliationError.code }
+      : {}),
+  };
+  return new SessionRegistryError(failure.code, failure.message, details, failure);
+}
+
+/** Observe one exact remote generation without touching local tracking refs. */
+function readExactRemoteGeneration(
+  git: GitCommandRunner,
+  cwd: string,
+  remote: string,
+  targetRef: string,
+): string | null {
+  let output: string;
+  try {
+    output = git.run(["ls-remote", "--heads", remote, targetRef], cwd).trim();
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw new SessionRegistryError(
+      "PUSH_REMOTE_INSPECTION_FAILED",
+      "Post-failure remote generation observation failed",
+      { remote, targetRef },
+      error,
+    );
+  }
+  if (output === "") return null;
+
+  const records = output.split(/\r?\n/u).filter((record) => record.length > 0);
+  if (records.length !== 1) {
+    throw new SessionRegistryError(
+      "PUSH_REMOTE_INSPECTION_FAILED",
+      "Post-failure remote generation observation returned multiple records",
+      { remote, targetRef },
+    );
+  }
+  const fields = records[0].split(/\s+/u);
+  if (fields.length !== 2 || !/^[0-9a-f]{40,64}$/u.test(fields[0]) || fields[1] !== targetRef) {
+    throw new SessionRegistryError(
+      "PUSH_REMOTE_INSPECTION_FAILED",
+      "Post-failure remote generation observation returned an invalid record",
+      { remote, targetRef },
+    );
+  }
+  return fields[0];
 }
 
 function inspectPushTarget(

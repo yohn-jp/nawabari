@@ -794,6 +794,201 @@ test("push reports remote inspection failure and preserves bounded timeout codes
   }
 });
 
+test("push reconciles a transport failure after the exact remote update", () => {
+  const fixture = createFixture(true);
+  try {
+    claim(fixture);
+    const options = {
+      sessionId: fixture.session.sessionId,
+      resources: ["file.txt"],
+      remote: "origin",
+      branch: fixture.session.branchName,
+      createUpstream: true,
+    } as const;
+    const initial = fixture.current.push(options);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "post-effect-push\n");
+    runGit(["commit", "-am", "post-effect-push"], fixture.worktree);
+    const intendedSourceSha = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    let injected = false;
+    const postEffectFailureGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "push" && !injected) {
+          injected = true;
+          defaultGit.run(args, cwd);
+          throw new SessionRegistryError("GIT_TIMEOUT", "injected post-effect push timeout");
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    const result = new SessionRegistry({ cwd: fixture.worktree, git: postEffectFailureGit }).push({
+      ...options,
+      createUpstream: false,
+    });
+    assert.equal(result.sourceSha, intendedSourceSha);
+    assert.equal(result.observedRemoteSha, initial.sourceSha);
+    assert.equal(result.reconciliation?.outcome, "proven-pushed");
+    assert.equal(result.reconciliation?.retrySafe, false);
+    assert.equal(result.reconciliation?.repositoryId, fixture.registry.repository.repositoryId);
+    assert.equal(result.reconciliation?.remote, "origin");
+    assert.equal(result.reconciliation?.branch, fixture.session.branchName);
+    assert.equal(result.reconciliation?.targetRef, `refs/heads/${fixture.session.branchName}`);
+    assert.equal(result.reconciliation?.preconditionSha, initial.sourceSha);
+    assert.equal(result.reconciliation?.intendedSourceSha, intendedSourceSha);
+    assert.equal(result.reconciliation?.observedRemoteSha, intendedSourceSha);
+    assert.equal(
+      runGit(["rev-parse", `refs/heads/${fixture.session.branchName}`], fixture.remote as string),
+      intendedSourceSha,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("push classifies a transport failure before the remote update as retry-safe proven absent", () => {
+  const fixture = createFixture(true);
+  try {
+    claim(fixture);
+    const options = {
+      sessionId: fixture.session.sessionId,
+      resources: ["file.txt"],
+      remote: "origin",
+      branch: fixture.session.branchName,
+      createUpstream: true,
+    } as const;
+    const initial = fixture.current.push(options);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "pre-effect-push\n");
+    runGit(["commit", "-am", "pre-effect-push"], fixture.worktree);
+    const intendedSourceSha = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    let injected = true;
+    const preEffectFailureGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "push" && injected) {
+          injected = false;
+          throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "injected pre-effect push output limit");
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () =>
+        new SessionRegistry({ cwd: fixture.worktree, git: preEffectFailureGit }).push({
+          ...options,
+          createUpstream: false,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "GIT_OUTPUT_LIMIT");
+        assert.equal(error.details.outcome, "proven-absent");
+        assert.equal(error.details.retrySafe, true);
+        assert.equal(error.details.repository, fixture.registry.repository.repositoryId);
+        assert.equal(error.details.remote, "origin");
+        assert.equal(error.details.branch, fixture.session.branchName);
+        assert.equal(error.details.targetRef, `refs/heads/${fixture.session.branchName}`);
+        assert.equal(error.details.preconditionSha, initial.sourceSha);
+        assert.equal(error.details.intendedSourceSha, intendedSourceSha);
+        assert.equal(error.details.observedRemoteSha, initial.sourceSha);
+        const reconciliation = error.details.reconciliation;
+        assert.ok(reconciliation !== null && typeof reconciliation === "object");
+        const reconciliationRecord = reconciliation as {
+          readonly outcome?: unknown;
+          readonly retrySafe?: unknown;
+        };
+        assert.equal(reconciliationRecord.outcome, "proven-absent");
+        assert.equal(reconciliationRecord.retrySafe, true);
+        return true;
+      },
+    );
+
+    const retry = new SessionRegistry({ cwd: fixture.worktree, git: preEffectFailureGit }).push({
+      ...options,
+      createUpstream: false,
+    });
+    assert.equal(retry.reconciliation, undefined);
+    assert.equal(retry.sourceSha, intendedSourceSha);
+    assert.equal(
+      runGit(["rev-parse", `refs/heads/${fixture.session.branchName}`], fixture.remote as string),
+      intendedSourceSha,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("push keeps unresolved remote-generation outcomes non-retry-safe when post-failure observation cannot complete", () => {
+  const fixture = createFixture(true);
+  try {
+    claim(fixture);
+    const options = {
+      sessionId: fixture.session.sessionId,
+      resources: ["file.txt"],
+      remote: "origin",
+      branch: fixture.session.branchName,
+      createUpstream: true,
+    } as const;
+    const initial = fixture.current.push(options);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "unresolved-push\n");
+    runGit(["commit", "-am", "unresolved-push"], fixture.worktree);
+    const intendedSourceSha = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    let injected = false;
+    const unresolvedGit: GitCommandRunner = {
+      run(args, cwd): string {
+        if (args[0] === "push" && !injected) {
+          injected = true;
+          defaultGit.run(args, cwd);
+          throw new SessionRegistryError("GIT_TIMEOUT", "injected unresolved push timeout");
+        }
+        if (
+          injected &&
+          args[0] === "ls-remote" &&
+          args[1] === "--heads" &&
+          args[3] === `refs/heads/${fixture.session.branchName}`
+        ) {
+          throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "injected reconciliation output limit");
+        }
+        return defaultGit.run(args, cwd);
+      },
+      runRaw(args, cwd): string {
+        return defaultGit.runRaw?.(args, cwd) ?? defaultGit.run(args, cwd);
+      },
+    };
+
+    assert.throws(
+      () =>
+        new SessionRegistry({ cwd: fixture.worktree, git: unresolvedGit }).push({
+          ...options,
+          createUpstream: false,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "GIT_TIMEOUT");
+        assert.equal(error.details.outcome, "unresolved");
+        assert.equal(error.details.retrySafe, false);
+        assert.equal(error.details.repository, fixture.registry.repository.repositoryId);
+        assert.equal(error.details.remote, "origin");
+        assert.equal(error.details.targetRef, `refs/heads/${fixture.session.branchName}`);
+        assert.equal(error.details.preconditionSha, initial.sourceSha);
+        assert.equal(error.details.intendedSourceSha, intendedSourceSha);
+        assert.equal(error.details.reconciliationErrorCode, "GIT_OUTPUT_LIMIT");
+        return true;
+      },
+    );
+    assert.equal(
+      runGit(["rev-parse", `refs/heads/${fixture.session.branchName}`], fixture.remote as string),
+      intendedSourceSha,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("push distinguishes behind and diverged histories and requires explicit force", () => {
   const fixture = createFixture(true);
   const clone = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-mutation-clone-"));
