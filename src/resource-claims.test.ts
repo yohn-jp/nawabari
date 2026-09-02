@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
+import { withDirectoryFsyncFailure } from "./testing/fs-fault-injection.js";
 import {
   canonicalizeClaimResource,
   canonicalizeConcretePath,
@@ -314,6 +315,104 @@ test("requires explicit migration before interpreting v1 claim semantics", () =>
     };
     assert.equal(migrated.claims_schema_version, 2);
     assert.equal(migrated.claims[0]?.schema_version, 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("migration rejects ambiguous legacy claims without rewriting them", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    registry.claimResources({ sessionId: session.sessionId, claims: [{ resource: "src/file.ts", mode: "read" }] });
+    const legacy = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
+      claims_schema_version: number;
+      claims: Array<Record<string, unknown>>;
+    };
+    legacy.claims_schema_version = 1;
+    legacy.claims[0] = { ...legacy.claims[0], schema_version: 1, resource: "../escape" };
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
+
+    assert.throws(
+      () => registry.migrate(),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "CLAIM_PATH_TRAVERSAL");
+        assert.equal(error.details.migrationRequired, true);
+        assert.ok(Array.isArray(error.details.recoveryHints));
+        assert.ok((error.details.recoveryHints as string[]).some((hint) => hint.includes("nawabari migrate")));
+        return true;
+      },
+    );
+    const stillLegacy = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
+      claims_schema_version: number;
+      claims: Array<{ schema_version: number; resource: string }>;
+    };
+    assert.equal(stillLegacy.claims_schema_version, 1);
+    assert.equal(stillLegacy.claims[0]?.schema_version, 1);
+    assert.equal(stillLegacy.claims[0]?.resource, "../escape");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("migration rejects v1 overlaps that are incompatible under legacy semantics", () => {
+  const fixture = createRepositoryFixture(true);
+  try {
+    const firstRegistry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const first = firstRegistry.create();
+    const secondRegistry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const second = secondRegistry.create();
+    firstRegistry.claimResources({ sessionId: first.sessionId, claims: [{ resource: "src/file.ts", mode: "read" }] });
+    secondRegistry.claimResources({
+      sessionId: second.sessionId,
+      claims: [{ resource: "src/file.ts", mode: "write" }],
+    });
+
+    const legacy = JSON.parse(fs.readFileSync(firstRegistry.paths.registry, "utf8")) as {
+      claims_schema_version: number;
+      claims: Array<{ schema_version: number }>;
+    };
+    legacy.claims_schema_version = 1;
+    for (const claim of legacy.claims) claim.schema_version = 1;
+    fs.writeFileSync(firstRegistry.paths.registry, `${JSON.stringify(legacy)}\n`);
+
+    assertRegistryError(() => firstRegistry.migrate(), "RESOURCE_CLAIM_CONFLICT");
+    const stillLegacy = JSON.parse(fs.readFileSync(firstRegistry.paths.registry, "utf8")) as {
+      claims_schema_version: number;
+    };
+    assert.equal(stillLegacy.claims_schema_version, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("migration retry converges after a post-rename durability-uncertain failure", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    registry.claimResources({ sessionId: session.sessionId, claims: [{ resource: "src/file.ts", mode: "read" }] });
+    const legacy = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
+      claims_schema_version: number;
+      claims: Array<{ schema_version: number }>;
+    };
+    legacy.claims_schema_version = 1;
+    for (const claim of legacy.claims) claim.schema_version = 1;
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
+
+    assertRegistryError(
+      () => withDirectoryFsyncFailure(registry.paths.directory, "EIO", () => registry.migrate()),
+      "REGISTRY_DURABILITY_UNCERTAIN",
+    );
+    const retried = registry.migrate();
+    assert.deepEqual(retried, {
+      migrated: false,
+      registrySchemaVersion: 1,
+      claimSchemaVersion: 2,
+    });
+    assert.equal(registry.listClaims()[0]?.schemaVersion, 2);
   } finally {
     fixture.cleanup();
   }

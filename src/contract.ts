@@ -9,6 +9,7 @@ import {
   RESOURCE_CLAIM_TRANSITION_MATRIX,
   RESOURCE_CLAIM_TRANSITION_MODES,
   RESOURCE_CLAIM_TRANSITIONS,
+  LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
 } from "./resource-claims.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
@@ -48,6 +49,7 @@ const RESOURCE_CLAIM_COMMANDS = Object.freeze([
   "resource claims",
   "session release",
   "resource release",
+  "migrate",
 ] as const);
 
 const RESOURCE_CLAIM_COMMAND_ALIASES = Object.freeze([
@@ -105,6 +107,18 @@ const RESOURCE_CLAIM_RESULT_MAPPINGS = Object.freeze([
     commands: ["session claims", "resource list", "resource claims"],
     required: ["claims", "claim_set_generation"],
     nested_claim_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
+  },
+  {
+    schema: "resource-claim.migration.v1",
+    version: RESOURCE_CLAIM_MACHINE_CONTRACT_VERSION,
+    commands: ["migrate"],
+    required: ["migrated", "registry_schema_version", "claim_schema_version"],
+    source_claim_schema_version: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
+    target_claim_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
+    nested_claim_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
+    atomic: true,
+    idempotent_retry: true,
+    fail_closed: true,
   },
 ] as const);
 
@@ -304,6 +318,9 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "updated_at",
       "claim_set_generation",
       "previous_claim_set_generation",
+      "migrated",
+      "registry_schema_version",
+      "claim_schema_version",
     ],
     failure_codes: RESOURCE_CLAIM_FAILURE_CODES,
     failure_code_policy: {
@@ -534,6 +551,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "RECOVERABLE_STASHES",
       "NESTED_REPOSITORY",
       "STALE_SESSION",
+      "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
       "REGISTRY_CORRUPT",
       "LOCK_CONTENTION",
       "REGISTRY_UNREADABLE",
@@ -600,6 +618,15 @@ export function machineContract(packageVersion: string): JsonObject {
               pairing: "adjacent-resource-mode",
               idempotent_retry: true,
               unchanged_on_rejection: true,
+            },
+            migration: {
+              command: "migrate",
+              source_claim_schema_version: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
+              target_claim_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
+              result_schema: "resource-claim.migration.v1",
+              atomic: true,
+              idempotent_retry: true,
+              fail_closed: true,
             },
           }
         : {}),

@@ -81,7 +81,7 @@ async function inspectRegistry(repository: RepositoryInfo, context: RepositoryCo
       const code = doctorErrorCode(error, "REGISTRY_UNREADABLE");
       return check("registry", "error", code, "The Nawabari registry failed authoritative validation.", {
         path: repository.registry_path,
-        ...(isSessionRegistryError(error) ? { reason: error.code } : {}),
+        ...(isSessionRegistryError(error) ? { reason: error.code, ...error.details } : {}),
       });
     }
   } catch (error: unknown) {
@@ -218,6 +218,7 @@ function doctorErrorCode(error: unknown, fallback: ErrorCode): ErrorCode {
   if (code === "PHYSICAL_OBSERVATION_UNAVAILABLE") return "PHYSICAL_OBSERVATION_UNAVAILABLE";
   if (code === "REPOSITORY_IDENTITY_AMBIGUOUS") return "GIT_STATE_AMBIGUOUS";
   if (code === "REGISTRY_CORRUPT" || code === "UNSUPPORTED_SCHEMA_VERSION") return "REGISTRY_CORRUPT";
+  if (code === "UNSUPPORTED_CLAIM_SCHEMA_VERSION") return "UNSUPPORTED_CLAIM_SCHEMA_VERSION";
   if (code === "REGISTRY_REPOSITORY_MISMATCH") return "INVALID_REGISTRY";
   if (code === "INVALID_BRANCH_ID") return "INVALID_BRANCH";
   if (code === "INVALID_WORKTREE_PATH") return "INVALID_WORKTREE";

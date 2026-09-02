@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { runCli } from "../cli.js";
+import { SessionRegistry } from "../session-registry.js";
 import { LocalSessionBackend } from "./session-backend.js";
 
 test("local session backend provisions through the domain contract", async () => {
@@ -69,6 +70,69 @@ test("status exposes the resolved managed root and bounded history selection", a
       history.value.sessions.find((session) => session.session_id === created.value.session_id)?.state,
       "closed",
     );
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("local backend migrates legacy claim state and restores ordinary reads", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-migration`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/migration", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    registry.claimResources({
+      sessionId: created.value.session_id,
+      claims: [{ resource: "README.md", mode: "read" }],
+    });
+    const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
+      claims_schema_version: number;
+      claims: Array<{ schema_version: number }>;
+    };
+    persisted.claims_schema_version = 1;
+    for (const claim of persisted.claims) claim.schema_version = 1;
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(persisted)}\n`);
+
+    const blocked = await backend.status({ cwd: worktreePath });
+    assert.equal(blocked.ok, false);
+    if (!blocked.ok) assert.equal(blocked.error.code, "UNSUPPORTED_CLAIM_SCHEMA_VERSION");
+
+    const migrationOutput: string[] = [];
+    const migrationExitCode = await runCli(["migrate", "--json"], {
+      cwd: worktreePath,
+      io: { stdout: (line) => migrationOutput.push(line), stderr: () => undefined },
+    });
+    assert.equal(migrationExitCode, 0);
+    assert.deepEqual(JSON.parse(migrationOutput[0] ?? ""), {
+      ok: true,
+      command: "migrate",
+      migrated: true,
+      registry_schema_version: 1,
+      claim_schema_version: 2,
+    });
+
+    const status = await backend.status({ cwd: worktreePath });
+    assert.equal(status.ok, true);
+    const after = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
+      claims_schema_version: number;
+      claims: Array<{ schema_version: number }>;
+    };
+    assert.equal(after.claims_schema_version, 2);
+    assert.equal(after.claims[0]?.schema_version, 2);
+
+    const retry = await backend.migrate({ cwd: worktreePath });
+    assert.deepEqual(retry, {
+      ok: true,
+      value: { migrated: false, registry_schema_version: 1, claim_schema_version: 2 },
+    });
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });
