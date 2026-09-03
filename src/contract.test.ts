@@ -147,7 +147,7 @@ test("protected-execution capability publishes the sandbox contract and canonica
   assert.equal(readiness.command, "doctor");
   assert.equal(readiness.report_field, "sandbox");
 
-  for (const command of ["session run", "session exec"]) {
+  for (const command of ["session run", "session exec"] as const) {
     const output: string[] = [];
     const exitCode = await runCli([...command.split(" "), "--help", "--json"], {
       io: { stdout: (line) => output.push(line), stderr: () => undefined },
@@ -155,7 +155,8 @@ test("protected-execution capability publishes the sandbox contract and canonica
     assert.equal(exitCode, 0, `${command} help failed`);
     const response = JSON.parse(output[0] ?? "") as JsonRecord;
     assert.equal(response.ok, true);
-    assert.equal(response.help_for, "session run");
+    assert.equal(response.help_for, command);
+    if (command === "session exec") assert.equal(response.canonical_command, "session run");
   }
 });
 

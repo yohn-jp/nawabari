@@ -26,7 +26,7 @@ import type {
   UpdateClaimsOptions,
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
-import { discoverSandboxRuntimeLayout, type SandboxProbe } from "./domain/sandbox.js";
+import { discoverSandboxRuntimeLayout, SANDBOX_REQUIRED_CAPABILITIES, type SandboxProbe } from "./domain/sandbox.js";
 import type { CliIO } from "./presentation.js";
 
 const sampleSession: SessionRecord = {
@@ -1039,7 +1039,10 @@ test("doctor JSON exposes protected-execution readiness without resolving a sess
       "ipc_namespace",
       "uts_namespace",
     ]);
-    assert.equal(response.sandbox.capabilities.filter((entry) => entry.requirement === "required").length, 6);
+    assert.equal(
+      response.sandbox.capabilities.filter((entry) => entry.requirement === "required").length,
+      SANDBOX_REQUIRED_CAPABILITIES.length,
+    );
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
