@@ -34,6 +34,7 @@ import {
   type SessionCloseOptions,
   type SessionCloseResult,
   type SessionDiscardResult,
+  type CleanupReconciliation,
   type SessionContext,
   type SessionCreateOptions,
   type SessionDiagnostic,
@@ -361,6 +362,9 @@ export class LocalSessionBackend implements SessionBackend {
           branch_removed: result.branchRemoved,
           idempotent: result.idempotent,
           claim_set_generation: result.claimSetGeneration,
+          ...(result.reconciliation === undefined
+            ? {}
+            : { reconciliation: toDomainCleanupReconciliation(result.reconciliation) }),
           ...(result.integrationProof === undefined
             ? {}
             : {
@@ -834,6 +838,30 @@ function toDomainSessionDiscardResult(
     released_claims_truncated: result.releasedClaimsTruncated,
     idempotent: result.idempotent,
     claim_set_generation: result.claimSetGeneration,
+    ...(result.reconciliation === undefined
+      ? {}
+      : { reconciliation: toDomainCleanupReconciliation(result.reconciliation) }),
+  };
+}
+
+function toDomainCleanupReconciliation(
+  reconciliation: import("../session-registry.js").CleanupReconciliation,
+): CleanupReconciliation {
+  return {
+    operation: reconciliation.operation,
+    outcome: reconciliation.outcome,
+    retry_safe: reconciliation.retrySafe,
+    repository: reconciliation.repositoryId,
+    session_id: reconciliation.sessionId,
+    worktree: reconciliation.worktreePath,
+    branch: reconciliation.branchName,
+    expected_head: reconciliation.expectedHead,
+    observed_worktree_head: reconciliation.observedWorktreeHead,
+    observed_branch_head: reconciliation.observedBranchHead,
+    worktree_present: reconciliation.worktreePresent,
+    branch_present: reconciliation.branchPresent,
+    remaining: [...reconciliation.remaining],
+    ...(reconciliation.reason === undefined ? {} : { reason: reconciliation.reason }),
   };
 }
 

@@ -22,7 +22,12 @@ import {
   type PhysicalExecutionContext,
   type RepositoryContext,
 } from "./git.js";
-import { SessionRegistryError, type RegistryErrorCode, type RegistryErrorDetails } from "./errors.js";
+import {
+  SessionRegistryError,
+  type RegistryErrorCode,
+  type RegistryErrorDetailValue,
+  type RegistryErrorDetails,
+} from "./errors.js";
 import { generateSessionId, isSessionId } from "./session-id.js";
 import { isPostRenameFailure, writeJsonAtomicallySync } from "./registry/atomic.js";
 import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
@@ -160,6 +165,8 @@ export interface SessionRecord {
   readonly terminalOperation?: "discard";
   /** HEAD captured before an explicit discard began; retained for retry/audit. */
   readonly discardedHead?: string;
+  /** HEAD captured before a normal close began; binds partial-close retries. */
+  readonly cleanupHead?: string;
 }
 
 export interface CreateSessionOptions {
@@ -186,6 +193,8 @@ export interface CloseSessionResult {
   readonly idempotent: boolean;
   readonly claimSetGeneration: number;
   readonly integrationProof?: IntegrationProof;
+  /** Present when this result completed a previously interrupted cleanup. */
+  readonly reconciliation?: CleanupReconciliation;
 }
 
 export interface DiscardSessionResult {
@@ -203,6 +212,29 @@ export interface DiscardSessionResult {
   readonly releasedClaimsTruncated: boolean;
   readonly idempotent: boolean;
   readonly claimSetGeneration: number;
+  /** Present when this result completed a previously interrupted cleanup. */
+  readonly reconciliation?: CleanupReconciliation;
+}
+
+export type CleanupReconciliationOutcome = "completed" | "retryable" | "unresolved";
+
+/** Bounded, identity-bound evidence for a destructive lifecycle retry. */
+export interface CleanupReconciliation {
+  readonly operation: "close" | "discard" | "gc";
+  readonly outcome: CleanupReconciliationOutcome;
+  /** True only when the remaining owned cleanup can be retried safely. */
+  readonly retrySafe: boolean;
+  readonly repositoryId: string;
+  readonly sessionId: string;
+  readonly worktreePath: string;
+  readonly branchName: string;
+  readonly expectedHead: string | null;
+  readonly observedWorktreeHead: string | null;
+  readonly observedBranchHead: string | null;
+  readonly worktreePresent: boolean;
+  readonly branchPresent: boolean;
+  readonly remaining: readonly ("worktree" | "branch" | "registry")[];
+  readonly reason?: "cleanup-complete" | "owned-cleanup-remains" | "identity-mismatch" | "observation-unavailable";
 }
 
 export interface CloseSessionOptions {
@@ -712,6 +744,7 @@ export interface PersistedSessionRecord {
   readonly label?: string;
   readonly terminal_operation?: "discard";
   readonly discarded_head?: string;
+  readonly cleanup_head?: string;
 }
 
 export interface PersistedResourceClaim {
@@ -2483,6 +2516,35 @@ export class SessionRegistry {
     return this.reconcile();
   }
 
+  /**
+   * Re-observe one destructive lifecycle operation after an interrupted
+   * effect. This is diagnostic-only: it never repairs Git or registry state.
+   * Every conclusion is bound to the persisted repository/session/worktree/
+   * branch identity and, for a started cleanup, its captured HEAD.
+   */
+  reconcileCleanup(sessionIdOrOptions?: string | null, operation?: "close" | "discard" | "gc"): CleanupReconciliation {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const sessionId = sessionIdOrOptions ?? this.resolveOwnerSession(state.sessions).sessionId;
+      assertSessionId(sessionId);
+      const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+      if (record === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      return this.observeCleanupReconciliation(
+        record,
+        operation ?? (record.terminalOperation === "discard" ? "discard" : "close"),
+      );
+    });
+  }
+
+  reconcileLifecycleCleanup(
+    sessionIdOrOptions?: string | null,
+    operation?: "close" | "discard" | "gc",
+  ): CleanupReconciliation {
+    return this.reconcileCleanup(sessionIdOrOptions, operation);
+  }
+
   /** Close one session only after its ownership and recoverability are proven safe. */
   close(sessionIdOrOptions?: string | null | CloseSessionOptions): CloseSessionResult {
     return this.withLock(() => {
@@ -2539,7 +2601,30 @@ export class SessionRegistry {
         .filter((record) => record.state !== "closed")
         .map((record) => assessGarbageCollection(record, now, staleAfterMs, worktrees));
       const candidates = assessments.filter((assessment) => assessment.suspicion !== "none");
-      const eligible = candidates.filter((assessment) => assessment.destructiveEligibility === "eligible");
+      const eligible = assessments.filter((assessment) => {
+        if (assessment.terminalOperation === "discard") return false;
+        const lifecycle = classifySessionLifecycle({
+          sessionState: assessment.state,
+          physicalState: assessment.physicalState,
+          closeReadiness: "ready",
+          gcAuthorized: true,
+          phase: "termination",
+        });
+        if (
+          assessment.destructiveEligibility === "eligible" &&
+          (lifecycle.destructiveCleanupEligible || assessment.physicalState === "prunable-missing")
+        ) {
+          return true;
+        }
+        // A close that already removed one physical resource is represented
+        // by a closing record plus its captured HEAD. Reconciliation may
+        // safely continue only after exact identity-bound re-observation.
+        if (assessment.state === "closing" && assessment.cleanupHead !== undefined) {
+          const reconciliation = this.observeCleanupReconciliation(assessment, "gc");
+          return reconciliation.outcome !== "unresolved";
+        }
+        return false;
+      });
 
       const blocked: GarbageCollectBlocked[] = [];
       if (!apply) {
@@ -2574,7 +2659,7 @@ export class SessionRegistry {
         }
 
         try {
-          const result = this.closeUnsafe(candidate.sessionId);
+          const result = this.closeUnsafe(candidate.sessionId, undefined, "gc");
           cleaned.push(result.session);
         } catch (error: unknown) {
           blocked.push(toGarbageCollectBlocked(candidate.sessionId, error));
@@ -2615,6 +2700,102 @@ export class SessionRegistry {
       "SESSION_NOT_FOUND",
       `No active session owns the current worktree: ${this.repository.worktreePath}`,
       { worktree: this.repository.worktreePath },
+    );
+  }
+
+  private observeCleanupReconciliation(
+    record: SessionRecord,
+    operation: "close" | "discard" | "gc",
+  ): CleanupReconciliation {
+    try {
+      const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
+      const inspection = inspectWorktreeState(record.worktreePath, worktrees);
+      const worktreePresent = inspection.kind === "healthy";
+      const gitCwd =
+        worktrees.find((worktree) => !worktree.prunable && !samePath(worktree.worktreePath, record.worktreePath))
+          ?.worktreePath ?? this.repository.worktreePath;
+      const branchPresent = localBranchExists(this.git, gitCwd, record.branchId);
+      const worktreeHead = worktreePresent ? readCurrentHead(this.git, record.worktreePath) : null;
+      const branchHead = branchPresent ? readLocalBranchHead(this.git, gitCwd, record.branchId) : null;
+      const observation = { worktreePresent, branchPresent, worktreeHead, branchHead };
+      const expectedHead = cleanupExpectedHead(record);
+      const identityMatches =
+        expectedHead !== null &&
+        (!worktreePresent || worktreeHead === expectedHead) &&
+        (!branchPresent || branchHead === expectedHead);
+      const physicalComplete = !worktreePresent && !branchPresent;
+
+      // Keep the canonical classifier in the reconciliation path. Its
+      // transition result is advisory here; the exact physical identity and
+      // captured HEAD below are the authority for retry safety.
+      const classification = classifySessionLifecycle({
+        sessionState: record.state,
+        physicalState: physicalComplete ? "closed" : inspection.kind,
+        closeReadiness: "ready",
+        terminalOperation: record.terminalOperation,
+        gcAuthorized: operation === "gc" && (record.state === "stale" || record.state === "closing"),
+        phase: "termination",
+      });
+      const gcAllowed =
+        operation !== "gc" ||
+        classification.transitions.some((transition) => transition.operation === "gc" && transition.allowed);
+
+      if (physicalComplete) {
+        return cleanupReconciliation(
+          record,
+          operation,
+          observation,
+          "completed",
+          record.state !== "closed",
+          "cleanup-complete",
+        );
+      }
+      if (
+        expectedHead !== null &&
+        identityMatches &&
+        (gcAllowed || (operation === "gc" && record.state === "closing"))
+      ) {
+        return cleanupReconciliation(record, operation, observation, "retryable", true, "owned-cleanup-remains");
+      }
+      return cleanupReconciliation(record, operation, observation, "unresolved", false, "identity-mismatch");
+    } catch {
+      return cleanupReconciliation(
+        record,
+        operation,
+        { worktreePresent: false, branchPresent: false, worktreeHead: null, branchHead: null },
+        "unresolved",
+        false,
+        "observation-unavailable",
+      );
+    }
+  }
+
+  private cleanupFailure(
+    error: unknown,
+    record: SessionRecord,
+    operation: "close" | "discard" | "gc",
+  ): SessionRegistryError {
+    const reconciliation = this.observeCleanupReconciliation(record, operation);
+    if (error instanceof SessionRegistryError) {
+      return new SessionRegistryError(
+        error.code,
+        error.message,
+        {
+          ...error.details,
+          ...cleanupIdentityDetails(record, cleanupExpectedHead(record)),
+          reconciliation: reconciliation as unknown as RegistryErrorDetailValue,
+        },
+        error,
+      );
+    }
+    return new SessionRegistryError(
+      "GIT_COMMAND_FAILED",
+      error instanceof Error ? error.message : "Destructive cleanup Git operation failed",
+      {
+        ...cleanupIdentityDetails(record, cleanupExpectedHead(record)),
+        reconciliation: reconciliation as unknown as RegistryErrorDetailValue,
+      },
+      error,
     );
   }
 
@@ -2921,7 +3102,11 @@ export class SessionRegistry {
     return candidates;
   }
 
-  private closeUnsafe(sessionId: string, evidence?: IntegrationEvidenceInput): CloseSessionResult {
+  private closeUnsafe(
+    sessionId: string,
+    evidence?: IntegrationEvidenceInput,
+    cleanupOperation: "close" | "gc" = "close",
+  ): CloseSessionResult {
     const state = this.readStateUnsafe();
     const records = state.sessions;
     const record = records.find((candidate) => candidate.sessionId === sessionId);
@@ -2953,45 +3138,61 @@ export class SessionRegistry {
     } catch (error: unknown) {
       throw enrichCloseBlockerError(error);
     }
-    const closingRecord = record.state === "closing" ? record : transitionSessionState(record, "closing", this.clock);
+    const resuming = record.state === "closing";
+    const cleanupHead = record.cleanupHead ?? resources.worktreeHead ?? resources.branchHead ?? undefined;
+    const closingRecord = resuming
+      ? record
+      : transitionSessionState(
+          freezeSessionRecord({ ...record, ...(cleanupHead === undefined ? {} : { cleanupHead }) }),
+          "closing",
+          this.clock,
+        );
     let closingRecords = replaceRecord(records, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
-    this.writeUnsafe(closingRecords, state.claims, state.claimSetGeneration);
+    if (!resuming) this.writeUnsafe(closingRecords, state.claims, state.claimSetGeneration);
 
-    let worktreeRemoved = false;
-    let branchRemoved = false;
+    let worktreeRemoved = resuming && !resources.worktreePresent;
+    let branchRemoved = resuming && !resources.branchPresent;
     let integrationProof: IntegrationProof | undefined;
 
     if (resources.removeWorktree) {
-      const revalidated = this.inspectCleanupResources(record, undefined, evidence);
-      assertSameCleanupObservation(resources, revalidated, "worktree-remove");
-      if (revalidated.removeWorktree) {
-        removeSessionWorktree(this.git, revalidated.gitCwd, record.worktreePath);
-        worktreeRemoved = revalidated.worktreePresent;
+      try {
+        const revalidated = this.inspectCleanupResources(closingRecord, undefined, evidence);
+        assertSameCleanupObservation(resources, revalidated, "worktree-remove");
+        if (revalidated.removeWorktree) {
+          removeSessionWorktree(this.git, revalidated.gitCwd, record.worktreePath);
+          worktreeRemoved = revalidated.worktreePresent;
+        }
+      } catch (error: unknown) {
+        throw this.cleanupFailure(error, closingRecord, cleanupOperation);
       }
     }
 
     // Once the owned worktree has been removed, the original registry cwd may
     // no longer exist. Reobserve Git from the stable integration/peer cwd that
     // was selected during the authoritative preflight.
-    const branchWorktrees = listGitWorktrees(this.git, resources.gitCwd);
-    const branchResources = this.inspectCleanupResources(record, branchWorktrees, evidence);
-    if (branchResources.branchPresent && branchResources.removeBranch) {
-      const branchRevalidated = this.inspectCleanupResources(
-        record,
-        listGitWorktrees(this.git, branchResources.gitCwd),
-        evidence,
-      );
-      assertSameCleanupObservation(branchResources, branchRevalidated, "branch-remove");
-      if (branchRevalidated.branchPresent && branchRevalidated.removeBranch) {
-        // Git's own "-d" safety check is ancestry-only and cannot see a
-        // tree-equivalence proof. Force deletion is only ever selected after
-        // Nawabari has independently re-derived that proof itself.
-        const forceDelete = branchRevalidated.integrationProof?.method === "tree-equivalence";
-        removeSessionBranch(this.git, branchRevalidated.gitCwd, record.branchName, forceDelete);
-        branchRemoved = true;
-        integrationProof = branchRevalidated.integrationProof;
+    try {
+      const branchWorktrees = listGitWorktrees(this.git, resources.gitCwd);
+      const branchResources = this.inspectCleanupResources(closingRecord, branchWorktrees, evidence);
+      if (branchResources.branchPresent && branchResources.removeBranch) {
+        const branchRevalidated = this.inspectCleanupResources(
+          closingRecord,
+          listGitWorktrees(this.git, branchResources.gitCwd),
+          evidence,
+        );
+        assertSameCleanupObservation(branchResources, branchRevalidated, "branch-remove");
+        if (branchRevalidated.branchPresent && branchRevalidated.removeBranch) {
+          // Git's own "-d" safety check is ancestry-only and cannot see a
+          // tree-equivalence proof. Force deletion is only ever selected after
+          // Nawabari has independently re-derived that proof itself.
+          const forceDelete = branchRevalidated.integrationProof?.method === "tree-equivalence";
+          removeSessionBranch(this.git, branchRevalidated.gitCwd, record.branchName, forceDelete);
+          branchRemoved = true;
+          integrationProof = branchRevalidated.integrationProof;
+        }
       }
+    } catch (error: unknown) {
+      throw this.cleanupFailure(error, closingRecord, cleanupOperation);
     }
 
     const closedRecord = transitionSessionState(closingRecord, "closed", this.clock);
@@ -2999,7 +3200,11 @@ export class SessionRegistry {
     validateRecords(closingRecords, this.repository.repositoryId);
     const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
     const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
-    this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration);
+    try {
+      this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration);
+    } catch (error: unknown) {
+      throw this.cleanupFailure(error, closingRecord, cleanupOperation);
+    }
 
     return {
       session: cloneSessionRecord(closedRecord),
@@ -3008,6 +3213,18 @@ export class SessionRegistry {
       idempotent: false,
       claimSetGeneration,
       ...(integrationProof === undefined ? {} : { integrationProof }),
+      ...(resuming
+        ? {
+            reconciliation: cleanupReconciliation(
+              closedRecord,
+              cleanupOperation,
+              { worktreePresent: false, branchPresent: false, worktreeHead: null, branchHead: null },
+              "completed",
+              false,
+              "cleanup-complete",
+            ),
+          }
+        : {}),
     };
   }
 
@@ -3082,28 +3299,36 @@ export class SessionRegistry {
     let worktreeRemoved = resuming && !resources.worktreePresent;
     let branchRemoved = resuming && !resources.branchPresent;
     if (resources.removeWorktree) {
-      const revalidated = this.inspectCleanupResources(record, undefined, undefined, "discard");
-      assertSameCleanupObservation(resources, revalidated, "worktree-remove");
-      if (revalidated.removeWorktree) {
-        removeSessionWorktree(this.git, revalidated.gitCwd, record.worktreePath, true);
-        worktreeRemoved = revalidated.worktreePresent;
+      try {
+        const revalidated = this.inspectCleanupResources(closingRecord, undefined, undefined, "discard");
+        assertSameCleanupObservation(resources, revalidated, "worktree-remove");
+        if (revalidated.removeWorktree) {
+          removeSessionWorktree(this.git, revalidated.gitCwd, record.worktreePath, true);
+          worktreeRemoved = revalidated.worktreePresent;
+        }
+      } catch (error: unknown) {
+        throw this.cleanupFailure(error, closingRecord, "discard");
       }
     }
 
-    const branchWorktrees = listGitWorktrees(this.git, resources.gitCwd);
-    const branchResources = this.inspectCleanupResources(record, branchWorktrees, undefined, "discard");
-    if (branchResources.branchPresent && branchResources.removeBranch) {
-      const branchRevalidated = this.inspectCleanupResources(
-        record,
-        listGitWorktrees(this.git, branchResources.gitCwd),
-        undefined,
-        "discard",
-      );
-      assertSameCleanupObservation(branchResources, branchRevalidated, "branch-remove");
-      if (branchRevalidated.branchPresent && branchRevalidated.removeBranch) {
-        removeSessionBranch(this.git, branchRevalidated.gitCwd, record.branchName, true);
-        branchRemoved = true;
+    try {
+      const branchWorktrees = listGitWorktrees(this.git, resources.gitCwd);
+      const branchResources = this.inspectCleanupResources(closingRecord, branchWorktrees, undefined, "discard");
+      if (branchResources.branchPresent && branchResources.removeBranch) {
+        const branchRevalidated = this.inspectCleanupResources(
+          closingRecord,
+          listGitWorktrees(this.git, branchResources.gitCwd),
+          undefined,
+          "discard",
+        );
+        assertSameCleanupObservation(branchResources, branchRevalidated, "branch-remove");
+        if (branchRevalidated.branchPresent && branchRevalidated.removeBranch) {
+          removeSessionBranch(this.git, branchRevalidated.gitCwd, record.branchName, true);
+          branchRemoved = true;
+        }
       }
+    } catch (error: unknown) {
+      throw this.cleanupFailure(error, closingRecord, "discard");
     }
 
     const closedRecord = transitionSessionState(closingRecord, "closed", this.clock);
@@ -3112,7 +3337,11 @@ export class SessionRegistry {
     const releasedClaims = state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim);
     const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
     const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
-    this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration);
+    try {
+      this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration);
+    } catch (error: unknown) {
+      throw this.cleanupFailure(error, closingRecord, "discard");
+    }
 
     return discardResult(
       closedRecord,
@@ -3122,6 +3351,18 @@ export class SessionRegistry {
       branchRemoved,
       false,
       claimSetGeneration,
+      resuming
+        ? {
+            reconciliation: cleanupReconciliation(
+              closedRecord,
+              "discard",
+              { worktreePresent: false, branchPresent: false, worktreeHead: null, branchHead: null },
+              "completed",
+              false,
+              "cleanup-complete",
+            ),
+          }
+        : {},
     );
   }
 
@@ -3178,6 +3419,14 @@ export class SessionRegistry {
 
     const worktreePresent = worktreeState.kind === "healthy";
     const branchPresent = localBranchExists(git, gitCwd, record.branchId);
+    const worktreeHead = worktreePresent ? readCurrentHead(git, record.worktreePath) : null;
+    const branchHead = branchPresent ? readLocalBranchHead(git, gitCwd, record.branchId) : null;
+    assertCleanupHeadMatches(record, {
+      worktreePresent,
+      branchPresent,
+      worktreeHead,
+      branchHead,
+    });
     if (worktreePresent) {
       if (!branchPresent || registeredWorktree?.branchName !== record.branchName) {
         throw ownershipMismatch(record, "The registered worktree no longer has the owned local branch");
@@ -3205,8 +3454,8 @@ export class SessionRegistry {
       physicalState: worktreeState.kind,
       registeredBranch: registeredWorktree?.branchName ?? null,
       branchWorktree: branchWorktree?.worktreePath ?? null,
-      worktreeHead: worktreePresent ? readCurrentHead(git, record.worktreePath) : null,
-      branchHead: branchPresent ? readLocalBranchHead(git, gitCwd, record.branchId) : null,
+      worktreeHead,
+      branchHead,
       worktreePresent,
       branchPresent,
       removeWorktree: registeredWorktree !== undefined && !worktreeProtection,
@@ -3987,6 +4236,103 @@ interface CleanupResources {
   readonly integrationProof?: IntegrationProof;
 }
 
+interface CleanupHeadObservation {
+  readonly worktreePresent: boolean;
+  readonly branchPresent: boolean;
+  readonly worktreeHead: string | null;
+  readonly branchHead: string | null;
+}
+
+function cleanupExpectedHead(record: SessionRecord): string | null {
+  if (record.terminalOperation === "discard") return record.discardedHead ?? null;
+  return record.cleanupHead ?? null;
+}
+
+function cleanupReconciliation(
+  record: SessionRecord,
+  operation: "close" | "discard" | "gc",
+  observation: CleanupHeadObservation,
+  outcome: CleanupReconciliationOutcome,
+  retrySafe: boolean,
+  reason: CleanupReconciliation["reason"],
+): CleanupReconciliation {
+  const remaining: Array<"worktree" | "branch" | "registry"> = [];
+  if (observation.worktreePresent) remaining.push("worktree");
+  if (observation.branchPresent) remaining.push("branch");
+  if (record.state !== "closed") remaining.push("registry");
+  return Object.freeze({
+    operation,
+    outcome,
+    retrySafe,
+    repositoryId: record.repositoryId,
+    sessionId: record.sessionId,
+    worktreePath: record.worktreePath,
+    branchName: record.branchName,
+    expectedHead: cleanupExpectedHead(record),
+    observedWorktreeHead: observation.worktreeHead,
+    observedBranchHead: observation.branchHead,
+    worktreePresent: observation.worktreePresent,
+    branchPresent: observation.branchPresent,
+    remaining: Object.freeze(remaining),
+    ...(reason === undefined ? {} : { reason }),
+  });
+}
+
+function cleanupIdentityDetails(record: SessionRecord, expectedHead: string | null): RegistryErrorDetails {
+  return {
+    repositoryId: record.repositoryId,
+    sessionId: record.sessionId,
+    worktreePath: record.worktreePath,
+    branchName: record.branchName,
+    expectedCleanupHead: expectedHead ?? "<none>",
+  };
+}
+
+function assertCleanupHeadMatches(record: SessionRecord, observation: CleanupHeadObservation): void {
+  if (record.state !== "closing") return;
+  const expectedHead = cleanupExpectedHead(record);
+  if (expectedHead === null) {
+    if (!observation.worktreePresent && !observation.branchPresent) return;
+    throw new SessionRegistryError(
+      "GIT_STATE_AMBIGUOUS",
+      "A partial cleanup has no persisted pre-mutation HEAD identity",
+      {
+        ...cleanupIdentityDetails(record, expectedHead),
+        observedWorktreeHead: observation.worktreeHead ?? "<none>",
+        observedBranchHead: observation.branchHead ?? "<none>",
+        reconciliation: cleanupReconciliation(
+          record,
+          record.terminalOperation === "discard" ? "discard" : "close",
+          observation,
+          "unresolved",
+          false,
+          "identity-mismatch",
+        ) as unknown as RegistryErrorDetailValue,
+        recoveryHints: recoveryHintsForCode("GIT_STATE_AMBIGUOUS"),
+      },
+    );
+  }
+  if (
+    (observation.worktreePresent && observation.worktreeHead !== expectedHead) ||
+    (observation.branchPresent && observation.branchHead !== expectedHead)
+  ) {
+    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "A cleanup retry observed a different owned HEAD", {
+      ...cleanupIdentityDetails(record, expectedHead),
+      observedWorktreeHead: observation.worktreeHead ?? "<none>",
+      observedBranchHead: observation.branchHead ?? "<none>",
+      reconciliation: cleanupReconciliation(
+        record,
+        record.terminalOperation === "discard" ? "discard" : "close",
+        observation,
+        "unresolved",
+        false,
+        "identity-mismatch",
+      ) as unknown as RegistryErrorDetailValue,
+      recoveryHints: recoveryHintsForCode("GIT_STATE_AMBIGUOUS"),
+    });
+  }
+}
+
 /**
  * Physical session identity observed around an explicit integration-proof
  * fetch.  The proof may only be used when the session still points at the
@@ -4088,6 +4434,7 @@ function discardResult(
   branchRemoved: boolean,
   idempotent: boolean,
   claimSetGeneration: number,
+  options: { readonly reconciliation?: CleanupReconciliation } = {},
 ): DiscardSessionResult {
   const boundedClaims = releasedClaims.slice(0, MAX_DISCARD_CLAIMS).map(cloneResourceClaim);
   return {
@@ -4105,6 +4452,7 @@ function discardResult(
     releasedClaimsTruncated: releasedClaims.length > boundedClaims.length,
     idempotent,
     claimSetGeneration,
+    ...(options.reconciliation === undefined ? {} : { reconciliation: options.reconciliation }),
   };
 }
 
@@ -6092,6 +6440,7 @@ export function toPersistedSessionRecord(
     ...(validated.label === undefined ? {} : { label: validated.label }),
     ...(validated.terminalOperation === undefined ? {} : { terminal_operation: validated.terminalOperation }),
     ...(validated.discardedHead === undefined ? {} : { discarded_head: validated.discardedHead }),
+    ...(validated.cleanupHead === undefined ? {} : { cleanup_head: validated.cleanupHead }),
   };
 }
 
@@ -6433,7 +6782,7 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
       "created_at",
       "updated_at",
     ],
-    ["base_revision", "label", "terminal_operation", "discarded_head"],
+    ["base_revision", "label", "terminal_operation", "discarded_head", "cleanup_head"],
     index,
   );
 
@@ -6472,6 +6821,9 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
     ...(value.discarded_head === undefined
       ? {}
       : { discardedHead: requireRevision(value.discarded_head, index, "discarded_head") }),
+    ...(value.cleanup_head === undefined
+      ? {}
+      : { cleanupHead: requireRevision(value.cleanup_head, index, "cleanup_head") }),
   };
 
   return validateSessionRecord(record, expectedRepositoryId, index);
@@ -6541,6 +6893,12 @@ function validateSessionRecord(record: SessionRecord, expectedRepositoryId: stri
   }
   if (record.state !== "closed" && record.state !== "closing" && record.terminalOperation !== undefined) {
     throw invalidRecord(index, "terminal_operation is only valid for a closing or closed session");
+  }
+  if (record.cleanupHead !== undefined && record.state !== "closing" && record.state !== "closed") {
+    throw invalidRecord(index, "cleanup_head is only valid for a closing or closed session");
+  }
+  if (record.cleanupHead !== undefined && record.terminalOperation === "discard") {
+    throw invalidRecord(index, "cleanup_head cannot accompany terminal_operation=discard");
   }
 
   return freezeSessionRecord({ ...record });
