@@ -647,7 +647,7 @@ export async function resolveSandboxExecutionRequest(
             ...(requestedCgroups.limits === undefined ? {} : { limits: requestedCgroups.limits }),
             ...(requestedCgroups.root === undefined ? {} : { root: requestedCgroups.root }),
           },
-    }),
+        }),
   });
 }
 
