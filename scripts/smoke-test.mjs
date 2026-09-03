@@ -245,6 +245,52 @@ async function main() {
     ) {
       fail("installed capabilities did not expose the protected-execution contract");
     }
+
+    // Result-schema parity is part of the packed caller contract. Every
+    // advertised schema is versioned and mapped to the public commands that
+    // can reach it; this check intentionally consumes only discovery output.
+    for (const capability of capabilities.capabilities ?? []) {
+      if (!Number.isSafeInteger(capability.result_schema_version) || capability.result_schema_version < 1) {
+        fail(`capability ${capability.id} did not expose an explicit result-schema version`);
+      }
+      if (!Array.isArray(capability.commands) || !Array.isArray(capability.result_schemas)) {
+        fail(`capability ${capability.id} did not expose result-schema command mappings`);
+      }
+      const advertised = String(capability.result_schema)
+        .split("/")
+        .map((schema) => schema.trim())
+        .filter(Boolean);
+      const mappedSchemas = new Set();
+      const mappedCommands = new Set();
+      for (const mapping of capability.result_schemas) {
+        if (
+          typeof mapping?.schema !== "string" ||
+          !/^(?:[a-z0-9-]+\.)+v[0-9]+$/.test(mapping.schema) ||
+          !Number.isSafeInteger(mapping.version) ||
+          mapping.version < 1 ||
+          !Array.isArray(mapping.commands) ||
+          mapping.commands.length === 0
+        ) {
+          fail(`capability ${capability.id} has an invalid result-schema mapping`);
+        }
+        if (mappedSchemas.has(mapping.schema)) fail(`capability ${capability.id} maps a schema more than once`);
+        mappedSchemas.add(mapping.schema);
+        for (const command of mapping.commands) {
+          if (!capability.commands.includes(command)) {
+            fail(`capability ${capability.id} maps ${mapping.schema} to a non-public command`);
+          }
+          if (mappedCommands.has(command)) fail(`capability ${capability.id} maps ${command} more than once`);
+          mappedCommands.add(command);
+        }
+      }
+      const unmappedEnvelopeSchemas = advertised.filter((schema) => !mappedSchemas.has(schema));
+      if (unmappedEnvelopeSchemas.length > 0 && capability.id !== "resource-claims") {
+        fail(`capability ${capability.id} has an advertised schema without an owner mapping`);
+      }
+      if (mappedCommands.size !== capability.commands.length) {
+        fail(`capability ${capability.id} does not map every public command to a result schema`);
+      }
+    }
     if (capabilitiesResult.stderr.trim().length > 0) fail("capabilities --json wrote decorative output to stderr");
     // The v2 resource-claim capability publishes lifecycle result mappings,
     // transition/recovery identities, and operation-mode rationale in one
