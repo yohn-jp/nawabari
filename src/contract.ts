@@ -53,6 +53,14 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
   commands: ["session run", "session exec"],
   command_aliases: [{ alias: "session exec", canonical: "session run" }],
   result_schema: "sandbox-execution.v1",
+  result_schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
+  result_schemas: [
+    {
+      schema: "sandbox-execution.v1",
+      version: SANDBOX_CONTRACT_SCHEMA_VERSION,
+      commands: ["session run", "session exec"],
+    },
+  ],
   identities: ["session_id", "repository", "worktree", "branch", "network_mode"],
   required_capabilities: SANDBOX_REQUIRED_CAPABILITIES,
   optional_capabilities: SANDBOX_OPTIONAL_CAPABILITIES,
@@ -206,6 +214,14 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "session-lifecycle",
     commands: ["session create", "session id", "session show", "session list", "status", "session close"],
     result_schema: "session.v1",
+    result_schema_version: 1,
+    result_schemas: [
+      {
+        schema: "session.v1",
+        version: 1,
+        commands: ["session create", "session id", "session show", "session list", "status", "session close"],
+      },
+    ],
     identities: ["session_id", "repository", "worktree", "branch", "state"],
     failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-lifecycle"],
     failure_code_policy: {
@@ -232,6 +248,8 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "session-discard",
     commands: ["session discard"],
     result_schema: "session-discard.v1",
+    result_schema_version: 1,
+    result_schemas: [{ schema: "session-discard.v1", version: 1, commands: ["session discard"] }],
     identities: [
       "session_id",
       "previous_head",
@@ -256,6 +274,8 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "session-diagnostics",
     commands: ["session inspect"],
     result_schema: "session-diagnostic.v1",
+    result_schema_version: 1,
+    result_schemas: [{ schema: "session-diagnostic.v1", version: 1, commands: ["session inspect"] }],
     identities: [
       "session_id",
       "repository",
@@ -401,6 +421,11 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "authorization-and-evidence",
     commands: ["guard", "authorize", "checkpoint"],
     result_schema: "decision.v1 / evidence.v1",
+    result_schema_version: 1,
+    result_schemas: [
+      { schema: "decision.v1", version: 1, commands: ["guard", "authorize"] },
+      { schema: "evidence.v1", version: 1, commands: ["checkpoint"] },
+    ],
     identities: ["operation", "allowed", "code", "claim_ids", "head", "in_claim", "out_of_claim"],
     failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["authorization-and-evidence"],
     failure_code_policy: {
@@ -413,6 +438,11 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "repository-evidence",
     commands: ["evidence snapshot", "diff"],
     result_schema: "repository-evidence.v1 / diff.v1",
+    result_schema_version: 1,
+    result_schemas: [
+      { schema: "repository-evidence.v1", version: 1, commands: ["evidence snapshot"] },
+      { schema: "diff.v1", version: 1, commands: ["diff"] },
+    ],
     identities: [
       "session_id",
       "repository",
@@ -435,6 +465,11 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "governed-git-mutation",
     commands: ["commit", "push"],
     result_schema: "commit.v1 / push.v1",
+    result_schema_version: 1,
+    result_schemas: [
+      { schema: "commit.v1", version: 1, commands: ["commit"] },
+      { schema: "push.v1", version: 1, commands: ["push"] },
+    ],
     identities: [
       "commit_sha",
       "reconciliation",
@@ -457,6 +492,11 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "reconciliation-and-cleanup",
     commands: ["doctor", "gc"],
     result_schema: "reconciliation.v1 / cleanup.v1",
+    result_schema_version: 1,
+    result_schemas: [
+      { schema: "reconciliation.v1", version: 1, commands: ["doctor"] },
+      { schema: "cleanup.v1", version: 1, commands: ["gc"] },
+    ],
     identities: [
       "clean",
       "issues",
@@ -509,6 +549,12 @@ export function machineContract(packageVersion: string): JsonObject {
       id: capability.id,
       commands: [...capability.commands],
       result_schema: capability.result_schema,
+      ...(capability.id !== "resource-claims"
+        ? {
+            result_schema_version: capability.result_schema_version,
+            result_schemas: jsonClone(capability.result_schemas),
+          }
+        : {}),
       identities: [...capability.identities],
       failure_codes: [...capability.failure_codes],
       failure_code_policy: jsonClone(capability.failure_code_policy),
