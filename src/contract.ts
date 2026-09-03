@@ -11,6 +11,11 @@ import {
   RESOURCE_CLAIM_TRANSITIONS,
   LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
 } from "./resource-claims.js";
+import {
+  SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION,
+  SESSION_LIFECYCLE_STATES,
+  SESSION_LIFECYCLE_TRANSITION_TABLE,
+} from "./session-lifecycle-classification.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -278,8 +283,17 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "blockers",
       "safe_actions",
       "integration_evidence",
+      "lifecycle_state",
+      "lifecycle",
       "garbage_collection",
     ],
+    lifecycle: {
+      schema_version: SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION,
+      states: [...SESSION_LIFECYCLE_STATES],
+      transition_table: SESSION_LIFECYCLE_TRANSITION_TABLE,
+      authority: "local-session-registry-observation",
+      age_rule: "elapsed-age-is-diagnostic-only",
+    },
     failure_codes: [
       "INVALID_SESSION_ID",
       "SESSION_NOT_FOUND",
@@ -540,6 +554,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "recovery_hints",
       "suspicion",
       "destructive_eligibility",
+      "lifecycle_state",
     ],
     failure_codes: [
       "RECONCILIATION_DRIFT",

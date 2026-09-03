@@ -1,4 +1,5 @@
 import { DomainError, type DomainResult, failure, type ErrorCode, type JsonObject } from "./errors.js";
+import type { SessionLifecycleState, SessionLifecycleTransition } from "../session-lifecycle-classification.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -198,6 +199,21 @@ export type SessionDiagnostic = {
   safe_actions: string[];
   integration_evidence: SessionDiagnosticIntegrationEvidence;
   garbage_collection?: GarbageCollectCandidate;
+  /** Canonical read-only termination/recovery classification. */
+  lifecycle_state?: SessionLifecycleState;
+  lifecycle?: {
+    schema_version: number;
+    state: SessionLifecycleState;
+    session_state: string;
+    physical_state: string | null;
+    close_readiness: string;
+    blockers: { code: string; classification?: string }[];
+    recoverability: "none" | "recoverable" | "ambiguous";
+    age_suspicious: boolean;
+    gc_authorized: boolean;
+    destructive_cleanup_eligible: boolean;
+    transitions: SessionLifecycleTransition[];
+  };
 };
 
 export type GuardOptions = {

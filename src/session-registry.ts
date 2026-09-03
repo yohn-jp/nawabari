@@ -76,8 +76,30 @@ import {
   type RepositoryEvidenceOptions,
   type RepositoryEvidenceSnapshot,
 } from "./repository-evidence.js";
+import {
+  classifySessionLifecycle,
+  type SessionLifecycleClassification,
+  type SessionLifecyclePhase,
+} from "./session-lifecycle-classification.js";
 
 export type { ResourceClaim, ResourceClaimRecoveryAction } from "./resource-claims.js";
+export {
+  classifySessionLifecycle,
+  lifecycleTransition,
+  SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION,
+  SESSION_LIFECYCLE_STATES,
+  SESSION_LIFECYCLE_TRANSITION_TABLE,
+} from "./session-lifecycle-classification.js";
+export type {
+  SessionLifecycleBlocker,
+  SessionLifecycleClassification,
+  SessionLifecycleCloseReadiness,
+  SessionLifecycleOperation,
+  SessionLifecycleObservation,
+  SessionLifecyclePhase,
+  SessionLifecycleState,
+  SessionLifecycleTransition,
+} from "./session-lifecycle-classification.js";
 export type {
   RepositoryDiffEvidence,
   RepositoryDiffOptions,
@@ -195,6 +217,12 @@ export interface CloseSessionOptions {
   /** Explicit opt-in integration branch used only to obtain missing proof objects. */
   readonly fetchBranch?: string | null;
   readonly fetch_branch?: string | null;
+}
+
+/** Read-only lifecycle projection options; no option authorizes mutation. */
+export interface SessionLifecycleClassificationOptions extends CloseSessionOptions {
+  /** `current` reports ownership as it exists; `termination` reports close readiness. */
+  readonly phase?: SessionLifecyclePhase;
 }
 
 export interface DiscardSessionOptions {
@@ -335,6 +363,8 @@ export interface CleanupDecision {
   readonly physicalState: string;
   readonly blockers: readonly CleanupBlocker[];
   readonly recoveryHints: readonly string[];
+  /** Canonical read-only lifecycle projection used by close preflight. */
+  readonly lifecycle?: SessionLifecycleClassification;
 }
 
 /**
@@ -379,6 +409,8 @@ export interface SessionDiagnostic {
   readonly safeActions: readonly string[];
   readonly integrationEvidence: SessionDiagnosticIntegrationEvidence;
   readonly garbageCollection: GarbageCollectCandidate;
+  /** Canonical termination/recovery projection; additive for old consumers. */
+  readonly lifecycle?: SessionLifecycleClassification;
 }
 
 export type ReconciliationSessionStatus = "healthy" | "candidate" | "drift" | "closed";
@@ -388,6 +420,8 @@ export interface ReconciliationSession {
   readonly status: ReconciliationSessionStatus;
   readonly physicalState: string;
   readonly blockers: readonly CleanupBlocker[];
+  /** Canonical read-only lifecycle projection of this reconciliation result. */
+  readonly lifecycle?: SessionLifecycleClassification;
 }
 
 export interface ReconciliationIssue {
@@ -2312,6 +2346,51 @@ export class SessionRegistry {
   }
 
   /**
+   * Return the canonical read-only termination/recovery classification for a
+   * session. Git, worktree, branch, registry, and integration evidence are
+   * observed through the existing diagnostic/cleanup authorities; this method
+   * only projects their result into the stable lifecycle vocabulary.
+   */
+  classifyLifecycle(
+    sessionIdOrOptions?: string | null | SessionLifecycleClassificationOptions,
+  ): SessionLifecycleClassification {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const requestedSessionId = isCloseSessionOptions(sessionIdOrOptions)
+        ? (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id)
+        : sessionIdOrOptions;
+      const sessionId = requestedSessionId ?? this.resolveOwnerSession(state.sessions).sessionId;
+      assertSessionId(sessionId);
+      const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+      if (record === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+
+      const integratedRevision = isCloseSessionOptions(sessionIdOrOptions)
+        ? (sessionIdOrOptions.integratedRevision ?? sessionIdOrOptions.integrated_revision ?? null)
+        : null;
+      const evidence: IntegrationEvidenceInput | undefined =
+        integratedRevision === null || integratedRevision === undefined ? undefined : { integratedRevision };
+      const diagnostic = this.diagnoseUnsafe(record, state, evidence);
+      const now = toTimestamp(this.clock());
+      const ageSuspicious = Date.parse(now) - Date.parse(record.updatedAt) >= this.staleAfterMs;
+      return classifySessionLifecycle({
+        sessionState: record.state,
+        physicalState: diagnostic.physicalState,
+        closeReadiness: diagnostic.closeReadiness === "not_due" ? "not-evaluated" : diagnostic.closeReadiness,
+        blockers: diagnostic.blockers.map((blocker) => ({ code: blocker.code })),
+        terminalOperation: record.terminalOperation,
+        ageSuspicious,
+        // Elapsed age is intentionally not a GC authority. The GC leaf may
+        // supply positive authority once its own physical/lifecycle proof is
+        // available, without changing this read-only classifier.
+        gcAuthorized: false,
+        phase: isCloseSessionOptions(sessionIdOrOptions) ? (sessionIdOrOptions.phase ?? "current") : "current",
+      });
+    });
+  }
+
+  /**
    * Side-effect-free close/cleanup readiness diagnostic for one session. This
    * observes the exact same authoritative Git/session/claim truth `close()`
    * uses (including the #123 non-ancestry integration proof contract when
@@ -3148,6 +3227,15 @@ export class SessionRegistry {
     }
     const claims = state.claims.filter((claim) => claim.sessionId === record.sessionId).map(cloneResourceClaim);
     const recoveryHints = sortStrings(blockers.flatMap((blocker) => blocker.recoveryHints));
+    const lifecycle = classifySessionLifecycle({
+      sessionState: record.state,
+      physicalState,
+      closeReadiness:
+        blockers.length === 0 ? "ready" : isAmbiguousObservationCode(blockers[0]!.code) ? "ambiguous" : "blocked",
+      blockers: blockers.map((blocker) => ({ code: blocker.code })),
+      terminalOperation: record.terminalOperation,
+      phase: "termination",
+    });
     return Object.freeze({
       schemaVersion: CLEANUP_DECISION_SCHEMA_VERSION,
       operation: "cleanup" as const,
@@ -3161,6 +3249,7 @@ export class SessionRegistry {
       physicalState,
       blockers: Object.freeze(blockers),
       recoveryHints: Object.freeze(recoveryHints),
+      lifecycle,
     });
   }
 
@@ -3180,6 +3269,13 @@ export class SessionRegistry {
     };
 
     if (record.state === "closed") {
+      const lifecycle = classifySessionLifecycle({
+        sessionState: record.state,
+        physicalState: "closed",
+        closeReadiness: "ready",
+        terminalOperation: record.terminalOperation,
+        phase: "termination",
+      });
       const garbageCollection = closedGarbageCollectionAssessment(record, now);
       return Object.freeze({
         schemaVersion: SESSION_DIAGNOSTIC_SCHEMA_VERSION,
@@ -3198,6 +3294,7 @@ export class SessionRegistry {
         safeActions: Object.freeze([]),
         integrationEvidence: Object.freeze(integrationEvidence),
         garbageCollection,
+        lifecycle,
       });
     }
 
@@ -3221,6 +3318,15 @@ export class SessionRegistry {
     const cleanupReadiness: ReadinessState =
       closeReadiness !== "ready" ? closeReadiness : staleCandidate ? "ready" : "not_due";
     const resultState = resultStateForDiagnostic(closeReadiness, blockers);
+    const lifecycle = classifySessionLifecycle({
+      sessionState: record.state,
+      physicalState,
+      closeReadiness: closeReadiness === "not_due" ? "not-evaluated" : closeReadiness,
+      blockers: blockers.map((blocker) => ({ code: blocker.code })),
+      terminalOperation: record.terminalOperation,
+      ageSuspicious: Date.parse(now) - Date.parse(record.updatedAt) >= this.staleAfterMs,
+      phase: "termination",
+    });
     const safeActions =
       blockers.length > 0
         ? sortStrings(Array.from(new Set(blockers.flatMap((blocker) => blocker.safeActions))))
@@ -3250,6 +3356,7 @@ export class SessionRegistry {
         ...(integrationProof === undefined ? {} : { proof: integrationProof }),
       }),
       garbageCollection,
+      lifecycle,
     });
   }
 
@@ -3282,6 +3389,13 @@ export class SessionRegistry {
             status: "drift",
             physicalState: physical.kind,
             blockers: [toCleanupBlocker(error)],
+            lifecycle: classifySessionLifecycle({
+              sessionState: record.state,
+              physicalState: physical.kind,
+              blockers: [{ code: error instanceof SessionRegistryError ? error.code : "GIT_STATE_AMBIGUOUS" }],
+              terminalOperation: record.terminalOperation,
+              phase: "current",
+            }),
           };
         }
       } catch (error: unknown) {
@@ -3290,6 +3404,13 @@ export class SessionRegistry {
           status: "drift",
           physicalState: physical.kind,
           blockers: [toCleanupBlocker(error)],
+          lifecycle: classifySessionLifecycle({
+            sessionState: record.state,
+            physicalState: physical.kind,
+            blockers: [{ code: error instanceof SessionRegistryError ? error.code : "GIT_STATE_AMBIGUOUS" }],
+            terminalOperation: record.terminalOperation,
+            phase: "current",
+          }),
         };
       }
       return {
@@ -3297,6 +3418,12 @@ export class SessionRegistry {
         status: "closed",
         physicalState: physical.kind,
         blockers: [],
+        lifecycle: classifySessionLifecycle({
+          sessionState: record.state,
+          physicalState: "closed",
+          terminalOperation: record.terminalOperation,
+          phase: "current",
+        }),
       };
     }
 
@@ -3317,6 +3444,13 @@ export class SessionRegistry {
           status: "candidate",
           physicalState: physical.kind,
           blockers: [toCleanupBlocker(error)],
+          lifecycle: classifySessionLifecycle({
+            sessionState: record.state,
+            physicalState: physical.kind,
+            blockers: [{ code: error.code }],
+            terminalOperation: record.terminalOperation,
+            phase: "current",
+          }),
         };
       }
       return {
@@ -3324,6 +3458,13 @@ export class SessionRegistry {
         status: isDestructiveGcEligible(record, worktrees) ? "candidate" : "healthy",
         physicalState: physical.kind,
         blockers: [],
+        lifecycle: classifySessionLifecycle({
+          sessionState: record.state,
+          physicalState: physical.kind,
+          ageSuspicious: Date.parse(now) - Date.parse(record.updatedAt) >= this.staleAfterMs,
+          terminalOperation: record.terminalOperation,
+          phase: "current",
+        }),
       };
     } catch (error: unknown) {
       return {
@@ -3331,6 +3472,13 @@ export class SessionRegistry {
         status: "drift",
         physicalState: physical.kind,
         blockers: [toCleanupBlocker(error)],
+        lifecycle: classifySessionLifecycle({
+          sessionState: record.state,
+          physicalState: physical.kind,
+          blockers: [{ code: error instanceof SessionRegistryError ? error.code : "GIT_STATE_AMBIGUOUS" }],
+          terminalOperation: record.terminalOperation,
+          phase: "current",
+        }),
       };
     }
   }

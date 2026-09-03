@@ -118,6 +118,12 @@ async function inspectReconciliation(context: RepositoryContext): Promise<Doctor
       {
         clean: result.clean,
         sessions: result.sessions.length,
+        lifecycle_sessions: result.sessions.map((session) => ({
+          session_id: session.session.sessionId,
+          status: session.status,
+          physical_state: session.physicalState,
+          lifecycle_state: session.lifecycle?.state ?? null,
+        })),
         worktrees: result.worktrees.length,
         issues,
       },
