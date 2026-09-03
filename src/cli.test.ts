@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -25,7 +26,7 @@ import type {
   UpdateClaimsOptions,
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
-import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
+import { discoverSandboxRuntimeLayout, SANDBOX_REQUIRED_CAPABILITIES, type SandboxProbe } from "./domain/sandbox.js";
 import type { CliIO } from "./presentation.js";
 
 const sampleSession: SessionRecord = {
@@ -49,6 +50,21 @@ function capture(): { stdout: string[]; stderr: string[]; io: CliIO } {
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
     },
+  };
+}
+
+function readySandboxProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe {
+  return {
+    platform: () => "linux",
+    uid: () => 1_000,
+    gid: () => 1_000,
+    hasBubblewrap: () => true,
+    hasNamespaceSupport: () => true,
+    hasCgroupsV2: () => false,
+    hasLandlock: () => false,
+    hasSeccomp: () => true,
+    hasCapabilities: () => true,
+    ...overrides,
   };
 }
 
@@ -979,6 +995,54 @@ test("capabilities discovery is available outside a Git repository and exposes t
     const evidence = response.capabilities.find((capability) => capability.commands.includes("evidence snapshot"));
     assert.ok(evidence?.commands.includes("diff"));
     assert.ok(evidence?.failure_codes.includes("GIT_OUTPUT_LIMIT"));
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor JSON exposes protected-execution readiness without resolving a session", async () => {
+  const output = capture();
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-doctor-discovery-"));
+  try {
+    execFileSync("git", ["init", "--quiet", directory]);
+    const exitCode = await runCli(["doctor", "--json"], {
+      cwd: directory,
+      io: output.io,
+      sandboxProbe: readySandboxProbe({ hasNamespaceSupport: () => false }),
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(output.stderr.length, 0);
+    const response = JSON.parse(output.stdout[0] ?? "") as {
+      ok: boolean;
+      command: string;
+      sandbox: {
+        contract_id: string;
+        schema_version: number;
+        platform_supported: boolean;
+        network_mode: string;
+        ready: boolean;
+        missing_required: string[];
+        capabilities: Array<{ id: string; requirement: string; status: string }>;
+      };
+    };
+    assert.equal(response.ok, true);
+    assert.equal(response.command, "doctor");
+    assert.equal(response.sandbox.contract_id, "nawabari.sandbox-execution.v1");
+    assert.equal(response.sandbox.schema_version, 1);
+    assert.equal(response.sandbox.platform_supported, true);
+    assert.equal(response.sandbox.network_mode, "inherited");
+    assert.equal(response.sandbox.ready, false);
+    assert.deepEqual(response.sandbox.missing_required, [
+      "user_namespaces",
+      "mount_namespaces",
+      "pid_namespace",
+      "ipc_namespace",
+      "uts_namespace",
+    ]);
+    assert.equal(
+      response.sandbox.capabilities.filter((entry) => entry.requirement === "required").length,
+      SANDBOX_REQUIRED_CAPABILITIES.length,
+    );
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

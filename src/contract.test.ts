@@ -9,6 +9,12 @@ import {
   machineContract,
 } from "./contract.js";
 import { RESOURCE_CLAIM_FAILURE_CODES } from "./domain/errors.js";
+import {
+  SANDBOX_CONTRACT_ID,
+  SANDBOX_CONTRACT_SCHEMA_VERSION,
+  SANDBOX_OPTIONAL_CAPABILITIES,
+  SANDBOX_REQUIRED_CAPABILITIES,
+} from "./domain/sandbox.js";
 import { RESOURCE_CLAIM_SCHEMA_VERSION } from "./resource-claims.js";
 import { runCli } from "./cli.js";
 
@@ -23,6 +29,20 @@ function resourceCapability(): JsonRecord {
       candidate !== null &&
       !Array.isArray(candidate) &&
       candidate.id === "resource-claims",
+  );
+  assert.ok(capability && typeof capability === "object" && !Array.isArray(capability));
+  return capability as JsonRecord;
+}
+
+function protectedExecutionCapability(): JsonRecord {
+  const contract = machineContract("test-version");
+  assert.ok(Array.isArray(contract.capabilities));
+  const capability = contract.capabilities.find(
+    (candidate) =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      !Array.isArray(candidate) &&
+      candidate.id === "protected-execution",
   );
   assert.ok(capability && typeof capability === "object" && !Array.isArray(capability));
   return capability as JsonRecord;
@@ -110,6 +130,34 @@ test("session lifecycle capability truthfully publishes Linux-only stale-lock re
   assert.equal(staleRecovery.live_owner, "never-reclaim-by-age");
   assert.equal(staleRecovery.unknown_or_remote_owner, "fail-closed");
   assert.equal(staleRecovery.pid_only_identity, "not-sufficient");
+});
+
+test("protected-execution capability publishes the sandbox contract and canonical entry point", async () => {
+  const capability = protectedExecutionCapability();
+  assert.equal(capability.contract_id, SANDBOX_CONTRACT_ID);
+  assert.equal(capability.schema_version, SANDBOX_CONTRACT_SCHEMA_VERSION);
+  assert.deepEqual(capability.commands, ["session run", "session exec"]);
+  assert.deepEqual(capability.command_aliases, [{ alias: "session exec", canonical: "session run" }]);
+  assert.deepEqual(capability.required_capabilities, [...SANDBOX_REQUIRED_CAPABILITIES]);
+  assert.deepEqual(capability.optional_capabilities, [...SANDBOX_OPTIONAL_CAPABILITIES]);
+  assert.equal(capability.network_mode, "inherited");
+  assert.equal(capability.fail_closed, true);
+  assert.equal(capability.ambient_fallback, false);
+  const readiness = capability.readiness as JsonRecord;
+  assert.equal(readiness.command, "doctor");
+  assert.equal(readiness.report_field, "sandbox");
+
+  for (const command of ["session run", "session exec"] as const) {
+    const output: string[] = [];
+    const exitCode = await runCli([...command.split(" "), "--help", "--json"], {
+      io: { stdout: (line) => output.push(line), stderr: () => undefined },
+    });
+    assert.equal(exitCode, 0, `${command} help failed`);
+    const response = JSON.parse(output[0] ?? "") as JsonRecord;
+    assert.equal(response.ok, true);
+    assert.equal(response.help_for, command);
+    if (command === "session exec") assert.equal(response.canonical_command, "session run");
+  }
 });
 
 test("every advertised resource lifecycle command has a result mapping and resolves through help", async () => {

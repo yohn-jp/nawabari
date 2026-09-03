@@ -208,6 +208,18 @@ async function main() {
     ) {
       fail("installed capabilities did not enumerate the governed lifecycle");
     }
+    const protectedExecution = capabilities.capabilities?.find((capability) => capability.id === "protected-execution");
+    if (
+      protectedExecution?.contract_id !== "nawabari.sandbox-execution.v1" ||
+      protectedExecution?.schema_version !== 1 ||
+      protectedExecution?.network_mode !== "inherited" ||
+      protectedExecution?.fail_closed !== true ||
+      protectedExecution?.ambient_fallback !== false ||
+      protectedExecution?.commands?.join(",") !== "session run,session exec" ||
+      protectedExecution?.command_aliases?.[0]?.alias !== "session exec"
+    ) {
+      fail("installed capabilities did not expose the protected-execution contract");
+    }
     if (capabilitiesResult.stderr.trim().length > 0) fail("capabilities --json wrote decorative output to stderr");
     // The v2 resource-claim capability publishes lifecycle result mappings,
     // transition/recovery identities, and operation-mode rationale in one
@@ -333,6 +345,24 @@ async function main() {
           }
         });
       });
+
+    const doctorResult = invokeInstalled(["doctor", "--json"], lifecycleRepository);
+    if (doctorResult.status !== 0) fail(`doctor --json exited ${doctorResult.status}, expected 0`);
+    const protectedExecutionDoctor = parseInstalledJson(doctorResult, "protected-execution readiness");
+    if (
+      protectedExecutionDoctor.ok !== true ||
+      protectedExecutionDoctor.sandbox?.contract_id !== "nawabari.sandbox-execution.v1" ||
+      protectedExecutionDoctor.sandbox?.schema_version !== 1 ||
+      typeof protectedExecutionDoctor.sandbox?.platform_supported !== "boolean" ||
+      typeof protectedExecutionDoctor.sandbox?.ready !== "boolean" ||
+      !Array.isArray(protectedExecutionDoctor.sandbox?.missing_required) ||
+      !Array.isArray(protectedExecutionDoctor.sandbox?.capabilities) ||
+      protectedExecutionDoctor.sandbox?.network_mode !== "inherited"
+    ) {
+      fail("installed doctor did not expose protected-execution readiness");
+    }
+    if (doctorResult.stderr.trim().length > 0) fail("doctor --json wrote decorative output to stderr");
+
     console.log("running the installed Nawabari session lifecycle...");
     const protectedGuardResult = invokeInstalled(["guard", "--json"], lifecycleRepository);
     const protectedGuard = parseInstalledJson(protectedGuardResult, "protected worktree guard");

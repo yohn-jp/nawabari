@@ -85,6 +85,17 @@ result-schema versions, identity fields, and stable `failure_codes`. The
 package version is release metadata; it is not a substitute for the
 machine-contract identifier.
 
+The `protected-execution` capability separately advertises the versioned
+`nawabari.sandbox-execution.v1` contract, its required and optional host
+capabilities, the canonical `session run` entry point and `session exec` alias,
+`network_mode: "inherited"`, and fail-closed behavior. Use
+`nawabari doctor --json` to inspect the current host without creating or
+selecting a session. Its `sandbox` report is produced by the same
+`sandboxDoctorReport` authority used when resolving protected execution and
+contains `platform_supported`, per-capability status, `ready`, and
+`missing_required`. An unavailable required capability never implies an
+ambient protected fallback.
+
 The `resource-claims` capability additionally exposes a machine-readable
 `claim_set_replacement` object (`commands`, `atomic: true`,
 `pairing: "adjacent-resource-mode"`, `idempotent_retry: true`,

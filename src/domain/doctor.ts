@@ -6,6 +6,7 @@ import { defaultGit, resolveRepositoryContext, type RepositoryContext } from "..
 import { isSessionRegistryError } from "../errors.js";
 import { SessionRegistry } from "../session-registry.js";
 import { success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
+import { defaultSandboxProbe, sandboxDoctorReport, type SandboxDoctorReport, type SandboxProbe } from "./sandbox.js";
 
 export type DoctorCheckStatus = "ok" | "warning" | "error" | "not_configured" | "not_applicable";
 
@@ -27,6 +28,8 @@ export type DoctorReport = {
   ok: boolean;
   checks: DoctorCheck[];
   repository: RepositoryInfo | null;
+  /** Runtime protected-execution readiness from the canonical sandbox probe. */
+  sandbox: SandboxDoctorReport;
 };
 
 function supportsRuntime(version: string): boolean {
@@ -139,16 +142,22 @@ async function inspectReconciliation(context: RepositoryContext): Promise<Doctor
   }
 }
 
-export async function runDoctor(cwd = process.cwd()): Promise<DomainResult<DoctorReport>> {
+export async function runDoctor(
+  cwd = process.cwd(),
+  sandboxProbe: SandboxProbe = defaultSandboxProbe,
+): Promise<DomainResult<DoctorReport>> {
   const checks: DoctorCheck[] = [];
+  const sandbox = sandboxDoctorReport(sandboxProbe);
   const runtimeOk = supportsRuntime(process.versions.node);
   checks.push(
     runtimeOk
       ? check("runtime", "ok", null, "The Nawabari runtime meets the supported Node.js version.", {
           node: process.versions.node,
+          sandbox: sandbox as unknown as JsonObject,
         })
       : check("runtime", "error", "UNSUPPORTED_RUNTIME", "The Node.js runtime is below the supported version.", {
           node: process.versions.node,
+          sandbox: sandbox as unknown as JsonObject,
         }),
   );
 
@@ -168,7 +177,7 @@ export async function runDoctor(cwd = process.cwd()): Promise<DomainResult<Docto
     checks.push(
       check("registry", "not_applicable", null, "Registry inspection was skipped because Git is unavailable."),
     );
-    return success({ ok: false, checks, repository: null });
+    return success({ ok: false, checks, repository: null, sandbox });
   }
 
   let repository: RepositoryInfo | null = null;
@@ -209,7 +218,7 @@ export async function runDoctor(cwd = process.cwd()): Promise<DomainResult<Docto
   }
 
   const hasError = checks.some((item) => item.status === "error");
-  return success({ ok: !hasError, checks, repository });
+  return success({ ok: !hasError, checks, repository, sandbox });
 }
 
 function doctorErrorCode(error: unknown, fallback: ErrorCode): ErrorCode {
