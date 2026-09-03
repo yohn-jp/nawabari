@@ -43,7 +43,10 @@ function packageBinTargets(packageDirectory) {
 
 function parseArgs(argv) {
   const index = argv.indexOf("--tarball");
-  return { tarball: index === -1 ? undefined : argv[index + 1] };
+  return {
+    tarball: index === -1 ? undefined : argv[index + 1],
+    requireProtectedExecution: argv.includes("--require-protected-execution"),
+  };
 }
 
 function addClosedHistory(registryPath, count, installDirectory) {
@@ -81,7 +84,7 @@ function parseInstalledJson(result, label) {
 }
 
 async function main() {
-  const { tarball } = parseArgs(process.argv.slice(2));
+  const { tarball, requireProtectedExecution } = parseArgs(process.argv.slice(2));
   let tarballPath;
   let ownsTarball;
   if (tarball !== undefined) {
@@ -498,6 +501,96 @@ async function main() {
     }
     if (typeof status.managed_worktree_root !== "string") {
       fail("status did not expose the resolved managed worktree root");
+    }
+
+    const protectedExecutionReady = protectedExecutionDoctor.sandbox?.ready === true;
+    if (protectedExecutionReady) {
+      const protectedArgument = "literal;$(touch packed-ambient-marker)";
+      const protectedRun = invokeInstalled(
+        [
+          "session",
+          "run",
+          "--session",
+          created.session_id,
+          "--json",
+          "--",
+          "node",
+          "-e",
+          "process.stdout.write(JSON.stringify({cwd: process.cwd(), session_id: process.env.NAWABARI_SESSION_ID, argv: process.argv.slice(1)}))",
+          protectedArgument,
+        ],
+        lifecycleWorktree,
+      );
+      const protectedRunJson = parseInstalledJson(protectedRun, "packed protected session run");
+      if (
+        protectedRun.status !== 0 ||
+        protectedRunJson.ok !== true ||
+        protectedRunJson.exit_code !== 0 ||
+        protectedRunJson.signal !== null ||
+        protectedRunJson.stderr !== ""
+      ) {
+        fail("packed protected session run did not return a successful bounded result");
+      }
+      let protectedEvidence;
+      try {
+        protectedEvidence = JSON.parse(protectedRunJson.stdout);
+      } catch {
+        fail("packed protected session run did not return JSON execution evidence");
+      }
+      if (
+        protectedEvidence.cwd !== fs.realpathSync.native(lifecycleWorktree) ||
+        protectedEvidence.session_id !== created.session_id ||
+        protectedEvidence.argv?.length !== 1 ||
+        protectedEvidence.argv[0] !== protectedArgument
+      ) {
+        fail("packed protected session run did not preserve authoritative cwd, session identity, and argv");
+      }
+      if (fs.existsSync(path.join(lifecycleWorktree, "packed-ambient-marker"))) {
+        fail("packed protected session run interpolated command argv through a shell");
+      }
+      console.log("protected-execution integration passed.");
+    } else {
+      // Package smoke owns the installed contract. A successful protected run
+      // is a separate integration contract because hosted runners may not
+      // expose the required sandbox capability. Even in that case, verify
+      // that the installed package rejects the command instead of falling
+      // back to ambient execution.
+      const unavailableRun = invokeInstalled(
+        [
+          "session",
+          "run",
+          "--session",
+          created.session_id,
+          "--json",
+          "--",
+          "node",
+          "-e",
+          "process.stdout.write('ambient')",
+        ],
+        lifecycleWorktree,
+      );
+      const unavailableRunJson = parseInstalledJson(unavailableRun, "unavailable protected session run");
+      const expectedUnavailableCode = protectedExecutionDoctor.sandbox?.platform_supported
+        ? "SANDBOX_CAPABILITY_UNAVAILABLE"
+        : "SANDBOX_UNSUPPORTED_PLATFORM";
+      if (
+        unavailableRun.status !== 4 ||
+        unavailableRunJson.ok !== false ||
+        unavailableRunJson.code !== expectedUnavailableCode ||
+        unavailableRun.stderr.trim().length > 0
+      ) {
+        fail("installed protected session run did not fail closed when the sandbox capability was unavailable");
+      }
+      if (requireProtectedExecution) {
+        fail(
+          `protected-execution integration requires an available sandbox; missing: ${
+            protectedExecutionDoctor.sandbox?.missing_required?.join(", ") || "unknown capability"
+          }`,
+        );
+      }
+      console.log(
+        `protected-execution integration not run (${expectedUnavailableCode}); fail-closed rejection verified.`,
+      );
     }
 
     const initialEvidence = parseInstalledJson(

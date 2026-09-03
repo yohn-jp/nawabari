@@ -21,7 +21,10 @@ function run(command, args, options = {}) {
 }
 
 function parseArgs(argv) {
-  return { keepTarball: argv.includes("--keep-tarball") };
+  return {
+    keepTarball: argv.includes("--keep-tarball"),
+    requireProtectedExecution: argv.includes("--require-protected-execution"),
+  };
 }
 
 function assertPackContents(packInfo) {
@@ -45,7 +48,7 @@ function assertPackContents(packInfo) {
 }
 
 function main() {
-  const { keepTarball } = parseArgs(process.argv.slice(2));
+  const { keepTarball, requireProtectedExecution } = parseArgs(process.argv.slice(2));
   const tarballName = `${packageJson.name}-${packageJson.version}.tgz`;
   const tarballPath = path.join(repoRoot, tarballName);
   fs.rmSync(tarballPath, { force: true });
@@ -60,7 +63,9 @@ function main() {
 
     run(process.execPath, ["scripts/validate-release-tarball.mjs", tarballPath]);
     console.log(`package contents verified in exact tarball: ${tarballName}`);
-    run(process.execPath, ["scripts/smoke-test.mjs", "--tarball", tarballPath], { stdio: "inherit" });
+    const smokeArgs = ["scripts/smoke-test.mjs", "--tarball", tarballPath];
+    if (requireProtectedExecution) smokeArgs.push("--require-protected-execution");
+    run(process.execPath, smokeArgs, { stdio: "inherit" });
   } finally {
     if (!keepTarball) fs.rmSync(tarballPath, { force: true });
   }

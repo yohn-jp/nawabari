@@ -859,17 +859,36 @@ function boundedOutput(
   maxBytes: number,
   value: Buffer | string,
 ): { readonly bytes: number; readonly exceeded: boolean } {
-  const text = typeof value === "string" ? value : value.toString("utf8");
-  const textBytes = Buffer.byteLength(text, "utf8");
+  const encoded = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+  const textBytes = encoded.byteLength;
   const remaining = maxBytes - bytes;
   if (remaining <= 0) return { bytes, exceeded: textBytes > 0 };
   if (textBytes <= remaining) {
-    chunks.push(text);
+    chunks.push(encoded.toString("utf8"));
     return { bytes: bytes + textBytes, exceeded: false };
   }
-  const bounded = Buffer.from(text).subarray(0, remaining).toString("utf8");
-  chunks.push(bounded);
-  return { bytes: maxBytes, exceeded: true };
+  // Do not let a partial UTF-8 code point turn into U+FFFD and exceed the
+  // advertised byte bound.  The launcher reports text, but the bound is
+  // defined in bytes so that machine callers can rely on it for arbitrary
+  // child output.
+  let end = remaining;
+  while (end > 0) {
+    const last = encoded[end - 1] ?? 0;
+    if ((last & 0x80) === 0) break;
+    if ((last & 0xc0) === 0x80) {
+      let start = end - 1;
+      while (start > 0 && ((encoded[start - 1] ?? 0) & 0xc0) === 0x80) start -= 1;
+      const lead = encoded[start] ?? 0;
+      const width = (lead & 0xe0) === 0xc0 ? 2 : (lead & 0xf0) === 0xe0 ? 3 : (lead & 0xf8) === 0xf0 ? 4 : 1;
+      if (start + width > end) {
+        end = start;
+        continue;
+      }
+    }
+    break;
+  }
+  chunks.push(encoded.subarray(0, end).toString("utf8"));
+  return { bytes: bytes + end, exceeded: true };
 }
 
 function landlockSetupDiagnostic(stderr: string): string | null {
@@ -970,8 +989,7 @@ export function runSandboxedCommand(
   return new Promise((resolve) => {
     const stdout: string[] = [];
     const stderr: string[] = [];
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
+    let outputBytes = 0;
     let timedOut = false;
     let outputExceeded = false;
     let spawnError: Error | null = null;
@@ -1098,16 +1116,16 @@ export function runSandboxedCommand(
     };
 
     child.stdout?.on("data", (value: Buffer | string) => {
-      const collected = boundedOutput(stdout, stdoutBytes, maxOutputBytes, value);
-      stdoutBytes = collected.bytes;
+      const collected = boundedOutput(stdout, outputBytes, maxOutputBytes, value);
+      outputBytes = collected.bytes;
       if (collected.exceeded) {
         outputExceeded = true;
         child.kill("SIGKILL");
       }
     });
     child.stderr?.on("data", (value: Buffer | string) => {
-      const collected = boundedOutput(stderr, stderrBytes, maxOutputBytes, value);
-      stderrBytes = collected.bytes;
+      const collected = boundedOutput(stderr, outputBytes, maxOutputBytes, value);
+      outputBytes = collected.bytes;
       if (collected.exceeded) {
         outputExceeded = true;
         child.kill("SIGKILL");
