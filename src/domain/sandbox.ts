@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
+import { LANDLOCK_ABI_MINIMUM, type LandlockCapability, type LandlockEffectiveState } from "./landlock.js";
 import type { SessionBackend, SessionContext } from "./session.js";
 import {
   SANDBOX_CAPABILITY_BASELINE_ID,
@@ -93,7 +93,10 @@ export type SandboxDoctorReport = {
   missing_required: SandboxCapabilityId[];
   seccomp_profile: ReturnType<typeof sandboxSeccompProfileMetadata>;
   capability_baseline: typeof sandboxCapabilityBaseline;
+  landlock: LandlockCapability;
 };
+
+export type { LandlockCapability, LandlockEffectiveState, LandlockRule } from "./landlock.js";
 
 /**
  * The real repository UID/GID is never equated with the namespace-local
@@ -154,6 +157,14 @@ export type SandboxExecutionRequest = {
   capability_baseline: typeof sandboxCapabilityBaseline;
   /** Optional cgroups v2 control/evidence below the session authority. */
   cgroups?: SandboxCgroupConfig;
+  /** Optional runtime adapter selected by the canonical profile. */
+  landlock_executable?: string | null;
+  /** ABI observed by the capability probe, retained for machine diagnostics. */
+  landlock_abi?: number | null;
+  /** Probe state retained when ABI observation itself failed. */
+  landlock_state?: LandlockEffectiveState;
+  /** Required only when the selected protected profile mandates Landlock. */
+  landlock_required?: boolean;
 };
 
 export type SandboxCgroupConfig = {
@@ -166,12 +177,18 @@ export type SandboxCgroupConfig = {
   readonly root?: string;
 };
 
+export type SandboxLandlockRequirement = "optional" | "required";
+
 export type SandboxExecutionOptions = {
   session_id: string | null;
   /** When true, resolution fails closed instead of returning an unsandboxed request. */
   enforce: boolean;
   /** Canonical protected profile's cgroups policy, when selected. */
   cgroups?: Omit<SandboxCgroupConfig, "execution_id"> & { readonly execution_id?: string };
+  /** Landlock remains optional by default; required profiles fail closed on setup/support failure. */
+  landlock?: SandboxLandlockRequirement;
+  /** Explicit compatibility spelling for callers that persist profile flags. */
+  landlock_required?: boolean;
 };
 
 /** Injectable capability probe so doctor/resolution logic stays host-independent and testable. */
@@ -193,6 +210,8 @@ export type SandboxProbe = {
   hasNamespaceSupport(): boolean;
   hasCgroupsV2(): boolean;
   hasLandlock(): boolean;
+  /** Return the supported ABI number when it can be observed, otherwise null. */
+  landlockAbi?: () => number | null;
   hasSeccomp(): boolean;
   hasCapabilities(): boolean;
 };
@@ -204,6 +223,8 @@ export type SandboxProbe = {
  */
 export type SandboxRuntimeLayout = {
   bubblewrap: string | null;
+  /** Optional interpreter used only to install Landlock inside bubblewrap. */
+  landlock_helper?: string | null;
   /** Host HOME used only to resolve the selected read-only tool directories. */
   user_home?: string | null;
   user_local_bin: string | null;
@@ -255,12 +276,37 @@ function executableOnPath(command: string, environment: NodeJS.ProcessEnv = proc
   return null;
 }
 
-function kernelSupportsLandlockAbi(): boolean {
-  const [majorText, minorText] = os.release().split(".");
-  const major = Number(majorText);
-  const minor = Number(minorText);
-  if (!Number.isFinite(major) || !Number.isFinite(minor)) return false;
-  return major > 5 || (major === 5 && minor >= 13);
+/**
+ * Ask the kernel for the Landlock ABI instead of inferring support from a
+ * kernel version string.  Node does not expose arbitrary syscalls, so the
+ * optional probe uses the same small Python/libc adapter as the launcher.
+ */
+function probeLandlockAbi(): number | null {
+  if (process.platform !== SANDBOX_SUPPORTED_PLATFORM) return null;
+  const python = executableOnPath("python3");
+  if (python === null) return null;
+  try {
+    const output = execFileSync(
+      python,
+      ["-c", "import ctypes; print(int(ctypes.CDLL(None,use_errno=True).syscall(444,None,0,1)))"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1_000 },
+    ).trim();
+    const abi = Number(output);
+    return Number.isSafeInteger(abi) && abi >= 0 ? abi : null;
+  } catch {
+    return null;
+  }
+}
+
+let cachedDefaultLandlockAbi: number | null | undefined;
+function defaultLandlockAbiProbe(): number | null {
+  if (cachedDefaultLandlockAbi === undefined) cachedDefaultLandlockAbi = probeLandlockAbi();
+  return cachedDefaultLandlockAbi;
+}
+
+function defaultLandlockSupported(): boolean {
+  const abi = defaultLandlockAbiProbe();
+  return abi !== null && abi >= LANDLOCK_ABI_MINIMUM;
 }
 
 const BUBBLEWRAP_NAMESPACE_PROBE_TIMEOUT_MS = 5_000;
@@ -300,7 +346,8 @@ export const defaultSandboxProbe: SandboxProbe = Object.freeze({
   hasBubblewrap: () => commandExistsOnPath("bwrap"),
   hasNamespaceSupport: () => probeBubblewrapNamespaceSupport(commandExistsOnPath("bwrap")),
   hasCgroupsV2: () => pathExists("/sys/fs/cgroup/cgroup.controllers"),
-  hasLandlock: () => pathExists("/sys/kernel/security/landlock") || kernelSupportsLandlockAbi(),
+  hasLandlock: defaultLandlockSupported,
+  landlockAbi: defaultLandlockAbiProbe,
   hasSeccomp: () => pathExists("/proc/sys/kernel/seccomp"),
   hasCapabilities: () => pathExists("/proc/self/status"),
 });
@@ -345,6 +392,27 @@ const CAPABILITY_LABEL: Readonly<Record<SandboxCapabilityId, string>> = Object.f
   seccomp: "seccomp filtering",
   capabilities: "Linux capability-set inspection",
 });
+
+function landlockCapability(probe: SandboxProbe, platformSupported: boolean): LandlockCapability {
+  if (!platformSupported) {
+    return { abi: null, supported: false, effective_state: "not-applicable" };
+  }
+
+  let abi: number | null;
+  try {
+    // Older injectable probes only expose hasLandlock(). Treat a positive
+    // result as ABI 1 while allowing newer probes to report the exact ABI.
+    abi = probe.landlockAbi === undefined ? (probe.hasLandlock() ? LANDLOCK_ABI_MINIMUM : null) : probe.landlockAbi();
+  } catch {
+    return { abi: null, supported: false, effective_state: "error" };
+  }
+  if (abi === null) return { abi: null, supported: false, effective_state: "reduced-defense" };
+  if (!Number.isSafeInteger(abi)) return { abi: null, supported: false, effective_state: "error" };
+  if (abi < LANDLOCK_ABI_MINIMUM) {
+    return { abi, supported: false, effective_state: "incompatible" };
+  }
+  return { abi, supported: true, effective_state: "available" };
+}
 
 function capabilityCheck(
   id: SandboxCapabilityId,
@@ -404,13 +472,40 @@ export function sandboxDoctorReport(probe: SandboxProbe = defaultSandboxProbe): 
   const platform = probe.platform();
   const platformSupported = platform === SANDBOX_SUPPORTED_PLATFORM;
   const namespaceSupport = platformSupported && probe.hasNamespaceSupport();
+  const landlock = landlockCapability(probe, platformSupported);
   const capabilities = [
     ...SANDBOX_REQUIRED_CAPABILITIES.map((id) =>
       capabilityCheck(id, "required", platformSupported, probe, namespaceSupport),
     ),
-    ...SANDBOX_OPTIONAL_CAPABILITIES.map((id) =>
-      capabilityCheck(id, "optional", platformSupported, probe, namespaceSupport),
-    ),
+    ...SANDBOX_OPTIONAL_CAPABILITIES.map((id) => {
+      if (id !== "landlock") {
+        return capabilityCheck(id, "optional", platformSupported, probe, namespaceSupport);
+      }
+      return {
+        id,
+        requirement: "optional" as const,
+        status: !platformSupported
+          ? ("not_applicable" as const)
+          : landlock.supported
+            ? ("available" as const)
+            : ("unavailable" as const),
+        code: !platformSupported
+          ? ("SANDBOX_UNSUPPORTED_PLATFORM" as const)
+          : landlock.supported
+            ? null
+            : ("SANDBOX_CAPABILITY_UNAVAILABLE" as const),
+        message: !platformSupported
+          ? "The Landlock LSM ABI was not evaluated because the platform does not support Nawabari sandbox execution."
+          : landlock.supported
+            ? "The Landlock LSM ABI is available."
+            : "The Landlock LSM ABI is unavailable or incompatible; bubblewrap remains active as reduced defense.",
+        details: {
+          abi: landlock.abi,
+          supported: landlock.supported,
+          effective_state: landlock.effective_state,
+        },
+      };
+    }),
   ];
   const missingRequired = capabilities
     .filter((entry) => entry.requirement === "required" && entry.status !== "available")
@@ -427,6 +522,7 @@ export function sandboxDoctorReport(probe: SandboxProbe = defaultSandboxProbe): 
     missing_required: missingRequired,
     seccomp_profile: sandboxSeccompProfileMetadata(),
     capability_baseline: sandboxCapabilityBaseline,
+    landlock,
   };
 }
 
@@ -443,6 +539,7 @@ export function discoverSandboxRuntimeLayout(environment: NodeJS.ProcessEnv = pr
   const perUserProfile = user === null ? null : `/etc/profiles/per-user/${user}`;
   return {
     bubblewrap: executableOnPath("bwrap", environment),
+    landlock_helper: executableOnPath("python3", environment),
     user_home: home,
     user_local_bin: home === null ? null : existingPath(path.join(home, ".local", "bin")),
     user_local_lib: home === null ? null : existingPath(path.join(home, ".local", "lib")),
@@ -623,6 +720,34 @@ export async function resolveSandboxExecutionRequest(
     );
   }
 
+  const landlockRequired = options.landlock === "required" || options.landlock_required === true;
+  if (landlockRequired && !options.enforce) {
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "Landlock can only be required for protected execution.", {
+        session_id: decision.session_id,
+        enforce: options.enforce,
+      }),
+    );
+  }
+  if (landlockRequired && !doctor.landlock.supported) {
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The required Landlock profile is unavailable.", {
+        session_id: decision.session_id,
+        abi: doctor.landlock.abi,
+        effective_state: doctor.landlock.effective_state,
+      }),
+    );
+  }
+  const landlockHelper = runtimeLayout.landlock_helper ?? null;
+  if (landlockRequired && landlockHelper === null) {
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The required Landlock runtime adapter is unavailable.", {
+        session_id: decision.session_id,
+        abi: doctor.landlock.abi,
+      }),
+    );
+  }
+
   return success({
     schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
     contract_id: SANDBOX_CONTRACT_ID,
@@ -648,6 +773,10 @@ export async function resolveSandboxExecutionRequest(
             ...(requestedCgroups.root === undefined ? {} : { root: requestedCgroups.root }),
           },
         }),
+    landlock_executable: doctor.landlock.supported ? landlockHelper : null,
+    landlock_abi: doctor.landlock.abi,
+    landlock_state: doctor.landlock.effective_state,
+    landlock_required: landlockRequired,
   });
 }
 
@@ -671,6 +800,7 @@ export {
 
 export {
   compileSandboxInvocation,
+  deriveLandlockRules,
   runSandboxedCommand,
   type SandboxCommand,
   type SandboxExecutionResult,
@@ -694,3 +824,5 @@ export {
   type CgroupScope,
   type CgroupScopeOptions,
 } from "./cgroups-v2.js";
+
+export { LANDLOCK_ACCESS_FS, LANDLOCK_ABI_MINIMUM, LANDLOCK_TRAMPOLINE } from "./landlock.js";

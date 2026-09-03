@@ -5,6 +5,14 @@ import process from "node:process";
 
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import {
+  deriveLandlockRules,
+  LANDLOCK_ABI_MINIMUM,
+  LANDLOCK_SETUP_FAILURE_PREFIX,
+  LANDLOCK_TRAMPOLINE,
+  type LandlockEffectiveState,
+  type LandlockRule,
+} from "./landlock.js";
+import {
   compileSandboxSeccompProfile,
   SANDBOX_CAPABILITY_BASELINE_ID,
   SANDBOX_CAPABILITY_BASELINE_VERSION,
@@ -48,6 +56,11 @@ export type SandboxInvocation = {
   /** Raw sock_filter bytes supplied to bubblewrap through inherited fd 3. */
   readonly seccomp_profile: Uint8Array;
   readonly seccomp_profile_metadata: SandboxSeccompProfileMetadata;
+  readonly landlock: {
+    readonly abi: number | null;
+    readonly state: LandlockEffectiveState;
+    readonly rule_count: number;
+  };
 };
 
 export type SandboxExecutionResult = {
@@ -63,6 +76,11 @@ export type SandboxExecutionResult = {
     readonly scope: string;
     readonly accounting: CgroupAccounting;
     readonly limit_events: readonly string[];
+  };
+  readonly landlock?: {
+    readonly abi: number | null;
+    readonly state: LandlockEffectiveState;
+    readonly rule_count: number;
   };
 };
 
@@ -80,6 +98,8 @@ type ValidatedTopology = {
   readonly git_metadata: string;
   readonly git_objects: string;
 };
+
+export type { LandlockRule } from "./landlock.js";
 
 function topologyError(message: string, details: JsonObject): DomainResult<never> {
   return failure(new DomainError("SANDBOX_TOPOLOGY_INVALID", message, details));
@@ -383,6 +403,54 @@ function validateExecutable(request: SandboxExecutionRequest): DomainResult<stri
   return checked;
 }
 
+function sandboxPathForLandlockHelper(source: string, request: SandboxExecutionRequest): string {
+  const kind = allowedUserToolPath(source, request.filesystem.user_tool_home);
+  if (kind === "local_bin") return `${SANDBOX_LOCAL_HOME}/bin/${path.basename(source)}`;
+  if (kind === "local_lib") return `${SANDBOX_LOCAL_HOME}/lib/${path.basename(source)}`;
+  if (kind === "pnpm_bin") return `${SANDBOX_LOCAL_HOME}/share/pnpm/${path.basename(source)}`;
+  return source;
+}
+
+function validateLandlockExecutable(request: SandboxExecutionRequest): DomainResult<string | null> {
+  const source = request.landlock_executable;
+  if (source === undefined || source === null) return success(null);
+  if (!path.isAbsolute(source) || source.includes("\0")) {
+    return topologyError("The Landlock runtime adapter must be an absolute path without NUL bytes.", {
+      path: source,
+    });
+  }
+  const checked = ensureSourcePath(source, "Landlock runtime adapter");
+  if (!checked.ok) return checked;
+  try {
+    const stat = fs.statSync(source);
+    if (!stat.isFile() || (stat.mode & 0o111) === 0) {
+      return failure(
+        new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The Landlock runtime adapter is not executable.", {
+          path: source,
+        }),
+      );
+    }
+    const resolved = fs.realpathSync.native(source);
+    if (
+      !allowedSystemPath(resolved) &&
+      !allowedRuntimePath(resolved) &&
+      allowedUserToolPath(resolved, request.filesystem.user_tool_home) === null
+    ) {
+      return topologyError("The Landlock runtime adapter resolves outside the canonical runtime profile.", {
+        path: source,
+        resolved,
+      });
+    }
+    return success(sandboxPathForLandlockHelper(resolved, request));
+  } catch {
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The Landlock runtime adapter cannot be canonicalized.", {
+        path: source,
+      }),
+    );
+  }
+}
+
 function validateProfilePaths(request: SandboxExecutionRequest): DomainResult<null> {
   for (const source of request.filesystem.runtime_paths) {
     if (!allowedRuntimePath(source)) {
@@ -554,6 +622,39 @@ export function compileSandboxInvocation(
   }
   const seccompProfile = compileSandboxSeccompProfile(request.seccomp_profile.architecture);
   if (!seccompProfile.ok) return seccompProfile;
+  const landlockAbi = request.landlock_abi ?? null;
+  const landlockSupported =
+    landlockAbi !== null && Number.isSafeInteger(landlockAbi) && landlockAbi >= LANDLOCK_ABI_MINIMUM;
+  const landlockUnavailableState: LandlockEffectiveState =
+    request.landlock_state === "error" || (landlockAbi !== null && !Number.isSafeInteger(landlockAbi))
+      ? "error"
+      : landlockAbi === null
+        ? "reduced-defense"
+        : "incompatible";
+  const landlockRequired = request.landlock_required === true;
+  if (landlockRequired && !landlockSupported) {
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The required Landlock ABI is unavailable or incompatible.", {
+        session_id: request.session_id,
+        abi: landlockAbi,
+        effective_state: landlockUnavailableState,
+      }),
+    );
+  }
+  const landlockSource = request.landlock_executable ?? null;
+  const shouldValidateLandlock = landlockRequired || (landlockSupported && landlockSource !== null);
+  const landlockExecutable = shouldValidateLandlock ? validateLandlockExecutable(request) : success(null);
+  if (!landlockExecutable.ok) return landlockExecutable;
+  if (landlockRequired && landlockExecutable.value === null) {
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The required Landlock runtime adapter is unavailable.", {
+        session_id: request.session_id,
+        abi: landlockAbi,
+      }),
+    );
+  }
+  const landlockEnabled = landlockSupported && landlockExecutable.value !== null;
+  const landlockRules = deriveLandlockRules(request.filesystem);
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
   const pathValue = pathEntriesForEnvironment(request).join(":");
@@ -651,7 +752,18 @@ export function compileSandboxInvocation(
     seenDirectories.add(parent);
     args.push("--dir", parent);
   }
-  args.push("--chdir", worktreeDestination, "--", command.command, ...commandArgs);
+  const commandArgv = landlockEnabled
+    ? [
+        landlockExecutable.value as string,
+        "-c",
+        LANDLOCK_TRAMPOLINE,
+        JSON.stringify(landlockRules),
+        "--",
+        command.command,
+        ...commandArgs,
+      ]
+    : [command.command, ...commandArgs];
+  args.push("--chdir", worktreeDestination, "--", ...commandArgv);
 
   const env: Record<string, string> = {
     PATH: pathValue,
@@ -671,6 +783,11 @@ export function compileSandboxInvocation(
     env,
     seccomp_profile: seccompProfile.value,
     seccomp_profile_metadata: request.seccomp_profile,
+    landlock: {
+      abi: landlockAbi,
+      state: landlockEnabled ? "enforced" : landlockUnavailableState,
+      rule_count: landlockRules.length,
+    },
   });
 }
 
@@ -753,6 +870,15 @@ function boundedOutput(
   const bounded = Buffer.from(text).subarray(0, remaining).toString("utf8");
   chunks.push(bounded);
   return { bytes: maxBytes, exceeded: true };
+}
+
+function landlockSetupDiagnostic(stderr: string): string | null {
+  const marker = stderr.indexOf(LANDLOCK_SETUP_FAILURE_PREFIX);
+  if (marker === -1) return null;
+  return stderr
+    .slice(marker + LANDLOCK_SETUP_FAILURE_PREFIX.length)
+    .trim()
+    .slice(0, 240);
 }
 
 /** Execute the compiled invocation with shell execution disabled and no fallback path. */
@@ -928,6 +1054,26 @@ export function runSandboxedCommand(
         );
         return;
       }
+      const landlockDiagnostic =
+        invocation.value.landlock.state === "enforced" ? landlockSetupDiagnostic(diagnostic) : null;
+      if (landlockDiagnostic !== null) {
+        resolve(
+          failure(
+            new DomainError(
+              "SANDBOX_EXECUTION_FAILED",
+              "Landlock setup failed; the protected command was not executed.",
+              {
+                session_id: request.session_id,
+                abi: invocation.value.landlock.abi,
+                effective_state: "error",
+                retryable: false,
+                diagnostic: landlockDiagnostic,
+              },
+            ),
+          ),
+        );
+        return;
+      }
       resolve(
         success({
           exit_code: code,
@@ -946,6 +1092,7 @@ export function runSandboxedCommand(
                   limit_events: cgroupLimitEvents(accounting),
                 },
               }),
+          landlock: invocation.value.landlock,
         }),
       );
     };
@@ -972,3 +1119,5 @@ export function runSandboxedCommand(
     child.on("close", (code, signal) => finish(code, signal));
   });
 }
+
+export { deriveLandlockRules } from "./landlock.js";
