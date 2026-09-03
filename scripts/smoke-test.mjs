@@ -294,8 +294,9 @@ async function main() {
     if (capabilitiesResult.stderr.trim().length > 0) fail("capabilities --json wrote decorative output to stderr");
     // The v2 resource-claim capability publishes lifecycle result mappings,
     // transition/recovery identities, and operation-mode rationale in one
-    // bounded document.
-    if (capabilitiesResult.stdout.length > 20_000) fail("capabilities --json exceeded its fixed discovery budget");
+    // bounded document. Keep enough room for the complete failure-code and
+    // result-schema vocabularies advertised by the public contract.
+    if (capabilitiesResult.stdout.length > 24_000) fail("capabilities --json exceeded its fixed discovery budget");
 
     const helpJsonResult = spawnSync(installedBinary, ["--help", "--json"], {
       cwd: installDirectory,
