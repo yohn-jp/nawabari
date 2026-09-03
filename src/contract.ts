@@ -16,6 +16,7 @@ import {
   SESSION_LIFECYCLE_STATES,
   SESSION_LIFECYCLE_TRANSITION_TABLE,
 } from "./session-lifecycle-classification.js";
+import { SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION, type SessionLifecycleActionId } from "./session-lifecycle-actions.js";
 import {
   SANDBOX_CONTRACT_ID,
   SANDBOX_CONTRACT_SCHEMA_VERSION,
@@ -288,6 +289,8 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "result_state",
       "blockers",
       "safe_actions",
+      "next_action",
+      "next_actions",
       "integration_evidence",
       "lifecycle_state",
       "lifecycle",
@@ -299,6 +302,18 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       transition_table: SESSION_LIFECYCLE_TRANSITION_TABLE,
       authority: "local-session-registry-observation",
       age_rule: "elapsed-age-is-diagnostic-only",
+      recovery_actions: {
+        schema_version: SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION,
+        action_ids: [
+          "retain-session",
+          "supply-exact-integrated-revision",
+          "retry-close-with-bounded-integration-fetch",
+          "discard-session",
+          "reconcile-physical-state",
+        ] satisfies readonly SessionLifecycleActionId[],
+        execution: "caller-must-invoke-explicit-command",
+        ambiguity: "retain-or-reconcile; no-destructive-action",
+      },
     },
     failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-diagnostics"],
     failure_code_policy: {

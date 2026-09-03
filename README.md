@@ -442,6 +442,16 @@ identifiers, in addition to the human-readable `message`. JSON and human
 output always render the identical underlying result; only the formatting
 differs.
 
+Lifecycle diagnostics additionally expose `next_action` (and the bounded
+`next_actions` list) as typed, non-mutating caller actions. The action schema
+is versioned independently and currently includes `retain-session`,
+`supply-exact-integrated-revision`,
+`retry-close-with-bounded-integration-fetch`, `discard-session`, and
+`reconcile-physical-state`. A discard action always carries explicit intent;
+ambiguous or terminal states never advertise destructive actions. These
+fields are additive to `session-diagnostic.v1`, so existing consumers may
+continue using `safe_actions`.
+
 - **`RESOURCE_CLAIM_CONFLICT`** (`session claim`/`session update`,
   `authorize`, `guard --operation`) reports the blocking claim
   (`ownerClaimId`, `ownerResource`, `ownerMode`) and the blocking session's

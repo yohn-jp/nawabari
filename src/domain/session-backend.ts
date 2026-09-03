@@ -6,6 +6,7 @@ import {
   type SessionRecord as RegistrySessionRecord,
   type SessionRegistryOptions,
 } from "../session-registry.js";
+import type { SessionLifecycleAction as RegistrySessionLifecycleAction } from "../session-lifecycle-actions.js";
 import { isSessionRegistryError, type RegistryErrorCode, type SessionRegistryError } from "../errors.js";
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import {
@@ -39,6 +40,7 @@ import {
   type SessionCreateOptions,
   type SessionDiagnostic,
   type SessionDiagnosticOptions,
+  type SessionLifecycleAction,
   type SessionListResult,
   type SessionListOptions,
   type SessionRecord,
@@ -764,6 +766,7 @@ function toDomainGarbageCollectCandidate(
 }
 
 function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").SessionDiagnostic): SessionDiagnostic {
+  const nextActions = diagnostic.nextActions.map(toDomainSessionLifecycleAction);
   return {
     schema_version: diagnostic.schemaVersion,
     session_id: diagnostic.session.sessionId,
@@ -784,6 +787,10 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
       safe_actions: [...blocker.safeActions],
     })),
     safe_actions: [...diagnostic.safeActions],
+    ...(diagnostic.nextAction === undefined
+      ? {}
+      : { next_action: toDomainSessionLifecycleAction(diagnostic.nextAction) }),
+    next_actions: nextActions,
     integration_evidence: {
       supplied: diagnostic.integrationEvidence.supplied,
       ...(diagnostic.integrationEvidence.integratedRevision === undefined
@@ -818,6 +825,55 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
         }),
     garbage_collection: toDomainGarbageCollectCandidate(diagnostic.garbageCollection),
   };
+}
+
+function toDomainSessionLifecycleAction(action: RegistrySessionLifecycleAction): SessionLifecycleAction {
+  switch (action.kind) {
+    case "retain":
+      return {
+        schema_version: action.schemaVersion,
+        action_id: action.actionId,
+        kind: action.kind,
+        command: action.command,
+        reason: action.reason,
+      };
+    case "integrated-revision":
+      return {
+        schema_version: action.schemaVersion,
+        action_id: action.actionId,
+        kind: action.kind,
+        command: action.command,
+        integrated_revision: action.integratedRevision,
+      };
+    case "bounded-integration-fetch":
+      return {
+        schema_version: action.schemaVersion,
+        action_id: action.actionId,
+        kind: action.kind,
+        command: action.command,
+        integrated_revision: action.integratedRevision,
+        fetch_remote: action.fetchRemote,
+        fetch_branch: action.fetchBranch,
+      };
+    case "explicit-discard":
+      return {
+        schema_version: action.schemaVersion,
+        action_id: action.actionId,
+        kind: action.kind,
+        command: action.command,
+        session_id: action.sessionId,
+        requires_explicit_intent: action.requiresExplicitIntent,
+      };
+    case "reconcile":
+      return {
+        schema_version: action.schemaVersion,
+        action_id: action.actionId,
+        kind: action.kind,
+        command: action.command,
+        session_id: action.sessionId,
+        mutates: action.mutates,
+      };
+  }
 }
 
 function toDomainSessionDiscardResult(

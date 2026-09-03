@@ -86,8 +86,26 @@ import {
   type SessionLifecycleClassification,
   type SessionLifecyclePhase,
 } from "./session-lifecycle-classification.js";
+import {
+  primarySessionLifecycleAction,
+  projectSessionLifecycleActions,
+  type SessionLifecycleAction,
+} from "./session-lifecycle-actions.js";
 
 export type { ResourceClaim, ResourceClaimRecoveryAction } from "./resource-claims.js";
+export {
+  primarySessionLifecycleAction,
+  primarySessionLifecycleNextAction,
+  projectSessionLifecycleActions,
+  projectSessionLifecycleNextActions,
+  SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION,
+} from "./session-lifecycle-actions.js";
+export type {
+  SessionLifecycleAction,
+  SessionLifecycleActionId,
+  SessionLifecycleNextAction,
+  SessionLifecycleNextActionId,
+} from "./session-lifecycle-actions.js";
 export {
   classifySessionLifecycle,
   lifecycleTransition,
@@ -439,6 +457,10 @@ export interface SessionDiagnostic {
   readonly idempotent: boolean;
   readonly blockers: readonly SessionDiagnosticBlocker[];
   readonly safeActions: readonly string[];
+  /** Typed, non-mutating caller action selected from canonical lifecycle evidence. */
+  readonly nextAction?: SessionLifecycleAction;
+  /** All bounded actions available for the observed state, in deterministic order. */
+  readonly nextActions: readonly SessionLifecycleAction[];
   readonly integrationEvidence: SessionDiagnosticIntegrationEvidence;
   readonly garbageCollection: GarbageCollectCandidate;
   /** Canonical termination/recovery projection; additive for old consumers. */
@@ -3525,6 +3547,7 @@ export class SessionRegistry {
         terminalOperation: record.terminalOperation,
         phase: "termination",
       });
+      const nextActions = projectSessionLifecycleActions({ classification: lifecycle, sessionId: record.sessionId });
       const garbageCollection = closedGarbageCollectionAssessment(record, now);
       return Object.freeze({
         schemaVersion: SESSION_DIAGNOSTIC_SCHEMA_VERSION,
@@ -3541,6 +3564,8 @@ export class SessionRegistry {
         idempotent: true,
         blockers: Object.freeze([]),
         safeActions: Object.freeze([]),
+        ...(nextActions.length === 0 ? {} : { nextAction: nextActions[0] }),
+        nextActions,
         integrationEvidence: Object.freeze(integrationEvidence),
         garbageCollection,
         lifecycle,
@@ -3584,6 +3609,11 @@ export class SessionRegistry {
             ? ["close-session", "run-garbage-collect"]
             : ["close-session"]
           : [];
+    const nextActions = projectSessionLifecycleActions({
+      classification: lifecycle,
+      sessionId: record.sessionId,
+      blockers: blockers.map((blocker) => ({ code: blocker.code, details: blocker.details })),
+    });
 
     return Object.freeze({
       schemaVersion: SESSION_DIAGNOSTIC_SCHEMA_VERSION,
@@ -3600,6 +3630,8 @@ export class SessionRegistry {
       idempotent: false,
       blockers: Object.freeze(blockers),
       safeActions: Object.freeze(safeActions),
+      ...(nextActions.length === 0 ? {} : { nextAction: nextActions[0] }),
+      nextActions,
       integrationEvidence: Object.freeze({
         ...integrationEvidence,
         ...(integrationProof === undefined ? {} : { proof: integrationProof }),
@@ -4841,6 +4873,19 @@ function enrichCloseBlockerError(error: unknown): SessionRegistryError {
   const blocker = toDiagnosticBlocker(error);
   const closeReadiness = closeReadinessForBlockers([blocker]);
   const resultState = resultStateForDiagnostic(closeReadiness, [blocker]);
+  const sessionId = typeof error.details.sessionId === "string" ? error.details.sessionId : "<unknown>";
+  const lifecycle = classifySessionLifecycle({
+    sessionState: "active",
+    physicalState: "healthy",
+    closeReadiness: closeReadiness === "not_due" ? "not-evaluated" : closeReadiness,
+    blockers: [{ code: blocker.code }],
+    phase: "termination",
+  });
+  const nextActions = projectSessionLifecycleActions({
+    classification: lifecycle,
+    sessionId,
+    blockers: [{ code: blocker.code, details: blocker.details }],
+  });
   return new SessionRegistryError(
     error.code,
     error.message,
@@ -4850,6 +4895,7 @@ function enrichCloseBlockerError(error: unknown): SessionRegistryError {
       recoveryHints: [...blocker.recoveryHints],
       closeReadiness,
       resultState,
+      ...(nextActions.length === 0 ? {} : { nextAction: nextActions[0] }),
     },
     error.cause,
   );
@@ -6138,7 +6184,22 @@ function withFetchedIntegrationRef<T>(
     throw cleanupFailure;
   }
 
-  if (operationError !== undefined) throw operationError;
+  if (operationError !== undefined) {
+    if (operationError instanceof SessionRegistryError && operationError.code === "INTEGRATION_FETCH_FAILED") {
+      throw new SessionRegistryError(
+        operationError.code,
+        operationError.message,
+        {
+          ...operationError.details,
+          integratedRevision: evidence.integratedRevision,
+          remote,
+          branch,
+        },
+        operationError.cause,
+      );
+    }
+    throw operationError;
+  }
   return result;
 }
 
