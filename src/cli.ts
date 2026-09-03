@@ -2305,14 +2305,16 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       const enriched = await enrichInvalidSessionIdError(result.error, backend, sessionContext(cwd));
       return emitFailure(mode, command, enriched, io);
     }
+    const childExitCode = result.value.exit_code;
+    const childSignal = result.value.signal;
     io.stdout(renderSuccess(mode, command, result.value));
     if (
       (command === "session run" || command === "session exec") &&
-      typeof result.value.exit_code === "number" &&
-      result.value.exit_code !== 0
+      (childSignal !== null || (typeof childExitCode === "number" && childExitCode !== 0))
     ) {
-      return result.value.exit_code >= 1 && result.value.exit_code <= 255
-        ? result.value.exit_code
+      if (childSignal !== null) return EXIT_CODES.rejected;
+      return typeof childExitCode === "number" && childExitCode >= 1 && childExitCode <= 255
+        ? childExitCode
         : EXIT_CODES.rejected;
     }
     return EXIT_CODES.success;

@@ -248,6 +248,42 @@ test("sandboxed child limits are bounded and fail with stable errors", async () 
     const timeout = await runSandboxedCommand(request, { command: "sh", args: ["-c", "sleep 1"] }, { timeout_ms: 20 });
     assert.equal(timeout.ok, false);
     if (!timeout.ok) assert.equal(timeout.error.code, "SANDBOX_EXECUTION_TIMEOUT");
+
+    const nonzero = await runSandboxedCommand(request, { command: "node", args: ["-e", "process.exit(7)"] });
+    assert.equal(nonzero.ok, true, nonzero.ok ? "" : JSON.stringify(nonzero.error));
+    if (nonzero.ok) {
+      assert.equal(nonzero.value.exit_code, 7);
+      assert.equal(nonzero.value.signal, null);
+    }
+
+    const signal = await runSandboxedCommand(request, {
+      command: "node",
+      args: ["-e", "process.kill(process.pid, 'SIGTERM')"],
+    });
+    assert.equal(signal.ok, true, signal.ok ? "" : JSON.stringify(signal.error));
+    if (signal.ok) {
+      assert.equal(signal.value.exit_code, null);
+      assert.equal(signal.value.signal, "SIGTERM");
+    }
+
+    const combinedOutput = await runSandboxedCommand(
+      request,
+      {
+        command: "node",
+        args: ["-e", "process.stdout.write('123'); process.stderr.write('456')"],
+      },
+      { max_output_bytes: 5 },
+    );
+    assert.equal(combinedOutput.ok, false);
+    if (!combinedOutput.ok) assert.equal(combinedOutput.error.code, "SANDBOX_OUTPUT_LIMIT");
+
+    const unicodeOutput = await runSandboxedCommand(
+      request,
+      { command: "node", args: ["-e", "process.stdout.write('あ')"] },
+      { max_output_bytes: 2 },
+    );
+    assert.equal(unicodeOutput.ok, false);
+    if (!unicodeOutput.ok) assert.equal(unicodeOutput.error.code, "SANDBOX_OUTPUT_LIMIT");
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);

@@ -500,6 +500,53 @@ async function main() {
       fail("status did not expose the resolved managed worktree root");
     }
 
+    if (protectedExecutionDoctor.sandbox?.ready !== true) {
+      fail("installed Linux package is not ready for the required protected-execution smoke");
+    }
+    const protectedArgument = "literal;$(touch packed-ambient-marker)";
+    const protectedRun = invokeInstalled(
+      [
+        "session",
+        "run",
+        "--session",
+        created.session_id,
+        "--json",
+        "--",
+        "node",
+        "-e",
+        "process.stdout.write(JSON.stringify({cwd: process.cwd(), session_id: process.env.NAWABARI_SESSION_ID, argv: process.argv.slice(1)}))",
+        protectedArgument,
+      ],
+      lifecycleWorktree,
+    );
+    const protectedRunJson = parseInstalledJson(protectedRun, "packed protected session run");
+    if (
+      protectedRun.status !== 0 ||
+      protectedRunJson.ok !== true ||
+      protectedRunJson.exit_code !== 0 ||
+      protectedRunJson.signal !== null ||
+      protectedRunJson.stderr !== ""
+    ) {
+      fail("packed protected session run did not return a successful bounded result");
+    }
+    let protectedEvidence;
+    try {
+      protectedEvidence = JSON.parse(protectedRunJson.stdout);
+    } catch {
+      fail("packed protected session run did not return JSON execution evidence");
+    }
+    if (
+      protectedEvidence.cwd !== fs.realpathSync.native(lifecycleWorktree) ||
+      protectedEvidence.session_id !== created.session_id ||
+      protectedEvidence.argv?.length !== 1 ||
+      protectedEvidence.argv[0] !== protectedArgument
+    ) {
+      fail("packed protected session run did not preserve authoritative cwd, session identity, and argv");
+    }
+    if (fs.existsSync(path.join(lifecycleWorktree, "packed-ambient-marker"))) {
+      fail("packed protected session run interpolated command argv through a shell");
+    }
+
     const initialEvidence = parseInstalledJson(
       invokeInstalled(["evidence", "snapshot", "--session", created.session_id, "--json"], lifecycleRepository),
       "repository evidence snapshot",

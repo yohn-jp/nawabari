@@ -136,7 +136,8 @@ test("session run resolves the existing session authority and preserves command 
         hasCapabilities: () => true,
       },
       sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
-      sandboxRunner: async (_request, command) => {
+      sandboxRunner: async (request, command) => {
+        assert.equal(request.worktree, sampleSession.worktree);
         observedCommand = [command.command, ...(command.args ?? [])];
         return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
       },
@@ -182,6 +183,64 @@ test("session run does not interpret a child --json argument as a Nawabari globa
 
   assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
   assert.match(output.stdout[0] ?? "", /^session run: ok/);
+});
+
+test("session run returns a rejected exit status for a signaled child and never falls back when protection is unavailable", async () => {
+  const signalOutput = capture();
+  const signalExitCode = await runCli(
+    ["--json", "session", "run", "--session", sampleSession.session_id, "--", "worker"],
+    {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: signalOutput.io,
+      sandboxProbe: readySandboxProbe(),
+      sandboxRunner: async () =>
+        success({ exit_code: null, signal: "SIGTERM", stdout: "", stderr: "", duration_ms: 1 }),
+    },
+  );
+
+  assert.equal(signalExitCode, 3);
+  assert.deepEqual(JSON.parse(signalOutput.stdout[0] ?? ""), {
+    ok: true,
+    command: "session run",
+    exit_code: null,
+    signal: "SIGTERM",
+    stdout: "",
+    stderr: "",
+    duration_ms: 1,
+  });
+
+  const unavailableOutput = capture();
+  let runnerInvocations = 0;
+  const unavailableExitCode = await runCli(
+    ["--json", "session", "run", "--session", sampleSession.session_id, "--", "worker"],
+    {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: unavailableOutput.io,
+      sandboxProbe: readySandboxProbe({ hasBubblewrap: () => false }),
+      sandboxRunner: async () => {
+        runnerInvocations += 1;
+        return success({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
+      },
+    },
+  );
+
+  assert.equal(unavailableExitCode, 4);
+  assert.equal(runnerInvocations, 0);
+  assert.deepEqual(JSON.parse(unavailableOutput.stdout[0] ?? ""), {
+    ok: false,
+    command: "session run",
+    code: "SANDBOX_CAPABILITY_UNAVAILABLE",
+    message:
+      "Sandbox execution was required but could not be established; the legacy unsandboxed path was not selected.",
+    details: {
+      session_id: sampleSession.session_id,
+      platform: "linux",
+      platform_supported: true,
+      missing_required: ["bubblewrap"],
+    },
+  });
 });
 
 test("command-specific help is projected from one spec and marks session create options accurately", async () => {
