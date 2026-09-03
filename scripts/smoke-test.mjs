@@ -208,6 +208,31 @@ async function main() {
     ) {
       fail("installed capabilities did not enumerate the governed lifecycle");
     }
+    if (!Array.isArray(capabilities.capabilities) || capabilities.capabilities.length === 0) {
+      fail("installed capabilities did not expose a capability inventory");
+    }
+    for (const capability of capabilities.capabilities) {
+      if (typeof capability.id !== "string") fail("installed capability has no stable id");
+      if (capability.no_failure_codes === true) {
+        if (capability.failure_codes !== undefined) {
+          fail(`installed capability ${capability.id} declares both failures and no-failure status`);
+        }
+        continue;
+      }
+      if (!Array.isArray(capability.failure_codes) || capability.failure_codes.length === 0) {
+        fail(`installed capability ${capability.id} has no advertised failure vocabulary`);
+      }
+      if (new Set(capability.failure_codes).size !== capability.failure_codes.length) {
+        fail(`installed capability ${capability.id} has duplicate advertised failure codes`);
+      }
+      if (
+        typeof capability.failure_code_policy?.source !== "string" ||
+        capability.failure_code_policy?.missing_or_extra !== "deterministic conformance failure" ||
+        !Array.isArray(capability.failure_code_policy?.internal_exceptions)
+      ) {
+        fail(`installed capability ${capability.id} has no documented failure-code policy`);
+      }
+    }
     const protectedExecution = capabilities.capabilities?.find((capability) => capability.id === "protected-execution");
     if (
       protectedExecution?.contract_id !== "nawabari.sandbox-execution.v1" ||

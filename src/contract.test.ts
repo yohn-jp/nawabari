@@ -9,6 +9,7 @@ import {
   machineContract,
 } from "./contract.js";
 import { RESOURCE_CLAIM_FAILURE_CODES } from "./domain/errors.js";
+import { IMPLEMENTATION_FAILURE_CODE_VOCABULARY } from "./failure-code-vocabulary.js";
 import {
   SANDBOX_CONTRACT_ID,
   SANDBOX_CONTRACT_SCHEMA_VERSION,
@@ -56,12 +57,21 @@ function assertFailureVocabulary(
   advertised: readonly string[],
   implementation: readonly string[],
   fixtureLabel = "resource lifecycle",
+  internalExceptions: readonly string[] = [],
 ): void {
-  const expected = new Set(implementation);
+  const implementationSet = new Set(implementation);
+  const invalidExceptions = internalExceptions.filter((code) => !implementationSet.has(code));
+  assert.deepEqual(invalidExceptions, [], `${fixtureLabel} has undocumented non-public failure exceptions`);
+  const expected = new Set(implementation.filter((code) => !internalExceptions.includes(code)));
   const actual = new Set(advertised);
-  const missing = implementation.filter((code) => !actual.has(code));
+  const missing = implementation.filter((code) => !internalExceptions.includes(code) && !actual.has(code));
   const extra = advertised.filter((code) => !expected.has(code));
-  assert.deepEqual({ missing, extra }, { missing: [], extra: [] }, `${fixtureLabel} failure vocabulary drifted`);
+  const duplicates = advertised.filter((code, index) => advertised.indexOf(code) !== index);
+  assert.deepEqual(
+    { missing, extra, duplicates },
+    { missing: [], extra: [], duplicates: [] },
+    `${fixtureLabel} failure vocabulary drifted`,
+  );
 }
 
 function assertResultSchema(
@@ -87,6 +97,68 @@ function assertResultSchema(
   assert.equal((mapping as JsonRecord).nested_claim_schema_version, nestedClaimSchemaVersion);
   assert.equal((mapping as JsonRecord).version, RESOURCE_CLAIM_MACHINE_CONTRACT_VERSION);
 }
+
+test("every advertised capability has parity with its implementation-owned failure vocabulary", () => {
+  const contract = machineContract("test-version");
+  assert.ok(Array.isArray(contract.capabilities));
+
+  const advertisedIds = new Set<string>();
+  for (const candidate of contract.capabilities) {
+    assert.ok(typeof candidate === "object" && candidate !== null && !Array.isArray(candidate));
+    const capability = candidate as JsonRecord;
+    assert.ok(typeof capability.id === "string");
+    const id = capability.id;
+    advertisedIds.add(id);
+
+    const implementation = (IMPLEMENTATION_FAILURE_CODE_VOCABULARY as Record<string, readonly string[]>)[id];
+    const advertised = capability.failure_codes;
+    const policy = capability.failure_code_policy;
+    if (implementation === undefined) {
+      assert.equal(capability.no_failure_codes, true, `${id} must explicitly declare no public failures`);
+      continue;
+    }
+
+    assert.ok(Array.isArray(advertised), `${id} must advertise failure_codes`);
+    assert.ok(typeof policy === "object" && policy !== null && !Array.isArray(policy));
+    const policyRecord = policy as JsonRecord;
+    assert.equal(typeof policyRecord.source, "string");
+    assert.equal(policyRecord.missing_or_extra, "deterministic conformance failure");
+    const exceptions = policyRecord.internal_exceptions;
+    assert.ok(Array.isArray(exceptions));
+    assertFailureVocabulary(advertised as string[], implementation, id, exceptions as string[]);
+  }
+
+  assert.deepEqual(
+    [...advertisedIds].sort(),
+    Object.keys(IMPLEMENTATION_FAILURE_CODE_VOCABULARY).sort(),
+    "every implementation capability vocabulary must be advertised",
+  );
+});
+
+test("capabilities JSON is the public failure-vocabulary authority", async () => {
+  const output: string[] = [];
+  const exitCode = await runCli(["capabilities", "--json"], {
+    version: "test-version",
+    io: { stdout: (line) => output.push(line), stderr: () => undefined },
+  });
+  assert.equal(exitCode, 0);
+  const response = JSON.parse(output[0] ?? "") as JsonRecord;
+  assert.ok(Array.isArray(response.capabilities));
+  for (const candidate of response.capabilities) {
+    assert.ok(typeof candidate === "object" && candidate !== null && !Array.isArray(candidate));
+    const capability = candidate as JsonRecord;
+    const id = capability.id;
+    assert.ok(typeof id === "string");
+    const implementation = (IMPLEMENTATION_FAILURE_CODE_VOCABULARY as Record<string, readonly string[]>)[id];
+    if (implementation === undefined) {
+      assert.equal(capability.no_failure_codes, true);
+      continue;
+    }
+    assertFailureVocabulary(capability.failure_codes as string[], implementation, `public ${id}`);
+    const policy = capability.failure_code_policy as JsonRecord;
+    assert.equal(policy.missing_or_extra, "deterministic conformance failure");
+  }
+});
 
 test("resource-claim capability publishes the current semantic generation without changing the envelope identity", () => {
   const contract = machineContract("test-version");
