@@ -106,6 +106,10 @@ const RECOVERABLE_CODES = new Set([
   "NESTED_REPOSITORY",
   "RECOVERABLE_COMMITS",
   "RECOVERABLE_STASHES",
+  // An explicit bounded integration fetch failed before mutation. The
+  // caller may retry the same bounded proof operation; this is not a
+  // destructive or ambient fallback.
+  "INTEGRATION_FETCH_FAILED",
 ]);
 
 const STALE_PHYSICAL_STATES = new Set([

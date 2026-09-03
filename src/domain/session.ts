@@ -182,6 +182,47 @@ export type SessionDiagnosticIntegrationEvidence = {
   proof?: IntegrationProof;
 };
 
+export type SessionLifecycleAction =
+  | {
+      schema_version: 1;
+      action_id: "retain-session";
+      kind: "retain";
+      command: "session inspect";
+      reason: "no-safe-transition-proven";
+    }
+  | {
+      schema_version: 1;
+      action_id: "supply-exact-integrated-revision";
+      kind: "integrated-revision";
+      command: "session close";
+      integrated_revision: string;
+    }
+  | {
+      schema_version: 1;
+      action_id: "retry-close-with-bounded-integration-fetch";
+      kind: "bounded-integration-fetch";
+      command: "session close";
+      integrated_revision: string;
+      fetch_remote: string;
+      fetch_branch: string;
+    }
+  | {
+      schema_version: 1;
+      action_id: "discard-session";
+      kind: "explicit-discard";
+      command: "session discard";
+      session_id: string;
+      requires_explicit_intent: true;
+    }
+  | {
+      schema_version: 1;
+      action_id: "reconcile-physical-state";
+      kind: "reconcile";
+      command: "doctor";
+      session_id: string;
+      mutates: false;
+    };
+
 export type SessionDiagnostic = {
   schema_version: number;
   session_id: string;
@@ -197,6 +238,10 @@ export type SessionDiagnostic = {
   idempotent: boolean;
   blockers: SessionDiagnosticBlocker[];
   safe_actions: string[];
+  /** Typed, non-mutating caller action selected from canonical lifecycle evidence. */
+  next_action?: SessionLifecycleAction;
+  /** All bounded actions available for the observed lifecycle state. */
+  next_actions?: SessionLifecycleAction[];
   integration_evidence: SessionDiagnosticIntegrationEvidence;
   garbage_collection?: GarbageCollectCandidate;
   /** Canonical read-only termination/recovery classification. */
