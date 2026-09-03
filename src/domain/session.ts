@@ -541,6 +541,24 @@ export type SessionCloseResult = {
   idempotent?: boolean;
   integration_proof?: IntegrationProof;
   claim_set_generation: number;
+  reconciliation?: CleanupReconciliation;
+};
+
+export type CleanupReconciliation = {
+  operation: "close" | "discard" | "gc";
+  outcome: "completed" | "retryable" | "unresolved";
+  retry_safe: boolean;
+  repository: string;
+  session_id: string;
+  worktree: string;
+  branch: string;
+  expected_head: string | null;
+  observed_worktree_head: string | null;
+  observed_branch_head: string | null;
+  worktree_present: boolean;
+  branch_present: boolean;
+  remaining: Array<"worktree" | "branch" | "registry">;
+  reason?: "cleanup-complete" | "owned-cleanup-remains" | "identity-mismatch" | "observation-unavailable";
 };
 
 export type SessionDiscardResult = {
@@ -558,6 +576,7 @@ export type SessionDiscardResult = {
   released_claims_truncated: boolean;
   idempotent: boolean;
   claim_set_generation: number;
+  reconciliation?: CleanupReconciliation;
 };
 
 export type GarbageCollectBlocked = {

@@ -472,6 +472,153 @@ test("an interrupted close remains retryable from the explicit closing state", (
   }
 });
 
+test("close reconciliation classifies post-effect registry failure and converges", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-close-final-write`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/close-final-write" });
+    let failBranchRemoval = true;
+    const interruptedGit = {
+      run(args: readonly string[], cwd: string): string {
+        if (failBranchRemoval && args[0] === "branch") {
+          failBranchRemoval = false;
+          throw new Error("simulated close branch deletion failure");
+        }
+        return defaultGit.run(args, cwd);
+      },
+    };
+    assert.throws(
+      () => new SessionRegistry({ repository: registry.repository, git: interruptedGit }).close(session.sessionId),
+      /simulated close branch deletion failure/u,
+    );
+
+    assert.throws(
+      () =>
+        withRegistryTempFileFsyncFailure(registry.paths.directory, "EIO", () =>
+          new SessionRegistry({ repository: registry.repository }).close(session.sessionId),
+        ),
+      (error: unknown) => {
+        if (!(error instanceof SessionRegistryError)) return false;
+        assert.equal(error.code, "REGISTRY_IO_FAILURE");
+        const reconciliation = error.details.reconciliation as {
+          outcome?: string;
+          retrySafe?: boolean;
+          remaining?: string[];
+        };
+        assert.equal(reconciliation.outcome, "completed");
+        assert.equal(reconciliation.retrySafe, true);
+        assert.deepEqual(reconciliation.remaining, ["registry"]);
+        return true;
+      },
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "closing");
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+
+    const observed = registry.reconcileCleanup(session.sessionId);
+    assert.equal(observed.outcome, "completed");
+    assert.equal(observed.retrySafe, true);
+    assert.deepEqual(observed.remaining, ["registry"]);
+
+    const retried = registry.close(session.sessionId);
+    assert.equal(retried.session.state, "closed");
+    assert.equal(retried.reconciliation?.outcome, "completed");
+    assert.equal(retried.reconciliation?.retrySafe, false);
+    assert.equal(registry.close(session.sessionId).idempotent, true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("close retry fails closed when a remaining branch no longer has its captured identity", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-close-identity`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/close-identity" });
+    let failBranchRemoval = true;
+    const interruptedGit = {
+      run(args: readonly string[], cwd: string): string {
+        if (failBranchRemoval && args[0] === "branch") {
+          failBranchRemoval = false;
+          throw new Error("simulated branch deletion failure");
+        }
+        return defaultGit.run(args, cwd);
+      },
+    };
+    assert.throws(
+      () => new SessionRegistry({ repository: registry.repository, git: interruptedGit }).close(session.sessionId),
+      /simulated branch deletion failure/u,
+    );
+    const closing = registry.get(session.sessionId);
+    assert.equal(closing?.state, "closing");
+    assert.equal(typeof closing?.cleanupHead, "string");
+    const replacement = runGit(
+      ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "replacement"],
+      fixture.repositoryPath,
+    );
+    runGit(["update-ref", session.branchId, replacement], fixture.repositoryPath);
+
+    assert.throws(
+      () => registry.close(session.sessionId),
+      (error: unknown) => {
+        if (!(error instanceof SessionRegistryError)) return false;
+        assert.equal(error.code, "GIT_STATE_AMBIGUOUS");
+        const reconciliation = error.details.reconciliation as { outcome?: string; retrySafe?: boolean };
+        assert.equal(reconciliation.outcome, "unresolved");
+        assert.equal(reconciliation.retrySafe, false);
+        return true;
+      },
+    );
+    assert.equal(registry.get(session.sessionId)?.state, "closing");
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("gc retries an identity-proven partial close without adopting another branch", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-gc-partial-close`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/gc-partial-close" });
+    setPersistedSessionState(registry, session.sessionId, "stale");
+    let failBranchRemoval = true;
+    const interruptedGit = {
+      run(args: readonly string[], cwd: string): string {
+        if (failBranchRemoval && args[0] === "branch") {
+          failBranchRemoval = false;
+          throw new Error("simulated gc branch deletion failure");
+        }
+        return defaultGit.run(args, cwd);
+      },
+    };
+    const interrupted = new SessionRegistry({ repository: registry.repository, git: interruptedGit });
+    const first = interrupted.garbageCollect({ apply: true });
+    assert.equal(first.cleaned.length, 0);
+    assert.equal(first.blocked[0]?.sessionId, session.sessionId);
+    const firstReconciliation = first.blocked[0]?.details.reconciliation as { outcome?: string; retrySafe?: boolean };
+    assert.equal(firstReconciliation.outcome, "retryable");
+    assert.equal(firstReconciliation.retrySafe, true);
+    assert.equal(registry.get(session.sessionId)?.state, "closing");
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), true);
+
+    const second = registry.garbageCollect({ apply: true });
+    assert.equal(second.cleaned.length, 1);
+    assert.equal(second.cleaned[0]?.state, "closed");
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+    assert.equal(registry.garbageCollect({ apply: true }).cleaned.length, 0);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 test("gc reports age suspicion without granting destructive authority to a healthy active session", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = `${fixture.repositoryPath}-stale-cleanup`;
