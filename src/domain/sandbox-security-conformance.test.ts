@@ -110,7 +110,8 @@ test("canonical protected execution rejects the Issue #93 security-negative matr
   }
 
   const fixture = await createSecurityFixture();
-  const hostTmpMarker = path.join(os.tmpdir(), `nawabari-host-tmp-${process.pid}-${Date.now()}`);
+  const hostTmpDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-host-tmp-"));
+  const hostTmpMarker = path.join(hostTmpDirectory, "marker");
   const privateTmpMarker = `nawabari-private-tmp-${process.pid}-${Date.now()}`;
   const controlMarker = path.join(fixture.repository, "nawabari", "control-plane-secret");
   const symlinkEscape = path.join(fixture.worktree, "sibling-escape");
@@ -271,7 +272,7 @@ test("canonical protected execution rejects the Issue #93 security-negative matr
       assert.equal(fs.existsSync(marker), false);
     });
   } finally {
-    fs.rmSync(hostTmpMarker, { force: true });
+    fs.rmSync(hostTmpDirectory, { recursive: true, force: true });
     fs.rmSync(controlMarker, { force: true });
     cleanupSecurityFixture(fixture);
   }
