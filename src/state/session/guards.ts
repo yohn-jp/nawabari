@@ -120,14 +120,9 @@ export function isObservationCloseReady(context: SessionMachineContext): boolean
   return current.phase === "termination" && current.closeReadiness === "ready";
 }
 
-/**
- * GC authority is independent evidence. An observation-level value wins over
- * the optional evidence envelope when both are present.
- */
+/** GC authority matches the classifier: strictly observation.gcAuthorized === true. */
 export function hasGcAuthorization(context: SessionMachineContext): boolean {
-  const observed = context.observation.gcAuthorized;
-  if (observed !== undefined) return observed === true;
-  return context.evidence.garbageCollection?.authorized === true;
+  return context.observation.gcAuthorized === true;
 }
 
 /**

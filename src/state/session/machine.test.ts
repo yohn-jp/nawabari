@@ -133,6 +133,18 @@ test("requires independent GC authorization", () => {
   ready.stop();
 });
 
+test("evidence.garbageCollection.authorized alone cannot substitute for observation.gcAuthorized", () => {
+  const readyWithEvidenceOnly = actorFor(
+    input({
+      closeReadiness: "ready",
+      phase: "termination",
+      evidence: { garbageCollection: { authorized: true } },
+    }),
+  );
+  assert.equal(send(readyWithEvidenceOnly, { type: "SESSION.GC.REQUESTED" }), "close-ready");
+  readyWithEvidenceOnly.stop();
+});
+
 test("explicit discard intent never enters the normal close path", () => {
   const discarded = actorFor(input({ terminalOperation: "discard" }));
   assert.equal(send(discarded, { type: "SESSION.CLOSE.REQUESTED" }), "discarded");
