@@ -199,5 +199,11 @@ jobs:
       - name: Install bubblewrap
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
+      - name: Enable unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Packed Mottainai UID handoff evidence
         run: pnpm run test:package:mottainai
