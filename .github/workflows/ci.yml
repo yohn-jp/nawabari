@@ -61,7 +61,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
@@ -76,7 +76,7 @@ jobs:
   typecheck:
     needs: changes
     if: needs.changes.outputs.release_docs_only != 'true'
-    name: typecheck (Node 22)
+    name: typecheck (Node 24)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -92,7 +92,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
@@ -104,7 +104,7 @@ jobs:
   test:
     needs: changes
     if: needs.changes.outputs.release_docs_only != 'true'
-    name: format / lint / test (Node 22)
+    name: format / lint / test (Node 24)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -120,7 +120,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
@@ -141,7 +141,7 @@ jobs:
   package:
     needs: changes
     if: needs.changes.outputs.release_docs_only != 'true'
-    name: build / package contents / smoke test (Node 22)
+    name: build / package contents / smoke test (Node 24)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -158,7 +158,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
@@ -173,7 +173,7 @@ jobs:
   mottainai-uid-handoff:
     needs: changes
     if: needs.changes.outputs.release_docs_only != 'true'
-    name: packed Mottainai UID handoff evidence (Node 22)
+    name: packed Mottainai UID handoff evidence (Node 24)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -190,7 +190,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: "24"
           cache: pnpm
 
       - name: Install dependencies

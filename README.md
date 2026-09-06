@@ -81,6 +81,8 @@ sandbox or treat Mottainai state as Nawabari authority.
 
 ## Install
 
+Nawabari requires Node.js >=24.
+
 ```bash
 npm install -g nawabari
 ```
