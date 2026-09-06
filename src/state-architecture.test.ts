@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { SESSION_MACHINE_EVENT_TYPES } from "./state/session/index.js";
+import { SESSION_MACHINE_EVENT_TYPES, SESSION_OPERATION_EVENT_TYPES } from "./state/session/index.js";
 
 const sessionStateDirectory = path.dirname(fileURLToPath(new URL("./state/session/types.ts", import.meta.url)));
 
@@ -33,6 +33,17 @@ test("session state module exposes capability-oriented internal events", () => {
     SESSION_MACHINE_EVENT_TYPES.some((event) => event.includes("session discard")),
     false,
   );
+});
+
+test("session lifecycle operations map to capability events without CLI-shaped names", () => {
+  assert.deepEqual(SESSION_OPERATION_EVENT_TYPES, {
+    close: "SESSION.CLOSE.REQUESTED",
+    discard: "SESSION.DISCARD.REQUESTED",
+    inspect: "SESSION.OBSERVE",
+    doctor: "SESSION.RECONCILE.REQUESTED",
+    reconcile: "SESSION.RECONCILE.REQUESTED",
+    gc: "SESSION.GC.REQUESTED",
+  });
 });
 
 test("session state production modules do not import mutation or observation authorities", () => {
