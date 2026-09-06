@@ -42,6 +42,19 @@ const GRAPH_OBSERVATIONS: readonly SessionLifecycleObservation[] = Object.freeze
     ageSuspicious: false,
     gcAuthorized: true,
   },
+  // Same lifecycle state (close-ready) as the fixture above, differing only
+  // in the GC authority guard's outcome. Both variants must be observed by
+  // the graph traversal so the guarded static projection's two branches are
+  // conformance-checked, not inferred from state identity alone (#266).
+  {
+    sessionState: "active",
+    physicalState: "healthy",
+    closeReadiness: "ready",
+    blockers: [],
+    phase: "termination",
+    ageSuspicious: false,
+    gcAuthorized: false,
+  },
   {
     sessionState: "active",
     physicalState: "healthy",
@@ -191,6 +204,21 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
       const expected = SESSION_LIFECYCLE_TRANSITION_TABLE[state].find(
         (transition) => transition.operation === operation,
       )!;
+      if (expected.guarded) {
+        // A guard-dependent edge has no single admissibility verdict from
+        // state identity alone: the graph traversal must observe both the
+        // guard-accepts and guard-rejects branches from distinct
+        // observations in the same lifecycle state (#266).
+        const acceptedKey = `${state}.${operation}.accepted`;
+        const forbiddenKey = `${state}.${operation}.forbidden`;
+        assert.equal(observed.has(acceptedKey), true, `graph did not cover ${acceptedKey}`);
+        assert.equal(observed.has(forbiddenKey), true, `graph did not cover ${forbiddenKey}`);
+        const acceptedCoverage = observed.get(acceptedKey)!;
+        assert.equal(acceptedCoverage.target, expected.whenGuardAccepts.target, `${acceptedKey} target drift`);
+        const forbiddenCoverage = observed.get(forbiddenKey)!;
+        assert.equal(forbiddenCoverage.accepted, false, `${forbiddenKey} availability drift`);
+        continue;
+      }
       const expectedKind = expected.allowed ? "accepted" : "forbidden";
       const key = `${state}.${operation}.${expectedKind}`;
       assert.equal(observed.has(key), true, `graph did not cover ${key}`);

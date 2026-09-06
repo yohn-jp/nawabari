@@ -74,6 +74,47 @@ export interface SessionLifecycleTransition {
     | "closed-terminal";
 }
 
+/**
+ * Static machine-contract projection entry whose runtime admissibility does
+ * not depend on the supplied observation beyond state identity. `allowed`,
+ * `target`, and `reason` are therefore truthful for every observation that
+ * classifies into this lifecycle state.
+ */
+export interface SessionLifecycleUnconditionalTransition extends SessionLifecycleTransition {
+  readonly guarded: false;
+}
+
+/**
+ * Static machine-contract projection entry for a transition whose
+ * admissibility depends on a context/observation-derived guard, not on state
+ * identity alone (for example `close-ready` GC, gated on independent GC
+ * authorization). Both outcomes are represented explicitly so a static
+ * consumer never infers a single flattened verdict for a guard-dependent
+ * edge; the caller must know or supply the guard's outcome to pick a branch.
+ */
+export interface SessionLifecycleGuardedTransition {
+  readonly operation: SessionLifecycleOperation;
+  readonly guarded: true;
+  readonly requiresExplicitIntent: boolean;
+  readonly authority: SessionLifecycleTransition["authority"];
+  /** Metadata when the machine's guard accepts the event for this state. */
+  readonly whenGuardAccepts: {
+    readonly allowed: true;
+    readonly target: SessionLifecycleState;
+    readonly reason: SessionLifecycleTransition["reason"];
+  };
+  /** Metadata when the machine's guard rejects the event for this state. */
+  readonly whenGuardRejects: {
+    readonly allowed: false;
+    readonly target: null;
+    readonly reason: SessionLifecycleTransition["reason"];
+  };
+}
+
+/** One entry of the static machine-contract projection table. */
+export type SessionLifecycleTransitionProjection =
+  SessionLifecycleUnconditionalTransition | SessionLifecycleGuardedTransition;
+
 export interface SessionLifecycleClassification {
   readonly schemaVersion: typeof SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION;
   readonly state: SessionLifecycleState;
@@ -173,7 +214,11 @@ export function availableLifecycleOperations(
   );
 }
 
-/** The complete state/operation table, useful to help/discovery consumers. */
+/**
+ * The complete state/operation table, useful to help/discovery consumers.
+ * A guard-dependent edge (see `SessionLifecycleGuardedTransition`) is never
+ * flattened into a single unconditional verdict here.
+ */
 export const SESSION_LIFECYCLE_TRANSITION_TABLE: Readonly<
-  Record<SessionLifecycleState, readonly SessionLifecycleTransition[]>
+  Record<SessionLifecycleState, readonly SessionLifecycleTransitionProjection[]>
 > = projectSessionLifecycleTransitionTable();
