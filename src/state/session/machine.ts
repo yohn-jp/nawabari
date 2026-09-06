@@ -120,8 +120,11 @@ function forbiddenTransition(meta: SessionMachineTransitionMetadata) {
   return { target: ".", guard: "operationIsForbidden", meta } as const;
 }
 
-const cleanupRetryTransition = {} as const;
-const cleanupFinalizeTransition = {} as const;
+// Explicit self targets make the protocol events observable to XState's
+// `can()` API.  They remain internal coordination events and do not add a
+// public lifecycle state or operation vocabulary.
+const cleanupRetryTransition = { target: "." } as const;
+const cleanupFinalizeTransition = { target: "." } as const;
 
 function observationTransitions(state: SessionLifecycleState) {
   return {

@@ -89,6 +89,12 @@ import {
   type SessionLifecyclePhase,
 } from "./session-lifecycle-classification.js";
 import {
+  coordinateSessionLifecycle,
+  type SessionActorDecision,
+  type SessionActorReconciliation,
+} from "./state/session/actors.js";
+import type { SessionMachineInput } from "./state/session/types.js";
+import {
   primarySessionLifecycleAction,
   projectSessionLifecycleActions,
   type SessionLifecycleAction,
@@ -2563,10 +2569,29 @@ export class SessionRegistry {
       if (record === undefined) {
         throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
       }
-      return this.observeCleanupReconciliation(
-        record,
-        operation ?? (record.terminalOperation === "discard" ? "discard" : "close"),
-      );
+      const cleanupOperation = operation ?? (record.terminalOperation === "discard" ? "discard" : "close");
+      let observed: CleanupReconciliation | undefined;
+      const result = coordinateSessionLifecycle<CleanupReconciliation>({
+        operation: "reconcile",
+        adapter: {
+          observe: (stage) =>
+            this.lifecycleActorInputUnsafe(
+              record,
+              this.readStateUnsafe(),
+              undefined,
+              false,
+              stage === "after" ? "current" : "termination",
+            ),
+          effect: () => {
+            observed = this.observeCleanupReconciliation(record, cleanupOperation);
+            return observed;
+          },
+        },
+      });
+      if (result.phase !== "completed" || observed === undefined) {
+        throw this.lifecycleActorRejection(record, result.decision);
+      }
+      return observed;
     });
   }
 
@@ -2586,7 +2611,7 @@ export class SessionRegistry {
       const selectedSessionId = sessionId ?? this.resolveCurrentSession().sessionId;
       assertSessionId(selectedSessionId);
       const evidence = closeIntegrationEvidence(sessionIdOrOptions ?? null);
-      return this.closeUnsafe(selectedSessionId, evidence);
+      return this.coordinateCleanupUnsafe("close", selectedSessionId, evidence);
     });
   }
 
@@ -2608,7 +2633,7 @@ export class SessionRegistry {
         );
       }
       assertSessionId(requestedSessionId);
-      return this.discardUnsafe(requestedSessionId);
+      return this.coordinateCleanupUnsafe("discard", requestedSessionId);
     });
   }
 
@@ -2691,7 +2716,7 @@ export class SessionRegistry {
         }
 
         try {
-          const result = this.closeUnsafe(candidate.sessionId, undefined, "gc");
+          const result = this.coordinateCleanupUnsafe("gc", candidate.sessionId);
           cleaned.push(result.session);
         } catch (error: unknown) {
           blocked.push(toGarbageCollectBlocked(candidate.sessionId, error));
@@ -2714,6 +2739,255 @@ export class SessionRegistry {
 
   gc(options: GarbageCollectOptions = {}): GarbageCollectResult {
     return this.garbageCollect(options);
+  }
+
+  /**
+   * Run one destructive lifecycle request through the Session actor.  The
+   * actor owns sequencing and admissibility; this class remains the adapter
+   * for authoritative Git/filesystem/registry observations and effects.
+   */
+  private coordinateCleanupUnsafe(
+    operation: "close",
+    sessionId: string,
+    evidence?: IntegrationEvidenceInput,
+    retryOverride?: boolean,
+  ): CloseSessionResult;
+  private coordinateCleanupUnsafe(
+    operation: "discard",
+    sessionId: string,
+    evidence?: undefined,
+    retryOverride?: boolean,
+  ): DiscardSessionResult;
+  private coordinateCleanupUnsafe(
+    operation: "gc",
+    sessionId: string,
+    evidence?: undefined,
+    retryOverride?: boolean,
+  ): CloseSessionResult;
+  private coordinateCleanupUnsafe(
+    operation: "close" | "discard" | "gc",
+    sessionId: string,
+    evidence?: IntegrationEvidenceInput,
+    retryOverride?: boolean,
+  ): CloseSessionResult | DiscardSessionResult {
+    const state = this.readStateUnsafe();
+    const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+    if (record === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+
+    const retry =
+      record.state === "closing" &&
+      (operation === "gc" ||
+        (operation === "close" && record.terminalOperation === undefined) ||
+        (operation === "discard" && record.terminalOperation === "discard"));
+    const actorRetry = retryOverride ?? retry;
+    const reconciliationOperation: "close" | "discard" | "gc" =
+      operation === "close" ? "close" : operation === "discard" ? "discard" : "gc";
+    let observedDiagnostic: SessionDiagnostic | undefined;
+    let observedResources: CleanupResources | undefined;
+
+    const result = coordinateSessionLifecycle<CloseSessionResult | DiscardSessionResult>({
+      operation,
+      retry: actorRetry,
+      adapter: {
+        retryAuthorized: actorRetry
+          ? () => {
+              const reconciliation = this.observeCleanupReconciliation(record, reconciliationOperation);
+              if (reconciliation.retrySafe && reconciliation.outcome !== "unresolved") return true;
+              // A cleanup that was not yet durably marked `closing` has no
+              // captured head to reconcile. The existing cleanup preflight is
+              // still the positive identity authority for prunable-missing
+              // worktrees; do not infer permission from age or state alone.
+              if (record.cleanupHead === undefined && record.discardedHead === undefined) {
+                try {
+                  this.inspectCleanupResources(
+                    record,
+                    undefined,
+                    operation === "close" ? evidence : undefined,
+                    operation === "discard" ? "discard" : "close",
+                  );
+                  return true;
+                } catch {
+                  return false;
+                }
+              }
+              return false;
+            }
+          : undefined,
+        observe: (stage) => {
+          const observedState = this.readStateUnsafe();
+          const observedRecord = observedState.sessions.find((candidate) => candidate.sessionId === sessionId);
+          if (observedRecord === undefined) {
+            throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+          }
+          return this.lifecycleActorInputUnsafe(
+            observedRecord,
+            observedState,
+            evidence,
+            operation === "gc",
+            stage === "after" ? "current" : "termination",
+            (diagnostic) => {
+              observedDiagnostic = diagnostic;
+            },
+            operation === "discard"
+              ? undefined
+              : (resources) => {
+                  if (stage === "before") observedResources = resources;
+                },
+          );
+        },
+        effect: () => {
+          if (operation === "discard") return this.discardUnsafe(sessionId);
+          return this.closeUnsafe(
+            sessionId,
+            operation === "close" ? evidence : undefined,
+            operation,
+            observedResources,
+          );
+        },
+        reconcile: (_error, _after, _decision) => {
+          const reconciliation = this.observeCleanupReconciliation(record, reconciliationOperation);
+          return {
+            outcome: reconciliation.outcome,
+            retrySafe: reconciliation.retrySafe,
+            ...(reconciliation.reason === undefined ? {} : { reason: reconciliation.reason }),
+          } satisfies SessionActorReconciliation;
+        },
+      },
+    });
+
+    if (
+      result.phase === "rejected" &&
+      !actorRetry &&
+      record.state !== "closed" &&
+      (operation === "close" || operation === "gc") &&
+      observedDiagnostic?.blockers.length === 0 &&
+      (observedDiagnostic.physicalState === "prunable-missing" ||
+        (operation === "close" && observedDiagnostic.physicalState === "unregistered-missing"))
+    ) {
+      if (operation === "close") return this.coordinateCleanupUnsafe("close", sessionId, evidence, true);
+      return this.coordinateCleanupUnsafe("gc", sessionId, undefined, true);
+    }
+    if (result.phase === "rejected") {
+      // Preserve the durable terminal-intent guards that the existing effect
+      // adapters enforce before any physical observation can reinterpret the
+      // request.  These are persisted intent contracts, not a new actor
+      // authority: normal close never acquires discard authority, and an
+      // ordinary close already in progress cannot be converted to discard.
+      if (operation === "close" && record.terminalOperation === "discard") {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "An explicit discard is already in progress; retry session discard to complete it",
+          { sessionId, state: record.state, terminalOperation: "discard", safeActions: ["retry-discard"] },
+        );
+      }
+      if (operation === "discard" && record.state === "closed" && record.terminalOperation !== "discard") {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "The selected session was already closed normally; discard cannot be retroactively applied",
+          { sessionId, state: record.state, terminalOperation: "close" },
+        );
+      }
+      if (operation === "discard" && record.state === "closing" && record.terminalOperation !== "discard") {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "The selected session has an ordinary close in progress; retry close before choosing discard",
+          { sessionId, state: record.state, safeActions: ["retry-close", "retain-session"] },
+        );
+      }
+      const blocker = observedDiagnostic?.blockers[0];
+      if (blocker !== undefined) {
+        throw enrichCloseBlockerError(
+          new SessionRegistryError(blocker.code, blocker.message, {
+            ...blocker.details,
+            recoveryHints: [...blocker.recoveryHints],
+            safeActions: [...blocker.safeActions],
+          }),
+        );
+      }
+      throw this.lifecycleActorRejection(record, result.decision, evidence);
+    }
+    if (result.error !== undefined) throw result.error;
+    if (result.phase !== "completed" || result.value === undefined) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Lifecycle cleanup did not finalize", {
+        sessionId,
+        operation,
+        phase: result.phase,
+        reconciliation: result.reconciliation as unknown as RegistryErrorDetailValue,
+      });
+    }
+    return result.value;
+  }
+
+  /** Build an actor input from one authoritative registry/physical diagnostic. */
+  private lifecycleActorInputUnsafe(
+    record: SessionRecord,
+    state: RegistryState,
+    evidence: IntegrationEvidenceInput | undefined,
+    gcAuthorized: boolean,
+    phase: "current" | "termination",
+    diagnosticSink?: (diagnostic: SessionDiagnostic) => void,
+    resourcesSink?: (resources: CleanupResources) => void,
+  ): SessionMachineInput {
+    const diagnostic = this.diagnoseUnsafe(record, state, evidence, resourcesSink);
+    diagnosticSink?.(diagnostic);
+    return {
+      persisted: {
+        sessionId: record.sessionId,
+        state: record.state,
+        ...(record.terminalOperation === undefined ? {} : { terminalOperation: record.terminalOperation }),
+        ...(record.cleanupHead === undefined ? {} : { cleanupHead: record.cleanupHead }),
+        ...(record.discardedHead === undefined ? {} : { discardedHead: record.discardedHead }),
+      },
+      observation: {
+        sessionState: record.state,
+        physicalState: diagnostic.physicalState,
+        closeReadiness: diagnostic.closeReadiness === "not_due" ? "not-evaluated" : diagnostic.closeReadiness,
+        blockers: diagnostic.blockers.map((blocker) => ({ code: blocker.code })),
+        terminalOperation: record.terminalOperation,
+        ageSuspicious: diagnostic.garbageCollection.suspicion === "age",
+        gcAuthorized,
+        phase,
+      },
+    };
+  }
+
+  /** Preserve existing blocker/error contracts when the actor rejects a request. */
+  private lifecycleActorRejection(
+    record: SessionRecord,
+    decision: SessionActorDecision,
+    evidence?: IntegrationEvidenceInput,
+  ): SessionRegistryError {
+    if (decision.operation === "close" || decision.operation === "discard" || decision.operation === "gc") {
+      try {
+        const resources = this.inspectCleanupResources(
+          record,
+          undefined,
+          decision.operation === "close" ? evidence : undefined,
+          decision.operation === "discard" ? "discard" : "close",
+        );
+        if (
+          decision.operation === "discard" &&
+          (resources.physicalState !== "healthy" || !resources.worktreePresent || !resources.branchPresent)
+        ) {
+          throw ownershipMismatch(record, "Discard requires an unambiguous, currently owned worktree and branch", {
+            physicalState: resources.physicalState,
+            worktreePresent: resources.worktreePresent,
+            branchPresent: resources.branchPresent,
+            phase: "discard-preflight",
+          });
+        }
+      } catch (error: unknown) {
+        return enrichCloseBlockerError(error);
+      }
+    }
+    return new SessionRegistryError("OPERATION_REJECTED", "Lifecycle transition was rejected by the Session actor", {
+      sessionId: record.sessionId,
+      operation: decision.operation,
+      reason: decision.reason,
+      target: decision.target,
+    });
   }
 
   private resolveOwnerSession(records: readonly SessionRecord[]): SessionRecord {
@@ -3138,6 +3412,7 @@ export class SessionRegistry {
     sessionId: string,
     evidence?: IntegrationEvidenceInput,
     cleanupOperation: "close" | "gc" = "close",
+    initialResources?: CleanupResources,
   ): CloseSessionResult {
     const state = this.readStateUnsafe();
     const records = state.sessions;
@@ -3166,7 +3441,7 @@ export class SessionRegistry {
 
     let resources: CleanupResources;
     try {
-      resources = this.inspectCleanupResources(record, undefined, evidence);
+      resources = initialResources ?? this.inspectCleanupResources(record, undefined, evidence);
     } catch (error: unknown) {
       throw enrichCloseBlockerError(error);
     }
@@ -3538,6 +3813,7 @@ export class SessionRegistry {
     record: SessionRecord,
     state: RegistryState,
     evidence?: IntegrationEvidenceInput,
+    resourcesSink?: (resources: CleanupResources) => void,
   ): SessionDiagnostic {
     const claims = state.claims.filter((claim) => claim.sessionId === record.sessionId).map(cloneResourceClaim);
     // Used only to evaluate staleness below; deliberately not part of the
@@ -3593,6 +3869,7 @@ export class SessionRegistry {
       garbageCollection = assessGarbageCollection(record, now, this.staleAfterMs, worktrees);
       staleCandidate = garbageCollection.destructiveEligibility === "eligible";
       const resources = this.inspectCleanupResources(record, worktrees, evidence);
+      resourcesSink?.(resources);
       integrationProof = resources.integrationProof;
     } catch (error: unknown) {
       blockers = [toDiagnosticBlocker(error)];
