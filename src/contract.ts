@@ -23,6 +23,7 @@ import {
   SANDBOX_OPTIONAL_CAPABILITIES,
   SANDBOX_REQUIRED_CAPABILITIES,
 } from "./domain/sandbox.js";
+import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -207,6 +208,58 @@ function operationRequiredModes(): JsonObject {
 
 function jsonClone(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+type CliCommandReference = {
+  readonly command: string;
+  readonly canonical_command: string;
+};
+
+/** Resolve every machine-contract command through the canonical CLI registry. */
+function registryCommandReference(command: string): CliCommandReference {
+  const definition = resolveCliCommandDefinition(command);
+  if (definition === undefined) {
+    throw new Error(`Machine contract command is not registered: ${command}`);
+  }
+  const canonical = CLI_COMMAND_REGISTRY.find(
+    (candidate) => candidate.name === command || candidate.aliases?.includes(command),
+  );
+  if (canonical === undefined) {
+    throw new Error(`Machine contract command has no canonical identity: ${command}`);
+  }
+  return { command: definition.name, canonical_command: canonical.name };
+}
+
+function registryCommands(commands: readonly string[]): readonly string[] {
+  return commands.map((command) => registryCommandReference(command).command);
+}
+
+function registryCommandReferences(commands: readonly string[]): readonly CliCommandReference[] {
+  return commands.map((command) => registryCommandReference(command));
+}
+
+function registryResultSchemas(mappings: readonly { readonly commands: readonly string[] }[]): JsonValue {
+  return jsonClone(
+    mappings.map((mapping) => ({
+      ...(jsonClone(mapping) as JsonObject),
+      commands: [...registryCommands(mapping.commands)],
+    })),
+  );
+}
+
+function registryAliasReferences(
+  aliases: readonly { readonly alias: string; readonly canonical: string }[],
+): JsonValue {
+  return jsonClone(
+    aliases.map((entry) => {
+      const alias = registryCommandReference(entry.alias);
+      const canonical = registryCommandReference(entry.canonical);
+      if (alias.canonical_command !== canonical.canonical_command) {
+        throw new Error(`Machine contract alias identity mismatch: ${entry.alias} -> ${entry.canonical}`);
+      }
+      return { alias: alias.command, canonical: canonical.canonical_command };
+    }),
+  );
 }
 
 const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
@@ -562,12 +615,13 @@ export function machineContract(packageVersion: string): JsonObject {
     },
     capabilities: MACHINE_CONTRACT_CAPABILITIES.map((capability) => ({
       id: capability.id,
-      commands: [...capability.commands],
+      commands: [...registryCommands(capability.commands)],
+      command_references: [...registryCommandReferences(capability.commands)],
       result_schema: capability.result_schema,
       ...(capability.id !== "resource-claims"
         ? {
             result_schema_version: capability.result_schema_version,
-            result_schemas: jsonClone(capability.result_schemas),
+            result_schemas: registryResultSchemas(capability.result_schemas),
           }
         : {}),
       identities: [...capability.identities],
@@ -579,8 +633,8 @@ export function machineContract(packageVersion: string): JsonObject {
             contract_version: capability.contract_version,
             claim_schema_version: capability.claim_schema_version,
             result_schema_version: capability.result_schema_version,
-            command_aliases: jsonClone(capability.command_aliases),
-            result_schemas: jsonClone(capability.result_schemas),
+            command_aliases: registryAliasReferences(capability.command_aliases),
+            result_schemas: registryResultSchemas(capability.result_schemas),
             failure_code_policy: jsonClone(capability.failure_code_policy),
             transition_matrix: jsonClone(capability.transition_matrix),
             compatibility: jsonClone(capability.compatibility),
@@ -589,18 +643,18 @@ export function machineContract(packageVersion: string): JsonObject {
             recovery: jsonClone(capability.recovery),
             operation_required_claim_modes: capability.operation_required_claim_modes,
             help_dispatcher: {
-              commands: [...capability.commands],
+              commands: [...registryCommands(capability.commands)],
               identity_rule: "each command and alias resolves to an existing dispatcher and help identity",
             },
             claim_set_replacement: {
-              commands: ["session update", "resource update"],
+              commands: [...registryCommands(["session update", "resource update"])],
               atomic: true,
               pairing: "adjacent-resource-mode",
               idempotent_retry: true,
               unchanged_on_rejection: true,
             },
             migration: {
-              command: "migrate",
+              command: registryCommandReference("migrate").command,
               source_claim_schema_version: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
               target_claim_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
               result_schema: "resource-claim.migration.v1",
@@ -617,7 +671,7 @@ export function machineContract(packageVersion: string): JsonObject {
         ? {
             contract_id: capability.contract_id,
             schema_version: capability.schema_version,
-            command_aliases: jsonClone(capability.command_aliases),
+            command_aliases: registryAliasReferences(capability.command_aliases),
             required_capabilities: [...capability.required_capabilities],
             optional_capabilities: [...capability.optional_capabilities],
             network_mode: capability.network_mode,

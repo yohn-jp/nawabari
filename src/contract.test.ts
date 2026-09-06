@@ -8,6 +8,7 @@ import {
   RESOURCE_CLAIM_MACHINE_CONTRACT_VERSION,
   machineContract,
 } from "./contract.js";
+import { publicCliCommandNames } from "./cli.js";
 import { RESOURCE_CLAIM_FAILURE_CODES } from "./domain/errors.js";
 import { IMPLEMENTATION_FAILURE_CODE_VOCABULARY } from "./failure-code-vocabulary.js";
 import {
@@ -229,6 +230,28 @@ test("protected-execution capability publishes the sandbox contract and canonica
     assert.equal(response.ok, true);
     assert.equal(response.help_for, command);
     if (command === "session exec") assert.equal(response.canonical_command, "session run");
+  }
+});
+
+test("machine capability command references resolve through canonical CLI identities", () => {
+  const publicNames = new Set(publicCliCommandNames());
+  const contract = machineContract("test-version");
+  assert.ok(Array.isArray(contract.capabilities));
+  for (const candidate of contract.capabilities) {
+    assert.ok(typeof candidate === "object" && candidate !== null && !Array.isArray(candidate));
+    const capability = candidate as JsonRecord;
+    assert.ok(Array.isArray(capability.commands));
+    assert.ok(Array.isArray(capability.command_references));
+    assert.deepEqual(
+      (capability.command_references as Array<JsonRecord>).map((reference) => reference.command),
+      capability.commands,
+    );
+    for (const command of capability.commands as string[]) assert.ok(publicNames.has(command));
+    for (const reference of capability.command_references as Array<JsonRecord>) {
+      assert.equal(typeof reference.command, "string");
+      assert.equal(typeof reference.canonical_command, "string");
+      assert.ok(publicNames.has(reference.canonical_command as string));
+    }
   }
 });
 
