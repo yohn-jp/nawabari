@@ -51,6 +51,7 @@ test("evaluates close, discard, inspect/doctor/reconcile, and GC capability even
   const active = actorFor(input());
   assert.equal(send(active, { type: "SESSION.CLOSE.REQUESTED" }), "close-ready");
   assert.equal(send(active, { type: "SESSION.CLOSE.REQUESTED" }), "closed");
+  assert.equal(send(active, { type: "SESSION.DOCTOR.REQUESTED" }), "closed");
   assert.equal(send(active, { type: "SESSION.RECONCILE.REQUESTED" }), "closed");
   active.stop();
 
@@ -79,15 +80,26 @@ test("evaluates close, discard, inspect/doctor/reconcile, and GC capability even
   ready.stop();
 });
 
-test("fails closed for ambiguous observation and integration evidence", () => {
+test("fails closed for ambiguous observation", () => {
   assert.equal(stateOf(input({ closeReadiness: "ambiguous" })), "stale-inconsistent");
+});
+
+test("integration evidence alone does not affect classification", () => {
   assert.equal(
     stateOf(
       input({
         evidence: { integration: { status: "ambiguous", reason: "identity race" } },
       }),
     ),
-    "stale-inconsistent",
+    "active",
+  );
+  assert.equal(
+    stateOf(
+      input({
+        evidence: { integration: { status: "unavailable", reason: "network partition" } },
+      }),
+    ),
+    "active",
   );
 });
 

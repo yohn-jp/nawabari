@@ -61,6 +61,7 @@ const observeTransition = {
   actions: "updateObservation",
 } as const;
 
+const doctorTransition = {} as const;
 const reconcileTransition = {} as const;
 const cleanupRetryTransition = {} as const;
 const cleanupFinalizeTransition = {} as const;
@@ -70,7 +71,7 @@ export const SESSION_OPERATION_EVENT_TYPES = Object.freeze({
   close: "SESSION.CLOSE.REQUESTED",
   discard: "SESSION.DISCARD.REQUESTED",
   inspect: "SESSION.OBSERVE",
-  doctor: "SESSION.RECONCILE.REQUESTED",
+  doctor: "SESSION.DOCTOR.REQUESTED",
   reconcile: "SESSION.RECONCILE.REQUESTED",
   gc: "SESSION.GC.REQUESTED",
 } as const satisfies Record<SessionLifecycleOperation, string>);
@@ -102,6 +103,7 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
         "SESSION.OBSERVE": observeTransition,
         "SESSION.CLOSE.REQUESTED": { target: "close-ready" },
         "SESSION.DISCARD.REQUESTED": { target: "discarded" },
+        "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
@@ -113,6 +115,7 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
         "SESSION.OBSERVE": observeTransition,
         "SESSION.CLOSE.REQUESTED": { target: "closed" },
         "SESSION.DISCARD.REQUESTED": { target: "discarded" },
+        "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
         "SESSION.GC.REQUESTED": { target: "closed", guard: "destructiveGcIsAllowed" },
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
@@ -124,6 +127,7 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
       on: {
         "SESSION.OBSERVE": observeTransition,
         "SESSION.DISCARD.REQUESTED": { target: "discarded" },
+        "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
@@ -134,12 +138,14 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
       on: {
         "SESSION.OBSERVE": observeTransition,
         "SESSION.DISCARD.REQUESTED": {},
+        "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
       },
     },
     "stale-inconsistent": {
       on: {
         "SESSION.OBSERVE": observeTransition,
+        "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
@@ -149,6 +155,7 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
       on: {
         "SESSION.OBSERVE": observeTransition,
         "SESSION.CLOSE.REQUESTED": {},
+        "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
       },
     },

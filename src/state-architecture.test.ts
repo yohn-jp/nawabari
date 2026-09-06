@@ -18,6 +18,7 @@ test("session state module exposes capability-oriented internal events", () => {
       "SESSION.OBSERVE",
       "SESSION.CLOSE.REQUESTED",
       "SESSION.DISCARD.REQUESTED",
+      "SESSION.DOCTOR.REQUESTED",
       "SESSION.RECONCILE.REQUESTED",
       "SESSION.GC.REQUESTED",
       "SESSION.CLEANUP.RETRY",
@@ -40,7 +41,7 @@ test("session lifecycle operations map to capability events without CLI-shaped n
     close: "SESSION.CLOSE.REQUESTED",
     discard: "SESSION.DISCARD.REQUESTED",
     inspect: "SESSION.OBSERVE",
-    doctor: "SESSION.RECONCILE.REQUESTED",
+    doctor: "SESSION.DOCTOR.REQUESTED",
     reconcile: "SESSION.RECONCILE.REQUESTED",
     gc: "SESSION.GC.REQUESTED",
   });

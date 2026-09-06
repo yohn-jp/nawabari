@@ -72,11 +72,6 @@ function hasUnknownBlocker(blockers: readonly SessionLifecycleBlocker[]): boolea
   );
 }
 
-function hasAmbiguousIntegrationEvidence(context: SessionMachineContext): boolean {
-  const integration = context.evidence.integration ?? context.observation.evidence?.integration;
-  return integration?.status === "ambiguous" || integration?.status === "unavailable";
-}
-
 function observation(context: SessionMachineContext): SessionLifecycleObservation {
   return context.observation;
 }
@@ -97,8 +92,7 @@ export function isObservationStaleInconsistent(context: SessionMachineContext): 
     hasUnknownBlocker(blockers) ||
     blockers.some((blocker) => blocker.classification === "stale") ||
     ambiguousReadiness ||
-    recoverability === "ambiguous" ||
-    hasAmbiguousIntegrationEvidence(context)
+    recoverability === "ambiguous"
   );
 }
 
