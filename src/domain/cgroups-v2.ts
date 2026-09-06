@@ -273,6 +273,55 @@ function verifiesScopeIdentity(scope: CgroupScope): boolean {
   );
 }
 
+function reconcileExistingScope(scopePath: string, name: string, filesystem: CgroupFileSystem): DomainResult<null> {
+  const processesText = readBounded(path.join(scopePath, "cgroup.procs"), filesystem);
+  if (processesText === null) {
+    return cgroupError("SANDBOX_CGROUP_SETUP_FAILED", "The existing cgroups v2 scope could not be inspected.", {
+      scope: name,
+    });
+  }
+  const processes = parseProcessIds(processesText);
+  if (processes.length > 0) {
+    return cgroupError("SANDBOX_CGROUP_SCOPE_CONFLICT", "The deterministic cgroups v2 scope is still occupied.", {
+      scope: name,
+      process_count: processes.length,
+    });
+  }
+
+  // Removing an empty scope is the only portable way to reset both writable
+  // limits and kernel-maintained accounting/event counters.  The path is
+  // already identity-derived and verified by the caller; never reclaim a
+  // scope before the occupancy check above.
+  try {
+    filesystem.rmdirSync(scopePath);
+  } catch (error: unknown) {
+    return cgroupError("SANDBOX_CGROUP_SETUP_FAILED", "The empty cgroups v2 scope could not be reconciled.", {
+      scope: name,
+      reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+    });
+  }
+
+  try {
+    filesystem.mkdirSync(scopePath, { mode: 0o755 });
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      const replacementProcesses = readBounded(path.join(scopePath, "cgroup.procs"), filesystem);
+      const replacement = parseProcessIds(replacementProcesses);
+      if (replacement.length > 0) {
+        return cgroupError("SANDBOX_CGROUP_SCOPE_CONFLICT", "The deterministic cgroups v2 scope is still occupied.", {
+          scope: name,
+          process_count: replacement.length,
+        });
+      }
+    }
+    return cgroupError("SANDBOX_CGROUP_SETUP_FAILED", "The reconciled cgroups v2 scope could not be recreated.", {
+      scope: name,
+      reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+    });
+  }
+  return success(null);
+}
+
 /** Create or resume a deterministic scope; an occupied scope is never adopted. */
 export function createCgroupScope(
   identity: CgroupExecutionIdentity,
@@ -317,13 +366,9 @@ export function createCgroupScope(
         scope: scopePath,
       });
     }
-    const processes = parseProcessIds(readBounded(path.join(scopePath, "cgroup.procs"), filesystem));
-    if (processes.length > 0) {
-      return cgroupError("SANDBOX_CGROUP_SCOPE_CONFLICT", "The deterministic cgroups v2 scope is still occupied.", {
-        scope: name,
-        process_count: processes.length,
-      });
-    }
+    const reconciled = reconcileExistingScope(scopePath, name, filesystem);
+    if (!reconciled.ok) return reconciled;
+    createdNew = true;
   }
   const applied = applyCgroupLimits(scopePath, limits.value, filesystem);
   if (!applied.ok) {
