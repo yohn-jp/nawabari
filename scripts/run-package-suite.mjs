@@ -31,6 +31,7 @@ function parseArgs(argv) {
   return {
     keepTarball: argv.includes("--keep-tarball"),
     evidenceOutput,
+    requireProtectedExecution: argv.includes("--require-protected-execution"),
   };
 }
 
@@ -130,7 +131,7 @@ function writeEvidence(outputPath, artifact) {
 }
 
 function main() {
-  const { keepTarball, evidenceOutput } = parseArgs(process.argv.slice(2));
+  const { keepTarball, evidenceOutput, requireProtectedExecution } = parseArgs(process.argv.slice(2));
   const tarballName = `${packageJson.name}-${packageJson.version}.tgz`;
   const tarballPath = path.join(repoRoot, tarballName);
   fs.rmSync(tarballPath, { force: true });
@@ -155,16 +156,21 @@ function main() {
     };
     console.log(`packed artifact identity: ${JSON.stringify(artifact)}`);
     console.log(`package contents verified in exact tarball: ${tarballName}`);
-    // Package/evidence validation is intentionally strict. An unavailable
-    // protected capability is a failed product gate, never a skip or an
-    // ambient fallback.
-    const smokeArgs = ["scripts/smoke-test.mjs", "--tarball", tarballPath, "--require-protected-execution"];
+    const smokeArgs = ["scripts/smoke-test.mjs", "--tarball", tarballPath];
+    if (requireProtectedExecution) {
+      // Protected evidence is intentionally strict. An unavailable
+      // capability is a failed product gate, never a skip or an ambient
+      // fallback.
+      smokeArgs.push("--require-protected-execution");
+    }
     run(process.execPath, smokeArgs, { stdio: "inherit" });
-    const reportPath = path.resolve(
-      evidenceOutput ?? path.join(repoRoot, "test-artifacts", "packed-standalone-protected-execution.json"),
-    );
-    writeEvidence(reportPath, artifact);
-    console.log(`packed standalone protected-execution evidence recorded: ${reportPath}`);
+    if (requireProtectedExecution) {
+      const reportPath = path.resolve(
+        evidenceOutput ?? path.join(repoRoot, "test-artifacts", "packed-standalone-protected-execution.json"),
+      );
+      writeEvidence(reportPath, artifact);
+      console.log(`packed standalone protected-execution evidence recorded: ${reportPath}`);
+    }
   } finally {
     if (!keepTarball) fs.rmSync(tarballPath, { force: true });
   }

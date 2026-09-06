@@ -747,8 +747,8 @@ installed CLI, or `pnpm run verify` for the complete local conformance gate.
 
 ## Exact packed standalone protected-execution evidence
 
-`pnpm run test:package` is the package/evidence gate for the standalone
-protected product. It creates one exact `pnpm pack` archive, records its
+`pnpm run test:package:protected` is the package/evidence gate for the
+standalone protected product. It creates one exact `pnpm pack` archive, records its
 package/version, filename, byte size, SHA-256, source revision, and host
 identity in `test-artifacts/packed-standalone-protected-execution.json`,
 validates the archive contents, and installs that archive into a fresh
@@ -767,6 +767,13 @@ report to be ready; unavailable protected execution is a failure, not a skip
 or an ambient fallback. The fixture uses only a temporary local repository and
 local bare remote and has no Mottainai, GitHub, `gh`, LLM, or network
 dependency.
+
+The ordinary `pnpm run test:package` command runs the package/install smoke
+without requiring a real protected host, so it retains the existing
+compatibility CI job; it still verifies fail-closed rejection when protection
+is unavailable. The `pnpm run test:package:protected` command is the #149
+evidence command and must be run on a supported Linux host. It requires a
+ready protected profile and fails when that prerequisite is unavailable.
 
 The evidence supports these boundaries only:
 

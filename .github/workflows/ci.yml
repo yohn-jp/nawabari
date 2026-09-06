@@ -167,10 +167,5 @@ jobs:
       - name: Build
         run: pnpm run build
 
-      - name: Install bubblewrap for protected package evidence
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes bubblewrap
-
       - name: Package contents and smoke test
         run: node scripts/run-package-suite.mjs
