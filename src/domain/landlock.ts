@@ -180,6 +180,14 @@ export function deriveLandlockRules(topology: SandboxFilesystemTopology): readon
   addDirectoryRule(rules, "/home/nawabari/.nawabari", WRITE_ACCESS);
   addDirectoryRule(rules, "/nawabari/git", WRITE_ACCESS);
   addDirectoryRule(rules, "/nawabari/git/objects", READ_ACCESS);
+  addRule(
+    rules,
+    "/dev/null",
+    LANDLOCK_ACCESS_FS.execute |
+      LANDLOCK_ACCESS_FS.read_file |
+      LANDLOCK_ACCESS_FS.write_file |
+      LANDLOCK_ACCESS_FS.truncate,
+  );
   addDirectoryRule(rules, "/tmp", WRITE_ACCESS);
 
   for (const source of topology.user_tool_paths) {
