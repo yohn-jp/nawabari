@@ -46,6 +46,7 @@ test("captures a deterministic session-addressed snapshot and bounded diff", () 
     assert.deepEqual(diff.paths, ["README.md"]);
     assert.match(diff.patch ?? "", /changed/u);
     assert.equal(diff.hunkCount, 1);
+    assert.deepEqual(diff.diagnostics, []);
   } finally {
     fs.rmSync(repositoryPath, { recursive: true, force: true });
   }
@@ -107,6 +108,54 @@ test("marks untracked stat evidence incomplete without dropping the path", () =>
         deletions: null,
         binary: null,
         available: false,
+      },
+    ]);
+
+    const diff = registry.repositoryDiff({
+      sessionId: session.sessionId,
+      paths: ["untracked.txt"],
+      includePatch: true,
+      maxBytes: 4_096,
+      maxHunks: 4,
+    });
+    assert.deepEqual(diff.incompleteReasons, ["STAT_UNAVAILABLE"]);
+    assert.deepEqual(diff.diagnostics, [
+      {
+        reason: "UNTRACKED_TARGET",
+        path: "untracked.txt",
+        message:
+          "The selected target is untracked; Git does not expose diff statistics or patch content for untracked files. Track the file explicitly before retrying.",
+      },
+    ]);
+    assert.equal(runGit(["diff", "--cached", "--name-only"], repositoryPath), "");
+    assert.match(runGit(["status", "--porcelain=v1", "--untracked-files=all"], repositoryPath), /\?\? untracked\.txt/u);
+  } finally {
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("keeps ignored or otherwise unavailable stats distinct from untracked targets", () => {
+  const repositoryPath = createRepository();
+  try {
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const session = registry.create();
+    fs.writeFileSync(path.join(repositoryPath, ".gitignore"), "ignored.txt\n");
+    fs.writeFileSync(path.join(repositoryPath, "ignored.txt"), "ignored\n");
+
+    const diff = registry.repositoryDiff({
+      sessionId: session.sessionId,
+      paths: ["ignored.txt"],
+      includePatch: true,
+      maxBytes: 4_096,
+      maxHunks: 4,
+    });
+
+    assert.equal(diff.complete, false);
+    assert.deepEqual(diff.diagnostics, [
+      {
+        reason: "STAT_UNAVAILABLE",
+        path: "ignored.txt",
+        message: "Git did not expose diff statistics for the selected target.",
       },
     ]);
   } finally {

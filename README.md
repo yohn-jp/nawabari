@@ -151,7 +151,7 @@ The result schemas expose the following identities:
 | authorization          | `operation`, `allowed`, `code`, `claim_ids`                                                                                         |
 | checkpoint evidence    | `head`, `changed`, `staged`, `unstaged`, `untracked`, `in_claim`, `out_of_claim`                                                    |
 | repository evidence    | `session_id`, `session_updated_at`, `base_revision`, `head`, `clean`, `paths.stats`, `evidence_hash`                                |
-| bounded diff           | `from_revision`, `to_revision`, `paths`, `stats`, `patch`, `evidence_hash`                                                          |
+| bounded diff           | `from_revision`, `to_revision`, `paths`, `stats`, `diagnostics`, `patch`, `evidence_hash`                                           |
 | commit/push            | `commit_sha`, `remote`, `branch`, `target`, `relation`                                                                              |
 | reconciliation/cleanup | `clean`, `issues`, `candidates`, `cleaned`, `blocked`, `recovery_hints`                                                             |
 
@@ -196,7 +196,11 @@ requires `--patch` and is bounded to at most 64 paths, 64 KiB, and 128 hunks;
 the caller may request smaller limits. Unrepresentable Git observations fail
 with `GIT_STATE_AMBIGUOUS`; a requested path whose stat is not exposed by Git
 remains in the result with `available: false` and makes snapshot evidence
-`complete: false`, so no path silently disappears.
+`complete: false`, so no path silently disappears. Such paths include a
+bounded `diagnostics` entry; a target directly observed as untracked reports
+`reason: UNTRACKED_TARGET`, while other unavailable-stat causes remain
+`STAT_UNAVAILABLE`. These diagnostics are read-only and do not stage or add
+files.
 
 ## Session lifecycle
 

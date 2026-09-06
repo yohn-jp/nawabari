@@ -33,6 +33,18 @@ export interface RepositoryDiffOptions {
   readonly maxHunks?: number;
 }
 
+/**
+ * A bounded explanation for a path whose Git diff statistic was unavailable.
+ * `UNTRACKED_TARGET` is emitted only when the selected worktree target is
+ * directly observed in Git's untracked path set; all other causes stay
+ * explicitly distinct.
+ */
+export interface RepositoryDiffDiagnostic {
+  readonly reason: "UNTRACKED_TARGET" | "STAT_UNAVAILABLE";
+  readonly path: string;
+  readonly message: string;
+}
+
 export interface RepositoryEvidencePaths extends GitCheckpointPaths {
   readonly stats: readonly GitPathStat[];
 }
@@ -89,6 +101,7 @@ export interface RepositoryDiffEvidence {
   readonly stats: readonly GitPathStat[];
   readonly complete: boolean;
   readonly incompleteReasons: readonly string[];
+  readonly diagnostics: readonly RepositoryDiffDiagnostic[];
   readonly patch: string | null;
   readonly patchBytes: number;
   readonly hunkCount: number;
