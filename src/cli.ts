@@ -1223,6 +1223,51 @@ async function executeRelease(
   return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
 }
 
+/**
+ * The one dispatcher boundary for protected managed execution.
+ *
+ * The public registry owns the command identity (including aliases); this
+ * function owns only the routing contract.  Resolution is always enforced
+ * and the resolved request is handed to the #145 launcher.  In particular,
+ * there is no ambient child-process path to select when resolution or launch
+ * fails.
+ */
+async function executeProtectedSessionCommand(
+  arguments_: string[],
+  dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
+    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout">,
+  context: SessionContext,
+): Promise<DomainResult<JsonObject>> {
+  const delimiter = arguments_.indexOf("--");
+  if (delimiter === -1) {
+    return failure(usageError("MISSING_ARGUMENT", "session run requires a -- terminator before the command."));
+  }
+  const parsed = parseOptions(arguments_.slice(0, delimiter), new Set(["--session"]));
+  if (!parsed.ok) return parsed;
+  const command = arguments_[delimiter + 1];
+  if (command === undefined || command.length === 0) {
+    return failure(usageError("MISSING_ARGUMENT", "session run requires a command after --."));
+  }
+
+  const request = await resolveSandboxExecutionRequest(
+    dependencies.backend,
+    context,
+    { session_id: parsed.value.session_id, enforce: true },
+    dependencies.sandboxProbe,
+    dependencies.sandboxRuntimeLayout,
+  );
+  if (!request.ok) return request;
+
+  // `sandboxRunner` is an injection seam for unit tests. Production always
+  // reaches the canonical protected launcher exported by #145.
+  const runner = dependencies.sandboxRunner ?? runSandboxedCommand;
+  const result = await runner(request.value, {
+    command,
+    args: arguments_.slice(delimiter + 2),
+  });
+  return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+}
+
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
@@ -1234,6 +1279,12 @@ async function executeCommand(
   if (command === "session") {
     if (subcommand === undefined) {
       return failure(usageError("MISSING_ARGUMENT", "session requires a subcommand."));
+    }
+    // Resolve the subcommand through the canonical registry before dispatch.
+    // This keeps `session exec` an alias of the same protected route instead
+    // of creating a second launch path.
+    if (canonicalCommandForName(`session ${subcommand}`)?.name === "session run") {
+      return executeProtectedSessionCommand(rest, dependencies, context);
     }
     if (subcommand === "claim") {
       const parsed = parseSingleClaimPair(rest);
@@ -1295,32 +1346,6 @@ async function executeCommand(
       };
       const result = await dependencies.backend.createSession(context, options);
       return result.ok ? { ok: true, value: result.value } : result;
-    }
-    if (subcommand === "run" || subcommand === "exec") {
-      const delimiter = rest.indexOf("--");
-      if (delimiter === -1) {
-        return failure(usageError("MISSING_ARGUMENT", "session run requires a -- terminator before the command."));
-      }
-      const parsed = parseOptions(rest.slice(0, delimiter), dispatcherAllowedOptions("session run"));
-      if (!parsed.ok) return parsed;
-      const command = rest[delimiter + 1];
-      if (command === undefined || command.length === 0) {
-        return failure(usageError("MISSING_ARGUMENT", "session run requires a command after --."));
-      }
-      const request = await resolveSandboxExecutionRequest(
-        dependencies.backend,
-        context,
-        { session_id: parsed.value.session_id, enforce: true },
-        dependencies.sandboxProbe,
-        dependencies.sandboxRuntimeLayout,
-      );
-      if (!request.ok) return request;
-      const runner = dependencies.sandboxRunner ?? runSandboxedCommand;
-      const result = await runner(request.value, {
-        command,
-        args: rest.slice(delimiter + 2),
-      });
-      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "inspect") {
       const parsed = parseTargetedOptions(rest, dispatcherAllowedOptions("session inspect"));

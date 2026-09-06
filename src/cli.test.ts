@@ -192,6 +192,37 @@ test("session run does not interpret a child --json argument as a Nawabari globa
   assert.match(output.stdout[0] ?? "", /^session run: ok/);
 });
 
+test("session exec routes through the canonical protected launcher and never falls back after launch failure", async () => {
+  const output = capture();
+  let launcherCalls = 0;
+  const exitCode = await runCli(
+    ["--json", "session", "exec", "--session", sampleSession.session_id, "--", "worker", "literal"],
+    {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: output.io,
+      sandboxProbe: readySandboxProbe(),
+      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRunner: async (request, command) => {
+        launcherCalls += 1;
+        assert.equal(request.enforce, true);
+        assert.equal(request.session_id, sampleSession.session_id);
+        assert.deepEqual([command.command, ...(command.args ?? [])], ["worker", "literal"]);
+        return failure(new DomainError("SANDBOX_EXECUTION_FAILED", "launcher failed"));
+      },
+    },
+  );
+
+  assert.equal(exitCode, 3);
+  assert.equal(launcherCalls, 1);
+  assert.deepEqual(JSON.parse(output.stdout[0] ?? ""), {
+    ok: false,
+    command: "session exec",
+    code: "SANDBOX_EXECUTION_FAILED",
+    message: "launcher failed",
+  });
+});
+
 test("session run returns a rejected exit status for a signaled child and never falls back when protection is unavailable", async () => {
   const signalOutput = capture();
   const signalExitCode = await runCli(
