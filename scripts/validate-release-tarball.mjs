@@ -48,7 +48,12 @@ const entries = run("tar", ["-tzf", tarballPath])
   .map((entry) => entry.replace(/\/$/, ""));
 const allowed = new Set(["package/package.json", "package/README.md", "package/LICENSE"]);
 for (const entry of entries) {
-  if (!allowed.has(entry) && !entry.startsWith("package/dist/")) {
+  const relative = entry.startsWith("package/") ? entry.slice("package/".length) : entry;
+  const runtimeArtifact =
+    relative.startsWith("dist/") &&
+    [".js", ".js.map", ".d.ts", ".d.ts.map"].some((suffix) => relative.endsWith(suffix));
+  const sourceOrTestPath = /(?:^|\/)(?:src|scripts?|test|tests)(?:\/|$)|\.(?:test|spec)\.[^/]+$/u.test(relative);
+  if (sourceOrTestPath || (!allowed.has(entry) && !runtimeArtifact)) {
     throw new Error(`unexpected entry in publish tarball: ${entry}`);
   }
 }

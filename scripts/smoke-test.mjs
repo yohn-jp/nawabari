@@ -132,6 +132,21 @@ async function main() {
       : path.join(installDirectory, "node_modules", packageName);
     if (!fs.existsSync(installedPackageDirectory)) fail(`${packageName} was not installed under node_modules`);
 
+    const installedPackageJson = JSON.parse(
+      fs.readFileSync(path.join(installedPackageDirectory, "package.json"), "utf8"),
+    );
+    const sourceRoot = fs.realpathSync.native(repoRoot);
+    const installedRoot = fs.realpathSync.native(installedPackageDirectory);
+    if (installedRoot === sourceRoot || installedRoot.startsWith(`${sourceRoot}${path.sep}`)) {
+      fail("installed package unexpectedly resolves inside the source tree");
+    }
+    for (const dependencyField of ["dependencies", "optionalDependencies", "peerDependencies", "bundleDependencies"]) {
+      const dependencies = installedPackageJson[dependencyField];
+      if (dependencies !== undefined && Object.keys(dependencies).length > 0) {
+        fail(`installed package declares an unexpected runtime dependency field: ${dependencyField}`);
+      }
+    }
+
     const binTargets = packageBinTargets(installedPackageDirectory);
     if (binTargets.length === 0) fail("package.json defines no bin entries to smoke test");
     if (packageName !== "nawabari" || packageJson.version !== expectedVersion) {

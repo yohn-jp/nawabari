@@ -745,6 +745,52 @@ The relevant Mottainai #28 execution cases are mapped as follows:
 Run `pnpm run test:package` to validate the exact packed tarball and its
 installed CLI, or `pnpm run verify` for the complete local conformance gate.
 
+## Exact packed standalone protected-execution evidence
+
+`pnpm run test:package` is the package/evidence gate for the standalone
+protected product. It creates one exact `pnpm pack` archive, records its
+package/version, filename, byte size, SHA-256, source revision, and host
+identity in `test-artifacts/packed-standalone-protected-execution.json`,
+validates the archive contents, and installs that archive into a fresh
+temporary consumer with `npm install --offline`. The default evidence report
+is ignored by Git; pass `--evidence-output <path>` to retain it elsewhere and
+`--keep-tarball` to retain the exact archive for inspection.
+
+The smoke test invokes only the installed `nawabari` bin. Its package allowlist
+contains `dist` runtime artifacts, `README.md`, `LICENSE`, and `package.json`;
+source, test, and script modules are rejected, and the installed manifest must
+not declare runtime dependencies. The lifecycle proof goes through the
+installed public CLI for `capabilities --json`, `doctor --json`, session
+creation/resolution, `session run`, resource claims, checkpoint, commit,
+local-bare-remote push, and close. The gate requires the protected doctor
+report to be ready; unavailable protected execution is a failure, not a skip
+or an ambient fallback. The fixture uses only a temporary local repository and
+local bare remote and has no Mottainai, GitHub, `gh`, LLM, or network
+dependency.
+
+The evidence supports these boundaries only:
+
+- Process: on Linux with the required capabilities, the canonical launcher
+  establishes bubblewrap user, mount, PID, IPC, and UTS namespaces, applies
+  the versioned seccomp profile, and drops ambient capabilities. This is not a
+  VM or a claim about every host process.
+- Filesystem: the protected child receives the authoritative session worktree
+  read-write, private session HOME/cache/`/tmp`/`/proc`, repository-owned
+  shared HOME state, and the fixed read-only runtime/tool inputs selected by
+  the profile. Sibling worktrees and unselected host HOME paths are not part
+  of the selected topology.
+- HOME/cache: the child sees `/home/nawabari`; private state is per session,
+  while only the repository's selected shared-home subtree is shared. Selected
+  host tool directories are read-only inputs, not the host HOME.
+- Network: `network_mode` is `inherited`; this evidence does not prove egress
+  isolation.
+- Linux prerequisites: use `nawabari doctor --json` on a supported Linux host.
+  Required bubblewrap, namespace, seccomp, and capability support must be
+  ready; cgroups v2 and Landlock remain profile-reported optional defenses.
+- Failure behavior: protected resolution uses `enforce: true`; missing
+  required capability, unsupported topology, or launch failure returns a
+  bounded failure and never retries through ambient execution.
+
 ## Development
 
 ```bash
