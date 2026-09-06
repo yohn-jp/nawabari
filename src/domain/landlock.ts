@@ -180,6 +180,9 @@ export function deriveLandlockRules(topology: SandboxFilesystemTopology): readon
   addDirectoryRule(rules, "/home/nawabari/.nawabari", WRITE_ACCESS);
   addDirectoryRule(rules, "/nawabari/git", WRITE_ACCESS);
   addDirectoryRule(rules, "/nawabari/git/objects", READ_ACCESS);
+  // `/dev` already grants execute/read_file/read_dir.  Only write_file is
+  // needed for subprocesses that open the canonical null device for output.
+  addRule(rules, "/dev/null", LANDLOCK_ACCESS_FS.write_file);
   addDirectoryRule(rules, "/tmp", WRITE_ACCESS);
 
   for (const source of topology.user_tool_paths) {

@@ -61,6 +61,7 @@ test("Landlock rules use fixed namespace destinations and omit host topology pat
     assert.equal(byPath.has(path.join(root, "state", "home")), false);
     assert.equal(byPath.get("/home/nawabari"), allFilesystemAccess());
     assert.equal(byPath.get("/home"), LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_dir);
+    assert.equal(byPath.get("/dev/null"), LANDLOCK_ACCESS_FS.write_file);
     assert.equal(
       byPath.get("/usr"),
       LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_file | LANDLOCK_ACCESS_FS.read_dir,
