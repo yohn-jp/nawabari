@@ -41,6 +41,27 @@ function packageBinTargets(packageDirectory) {
   }));
 }
 
+function packLocalXState(installDirectory) {
+  const xstateDirectory = path.join(repoRoot, "node_modules", "xstate");
+  if (!fs.existsSync(xstateDirectory)) {
+    fail("local xstate installation is required to seed the offline package smoke test");
+  }
+  const result = run("npm", ["pack", "--json", xstateDirectory, "--pack-destination", installDirectory], {
+    cwd: repoRoot,
+  });
+  let packInfo;
+  try {
+    const metadata = JSON.parse(result.stdout);
+    packInfo = Array.isArray(metadata) ? metadata[0] : metadata.xstate;
+  } catch {
+    fail("local xstate packaging did not emit valid package metadata");
+  }
+  if (packInfo?.name !== "xstate" || typeof packInfo.filename !== "string") {
+    fail("local xstate packaging emitted unexpected package metadata");
+  }
+  return path.join(installDirectory, packInfo.filename);
+}
+
 function parseArgs(argv) {
   const index = argv.indexOf("--tarball");
   return {
@@ -116,9 +137,19 @@ async function main() {
 
   const installDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-"));
   try {
+    const xstateTarball = packLocalXState(installDirectory);
     fs.writeFileSync(
       path.join(installDirectory, "package.json"),
-      JSON.stringify({ name: "smoke-consumer", private: true, version: "0.0.0" }, null, 2),
+      JSON.stringify(
+        {
+          name: "smoke-consumer",
+          private: true,
+          version: "0.0.0",
+          overrides: { xstate: xstateTarball },
+        },
+        null,
+        2,
+      ),
     );
 
     console.log("installing packed tarball into isolated directory...");
@@ -140,10 +171,21 @@ async function main() {
     if (installedRoot === sourceRoot || installedRoot.startsWith(`${sourceRoot}${path.sep}`)) {
       fail("installed package unexpectedly resolves inside the source tree");
     }
+    const allowedRuntimeDependencies = new Set(["xstate"]);
     for (const dependencyField of ["dependencies", "optionalDependencies", "peerDependencies", "bundleDependencies"]) {
       const dependencies = installedPackageJson[dependencyField];
-      if (dependencies !== undefined && Object.keys(dependencies).length > 0) {
-        fail(`installed package declares an unexpected runtime dependency field: ${dependencyField}`);
+      if (dependencies === undefined) continue;
+      const unexpected = Object.keys(dependencies).filter(
+        (dependency) => dependencyField !== "dependencies" || !allowedRuntimeDependencies.has(dependency),
+      );
+      if (unexpected.length > 0) {
+        fail(`installed package declares unexpected runtime dependencies: ${unexpected.join(", ")}`);
+      }
+      if (
+        dependencyField === "dependencies" &&
+        installedPackageJson.dependencies?.xstate !== packageJson.dependencies?.xstate
+      ) {
+        fail("installed package does not preserve the declared xstate runtime dependency");
       }
     }
 
