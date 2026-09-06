@@ -6,6 +6,7 @@ import { defaultGit, resolveRepositoryContext, type RepositoryContext } from "..
 import { isSessionRegistryError } from "../errors.js";
 import { SessionRegistry } from "../session-registry.js";
 import { success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
+import { supportsRuntime } from "./runtime.js";
 import { defaultSandboxProbe, sandboxDoctorReport, type SandboxDoctorReport, type SandboxProbe } from "./sandbox.js";
 
 export type DoctorCheckStatus = "ok" | "warning" | "error" | "not_configured" | "not_applicable";
@@ -31,13 +32,6 @@ export type DoctorReport = {
   /** Runtime protected-execution readiness from the canonical sandbox probe. */
   sandbox: SandboxDoctorReport;
 };
-
-function supportsRuntime(version: string): boolean {
-  const [majorText, minorText] = version.split(".");
-  const major = Number(majorText);
-  const minor = Number(minorText);
-  return Number.isFinite(major) && Number.isFinite(minor) && (major > 22 || (major === 22 && minor >= 13));
-}
 
 function check(
   name: DoctorCheck["name"],
@@ -145,18 +139,19 @@ async function inspectReconciliation(context: RepositoryContext): Promise<Doctor
 export async function runDoctor(
   cwd = process.cwd(),
   sandboxProbe: SandboxProbe = defaultSandboxProbe,
+  runtimeVersion = process.versions.node,
 ): Promise<DomainResult<DoctorReport>> {
   const checks: DoctorCheck[] = [];
   const sandbox = sandboxDoctorReport(sandboxProbe);
-  const runtimeOk = supportsRuntime(process.versions.node);
+  const runtimeOk = supportsRuntime(runtimeVersion);
   checks.push(
     runtimeOk
       ? check("runtime", "ok", null, "The Nawabari runtime meets the supported Node.js version.", {
-          node: process.versions.node,
+          node: runtimeVersion,
           sandbox: sandbox as unknown as JsonObject,
         })
       : check("runtime", "error", "UNSUPPORTED_RUNTIME", "The Node.js runtime is below the supported version.", {
-          node: process.versions.node,
+          node: runtimeVersion,
           sandbox: sandbox as unknown as JsonObject,
         }),
   );

@@ -14,7 +14,7 @@ breaking changes between minor versions until 1.0.
 
 ## Development setup
 
-Requires Node.js >= 22.13 and [pnpm](https://pnpm.io/) 11.18.0.
+Requires Node.js >= 24 and [pnpm](https://pnpm.io/) 11.18.0.
 
 ```bash
 pnpm install

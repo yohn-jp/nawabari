@@ -29,8 +29,11 @@ warm runs together. No other pnpm defaults are redundantly configured.
 
 ## Measured result
 
-Environment: Linux WSL2 (`6.6.114.1-microsoft-standard-WSL2`), x64, Node
-`v22.22.1`, pnpm `11.18.0`, filesystem statfs type `61267`, 4096-byte blocks.
+Historical benchmark environment: Linux WSL2
+(`6.6.114.1-microsoft-standard-WSL2`), x64, Node `v22.22.1`, pnpm `11.18.0`,
+filesystem statfs type `61267`, 4096-byte blocks. The recorded Node version is
+measurement context, not Nawabari's supported runtime policy; the current
+package baseline is `>=24`.
 The baseline was `origin/main` at commit
 `9ddb76c737ebf99e94c252c5dc321ea70032f8b3`.
 

@@ -102,3 +102,35 @@ test("doctor exposes canonical protected-execution readiness from the injected s
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("doctor preserves the unsupported runtime contract below the package baseline", async () => {
+  const directory = temporaryRepository();
+  try {
+    const result = await runDoctor(directory, sandboxProbe(), "23.99.99");
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.ok, false);
+    const runtime = result.value.checks.find((check) => check.name === "runtime");
+    assert.equal(runtime?.status, "error");
+    assert.equal(runtime?.code, "UNSUPPORTED_RUNTIME");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor accepts the Node 24 baseline and later major versions", async () => {
+  const directory = temporaryRepository();
+  try {
+    for (const version of ["24.0.0", "26.1.0"]) {
+      const result = await runDoctor(directory, sandboxProbe(), version);
+      assert.equal(result.ok, true);
+      if (!result.ok) continue;
+      assert.equal(result.value.ok, true);
+      const runtime = result.value.checks.find((check) => check.name === "runtime");
+      assert.equal(runtime?.status, "ok");
+      assert.equal(runtime?.code, null);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
