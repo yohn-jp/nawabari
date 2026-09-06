@@ -11,6 +11,13 @@
  * XState behavior — a mismatch here means the machine drifted, not that this
  * oracle is wrong. If a deliberate semantic change is required, update this
  * file and the fixed expectations in the same change, with explicit review.
+ *
+ * Known intentional delta from the raw #252 baseline: blocked-recoverable's
+ * GC-forbidden reason is `recoverable-work-must-be-retained-or-discarded`,
+ * not the generic `age-is-not-destructive-authority` the original #252
+ * implementation emitted for every GC rejection regardless of cause. That
+ * blanket rewrite was a #252 bug — canonicalized to the state-specific
+ * reason here per explicit review decision on #263.
  */
 
 import type {
@@ -352,8 +359,15 @@ export function classifySessionLifecycleLegacyOracle(
   const destructiveCleanupEligible =
     gcAuthorized && state === "close-ready" && !(ageSuspicious && physicalState === "healthy");
 
+  // The generic "age-is-not-destructive-authority" reason applies only when
+  // GC authorization itself is the missing/insufficient authority (active,
+  // close-ready without independent authorization or with age-suspicion on
+  // an otherwise-healthy session). For blocked-recoverable, GC is refused
+  // because recoverable work must be retained or discarded, independent of
+  // GC authorization — that state-specific reason is canonical here, matching
+  // the intentional #253 correction.
   const transitions = transitionTable(state).map((transition) =>
-    transition.operation === "gc" && (!gcAuthorized || !destructiveCleanupEligible)
+    transition.operation === "gc" && state !== "blocked-recoverable" && (!gcAuthorized || !destructiveCleanupEligible)
       ? Object.freeze({
           ...transition,
           allowed: false,

@@ -167,6 +167,23 @@ test("derives the compatibility transition table from the XState machine", () =>
   assert.deepEqual(SESSION_LIFECYCLE_TRANSITION_TABLE, projectSessionLifecycleTransitionTable());
 });
 
+test("blocked-recoverable GC reason is the recoverable-work cause, not the generic age reason", () => {
+  const classification = classifySessionLifecycle({
+    sessionState: "active",
+    physicalState: "healthy",
+    closeReadiness: "external_evidence_required",
+    blockers: [{ code: "RECOVERABLE_COMMITS" }],
+    phase: "termination",
+  });
+  assert.equal(classification.state, "blocked-recoverable");
+  assert.equal(lifecycleTransition(classification, "gc").reason, "recoverable-work-must-be-retained-or-discarded");
+  assert.equal(
+    SESSION_LIFECYCLE_TRANSITION_TABLE["blocked-recoverable"].find((transition) => transition.operation === "gc")
+      ?.reason,
+    "recoverable-work-must-be-retained-or-discarded",
+  );
+});
+
 test("registry classification reuses diagnostic authority without mutation", () => {
   const repository = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-lifecycle-classification-"));
   const worktree = `${repository}-worktree`;

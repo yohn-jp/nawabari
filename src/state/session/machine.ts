@@ -233,15 +233,7 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
           operationMetadata("discard", true, "discarded", true, "caller", "explicit-discard-required"),
         ),
         "SESSION.GC.REQUESTED": forbiddenTransition(
-          operationMetadata(
-            "gc",
-            false,
-            null,
-            false,
-            "gc",
-            "recoverable-work-must-be-retained-or-discarded",
-            "age-is-not-destructive-authority",
-          ),
+          operationMetadata("gc", false, null, false, "gc", "recoverable-work-must-be-retained-or-discarded"),
         ),
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
