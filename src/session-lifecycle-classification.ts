@@ -6,6 +6,10 @@
  * not inspect or mutate Git, the registry, a worktree, or a branch itself.
  */
 
+import { classifyObservationBlockers } from "./state/session/guards.js";
+import { projectSessionLifecycleMachine, projectSessionLifecycleTransitionTable } from "./state/session/machine.js";
+import type { SessionObservationInput } from "./state/session/types.js";
+
 export const SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION = 1 as const;
 
 export type SessionLifecycleState =
@@ -85,49 +89,6 @@ export interface SessionLifecycleClassification {
   readonly transitions: readonly SessionLifecycleTransition[];
 }
 
-const AMBIGUOUS_CODES = new Set([
-  "GIT_STATE_AMBIGUOUS",
-  "PHYSICAL_OBSERVATION_UNAVAILABLE",
-  "REPOSITORY_IDENTITY_AMBIGUOUS",
-  "WORKTREE_IDENTITY_AMBIGUOUS",
-  "GIT_COMMAND_FAILED",
-  "GIT_SPAWN_FAILED",
-  "GIT_TIMEOUT",
-  "GIT_OUTPUT_LIMIT",
-  "OWNERSHIP_MISMATCH",
-  "DUPLICATE_WORKTREE_OWNERSHIP",
-  "DUPLICATE_BRANCH_OWNERSHIP",
-  "RECONCILIATION_DRIFT",
-  "STALE_REGISTRY",
-]);
-
-const RECOVERABLE_CODES = new Set([
-  "DIRTY_WORKTREE",
-  "NESTED_REPOSITORY",
-  "RECOVERABLE_COMMITS",
-  "RECOVERABLE_STASHES",
-  // An explicit bounded integration fetch failed before mutation. The
-  // caller may retry the same bounded proof operation; this is not a
-  // destructive or ambient fallback.
-  "INTEGRATION_FETCH_FAILED",
-]);
-
-const STALE_PHYSICAL_STATES = new Set([
-  "prunable-missing",
-  "prunable-present",
-  "registered-missing",
-  "unregistered-missing",
-  "unregistered-present",
-  "invalid",
-  "unavailable",
-]);
-
-const KNOWN_SESSION_STATES = new Set(["new", "active", "closing", "closed", "stale"]);
-
-const KNOWN_PHYSICAL_STATES = new Set(["healthy", "closed", ...STALE_PHYSICAL_STATES]);
-
-const KNOWN_BLOCKER_CLASSIFICATIONS = new Set(["recoverable", "ambiguous", "stale"]);
-
 function freezeBlocker(blocker: SessionLifecycleBlocker): SessionLifecycleBlocker {
   return Object.freeze({
     code: blocker.code,
@@ -135,226 +96,18 @@ function freezeBlocker(blocker: SessionLifecycleBlocker): SessionLifecycleBlocke
   });
 }
 
-function classifyBlockers(blockers: readonly SessionLifecycleBlocker[]): "none" | "recoverable" | "ambiguous" {
-  if (blockers.some((blocker) => blocker.classification === "ambiguous" || AMBIGUOUS_CODES.has(blocker.code))) {
-    return "ambiguous";
-  }
-  if (blockers.some((blocker) => blocker.classification === "recoverable" || RECOVERABLE_CODES.has(blocker.code))) {
-    return "recoverable";
-  }
-  return "none";
-}
-
-function isStalePhysicalState(physicalState: string | null): boolean {
-  return (
-    physicalState === null || !KNOWN_PHYSICAL_STATES.has(physicalState) || STALE_PHYSICAL_STATES.has(physicalState)
-  );
-}
-
-function freezeTransitions(transitions: readonly SessionLifecycleTransition[]): readonly SessionLifecycleTransition[] {
-  return Object.freeze(transitions.map((transition) => Object.freeze({ ...transition })));
-}
-
-function transitionTable(state: SessionLifecycleState): readonly SessionLifecycleTransition[] {
-  const inspect = (operation: "inspect" | "doctor"): SessionLifecycleTransition => ({
-    operation,
-    allowed: true,
-    target: state,
-    requiresExplicitIntent: false,
-    authority: operation === "doctor" ? "reconciliation" : "session-registry",
-    reason: "observe",
+function normalizeObservation(
+  observation: SessionLifecycleObservation,
+  blockers: readonly SessionLifecycleBlocker[],
+): SessionObservationInput {
+  return Object.freeze({
+    ...observation,
+    blockers,
+    closeReadiness: observation.closeReadiness ?? "not-evaluated",
+    ageSuspicious: observation.ageSuspicious === true,
+    gcAuthorized: observation.gcAuthorized === true,
+    phase: observation.phase ?? "current",
   });
-  const reconcile: SessionLifecycleTransition = {
-    operation: "reconcile",
-    allowed: true,
-    target: state,
-    requiresExplicitIntent: false,
-    authority: "reconciliation",
-    reason: "observe",
-  };
-
-  switch (state) {
-    case "active":
-      return freezeTransitions([
-        {
-          operation: "close",
-          allowed: true,
-          target: "close-ready",
-          requiresExplicitIntent: false,
-          authority: "session-registry",
-          reason: "close-proof-required",
-        },
-        {
-          operation: "discard",
-          allowed: true,
-          target: "discarded",
-          requiresExplicitIntent: true,
-          authority: "caller",
-          reason: "explicit-discard-required",
-        },
-        inspect("inspect"),
-        inspect("doctor"),
-        reconcile,
-        {
-          operation: "gc",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: false,
-          authority: "gc",
-          reason: "age-is-not-destructive-authority",
-        },
-      ]);
-    case "close-ready":
-      return freezeTransitions([
-        {
-          operation: "close",
-          allowed: true,
-          target: "closed",
-          requiresExplicitIntent: false,
-          authority: "session-registry",
-          reason: "close-authorized",
-        },
-        {
-          operation: "discard",
-          allowed: true,
-          target: "discarded",
-          requiresExplicitIntent: true,
-          authority: "caller",
-          reason: "explicit-discard-required",
-        },
-        inspect("inspect"),
-        inspect("doctor"),
-        reconcile,
-        {
-          operation: "gc",
-          allowed: true,
-          target: "closed",
-          requiresExplicitIntent: false,
-          authority: "gc",
-          reason: "close-authorized",
-        },
-      ]);
-    case "blocked-recoverable":
-      return freezeTransitions([
-        {
-          operation: "close",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: false,
-          authority: "session-registry",
-          reason: "recoverable-work-must-be-retained-or-discarded",
-        },
-        {
-          operation: "discard",
-          allowed: true,
-          target: "discarded",
-          requiresExplicitIntent: true,
-          authority: "caller",
-          reason: "explicit-discard-required",
-        },
-        inspect("inspect"),
-        inspect("doctor"),
-        reconcile,
-        {
-          operation: "gc",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: false,
-          authority: "gc",
-          reason: "recoverable-work-must-be-retained-or-discarded",
-        },
-      ]);
-    case "discarded":
-      return freezeTransitions([
-        {
-          operation: "close",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: false,
-          authority: "session-registry",
-          reason: "discarded-terminal",
-        },
-        {
-          operation: "discard",
-          allowed: true,
-          target: "discarded",
-          requiresExplicitIntent: true,
-          authority: "caller",
-          reason: "discarded-terminal",
-        },
-        inspect("inspect"),
-        inspect("doctor"),
-        reconcile,
-        {
-          operation: "gc",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: false,
-          authority: "gc",
-          reason: "discarded-terminal",
-        },
-      ]);
-    case "stale-inconsistent":
-      return freezeTransitions([
-        {
-          operation: "close",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: false,
-          authority: "reconciliation",
-          reason: "physical-reconciliation-required",
-        },
-        {
-          operation: "discard",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: true,
-          authority: "reconciliation",
-          reason: "physical-reconciliation-required",
-        },
-        inspect("inspect"),
-        inspect("doctor"),
-        reconcile,
-        {
-          operation: "gc",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: false,
-          authority: "reconciliation",
-          reason: "physical-reconciliation-required",
-        },
-      ]);
-    case "closed":
-      return freezeTransitions([
-        {
-          operation: "close",
-          allowed: true,
-          target: "closed",
-          requiresExplicitIntent: false,
-          authority: "session-registry",
-          reason: "closed-terminal",
-        },
-        {
-          operation: "discard",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: true,
-          authority: "session-registry",
-          reason: "closed-terminal",
-        },
-        inspect("inspect"),
-        inspect("doctor"),
-        reconcile,
-        {
-          operation: "gc",
-          allowed: false,
-          target: null,
-          requiresExplicitIntent: false,
-          authority: "gc",
-          reason: "closed-terminal",
-        },
-      ]);
-  }
 }
 
 /**
@@ -366,63 +119,23 @@ export function classifySessionLifecycle(observation: SessionLifecycleObservatio
   const blockers = Object.freeze((observation.blockers ?? []).map(freezeBlocker));
   const physicalState = observation.physicalState ?? null;
   const closeReadiness = observation.closeReadiness ?? "not-evaluated";
-  const recoverability = classifyBlockers(blockers);
+  const recoverability = classifyObservationBlockers(blockers);
   const ageSuspicious = observation.ageSuspicious === true;
   const gcAuthorized = observation.gcAuthorized === true;
-  const stalePhysical = isStalePhysicalState(physicalState);
-  const unknownSessionState = !KNOWN_SESSION_STATES.has(observation.sessionState);
-  const unknownBlocker = blockers.some(
-    (blocker) =>
-      !AMBIGUOUS_CODES.has(blocker.code) &&
-      !RECOVERABLE_CODES.has(blocker.code) &&
-      (blocker.classification === undefined || !KNOWN_BLOCKER_CLASSIFICATIONS.has(blocker.classification)),
+  const machineProjection = projectSessionLifecycleMachine({
+    observation: normalizeObservation(observation, blockers),
+  });
+  const transitions = Object.freeze(
+    Object.values(machineProjection.transitions).map(({ eventType: _eventType, ...transition }) =>
+      Object.freeze(transition),
+    ),
   );
-  const staleBlocker = blockers.some((blocker) => blocker.classification === "stale");
-  const ambiguousReadiness = closeReadiness === "ambiguous" || (closeReadiness === "blocked" && blockers.length === 0);
-  const phase = observation.phase ?? "current";
-
-  let state: SessionLifecycleState;
-  const physicalEvidenceRequired = observation.sessionState !== "closed";
-  if (
-    unknownSessionState ||
-    unknownBlocker ||
-    staleBlocker ||
-    ambiguousReadiness ||
-    recoverability === "ambiguous" ||
-    (physicalEvidenceRequired && stalePhysical)
-  ) {
-    state = "stale-inconsistent";
-  } else if (observation.sessionState === "closed") {
-    state = observation.terminalOperation === "discard" ? "discarded" : "closed";
-  } else if (observation.terminalOperation === "discard") {
-    state = "discarded";
-  } else if (recoverability === "recoverable" || closeReadiness === "external_evidence_required") {
-    state = "blocked-recoverable";
-  } else if (phase === "termination" && closeReadiness === "ready") {
-    state = "close-ready";
-  } else {
-    state = "active";
-  }
-
-  // A positive GC authority must be independent of elapsed age. In
-  // particular, old-but-healthy active sessions remain non-destructive.
-  const destructiveCleanupEligible =
-    gcAuthorized && state === "close-ready" && !(ageSuspicious && physicalState === "healthy");
-
-  const transitions = transitionTable(state).map((transition) =>
-    transition.operation === "gc" && (!gcAuthorized || !destructiveCleanupEligible)
-      ? Object.freeze({
-          ...transition,
-          allowed: false,
-          target: null,
-          reason: "age-is-not-destructive-authority" as const,
-        })
-      : transition,
-  );
+  const gcTransition = machineProjection.transitions.gc;
+  const destructiveCleanupEligible = gcTransition.allowed;
 
   return Object.freeze({
     schemaVersion: SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION,
-    state,
+    state: machineProjection.state,
     sessionState: observation.sessionState,
     physicalState,
     closeReadiness,
@@ -450,9 +163,4 @@ export function lifecycleTransition(
 /** The complete state/operation table, useful to help/discovery consumers. */
 export const SESSION_LIFECYCLE_TRANSITION_TABLE: Readonly<
   Record<SessionLifecycleState, readonly SessionLifecycleTransition[]>
-> = Object.freeze(
-  Object.fromEntries(SESSION_LIFECYCLE_STATES.map((state) => [state, transitionTable(state)])) as Record<
-    SessionLifecycleState,
-    readonly SessionLifecycleTransition[]
-  >,
-);
+> = projectSessionLifecycleTransitionTable();

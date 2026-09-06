@@ -112,8 +112,9 @@ function reconcileAction(sessionId: string): SessionLifecycleAction {
 
 /**
  * Project one canonical lifecycle observation into bounded typed caller
- * actions.  The classifier remains the sole owner of lifecycle state; this
- * function only consumes its result and already-authoritative blocker facts.
+ * actions.  Lifecycle state and admissibility arrive through the canonical
+ * classification projection; this function only consumes that result and
+ * already-authoritative blocker facts.
  */
 export function projectSessionLifecycleActions(
   input: SessionLifecycleActionProjectionInput,

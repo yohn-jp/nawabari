@@ -1,8 +1,6 @@
 import { createActor } from "xstate";
 
 import {
-  classifySessionLifecycle,
-  lifecycleTransition,
   SESSION_LIFECYCLE_STATES,
   type SessionLifecycleBlocker,
   type SessionLifecycleCloseReadiness,
@@ -16,6 +14,7 @@ import {
   sessionLifecycleMachine,
   type SessionMachineTransitionMetadata,
 } from "../state/session/machine.js";
+import { classifySessionLifecycleLegacyOracle, legacyOracleTransition } from "./session-lifecycle-legacy-oracle.js";
 import type {
   PersistedSessionState,
   SessionEvidenceInput,
@@ -505,11 +504,18 @@ export type XStateParityProjection = {
   readonly transitions: Readonly<Record<SessionLifecycleOperation, XStateTransitionProjection>>;
 };
 
+/**
+ * Projects the frozen #252-baseline oracle, not the production classifier.
+ * Since #253 made XState the canonical authority, `classifySessionLifecycle`
+ * itself is a thin XState projection — comparing it against `projectXState`
+ * would be XState compared to XState. This oracle is the independent
+ * semantic authority the parity gate needs to catch real drift.
+ */
 export function projectClassifier(fixtureToProject: SessionParityFixture): ClassifierParityProjection {
-  const classification = classifySessionLifecycle(fixtureToProject.input.observation);
+  const classification = classifySessionLifecycleLegacyOracle(fixtureToProject.input.observation);
   const transitions = Object.fromEntries(
     SESSION_PARITY_OPERATIONS.map((operation) => {
-      const transition = lifecycleTransition(classification, operation);
+      const transition = legacyOracleTransition(classification, operation);
       return [
         operation,
         {
