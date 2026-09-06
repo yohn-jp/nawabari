@@ -801,14 +801,20 @@ The evidence supports these boundaries only:
 
 ## Packed Mottainai preselected-UID handoff evidence
 
-`pnpm run test:package:mottainai` is the opt-in external-handoff fixture for
-Issue #150. It runs the #149 protected package gate once, retains the exact
-tarball and its `nawabari.packed-standalone-protected-execution.v1` evidence,
-then installs that same tarball into a disposable consumer. The fixture invokes
-the installed `session run` contract under two distinct preselected
-unprivileged UIDs (23001 and 23002 by default) and records bounded
+`pnpm run test:package:mottainai` is the required-CI external-handoff gate for
+Issue #150. `scripts/run-mottainai-uid-handoff-gate.mjs` runs the #149
+protected package gate exactly once, retains that exact tarball and its
+`nawabari.packed-standalone-protected-execution.v1` evidence, and passes only
+those exact paths into `scripts/run-mottainai-uid-handoff.mjs`, which installs
+that same tarball into a disposable consumer. `run-mottainai-uid-handoff.mjs`
+itself has no self-pack path: it always requires an already-produced
+`--tarball`/`--artifact-evidence` pair, so #150 can never hide a stale or
+mismatched artifact behind a second pack. The fixture invokes the installed
+`session run` contract under two distinct preselected unprivileged UIDs
+(23001 and 23002 by default) and records bounded
 artifact/fixture/UID/session/worktree/resource/Git evidence in
-`test-artifacts/mottainai-packed-uid-handoff.json`.
+`test-artifacts/mottainai-packed-uid-handoff.json`. This gate runs in required
+CI on a Linux host with bubblewrap (`mottainai-uid-handoff` job).
 
 The checked-in `scripts/test-fixtures/mottainai-preselected-uid-runner.sh` is a
 UID-only execution adapter. A real Mottainai Runtime may supply another

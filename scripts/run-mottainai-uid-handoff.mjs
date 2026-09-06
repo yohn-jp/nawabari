@@ -25,8 +25,7 @@ function usage() {
     "Usage: node scripts/run-mottainai-uid-handoff.mjs [options]",
     "",
     "Options:",
-    "  --pack                         Run the #149 protected package gate once and reuse its tarball",
-    "  --tarball <path>               Exact #149 tarball to consume",
+    "  --tarball <path>               Exact #149 tarball to consume (required)",
     "  --artifact-evidence <path>     Exact #149 evidence JSON for that tarball",
     `  --fixture-runner <path>         External UID-only runner (default: ${defaultRunner})`,
     `  --uids <uid,uid>                Two preselected unprivileged UIDs (default: ${DEFAULT_UIDS.join(",")})`,
@@ -38,7 +37,6 @@ function usage() {
 
 export function parseArgs(argv) {
   const options = {
-    pack: false,
     tarball: undefined,
     artifactEvidence: undefined,
     fixtureRunner: defaultRunner,
@@ -52,10 +50,6 @@ export function parseArgs(argv) {
     if (argument === "--") continue;
     if (argument === "--help") {
       options.help = true;
-      continue;
-    }
-    if (argument === "--pack") {
-      options.pack = true;
       continue;
     }
     if (argument === "--keep-temp") {
@@ -82,8 +76,8 @@ export function parseArgs(argv) {
     }
   }
   if (options.help) return options;
-  if (!options.pack && (options.tarball === undefined || options.artifactEvidence === undefined)) {
-    throw new Error("--tarball and --artifact-evidence are required unless --pack is supplied");
+  if (options.tarball === undefined || options.artifactEvidence === undefined) {
+    throw new Error("--tarball and --artifact-evidence are required");
   }
   return options;
 }
@@ -539,39 +533,12 @@ function main() {
   if (!fs.existsSync(fixtureRunner)) throw new Error(`fixture runner not found: ${fixtureRunner}`);
   if ((fs.statSync(fixtureRunner).mode & 0o111) === 0)
     throw new Error(`fixture runner is not executable: ${fixtureRunner}`);
-  let tarballPath = options.tarball === undefined ? undefined : path.resolve(options.tarball);
-  let artifactEvidencePath =
-    options.artifactEvidence === undefined ? undefined : path.resolve(options.artifactEvidence);
-  let ownsTarball = false;
-  let ownsEvidence = false;
+  const tarballPath = path.resolve(options.tarball);
+  const artifactEvidencePath = path.resolve(options.artifactEvidence);
   let tempRoot;
   try {
-    if (options.pack) {
-      tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-mottainai-uid-pack-"));
-      artifactEvidencePath = path.join(tempRoot, "packed-standalone-protected-execution.json");
-      run(
-        process.execPath,
-        [
-          "scripts/run-package-suite.mjs",
-          "--require-protected-execution",
-          "--keep-tarball",
-          "--evidence-output",
-          artifactEvidencePath,
-        ],
-        {
-          cwd: repoRoot,
-          stdio: "inherit",
-        },
-      );
-      tarballPath = path.join(repoRoot, `${packageJson.name}-${packageJson.version}.tgz`);
-      ownsTarball = true;
-      ownsEvidence = true;
-    }
-    if (tarballPath === undefined || artifactEvidencePath === undefined) {
-      throw new Error("an exact #149 tarball and evidence file are required");
-    }
     const artifact = assertPackedArtifact(tarballPath, artifactEvidencePath);
-    tempRoot ??= fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-mottainai-uid-handoff-"));
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-mottainai-uid-handoff-"));
     fs.chmodSync(tempRoot, 0o777);
     fs.mkdirSync(path.join(tempRoot, "tmp"), { recursive: true, mode: 0o777 });
     const consumer = path.join(tempRoot, "consumer");
@@ -613,8 +580,6 @@ function main() {
     writeEvidence(path.resolve(options.output), artifact, fixture, principals);
     console.log(`Mottainai packed UID handoff evidence recorded: ${path.resolve(options.output)}`);
   } finally {
-    if (ownsTarball && tarballPath !== undefined) fs.rmSync(tarballPath, { force: true });
-    if (ownsEvidence && artifactEvidencePath !== undefined) fs.rmSync(artifactEvidencePath, { force: true });
     if (tempRoot !== undefined && !options.keepTemp) fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 }

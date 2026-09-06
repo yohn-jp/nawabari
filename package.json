@@ -25,7 +25,7 @@
     "smoke-test": "node scripts/smoke-test.mjs",
     "test:package": "pnpm run build && node scripts/run-package-suite.mjs",
     "test:package:protected": "pnpm run build && node scripts/run-package-suite.mjs --require-protected-execution",
-    "test:package:mottainai": "pnpm run build && node scripts/run-mottainai-uid-handoff.mjs --pack",
+    "test:package:mottainai": "pnpm run build && node scripts/run-mottainai-uid-handoff-gate.mjs",
     "governance:actions": "node scripts/validate-actions.mjs",
     "governance:workflows": "node scripts/validate-workflows.mjs",
     "verify": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm test && pnpm run governance:actions && pnpm run governance:workflows && pnpm run test:package",

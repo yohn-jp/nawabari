@@ -14,12 +14,12 @@ test("UID handoff parser requires the exact packed artifact lineage", () => {
     "23001,23002",
   ]);
   assert.deepEqual(parsed.uids, [23001, 23002]);
-  assert.equal(parsed.pack, false);
+  assert.equal(parsed.tarball, "/tmp/nawabari.tgz");
+  assert.equal(parsed.artifactEvidence, "/tmp/packed.json");
 });
 
-test("UID handoff parser accepts the one-shot #149 pack path", () => {
-  const parsed = parseArgs(["--pack", "--help"]);
-  assert.equal(parsed.help, true);
+test("UID handoff parser never accepts a self-repack shortcut", () => {
+  assert.equal(parseArgs(["--help"]).help, true);
   assert.deepEqual(DEFAULT_UIDS, [23001, 23002]);
   assert.equal(UID_HANDOFF_CONTRACT_ID, "nawabari.mottainai-packed-uid-handoff.v1");
 });
