@@ -7,6 +7,7 @@ import {
   type SessionRegistryOptions,
 } from "../session-registry.js";
 import type { SessionLifecycleAction as RegistrySessionLifecycleAction } from "../session-lifecycle-actions.js";
+import { availableLifecycleOperations } from "../session-lifecycle-classification.js";
 import { isSessionRegistryError, type RegistryErrorCode, type SessionRegistryError } from "../errors.js";
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import {
@@ -44,6 +45,7 @@ import {
   type SessionListResult,
   type SessionListOptions,
   type SessionRecord,
+  type SessionStatusRecord,
   type IntegrationProof as DomainIntegrationProof,
   boundedSessionListing,
   type ReleaseClaimsOptions,
@@ -325,17 +327,25 @@ export class LocalSessionBackend implements SessionBackend {
   public async status(context: SessionContext, options: SessionListOptions = {}): Promise<DomainResult<StatusResult>> {
     try {
       const registry = this.registryFor(context);
-      let currentSession: SessionRecord | null = null;
+      let currentSession: SessionStatusRecord | null = null;
       try {
-        currentSession = toDomainRecord(registry.resolveCurrentSession());
+        const record = registry.resolveCurrentSession();
+        currentSession = toDomainStatusRecord(record, registry.diagnose(record.sessionId));
       } catch (error: unknown) {
         if (!isSessionRegistryError(error) || error.code !== "SESSION_NOT_FOUND") throw error;
       }
-      const listing = boundedSessionListing(registry.list().map(toDomainRecord), options);
+      const records = registry.list();
+      const listing = boundedSessionListing(records.map(toDomainRecord), options);
+      const statusSessions = listing.sessions.map((session) => {
+        const record = records.find((candidate) => candidate.sessionId === session.session_id);
+        if (record === undefined) return session;
+        return toDomainStatusRecord(record, registry.diagnose(record.sessionId));
+      });
       return success({
         repository: registry.repository.repositoryId,
         current_session: currentSession,
         ...listing,
+        sessions: statusSessions,
         capabilities: { ...LOCAL_SESSION_CAPABILITIES },
         managed_worktree_root: registry.managedWorktreeRoot,
       });
@@ -547,6 +557,48 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
     ...(record.label === undefined ? {} : { label: record.label }),
     ...(record.terminalOperation === undefined ? {} : { terminal_operation: record.terminalOperation }),
     ...(record.discardedHead === undefined ? {} : { discarded_head: record.discardedHead }),
+  };
+}
+
+function toDomainLifecycleProjection(
+  lifecycle: import("../session-registry.js").SessionLifecycleClassification,
+): NonNullable<SessionDiagnostic["lifecycle"]> {
+  return {
+    schema_version: lifecycle.schemaVersion,
+    state: lifecycle.state,
+    session_state: lifecycle.sessionState,
+    physical_state: lifecycle.physicalState,
+    close_readiness: lifecycle.closeReadiness,
+    blockers: lifecycle.blockers.map((blocker) => ({
+      code: blocker.code,
+      ...(blocker.classification === undefined ? {} : { classification: blocker.classification }),
+    })),
+    recoverability: lifecycle.recoverability,
+    age_suspicious: lifecycle.ageSuspicious,
+    gc_authorized: lifecycle.gcAuthorized,
+    destructive_cleanup_eligible: lifecycle.destructiveCleanupEligible,
+    available_operations: [...availableLifecycleOperations(lifecycle)],
+    transitions: lifecycle.transitions.map((transition) => ({ ...transition })),
+  };
+}
+
+function toDomainStatusRecord(
+  record: RegistrySessionRecord,
+  diagnostic: import("../session-registry.js").SessionDiagnostic,
+): import("./session.js").SessionStatusRecord {
+  const projected = toDomainSessionDiagnostic(diagnostic);
+  return {
+    ...toDomainRecord(record),
+    physical_state: projected.physical_state,
+    close_readiness: projected.close_readiness,
+    cleanup_readiness: projected.cleanup_readiness,
+    result_state: projected.result_state,
+    blockers: projected.blockers,
+    safe_actions: [...projected.safe_actions],
+    ...(projected.next_action === undefined ? {} : { next_action: projected.next_action }),
+    next_actions: projected.next_actions,
+    ...(projected.lifecycle_state === undefined ? {} : { lifecycle_state: projected.lifecycle_state }),
+    ...(projected.lifecycle === undefined ? {} : { lifecycle: projected.lifecycle }),
   };
 }
 
@@ -763,6 +815,10 @@ function toDomainGarbageCollectCandidate(
     suspicion_reason: candidate.suspicionReason,
     destructive_eligibility: candidate.destructiveEligibility,
     destructive_eligibility_reason: candidate.destructiveEligibilityReason,
+    ...(candidate.lifecycle === undefined ? {} : { lifecycle: toDomainLifecycleProjection(candidate.lifecycle) }),
+    ...(candidate.nextActions === undefined
+      ? {}
+      : { next_actions: candidate.nextActions.map(toDomainSessionLifecycleAction) }),
   };
 }
 
@@ -807,22 +863,7 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
       ? {}
       : {
           lifecycle_state: diagnostic.lifecycle.state,
-          lifecycle: {
-            schema_version: diagnostic.lifecycle.schemaVersion,
-            state: diagnostic.lifecycle.state,
-            session_state: diagnostic.lifecycle.sessionState,
-            physical_state: diagnostic.lifecycle.physicalState,
-            close_readiness: diagnostic.lifecycle.closeReadiness,
-            blockers: diagnostic.lifecycle.blockers.map((blocker) => ({
-              code: blocker.code,
-              ...(blocker.classification === undefined ? {} : { classification: blocker.classification }),
-            })),
-            recoverability: diagnostic.lifecycle.recoverability,
-            age_suspicious: diagnostic.lifecycle.ageSuspicious,
-            gc_authorized: diagnostic.lifecycle.gcAuthorized,
-            destructive_cleanup_eligible: diagnostic.lifecycle.destructiveCleanupEligible,
-            transitions: diagnostic.lifecycle.transitions.map((transition) => ({ ...transition })),
-          },
+          lifecycle: toDomainLifecycleProjection(diagnostic.lifecycle),
         }),
     garbage_collection: toDomainGarbageCollectCandidate(diagnostic.garbageCollection),
   };

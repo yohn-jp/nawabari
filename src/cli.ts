@@ -1630,7 +1630,7 @@ async function executeCommand(
     const options = sessionListingOptions(parsed.value);
     if (!options.ok) return options;
     const result = await dependencies.backend.status(context, options.value);
-    return result.ok ? { ok: true, value: result.value } : result;
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
   }
 
   if (command === "guard") {
@@ -1689,7 +1689,7 @@ async function executeCommand(
     if (!parsed.ok) return parsed;
     const options: GarbageCollectOptions = { apply: parsed.value.apply };
     const result = await dependencies.backend.garbageCollect(context, options);
-    return result.ok ? { ok: true, value: result.value } : result;
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
   }
 
   if (command === "doctor") {

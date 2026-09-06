@@ -1,5 +1,9 @@
 import { DomainError, type DomainResult, failure, type ErrorCode, type JsonObject } from "./errors.js";
-import type { SessionLifecycleState, SessionLifecycleTransition } from "../session-lifecycle-classification.js";
+import type {
+  SessionLifecycleOperation,
+  SessionLifecycleState,
+  SessionLifecycleTransition,
+} from "../session-lifecycle-classification.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -182,6 +186,26 @@ export type SessionDiagnosticIntegrationEvidence = {
   proof?: IntegrationProof;
 };
 
+/**
+ * Stable public projection of the XState-derived lifecycle snapshot. It is
+ * derived evidence, not persisted SessionRecord state and not a mutation
+ * authority.
+ */
+export type SessionLifecycleProjection = {
+  schema_version: number;
+  state: SessionLifecycleState;
+  session_state: string;
+  physical_state: string | null;
+  close_readiness: string;
+  blockers: { code: string; classification?: string }[];
+  recoverability: "none" | "recoverable" | "ambiguous";
+  age_suspicious: boolean;
+  gc_authorized: boolean;
+  destructive_cleanup_eligible: boolean;
+  available_operations: SessionLifecycleOperation[];
+  transitions: SessionLifecycleTransition[];
+};
+
 export type SessionLifecycleAction =
   | {
       schema_version: 1;
@@ -246,19 +270,21 @@ export type SessionDiagnostic = {
   garbage_collection?: GarbageCollectCandidate;
   /** Canonical read-only termination/recovery classification. */
   lifecycle_state?: SessionLifecycleState;
-  lifecycle?: {
-    schema_version: number;
-    state: SessionLifecycleState;
-    session_state: string;
-    physical_state: string | null;
-    close_readiness: string;
-    blockers: { code: string; classification?: string }[];
-    recoverability: "none" | "recoverable" | "ambiguous";
-    age_suspicious: boolean;
-    gc_authorized: boolean;
-    destructive_cleanup_eligible: boolean;
-    transitions: SessionLifecycleTransition[];
-  };
+  lifecycle?: SessionLifecycleProjection;
+};
+
+/** Status rows retain persisted identity while carrying derived lifecycle data. */
+export type SessionStatusRecord = SessionRecord & {
+  physical_state?: string;
+  close_readiness?: ReadinessState;
+  cleanup_readiness?: ReadinessState;
+  result_state?: DiagnosticCompleteness;
+  blockers?: SessionDiagnosticBlocker[];
+  safe_actions?: string[];
+  next_action?: SessionLifecycleAction;
+  next_actions?: SessionLifecycleAction[];
+  lifecycle_state?: SessionLifecycleState;
+  lifecycle?: SessionLifecycleProjection;
 };
 
 export type GuardOptions = {
@@ -498,6 +524,9 @@ export type GarbageCollectCandidate = SessionRecord & {
     | "explicit-closing-state"
     | "prunable-missing-worktree"
     | "physical-state-ambiguous";
+  /** Canonical read-only lifecycle projection for the GC observation. */
+  lifecycle?: SessionLifecycleProjection;
+  next_actions?: SessionLifecycleAction[];
 };
 
 export type BackendCapabilities = {
@@ -538,8 +567,8 @@ export type SessionListResult = {
 
 export type StatusResult = {
   repository: string | null;
-  current_session: SessionRecord | null;
-  sessions: SessionRecord[];
+  current_session: SessionStatusRecord | null;
+  sessions: SessionStatusRecord[];
   capabilities: BackendCapabilities;
   managed_worktree_root?: string | null;
   total?: number;

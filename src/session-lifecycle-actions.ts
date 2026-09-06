@@ -1,4 +1,4 @@
-import type { SessionLifecycleClassification } from "./session-lifecycle-classification.js";
+import { lifecycleTransition, type SessionLifecycleClassification } from "./session-lifecycle-classification.js";
 
 /**
  * The small, public vocabulary for lifecycle recovery.  These values are
@@ -122,14 +122,23 @@ export function projectSessionLifecycleActions(
   const { classification, sessionId } = input;
   const blocker = input.blockers?.[0];
   const details = blocker?.details;
+  const close = lifecycleTransition(classification, "close");
+  const discard = lifecycleTransition(classification, "discard");
 
-  if (classification.state === "closed" || classification.state === "discarded") return Object.freeze([]);
+  // Lifecycle state and operation admissibility come from the machine-derived
+  // transition projection. This adapter only chooses a caller-facing action
+  // for the already-authoritative blocker evidence.
+  if (close.allowed || discard.reason === "discarded-terminal" || close.reason === "closed-terminal") {
+    return Object.freeze([]);
+  }
 
-  if (classification.state === "stale-inconsistent") {
+  if (close.reason === "physical-reconciliation-required") {
     return Object.freeze([reconcileAction(sessionId)]);
   }
 
-  if (classification.state !== "blocked-recoverable") return Object.freeze([]);
+  if (close.reason !== "recoverable-work-must-be-retained-or-discarded" || !discard.allowed) {
+    return Object.freeze([]);
+  }
 
   const actions: SessionLifecycleAction[] = [];
   if (blocker?.code === "INTEGRATION_FETCH_FAILED") {

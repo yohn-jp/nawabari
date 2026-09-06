@@ -52,6 +52,16 @@ test("status exposes the resolved managed root and bounded history selection", a
       status.value.sessions.some((session) => session.session_id === created.value.session_id),
       true,
     );
+    const statusSession = status.value.sessions.find((session) => session.session_id === created.value.session_id);
+    const inspected = await backend.sessionDiagnostic(
+      { cwd: repositoryPath },
+      { session_id: created.value.session_id, integrated_revision: null },
+    );
+    assert.equal(inspected.ok, true);
+    if (!inspected.ok || statusSession === undefined) return;
+    assert.equal(statusSession.lifecycle_state, inspected.value.lifecycle_state);
+    assert.deepEqual(statusSession.lifecycle, inspected.value.lifecycle);
+    assert.deepEqual(statusSession.next_actions, inspected.value.next_actions);
 
     const closed = await backend.closeSession({ cwd: repositoryPath }, { session_id: created.value.session_id });
     assert.equal(closed.ok, true);

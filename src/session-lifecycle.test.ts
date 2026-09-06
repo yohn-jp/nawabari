@@ -638,6 +638,11 @@ test("gc reports age suspicion without granting destructive authority to a healt
     assert.equal(detected.candidates[0].suspicion, "age");
     assert.equal(detected.candidates[0].destructiveEligibility, "ineligible");
     assert.equal(detected.candidates[0].destructiveEligibilityReason, "age-only");
+    assert.equal(detected.candidates[0].lifecycle?.state, "close-ready");
+    assert.equal(
+      detected.candidates[0].lifecycle?.transitions.find((transition) => transition.operation === "gc")?.allowed,
+      false,
+    );
     assert.equal(detected.eligible.length, 0);
     assert.equal(detected.cleaned.length, 0);
     assert.equal(registry.get(session.sessionId)?.state, "active");
@@ -668,6 +673,11 @@ test("gc cleans a healthy worktree only when stale lifecycle state is explicit",
     assert.equal(dryRun.candidates[0]?.suspicion, "lifecycle");
     assert.equal(dryRun.candidates[0]?.destructiveEligibility, "eligible");
     assert.equal(dryRun.candidates[0]?.destructiveEligibilityReason, "explicit-stale-state");
+    assert.equal(dryRun.candidates[0]?.lifecycle?.state, "close-ready");
+    assert.equal(
+      dryRun.candidates[0]?.lifecycle?.transitions.find((transition) => transition.operation === "gc")?.allowed,
+      true,
+    );
     assert.equal(dryRun.eligible.length, 1);
     assert.deepEqual(dryRun.blocked, []);
 
@@ -725,6 +735,11 @@ test("gc marks stale dirty sessions but does not remove recoverable work", () =>
     assert.equal(result.blocked.length, 1);
     assert.equal(result.blocked[0].sessionId, session.sessionId);
     assert.equal(result.blocked[0].code, "DIRTY_WORKTREE");
+    assert.equal(result.candidates[0]?.lifecycle?.state, "blocked-recoverable");
+    assert.deepEqual(
+      result.candidates[0]?.nextActions?.map((action) => action.actionId),
+      ["retain-session", "discard-session"],
+    );
     assert.equal(registry.get(session.sessionId)?.state, "stale");
     assert.equal(fs.existsSync(worktreePath), true);
   } finally {

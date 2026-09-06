@@ -5,6 +5,8 @@ import process from "node:process";
 import { defaultGit, resolveRepositoryContext, type RepositoryContext } from "../git.js";
 import { isSessionRegistryError } from "../errors.js";
 import { SessionRegistry } from "../session-registry.js";
+import { projectSessionLifecycleActions } from "../session-lifecycle-actions.js";
+import { availableLifecycleOperations } from "../session-lifecycle-classification.js";
 import { success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import { supportsRuntime } from "./runtime.js";
 import { defaultSandboxProbe, sandboxDoctorReport, type SandboxDoctorReport, type SandboxProbe } from "./sandbox.js";
@@ -120,6 +122,49 @@ async function inspectReconciliation(context: RepositoryContext): Promise<Doctor
           status: session.status,
           physical_state: session.physicalState,
           lifecycle_state: session.lifecycle?.state ?? null,
+          lifecycle:
+            session.lifecycle === undefined
+              ? null
+              : {
+                  schema_version: session.lifecycle.schemaVersion,
+                  state: session.lifecycle.state,
+                  session_state: session.lifecycle.sessionState,
+                  physical_state: session.lifecycle.physicalState,
+                  close_readiness: session.lifecycle.closeReadiness,
+                  blockers: session.lifecycle.blockers.map((blocker) => ({
+                    code: blocker.code,
+                    ...(blocker.classification === undefined ? {} : { classification: blocker.classification }),
+                  })),
+                  recoverability: session.lifecycle.recoverability,
+                  age_suspicious: session.lifecycle.ageSuspicious,
+                  gc_authorized: session.lifecycle.gcAuthorized,
+                  destructive_cleanup_eligible: session.lifecycle.destructiveCleanupEligible,
+                  available_operations: [...availableLifecycleOperations(session.lifecycle)],
+                  transitions: session.lifecycle.transitions.map((transition) => ({ ...transition })),
+                  next_actions: projectSessionLifecycleActions({
+                    classification: session.lifecycle,
+                    sessionId: session.session.sessionId,
+                    blockers: session.blockers.map((blocker) => ({ code: blocker.code, details: blocker.details })),
+                  }).map((action) => ({
+                    schema_version: action.schemaVersion,
+                    action_id: action.actionId,
+                    kind: action.kind,
+                    command: action.command,
+                    ...(action.kind === "integrated-revision"
+                      ? { integrated_revision: action.integratedRevision }
+                      : action.kind === "bounded-integration-fetch"
+                        ? {
+                            integrated_revision: action.integratedRevision,
+                            fetch_remote: action.fetchRemote,
+                            fetch_branch: action.fetchBranch,
+                          }
+                        : action.kind === "explicit-discard"
+                          ? { session_id: action.sessionId, requires_explicit_intent: action.requiresExplicitIntent }
+                          : action.kind === "reconcile"
+                            ? { session_id: action.sessionId, mutates: action.mutates }
+                            : { reason: action.reason }),
+                  })),
+                },
         })),
         worktrees: result.worktrees.length,
         issues,
