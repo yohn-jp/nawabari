@@ -40,14 +40,14 @@ const KNOWN_SESSION_STATES = new Set(["new", "active", "closing", "closed", "sta
 const KNOWN_PHYSICAL_STATES = new Set(["healthy", "closed", ...STALE_PHYSICAL_STATES]);
 const KNOWN_BLOCKER_CLASSIFICATIONS = new Set(["recoverable", "ambiguous", "stale"]);
 
-type BlockerKind = "none" | "recoverable" | "ambiguous";
+export type SessionLifecycleBlockerKind = "none" | "recoverable" | "ambiguous";
 
 /**
- * Return the classifier's blocker category without consulting the classifier.
- * This is deliberately kept as machine-local executable guard logic for the
- * shadow phase; the existing classifier remains the production authority.
+ * Classify already-observed blocker evidence for the lifecycle machine.
+ * This is domain projection input to the guards; it never observes an
+ * external authority and must remain deterministic for the same observation.
  */
-function blockerKind(blockers: readonly SessionLifecycleBlocker[]): BlockerKind {
+export function classifyObservationBlockers(blockers: readonly SessionLifecycleBlocker[]): SessionLifecycleBlockerKind {
   if (blockers.some((blocker) => blocker.classification === "ambiguous" || AMBIGUOUS_CODES.has(blocker.code))) {
     return "ambiguous";
   }
@@ -82,7 +82,7 @@ export function isObservationStaleInconsistent(context: SessionMachineContext): 
   const blockers = current.blockers ?? [];
   const physicalState = current.physicalState ?? null;
   const closeReadiness = current.closeReadiness ?? "not-evaluated";
-  const recoverability = blockerKind(blockers);
+  const recoverability = classifyObservationBlockers(blockers);
   const physicalEvidenceRequired = current.sessionState !== "closed";
   const ambiguousReadiness = closeReadiness === "ambiguous" || (closeReadiness === "blocked" && blockers.length === 0);
 
@@ -98,7 +98,7 @@ export function isObservationStaleInconsistent(context: SessionMachineContext): 
 
 /** Explicit discard intent is observation data, never an age-derived guess. */
 export function hasExplicitDiscardIntent(context: SessionMachineContext): boolean {
-  return context.observation.terminalOperation === "discard" || context.persisted.terminalOperation === "discard";
+  return context.observation.terminalOperation === "discard" || context.persisted?.terminalOperation === "discard";
 }
 
 export function isObservationDiscarded(context: SessionMachineContext): boolean {
@@ -111,7 +111,7 @@ export function isObservationClosed(context: SessionMachineContext): boolean {
 
 export function isObservationBlockedRecoverable(context: SessionMachineContext): boolean {
   const current = observation(context);
-  const recoverability = blockerKind(current.blockers ?? []);
+  const recoverability = classifyObservationBlockers(current.blockers ?? []);
   return recoverability === "recoverable" || current.closeReadiness === "external_evidence_required";
 }
 

@@ -63,7 +63,8 @@ export type SessionObservationPhase = SessionLifecyclePhase;
 
 /** Input hydrated from authoritative adapters before a machine is evaluated. */
 export interface SessionMachineInput {
-  readonly persisted: SessionPersistedStateInput;
+  /** Optional because lifecycle projection may receive observation only. */
+  readonly persisted?: SessionPersistedStateInput;
   readonly observation: SessionObservationInput;
   readonly evidence?: SessionEvidenceInput;
 }
@@ -73,7 +74,7 @@ export interface SessionMachineInput {
  * does not own authoritative facts or mutation capabilities.
  */
 export interface SessionMachineContext {
-  readonly persisted: SessionPersistedStateInput;
+  readonly persisted?: SessionPersistedStateInput;
   readonly observation: SessionObservationInput;
   readonly evidence: SessionEvidenceInput;
 }
