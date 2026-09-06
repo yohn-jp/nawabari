@@ -537,6 +537,13 @@ export function discoverSandboxRuntimeLayout(environment: NodeJS.ProcessEnv = pr
     candidateHome !== null && path.isAbsolute(candidateHome) && !candidateHome.includes("\0") ? candidateHome : null;
   const user = environment.USER ?? environment.LOGNAME ?? null;
   const perUserProfile = user === null ? null : `/etc/profiles/per-user/${user}`;
+  const nixStore = existingPath("/nix/store");
+  const nixCurrentSystem = existingPath("/run/current-system");
+  // A NixOS Runtime is non-FHS by contract.  The current system closure and
+  // store are the authoritative executable/runtime roots; selecting a broad
+  // /usr (or its /bin,/lib symlink views) would accidentally expose the outer
+  // Runtime and hide a missing NixOS path behind a compatibility mount.
+  const nixOSRuntime = nixStore !== null && nixCurrentSystem !== null;
   return {
     bubblewrap: executableOnPath("bwrap", environment),
     landlock_helper: executableOnPath("python3", environment),
@@ -544,14 +551,14 @@ export function discoverSandboxRuntimeLayout(environment: NodeJS.ProcessEnv = pr
     user_local_bin: home === null ? null : existingPath(path.join(home, ".local", "bin")),
     user_local_lib: home === null ? null : existingPath(path.join(home, ".local", "lib")),
     user_pnpm_bin: home === null ? null : existingPath(path.join(home, ".local", "share", "pnpm")),
-    nix_store: existingPath("/nix/store"),
-    nix_current_system: existingPath("/run/current-system"),
+    nix_store: nixStore,
+    nix_current_system: nixCurrentSystem,
     nix_wrappers: existingPath("/run/wrappers"),
     nix_user_profile: perUserProfile === null ? null : existingPath(perUserProfile),
-    usr: existingPath("/usr"),
-    bin: existingPath("/bin"),
-    lib: existingPath("/lib"),
-    lib64: existingPath("/lib64"),
+    usr: nixOSRuntime ? null : existingPath("/usr"),
+    bin: nixOSRuntime ? null : existingPath("/bin"),
+    lib: nixOSRuntime ? null : existingPath("/lib"),
+    lib64: nixOSRuntime ? null : existingPath("/lib64"),
     passwd: existingPath("/etc/passwd"),
     group: existingPath("/etc/group"),
     nsswitch: existingPath("/etc/nsswitch.conf"),

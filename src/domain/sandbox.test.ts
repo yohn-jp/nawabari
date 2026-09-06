@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { SessionRegistry, toPersistedSessionRecord, REGISTRY_SCHEMA_VERSION } from "../session-registry.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import {
+  discoverSandboxRuntimeLayout,
   resolveSandboxExecutionRequest,
   sandboxDoctorReport,
   SANDBOX_REQUIRED_CAPABILITIES,
@@ -85,6 +86,21 @@ test("sandbox doctor marks every capability not_applicable on an unsupported pla
     ),
     true,
   );
+});
+
+test("NixOS discovery uses explicit closure roots instead of broad FHS views", (t) => {
+  const layout = discoverSandboxRuntimeLayout();
+  if (layout.nix_store === null || layout.nix_current_system === null) {
+    t.skip("canonical NixOS Runtime paths are unavailable in this environment");
+    return;
+  }
+
+  assert.equal(layout.usr, null);
+  assert.equal(layout.bin, null);
+  assert.equal(layout.lib, null);
+  assert.equal(layout.lib64, null);
+  assert.equal(layout.nix_store, "/nix/store");
+  assert.equal(layout.nix_current_system, "/run/current-system");
 });
 
 test("resolveSandboxExecutionRequest binds an owned active session and derives its filesystem topology", async () => {

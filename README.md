@@ -57,12 +57,27 @@ attempted.
 On standalone Linux the profile uses existing `/usr`, `/bin`, `/lib*` and
 selected `/etc` paths only when present. On NixOS it additionally selects
 `/nix/store`, `/run/current-system`, `/run/wrappers`, and the per-user profile
-when present; no `/usr` layout is assumed. Missing required paths or namespace
+when present; broad FHS views (`/usr`, `/bin`, `/lib*`) are not selected when
+the NixOS closure roots are present. Missing required paths or namespace
 support produces a stable capability/topology error. The protected child uses
 `nawabari.seccomp.v1`, a compatibility-first deny-list whose policy denials
 return `EPERM` rather than hanging or terminating ordinary development
 subprocess trees. Ambient capabilities are empty (`--cap-drop ALL`). Network
 remains inherited by design.
+
+The canonical Mottainai NixOS Runtime fixture can run the opt-in compatibility
+conformance matrix as its unprivileged repository principal:
+
+```bash
+NAWABARI_NIXOS_RUNTIME_CONFORMANCE=1 \
+  node --test --import tsx src/domain/nixos-runtime-compat.test.ts
+```
+
+This invokes the normal `session run` CLI route and production launcher. It
+checks explicit NixOS closure paths, private versus repository-shared HOME
+state, Git/checkpoint authority, representative toolchain subprocesses, and
+sequential/concurrent session isolation. It does not create a test-only
+sandbox or treat Mottainai state as Nawabari authority.
 
 ## Install
 
