@@ -21,6 +21,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "benchmark:pnpm-worktree-install": "node scripts/benchmark-pnpm-worktree-install.mjs",
+    "benchmark:protected-execution": "node scripts/benchmark-protected-execution.mjs",
     "smoke-test": "node scripts/smoke-test.mjs",
     "test:package": "pnpm run build && node scripts/run-package-suite.mjs",
     "governance:actions": "node scripts/validate-actions.mjs",
