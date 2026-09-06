@@ -89,6 +89,7 @@ export type SessionMachineEvent =
     })
   | (SessionEventWithPayload & { readonly type: "SESSION.CLOSE.REQUESTED" })
   | (SessionEventWithPayload & { readonly type: "SESSION.DISCARD.REQUESTED" })
+  | (SessionEventWithPayload & { readonly type: "SESSION.DOCTOR.REQUESTED" })
   | (SessionEventWithPayload & { readonly type: "SESSION.RECONCILE.REQUESTED" })
   | (SessionEventWithPayload & { readonly type: "SESSION.GC.REQUESTED" })
   | (SessionEventWithPayload & { readonly type: "SESSION.CLEANUP.RETRY" })
@@ -99,6 +100,7 @@ export const SESSION_MACHINE_EVENT_TYPES = Object.freeze([
   "SESSION.OBSERVE",
   "SESSION.CLOSE.REQUESTED",
   "SESSION.DISCARD.REQUESTED",
+  "SESSION.DOCTOR.REQUESTED",
   "SESSION.RECONCILE.REQUESTED",
   "SESSION.GC.REQUESTED",
   "SESSION.CLEANUP.RETRY",
