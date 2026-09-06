@@ -271,6 +271,104 @@ test("preserves explicit transport authentication variables while enforcing loca
   }
 });
 
+test("sanitizes Git authority environment regardless of key casing", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-environment-"));
+  try {
+    const git = createGitCommandRunner({
+      executable: process.execPath,
+      env: {
+        git_dir: "/foreign/.git",
+        Git_Work_Tree: "/foreign",
+        GIT_CONFIG_count: "1",
+        git_config_key_0: "core.worktree",
+        git_config_value_0: "/foreign",
+        git_external_diff: "/explicit/evil-diff",
+      },
+    });
+    const observed = JSON.parse(
+      git.run(
+        [
+          "-e",
+          "process.stdout.write(JSON.stringify({dir: process.env.git_dir ?? process.env.GIT_DIR, worktree: process.env.Git_Work_Tree ?? process.env.GIT_WORK_TREE, configCount: process.env.GIT_CONFIG_count ?? process.env.GIT_CONFIG_COUNT, externalDiff: process.env.git_external_diff ?? process.env.GIT_EXTERNAL_DIFF}))",
+        ],
+        directory,
+      ),
+    ) as Record<string, string | undefined>;
+
+    assert.equal(observed.dir, undefined);
+    assert.equal(observed.worktree, undefined);
+    assert.equal(observed.configCount, undefined);
+    assert.equal(observed.externalDiff, undefined);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("sanitizes Git environment that changes local observation or mutation semantics", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-environment-"));
+  try {
+    const git = createGitCommandRunner({
+      executable: process.execPath,
+      env: {
+        GIT_EXTERNAL_DIFF: "/explicit/evil-diff",
+        GIT_PAGER: "/explicit/evil-pager",
+        GIT_EDITOR: "/explicit/evil-editor",
+        GIT_SEQUENCE_EDITOR: "/explicit/evil-sequence-editor",
+        GIT_ICASE_PATHSPECS: "1",
+        GIT_LITERAL_PATHSPECS: "1",
+        GIT_GLOB_PATHSPECS: "1",
+        GIT_NOGLOB_PATHSPECS: "1",
+        GIT_ATTR_SOURCE: "refs/heads/foreign",
+        GIT_SSH_COMMAND: "ssh -i /explicit/key",
+      },
+    });
+    const observed = JSON.parse(
+      git.run(
+        [
+          "-e",
+          "process.stdout.write(JSON.stringify({externalDiff: process.env.GIT_EXTERNAL_DIFF, pager: process.env.GIT_PAGER, editor: process.env.GIT_EDITOR, sequenceEditor: process.env.GIT_SEQUENCE_EDITOR, icasePathspecs: process.env.GIT_ICASE_PATHSPECS, literalPathspecs: process.env.GIT_LITERAL_PATHSPECS, globPathspecs: process.env.GIT_GLOB_PATHSPECS, noglobPathspecs: process.env.GIT_NOGLOB_PATHSPECS, attrSource: process.env.GIT_ATTR_SOURCE, ssh: process.env.GIT_SSH_COMMAND}))",
+        ],
+        directory,
+      ),
+    ) as Record<string, string | undefined>;
+
+    assert.equal(observed.externalDiff, undefined);
+    assert.equal(observed.pager, undefined);
+    assert.equal(observed.editor, undefined);
+    assert.equal(observed.sequenceEditor, undefined);
+    assert.equal(observed.icasePathspecs, undefined);
+    assert.equal(observed.literalPathspecs, undefined);
+    assert.equal(observed.globPathspecs, undefined);
+    assert.equal(observed.noglobPathspecs, undefined);
+    assert.equal(observed.attrSource, undefined);
+    assert.equal(observed.ssh, "ssh -i /explicit/key");
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("does not let GIT_EXTERNAL_DIFF substitute an external process for evidence diffs", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const canaryPath = path.join(fixture.repositoryPath, "external-diff-ran.txt");
+    const script = path.join(fixture.repositoryPath, "external-diff.cjs");
+    fs.writeFileSync(script, `require("fs").writeFileSync(${JSON.stringify(canaryPath)}, "ran");\nprocess.exit(0);\n`);
+    fs.writeFileSync(path.join(fixture.repositoryPath, "README.md"), "changed\n");
+
+    const git = createGitCommandRunner({
+      env: {
+        GIT_EXTERNAL_DIFF: `${process.execPath} ${script}`,
+      },
+    });
+
+    git.run(["diff"], fixture.repositoryPath);
+
+    assert.equal(fs.existsSync(canaryPath), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("does not collapse unexpected Git exits or unavailable observations", () => {
   const fixture = createRepositoryFixture();
   try {

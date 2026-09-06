@@ -35,13 +35,64 @@ const GIT_AUTHORITY_ENVIRONMENT_VARIABLES = new Set([
 ]);
 
 /**
+ * Git environment variables which do not change repository identity but can
+ * still change local observation or mutation semantics away from Git's own
+ * defaults: substituting an external diff/pathspec/pager/editor process,
+ * rewriting index or attribute behavior, or altering which paths a command
+ * observes or mutates. These are execution-semantics authority, not
+ * transport/authentication, and are removed for the same reason as the
+ * repository-identity variables above.
+ */
+const GIT_SEMANTICS_ENVIRONMENT_VARIABLES = new Set([
+  "GIT_EXTERNAL_DIFF",
+  "GIT_DIFF_OPTS",
+  "GIT_DIFF_PATH_COUNTER",
+  "GIT_DIFF_PATH_TOTAL",
+  "GIT_PAGER",
+  "GIT_EDITOR",
+  "GIT_SEQUENCE_EDITOR",
+  "GIT_MERGE_VERBOSITY",
+  "GIT_ATTR_SOURCE",
+  "GIT_ICASE_PATHSPECS",
+  "GIT_LITERAL_PATHSPECS",
+  "GIT_GLOB_PATHSPECS",
+  "GIT_NOGLOB_PATHSPECS",
+  "GIT_REFLOG_ACTION",
+  "GIT_INDEX_VERSION",
+]);
+
+/**
+ * Git environment variable name prefixes which govern the same authority
+ * boundaries as the exact-name sets above. Matched case-insensitively so
+ * that a case-insensitive host environment (e.g. Windows) cannot preserve a
+ * differently-cased alias of a sanitized variable.
+ */
+const GIT_ENVIRONMENT_AUTHORITY_PREFIXES = ["GIT_CONFIG_"];
+
+/**
  * Git config environment is an authority boundary too.  In particular,
  * GIT_CONFIG_COUNT/KEY_n/VALUE_n and GIT_CONFIG_PARAMETERS can inject config
  * without changing the caller's cwd.  System and global config are disabled
  * for governed Git operations; repository-local config remains Git's local
  * authority and transport/authentication variables remain available.
+ *
+ * Matching is case-insensitive: `NodeJS.ProcessEnv` keys are treated as
+ * case-sensitive by V8/Node on every platform, but the underlying OS
+ * environment on Windows is case-insensitive, so a caller-supplied `git_dir`
+ * or `Git_Config_Count` reaches the same native environment block as
+ * `GIT_DIR`/`GIT_CONFIG_COUNT`. Sanitizing only the exact-cased key would
+ * leave a same-effect alias in place on that platform.
  */
 const GIT_CONFIG_NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+
+function isSanitizedGitEnvironmentKey(key: string): boolean {
+  const upperCaseKey = key.toUpperCase();
+  return (
+    GIT_AUTHORITY_ENVIRONMENT_VARIABLES.has(upperCaseKey) ||
+    GIT_SEMANTICS_ENVIRONMENT_VARIABLES.has(upperCaseKey) ||
+    GIT_ENVIRONMENT_AUTHORITY_PREFIXES.some((prefix) => upperCaseKey.startsWith(prefix))
+  );
+}
 
 function canonicalGitSubprocessEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
@@ -50,7 +101,7 @@ function canonicalGitSubprocessEnvironment(overrides: NodeJS.ProcessEnv = {}): N
   };
 
   for (const key of Object.keys(environment)) {
-    if (GIT_AUTHORITY_ENVIRONMENT_VARIABLES.has(key) || key.startsWith("GIT_CONFIG_")) {
+    if (isSanitizedGitEnvironmentKey(key)) {
       delete environment[key];
     }
   }
