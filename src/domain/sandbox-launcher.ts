@@ -236,13 +236,12 @@ function pathMatches(candidate: string, root: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
 
-function allowedSystemPath(candidate: string): boolean {
+const BROAD_FHS_SYSTEM_ROOTS = ["/usr", "/bin", "/lib", "/lib64"] as const;
+
+function allowedSystemPath(candidate: string, nixOSRuntime = false): boolean {
   const normalized = path.normalize(candidate);
   const roots = [
-    "/usr",
-    "/bin",
-    "/lib",
-    "/lib64",
+    ...BROAD_FHS_SYSTEM_ROOTS,
     "/nix/store",
     "/run/current-system",
     "/run/wrappers",
@@ -255,8 +254,14 @@ function allowedSystemPath(candidate: string): boolean {
     "/etc/pki",
     "/etc/ca-certificates",
   ];
+  if (nixOSRuntime && BROAD_FHS_SYSTEM_ROOTS.some((root) => pathMatches(normalized, root))) return false;
   if (roots.some((root) => pathMatches(normalized, root))) return true;
   return new Set(["/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf"]).has(normalized);
+}
+
+function isNixOSRuntime(request: SandboxExecutionRequest): boolean {
+  const runtimePaths = new Set(request.filesystem.runtime_paths);
+  return runtimePaths.has("/nix/store") && runtimePaths.has("/run/current-system");
 }
 
 function allowedRuntimePath(candidate: string): boolean {
@@ -384,7 +389,7 @@ function validateExecutable(request: SandboxExecutionRequest): DomainResult<stri
       );
     }
     if (
-      !allowedSystemPath(resolved) &&
+      !allowedSystemPath(resolved, isNixOSRuntime(request)) &&
       allowedUserToolPath(resolved, request.filesystem.user_tool_home) === null &&
       !allowedRuntimePath(resolved)
     ) {
@@ -432,7 +437,7 @@ function validateLandlockExecutable(request: SandboxExecutionRequest): DomainRes
     }
     const resolved = fs.realpathSync.native(source);
     if (
-      !allowedSystemPath(resolved) &&
+      !allowedSystemPath(resolved, isNixOSRuntime(request)) &&
       !allowedRuntimePath(resolved) &&
       allowedUserToolPath(resolved, request.filesystem.user_tool_home) === null
     ) {
@@ -452,6 +457,7 @@ function validateLandlockExecutable(request: SandboxExecutionRequest): DomainRes
 }
 
 function validateProfilePaths(request: SandboxExecutionRequest): DomainResult<null> {
+  const nixOSRuntime = isNixOSRuntime(request);
   for (const source of request.filesystem.runtime_paths) {
     if (!allowedRuntimePath(source)) {
       return topologyError("The runtime path is outside the canonical profile.", { path: source });
@@ -472,14 +478,14 @@ function validateProfilePaths(request: SandboxExecutionRequest): DomainResult<nu
     }
   }
   for (const source of request.filesystem.system_paths) {
-    if (!allowedSystemPath(source)) {
+    if (!allowedSystemPath(source, nixOSRuntime)) {
       return topologyError("The system path is outside the canonical profile.", { path: source });
     }
     const checked = ensureSourcePath(source, "system path");
     if (!checked.ok) return checked;
     try {
       const resolved = fs.realpathSync.native(source);
-      if (!allowedSystemPath(resolved)) {
+      if (!allowedSystemPath(resolved, nixOSRuntime)) {
         return topologyError("The system path symlink resolves outside the canonical profile.", {
           path: source,
           resolved,
