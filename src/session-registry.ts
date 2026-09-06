@@ -109,6 +109,7 @@ export type {
   SessionLifecycleNextActionId,
 } from "./session-lifecycle-actions.js";
 export {
+  availableLifecycleOperations,
   classifySessionLifecycle,
   lifecycleTransition,
   SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION,
@@ -376,6 +377,10 @@ export interface GarbageCollectCandidate extends SessionRecord {
   readonly suspicionReason: GarbageCollectSuspicionReason;
   readonly destructiveEligibility: GarbageCollectEligibility;
   readonly destructiveEligibilityReason: GarbageCollectEligibilityReason;
+  /** Canonical read-only lifecycle projection for this GC observation. */
+  readonly lifecycle?: SessionLifecycleClassification;
+  /** Typed caller actions projected from the same lifecycle snapshot. */
+  readonly nextActions?: readonly SessionLifecycleAction[];
 }
 
 export interface GarbageCollectBlocked {
@@ -2631,20 +2636,39 @@ export class SessionRegistry {
       const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
       const assessments = records
         .filter((record) => record.state !== "closed")
-        .map((record) => assessGarbageCollection(record, now, staleAfterMs, worktrees));
+        .map((record) => {
+          const assessment = assessGarbageCollection(record, now, staleAfterMs, worktrees);
+          const decision = this.cleanupDecisionUnsafe(record, state);
+          const lifecycle = classifySessionLifecycle({
+            sessionState: record.state,
+            physicalState: decision.physicalState,
+            closeReadiness: decision.lifecycle?.closeReadiness ?? (decision.allowed ? "ready" : "blocked"),
+            blockers: decision.blockers.map((blocker) => ({ code: blocker.code })),
+            terminalOperation: record.terminalOperation,
+            ageSuspicious: assessment.suspicion === "age",
+            // GC's existing candidate assessment is the independent positive
+            // authority; the machine still evaluates the complete observed
+            // cleanup evidence and may reject the event.
+            gcAuthorized: assessment.destructiveEligibility === "eligible",
+            phase: "termination",
+          });
+          const nextActions = projectSessionLifecycleActions({
+            classification: lifecycle,
+            sessionId: record.sessionId,
+            blockers: decision.blockers.map((blocker) => ({ code: blocker.code, details: blocker.details })),
+          });
+          return Object.freeze({ ...assessment, physicalState: decision.physicalState, lifecycle, nextActions });
+        });
       const candidates = assessments.filter((assessment) => assessment.suspicion !== "none");
       const eligible = assessments.filter((assessment) => {
         if (assessment.terminalOperation === "discard") return false;
-        const lifecycle = classifySessionLifecycle({
-          sessionState: assessment.state,
-          physicalState: assessment.physicalState,
-          closeReadiness: "ready",
-          gcAuthorized: true,
-          phase: "termination",
-        });
+        // Eligibility is evaluated from the GC authority's own bounded
+        // evidence. Full cleanup blockers remain on `assessment.lifecycle`
+        // and are applied by the existing preflight below.
+        const gcLifecycle = projectGarbageCollectAuthorization(assessment);
         if (
           assessment.destructiveEligibility === "eligible" &&
-          (lifecycle.destructiveCleanupEligible || assessment.physicalState === "prunable-missing")
+          (gcLifecycle.destructiveCleanupEligible || assessment.physicalState === "prunable-missing")
         ) {
           return true;
         }
@@ -3559,6 +3583,7 @@ export class SessionRegistry {
       });
       const nextActions = projectSessionLifecycleActions({ classification: lifecycle, sessionId: record.sessionId });
       const garbageCollection = closedGarbageCollectionAssessment(record, now);
+      const projectedGarbageCollection = projectGarbageCollectCandidateLifecycle(garbageCollection, lifecycle, []);
       return Object.freeze({
         schemaVersion: SESSION_DIAGNOSTIC_SCHEMA_VERSION,
         operation: "diagnostic" as const,
@@ -3577,7 +3602,7 @@ export class SessionRegistry {
         ...(nextActions.length === 0 ? {} : { nextAction: nextActions[0] }),
         nextActions,
         integrationEvidence: Object.freeze(integrationEvidence),
-        garbageCollection,
+        garbageCollection: projectedGarbageCollection,
         lifecycle,
       });
     }
@@ -3611,6 +3636,7 @@ export class SessionRegistry {
       ageSuspicious: Date.parse(now) - Date.parse(record.updatedAt) >= this.staleAfterMs,
       phase: "termination",
     });
+    garbageCollection = projectGarbageCollectCandidateLifecycle(garbageCollection, lifecycle, blockers);
     const safeActions =
       blockers.length > 0
         ? sortStrings(Array.from(new Set(blockers.flatMap((blocker) => blocker.safeActions))))
@@ -4554,6 +4580,18 @@ function assessGarbageCollection(
     destructiveEligibilityReason = "age-only";
   }
 
+  const lifecycle = projectGarbageCollectAuthorization({
+    state: record.state,
+    physicalState: worktreeState.kind,
+    terminalOperation: record.terminalOperation,
+    suspicion,
+    destructiveEligibility,
+  });
+  const nextActions = projectSessionLifecycleActions({
+    classification: lifecycle,
+    sessionId: record.sessionId,
+  });
+
   return Object.freeze({
     ...cloneSessionRecord(record),
     physicalState: worktreeState.kind,
@@ -4561,10 +4599,42 @@ function assessGarbageCollection(
     suspicionReason,
     destructiveEligibility,
     destructiveEligibilityReason,
+    lifecycle,
+    nextActions,
+  });
+}
+
+/** Evaluate GC's independent authorization through the canonical machine. */
+function projectGarbageCollectAuthorization(
+  candidate: Pick<
+    GarbageCollectCandidate,
+    "state" | "physicalState" | "terminalOperation" | "suspicion" | "destructiveEligibility"
+  >,
+): SessionLifecycleClassification {
+  return classifySessionLifecycle({
+    sessionState: candidate.state,
+    physicalState: candidate.physicalState,
+    closeReadiness: "ready",
+    blockers: [],
+    terminalOperation: candidate.terminalOperation,
+    ageSuspicious: candidate.suspicion === "age",
+    gcAuthorized: candidate.destructiveEligibility === "eligible",
+    phase: "termination",
   });
 }
 
 function closedGarbageCollectionAssessment(record: SessionRecord, now: string): GarbageCollectCandidate {
+  const lifecycle = classifySessionLifecycle({
+    sessionState: record.state,
+    physicalState: "closed",
+    closeReadiness: "ready",
+    terminalOperation: record.terminalOperation,
+    phase: "termination",
+  });
+  const nextActions = projectSessionLifecycleActions({
+    classification: lifecycle,
+    sessionId: record.sessionId,
+  });
   return Object.freeze({
     ...cloneSessionRecord(record),
     physicalState: "closed",
@@ -4572,6 +4642,8 @@ function closedGarbageCollectionAssessment(record: SessionRecord, now: string): 
     suspicionReason: "none",
     destructiveEligibility: "ineligible",
     destructiveEligibilityReason: "not-suspected",
+    lifecycle,
+    nextActions,
   });
 }
 
@@ -4769,6 +4841,20 @@ function toCleanupBlocker(error: unknown): CleanupBlocker {
     details: error.details,
     recoveryHints: Object.freeze(recoveryHints),
   });
+}
+
+/** Keep the nested GC assessment on the same observed lifecycle snapshot. */
+function projectGarbageCollectCandidateLifecycle(
+  candidate: GarbageCollectCandidate,
+  lifecycle: SessionLifecycleClassification,
+  blockers: readonly { readonly code: string; readonly details?: Readonly<Record<string, unknown>> }[],
+): GarbageCollectCandidate {
+  const nextActions = projectSessionLifecycleActions({
+    classification: lifecycle,
+    sessionId: candidate.sessionId,
+    blockers,
+  });
+  return Object.freeze({ ...candidate, lifecycle, nextActions });
 }
 
 function toDiagnosticBlocker(error: unknown): SessionDiagnosticBlocker {

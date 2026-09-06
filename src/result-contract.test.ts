@@ -210,11 +210,18 @@ test("lifecycle, diagnostic, and cleanup schemas are checked against reachable p
     const status = await invokeJson(["status"], fixture.repository);
     assert.ok(Array.isArray(status.sessions));
     assert.ok(Object.hasOwn(status, "repository"));
+    const statusSession = object((status.sessions as unknown[])[0], "status session");
+    assert.equal(statusSession.session_id, sessionId);
+    assert.equal(typeof statusSession.lifecycle_state, "string");
+    assert.ok(Object.hasOwn(statusSession, "next_actions"));
 
     const diagnostic = await invokeJson(["session", "inspect", "--session", sessionId as string], worktree as string);
     assert.equal(diagnostic.session_id, sessionId);
     assert.ok(Object.hasOwn(diagnostic, "lifecycle_state"));
     assert.ok(Object.hasOwn(diagnostic, "close_readiness"));
+    assert.equal(statusSession.lifecycle_state, diagnostic.lifecycle_state);
+    assert.deepEqual(statusSession.lifecycle, diagnostic.lifecycle);
+    assert.deepEqual(statusSession.next_actions, diagnostic.next_actions);
 
     const doctor = await invokeJson(["doctor"], fixture.repository);
     assert.ok(Array.isArray(doctor.checks));

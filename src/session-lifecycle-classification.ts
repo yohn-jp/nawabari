@@ -160,6 +160,19 @@ export function lifecycleTransition(
   return transition;
 }
 
+/**
+ * Return the operation names currently admissible by the canonical machine
+ * projection. Consumers use this for discovery/availability only; it does not
+ * authorize or execute a mutation.
+ */
+export function availableLifecycleOperations(
+  classification: SessionLifecycleClassification,
+): readonly SessionLifecycleOperation[] {
+  return Object.freeze(
+    classification.transitions.filter((transition) => transition.allowed).map((transition) => transition.operation),
+  );
+}
+
 /** The complete state/operation table, useful to help/discovery consumers. */
 export const SESSION_LIFECYCLE_TRANSITION_TABLE: Readonly<
   Record<SessionLifecycleState, readonly SessionLifecycleTransition[]>
