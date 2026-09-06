@@ -49,6 +49,15 @@ export const SANDBOX_SECCOMP_DENIED_SYSCALLS = Object.freeze([
   "userfaultfd",
 ] as const);
 
+type SeccompSyscallName = (typeof SANDBOX_SECCOMP_DENIED_SYSCALLS)[number];
+/**
+ * A null entry is an authoritative declaration that the syscall does not
+ * exist for an architecture. An absent or otherwise invalid entry is a
+ * mapping defect and must never be silently omitted from the policy.
+ */
+type SeccompSyscallNumber = number | null;
+type SeccompSyscallMapping = Readonly<Record<SeccompSyscallName, SeccompSyscallNumber>>;
+
 export const SANDBOX_SECCOMP_PROFILE = Object.freeze({
   id: SANDBOX_SECCOMP_PROFILE_ID,
   version: SANDBOX_SECCOMP_PROFILE_VERSION,
@@ -126,7 +135,8 @@ const AUDIT_ARCH: Readonly<Record<string, number>> = Object.freeze({
 });
 
 /** Syscall numbers needed by the compatibility profile on supported hosts. */
-const SYSCALLS: Readonly<Record<string, Readonly<Record<string, number>>>> = Object.freeze({
+const SYSCALLS: Readonly<Record<string, SeccompSyscallMapping>> = Object.freeze({
+  // Linux arch/x86/entry/syscalls/syscall_64.tbl.
   x64: Object.freeze({
     acct: 163,
     add_key: 248,
@@ -162,6 +172,7 @@ const SYSCALLS: Readonly<Record<string, Readonly<Record<string, number>>>> = Obj
     unshare: 272,
     userfaultfd: 323,
   }),
+  // Linux include/uapi/asm-generic/unistd.h.
   arm64: Object.freeze({
     acct: 89,
     add_key: 217,
@@ -197,6 +208,7 @@ const SYSCALLS: Readonly<Record<string, Readonly<Record<string, number>>>> = Obj
     unshare: 97,
     userfaultfd: 282,
   }),
+  // Linux arch/arm/tools/syscall.tbl (EABI).
   arm: Object.freeze({
     acct: 51,
     add_key: 309,
@@ -210,17 +222,17 @@ const SYSCALLS: Readonly<Record<string, Readonly<Record<string, number>>>> = Obj
     init_module: 128,
     kexec_file_load: 401,
     kexec_load: 347,
-    keyctl: 309,
+    keyctl: 311,
     mount: 21,
     mount_setattr: 442,
     move_mount: 429,
-    open_by_handle_at: 372,
+    open_by_handle_at: 371,
     perf_event_open: 364,
     pivot_root: 218,
     process_vm_readv: 376,
     process_vm_writev: 377,
     ptrace: 26,
-    quotactl: 388,
+    quotactl: 131,
     quotactl_fd: 443,
     reboot: 88,
     request_key: 310,
@@ -232,6 +244,7 @@ const SYSCALLS: Readonly<Record<string, Readonly<Record<string, number>>>> = Obj
     unshare: 337,
     userfaultfd: 388,
   }),
+  // Linux include/uapi/asm-generic/unistd.h.
   riscv64: Object.freeze({
     acct: 89,
     add_key: 217,
@@ -279,7 +292,7 @@ function jumpIfEqual(k: number, jt: number, jf: number): BpfInstruction {
 
 function profileArchitecture(
   architecture: string,
-): { readonly audit: number; readonly syscalls: Readonly<Record<string, number>> } | null {
+): { readonly audit: number; readonly syscalls: SeccompSyscallMapping } | null {
   const audit = AUDIT_ARCH[architecture];
   const syscalls = SYSCALLS[architecture];
   return audit === undefined || syscalls === undefined ? null : { audit, syscalls };
@@ -318,7 +331,21 @@ export function compileSandboxSeccompProfile(architecture: string = process.arch
   ];
   for (const name of SANDBOX_SECCOMP_DENIED_SYSCALLS) {
     const syscall = selected.syscalls[name];
-    if (syscall === undefined) continue;
+    if (syscall === null) continue;
+    if (syscall === undefined || !Number.isSafeInteger(syscall) || syscall < 0 || syscall > 0xffffffff) {
+      return failure(
+        new DomainError(
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "The seccomp baseline contains an invalid architecture syscall mapping.",
+          {
+            profile_id: SANDBOX_SECCOMP_PROFILE_ID,
+            profile_version: SANDBOX_SECCOMP_PROFILE_VERSION,
+            architecture,
+            syscall: name,
+          },
+        ),
+      );
+    }
     instructions.push(jumpIfEqual(syscall, 0, 1), statement(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM));
   }
   instructions.push(statement(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
