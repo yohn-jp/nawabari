@@ -74,6 +74,19 @@ function addClosedHistory(registryPath, count, installDirectory) {
   fs.writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
 }
 
+// Fixture-only clock manipulation used to prove that an old active record is
+// still non-destructive. The lifecycle decision remains owned by the packed
+// CLI; this helper only supplies the age observation that a real clock would
+// eventually produce.
+function ageSessionRecord(registryPath, sessionId, updatedAt) {
+  const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  const session = registry.sessions.find((candidate) => candidate.session_id === sessionId);
+  if (session === undefined) fail(`could not age packed lifecycle fixture session ${sessionId}`);
+  session.created_at = updatedAt;
+  session.updated_at = updatedAt;
+  fs.writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
+}
+
 function parseInstalledJson(result, label) {
   if (result.stdout.trim().length === 0) fail(`${label} emitted no JSON`);
   try {
@@ -247,6 +260,22 @@ async function main() {
       protectedExecution?.command_aliases?.[0]?.alias !== "session exec"
     ) {
       fail("installed capabilities did not expose the protected-execution contract");
+    }
+    const lifecycleCapability = capabilities.capabilities?.find((capability) => capability.id === "session-lifecycle");
+    const diagnosticsCapability = capabilities.capabilities?.find(
+      (capability) => capability.id === "session-diagnostics",
+    );
+    const cleanupCapability = capabilities.capabilities?.find(
+      (capability) => capability.id === "reconciliation-and-cleanup",
+    );
+    if (
+      !lifecycleCapability?.commands?.includes("session close") ||
+      !lifecycleCapability?.commands?.includes("session show") ||
+      !diagnosticsCapability?.commands?.includes("session inspect") ||
+      !cleanupCapability?.commands?.includes("doctor") ||
+      !cleanupCapability?.commands?.includes("gc")
+    ) {
+      fail("installed capabilities did not enumerate the packed lifecycle authorities");
     }
 
     // Result-schema parity is part of the packed caller contract. Every
@@ -634,6 +663,22 @@ async function main() {
       fail("installed session create help did not expose the optional/defaulted contract");
     }
 
+    const lifecycleHelp = [
+      ["session", "close", "session close"],
+      ["session", "discard", "session discard"],
+      ["session", "inspect", "session inspect"],
+      ["gc", "gc"],
+    ];
+    for (const args of lifecycleHelp) {
+      const help = parseInstalledJson(
+        invokeInstalled([...args.slice(0, -1), "--help", "--json"], lifecycleRepository),
+        `${args[args.length - 1]} help`,
+      );
+      if (help.ok !== true || help.help_for !== args[args.length - 1]) {
+        fail(`packed lifecycle help did not resolve ${args[args.length - 1]} through the canonical dispatcher`);
+      }
+    }
+
     console.log("verifying default-root, caller-selected --worktree-root, exact --worktree placement...");
 
     const statusBeforeRootChecks = parseInstalledJson(
@@ -668,6 +713,19 @@ async function main() {
       fs.existsSync(defaultRootCreated.worktree)
     ) {
       fail("default-root session close did not remove its worktree");
+    }
+    const defaultRootRepeatedClose = parseInstalledJson(
+      invokeInstalled(["session", "close", "--session", defaultRootCreated.session_id, "--json"], lifecycleRepository),
+      "already-closed session close",
+    );
+    if (
+      defaultRootRepeatedClose.ok !== true ||
+      defaultRootRepeatedClose.idempotent !== true ||
+      defaultRootRepeatedClose.session?.state !== "closed" ||
+      defaultRootRepeatedClose.worktree_removed !== false ||
+      defaultRootRepeatedClose.branch_removed !== false
+    ) {
+      fail("packed close was not idempotent for an already-closed session");
     }
 
     const customWorktreeRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(installDirectory, "custom-root-")));
@@ -1097,6 +1155,164 @@ async function main() {
     }
     run("git", ["merge", "--ff-only", "feature/installed-smoke"], { cwd: lifecycleRepository, env: gitEnvironment });
 
+    // #139 packed conformance: the integration branch is authoritative for a
+    // non-ancestry proof, and Nawabari independently verifies exact tree
+    // equivalence before allowing cleanup.
+    const squashProofWorktree = path.join(installDirectory, "packed-squash-proof-worktree");
+    const squashProofSession = parseInstalledJson(
+      invokeInstalled(
+        ["session", "create", "--branch", "feature/packed-squash-proof", "--worktree", squashProofWorktree, "--json"],
+        lifecycleRepository,
+      ),
+      "packed squash-proof session create",
+    );
+    fs.writeFileSync(path.join(squashProofWorktree, "packed-squash-proof.txt"), "authoritative packed proof\n");
+    run("git", ["add", "packed-squash-proof.txt"], { cwd: squashProofWorktree, env: gitEnvironment });
+    run("git", ["commit", "-m", "packed squash-proof candidate"], {
+      cwd: squashProofWorktree,
+      env: gitEnvironment,
+    });
+    fs.writeFileSync(path.join(lifecycleRepository, "packed-squash-proof.txt"), "authoritative packed proof\n");
+    run("git", ["add", "packed-squash-proof.txt"], { cwd: lifecycleRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "squash merge packed proof"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+    const squashIntegratedRevision = run("git", ["rev-parse", "HEAD"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    }).stdout.trim();
+    const squashProofInspect = invokeInstalled(
+      [
+        "session",
+        "inspect",
+        "--session",
+        squashProofSession.session_id,
+        "--integrated-revision",
+        squashIntegratedRevision,
+        "--json",
+      ],
+      lifecycleRepository,
+    );
+    const squashProofInspectJson = parseInstalledJson(squashProofInspect, "packed squash-proof inspect");
+    if (
+      squashProofInspect.status !== 0 ||
+      squashProofInspectJson.close_readiness !== "ready" ||
+      squashProofInspectJson.lifecycle_state !== "close-ready" ||
+      squashProofInspectJson.blockers?.length !== 0 ||
+      squashProofInspectJson.integration_evidence?.supplied !== true ||
+      squashProofInspectJson.integration_evidence?.proof?.method !== "tree-equivalence"
+    ) {
+      fail("packed inspect did not expose the authoritative #139 integration proof");
+    }
+    const squashProofClose = invokeInstalled(
+      [
+        "session",
+        "close",
+        "--session",
+        squashProofSession.session_id,
+        "--integrated-revision",
+        squashIntegratedRevision,
+        "--json",
+      ],
+      lifecycleRepository,
+    );
+    const squashProofCloseJson = parseInstalledJson(squashProofClose, "packed squash-proof close");
+    if (
+      squashProofClose.status !== 0 ||
+      squashProofCloseJson.ok !== true ||
+      squashProofCloseJson.integration_proof?.method !== "tree-equivalence" ||
+      squashProofCloseJson.integration_proof?.integrated_revision !== squashIntegratedRevision ||
+      squashProofCloseJson.worktree_removed !== true ||
+      squashProofCloseJson.branch_removed !== true
+    ) {
+      fail("packed close did not consume the authoritative #139 integration proof");
+    }
+
+    // #160 packed conformance: an exact remote integration revision is fetched
+    // only into Nawabari's disposable proof ref. Local integration refs and
+    // FETCH_HEAD remain untouched by the caller-authorized proof operation.
+    run("git", ["push", "origin", "main"], { cwd: lifecycleRepository, env: gitEnvironment });
+    run("git", ["fetch", "origin", "main"], { cwd: lifecycleRepository, env: gitEnvironment });
+    const fetchTrackingBefore = run("git", ["rev-parse", "refs/remotes/origin/main"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    }).stdout.trim();
+    const fetchHeadPath = path.join(lifecycleRepository, ".git", "FETCH_HEAD");
+    const fetchHeadBefore = fs.readFileSync(fetchHeadPath, "utf8");
+    const remoteProofWorktree = path.join(installDirectory, "packed-remote-proof-worktree");
+    const remoteProofSession = parseInstalledJson(
+      invokeInstalled(
+        ["session", "create", "--branch", "feature/packed-remote-proof", "--worktree", remoteProofWorktree, "--json"],
+        lifecycleRepository,
+      ),
+      "packed remote-proof session create",
+    );
+    fs.writeFileSync(path.join(remoteProofWorktree, "packed-remote-proof.txt"), "remote packed proof\n");
+    run("git", ["add", "packed-remote-proof.txt"], { cwd: remoteProofWorktree, env: gitEnvironment });
+    run("git", ["commit", "-m", "packed remote-proof candidate"], {
+      cwd: remoteProofWorktree,
+      env: gitEnvironment,
+    });
+    const remoteProofClone = path.join(installDirectory, "packed-remote-proof-clone");
+    run("git", ["clone", remoteRepository, remoteProofClone], { cwd: installDirectory, env: gitEnvironment });
+    run("git", ["checkout", "-b", "main", "origin/main"], { cwd: remoteProofClone, env: gitEnvironment });
+    run("git", ["config", "user.email", "nawabari-packed@example.invalid"], {
+      cwd: remoteProofClone,
+      env: gitEnvironment,
+    });
+    run("git", ["config", "user.name", "Nawabari Packed Smoke"], { cwd: remoteProofClone, env: gitEnvironment });
+    fs.writeFileSync(path.join(remoteProofClone, "packed-remote-proof.txt"), "remote packed proof\n");
+    run("git", ["add", "packed-remote-proof.txt"], { cwd: remoteProofClone, env: gitEnvironment });
+    run("git", ["commit", "-m", "squash merge packed remote proof"], {
+      cwd: remoteProofClone,
+      env: gitEnvironment,
+    });
+    run("git", ["push", "origin", "HEAD:refs/heads/main"], { cwd: remoteProofClone, env: gitEnvironment });
+    const remoteIntegratedRevision = run("git", ["rev-parse", "HEAD"], {
+      cwd: remoteProofClone,
+      env: gitEnvironment,
+    }).stdout.trim();
+    const remoteRevisionProbe = spawnSync("git", ["cat-file", "-e", `${remoteIntegratedRevision}^{commit}`], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+      encoding: "utf8",
+    });
+    if (remoteRevisionProbe.status === 0) {
+      fail("packed #160 fixture unexpectedly made the remote proof revision locally available");
+    }
+    const remoteProofClose = invokeInstalled(
+      [
+        "session",
+        "close",
+        "--session",
+        remoteProofSession.session_id,
+        "--integrated-revision",
+        remoteIntegratedRevision,
+        "--fetch-remote",
+        "origin",
+        "--fetch-branch",
+        "main",
+        "--json",
+      ],
+      lifecycleRepository,
+    );
+    const remoteProofCloseJson = parseInstalledJson(remoteProofClose, "packed remote-proof close");
+    const fetchTrackingAfter = run("git", ["rev-parse", "refs/remotes/origin/main"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    }).stdout.trim();
+    if (
+      remoteProofClose.status !== 0 ||
+      remoteProofCloseJson.ok !== true ||
+      remoteProofCloseJson.integration_proof?.method !== "tree-equivalence" ||
+      remoteProofCloseJson.integration_proof?.integrated_revision !== remoteIntegratedRevision ||
+      fetchTrackingAfter !== fetchTrackingBefore ||
+      fs.readFileSync(fetchHeadPath, "utf8") !== fetchHeadBefore
+    ) {
+      fail("packed #160 close did not preserve local integration refs while proving the fetched revision");
+    }
+
     const secondCreated = parseInstalledJson(
       invokeInstalled(
         ["session", "create", "--branch", "feature/installed-second", "--worktree", secondWorktree, "--json"],
@@ -1104,6 +1320,199 @@ async function main() {
       ),
       "second session create",
     );
+
+    // #201 packed conformance: one physical cleanup effect may already have
+    // completed before the caller retries. The packed close authority must
+    // retain the captured session identity, finish only the remaining branch
+    // cleanup, and converge to one terminal record.
+    const partialCleanupWorktree = path.join(installDirectory, "packed-partial-cleanup-worktree");
+    const partialCleanupSession = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "create",
+          "--branch",
+          "feature/packed-partial-cleanup",
+          "--worktree",
+          partialCleanupWorktree,
+          "--json",
+        ],
+        lifecycleRepository,
+      ),
+      "packed partial-cleanup session create",
+    );
+    run("git", ["worktree", "remove", "--force", partialCleanupWorktree], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+    const partialCleanupInspect = parseInstalledJson(
+      invokeInstalled(
+        ["session", "inspect", "--session", partialCleanupSession.session_id, "--json"],
+        lifecycleRepository,
+      ),
+      "packed partial-cleanup inspect",
+    );
+    if (
+      partialCleanupInspect.lifecycle_state !== "stale-inconsistent" ||
+      partialCleanupInspect.physical_state !== "unregistered-missing" ||
+      partialCleanupInspect.close_readiness !== "ready"
+    ) {
+      fail("packed partial-cleanup reconciliation did not expose a deterministic safe retry");
+    }
+    const partialCleanupClose = invokeInstalled(
+      ["session", "close", "--session", partialCleanupSession.session_id, "--json"],
+      lifecycleRepository,
+    );
+    const partialCleanupCloseJson = parseInstalledJson(partialCleanupClose, "packed partial-cleanup close");
+    if (
+      partialCleanupClose.status !== 0 ||
+      partialCleanupCloseJson.ok !== true ||
+      partialCleanupCloseJson.worktree_removed !== false ||
+      partialCleanupCloseJson.branch_removed !== true ||
+      partialCleanupCloseJson.session?.state !== "closed"
+    ) {
+      fail("packed close did not converge after the partial physical cleanup effect");
+    }
+
+    // A physically ambiguous owner remains non-destructive even when GC is
+    // asked to apply. Doctor and inspect must project the same fail-closed
+    // identity evidence through machine-readable lifecycle fields.
+    const ambiguousWorktree = path.join(installDirectory, "packed-ambiguous-worktree");
+    const ambiguousSession = parseInstalledJson(
+      invokeInstalled(
+        ["session", "create", "--branch", "feature/packed-ambiguous", "--worktree", ambiguousWorktree, "--json"],
+        lifecycleRepository,
+      ),
+      "packed ambiguous session create",
+    );
+    run("git", ["checkout", "-b", "feature/packed-ambiguous-hijacked"], {
+      cwd: ambiguousWorktree,
+      env: gitEnvironment,
+    });
+    const ambiguousInspect = parseInstalledJson(
+      invokeInstalled(["session", "inspect", "--session", ambiguousSession.session_id, "--json"], lifecycleRepository),
+      "packed ambiguous inspect",
+    );
+    if (
+      ambiguousInspect.lifecycle_state !== "stale-inconsistent" ||
+      ambiguousInspect.close_readiness !== "blocked" ||
+      ambiguousInspect.result_state !== "complete" ||
+      ambiguousInspect.blockers?.[0]?.code !== "OWNERSHIP_MISMATCH" ||
+      ambiguousInspect.lifecycle?.recoverability !== "ambiguous"
+    ) {
+      fail("packed ambiguous ownership was not classified fail-closed");
+    }
+    const ambiguousGc = parseInstalledJson(
+      invokeInstalled(["gc", "--apply", "--json"], lifecycleRepository),
+      "packed ambiguous gc",
+    );
+    const ambiguousCandidate = ambiguousGc.candidates?.find(
+      (candidate) => candidate.session_id === ambiguousSession.session_id,
+    );
+    if (
+      ambiguousGc.ok !== true ||
+      ambiguousCandidate?.suspicion !== "physical" ||
+      ambiguousCandidate?.destructive_eligibility !== "ambiguous" ||
+      ambiguousCandidate?.destructive_eligibility_reason !== "physical-state-ambiguous" ||
+      ambiguousGc.eligible?.some((candidate) => candidate.session_id === ambiguousSession.session_id) ||
+      ambiguousGc.cleaned?.some((session) => session.session_id === ambiguousSession.session_id)
+    ) {
+      fail("packed GC treated ambiguous physical ownership as destructive authority");
+    }
+    const ambiguousDoctor = parseInstalledJson(
+      invokeInstalled(["doctor", "--json"], lifecycleRepository),
+      "packed ambiguous doctor",
+    );
+    const ambiguousReconciliation = ambiguousDoctor.checks?.find((check) => check.name === "reconciliation");
+    if (
+      ambiguousDoctor.ok !== true ||
+      ambiguousReconciliation?.status !== "warning" ||
+      ambiguousReconciliation.details?.clean !== false ||
+      !ambiguousReconciliation.details?.lifecycle_sessions?.some(
+        (session) =>
+          session.session_id === ambiguousSession.session_id && session.lifecycle_state === "stale-inconsistent",
+      ) ||
+      !ambiguousReconciliation.details?.issues?.some(
+        (issue) => issue.session_id === ambiguousSession.session_id && issue.code === "OWNERSHIP_MISMATCH",
+      )
+    ) {
+      fail("packed doctor did not project ambiguous ownership through reconciliation authority");
+    }
+    // Leave Git's prunable worktree entry intact so the packed GC authority
+    // can distinguish a safely missing physical resource from ambiguity.
+    fs.rmSync(ambiguousWorktree, { recursive: true, force: true });
+    // Re-establish the captured branch identity before continuing the matrix;
+    // the restoration is fixture setup, while the terminal cleanup still goes
+    // through the packed close authority.
+    run("git", ["worktree", "prune"], { cwd: lifecycleRepository, env: gitEnvironment });
+    run("git", ["worktree", "add", ambiguousWorktree, "feature/packed-ambiguous"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+    run("git", ["branch", "-D", "feature/packed-ambiguous-hijacked"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    });
+    const ambiguityResolvedClose = invokeInstalled(
+      ["session", "close", "--session", ambiguousSession.session_id, "--json"],
+      lifecycleRepository,
+    );
+    if (ambiguityResolvedClose.status !== 0) {
+      fail("packed ambiguous session could not close after its physical identity was restored");
+    }
+
+    // Age is a suspicion only. The record is deliberately made old in the
+    // fixture while remaining physically healthy and active; the packed CLI
+    // must report it without making it eligible or cleaning it.
+    const oldActiveWorktree = path.join(installDirectory, "packed-old-active-worktree");
+    const oldActiveSession = parseInstalledJson(
+      invokeInstalled(
+        ["session", "create", "--branch", "feature/packed-old-active", "--worktree", oldActiveWorktree, "--json"],
+        lifecycleRepository,
+      ),
+      "packed old-active session create",
+    );
+    const packedRegistryPath = path.join(lifecycleRepository, ".git", "nawabari", "session-registry.json");
+    ageSessionRecord(packedRegistryPath, oldActiveSession.session_id, "2020-01-01T00:00:00.000Z");
+    const oldActiveInspect = parseInstalledJson(
+      invokeInstalled(["session", "inspect", "--session", oldActiveSession.session_id, "--json"], lifecycleRepository),
+      "packed old-active inspect",
+    );
+    const oldActiveGc = parseInstalledJson(
+      invokeInstalled(["gc", "--dry-run", "--json"], lifecycleRepository),
+      "packed old-active gc dry-run",
+    );
+    const oldActiveCandidate = oldActiveGc.candidates?.find(
+      (candidate) => candidate.session_id === oldActiveSession.session_id,
+    );
+    if (
+      oldActiveInspect.lifecycle?.age_suspicious !== true ||
+      oldActiveInspect.lifecycle?.destructive_cleanup_eligible !== false ||
+      oldActiveInspect.lifecycle?.transitions?.find((transition) => transition.operation === "gc")?.allowed !== false ||
+      oldActiveCandidate?.suspicion !== "age" ||
+      oldActiveCandidate?.destructive_eligibility !== "ineligible" ||
+      oldActiveCandidate?.destructive_eligibility_reason !== "age-only" ||
+      oldActiveGc.eligible?.some((candidate) => candidate.session_id === oldActiveSession.session_id) ||
+      oldActiveGc.cleaned?.some((session) => session.session_id === oldActiveSession.session_id)
+    ) {
+      fail("packed GC granted destructive authority to an old but healthy active session");
+    }
+    const oldActiveApplied = parseInstalledJson(
+      invokeInstalled(["gc", "--apply", "--json"], lifecycleRepository),
+      "packed old-active gc apply",
+    );
+    if (
+      oldActiveApplied.cleaned?.some((session) => session.session_id === oldActiveSession.session_id) ||
+      oldActiveApplied.eligible?.some((candidate) => candidate.session_id === oldActiveSession.session_id)
+    ) {
+      fail("packed GC apply destructively cleaned an age-only active session");
+    }
+    const oldActiveClose = invokeInstalled(
+      ["session", "close", "--session", oldActiveSession.session_id, "--json"],
+      lifecycleRepository,
+    );
+    if (oldActiveClose.status !== 0) fail("packed old active session could not be safely closed explicitly");
+
     const deniedGuard = invokeInstalled(["guard", "--session", secondCreated.session_id, "--json"], lifecycleWorktree);
     const deniedGuardJson = parseInstalledJson(deniedGuard, "cross-session guard");
     if (deniedGuard.status !== 3 || deniedGuardJson.allowed !== false) {
@@ -1199,6 +1608,19 @@ async function main() {
     fs.writeFileSync(path.join(hazardWorktree, "recoverable-commit.txt"), "retain this commit\n");
     run("git", ["add", "recoverable-commit.txt"], { cwd: hazardWorktree, env: gitEnvironment });
     run("git", ["commit", "-m", "recoverable smoke commit"], { cwd: hazardWorktree, env: gitEnvironment });
+    const hazardInspect = parseInstalledJson(
+      invokeInstalled(["session", "inspect", "--session", hazardCreated.session_id, "--json"], lifecycleRepository),
+      "recoverable commit inspect",
+    );
+    if (
+      hazardInspect.lifecycle_state !== "blocked-recoverable" ||
+      hazardInspect.close_readiness !== "external_evidence_required" ||
+      hazardInspect.result_state !== "external_evidence_required" ||
+      hazardInspect.blockers?.[0]?.code !== "RECOVERABLE_COMMITS" ||
+      !hazardInspect.next_actions?.some((action) => action.kind === "retain")
+    ) {
+      fail("packed inspect did not expose typed recoverable-work retention evidence");
+    }
     const blockedCommitClose = invokeInstalled(
       ["session", "close", "--session", hazardCreated.session_id, "--json"],
       lifecycleRepository,
@@ -1934,7 +2356,11 @@ async function main() {
     }
 
     const registryPath = path.join(lifecycleRepository, ".git", "nawabari", "session-registry.json");
+    const closedHistoryBaseline = JSON.parse(fs.readFileSync(registryPath, "utf8")).sessions.filter(
+      (session) => session.state === "closed",
+    ).length;
     addClosedHistory(registryPath, 512, installDirectory);
+    const expectedClosedCount = closedHistoryBaseline + 512;
     const boundedStatus = invokeInstalled(["status", "--json"], lifecycleRepository);
     const boundedStatusJson = parseInstalledJson(boundedStatus, "bounded status");
     const boundedList = invokeInstalled(["session", "list", "--json"], lifecycleRepository);
@@ -1944,8 +2370,8 @@ async function main() {
       boundedList.status !== 0 ||
       boundedStatusJson.sessions?.length !== 0 ||
       boundedListJson.sessions?.length !== 0 ||
-      boundedStatusJson.closed_count !== 512 + 13 ||
-      boundedListJson.closed_count !== 512 + 13 ||
+      boundedStatusJson.closed_count !== expectedClosedCount ||
+      boundedListJson.closed_count !== expectedClosedCount ||
       boundedStatusJson.history_available !== true ||
       boundedListJson.history_available !== true ||
       boundedStatus.stdout.length > 4_000 ||
