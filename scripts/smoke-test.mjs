@@ -10,6 +10,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { seedOfflineRuntimeDependencyOverrides } from "./seed-offline-runtime-dependencies.mjs";
+
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
 const packageName = packageJson.name;
@@ -116,9 +118,22 @@ async function main() {
 
   const installDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-"));
   try {
+    const runtimeDependencyOverrides = seedOfflineRuntimeDependencyOverrides({
+      packageRoot: repoRoot,
+      seedDirectory: installDirectory,
+    });
     fs.writeFileSync(
       path.join(installDirectory, "package.json"),
-      JSON.stringify({ name: "smoke-consumer", private: true, version: "0.0.0" }, null, 2),
+      JSON.stringify(
+        {
+          name: "smoke-consumer",
+          private: true,
+          version: "0.0.0",
+          overrides: runtimeDependencyOverrides,
+        },
+        null,
+        2,
+      ),
     );
 
     console.log("installing packed tarball into isolated directory...");
@@ -140,10 +155,21 @@ async function main() {
     if (installedRoot === sourceRoot || installedRoot.startsWith(`${sourceRoot}${path.sep}`)) {
       fail("installed package unexpectedly resolves inside the source tree");
     }
+    const allowedRuntimeDependencies = new Set(["xstate"]);
     for (const dependencyField of ["dependencies", "optionalDependencies", "peerDependencies", "bundleDependencies"]) {
       const dependencies = installedPackageJson[dependencyField];
-      if (dependencies !== undefined && Object.keys(dependencies).length > 0) {
-        fail(`installed package declares an unexpected runtime dependency field: ${dependencyField}`);
+      if (dependencies === undefined) continue;
+      const unexpected = Object.keys(dependencies).filter(
+        (dependency) => dependencyField !== "dependencies" || !allowedRuntimeDependencies.has(dependency),
+      );
+      if (unexpected.length > 0) {
+        fail(`installed package declares unexpected runtime dependencies: ${unexpected.join(", ")}`);
+      }
+      if (
+        dependencyField === "dependencies" &&
+        installedPackageJson.dependencies?.xstate !== packageJson.dependencies?.xstate
+      ) {
+        fail("installed package does not preserve the declared xstate runtime dependency");
       }
     }
 

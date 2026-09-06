@@ -58,5 +58,8 @@
   "bugs": {
     "url": "https://github.com/yohn-jp/nawabari/issues"
   },
-  "keywords": []
+  "keywords": [],
+  "dependencies": {
+    "xstate": "^5.32.6"
+  }
 }

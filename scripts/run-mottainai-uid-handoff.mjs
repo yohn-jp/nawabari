@@ -10,6 +10,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { seedOfflineRuntimeDependencyOverrides } from "./seed-offline-runtime-dependencies.mjs";
+
 export const UID_HANDOFF_CONTRACT_ID = "nawabari.mottainai-packed-uid-handoff.v1";
 export const SANDBOX_CONTRACT_ID = "nawabari.sandbox-execution.v1";
 export const PACKED_EVIDENCE_CONTRACT_ID = "nawabari.packed-standalone-protected-execution.v1";
@@ -543,9 +545,13 @@ function main() {
     fs.mkdirSync(path.join(tempRoot, "tmp"), { recursive: true, mode: 0o777 });
     const consumer = path.join(tempRoot, "consumer");
     fs.mkdirSync(consumer, { recursive: true, mode: 0o777 });
+    const runtimeDependencyOverrides = seedOfflineRuntimeDependencyOverrides({
+      packageRoot: repoRoot,
+      seedDirectory: consumer,
+    });
     fs.writeFileSync(
       path.join(consumer, "package.json"),
-      JSON.stringify({ name: "mottainai-uid-fixture", private: true }),
+      JSON.stringify({ name: "mottainai-uid-fixture", private: true, overrides: runtimeDependencyOverrides }),
     );
     run("npm", ["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--no-save", tarballPath], {
       cwd: consumer,
