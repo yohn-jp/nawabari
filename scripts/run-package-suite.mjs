@@ -94,6 +94,9 @@ function writeEvidence(outputPath, artifact) {
       kernel: os.release(),
       node: process.version,
       pnpm: run("pnpm", ["--version"]).stdout.trim(),
+      npm: run("npm", ["--version"]).stdout.trim(),
+      git: run("git", ["--version"]).stdout.trim(),
+      bubblewrap: run("bwrap", ["--version"]).stdout.trim(),
     },
     installation: {
       mode: "fresh temporary consumer",

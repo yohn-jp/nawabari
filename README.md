@@ -785,8 +785,9 @@ The evidence supports these boundaries only:
 - Network: `network_mode` is `inherited`; this evidence does not prove egress
   isolation.
 - Linux prerequisites: use `nawabari doctor --json` on a supported Linux host.
-  Required bubblewrap, namespace, seccomp, and capability support must be
-  ready; cgroups v2 and Landlock remain profile-reported optional defenses.
+  The package's supported Node.js engine, Git, and required bubblewrap,
+  namespace, seccomp, and capability support must be available and ready;
+  cgroups v2 and Landlock remain profile-reported optional defenses.
 - Failure behavior: protected resolution uses `enforce: true`; missing
   required capability, unsupported topology, or launch failure returns a
   bounded failure and never retries through ambient execution.
