@@ -18,6 +18,7 @@ import {
   treeEntriesEqual,
   verifyPhysicalExecutionContext,
   type GitCommandRunner,
+  type GitPathStat,
   type GitWorktreeInfo,
   type PhysicalExecutionContext,
   type RepositoryContext,
@@ -77,6 +78,7 @@ import {
   EVIDENCE_MAX_DIFF_PATHS,
   evidenceHash,
   type RepositoryDiffEvidence,
+  type RepositoryDiffDiagnostic,
   type RepositoryDiffOptions,
   type RepositoryEvidenceOptions,
   type RepositoryEvidenceSnapshot,
@@ -125,6 +127,7 @@ export type {
 } from "./session-lifecycle-classification.js";
 export type {
   RepositoryDiffEvidence,
+  RepositoryDiffDiagnostic,
   RepositoryDiffOptions,
   RepositoryEvidenceBounds,
   RepositoryEvidenceOptions,
@@ -2320,6 +2323,10 @@ export class SessionRegistry {
   repositoryDiff(options: RepositoryDiffOptions): RepositoryDiffEvidence {
     return this.withLock(() => {
       const initial = this.verifyEvidenceSession(options.sessionId);
+      // Git's numstat output intentionally omits untracked paths. Reuse the
+      // bounded checkpoint observation as the sole authority for identifying
+      // that concrete cause; this remains read-only.
+      const checkpoint = observeGitCheckpoint(this.git, initial.physical.worktreePath);
       const diff = readBoundedGitDiff(this.git, initial.physical.worktreePath, {
         paths: options.paths,
         from: options.from,
@@ -2329,9 +2336,11 @@ export class SessionRegistry {
         maxHunks: options.maxHunks,
       });
       const final = this.verifyEvidenceSession(options.sessionId);
+      const finalCheckpoint = observeGitCheckpoint(this.git, final.physical.worktreePath);
       if (
         final.physical.branchName !== initial.physical.branchName ||
-        final.physical.headId !== initial.physical.headId
+        final.physical.headId !== initial.physical.headId ||
+        !sameCheckpointPaths(checkpoint, finalCheckpoint)
       ) {
         throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Repository diff changed during physical observation", {
           sessionId: options.sessionId,
@@ -2356,6 +2365,7 @@ export class SessionRegistry {
         stats: diff.stats,
         complete: diff.stats.every((stat) => stat.available),
         incompleteReasons: Object.freeze(diff.stats.some((stat) => !stat.available) ? ["STAT_UNAVAILABLE"] : []),
+        diagnostics: diffDiagnostics(diff.stats, checkpoint.untracked, diff.toRevision),
         patch: diff.patch,
         patchBytes: diff.patchBytes,
         hunkCount: diff.hunkCount,
@@ -5759,6 +5769,39 @@ function sameCheckpointPaths(
 
 function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/**
+ * Project only mechanically provable causes for unavailable per-path stats.
+ * A worktree target is untracked only when no explicit `to` revision was
+ * supplied; commit-to-commit ranges must not be labeled from current status.
+ */
+function diffDiagnostics(
+  stats: readonly GitPathStat[],
+  untrackedPaths: readonly string[],
+  toRevision: string | null,
+): readonly RepositoryDiffDiagnostic[] {
+  const untracked = new Set(untrackedPaths);
+  return Object.freeze(
+    stats
+      .filter((stat) => !stat.available)
+      .map((stat) =>
+        Object.freeze(
+          untracked.has(stat.path) && toRevision === null
+            ? {
+                reason: "UNTRACKED_TARGET" as const,
+                path: stat.path,
+                message:
+                  "The selected target is untracked; Git does not expose diff statistics or patch content for untracked files. Track the file explicitly before retrying.",
+              }
+            : {
+                reason: "STAT_UNAVAILABLE" as const,
+                path: stat.path,
+                message: "Git did not expose diff statistics for the selected target.",
+              },
+        ),
+      ),
+  );
 }
 
 function assertWorktreeClean(git: GitCommandRunner, worktreePath: string): void {

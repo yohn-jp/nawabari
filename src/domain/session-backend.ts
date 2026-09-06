@@ -676,6 +676,7 @@ function toDomainRepositoryDiff(
     stats: evidence.stats.map((stat) => ({ ...stat })),
     complete: evidence.complete,
     incomplete_reasons: [...evidence.incompleteReasons],
+    diagnostics: evidence.diagnostics.map((diagnostic) => ({ ...diagnostic })),
     patch: evidence.patch,
     patch_bytes: evidence.patchBytes,
     hunk_count: evidence.hunkCount,

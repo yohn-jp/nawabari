@@ -400,12 +400,19 @@ export type RepositoryDiffEvidence = {
   stats: RepositoryEvidenceStat[];
   complete: boolean;
   incomplete_reasons: string[];
+  diagnostics: RepositoryDiffDiagnostic[];
   patch: string | null;
   patch_bytes: number;
   hunk_count: number;
   max_bytes: number;
   max_hunks: number;
   evidence_hash: string;
+};
+
+export type RepositoryDiffDiagnostic = {
+  reason: "UNTRACKED_TARGET" | "STAT_UNAVAILABLE";
+  path: string;
+  message: string;
 };
 
 export type CommitOptions = {
