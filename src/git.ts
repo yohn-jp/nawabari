@@ -15,6 +15,107 @@ export const EVIDENCE_MAX_DIFF_BYTES = GIT_COMMAND_MAX_OUTPUT_BYTES;
 export const EVIDENCE_MAX_DIFF_HUNKS = 128 as const;
 const MAX_ERROR_DETAIL_LENGTH = 4_096;
 
+/**
+ * Git environment variables which can change the repository facts observed
+ * by a command.  These are never inherited from the caller: the cwd and the
+ * repository metadata observed by Git are the sole local-authority inputs.
+ */
+const GIT_AUTHORITY_ENVIRONMENT_VARIABLES = new Set([
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_OBJECT_DIRECTORY_RELATIVE",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_QUARANTINE_PATH",
+  "GIT_NAMESPACE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+]);
+
+/**
+ * Git environment variables which do not change repository identity but can
+ * still change local observation or mutation semantics away from Git's own
+ * defaults: substituting an external diff/pathspec/pager/editor process,
+ * rewriting index or attribute behavior, or altering which paths a command
+ * observes or mutates. These are execution-semantics authority, not
+ * transport/authentication, and are removed for the same reason as the
+ * repository-identity variables above.
+ */
+const GIT_SEMANTICS_ENVIRONMENT_VARIABLES = new Set([
+  "GIT_EXTERNAL_DIFF",
+  "GIT_DIFF_OPTS",
+  "GIT_DIFF_PATH_COUNTER",
+  "GIT_DIFF_PATH_TOTAL",
+  "GIT_PAGER",
+  "GIT_EDITOR",
+  "GIT_SEQUENCE_EDITOR",
+  "GIT_MERGE_VERBOSITY",
+  "GIT_ATTR_SOURCE",
+  "GIT_ICASE_PATHSPECS",
+  "GIT_LITERAL_PATHSPECS",
+  "GIT_GLOB_PATHSPECS",
+  "GIT_NOGLOB_PATHSPECS",
+  "GIT_REFLOG_ACTION",
+  "GIT_INDEX_VERSION",
+]);
+
+/**
+ * Git environment variable name prefixes which govern the same authority
+ * boundaries as the exact-name sets above. Matched case-insensitively so
+ * that a case-insensitive host environment (e.g. Windows) cannot preserve a
+ * differently-cased alias of a sanitized variable.
+ */
+const GIT_ENVIRONMENT_AUTHORITY_PREFIXES = ["GIT_CONFIG_"];
+
+/**
+ * Git config environment is an authority boundary too.  In particular,
+ * GIT_CONFIG_COUNT/KEY_n/VALUE_n and GIT_CONFIG_PARAMETERS can inject config
+ * without changing the caller's cwd.  System and global config are disabled
+ * for governed Git operations; repository-local config remains Git's local
+ * authority and transport/authentication variables remain available.
+ *
+ * Matching is case-insensitive: `NodeJS.ProcessEnv` keys are treated as
+ * case-sensitive by V8/Node on every platform, but the underlying OS
+ * environment on Windows is case-insensitive, so a caller-supplied `git_dir`
+ * or `Git_Config_Count` reaches the same native environment block as
+ * `GIT_DIR`/`GIT_CONFIG_COUNT`. Sanitizing only the exact-cased key would
+ * leave a same-effect alias in place on that platform.
+ */
+const GIT_CONFIG_NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+
+function isSanitizedGitEnvironmentKey(key: string): boolean {
+  const upperCaseKey = key.toUpperCase();
+  return (
+    GIT_AUTHORITY_ENVIRONMENT_VARIABLES.has(upperCaseKey) ||
+    GIT_SEMANTICS_ENVIRONMENT_VARIABLES.has(upperCaseKey) ||
+    GIT_ENVIRONMENT_AUTHORITY_PREFIXES.some((prefix) => upperCaseKey.startsWith(prefix))
+  );
+}
+
+function canonicalGitSubprocessEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...overrides,
+  };
+
+  for (const key of Object.keys(environment)) {
+    if (isSanitizedGitEnvironmentKey(key)) {
+      delete environment[key];
+    }
+  }
+
+  return {
+    ...environment,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: GIT_CONFIG_NULL_DEVICE,
+    GIT_CONFIG_GLOBAL: GIT_CONFIG_NULL_DEVICE,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_OPTIONAL_LOCKS: "0",
+  };
+}
+
 export interface GitCommandRunner {
   run(args: readonly string[], cwd: string): string;
   /** Preserve leading/trailing whitespace for NUL-delimited Git records. */
@@ -94,12 +195,7 @@ export function createGitCommandRunner(options: GitCommandRunnerOptions = {}): G
           maxBuffer: maxOutputBytes,
           stdio: ["ignore", "pipe", "pipe"],
           timeout: timeoutMs,
-          env: {
-            ...process.env,
-            ...options.env,
-            GIT_TERMINAL_PROMPT: "0",
-            GIT_OPTIONAL_LOCKS: "0",
-          },
+          env: canonicalGitSubprocessEnvironment(options.env),
         }),
       );
     } catch (error: unknown) {
