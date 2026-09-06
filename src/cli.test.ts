@@ -4,7 +4,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { CLI_COMMAND_REGISTRY, publicCliCommandDefinitions, resolveCliCommandDefinition, runCli } from "./cli.js";
+import {
+  CLI_COMMAND_REGISTRY,
+  dispatcherAllowedOptions,
+  publicCliCommandDefinitions,
+  resolveCliCommandDefinition,
+  runCli,
+  validateCliRegistryParity,
+} from "./cli.js";
 import { DomainError, failure, success } from "./domain/errors.js";
 import type {
   ClaimDeltasOptions,
@@ -348,6 +355,15 @@ test("canonical command registry resolves aliases without duplicating option def
     "migrate",
     "capabilities",
   ]);
+});
+
+test("dispatcher command and option inventory is structurally bound to the canonical registry", () => {
+  assert.doesNotThrow(() => validateCliRegistryParity());
+  assert.deepEqual(
+    [...dispatcherAllowedOptions("resource update")],
+    ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
+  );
+  assert.deepEqual([...dispatcherAllowedOptions("session exec")], ["--session"]);
 });
 
 test("session list discovery describes the implemented bounded pagination and history semantics", async () => {
