@@ -1,9 +1,8 @@
 import { assign, setup } from "xstate";
 
-import type { SessionLifecycleOperation } from "../../session-lifecycle-classification.js";
+import type { SessionLifecycleOperation, SessionLifecycleTransition } from "../../session-lifecycle-classification.js";
 
 import {
-  hasGcAuthorization,
   isDestructiveGcAllowed,
   isObservationBlockedRecoverable,
   isObservationCloseReady,
@@ -12,6 +11,15 @@ import {
   isObservationStaleInconsistent,
 } from "./guards.js";
 import type { SessionMachineContext, SessionMachineEvent, SessionMachineInput } from "./types.js";
+
+/** Semantic metadata retained on every modeled operation transition. */
+export type SessionMachineTransitionMetadata = Pick<
+  SessionLifecycleTransition,
+  "operation" | "requiresExplicitIntent" | "authority" | "reason"
+> & {
+  /** Reason selected when the transition's guard rejects the event. */
+  readonly forbiddenReason?: SessionLifecycleTransition["reason"];
+};
 
 function evidenceForInput(input: SessionMachineInput): SessionMachineContext["evidence"] {
   return {
@@ -53,16 +61,51 @@ const machineSetup = setup({
     observationIsBlockedRecoverable: ({ context }) => isObservationBlockedRecoverable(context),
     observationIsCloseReady: ({ context }) => isObservationCloseReady(context),
     destructiveGcIsAllowed: ({ context }) => isDestructiveGcAllowed(context),
+    operationIsForbidden: () => false,
   },
 });
 
 const observeTransition = {
   target: "classify",
   actions: "updateObservation",
+  meta: {
+    operation: "inspect",
+    requiresExplicitIntent: false,
+    authority: "session-registry",
+    reason: "observe",
+  },
 } as const;
 
-const doctorTransition = {} as const;
-const reconcileTransition = {} as const;
+function operationMetadata(
+  operation: SessionLifecycleOperation,
+  requiresExplicitIntent: boolean,
+  authority: SessionMachineTransitionMetadata["authority"],
+  reason: SessionMachineTransitionMetadata["reason"],
+  forbiddenReason?: SessionMachineTransitionMetadata["forbiddenReason"],
+): SessionMachineTransitionMetadata {
+  return {
+    operation,
+    requiresExplicitIntent,
+    authority,
+    reason,
+    ...(forbiddenReason === undefined ? {} : { forbiddenReason }),
+  };
+}
+
+function allowedTransition(target: string, meta: SessionMachineTransitionMetadata) {
+  return { target, meta } as const;
+}
+
+function selfTransition(meta: SessionMachineTransitionMetadata) {
+  return allowedTransition(".", meta);
+}
+
+function forbiddenTransition(meta: SessionMachineTransitionMetadata) {
+  return { target: ".", guard: "operationIsForbidden", meta } as const;
+}
+
+const doctorTransition = selfTransition(operationMetadata("doctor", false, "reconciliation", "observe"));
+const reconcileTransition = selfTransition(operationMetadata("reconcile", false, "reconciliation", "observe"));
 const cleanupRetryTransition = {} as const;
 const cleanupFinalizeTransition = {} as const;
 
@@ -101,10 +144,19 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
     active: {
       on: {
         "SESSION.OBSERVE": observeTransition,
-        "SESSION.CLOSE.REQUESTED": { target: "close-ready" },
-        "SESSION.DISCARD.REQUESTED": { target: "discarded" },
+        "SESSION.CLOSE.REQUESTED": allowedTransition(
+          "close-ready",
+          operationMetadata("close", false, "session-registry", "close-proof-required"),
+        ),
+        "SESSION.DISCARD.REQUESTED": allowedTransition(
+          "discarded",
+          operationMetadata("discard", true, "caller", "explicit-discard-required"),
+        ),
         "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
+        "SESSION.GC.REQUESTED": forbiddenTransition(
+          operationMetadata("gc", false, "gc", "age-is-not-destructive-authority"),
+        ),
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
         "SESSION.MARK_STALE": { target: "stale-inconsistent" },
@@ -113,11 +165,21 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
     "close-ready": {
       on: {
         "SESSION.OBSERVE": observeTransition,
-        "SESSION.CLOSE.REQUESTED": { target: "closed" },
-        "SESSION.DISCARD.REQUESTED": { target: "discarded" },
+        "SESSION.CLOSE.REQUESTED": allowedTransition(
+          "closed",
+          operationMetadata("close", false, "session-registry", "close-authorized"),
+        ),
+        "SESSION.DISCARD.REQUESTED": allowedTransition(
+          "discarded",
+          operationMetadata("discard", true, "caller", "explicit-discard-required"),
+        ),
         "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
-        "SESSION.GC.REQUESTED": { target: "closed", guard: "destructiveGcIsAllowed" },
+        "SESSION.GC.REQUESTED": {
+          target: "closed",
+          guard: "destructiveGcIsAllowed",
+          meta: operationMetadata("gc", false, "gc", "close-authorized", "age-is-not-destructive-authority"),
+        },
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
         "SESSION.MARK_STALE": { target: "stale-inconsistent" },
@@ -126,9 +188,18 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
     "blocked-recoverable": {
       on: {
         "SESSION.OBSERVE": observeTransition,
-        "SESSION.DISCARD.REQUESTED": { target: "discarded" },
+        "SESSION.CLOSE.REQUESTED": forbiddenTransition(
+          operationMetadata("close", false, "session-registry", "recoverable-work-must-be-retained-or-discarded"),
+        ),
+        "SESSION.DISCARD.REQUESTED": allowedTransition(
+          "discarded",
+          operationMetadata("discard", true, "caller", "explicit-discard-required"),
+        ),
         "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
+        "SESSION.GC.REQUESTED": forbiddenTransition(
+          operationMetadata("gc", false, "gc", "age-is-not-destructive-authority"),
+        ),
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
         "SESSION.MARK_STALE": { target: "stale-inconsistent" },
@@ -137,16 +208,37 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
     discarded: {
       on: {
         "SESSION.OBSERVE": observeTransition,
-        "SESSION.DISCARD.REQUESTED": {},
+        "SESSION.CLOSE.REQUESTED": forbiddenTransition(
+          operationMetadata("close", false, "session-registry", "discarded-terminal"),
+        ),
+        "SESSION.DISCARD.REQUESTED": selfTransition(operationMetadata("discard", true, "caller", "discarded-terminal")),
         "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
+        "SESSION.GC.REQUESTED": forbiddenTransition(
+          operationMetadata("gc", false, "gc", "discarded-terminal", "age-is-not-destructive-authority"),
+        ),
       },
     },
     "stale-inconsistent": {
       on: {
         "SESSION.OBSERVE": observeTransition,
+        "SESSION.CLOSE.REQUESTED": forbiddenTransition(
+          operationMetadata("close", false, "reconciliation", "physical-reconciliation-required"),
+        ),
+        "SESSION.DISCARD.REQUESTED": forbiddenTransition(
+          operationMetadata("discard", true, "reconciliation", "physical-reconciliation-required"),
+        ),
         "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
+        "SESSION.GC.REQUESTED": forbiddenTransition(
+          operationMetadata(
+            "gc",
+            false,
+            "reconciliation",
+            "physical-reconciliation-required",
+            "age-is-not-destructive-authority",
+          ),
+        ),
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
       },
@@ -154,9 +246,17 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
     closed: {
       on: {
         "SESSION.OBSERVE": observeTransition,
-        "SESSION.CLOSE.REQUESTED": {},
+        "SESSION.CLOSE.REQUESTED": selfTransition(
+          operationMetadata("close", false, "session-registry", "closed-terminal"),
+        ),
+        "SESSION.DISCARD.REQUESTED": forbiddenTransition(
+          operationMetadata("discard", true, "session-registry", "closed-terminal"),
+        ),
         "SESSION.DOCTOR.REQUESTED": doctorTransition,
         "SESSION.RECONCILE.REQUESTED": reconcileTransition,
+        "SESSION.GC.REQUESTED": forbiddenTransition(
+          operationMetadata("gc", false, "gc", "closed-terminal", "age-is-not-destructive-authority"),
+        ),
       },
     },
   },
