@@ -10,6 +10,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { seedOfflineRuntimeDependencyOverrides } from "./seed-offline-runtime-dependencies.mjs";
+
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
 const packageName = packageJson.name;
@@ -39,27 +41,6 @@ function packageBinTargets(packageDirectory) {
     name,
     target: path.join(packageDirectory, relativeTarget),
   }));
-}
-
-function packLocalXState(installDirectory) {
-  const xstateDirectory = path.join(repoRoot, "node_modules", "xstate");
-  if (!fs.existsSync(xstateDirectory)) {
-    fail("local xstate installation is required to seed the offline package smoke test");
-  }
-  const result = run("npm", ["pack", "--json", xstateDirectory, "--pack-destination", installDirectory], {
-    cwd: repoRoot,
-  });
-  let packInfo;
-  try {
-    const metadata = JSON.parse(result.stdout);
-    packInfo = Array.isArray(metadata) ? metadata[0] : metadata.xstate;
-  } catch {
-    fail("local xstate packaging did not emit valid package metadata");
-  }
-  if (packInfo?.name !== "xstate" || typeof packInfo.filename !== "string") {
-    fail("local xstate packaging emitted unexpected package metadata");
-  }
-  return path.join(installDirectory, packInfo.filename);
 }
 
 function parseArgs(argv) {
@@ -137,7 +118,10 @@ async function main() {
 
   const installDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-"));
   try {
-    const xstateTarball = packLocalXState(installDirectory);
+    const runtimeDependencyOverrides = seedOfflineRuntimeDependencyOverrides({
+      packageRoot: repoRoot,
+      seedDirectory: installDirectory,
+    });
     fs.writeFileSync(
       path.join(installDirectory, "package.json"),
       JSON.stringify(
@@ -145,7 +129,7 @@ async function main() {
           name: "smoke-consumer",
           private: true,
           version: "0.0.0",
-          overrides: { xstate: xstateTarball },
+          overrides: runtimeDependencyOverrides,
         },
         null,
         2,
