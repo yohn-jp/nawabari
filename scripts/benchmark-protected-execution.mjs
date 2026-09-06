@@ -41,6 +41,7 @@ export function parseArgs(argv) {
   const options = { runs: DEFAULT_RUNS, parallel: DEFAULT_PARALLEL, output: undefined, keepTemp: false };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument === "--") continue;
     if (argument === "--help") {
       console.log(usage());
       return null;
