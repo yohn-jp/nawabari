@@ -8,10 +8,15 @@ const packageJson = JSON.parse(
   fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../package.json"), "utf8"),
 ) as { readonly exports?: Record<string, unknown> };
 
-test("package.json#exports exposes exactly the documented stable state/contract entry points", () => {
+test("package.json#exports exposes exactly the documented stable state/contract/manifest entry points", () => {
   const exportsField = packageJson.exports;
   assert.notEqual(exportsField, undefined);
-  assert.deepEqual(Object.keys(exportsField as object).sort(), ["./contract", "./package.json", "./state"]);
+  assert.deepEqual(Object.keys(exportsField as object).sort(), [
+    "./contract",
+    "./manifest",
+    "./package.json",
+    "./state",
+  ]);
 
   const state = (exportsField as Record<string, { types: string; default: string }>)["./state"];
   assert.equal(state.types, "./dist/public-state.d.ts");
@@ -21,9 +26,13 @@ test("package.json#exports exposes exactly the documented stable state/contract 
   assert.equal(contract.types, "./dist/public-contract.d.ts");
   assert.equal(contract.default, "./dist/public-contract.js");
 
+  const manifest = (exportsField as Record<string, { types: string; default: string }>)["./manifest"];
+  assert.equal(manifest.types, "./dist/product-state-manifest.d.ts");
+  assert.equal(manifest.default, "./dist/product-state-manifest.js");
+
   // Neither entry point resolves into the internal `src/state/` boundary
   // (state-node ids, actor refs, private machine context).
-  for (const entry of [state, contract]) {
+  for (const entry of [state, contract, manifest]) {
     assert.doesNotMatch(entry.default, /dist\/state\//u);
     assert.doesNotMatch(entry.types, /dist\/state\//u);
   }

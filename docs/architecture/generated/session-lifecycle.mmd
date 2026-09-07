@@ -1,0 +1,45 @@
+%% Generated from Nawabari Product State Manifest; do not edit.
+stateDiagram-v2
+  state "active" as active
+  state "close-ready" as close_ready
+  state "blocked-recoverable" as blocked_recoverable
+  state "discarded" as discarded
+  state "stale-inconsistent" as stale_inconsistent
+  state "closed" as closed
+  active --> close_ready : close
+  active --> discarded : discard
+  active --> active : inspect
+  active --> active : doctor
+  active --> active : reconcile
+  %% active -- gc --> no public transition (age-is-not-destructive-authority)
+  close_ready --> closed : close
+  close_ready --> discarded : discard
+  close_ready --> close_ready : inspect
+  close_ready --> close_ready : doctor
+  close_ready --> close_ready : reconcile
+  close_ready --> closed : gc [guard accepts]
+  %% close-ready -- gc [guard rejects] --> no public transition (age-is-not-destructive-authority)
+  %% blocked-recoverable -- close --> no public transition (recoverable-work-must-be-retained-or-discarded)
+  blocked_recoverable --> discarded : discard
+  blocked_recoverable --> blocked_recoverable : inspect
+  blocked_recoverable --> blocked_recoverable : doctor
+  blocked_recoverable --> blocked_recoverable : reconcile
+  %% blocked-recoverable -- gc --> no public transition (recoverable-work-must-be-retained-or-discarded)
+  %% discarded -- close --> no public transition (discarded-terminal)
+  discarded --> discarded : discard
+  discarded --> discarded : inspect
+  discarded --> discarded : doctor
+  discarded --> discarded : reconcile
+  %% discarded -- gc --> no public transition (age-is-not-destructive-authority)
+  %% stale-inconsistent -- close --> no public transition (physical-reconciliation-required)
+  %% stale-inconsistent -- discard --> no public transition (physical-reconciliation-required)
+  stale_inconsistent --> stale_inconsistent : inspect
+  stale_inconsistent --> stale_inconsistent : doctor
+  stale_inconsistent --> stale_inconsistent : reconcile
+  %% stale-inconsistent -- gc --> no public transition (age-is-not-destructive-authority)
+  closed --> closed : close
+  %% closed -- discard --> no public transition (closed-terminal)
+  closed --> closed : inspect
+  closed --> closed : doctor
+  closed --> closed : reconcile
+  %% closed -- gc --> no public transition (age-is-not-destructive-authority)

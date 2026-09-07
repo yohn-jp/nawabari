@@ -312,6 +312,16 @@ XState/domain authority -> Product State Manifest -> diagrams/docs/CI
 
 Diagrams are projections, never an editable source of truth.
 
+Nawabari's first implementation is `src/product-state-manifest.ts`, exposed
+through the stable `nawabari/manifest` package subpath. It projects the public
+state API and machine contract for the Session actor. The public command
+descriptors carry versioned producer/consumer, correlation, and idempotency
+metadata. No public cross-product event is currently emitted, so the manifest
+declares an explicit empty `not-exposed` event surface rather than inventing
+runtime events. The generated Session diagram is
+`docs/architecture/generated/session-lifecycle.mmd`; `pnpm run manifest:check`
+fails when that output drifts from the projection.
+
 ## Proposed module layout
 
 Initial target:

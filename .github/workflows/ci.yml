@@ -129,6 +129,9 @@ jobs:
       - name: Format check
         run: pnpm run format:check
 
+      - name: Verify generated Product State Manifest diagram
+        run: pnpm run manifest:check
+
       - name: Lint
         run: pnpm run lint
 
