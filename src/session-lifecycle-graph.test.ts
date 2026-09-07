@@ -10,6 +10,7 @@ import {
   type SessionLifecycleOperation,
   type SessionLifecycleObservation,
   type SessionLifecycleState,
+  type SessionLifecycleTransition,
 } from "./session-lifecycle-classification.js";
 import { SESSION_OPERATION_EVENT_TYPES, sessionLifecycleMachine } from "./state/session/machine.js";
 import type { SessionMachineEvent, SessionMachineInput } from "./state/session/types.js";
@@ -41,6 +42,19 @@ const GRAPH_OBSERVATIONS: readonly SessionLifecycleObservation[] = Object.freeze
     phase: "termination",
     ageSuspicious: false,
     gcAuthorized: true,
+  },
+  // Same lifecycle state (close-ready) as the fixture above, differing only
+  // in the GC authority guard's outcome. Both variants must be observed by
+  // the graph traversal so the guarded static projection's two branches are
+  // conformance-checked, not inferred from state identity alone (#266).
+  {
+    sessionState: "active",
+    physicalState: "healthy",
+    closeReadiness: "ready",
+    blockers: [],
+    phase: "termination",
+    ageSuspicious: false,
+    gcAuthorized: false,
   },
   {
     sessionState: "active",
@@ -127,9 +141,20 @@ function operationForEvent(source: GraphSnapshot, event: SessionMachineEvent): S
   return operation;
 }
 
+type ObservedTransition = {
+  readonly accepted: boolean;
+  /** Structural machine state after the event (self-loop when forbidden). */
+  readonly target: SessionLifecycleState;
+  /** Public contract target: the accepted destination, or null when forbidden. */
+  readonly publicTarget: SessionLifecycleState | null;
+  readonly reason: SessionLifecycleTransition["reason"];
+  readonly authority: SessionLifecycleTransition["authority"];
+  readonly requiresExplicitIntent: boolean;
+};
+
 function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<GraphSnapshot, SessionMachineEvent>): void {
   const reachableStates = new Set<string>();
-  const observed = new Map<string, { readonly accepted: boolean; readonly target: SessionLifecycleState }>();
+  const observed = new Map<string, ObservedTransition>();
   const directed = toDirectedGraph(sessionLifecycleMachine);
   const directedNodes = new Map(directed.children.map((node) => [node.id, node]));
 
@@ -178,6 +203,10 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
       observed.set(`${sourceState}.${operation}.${accepted ? "accepted" : "forbidden"}`, {
         accepted,
         target,
+        publicTarget: expected.target,
+        reason: expected.reason,
+        authority: expected.authority,
+        requiresExplicitIntent: expected.requiresExplicitIntent,
       });
     }
   }
@@ -191,11 +220,68 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
       const expected = SESSION_LIFECYCLE_TRANSITION_TABLE[state].find(
         (transition) => transition.operation === operation,
       )!;
+      if (expected.guarded) {
+        // A guard-dependent edge has no single admissibility verdict from
+        // state identity alone: the graph traversal must observe both the
+        // guard-accepts and guard-rejects branches from distinct
+        // observations in the same lifecycle state, and each observed
+        // branch must carry the full public transition metadata the static
+        // projection promises for it — allowed, target, reason, authority,
+        // and requiresExplicitIntent (#266).
+        const acceptedKey = `${state}.${operation}.accepted`;
+        const forbiddenKey = `${state}.${operation}.forbidden`;
+        assert.equal(observed.has(acceptedKey), true, `graph did not cover ${acceptedKey}`);
+        assert.equal(observed.has(forbiddenKey), true, `graph did not cover ${forbiddenKey}`);
+
+        const acceptedCoverage = observed.get(acceptedKey)!;
+        assert.equal(acceptedCoverage.accepted, true, `${acceptedKey} availability drift`);
+        assert.equal(acceptedCoverage.target, expected.whenGuardAccepts.target, `${acceptedKey} target drift`);
+        assert.equal(
+          acceptedCoverage.publicTarget,
+          expected.whenGuardAccepts.target,
+          `${acceptedKey} public target drift`,
+        );
+        assert.equal(acceptedCoverage.reason, expected.whenGuardAccepts.reason, `${acceptedKey} reason drift`);
+        assert.equal(acceptedCoverage.authority, expected.authority, `${acceptedKey} authority drift`);
+        assert.equal(
+          acceptedCoverage.requiresExplicitIntent,
+          expected.requiresExplicitIntent,
+          `${acceptedKey} requiresExplicitIntent drift`,
+        );
+
+        const forbiddenCoverage = observed.get(forbiddenKey)!;
+        assert.equal(forbiddenCoverage.accepted, false, `${forbiddenKey} availability drift`);
+        // The public contract's rejection branch always carries target: null
+        // — a forbidden guarded transition has no destination, regardless of
+        // the underlying machine staying on its self-loop structurally
+        // (checked separately above via `target`) (#266).
+        assert.equal(forbiddenCoverage.publicTarget, expected.whenGuardRejects.target, `${forbiddenKey} target drift`);
+        assert.equal(forbiddenCoverage.reason, expected.whenGuardRejects.reason, `${forbiddenKey} reason drift`);
+        assert.equal(forbiddenCoverage.authority, expected.authority, `${forbiddenKey} authority drift`);
+        assert.equal(
+          forbiddenCoverage.requiresExplicitIntent,
+          expected.requiresExplicitIntent,
+          `${forbiddenKey} requiresExplicitIntent drift`,
+        );
+        continue;
+      }
       const expectedKind = expected.allowed ? "accepted" : "forbidden";
       const key = `${state}.${operation}.${expectedKind}`;
       assert.equal(observed.has(key), true, `graph did not cover ${key}`);
       const coverage = observed.get(key)!;
       assert.equal(coverage.accepted, expected.allowed, `${key} availability drift`);
+      assert.equal(coverage.reason, expected.reason, `${key} reason drift`);
+      assert.equal(coverage.authority, expected.authority, `${key} authority drift`);
+      assert.equal(
+        coverage.requiresExplicitIntent,
+        expected.requiresExplicitIntent,
+        `${key} requiresExplicitIntent drift`,
+      );
+      // expected.target is already null for a forbidden unconditional
+      // transition, so this covers both branches' public contract without
+      // an `if (expected.allowed)` guard: forbidden asserts null, accepted
+      // asserts the real destination (#266).
+      assert.equal(coverage.publicTarget, expected.target, `${key} public target drift`);
       if (expected.allowed) assert.equal(coverage.target, expected.target, `${key} target drift`);
     }
   }

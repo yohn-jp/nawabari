@@ -1,9 +1,12 @@
 import { assign, createActor, setup } from "xstate";
 
 import type {
+  SessionLifecycleGuardedTransition,
   SessionLifecycleOperation,
   SessionLifecycleState,
   SessionLifecycleTransition,
+  SessionLifecycleTransitionProjection,
+  SessionLifecycleUnconditionalTransition,
 } from "../../session-lifecycle-classification.js";
 
 import {
@@ -315,8 +318,39 @@ export interface SessionMachineProjection {
 
 type TransitionDefinition = {
   readonly target?: readonly { readonly key: string }[];
+  readonly guard?: unknown;
   readonly meta?: unknown;
 };
+
+/**
+ * The constant-false guard used by every unconditionally forbidden
+ * transition. Unlike a context-dependent guard (for example
+ * `destructiveGcIsAllowed`), its outcome never varies with the observation,
+ * so a transition using it is still statically resolvable.
+ */
+const STATIC_FORBIDDEN_GUARD_NAME = "operationIsForbidden";
+
+/** Resolve a transition definition's guard to its stable name, if any. */
+function definitionGuardName(definition: TransitionDefinition | undefined): string | undefined {
+  const guard = definition?.guard;
+  if (guard === undefined) return undefined;
+  if (typeof guard === "string") return guard;
+  if (typeof guard === "object" && guard !== null && "type" in guard && typeof guard.type === "string") {
+    return guard.type;
+  }
+  throw new Error("Session lifecycle machine transition has an unrecognized guard shape");
+}
+
+/**
+ * True when a transition's admissibility depends on the supplied
+ * observation/context rather than on state identity alone. The constant
+ * `operationIsForbidden` guard is statically always-false and therefore not
+ * context-dependent.
+ */
+function isContextDependentGuard(definition: TransitionDefinition | undefined): boolean {
+  const name = definitionGuardName(definition);
+  return name !== undefined && name !== STATIC_FORBIDDEN_GUARD_NAME;
+}
 
 function operationalState(value: unknown): SessionLifecycleState {
   if (typeof value !== "string" || value === "classify") {
@@ -424,9 +458,69 @@ export function projectSessionLifecycleMachine(input: SessionMachineInput): Sess
   });
 }
 
-/** Generate the compatibility table directly from machine transition metadata. */
+function projectUnconditionalTransition(
+  operation: SessionLifecycleOperation,
+  state: SessionLifecycleState,
+  metadata: SessionMachineTransitionMetadata,
+): SessionLifecycleUnconditionalTransition {
+  const allowed = metadata.allowed;
+  return Object.freeze({
+    operation,
+    guarded: false,
+    allowed,
+    target: allowed ? (metadata.target ?? state) : null,
+    requiresExplicitIntent: metadata.requiresExplicitIntent,
+    authority: metadata.authority,
+    // A rejected transition's public reason is the guard's own rejection
+    // cause when one is recorded; falling back to `reason` would silently
+    // republish the accepted-branch cause for a transition that never
+    // accepts (see #266).
+    reason: allowed ? metadata.reason : (metadata.forbiddenReason ?? metadata.reason),
+  });
+}
+
+function projectGuardedTransition(
+  operation: SessionLifecycleOperation,
+  state: SessionLifecycleState,
+  metadata: SessionMachineTransitionMetadata,
+): SessionLifecycleGuardedTransition {
+  if (metadata.forbiddenReason === undefined) {
+    throw new Error(
+      `Session lifecycle machine transition ${state}.${operation} depends on a context guard but declares no forbiddenReason for its rejection branch`,
+    );
+  }
+  if (metadata.target === null) {
+    throw new Error(
+      `Session lifecycle machine transition ${state}.${operation} depends on a context guard but declares no target for its acceptance branch`,
+    );
+  }
+  return Object.freeze({
+    operation,
+    guarded: true,
+    requiresExplicitIntent: metadata.requiresExplicitIntent,
+    authority: metadata.authority,
+    whenGuardAccepts: Object.freeze({
+      allowed: true,
+      target: metadata.target,
+      reason: metadata.reason,
+    }),
+    whenGuardRejects: Object.freeze({
+      allowed: false,
+      target: null,
+      reason: metadata.forbiddenReason,
+    }),
+  });
+}
+
+/**
+ * Generate the compatibility table directly from machine transition
+ * metadata. A transition whose XState definition carries a context-dependent
+ * guard is projected as `guarded: true` with both branches represented; it
+ * is never flattened into a single `allowed` verdict from state identity
+ * alone (#266).
+ */
 export function projectSessionLifecycleTransitionTable(): Readonly<
-  Record<SessionLifecycleState, readonly SessionLifecycleTransition[]>
+  Record<SessionLifecycleState, readonly SessionLifecycleTransitionProjection[]>
 > {
   const table = Object.fromEntries(
     (Object.keys(sessionLifecycleMachine.states) as SessionLifecycleState[])
@@ -435,19 +529,15 @@ export function projectSessionLifecycleTransitionTable(): Readonly<
         const transitions = (Object.keys(SESSION_OPERATION_EVENT_TYPES) as SessionLifecycleOperation[]).map(
           (operation) => {
             const eventType = SESSION_OPERATION_EVENT_TYPES[operation];
-            const metadata = transitionMetadata(transitionDefinitions(state, eventType)[0]?.meta);
-            return Object.freeze({
-              operation,
-              allowed: metadata.allowed,
-              target: metadata.allowed ? (metadata.target ?? state) : null,
-              requiresExplicitIntent: metadata.requiresExplicitIntent,
-              authority: metadata.authority,
-              reason: metadata.reason,
-            });
+            const definition = transitionDefinitions(state, eventType)[0];
+            const metadata = transitionMetadata(definition?.meta);
+            return isContextDependentGuard(definition)
+              ? projectGuardedTransition(operation, state, metadata)
+              : projectUnconditionalTransition(operation, state, metadata);
           },
         );
         return [state, Object.freeze(transitions)];
       }),
-  ) as Record<SessionLifecycleState, readonly SessionLifecycleTransition[]>;
+  ) as Record<SessionLifecycleState, readonly SessionLifecycleTransitionProjection[]>;
   return Object.freeze(table);
 }

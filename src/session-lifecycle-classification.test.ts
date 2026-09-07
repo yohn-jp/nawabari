@@ -177,11 +177,78 @@ test("blocked-recoverable GC reason is the recoverable-work cause, not the gener
   });
   assert.equal(classification.state, "blocked-recoverable");
   assert.equal(lifecycleTransition(classification, "gc").reason, "recoverable-work-must-be-retained-or-discarded");
+  const staticGc = SESSION_LIFECYCLE_TRANSITION_TABLE["blocked-recoverable"].find(
+    (transition) => transition.operation === "gc",
+  );
+  assert.equal(staticGc?.guarded, false);
   assert.equal(
-    SESSION_LIFECYCLE_TRANSITION_TABLE["blocked-recoverable"].find((transition) => transition.operation === "gc")
-      ?.reason,
+    staticGc?.guarded === false ? staticGc.reason : undefined,
     "recoverable-work-must-be-retained-or-discarded",
   );
+});
+
+test("close-ready GC is projected as guarded, not flattened to a single unconditional verdict", () => {
+  const staticGc = SESSION_LIFECYCLE_TRANSITION_TABLE["close-ready"].find(
+    (transition) => transition.operation === "gc",
+  );
+  assert.equal(staticGc?.guarded, true);
+  if (staticGc?.guarded !== true) throw new Error("unreachable");
+  assert.deepEqual(staticGc.whenGuardAccepts, {
+    allowed: true,
+    target: "closed",
+    reason: "close-authorized",
+  });
+  assert.deepEqual(staticGc.whenGuardRejects, {
+    allowed: false,
+    target: null,
+    reason: "age-is-not-destructive-authority",
+  });
+  assert.equal(staticGc.authority, "gc");
+  assert.equal(staticGc.requiresExplicitIntent, false);
+
+  const authorized = classifySessionLifecycle({
+    sessionState: "active",
+    physicalState: "healthy",
+    closeReadiness: "ready",
+    gcAuthorized: true,
+    phase: "termination",
+  });
+  assert.equal(authorized.state, "close-ready");
+  assert.deepEqual(lifecycleTransition(authorized, "gc"), {
+    operation: "gc",
+    allowed: true,
+    target: "closed",
+    requiresExplicitIntent: false,
+    authority: "gc",
+    reason: "close-authorized",
+  });
+
+  const unauthorized = classifySessionLifecycle({
+    sessionState: "active",
+    physicalState: "healthy",
+    closeReadiness: "ready",
+    gcAuthorized: false,
+    phase: "termination",
+  });
+  assert.equal(unauthorized.state, "close-ready");
+  assert.deepEqual(lifecycleTransition(unauthorized, "gc"), {
+    operation: "gc",
+    allowed: false,
+    target: null,
+    requiresExplicitIntent: false,
+    authority: "gc",
+    reason: "age-is-not-destructive-authority",
+  });
+});
+
+test("static forbidden-GC reasons publish the runtime rejection cause, not the accepted-branch reason", () => {
+  for (const state of ["discarded", "stale-inconsistent", "closed"] as const) {
+    const staticGc = SESSION_LIFECYCLE_TRANSITION_TABLE[state].find((transition) => transition.operation === "gc");
+    assert.equal(staticGc?.guarded, false);
+    if (staticGc?.guarded !== false) throw new Error("unreachable");
+    assert.equal(staticGc.allowed, false);
+    assert.equal(staticGc.reason, "age-is-not-destructive-authority");
+  }
 });
 
 test("registry classification reuses diagnostic authority without mutation", () => {
