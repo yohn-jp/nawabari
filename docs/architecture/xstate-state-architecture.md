@@ -196,8 +196,6 @@ Normal close must never acquire discard authority. Discard remains explicit call
 
 ## Resource claims
 
-Resource claims are a second state-machine candidate, not part of the first migration authority switch.
-
 The existing transition matrix:
 
 ```text
@@ -206,7 +204,45 @@ none <-> read <-> write <-> exclusive-write
 
 with transition classes `acquire`, `no-op`, `change`, `release` is already an explicit finite-state model.
 
-After session migration, evaluate whether representing exact-resource claim transitions with XState reduces duplicate machinery and improves graph testing. Do not replace the independent compatibility/access policy merely because the transition matrix moves to XState.
+### Issue #258 decision: retain the pure exact-resource transition authority
+
+Retain `RESOURCE_CLAIM_TRANSITION_MATRIX` as the sole exact-resource transition authority. Do not migrate this finite classification table to XState.
+
+This is a code-level decision based on the current implementation:
+
+| Criterion              | Current exact-resource implementation                                                           | Decision consequence                                                                                                |
+| ---------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| State domain           | Four closed values: `none`, `read`, `write`, `exclusive-write`                                  | A total 4 x 4 table is sufficient for every valid pair.                                                             |
+| Transition semantics   | `classifyResourceClaimTransition()` validates the two modes and performs a direct matrix lookup | The classifier is a pure validated lookup, not a competing semantic authority.                                      |
+| Observation and guards | No external observation or contextual guard is needed to classify a pair                        | No XState guard or context is required.                                                                             |
+| Effects and recovery   | Classification performs no asynchronous effect and has no intermediate or recovery state        | No actor lifecycle or statechart runtime semantics are needed.                                                      |
+| Coverage               | The matrix has one deterministic class for every source/requested pair                          | Exhaustive table tests provide direct coverage; graph traversal would add machinery without adding domain evidence. |
+
+The distinction from Session lifecycle is therefore intentional:
+
+```text
+Session lifecycle
+    -> contextual state machine
+    -> XState authority
+
+Exact-resource claim transition
+    -> finite pure classification table
+    -> RESOURCE_CLAIM_TRANSITION_MATRIX authority
+```
+
+This decision must be revisited only if exact-resource transitions acquire contextual guards, external observation, asynchronous effects, intermediate/recovery states, or actor lifecycle semantics. Per-resource actors and statecharts are not introduced for architectural symmetry.
+
+The following authorities remain independent and are not copied into XState configuration or guards:
+
+- `RESOURCE_CLAIM_COMPATIBILITY_MATRIX`: overlapping claim compatibility and conflict policy.
+- `RESOURCE_CLAIM_ACCESS_STRENGTH` and `claimModeGrantsAccess()`: access-strength policy.
+- `canonicalizeClaimResource()` and `canonicalizeConcretePath()`: path canonicalization.
+- `claimsOverlap()`, `claimsConflict()`, and `resourceClaimConflictsWithAccess()`: overlap/conflict evaluation.
+- `OPERATION_AUTHORIZATION_POLICY`: operation authorization policy.
+
+The Product State Manifest remains a projection of the Session actor. This decision does not add a Resource Claim actor or statechart to the manifest.
+
+Do not replace the independent compatibility/access policy merely because the exact-resource transition table is used alongside XState elsewhere.
 
 ## Operation authorization
 
@@ -387,10 +423,10 @@ Existing domain observation, Git, registry, claim, authorization, and sandbox mo
 - Keep raw actor/machine internals private.
 - Provide a transport-neutral boundary suitable for Mottainai/Inari adapters.
 
-### Phase 8: resource-claim evaluation/migration
+### Phase 8: resource-claim evaluation (completed by #258)
 
-- Evaluate `RESOURCE_CLAIM_TRANSITION_MATRIX` as the next XState migration candidate.
-- Migrate only if it simplifies authority and improves testability without obscuring compatibility policy.
+- Retain `RESOURCE_CLAIM_TRANSITION_MATRIX` as the exact-resource transition authority.
+- Reconsider migration only if the transition domain gains the contextual, effectful, or actor-lifecycle characteristics documented above.
 
 ### Phase 9: generated visualization and cross-product manifest foundation
 
@@ -422,7 +458,7 @@ The architecture should be implemented through at least these leaf Issues:
 6. Converge lifecycle next-action/status/diagnostic projections on the XState-derived public snapshot.
 7. Generate session lifecycle machine-contract metadata from the XState authority.
 8. Add stable package exports for Nawabari state/contract integration without exposing raw actor internals.
-9. Evaluate and, if justified, migrate resource-claim transition semantics to XState.
+9. Evaluate resource-claim transition semantics and record the authority decision; #258 retains the pure matrix.
 10. Define/generate Nawabari Product State Manifest and state diagrams as groundwork for Inari/Mottainai composition.
 
 Leaves 1-3 may proceed with limited parallelism once interfaces are agreed. The authority switch depends on parity proof. Cleanup/reconciliation migration depends on the authority switch or an explicitly compatible staged adapter. Contract/public API work follows stable public projection semantics.
