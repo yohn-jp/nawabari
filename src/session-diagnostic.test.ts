@@ -41,6 +41,53 @@ test("diagnose reports ready close readiness and not-due cleanup readiness for a
   }
 });
 
+test("discard preview is read-only and reports destructive commit, identity, and claim evidence", () => {
+  const fixture = createFixture("discard-preview");
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repository });
+    const session = registry.provision({ worktreePath: fixture.worktree, branchName: "feature/discard-preview" });
+    fs.writeFileSync(path.join(fixture.worktree, "recoverable.txt"), "recoverable\n");
+    runGit(["add", "recoverable.txt"], fixture.worktree);
+    runGit(["commit", "-m", "recoverable"], fixture.worktree);
+    registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "recoverable.txt", mode: "exclusive-write" }],
+    });
+
+    const registryBefore = fs.readFileSync(registry.paths.registry, "utf8");
+    const head = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    const preview = registry.previewDiscard(session.sessionId);
+    const repeated = registry.previewDiscard(session.sessionId);
+
+    assert.deepEqual(repeated, preview);
+    assert.equal(preview.operation, "discard-preview");
+    assert.equal(preview.destructive, true);
+    assert.match(preview.warning, /destructive/u);
+    assert.equal(preview.session.sessionId, session.sessionId);
+    assert.equal(preview.currentState, "active");
+    assert.equal(preview.persistedState, "active");
+    assert.equal(preview.worktreePresent, true);
+    assert.equal(preview.branchPresent, true);
+    assert.equal(preview.head, head);
+    assert.equal(preview.worktreeHead, head);
+    assert.equal(preview.branchHead, head);
+    assert.equal(preview.recoverableCommits.observable, true);
+    assert.equal(preview.recoverableCommits.present, true);
+    assert.equal(preview.recoverableCommits.evidence[0]?.code, "RECOVERABLE_COMMITS");
+    assert.equal(preview.uncommittedWork.present, false);
+    assert.equal(preview.claimCount, 1);
+    assert.equal(preview.claims[0]?.resource, "recoverable.txt");
+    assert.equal(preview.destructiveScope.worktree, true);
+    assert.equal(preview.destructiveScope.branch, true);
+    assert.equal(preview.destructiveScope.unintegratedCommits, true);
+    assert.equal(fs.readFileSync(registry.paths.registry, "utf8"), registryBefore);
+    assert.equal(fs.existsSync(fixture.worktree), true);
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("diagnose reports age suspicion without destructive GC eligibility for a healthy session", () => {
   const fixture = createFixture("stale-candidate");
   try {

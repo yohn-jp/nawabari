@@ -1,4 +1,5 @@
 import { DEFAULT_SESSION_LIST_LIMIT, MAX_SESSION_LIST_LIMIT } from "./domain/session.js";
+import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS } from "./repository-evidence.js";
 
 const CLI_NAME = "nawabari";
@@ -13,6 +14,12 @@ export type CliHelpOptionSpec = {
   readonly minimum?: number;
   readonly maximum?: number;
   readonly repeatable?: boolean;
+  /** Closed values projected from the authority that validates this option. */
+  readonly values?: readonly string[];
+  /** This option remains required unless one of these additive selectors is present. */
+  readonly required_unless?: readonly string[];
+  /** Selectors that cannot be combined with this option. */
+  readonly mutually_exclusive_with?: readonly string[];
   readonly description: string;
 };
 
@@ -36,7 +43,17 @@ const option = (
   description: string,
   options: Pick<
     CliHelpOptionSpec,
-    "aliases" | "alias_of" | "value" | "required" | "default" | "minimum" | "maximum" | "repeatable"
+    | "aliases"
+    | "alias_of"
+    | "value"
+    | "required"
+    | "default"
+    | "minimum"
+    | "maximum"
+    | "repeatable"
+    | "values"
+    | "required_unless"
+    | "mutually_exclusive_with"
   > = {},
 ): CliHelpOptionSpec => ({ name, description, ...options });
 
@@ -322,12 +339,13 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
   {
     name: "session discard",
     summary: "Explicitly discard one selected session and its owned resources",
-    usage: `${CLI_NAME} session discard <session-id>|--session <id>`,
+    usage: `${CLI_NAME} session discard <session-id>|--session <id> [--preview]`,
     options: [
       option("--session", "Required explicit target; the current session is never inferred", {
         value: "<id>",
         required: true,
       }),
+      option("--preview", "Read-only bounded summary of the destructive discard scope"),
     ],
     notes: [
       "Destructive and explicit: unintegrated commits and uncommitted work in the selected owned worktree may be destroyed.",
@@ -342,7 +360,11 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     usage: `${CLI_NAME} authorize --operation <name> --resource <path> [--resource <path>] [--session <id>]`,
     options: [
       option("--session", "Assert the current session identity", { value: "<id>" }),
-      option("--operation", "Operation vocabulary entry", { value: "<name>", required: true }),
+      option("--operation", "Operation vocabulary entry", {
+        value: "<name>",
+        required: true,
+        values: OPERATION_VOCABULARY,
+      }),
       option("--resource", "Concrete repository-relative path; repeatable", {
         value: "<path>",
         required: true,
@@ -394,7 +416,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
   {
     name: "commit",
     summary: "Commit explicit claim-authorized resources",
-    usage: `${CLI_NAME} commit --message <final-message> --resource <path> [--resource <path>] [--session <id>] [--message-pattern <regex>]`,
+    usage: `${CLI_NAME} commit --message <final-message> (--resource <path> [--resource <path>] | --all-claimed) [--session <id>] [--message-pattern <regex>]`,
     options: [
       option("--session", "Assert the current session identity", { value: "<id>" }),
       option("--message", "Caller-decided final commit message", { value: "<final-message>", required: true }),
@@ -402,22 +424,34 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         value: "<path>",
         required: true,
         repeatable: true,
+        required_unless: ["--all-claimed"],
+      }),
+      option("--all-claimed", "Select all safely resolved session resources covered by qualifying commit claims", {
+        mutually_exclusive_with: ["--resource"],
       }),
       option("--message-pattern", "Caller-declared commit-message rule; validated only when supplied", {
         value: "<regex>",
       }),
     ],
+    notes: [
+      "Use repeated --resource by default, or explicitly use --all-claimed; the selectors cannot be combined.",
+      "--all-claimed resolves only concrete Git-changed resources and retains unexpected changed-path protection.",
+    ],
   },
   {
     name: "push",
     summary: "Push the owned branch to an explicit target",
-    usage: `${CLI_NAME} push --remote <name> --branch <name> --resource <path> [options]`,
+    usage: `${CLI_NAME} push --remote <name> --branch <name> (--resource <path> [--resource <path>] | --all-claimed) [options]`,
     options: [
       option("--session", "Assert the current session identity", { value: "<id>" }),
       option("--resource", "Claim-covered concrete path; repeatable", {
         value: "<path>",
         required: true,
         repeatable: true,
+        required_unless: ["--all-claimed"],
+      }),
+      option("--all-claimed", "Select all safely resolved session resources covered by qualifying push claims", {
+        mutually_exclusive_with: ["--resource"],
       }),
       option("--remote", "Explicit Git remote", { value: "<name>", required: true }),
       option("--branch", "Explicit target branch", {
@@ -462,7 +496,10 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     usage: `${CLI_NAME} guard [--session <id>] [--operation <name> --resource <path>]`,
     options: [
       option("--session", "Assert the current session identity", { value: "<id>" }),
-      option("--operation", "Authorize an operation when resources are supplied", { value: "<name>" }),
+      option("--operation", "Authorize an operation when resources are supplied", {
+        value: "<name>",
+        values: OPERATION_VOCABULARY,
+      }),
       option("--resource", "Concrete resource; repeatable with --operation", { value: "<path>" }),
     ],
   },

@@ -21,6 +21,7 @@ import {
 } from "./domain/session.js";
 import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS, EVIDENCE_MAX_DIFF_PATHS } from "./repository-evidence.js";
 import { isResourceClaimMode } from "./resource-claims.js";
+import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
@@ -125,13 +126,22 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session claims": ["--session"],
   "session release": ["--session", "--resource", "--claim-id", "--all", "--if-generation", "--force"],
   "session close": ["--session", "--integrated-revision", "--fetch-remote", "--fetch-branch"],
-  "session discard": ["--session"],
+  "session discard": ["--session", "--preview"],
   authorize: ["--session", "--operation", "--resource"],
   checkpoint: ["--session"],
   "evidence snapshot": ["--session"],
   diff: ["--session", "--path", "--from", "--to", "--patch", "--max-bytes", "--max-hunks"],
-  commit: ["--session", "--message", "--resource", "--message-pattern"],
-  push: ["--session", "--resource", "--remote", "--branch", "--remote-branch", "--force", "--create-upstream"],
+  commit: ["--session", "--message", "--resource", "--all-claimed", "--message-pattern"],
+  push: [
+    "--session",
+    "--resource",
+    "--all-claimed",
+    "--remote",
+    "--branch",
+    "--remote-branch",
+    "--force",
+    "--create-upstream",
+  ],
   status: ["--all", "--history", "--limit", "--offset"],
   guard: ["--session", "--operation", "--resource"],
   gc: ["--apply", "--dry-run"],
@@ -185,6 +195,20 @@ export function validateCliRegistryParity(): void {
       throw new Error(
         `CLI option registry parity failure for ${name}: missing_from_dispatcher=${missing.join(",")}; ` +
           `missing_from_registry=${extra.join(",")}`,
+      );
+    }
+  }
+
+  for (const command of ["authorize", "guard"] as const) {
+    const definition = resolveCliCommandDefinition(command);
+    const operation = definition?.options.find((candidate) => candidate.name === "--operation");
+    if (operation === undefined || operation.values === undefined) {
+      throw new Error(`CLI operation vocabulary parity failure for ${command}: missing --operation values`);
+    }
+    if (operation.values.join("\u0000") !== OPERATION_VOCABULARY.join("\u0000")) {
+      throw new Error(
+        `CLI operation vocabulary parity failure for ${command}: expected=${OPERATION_VOCABULARY.join(",")}; ` +
+          `actual=${operation.values.join(",")}`,
       );
     }
   }
@@ -246,6 +270,11 @@ function helpPayload(spec: CliCommandDefinition): JsonObject {
     ...(candidate.default === undefined ? {} : { default: candidate.default }),
     ...(candidate.minimum === undefined ? {} : { minimum: candidate.minimum }),
     ...(candidate.maximum === undefined ? {} : { maximum: candidate.maximum }),
+    ...(candidate.values === undefined ? {} : { values: [...candidate.values] }),
+    ...(candidate.required_unless === undefined ? {} : { required_unless: [...candidate.required_unless] }),
+    ...(candidate.mutually_exclusive_with === undefined
+      ? {}
+      : { mutually_exclusive_with: [...candidate.mutually_exclusive_with] }),
     description: candidate.description,
   }));
   const canonical = canonicalCommandForName(spec.name);
@@ -296,7 +325,16 @@ function helpText(spec: CliCommandDefinition): string {
         candidate.minimum === undefined && candidate.maximum === undefined
           ? ""
           : `; bounds: ${candidate.minimum ?? "-∞"}..${candidate.maximum ?? "∞"}`;
-      lines.push(`  ${label.padEnd(38)} ${qualifier}${bounds}; ${candidate.description}`);
+      const values = candidate.values === undefined ? "" : `; values: ${candidate.values.join(", ")}`;
+      const requiredUnless =
+        candidate.required_unless === undefined ? "" : `; required unless: ${candidate.required_unless.join(", ")}`;
+      const mutuallyExclusive =
+        candidate.mutually_exclusive_with === undefined
+          ? ""
+          : `; mutually exclusive with: ${candidate.mutually_exclusive_with.join(", ")}`;
+      lines.push(
+        `  ${label.padEnd(38)} ${qualifier}${bounds}${values}${requiredUnless}${mutuallyExclusive}; ${candidate.description}`,
+      );
     }
     if (spec.notes !== undefined) {
       lines.push("", "Notes:");
@@ -348,6 +386,7 @@ type ParsedOptions = {
   apply: boolean;
   force: boolean;
   create_upstream: boolean;
+  all_claimed: boolean;
   all: boolean;
   history: boolean;
   limit: string | null;
@@ -361,6 +400,7 @@ type ParsedOptions = {
   integrated_revision: string | null;
   fetch_remote: string | null;
   fetch_branch: string | null;
+  preview: boolean;
 };
 
 function usageError(
@@ -435,6 +475,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     apply: false,
     force: false,
     create_upstream: false,
+    all_claimed: false,
     all: false,
     history: false,
     limit: null,
@@ -448,6 +489,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     integrated_revision: null,
     fetch_remote: null,
     fetch_branch: null,
+    preview: false,
   };
   let dryRun = false;
 
@@ -462,9 +504,11 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       name === "--dry-run" ||
       name === "--force" ||
       name === "--create-upstream" ||
+      name === "--all-claimed" ||
       name === "--all" ||
       name === "--history" ||
-      name === "--patch"
+      name === "--patch" ||
+      name === "--preview"
     ) {
       if (inlineValue !== null) {
         return failure(usageError("INVALID_ARGUMENT", `${name} does not accept a value.`, { option: name }));
@@ -473,9 +517,11 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       else if (name === "--dry-run") dryRun = true;
       else if (name === "--force") options.force = true;
       else if (name === "--create-upstream") options.create_upstream = true;
+      else if (name === "--all-claimed") options.all_claimed = true;
       else if (name === "--all") options.all = true;
       else if (name === "--history") options.history = true;
-      else options.patch = true;
+      else if (name === "--patch") options.patch = true;
+      else options.preview = true;
       continue;
     }
 
@@ -1361,6 +1407,11 @@ async function executeCommand(
     if (subcommand === "discard") {
       const parsed = parseTargetedOptions(rest, dispatcherAllowedOptions("session discard"), true);
       if (!parsed.ok) return parsed;
+      if (parsed.value.preview) {
+        if (dependencies.backend.discardPreview === undefined) return sessionDiscardPreviewCapabilityUnavailable();
+        const preview = await dependencies.backend.discardPreview(context, parsed.value.session_id as string);
+        return preview.ok ? { ok: true, value: preview.value as unknown as JsonObject } : preview;
+      }
       if (dependencies.backend.discardSession === undefined) return sessionDiscardCapabilityUnavailable();
       const result = await dependencies.backend.discardSession(context, parsed.value.session_id as string);
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
@@ -1574,7 +1625,14 @@ async function executeCommand(
     if (parsed.value.message === null) {
       return failure(usageError("MISSING_ARGUMENT", "--message requires a value.", { option: "--message" }));
     }
-    if (parsed.value.resources.length === 0) {
+    if (parsed.value.all_claimed && parsed.value.resources.length > 0) {
+      return failure(
+        usageError("INVALID_ARGUMENT", "--resource and --all-claimed cannot be used together.", {
+          options: ["--resource", "--all-claimed"],
+        }),
+      );
+    }
+    if (!parsed.value.all_claimed && parsed.value.resources.length === 0) {
       return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
     }
     if (dependencies.backend.commit === undefined) return mutationCapabilityUnavailable("commit");
@@ -1582,6 +1640,7 @@ async function executeCommand(
       session_id: parsed.value.session_id,
       message: parsed.value.message,
       resources: parsed.value.resources,
+      ...(parsed.value.all_claimed ? { all_claimed: true } : {}),
       message_pattern: parsed.value.message_pattern,
     });
     return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
@@ -1606,13 +1665,21 @@ async function executeCommand(
     ) {
       return failure(usageError("INVALID_ARGUMENT", "--branch and --remote-branch must identify the same target."));
     }
-    if (parsed.value.resources.length === 0) {
+    if (parsed.value.all_claimed && parsed.value.resources.length > 0) {
+      return failure(
+        usageError("INVALID_ARGUMENT", "--resource and --all-claimed cannot be used together.", {
+          options: ["--resource", "--all-claimed"],
+        }),
+      );
+    }
+    if (!parsed.value.all_claimed && parsed.value.resources.length === 0) {
       return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
     }
     if (dependencies.backend.push === undefined) return mutationCapabilityUnavailable("push");
     const result = await dependencies.backend.push(context, {
       session_id: parsed.value.session_id,
       resources: parsed.value.resources,
+      ...(parsed.value.all_claimed ? { all_claimed: true } : {}),
       remote: parsed.value.remote,
       branch: parsed.value.branch ?? parsed.value.remote_branch,
       force: parsed.value.force,
@@ -1768,6 +1835,14 @@ function sessionDiscardCapabilityUnavailable(): DomainResult<JsonObject> {
   return failure(
     new DomainError("BACKEND_UNAVAILABLE", "Session discard capability is not available.", {
       operation: "session.discard",
+    }),
+  );
+}
+
+function sessionDiscardPreviewCapabilityUnavailable(): DomainResult<JsonObject> {
+  return failure(
+    new DomainError("BACKEND_UNAVAILABLE", "Session discard preview capability is not available.", {
+      operation: "session.discard.preview",
     }),
   );
 }
