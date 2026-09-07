@@ -24,6 +24,7 @@ import {
   SANDBOX_REQUIRED_CAPABILITIES,
 } from "./domain/sandbox.js";
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
+import { DISCARD_PREVIEW_SCHEMA_VERSION } from "./session-registry.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -323,6 +324,32 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       missing_or_extra: "deterministic conformance failure",
       internal_exceptions: [],
     },
+    preview: {
+      option: "--preview",
+      read_only: true,
+      result_schema: "session-discard-preview.v1",
+      result_schema_version: DISCARD_PREVIEW_SCHEMA_VERSION,
+      identities: [
+        "session_id",
+        "repository",
+        "worktree",
+        "branch",
+        "current_state",
+        "persisted_state",
+        "physical_state",
+        "worktree_present",
+        "branch_present",
+        "head",
+        "recoverable_commits",
+        "claims",
+        "claim_count",
+        "destructive_scope",
+        "warning",
+      ],
+      evidence_sources: ["session-diagnostic", "cleanup-reconciliation", "authoritative-claim-snapshot"],
+      destructive: true,
+      one_document: true,
+    },
   },
   {
     id: "session-diagnostics",
@@ -495,6 +522,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       { schema: "evidence.v1", version: 1, commands: ["checkpoint"] },
     ],
     identities: ["operation", "allowed", "code", "claim_ids", "head", "in_claim", "out_of_claim"],
+    operation_vocabulary: [...OPERATION_VOCABULARY],
     failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["authorization-and-evidence"],
     failure_code_policy: {
       source: "implementation-owned authorization-and-evidence vocabulary",
@@ -554,6 +582,11 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       source: "implementation-owned governed-git-mutation vocabulary",
       missing_or_extra: "deterministic conformance failure",
       internal_exceptions: [],
+    },
+    selectors: {
+      explicit_resources: "--resource <path> (repeatable; existing default)",
+      all_claimed: "--all-claimed (explicit opt-in; mutually exclusive with --resource)",
+      resolution: "authoritative claim snapshot plus concrete Git/repository evidence and operation authorization",
     },
   },
   {
@@ -719,6 +752,7 @@ export function machineContract(packageVersion: string): JsonObject {
       commands: ["show", "inspect", "claim", "claims", "release", "update", "close", "discard"],
       ambiguity: "supplying both positional and --session is rejected",
       discard_requires_explicit_target: true,
+      discard_preview: "--preview (read-only; one bounded JSON document in machine mode)",
     },
     destructive_lifecycle: {
       command: "session discard",

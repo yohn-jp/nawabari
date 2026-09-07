@@ -11,6 +11,7 @@ import {
   readBoundedGitDiff,
   readCanonicalCommitChangedPaths,
   readChangedPathNames,
+  canonicalizeGitObservedPaths,
   readGitPathStats,
   readCurrentHead,
   readTreePathStates,
@@ -159,6 +160,7 @@ export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
 export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
 export const SESSION_DIAGNOSTIC_SCHEMA_VERSION = 1 as const;
 export const DISCARD_RESULT_SCHEMA_VERSION = 1 as const;
+export const DISCARD_PREVIEW_SCHEMA_VERSION = 1 as const;
 const DEFAULT_LOCK_METADATA_GRACE_MS = 1_000;
 /** Bounds a caller-declared commit-message pattern before it is compiled. */
 export const MAX_MESSAGE_PATTERN_LENGTH = 512 as const;
@@ -242,6 +244,57 @@ export interface DiscardSessionResult {
   readonly claimSetGeneration: number;
   /** Present when this result completed a previously interrupted cleanup. */
   readonly reconciliation?: CleanupReconciliation;
+}
+
+export interface DiscardPreviewEvidence {
+  readonly code: RegistryErrorCode;
+  readonly message: string;
+  readonly details: RegistryErrorDetails;
+}
+
+/** Bounded, read-only destruction evidence projected by `session discard --preview`. */
+export interface DiscardPreview {
+  readonly schemaVersion: typeof DISCARD_PREVIEW_SCHEMA_VERSION;
+  readonly operation: "discard-preview";
+  readonly destructive: true;
+  readonly warning: string;
+  readonly session: SessionRecord;
+  readonly currentState: SessionState;
+  readonly persistedState: SessionState;
+  readonly physicalState: string;
+  readonly worktreePresent: boolean;
+  readonly branchPresent: boolean;
+  readonly worktreeHead: string | null;
+  readonly branchHead: string | null;
+  readonly head: string | null;
+  readonly expectedHead: string | null;
+  readonly recoverableCommits: {
+    readonly observable: boolean;
+    readonly present: boolean | null;
+    readonly evidence: readonly DiscardPreviewEvidence[];
+  };
+  readonly uncommittedWork: {
+    readonly observable: boolean;
+    readonly present: boolean | null;
+    readonly evidence: readonly DiscardPreviewEvidence[];
+  };
+  readonly claims: readonly ResourceClaim[];
+  readonly claimCount: number;
+  readonly claimsTruncated: boolean;
+  readonly destructiveScope: {
+    readonly worktree: boolean;
+    readonly branch: boolean;
+    readonly unintegratedCommits: boolean | null;
+    readonly uncommittedWork: boolean | null;
+    readonly claims: number;
+  };
+  readonly diagnostic: {
+    readonly closeReadiness: ReadinessState;
+    readonly cleanupReadiness: ReadinessState;
+    readonly resultState: DiagnosticCompleteness;
+    readonly blockers: readonly DiscardPreviewEvidence[];
+    readonly lifecycleState?: string;
+  };
 }
 
 export type CleanupReconciliationOutcome = "completed" | "retryable" | "unresolved";
@@ -656,6 +709,9 @@ export interface CommitOptions {
   readonly message: string;
   /** Concrete repository-relative paths. Globs are never accepted here. */
   readonly resources?: readonly string[];
+  /** Explicitly resolve the authoritative session claim set to concrete resources. */
+  readonly allClaimed?: boolean;
+  readonly all_claimed?: boolean;
   /** Alias for callers that name the same explicit paths as paths. */
   readonly paths?: readonly string[];
   /**
@@ -716,6 +772,9 @@ export interface PushOptions {
   readonly session_id?: string | null;
   /** Explicit claim-covered resources; push never infers these from the registry. */
   readonly resources?: readonly string[];
+  /** Explicitly resolve the authoritative session claim set to concrete resources. */
+  readonly allClaimed?: boolean;
+  readonly all_claimed?: boolean;
   readonly remote?: string | null;
   readonly branch?: string | null;
   readonly remoteBranch?: string | null;
@@ -1884,7 +1943,17 @@ export class SessionRegistry {
 
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
-      const requestedResources = operationResources(options.resources ?? options.paths);
+      const allClaimed = options.allClaimed === true || options.all_claimed === true;
+      const explicitResources = options.resources ?? options.paths;
+      if (allClaimed && explicitResources !== undefined && explicitResources.length > 0) {
+        throw new SessionRegistryError("INVALID_RESOURCE", "--all-claimed cannot be combined with explicit resources", {
+          operation: "commit",
+          selectors: ["--resource", "--all-claimed"],
+        });
+      }
+      const requestedResources = allClaimed
+        ? this.resolveAllClaimedResourcesUnsafe("commit", sessionId)
+        : operationResources(explicitResources);
       const authorization = this.requireMutationAuthorization("commit", requestedResources, sessionId);
       const initial = this.verifyGovernedExecutionContext(sessionId);
 
@@ -2066,7 +2135,16 @@ export class SessionRegistry {
   push(options: PushOptions): PushResult {
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
-      const requestedResources = operationResources(options.resources);
+      const allClaimed = options.allClaimed === true || options.all_claimed === true;
+      if (allClaimed && options.resources !== undefined && options.resources.length > 0) {
+        throw new SessionRegistryError("INVALID_RESOURCE", "--all-claimed cannot be combined with explicit resources", {
+          operation: "push",
+          selectors: ["--resource", "--all-claimed"],
+        });
+      }
+      const requestedResources = allClaimed
+        ? this.resolveAllClaimedResourcesUnsafe("push", sessionId)
+        : operationResources(options.resources);
       this.requireMutationAuthorization("push", requestedResources, sessionId);
       const initial = this.verifyGovernedExecutionContext(sessionId);
       const remote = explicitRemote(options.remote);
@@ -2194,6 +2272,90 @@ export class SessionRegistry {
 
   pushSession(options: PushOptions): PushResult {
     return this.push(options);
+  }
+
+  /**
+   * Resolve the opt-in all-claimed selector while the mutation lock is held.
+   * Claims remain the authority, but only concrete Git/repository evidence is
+   * ever handed to the existing concrete authorization path.
+   */
+  private resolveAllClaimedResourcesUnsafe(operation: "commit" | "push", sessionId: string | null): readonly string[] {
+    const execution = this.verifyGovernedExecutionContext(sessionId);
+    const requiredAccess = requiredAccessForOperation(operation);
+    const state = this.readStateUnsafe();
+    const claims = sortResourceClaims(
+      state.claims.filter(
+        (claim) =>
+          claim.sessionId === execution.session.sessionId &&
+          claim.repositoryId === execution.repositoryId &&
+          claim.worktreePath === execution.worktreePath,
+      ),
+    );
+    const globClaims = claims.filter((claim) => claim.resource.includes("*") || claim.resource.includes("?"));
+
+    let candidates: readonly string[];
+    if (operation === "commit") {
+      candidates = observeGitMutationPaths(this.git, execution.worktreePath).changed;
+    } else {
+      const exactClaims = claims.filter((claim) => !claim.resource.includes("*") && !claim.resource.includes("?"));
+      const selected = new Set(exactClaims.map((claim) => claim.resource));
+      if (globClaims.length === 0) return Object.freeze(sortStrings(selected));
+
+      const baseRevision = execution.session.baseRevision;
+      if (baseRevision === undefined) {
+        throw new SessionRegistryError(
+          "INVALID_RESOURCE",
+          "A glob claim cannot be projected to concrete push resources without a persisted base revision",
+          { operation, reason: "non-enumerable-claim", claims: globClaims.map((claim) => claim.resource) },
+        );
+      }
+      const changed = readChangedPathNames(this.git, execution.worktreePath, baseRevision, execution.headId);
+      candidates = canonicalizeGitObservedPaths(changed, execution.worktreePath);
+      const ambiguousResource = candidates.find((resource) => resource.includes("*") || resource.includes("?"));
+      if (ambiguousResource !== undefined) {
+        throw new SessionRegistryError(
+          "INVALID_RESOURCE",
+          "Git reported a concrete resource whose wildcard spelling is ambiguous",
+          { operation, reason: "ambiguous-concrete-resource", resource: ambiguousResource },
+        );
+      }
+      for (const claim of globClaims) {
+        const matches = candidates.filter((resource) => resourceMatchesClaim(claim, resource));
+        if (matches.length === 0) {
+          throw new SessionRegistryError(
+            "INVALID_RESOURCE",
+            "A glob claim could not be deterministically projected to a concrete push resource",
+            { operation, reason: "non-enumerable-claim", claim: claim.resource },
+          );
+        }
+        for (const match of matches) selected.add(match);
+      }
+      return Object.freeze(sortStrings(selected));
+    }
+
+    const selected = new Set<string>();
+    for (const resource of candidates) {
+      if (resource.includes("*") || resource.includes("?")) {
+        throw new SessionRegistryError(
+          "INVALID_RESOURCE",
+          "Git reported a concrete resource whose wildcard spelling is ambiguous",
+          { operation, reason: "ambiguous-concrete-resource", resource },
+        );
+      }
+      const matchingClaims = claims.filter((claim) => resourceMatchesClaim(claim, resource));
+      if (matchingClaims.length === 0) continue;
+      const qualifyingClaims = matchingClaims.filter((claim) => claimModeGrantsAccess(claim.mode, requiredAccess));
+      // Include mode-insufficient matches as concrete candidates so the
+      // existing authorization authority emits INSUFFICIENT_CLAIM_MODE.
+      // Unclaimed paths remain outside the selection and are still rejected by
+      // commit's existing UNEXPECTED_CHANGED_PATHS protection.
+      if (qualifyingClaims.length > 0 || matchingClaims.length > 0) selected.add(resource);
+    }
+
+    // Let the existing authorization authority produce its normal missing-claim
+    // denial when every observed path is unclaimed; do not invent a selector
+    // denial with different semantics.
+    return Object.freeze(sortStrings(selected.size === 0 ? candidates : selected));
   }
 
   private requireMutationAuthorization(
@@ -2644,6 +2806,97 @@ export class SessionRegistry {
 
   discardSession(sessionIdOrOptions: string | DiscardSessionOptions): DiscardSessionResult {
     return this.discard(sessionIdOrOptions);
+  }
+
+  /**
+   * Produce a bounded, side-effect-free summary of the same session/Git/claim
+   * authorities that an explicit discard observes. The preview never invokes
+   * the cleanup actor or writes registry, worktree, branch, or claim state.
+   */
+  previewDiscard(sessionIdOrOptions: string | DiscardSessionOptions): DiscardPreview {
+    return this.withLock(() => {
+      const requestedSessionId =
+        typeof sessionIdOrOptions === "string"
+          ? sessionIdOrOptions
+          : (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id ?? null);
+      if (requestedSessionId === null) {
+        throw new SessionRegistryError(
+          "SESSION_NOT_FOUND",
+          "Explicit session identity is required for discard preview; the current session is never inferred",
+        );
+      }
+      assertSessionId(requestedSessionId);
+      const state = this.readStateUnsafe();
+      const record = state.sessions.find((candidate) => candidate.sessionId === requestedSessionId);
+      if (record === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${requestedSessionId}`, {
+          sessionId: requestedSessionId,
+        });
+      }
+
+      const diagnostic = this.diagnoseUnsafe(record, state);
+      const reconciliation = this.observeCleanupReconciliation(record, "discard");
+      const blockers = diagnostic.blockers.map((blocker) => ({
+        code: blocker.code,
+        message: blocker.message,
+        details: { ...blocker.details },
+      }));
+      const recoverableEvidence = blockers.filter((blocker) => blocker.code === "RECOVERABLE_COMMITS");
+      const dirtyEvidence = blockers.filter((blocker) => blocker.code === "DIRTY_WORKTREE");
+      const branchEvidenceObservable = recoverableEvidence.length > 0 || blockers.length === 0;
+      const worktreeEvidenceObservable =
+        dirtyEvidence.length > 0 || recoverableEvidence.length > 0 || blockers.length === 0;
+      const recoverableCommits = {
+        observable: branchEvidenceObservable,
+        present: recoverableEvidence.length > 0 ? true : branchEvidenceObservable ? false : null,
+        evidence: Object.freeze(recoverableEvidence.slice(0, 8)),
+      } as const;
+      const uncommittedWork = {
+        observable: worktreeEvidenceObservable,
+        present: dirtyEvidence.length > 0 ? true : worktreeEvidenceObservable ? false : null,
+        evidence: Object.freeze(dirtyEvidence.slice(0, 8)),
+      } as const;
+      const ownedClaims = sortResourceClaims(state.claims.filter((claim) => claim.sessionId === record.sessionId));
+      const boundedClaims = ownedClaims.slice(0, MAX_DISCARD_CLAIMS).map(cloneResourceClaim);
+      const worktreeHead = reconciliation.observedWorktreeHead;
+      const branchHead = reconciliation.observedBranchHead;
+      return Object.freeze({
+        schemaVersion: DISCARD_PREVIEW_SCHEMA_VERSION,
+        operation: "discard-preview" as const,
+        destructive: true as const,
+        warning:
+          "Actual session discard is destructive: it may remove the worktree and branch and discard recoverable work.",
+        session: cloneSessionRecord(record),
+        currentState: record.state,
+        persistedState: record.state,
+        physicalState: diagnostic.physicalState,
+        worktreePresent: reconciliation.worktreePresent,
+        branchPresent: reconciliation.branchPresent,
+        worktreeHead,
+        branchHead,
+        head: worktreeHead ?? branchHead ?? record.discardedHead ?? null,
+        expectedHead: reconciliation.expectedHead,
+        recoverableCommits,
+        uncommittedWork,
+        claims: Object.freeze(boundedClaims),
+        claimCount: ownedClaims.length,
+        claimsTruncated: ownedClaims.length > boundedClaims.length,
+        destructiveScope: Object.freeze({
+          worktree: reconciliation.worktreePresent,
+          branch: reconciliation.branchPresent,
+          unintegratedCommits: recoverableCommits.present,
+          uncommittedWork: uncommittedWork.present,
+          claims: ownedClaims.length,
+        }),
+        diagnostic: Object.freeze({
+          closeReadiness: diagnostic.closeReadiness,
+          cleanupReadiness: diagnostic.cleanupReadiness,
+          resultState: diagnostic.resultState,
+          blockers: Object.freeze(blockers.slice(0, 8)),
+          ...(diagnostic.lifecycle === undefined ? {} : { lifecycleState: diagnostic.lifecycle.state }),
+        }),
+      });
+    });
   }
 
   /** Detect stale sessions, optionally applying only cleanup that passes close preflight. */

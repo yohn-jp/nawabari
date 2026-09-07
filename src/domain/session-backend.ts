@@ -36,6 +36,7 @@ import {
   type SessionCloseOptions,
   type SessionCloseResult,
   type SessionDiscardResult,
+  type SessionDiscardPreview,
   type CleanupReconciliation,
   type SessionContext,
   type SessionCreateOptions,
@@ -288,6 +289,7 @@ export class LocalSessionBackend implements SessionBackend {
         sessionId: options.session_id,
         message: options.message,
         resources: options.resources,
+        allClaimed: options.all_claimed,
         messagePattern: options.message_pattern,
       });
       return success(toDomainCommitResult(result));
@@ -301,6 +303,7 @@ export class LocalSessionBackend implements SessionBackend {
       const result = this.registryFor(context).push({
         sessionId: options.session_id,
         resources: options.resources,
+        allClaimed: options.all_claimed,
         remote: options.remote,
         branch: options.branch,
         force: options.force,
@@ -395,6 +398,15 @@ export class LocalSessionBackend implements SessionBackend {
       return Promise.resolve(success(toDomainSessionDiscardResult(result)));
     } catch (error: unknown) {
       return Promise.resolve(failure(toDomainError(error)));
+    }
+  }
+
+  public discardPreview(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardPreview>> {
+    try {
+      const result = this.registryFor(context).previewDiscard({ sessionId });
+      return Promise.resolve(success(toDomainSessionDiscardPreview(result)));
+    } catch (error: unknown) {
+      return Promise.resolve(failure(toDomainError(error, "NO_CURRENT_SESSION")));
     }
   }
 
@@ -939,6 +951,65 @@ function toDomainSessionDiscardResult(
     ...(result.reconciliation === undefined
       ? {}
       : { reconciliation: toDomainCleanupReconciliation(result.reconciliation) }),
+  };
+}
+
+function toDomainSessionDiscardPreview(
+  preview: import("../session-registry.js").DiscardPreview,
+): SessionDiscardPreview {
+  const evidence = (item: import("../session-registry.js").DiscardPreviewEvidence) => ({
+    code: REGISTRY_ERROR_CODE_MAP[item.code],
+    message: item.message,
+    details: { ...item.details },
+  });
+  return {
+    schema_version: preview.schemaVersion,
+    operation: preview.operation,
+    destructive: preview.destructive,
+    warning: preview.warning,
+    session_id: preview.session.sessionId,
+    repository: preview.session.repositoryId,
+    worktree: preview.session.worktreePath,
+    branch: preview.session.branchName,
+    session: toDomainRecord(preview.session),
+    current_state: preview.currentState,
+    persisted_state: preview.persistedState,
+    physical_state: preview.physicalState,
+    worktree_present: preview.worktreePresent,
+    branch_present: preview.branchPresent,
+    head: preview.head,
+    worktree_head: preview.worktreeHead,
+    branch_head: preview.branchHead,
+    expected_head: preview.expectedHead,
+    recoverable_commits: {
+      observable: preview.recoverableCommits.observable,
+      present: preview.recoverableCommits.present,
+      evidence: preview.recoverableCommits.evidence.map(evidence),
+    },
+    uncommitted_work: {
+      observable: preview.uncommittedWork.observable,
+      present: preview.uncommittedWork.present,
+      evidence: preview.uncommittedWork.evidence.map(evidence),
+    },
+    claims: preview.claims.map(toDomainClaim),
+    claim_count: preview.claimCount,
+    claims_truncated: preview.claimsTruncated,
+    destructive_scope: {
+      worktree: preview.destructiveScope.worktree,
+      branch: preview.destructiveScope.branch,
+      unintegrated_commits: preview.destructiveScope.unintegratedCommits,
+      uncommitted_work: preview.destructiveScope.uncommittedWork,
+      claims: preview.destructiveScope.claims,
+    },
+    diagnostic: {
+      close_readiness: preview.diagnostic.closeReadiness,
+      cleanup_readiness: preview.diagnostic.cleanupReadiness,
+      result_state: preview.diagnostic.resultState,
+      blockers: preview.diagnostic.blockers.map(evidence),
+      ...(preview.diagnostic.lifecycleState === undefined
+        ? {}
+        : { lifecycle_state: preview.diagnostic.lifecycleState }),
+    },
   };
 }
 

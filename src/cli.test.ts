@@ -13,6 +13,7 @@ import {
   validateCliRegistryParity,
 } from "./cli.js";
 import { DomainError, failure, success } from "./domain/errors.js";
+import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import type {
   ClaimDeltasOptions,
   ClaimDeltasResult,
@@ -29,6 +30,7 @@ import type {
   SessionDiagnostic,
   SessionDiagnosticOptions,
   SessionDiscardResult,
+  SessionDiscardPreview,
   SessionRecord,
   UpdateClaimsOptions,
 } from "./domain/session.js";
@@ -480,6 +482,74 @@ test("registry-generated human and JSON help retain specialized parser surfaces"
   assert.match(updateHuman.stdout.join("\n"), /immediately followed/u);
 });
 
+test("authorize and guard operation help project the authoritative vocabulary in human and JSON modes", async () => {
+  for (const command of ["authorize", "guard"] as const) {
+    const json = capture();
+    const human = capture();
+    assert.equal(await runCli(["--json", command, "--help"], { io: json.io }), 0);
+    assert.equal(await runCli([command, "--help"], { io: human.io }), 0);
+
+    const response = JSON.parse(json.stdout[0] ?? "") as {
+      options: Array<{ name: string; values?: string[] }>;
+    };
+    const operation = response.options.find((option) => option.name === "--operation");
+    assert.ok(operation, `${command} should expose --operation`);
+    assert.deepEqual(operation.values, [...OPERATION_VOCABULARY]);
+    const text = human.stdout.join("\n");
+    for (const value of OPERATION_VOCABULARY) assert.ok(text.includes(value), `${command} help should list ${value}`);
+  }
+});
+
+test("all-claimed is an explicit additive mutation selector and cannot combine with --resource", async () => {
+  let commitCalls = 0;
+  const commitOutput = capture();
+  const commitExit = await runCli(
+    ["--json", "commit", "--message", "test", "--all-claimed", "--resource", "file.txt"],
+    {
+      backend: backendForTests({
+        commit: async () => {
+          commitCalls += 1;
+          return success({ schema_version: 1, commit_sha: "a", message: "test", resources: ["file.txt"] });
+        },
+      }),
+      io: commitOutput.io,
+    },
+  );
+  assert.equal(commitExit, 2);
+  assert.equal(commitCalls, 0);
+  assert.equal(JSON.parse(commitOutput.stdout[0] ?? "").code, "INVALID_ARGUMENT");
+
+  const pushOutput = capture();
+  const pushExit = await runCli(
+    ["--json", "push", "--remote", "origin", "--branch", "feature/example", "--all-claimed", "--resource", "file.txt"],
+    { backend: backendForTests(), io: pushOutput.io },
+  );
+  assert.equal(pushExit, 2);
+  assert.equal(JSON.parse(pushOutput.stdout[0] ?? "").code, "INVALID_ARGUMENT");
+});
+
+test("CLI all-claimed delegates selection intent to the existing mutation backend", async () => {
+  let received: { resources: string[]; all_claimed?: boolean } | null = null;
+  const output = capture();
+  const exitCode = await runCli(["--json", "commit", "--message", "selected", "--all-claimed"], {
+    backend: backendForTests({
+      commit: async (_context, options) => {
+        received = options;
+        return success({ schema_version: 1, commit_sha: "a", message: "selected", resources: [] });
+      },
+    }),
+    io: output.io,
+  });
+  assert.equal(exitCode, 0);
+  assert.deepEqual(received, {
+    resources: [],
+    all_claimed: true,
+    session_id: null,
+    message: "selected",
+    message_pattern: null,
+  });
+});
+
 test("JSON help separates global, session, and garbage-collection options", async () => {
   const output = capture();
   const exitCode = await runCli(["--help", "--json"], { io: output.io });
@@ -546,13 +616,15 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--claim-id",
       "--fetch-remote",
       "--fetch-branch",
+      "--preview",
     ],
     authorization_options: ["--session", "--operation", "--resource"],
     checkpoint_options: ["--session"],
-    commit_options: ["--session", "--message", "--resource", "--message-pattern"],
+    commit_options: ["--session", "--message", "--resource", "--all-claimed", "--message-pattern"],
     push_options: [
       "--session",
       "--resource",
+      "--all-claimed",
       "--remote",
       "--branch",
       "--remote-branch",
@@ -945,6 +1017,68 @@ test("discard help JSON makes explicit targeting and destructive semantics disco
   assert.deepEqual(response.required_options, ["--session"]);
   assert.match(response.usage, /<session-id>\|--session <id>/u);
   assert.ok(response.notes.some((note: string) => note.includes("exactly one target form")));
+});
+
+test("session discard --preview emits one stable destructive summary without invoking discard", async () => {
+  const preview: SessionDiscardPreview = {
+    schema_version: 1,
+    operation: "discard-preview",
+    destructive: true,
+    warning: "Actual session discard is destructive.",
+    session_id: sampleSession.session_id,
+    repository: sampleSession.repository,
+    worktree: sampleSession.worktree,
+    branch: sampleSession.branch,
+    session: sampleSession,
+    current_state: "active",
+    persisted_state: "active",
+    physical_state: "healthy",
+    worktree_present: true,
+    branch_present: true,
+    head: "a".repeat(40),
+    worktree_head: "a".repeat(40),
+    branch_head: "a".repeat(40),
+    expected_head: null,
+    recoverable_commits: { observable: true, present: false, evidence: [] },
+    uncommitted_work: { observable: true, present: false, evidence: [] },
+    claims: [],
+    claim_count: 0,
+    claims_truncated: false,
+    destructive_scope: {
+      worktree: true,
+      branch: true,
+      unintegrated_commits: false,
+      uncommitted_work: false,
+      claims: 0,
+    },
+    diagnostic: {
+      close_readiness: "ready",
+      cleanup_readiness: "not_due",
+      result_state: "complete",
+      blockers: [],
+    },
+  };
+  let discardCalls = 0;
+  const output = capture();
+  const exitCode = await runCli(["--json", "session", "discard", sampleSession.session_id, "--preview"], {
+    backend: backendForTests({
+      discardPreview: async () => success(preview),
+      discardSession: async () => {
+        discardCalls += 1;
+        return failure(new DomainError("INTERNAL_ERROR", "discard must not run"));
+      },
+    }),
+    io: output.io,
+  });
+  assert.equal(exitCode, 0);
+  assert.equal(discardCalls, 0);
+  assert.equal(output.stdout.length, 1);
+  assert.equal(output.stderr.length, 0);
+  assert.deepEqual(JSON.parse(output.stdout[0] ?? ""), {
+    ok: true,
+    command: "session discard",
+    ...preview,
+  });
 });
 
 test("all session target aliases carry the same positional session identity", async () => {

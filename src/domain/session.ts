@@ -445,6 +445,8 @@ export type CommitOptions = {
   session_id: string | null;
   message: string;
   resources: string[];
+  /** Explicitly resolve the authoritative session claim set to concrete resources. */
+  all_claimed?: boolean;
   /** Caller-declared commit-message rule; validated only when supplied. */
   message_pattern?: string | null;
 };
@@ -471,6 +473,8 @@ export type CommitReconciliation = {
 export type PushOptions = {
   session_id: string | null;
   resources: string[];
+  /** Explicitly resolve the authoritative session claim set to concrete resources. */
+  all_claimed?: boolean;
   remote: string | null;
   branch: string | null;
   force: boolean;
@@ -660,6 +664,61 @@ export type SessionDiscardResult = {
   reconciliation?: CleanupReconciliation;
 };
 
+export type SessionDiscardPreviewEvidence = {
+  code: ErrorCode;
+  message: string;
+  details: JsonObject;
+};
+
+/** Bounded, read-only destruction evidence for the explicit discard command. */
+export type SessionDiscardPreview = {
+  schema_version: number;
+  operation: "discard-preview";
+  destructive: true;
+  warning: string;
+  session_id: string;
+  repository: string;
+  worktree: string;
+  branch: string;
+  session: SessionRecord;
+  current_state: SessionState;
+  persisted_state: SessionState;
+  physical_state: string;
+  worktree_present: boolean;
+  branch_present: boolean;
+  head: string | null;
+  worktree_head: string | null;
+  branch_head: string | null;
+  expected_head: string | null;
+  recoverable_commits: {
+    observable: boolean;
+    present: boolean | null;
+    evidence: SessionDiscardPreviewEvidence[];
+  };
+  uncommitted_work: {
+    observable: boolean;
+    present: boolean | null;
+    evidence: SessionDiscardPreviewEvidence[];
+  };
+  claims: ResourceClaim[];
+  claim_count: number;
+  claims_truncated: boolean;
+  destructive_scope: {
+    worktree: boolean;
+    branch: boolean;
+    unintegrated_commits: boolean | null;
+    uncommitted_work: boolean | null;
+    claims: number;
+  };
+  diagnostic: {
+    close_readiness: ReadinessState;
+    cleanup_readiness: ReadinessState;
+    result_state: DiagnosticCompleteness;
+    blockers: SessionDiscardPreviewEvidence[];
+    lifecycle_state?: string;
+  };
+};
+
 export type GarbageCollectBlocked = {
   session_id: string;
   code: ErrorCode;
@@ -707,6 +766,7 @@ export interface SessionBackend {
   status(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
   discardSession?(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardResult>>;
+  discardPreview?(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardPreview>>;
   sessionDiagnostic?(
     context: SessionContext,
     options: SessionDiagnosticOptions,

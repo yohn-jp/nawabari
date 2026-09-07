@@ -68,6 +68,196 @@ function claim(fixture: Fixture, resource = "file.txt"): void {
   });
 }
 
+test("commit --all-claimed resolves exact claims through concrete Git evidence in deterministic order", () => {
+  const fixture = createFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.worktree, "z.txt"), "z\n");
+    fs.writeFileSync(path.join(fixture.worktree, "a.txt"), "a\n");
+    fixture.registry.claimResources({
+      sessionId: fixture.session.sessionId,
+      claims: [
+        { resource: "z.txt", mode: "exclusive-write" },
+        { resource: "a.txt", mode: "exclusive-write" },
+        { resource: "file.txt", mode: "exclusive-write" },
+      ],
+    });
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "all claimed\n");
+
+    const result = fixture.current.commit({
+      sessionId: fixture.session.sessionId,
+      message: "all claimed",
+      resources: [],
+      allClaimed: true,
+    });
+    assert.deepEqual(result.resources, ["a.txt", "file.txt", "z.txt"]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("commit --all-claimed preserves insufficient claim-mode denial and unexpected-path protection", () => {
+  const fixture = createFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.worktree, "unexpected.txt"), "unexpected\n");
+    fixture.registry.claimResources({
+      sessionId: fixture.session.sessionId,
+      claims: [
+        { resource: "file.txt", mode: "write" },
+        { resource: "unexpected.txt", mode: "exclusive-write" },
+      ],
+    });
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "insufficient\n");
+    assert.throws(
+      () =>
+        fixture.current.commit({
+          sessionId: fixture.session.sessionId,
+          message: "insufficient",
+          resources: [],
+          allClaimed: true,
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "INSUFFICIENT_CLAIM_MODE" &&
+        error.details.resource === "file.txt",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+
+  const unexpected = createFixture();
+  try {
+    fs.writeFileSync(path.join(unexpected.worktree, "unexpected.txt"), "unexpected\n");
+    claim(unexpected);
+    fs.appendFileSync(path.join(unexpected.worktree, "file.txt"), "unexpected path\n");
+    assert.throws(
+      () =>
+        unexpected.current.commit({
+          sessionId: unexpected.session.sessionId,
+          message: "unexpected",
+          resources: [],
+          allClaimed: true,
+        }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "UNEXPECTED_CHANGED_PATHS",
+    );
+  } finally {
+    unexpected.cleanup();
+  }
+});
+
+test("commit --all-claimed expands only concrete resources covered by a glob claim", () => {
+  const fixture = createFixture();
+  try {
+    fs.mkdirSync(path.join(fixture.worktree, "docs"));
+    fs.writeFileSync(path.join(fixture.worktree, "docs", "guide.txt"), "guide\n");
+    fixture.registry.claimResources({
+      sessionId: fixture.session.sessionId,
+      claims: [{ resource: "docs/**", mode: "exclusive-write" }],
+    });
+    const result = fixture.current.commit({
+      sessionId: fixture.session.sessionId,
+      message: "glob claimed",
+      resources: [],
+      allClaimed: true,
+    });
+    assert.deepEqual(result.resources, ["docs/guide.txt"]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("all-claimed rejects ambiguous concrete Git paths instead of treating them as glob syntax", () => {
+  const fixture = createFixture();
+  try {
+    const resource = "literal*name.txt";
+    fs.writeFileSync(path.join(fixture.worktree, resource), "ambiguous\n");
+    fixture.registry.claimResources({
+      sessionId: fixture.session.sessionId,
+      claims: [{ resource, mode: "exclusive-write" }],
+    });
+    assert.throws(
+      () =>
+        fixture.current.commit({
+          sessionId: fixture.session.sessionId,
+          message: "ambiguous",
+          resources: [],
+          allClaimed: true,
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "INVALID_RESOURCE" &&
+        error.details.reason === "ambiguous-concrete-resource",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("push --all-claimed keeps exact claim semantics and fails closed for a non-enumerable glob", () => {
+  const exact = createFixture(true);
+  try {
+    claim(exact);
+    const result = exact.current.push({
+      sessionId: exact.session.sessionId,
+      resources: [],
+      allClaimed: true,
+      remote: "origin",
+      branch: exact.session.branchName,
+      createUpstream: true,
+    });
+    assert.equal(result.target, `origin/${exact.session.branchName}`);
+  } finally {
+    exact.cleanup();
+  }
+
+  const glob = createFixture(true);
+  try {
+    fs.mkdirSync(path.join(glob.worktree, "docs"));
+    fs.writeFileSync(path.join(glob.worktree, "docs", "branch.txt"), "branch\n");
+    runGit(["add", "docs/branch.txt"], glob.worktree);
+    runGit(["commit", "-m", "branch change"], glob.worktree);
+    glob.registry.claimResources({
+      sessionId: glob.session.sessionId,
+      claims: [{ resource: "docs/**", mode: "exclusive-write" }],
+    });
+    const result = glob.current.push({
+      sessionId: glob.session.sessionId,
+      resources: [],
+      allClaimed: true,
+      remote: "origin",
+      branch: glob.session.branchName,
+      createUpstream: true,
+    });
+    assert.equal(result.upstreamCreated, true);
+  } finally {
+    glob.cleanup();
+  }
+
+  const nonEnumerable = createFixture(true);
+  try {
+    nonEnumerable.registry.claimResources({
+      sessionId: nonEnumerable.session.sessionId,
+      claims: [{ resource: "docs/**", mode: "exclusive-write" }],
+    });
+    assert.throws(
+      () =>
+        nonEnumerable.current.push({
+          sessionId: nonEnumerable.session.sessionId,
+          resources: [],
+          allClaimed: true,
+          remote: "origin",
+          branch: nonEnumerable.session.branchName,
+          createUpstream: true,
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "INVALID_RESOURCE" &&
+        error.details.reason === "non-enumerable-claim",
+    );
+  } finally {
+    nonEnumerable.cleanup();
+  }
+});
+
 test("commit denies missing claims and does not mutate the worktree", () => {
   const fixture = createFixture();
   try {
