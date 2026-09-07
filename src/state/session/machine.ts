@@ -304,6 +304,61 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
 /** Alias using the shorter module vocabulary used by internal callers. */
 export const sessionMachine = sessionLifecycleMachine;
 
+/**
+ * Explicit, versioned mapping from the public lifecycle vocabulary to this
+ * machine's own internal state-node id. XState internal state-node ids are
+ * not automatically public contract values (#256): every operational public
+ * state name is declared once, by hand, against the internal id it
+ * currently maps to, instead of being read off the machine's own state
+ * keys. A renamed or restructured internal node therefore cannot silently
+ * change the public projection — `checkSessionLifecycleStateVocabularyAlignment`
+ * fails the module load the moment the two diverge (see
+ * `assertSessionLifecycleStateVocabularyAligned` below).
+ */
+export const SESSION_LIFECYCLE_STATE_NODE_IDS: Readonly<Record<SessionLifecycleState, string>> = Object.freeze({
+  active: "active",
+  "close-ready": "close-ready",
+  "blocked-recoverable": "blocked-recoverable",
+  discarded: "discarded",
+  "stale-inconsistent": "stale-inconsistent",
+  closed: "closed",
+} satisfies Record<SessionLifecycleState, string>);
+
+const NODE_ID_TO_PUBLIC_STATE: ReadonlyMap<string, SessionLifecycleState> = new Map(
+  (Object.entries(SESSION_LIFECYCLE_STATE_NODE_IDS) as [SessionLifecycleState, string][]).map(
+    ([publicState, nodeId]) => [nodeId, publicState],
+  ),
+);
+
+/**
+ * Compare the machine's actual internal state-node ids against the explicit
+ * public mapping. Exposed as a pure function (not just asserted once at
+ * module load) so a conformance test can prove it deterministically flags a
+ * divergence rather than merely trusting that it currently agrees.
+ */
+export function checkSessionLifecycleStateVocabularyAlignment(
+  internalStateNodeIds: ReadonlySet<string> = new Set(
+    Object.keys(sessionLifecycleMachine.states).filter((id) => id !== "classify"),
+  ),
+  publicVocabularyNodeIds: ReadonlySet<string> = new Set(Object.values(SESSION_LIFECYCLE_STATE_NODE_IDS)),
+): { readonly missingFromMap: readonly string[]; readonly missingFromMachine: readonly string[] } {
+  return Object.freeze({
+    missingFromMap: Object.freeze([...internalStateNodeIds].filter((id) => !publicVocabularyNodeIds.has(id))),
+    missingFromMachine: Object.freeze([...publicVocabularyNodeIds].filter((id) => !internalStateNodeIds.has(id))),
+  });
+}
+
+function assertSessionLifecycleStateVocabularyAligned(): void {
+  const { missingFromMap, missingFromMachine } = checkSessionLifecycleStateVocabularyAlignment();
+  if (missingFromMap.length > 0 || missingFromMachine.length > 0) {
+    throw new Error(
+      "Session lifecycle machine state nodes diverged from the explicit public lifecycle vocabulary mapping: " +
+        `missingFromMap=[${missingFromMap.join(",")}] missingFromMachine=[${missingFromMachine.join(",")}]`,
+    );
+  }
+}
+assertSessionLifecycleStateVocabularyAligned();
+
 export type SessionMachineTransitionProjection = Pick<
   SessionLifecycleTransition,
   "operation" | "allowed" | "target" | "requiresExplicitIntent" | "authority" | "reason"
@@ -353,10 +408,16 @@ function isContextDependentGuard(definition: TransitionDefinition | undefined): 
 }
 
 function operationalState(value: unknown): SessionLifecycleState {
-  if (typeof value !== "string" || value === "classify") {
-    throw new Error(`Session lifecycle machine exposed an invalid operational state: ${String(value)}`);
+  if (typeof value !== "string") {
+    throw new Error(`Session lifecycle machine exposed a non-string internal state-node id: ${String(value)}`);
   }
-  return value as SessionLifecycleState;
+  const publicState = NODE_ID_TO_PUBLIC_STATE.get(value);
+  if (publicState === undefined) {
+    throw new Error(
+      `Session lifecycle machine exposed an internal state-node id with no public vocabulary mapping: ${value}`,
+    );
+  }
+  return publicState;
 }
 
 function transitionMetadata(value: unknown): SessionMachineTransitionMetadata {
@@ -398,8 +459,9 @@ function eventFor(input: SessionMachineInput, operation: SessionLifecycleOperati
   }
 }
 
-function transitionDefinitions(state: SessionLifecycleState, eventType: string): readonly TransitionDefinition[] {
-  const stateNode = sessionLifecycleMachine.getStateNodeById(`${sessionLifecycleMachine.id}.${state}`);
+/** `nodeId` is the machine's own internal state-node id, never a public state name directly. */
+function transitionDefinitions(nodeId: string, eventType: string): readonly TransitionDefinition[] {
+  const stateNode = sessionLifecycleMachine.getStateNodeById(`${sessionLifecycleMachine.id}.${nodeId}`);
   return (stateNode.transitions.get(eventType) ?? []) as readonly TransitionDefinition[];
 }
 
@@ -411,7 +473,7 @@ function projectMachineTransition(
   const actor = createActor(sessionLifecycleMachine, { input }).start();
   const initial = actor.getSnapshot();
   const event = eventFor(input, operation);
-  const definitions = transitionDefinitions(initialState, event.type);
+  const definitions = transitionDefinitions(SESSION_LIFECYCLE_STATE_NODE_IDS[initialState], event.type);
   const accepted = initial.can(event);
   const enabledDefinitions = sessionLifecycleMachine.getTransitionData(
     initial,
@@ -522,22 +584,22 @@ function projectGuardedTransition(
 export function projectSessionLifecycleTransitionTable(): Readonly<
   Record<SessionLifecycleState, readonly SessionLifecycleTransitionProjection[]>
 > {
+  assertSessionLifecycleStateVocabularyAligned();
   const table = Object.fromEntries(
-    (Object.keys(sessionLifecycleMachine.states) as SessionLifecycleState[])
-      .filter((state) => state !== ("classify" as SessionLifecycleState))
-      .map((state) => {
-        const transitions = (Object.keys(SESSION_OPERATION_EVENT_TYPES) as SessionLifecycleOperation[]).map(
-          (operation) => {
-            const eventType = SESSION_OPERATION_EVENT_TYPES[operation];
-            const definition = transitionDefinitions(state, eventType)[0];
-            const metadata = transitionMetadata(definition?.meta);
-            return isContextDependentGuard(definition)
-              ? projectGuardedTransition(operation, state, metadata)
-              : projectUnconditionalTransition(operation, state, metadata);
-          },
-        );
-        return [state, Object.freeze(transitions)];
-      }),
+    (Object.keys(SESSION_LIFECYCLE_STATE_NODE_IDS) as SessionLifecycleState[]).map((state) => {
+      const nodeId = SESSION_LIFECYCLE_STATE_NODE_IDS[state];
+      const transitions = (Object.keys(SESSION_OPERATION_EVENT_TYPES) as SessionLifecycleOperation[]).map(
+        (operation) => {
+          const eventType = SESSION_OPERATION_EVENT_TYPES[operation];
+          const definition = transitionDefinitions(nodeId, eventType)[0];
+          const metadata = transitionMetadata(definition?.meta);
+          return isContextDependentGuard(definition)
+            ? projectGuardedTransition(operation, state, metadata)
+            : projectUnconditionalTransition(operation, state, metadata);
+        },
+      );
+      return [state, Object.freeze(transitions)];
+    }),
   ) as Record<SessionLifecycleState, readonly SessionLifecycleTransitionProjection[]>;
   return Object.freeze(table);
 }

@@ -7,7 +7,11 @@
  */
 
 import { classifyObservationBlockers } from "./state/session/guards.js";
-import { projectSessionLifecycleMachine, projectSessionLifecycleTransitionTable } from "./state/session/machine.js";
+import {
+  projectSessionLifecycleMachine,
+  projectSessionLifecycleTransitionTable,
+  SESSION_LIFECYCLE_STATE_NODE_IDS,
+} from "./state/session/machine.js";
 import type { SessionObservationInput } from "./state/session/types.js";
 
 export const SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION = 1 as const;
@@ -15,14 +19,15 @@ export const SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION = 1 as const;
 export type SessionLifecycleState =
   "active" | "close-ready" | "blocked-recoverable" | "discarded" | "stale-inconsistent" | "closed";
 
-export const SESSION_LIFECYCLE_STATES: readonly SessionLifecycleState[] = Object.freeze([
-  "active",
-  "close-ready",
-  "blocked-recoverable",
-  "discarded",
-  "stale-inconsistent",
-  "closed",
-]);
+/**
+ * The public state vocabulary is derived from the machine's own explicit
+ * internal-id-to-public-name mapping (`SESSION_LIFECYCLE_STATE_NODE_IDS`),
+ * not hand-duplicated here. That mapping is the single declared source of
+ * the public lifecycle vocabulary; this module only re-exposes its keys.
+ */
+export const SESSION_LIFECYCLE_STATES: readonly SessionLifecycleState[] = Object.freeze(
+  Object.keys(SESSION_LIFECYCLE_STATE_NODE_IDS) as SessionLifecycleState[],
+);
 
 export type SessionLifecycleOperation = "close" | "discard" | "inspect" | "doctor" | "reconcile" | "gc";
 

@@ -12,7 +12,12 @@ import {
   SESSION_LIFECYCLE_TRANSITION_TABLE,
 } from "./session-lifecycle-classification.js";
 import { SessionRegistry } from "./session-registry.js";
-import { projectSessionLifecycleTransitionTable } from "./state/session/machine.js";
+import {
+  checkSessionLifecycleStateVocabularyAlignment,
+  projectSessionLifecycleTransitionTable,
+  SESSION_LIFECYCLE_STATE_NODE_IDS,
+  sessionLifecycleMachine,
+} from "./state/session/machine.js";
 
 test("classifies an owned session as active until termination evidence is requested", () => {
   const current = classifySessionLifecycle({ sessionState: "active", physicalState: "healthy" });
@@ -165,6 +170,35 @@ test("publishes a complete typed transition table", () => {
 
 test("derives the compatibility transition table from the XState machine", () => {
   assert.deepEqual(SESSION_LIFECYCLE_TRANSITION_TABLE, projectSessionLifecycleTransitionTable());
+});
+
+test("public lifecycle vocabulary is explicitly mapped to the machine's own internal state-node ids, not inferred from them", () => {
+  const internalStateNodeIds = Object.keys(sessionLifecycleMachine.states).filter((id) => id !== "classify");
+  assert.deepEqual([...internalStateNodeIds].sort(), [...Object.values(SESSION_LIFECYCLE_STATE_NODE_IDS)].sort());
+  assert.deepEqual(Object.keys(SESSION_LIFECYCLE_STATE_NODE_IDS).sort(), [...SESSION_LIFECYCLE_STATES].sort());
+  const alignment = checkSessionLifecycleStateVocabularyAlignment();
+  assert.deepEqual(alignment.missingFromMap, []);
+  assert.deepEqual(alignment.missingFromMachine, []);
+});
+
+test("state-vocabulary alignment check deterministically detects drift instead of trusting agreement", () => {
+  const driftedInternalIds = new Set(["active", "close-ready-renamed"]);
+  const drifted = checkSessionLifecycleStateVocabularyAlignment(
+    driftedInternalIds,
+    new Set(Object.values(SESSION_LIFECYCLE_STATE_NODE_IDS)),
+  );
+  assert.deepEqual(drifted.missingFromMap, ["close-ready-renamed"]);
+  assert.deepEqual(
+    [...drifted.missingFromMachine].sort(),
+    ["blocked-recoverable", "close-ready", "closed", "discarded", "stale-inconsistent"].sort(),
+  );
+
+  const aligned = checkSessionLifecycleStateVocabularyAlignment(
+    new Set(Object.values(SESSION_LIFECYCLE_STATE_NODE_IDS)),
+    new Set(Object.values(SESSION_LIFECYCLE_STATE_NODE_IDS)),
+  );
+  assert.deepEqual(aligned.missingFromMap, []);
+  assert.deepEqual(aligned.missingFromMachine, []);
 });
 
 test("blocked-recoverable GC reason is the recoverable-work cause, not the generic age reason", () => {
