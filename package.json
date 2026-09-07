@@ -21,6 +21,10 @@
       "types": "./dist/public-contract.d.ts",
       "default": "./dist/public-contract.js"
     },
+    "./manifest": {
+      "types": "./dist/product-state-manifest.d.ts",
+      "default": "./dist/product-state-manifest.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
@@ -34,6 +38,8 @@
     "benchmark:pnpm-worktree-install": "node scripts/benchmark-pnpm-worktree-install.mjs",
     "benchmark:protected-execution": "node scripts/benchmark-protected-execution.mjs",
     "smoke-test": "node scripts/smoke-test.mjs",
+    "manifest:generate": "node --import tsx scripts/generate-state-diagram.mjs",
+    "manifest:check": "node --import tsx scripts/generate-state-diagram.mjs --check",
     "test:package": "pnpm run build && node scripts/run-package-suite.mjs",
     "test:package:protected": "pnpm run build && node scripts/run-package-suite.mjs --require-protected-execution",
     "test:package:mottainai": "pnpm run build && node scripts/run-mottainai-uid-handoff-gate.mjs",

@@ -43,14 +43,15 @@ function packageBinTargets(packageDirectory) {
   }));
 }
 
-// #257: prove that the exact packed/installed tarball exposes the intended
-// stable state/contract package entry points (and only those), by importing
+// #257/#259: prove that the exact packed/installed tarball exposes the intended
+// stable state/contract/manifest package entry points (and only those), by importing
 // them from the isolated consumer install rather than the source tree.
 const PACKAGE_ENTRY_POINT_CHECK_SCRIPT = [
   "import assert from 'node:assert/strict';",
   "",
   "const state = await import('nawabari/state');",
   "const contract = await import('nawabari/contract');",
+  "const manifest = await import('nawabari/manifest');",
   "",
   "assert.equal(typeof state.classifyNawabariState, 'function');",
   "assert.equal(typeof state.nawabariTransitionDecision, 'function');",
@@ -71,6 +72,16 @@ const PACKAGE_ENTRY_POINT_CHECK_SCRIPT = [
   "const machineContract = contract.nawabariMachineContract();",
   "assert.equal(machineContract.contract_id, 'nawabari.standalone-execution.v1');",
   "assert.equal(typeof machineContract.package_version, 'string');",
+  "",
+  "assert.equal(typeof manifest.generateNawabariProductStateManifest, 'function');",
+  "assert.equal(typeof manifest.renderNawabariSessionLifecycleDiagram, 'function');",
+  "const productManifest = manifest.generateNawabariProductStateManifest();",
+  "assert.equal(productManifest.manifest_id, 'nawabari.product-state-manifest.v1');",
+  "assert.equal(productManifest.schema_version, 1);",
+  "assert.equal(productManifest.product.package_version, machineContract.package_version);",
+  "assert.equal(productManifest.actors[0].emitted_events.status, 'not-exposed');",
+  "assert.deepEqual(productManifest.actors[0].emitted_events.events, []);",
+  "assert.match(manifest.renderNawabariSessionLifecycleDiagram(productManifest), /^stateDiagram-v2/mu);",
   "",
   "let deepImportRejected = false;",
   "try {",
@@ -101,7 +112,9 @@ function verifyPackageEntryPoints(installDirectory) {
   });
   if (result.error) fail(`package entry-point check failed to start: ${result.error.message}`);
   if (result.status !== 0 || result.stdout.trim() !== "ok") {
-    fail(`installed package did not expose the intended stable state/contract entry points:\n${result.stderr}`);
+    fail(
+      `installed package did not expose the intended stable state/contract/manifest entry points:\n${result.stderr}`,
+    );
   }
 }
 
