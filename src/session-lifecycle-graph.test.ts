@@ -143,7 +143,10 @@ function operationForEvent(source: GraphSnapshot, event: SessionMachineEvent): S
 
 type ObservedTransition = {
   readonly accepted: boolean;
+  /** Structural machine state after the event (self-loop when forbidden). */
   readonly target: SessionLifecycleState;
+  /** Public contract target: the accepted destination, or null when forbidden. */
+  readonly publicTarget: SessionLifecycleState | null;
   readonly reason: SessionLifecycleTransition["reason"];
   readonly authority: SessionLifecycleTransition["authority"];
   readonly requiresExplicitIntent: boolean;
@@ -200,6 +203,7 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
       observed.set(`${sourceState}.${operation}.${accepted ? "accepted" : "forbidden"}`, {
         accepted,
         target,
+        publicTarget: expected.target,
         reason: expected.reason,
         authority: expected.authority,
         requiresExplicitIntent: expected.requiresExplicitIntent,
@@ -232,6 +236,11 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
         const acceptedCoverage = observed.get(acceptedKey)!;
         assert.equal(acceptedCoverage.accepted, true, `${acceptedKey} availability drift`);
         assert.equal(acceptedCoverage.target, expected.whenGuardAccepts.target, `${acceptedKey} target drift`);
+        assert.equal(
+          acceptedCoverage.publicTarget,
+          expected.whenGuardAccepts.target,
+          `${acceptedKey} public target drift`,
+        );
         assert.equal(acceptedCoverage.reason, expected.whenGuardAccepts.reason, `${acceptedKey} reason drift`);
         assert.equal(acceptedCoverage.authority, expected.authority, `${acceptedKey} authority drift`);
         assert.equal(
@@ -242,6 +251,11 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
 
         const forbiddenCoverage = observed.get(forbiddenKey)!;
         assert.equal(forbiddenCoverage.accepted, false, `${forbiddenKey} availability drift`);
+        // The public contract's rejection branch always carries target: null
+        // — a forbidden guarded transition has no destination, regardless of
+        // the underlying machine staying on its self-loop structurally
+        // (checked separately above via `target`) (#266).
+        assert.equal(forbiddenCoverage.publicTarget, expected.whenGuardRejects.target, `${forbiddenKey} target drift`);
         assert.equal(forbiddenCoverage.reason, expected.whenGuardRejects.reason, `${forbiddenKey} reason drift`);
         assert.equal(forbiddenCoverage.authority, expected.authority, `${forbiddenKey} authority drift`);
         assert.equal(
@@ -263,6 +277,11 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
         expected.requiresExplicitIntent,
         `${key} requiresExplicitIntent drift`,
       );
+      // expected.target is already null for a forbidden unconditional
+      // transition, so this covers both branches' public contract without
+      // an `if (expected.allowed)` guard: forbidden asserts null, accepted
+      // asserts the real destination (#266).
+      assert.equal(coverage.publicTarget, expected.target, `${key} public target drift`);
       if (expected.allowed) assert.equal(coverage.target, expected.target, `${key} target drift`);
     }
   }
