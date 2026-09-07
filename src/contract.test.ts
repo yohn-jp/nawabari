@@ -18,6 +18,12 @@ import {
   SANDBOX_REQUIRED_CAPABILITIES,
 } from "./domain/sandbox.js";
 import { RESOURCE_CLAIM_SCHEMA_VERSION } from "./resource-claims.js";
+import {
+  classifySessionLifecycle,
+  lifecycleTransition,
+  SESSION_LIFECYCLE_STATES,
+  SESSION_LIFECYCLE_TRANSITION_TABLE,
+} from "./session-lifecycle-classification.js";
 import { runCli } from "./cli.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -203,6 +209,67 @@ test("session lifecycle capability truthfully publishes Linux-only stale-lock re
   assert.equal(staleRecovery.live_owner, "never-reclaim-by-age");
   assert.equal(staleRecovery.unknown_or_remote_owner, "fail-closed");
   assert.equal(staleRecovery.pid_only_identity, "not-sufficient");
+});
+
+test("session-diagnostics lifecycle projection is the live XState-derived table, including both branches of a guarded transition observed at the same state", () => {
+  const contract = machineContract("test-version");
+  assert.ok(Array.isArray(contract.capabilities));
+  const diagnostics = contract.capabilities.find(
+    (candidate) =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      !Array.isArray(candidate) &&
+      candidate.id === "session-diagnostics",
+  ) as JsonRecord | undefined;
+  assert.ok(diagnostics);
+  const lifecycle = diagnostics?.lifecycle as JsonRecord;
+  assert.deepEqual(lifecycle.states, [...SESSION_LIFECYCLE_STATES]);
+  assert.deepEqual(lifecycle.transition_table, SESSION_LIFECYCLE_TRANSITION_TABLE);
+
+  // close-ready.gc is guard-dependent (#266): the published JSON discovery
+  // surface itself — not merely the exported constant — must not flatten it
+  // to a single verdict. Two observations landing in the SAME public
+  // lifecycle state must realize both branches the table promises.
+  const closeReadyTable = (lifecycle.transition_table as JsonRecord)["close-ready"] as JsonRecord[];
+  const gcEntry = closeReadyTable.find((transition) => transition.operation === "gc");
+  assert.ok(gcEntry);
+  assert.equal(gcEntry?.guarded, true);
+  const whenGuardAccepts = gcEntry?.whenGuardAccepts as JsonRecord;
+  const whenGuardRejects = gcEntry?.whenGuardRejects as JsonRecord;
+
+  const authorized = classifySessionLifecycle({
+    sessionState: "active",
+    physicalState: "healthy",
+    closeReadiness: "ready",
+    gcAuthorized: true,
+    phase: "termination",
+  });
+  assert.equal(authorized.state, "close-ready");
+  assert.deepEqual(lifecycleTransition(authorized, "gc"), {
+    operation: "gc",
+    allowed: true,
+    target: whenGuardAccepts.target,
+    requiresExplicitIntent: gcEntry?.requiresExplicitIntent,
+    authority: gcEntry?.authority,
+    reason: whenGuardAccepts.reason,
+  });
+
+  const unauthorized = classifySessionLifecycle({
+    sessionState: "active",
+    physicalState: "healthy",
+    closeReadiness: "ready",
+    gcAuthorized: false,
+    phase: "termination",
+  });
+  assert.equal(unauthorized.state, "close-ready");
+  assert.deepEqual(lifecycleTransition(unauthorized, "gc"), {
+    operation: "gc",
+    allowed: false,
+    target: whenGuardRejects.target,
+    requiresExplicitIntent: gcEntry?.requiresExplicitIntent,
+    authority: gcEntry?.authority,
+    reason: whenGuardRejects.reason,
+  });
 });
 
 test("protected-execution capability publishes the sandbox contract and canonical entry point", async () => {

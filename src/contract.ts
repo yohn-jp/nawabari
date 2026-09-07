@@ -667,6 +667,7 @@ export function machineContract(packageVersion: string): JsonObject {
       ...(capability.id === "session-lifecycle"
         ? { registry_lock_recovery: jsonClone(capability.registry_lock_recovery) }
         : {}),
+      ...(capability.id === "session-diagnostics" ? { lifecycle: jsonClone(capability.lifecycle) } : {}),
       ...(capability.id === "protected-execution"
         ? {
             contract_id: capability.contract_id,
