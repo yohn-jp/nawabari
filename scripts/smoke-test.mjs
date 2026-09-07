@@ -43,6 +43,68 @@ function packageBinTargets(packageDirectory) {
   }));
 }
 
+// #257: prove that the exact packed/installed tarball exposes the intended
+// stable state/contract package entry points (and only those), by importing
+// them from the isolated consumer install rather than the source tree.
+const PACKAGE_ENTRY_POINT_CHECK_SCRIPT = [
+  "import assert from 'node:assert/strict';",
+  "",
+  "const state = await import('nawabari/state');",
+  "const contract = await import('nawabari/contract');",
+  "",
+  "assert.equal(typeof state.classifyNawabariState, 'function');",
+  "assert.equal(typeof state.nawabariTransitionDecision, 'function');",
+  "assert.equal(typeof state.availableNawabariCommands, 'function');",
+  "assert.equal(typeof state.getNawabariSessionStateSnapshot, 'function');",
+  "assert.equal(state.NAWABARI_STATE_API_SCHEMA_VERSION, 1);",
+  "assert.equal(Array.isArray(state.NAWABARI_LIFECYCLE_STATES), true);",
+  "",
+  "const snapshot = state.classifyNawabariState({ sessionState: 'active', physicalState: 'healthy' });",
+  "assert.equal(snapshot.state, 'active');",
+  "const closeDecision = state.nawabariTransitionDecision(snapshot, 'close');",
+  "assert.equal(closeDecision.allowed, true);",
+  "assert.equal(closeDecision.target, 'close-ready');",
+  "assert.equal(state.availableNawabariCommands(snapshot).includes('close'), true);",
+  "",
+  "assert.equal(typeof contract.machineContract, 'function');",
+  "assert.equal(typeof contract.nawabariMachineContract, 'function');",
+  "const machineContract = contract.nawabariMachineContract();",
+  "assert.equal(machineContract.contract_id, 'nawabari.standalone-execution.v1');",
+  "assert.equal(typeof machineContract.package_version, 'string');",
+  "",
+  "let deepImportRejected = false;",
+  "try {",
+  "  await import('nawabari/dist/state/session/machine.js');",
+  "} catch (error) {",
+  "  deepImportRejected = error?.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED';",
+  "}",
+  "assert.equal(deepImportRejected, true, 'raw XState session-machine internals must not be importable');",
+  "",
+  "let rootImportRejected = false;",
+  "try {",
+  "  await import('nawabari');",
+  "} catch (error) {",
+  "  rootImportRejected = error?.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED';",
+  "}",
+  "assert.equal(rootImportRejected, true, 'the package declares no root/library import surface');",
+  "",
+  "process.stdout.write('ok');",
+].join("\n");
+
+function verifyPackageEntryPoints(installDirectory) {
+  const scriptPath = path.join(installDirectory, "verify-package-entry-points.mjs");
+  fs.writeFileSync(scriptPath, PACKAGE_ENTRY_POINT_CHECK_SCRIPT);
+  const result = spawnSync(process.execPath, [scriptPath], {
+    cwd: installDirectory,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  if (result.error) fail(`package entry-point check failed to start: ${result.error.message}`);
+  if (result.status !== 0 || result.stdout.trim() !== "ok") {
+    fail(`installed package did not expose the intended stable state/contract entry points:\n${result.stderr}`);
+  }
+}
+
 function parseArgs(argv) {
   const index = argv.indexOf("--tarball");
   return {
@@ -172,6 +234,9 @@ async function main() {
         fail("installed package does not preserve the declared xstate runtime dependency");
       }
     }
+
+    console.log("verifying installed package exposes the intended stable state/contract entry points...");
+    verifyPackageEntryPoints(installDirectory);
 
     const binTargets = packageBinTargets(installedPackageDirectory);
     if (binTargets.length === 0) fail("package.json defines no bin entries to smoke test");
