@@ -50,13 +50,13 @@
     "prepublishOnly": "pnpm run typecheck && pnpm test"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
-    "eslint": "10.9.1",
-    "gh-inari": "0.8.0",
+    "@types/node": "^26.4.1",
+    "eslint": "10.10.0",
+    "gh-inari": "0.10.2",
     "prettier": "3.9.6",
-    "tsx": "^4.19.4",
+    "tsx": "^4.23.13",
     "typescript": "^6.0.3",
-    "typescript-eslint": "8.68.0"
+    "typescript-eslint": "8.69.0"
   },
   "engines": {
     "node": ">=24"
