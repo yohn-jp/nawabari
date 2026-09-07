@@ -14,11 +14,13 @@ import {
   classifyResourceClaimTransition,
   claimsConflict,
   createResourceClaim,
+  RESOURCE_CLAIM_TRANSITIONS,
   RESOURCE_CLAIM_TRANSITION_MATRIX,
   RESOURCE_CLAIM_TRANSITION_MODES,
   resourceClaimConflictsWithAccess,
   RESOURCE_CLAIM_COMPATIBILITY_MATRIX,
   RESOURCE_CLAIM_MODES,
+  type ResourceClaimTransition,
 } from "./resource-claims.js";
 import { SessionRegistry, type PersistedRegistry } from "./session-registry.js";
 
@@ -78,35 +80,46 @@ test("defines every overlapping mode combination in the compatibility matrix", (
   assert.equal(claimsConflict(starA, starExclusive), true, "* write vs * exclusive-write");
 });
 
-test("classifies every exact-resource transition without adding none to persisted modes", () => {
+test("exhaustively classifies every exact-resource transition from the normative matrix", () => {
   assert.deepEqual(RESOURCE_CLAIM_MODES, ["read", "write", "exclusive-write"]);
   assert.deepEqual(RESOURCE_CLAIM_TRANSITION_MODES, ["none", "read", "write", "exclusive-write"]);
-  assert.deepEqual(RESOURCE_CLAIM_TRANSITION_MATRIX, {
-    none: { none: "no-op", read: "acquire", write: "acquire", "exclusive-write": "acquire" },
-    read: { none: "release", read: "no-op", write: "change", "exclusive-write": "change" },
-    write: { none: "release", read: "change", write: "no-op", "exclusive-write": "change" },
-    "exclusive-write": {
-      none: "release",
-      read: "change",
-      write: "change",
-      "exclusive-write": "no-op",
-    },
-  });
+  assert.equal(new Set(RESOURCE_CLAIM_TRANSITIONS).size, RESOURCE_CLAIM_TRANSITIONS.length);
 
-  const expected = {
-    none: { none: "no-op", read: "acquire", write: "acquire", "exclusive-write": "acquire" },
-    read: { none: "release", read: "no-op", write: "change", "exclusive-write": "change" },
-    write: { none: "release", read: "change", write: "no-op", "exclusive-write": "change" },
-    "exclusive-write": {
-      none: "release",
-      read: "change",
-      write: "change",
-      "exclusive-write": "no-op",
-    },
-  } as const;
+  const expectedModes = [...RESOURCE_CLAIM_TRANSITION_MODES].sort();
+  assert.deepEqual(Object.keys(RESOURCE_CLAIM_TRANSITION_MATRIX).sort(), expectedModes);
+
   for (const source of RESOURCE_CLAIM_TRANSITION_MODES) {
+    const row = RESOURCE_CLAIM_TRANSITION_MATRIX[source];
+    assert.deepEqual(Object.keys(row).sort(), expectedModes, `${source} row must cover every requested mode`);
     for (const target of RESOURCE_CLAIM_TRANSITION_MODES) {
-      assert.equal(classifyResourceClaimTransition(source, target), expected[source][target], `${source} -> ${target}`);
+      const matrixClassification: ResourceClaimTransition = row[target];
+      assert.equal(
+        RESOURCE_CLAIM_TRANSITIONS.includes(matrixClassification),
+        true,
+        `${source} -> ${target} must have one valid classification`,
+      );
+      assert.equal(
+        classifyResourceClaimTransition(source, target),
+        matrixClassification,
+        `${source} -> ${target} must agree with the normative matrix`,
+      );
+      assert.equal(
+        classifyResourceClaimTransition(source, target),
+        classifyResourceClaimTransition(source, target),
+        `${source} -> ${target} must be deterministic`,
+      );
+    }
+  }
+
+  assert.equal(RESOURCE_CLAIM_TRANSITION_MATRIX.none.none, "no-op");
+  for (const claimedMode of RESOURCE_CLAIM_MODES) {
+    assert.equal(RESOURCE_CLAIM_TRANSITION_MATRIX.none[claimedMode], "acquire");
+    assert.equal(RESOURCE_CLAIM_TRANSITION_MATRIX[claimedMode].none, "release");
+    assert.equal(RESOURCE_CLAIM_TRANSITION_MATRIX[claimedMode][claimedMode], "no-op");
+    for (const requestedMode of RESOURCE_CLAIM_MODES) {
+      if (requestedMode !== claimedMode) {
+        assert.equal(RESOURCE_CLAIM_TRANSITION_MATRIX[claimedMode][requestedMode], "change");
+      }
     }
   }
 });
