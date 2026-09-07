@@ -179,6 +179,41 @@ The local lifecycle requires Git and the repository-local registry/lock only;
 it does not require Mottainai, GitHub, `gh`, network access, an LLM, or a
 coding-agent runtime.
 
+## Package state/contract API
+
+The CLI/JSON surface above remains the primary integration boundary. For a
+Node caller that wants public lifecycle observation/snapshot,
+transition-decision data, or machine-contract discovery without spawning the
+CLI and parsing its output, the package additionally exports two explicit,
+stable entry points:
+
+```js
+import { classifyNawabariState, getNawabariSessionStateSnapshot } from "nawabari/state";
+import { nawabariMachineContract } from "nawabari/contract";
+```
+
+`nawabari/state` exposes the public lifecycle vocabulary
+(`NawabariLifecycleState`, `NawabariCommand`), the public observation input
+(`NawabariObservation`), and the public projection produced from it
+(`NawabariStateSnapshot`, `NawabariTransitionDecision`). `classifyNawabariState`
+is a pure, transport-neutral projection function; `getNawabariSessionStateSnapshot`
+observes one real, already-provisioned session through the same
+`SessionRegistry` Git/filesystem/session-registry authority `session inspect`
+uses, without mutating anything. `nawabari/contract` exposes
+`nawabariMachineContract()`, a zero-argument wrapper over the same
+`capabilities --json` contract that defaults to the installed package's own
+version.
+
+These are the only supported package entry points beyond the CLI binaries.
+Raw XState machine/actor internals, actor refs, internal state-node ids, and
+private machine context are not exported — `package.json#exports` declares no
+other subpath, so a deep import such as `nawabari/dist/state/session/machine.js`
+is rejected. `classifyNawabariState` only ever projects a caller-supplied observation into
+a decision; it never mutates anything, and no observation or transition
+decision it returns grants mutation authority. Mutating a session
+(close/discard/claim/commit/push/...) still requires the existing CLI or the
+`SessionRegistry` authority directly.
+
 ## Read-only repository evidence
 
 The evidence family is session-addressed and has no task, Issue, semantic, or

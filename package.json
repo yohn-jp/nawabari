@@ -12,6 +12,17 @@
     "README.md",
     "LICENSE"
   ],
+  "exports": {
+    "./state": {
+      "types": "./dist/public-state.d.ts",
+      "default": "./dist/public-state.js"
+    },
+    "./contract": {
+      "types": "./dist/public-contract.d.ts",
+      "default": "./dist/public-contract.js"
+    },
+    "./package.json": "./package.json"
+  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "start": "node dist/index.js",
