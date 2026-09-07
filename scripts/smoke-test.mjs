@@ -367,9 +367,15 @@ async function main() {
     if (capabilitiesResult.stderr.trim().length > 0) fail("capabilities --json wrote decorative output to stderr");
     // The v2 resource-claim capability publishes lifecycle result mappings,
     // transition/recovery identities, and operation-mode rationale in one
-    // bounded document. Keep enough room for the complete failure-code and
-    // result-schema vocabularies advertised by the public contract.
-    if (capabilitiesResult.stdout.length > 24_000) fail("capabilities --json exceeded its fixed discovery budget");
+    // bounded document. The session-diagnostics capability additionally
+    // publishes the complete XState-derived session lifecycle state and
+    // guarded/unconditional transition table (#256), so the document as a
+    // whole is bigger than the resource-claim vocabulary alone. Keep enough
+    // room for the complete failure-code, result-schema, and lifecycle
+    // transition vocabularies advertised by the public contract, plus
+    // headroom for incremental growth — this remains a fixed budget, not an
+    // unbounded one.
+    if (capabilitiesResult.stdout.length > 32_000) fail("capabilities --json exceeded its fixed discovery budget");
 
     const helpJsonResult = spawnSync(installedBinary, ["--help", "--json"], {
       cwd: installDirectory,
