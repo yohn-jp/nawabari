@@ -8,13 +8,19 @@ import { compileLocalGovernedContract } from "gh-inari/governance";
 import { compilePullRequestTemplate } from "gh-inari/pull-request-template";
 import { PullRequestPolicyError } from "gh-inari/pr-policy";
 import { resolvePullRequestTemplate } from "./pr-contract-routing.mjs";
+import { classifyEpicPrTitle } from "./epic-branch.mjs";
 
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
  * Validate a pull-request event against the checked-out repository's local
  * Inari snapshot. The workflow owns event plumbing; gh-inari owns contract
- * compilation, Markdown parsing, and semantic validation.
+ * compilation, Markdown parsing, and semantic validation. gh-inari itself only
+ * checks that a title is non-empty; the canonical epic(<scope>): <description>
+ * title form (Issue #177) is a separate, narrow addition owned directly here,
+ * exactly like branch-name validation — see epic-branch.mjs. It only ever
+ * classifies a title that is itself attempting the epic type; every
+ * ordinary/release title remains unaffected.
  */
 export async function validatePullRequest({ title, body, root = REPOSITORY_ROOT, template, branch }) {
   const routing = resolvePullRequestTemplate({ branch, template });
@@ -139,7 +145,20 @@ async function candidateContracts(root, template, classification) {
 function report(outcome, title, branchClassification) {
   const violations = [...outcome.result.violations];
   const titleViolation = validateRequiredMetadataString(title, "title");
-  if (titleViolation !== undefined) violations.unshift(titleViolation);
+  if (titleViolation !== undefined) {
+    violations.unshift(titleViolation);
+  } else {
+    // Only a title itself attempting the epic type is classified at all
+    // (see epic-branch.mjs); every ordinary/release title is unaffected.
+    const epicTitle = classifyEpicPrTitle(title);
+    if (epicTitle?.kind === "invalid-epic-title") {
+      violations.unshift({
+        code: "GOVERNANCE_EPIC_PR_TITLE_INVALID",
+        path: "$.pull_request.title",
+        message: epicTitle.errors[0],
+      });
+    }
+  }
   return {
     valid: violations.length === 0,
     contract: outcome.contract,
