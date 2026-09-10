@@ -4,6 +4,8 @@
 
 このファイルは Claude 固有の応答スタイルだけを定義する。実行規律、scope、branch/worktree、validation、GitHub lifecycle、governance の正本ではない。exact rule は `AGENTS.md` と各 machine-readable / executable authority に従う。矛盾時は authority を確認し、差分を報告する。
 
+Claude Code の実行・subagent delegation・top-level session topology は、同期済みの場合 `.github/agent-governance/runtime-profiles.md` / `runtime-profiles.json` の `claude-code-autonomous` profile に従う。このファイルへ execution policy を重複定義しない。
+
 ## 応答スタイル（原始人モード）
 
 目的: 技術情報を落とさず、前置き・冗長表現・進捗実況を削る。
