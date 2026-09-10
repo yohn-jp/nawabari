@@ -120,7 +120,7 @@ Then finish the requested lifecycle:
 - Latest explicit user instruction and the accepted Issue define intent, scope, and requested lifecycle.
 - Executable policy, schema, validators, workflows, rulesets, and tests define exact machine behavior when relevant.
 - Live repository/GitHub state is authoritative for volatile facts such as current `main`, existing PRs, branch/base identity, CI state, and what is already merged.
-- Repository-specific `.github/agent-governance/repository-overlay.md`, `AGENTS.md`, or equivalent may refine this shared contract for local architecture or execution constraints without weakening higher-order governance.
+- `.github/agent-governance/repository-overlay.md` is the sole repository-local extension point; it may refine this shared contract for local architecture or execution constraints without weakening higher-order governance. Synchronized `AGENTS.md`/`CLAUDE.md` are organization-managed and must not be hand-patched into a second local authority (see `docs/github-metadata-inheritance.md`).
 - Runtime profiles adapt delegation/execution only; they do not change semantic workflow governance.
 - This file defines shared execution discipline only.
 - If a guard blocks an action, that block is authoritative for the run unless the task explicitly changes the guard policy.

@@ -14,8 +14,8 @@
       "additionalProperties": false,
       "required": ["workflow", "promptGuide"],
       "properties": {
-        "workflow": { "type": "string", "minLength": 1 },
-        "promptGuide": { "type": "string", "minLength": 1 }
+        "workflow": { "$ref": "#/$defs/authorityReference" },
+        "promptGuide": { "$ref": "#/$defs/authorityReference" }
       }
     },
     "profiles": {
@@ -25,6 +25,23 @@
     }
   },
   "$defs": {
+    "authorityReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical", "projected"],
+      "properties": {
+        "canonical": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path resolved against the canonical provider repository (yohn-jp/.github)."
+        },
+        "projected": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path resolved against a consumer repository after sync-agents.yml projection."
+        }
+      }
+    },
     "profile": {
       "type": "object",
       "additionalProperties": false,

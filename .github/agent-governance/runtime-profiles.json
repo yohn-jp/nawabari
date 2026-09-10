@@ -3,8 +3,14 @@
   "version": 1,
   "kind": "yohn-agent-runtime-profiles",
   "authority": {
-    "workflow": "docs/agent-change-workflow.md",
-    "promptGuide": "docs/agent-runtime-profiles.md"
+    "workflow": {
+      "canonical": "docs/agent-change-workflow.md",
+      "projected": ".github/agent-governance/change-workflow.md"
+    },
+    "promptGuide": {
+      "canonical": "docs/agent-runtime-profiles.md",
+      "projected": ".github/agent-governance/runtime-profiles.md"
+    }
   },
   "profiles": [
     {
