@@ -195,21 +195,21 @@ For write-capable CI/release paths, preserve the security boundary: privileged p
 
 ## 12. Failure-prevention matrix
 
-| Failure class | Required behavior |
-| --- | --- |
-| Stale plan/Issue metadata | Reconcile against current `main`, Issue/PR state, and actual code before acting. |
-| Duplicate or speculative artifacts | Search current Issues/PRs/branches first; create only artifacts required by the accepted lifecycle. |
-| Scope explosion | Define an implementation envelope and reconcile the final diff to it. |
-| Wrong PR base in Epic work | Derive child routing from the parent Epic; child -> Epic, Epic -> `main`. |
-| Design request turned into implementation | Classify request mode first; read-only means no repository mutation unless explicitly requested. |
-| Incomplete bulk review presented as complete | Enumerate targets, inspect each, and report per-target evidence/status. |
-| CI success treated as correctness | Perform semantic/scope/security review in addition to required CI. |
-| Stale review/certification | Re-evaluate against the current base/head before merge/publication. |
-| Governance formatting/escaping mistakes | Use structured Inari inputs/rendering; repair the exact validator error instead of bypassing it. |
-| Unsafe parallelism | Parallelize only independent dependency/write-set leaves; centralize or serialize shared authority changes. |
-| Requested single orchestrator split into several sessions | Preserve the requested top-level session; delegate internally according to the runtime profile. |
-| Long silent execution | Report material phase progress/blockers without polling noise. |
-| Forced progress through guard failure | Treat the guard as authoritative; fix the cause or report the blocker. |
+| Failure class                                             | Required behavior                                                                                           |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Stale plan/Issue metadata                                 | Reconcile against current `main`, Issue/PR state, and actual code before acting.                            |
+| Duplicate or speculative artifacts                        | Search current Issues/PRs/branches first; create only artifacts required by the accepted lifecycle.         |
+| Scope explosion                                           | Define an implementation envelope and reconcile the final diff to it.                                       |
+| Wrong PR base in Epic work                                | Derive child routing from the parent Epic; child -> Epic, Epic -> `main`.                                   |
+| Design request turned into implementation                 | Classify request mode first; read-only means no repository mutation unless explicitly requested.            |
+| Incomplete bulk review presented as complete              | Enumerate targets, inspect each, and report per-target evidence/status.                                     |
+| CI success treated as correctness                         | Perform semantic/scope/security review in addition to required CI.                                          |
+| Stale review/certification                                | Re-evaluate against the current base/head before merge/publication.                                         |
+| Governance formatting/escaping mistakes                   | Use structured Inari inputs/rendering; repair the exact validator error instead of bypassing it.            |
+| Unsafe parallelism                                        | Parallelize only independent dependency/write-set leaves; centralize or serialize shared authority changes. |
+| Requested single orchestrator split into several sessions | Preserve the requested top-level session; delegate internally according to the runtime profile.             |
+| Long silent execution                                     | Report material phase progress/blockers without polling noise.                                              |
+| Forced progress through guard failure                     | Treat the guard as authoritative; fix the cause or report the blocker.                                      |
 
 ## 13. Distribution and repository overlays
 
