@@ -3,14 +3,20 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateExistingPullRequestArtifact, validateRequiredMetadataString } from "gh-inari/artifact";
+import {
+  validateExistingPullRequestArtifact,
+  validateRequiredMetadataString
+} from "gh-inari/artifact";
 import { compileLocalGovernedContract } from "gh-inari/governance";
 import { compilePullRequestTemplate } from "gh-inari/pull-request-template";
 import { PullRequestPolicyError } from "gh-inari/pr-policy";
 import { resolvePullRequestTemplate } from "./pr-contract-routing.mjs";
 import { classifyEpicPrTitle } from "./epic-branch.mjs";
 
-const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const REPOSITORY_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  ".."
+);
 
 /**
  * Validate a pull-request event against the checked-out repository's local
@@ -22,29 +28,40 @@ const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)
  * classifies a title that is itself attempting the epic type; every
  * ordinary/release title remains unaffected.
  */
-export async function validatePullRequest({ title, body, root = REPOSITORY_ROOT, template, branch }) {
+export async function validatePullRequest({
+  title,
+  body,
+  root = REPOSITORY_ROOT,
+  template,
+  branch
+}) {
   const routing = resolvePullRequestTemplate({ branch, template });
   if (routing.errors.length > 0) {
     const violations = routing.errors.map((message) => ({
       code: "GOVERNANCE_RELEASE_BRANCH_INVALID",
       path: "$.pull_request.head.ref",
-      message,
+      message
     }));
     return {
       valid: false,
       branchClassification: routing.classification,
       violations,
-      errors: violations.map((violation) => violation.message),
+      errors: violations.map((violation) => violation.message)
     };
   }
 
-  const contracts = await candidateContracts(root, routing.template, routing.classification);
+  const contracts = await candidateContracts(
+    root,
+    routing.template,
+    routing.classification
+  );
   const outcomes = contracts.map((contract) => ({
     contract,
-    result: validateExistingPullRequestArtifact(contract, body),
+    result: validateExistingPullRequestArtifact(contract, body)
   }));
   const valid = outcomes.filter(({ result }) => result.valid);
-  if (valid.length === 1) return report(valid[0], title, routing.classification);
+  if (valid.length === 1)
+    return report(valid[0], title, routing.classification);
   if (valid.length > 1) {
     return report(
       {
@@ -56,13 +73,14 @@ export async function validatePullRequest({ title, body, root = REPOSITORY_ROOT,
             {
               code: "GOVERNANCE_TEMPLATE_AMBIGUOUS",
               path: "$.template",
-              message: "Pull-request body matches more than one repository-native PR template.",
-            },
-          ],
-        },
+              message:
+                "Pull-request body matches more than one repository-native PR template."
+            }
+          ]
+        }
       },
       title,
-      routing.classification,
+      routing.classification
     );
   }
 
@@ -73,7 +91,9 @@ export async function validatePullRequest({ title, body, root = REPOSITORY_ROOT,
     if (left.result.violations.length !== right.result.violations.length) {
       return left.result.violations.length - right.result.violations.length;
     }
-    return left.contract.templateIdentity.id.localeCompare(right.contract.templateIdentity.id);
+    return left.contract.templateIdentity.id.localeCompare(
+      right.contract.templateIdentity.id
+    );
   })[0];
 
   if (selected === undefined) {
@@ -83,9 +103,10 @@ export async function validatePullRequest({ title, body, root = REPOSITORY_ROOT,
         {
           code: "GOVERNANCE_TEMPLATE_UNAVAILABLE",
           path: "$.template",
-          message: "No repository-native PR template is available for validation.",
-        },
-      ],
+          message:
+            "No repository-native PR template is available for validation."
+        }
+      ]
     };
   }
   return report(selected, title, routing.classification);
@@ -107,9 +128,9 @@ async function candidateContracts(root, template, classification) {
           ...contract,
           templateIdentity: {
             ...contract.templateIdentity,
-            id: template,
-          },
-        },
+            id: template
+          }
+        }
       ];
     }
     return [await compileLocalGovernedContract("pr", root, template)];
@@ -123,7 +144,13 @@ async function candidateContracts(root, template, classification) {
   const outcomes = await Promise.all(
     names.map(async (name) => {
       try {
-        return { compiled: await compileLocalGovernedContract("pr", root, path.basename(name, ".json")) };
+        return {
+          compiled: await compileLocalGovernedContract(
+            "pr",
+            root,
+            path.basename(name, ".json")
+          )
+        };
       } catch (error) {
         // A repository PR policy commonly binds to one native template (e.g.
         // `template: default`). During auto-detection every native template is
@@ -132,14 +159,19 @@ async function candidateContracts(root, template, classification) {
         // is simply not a candidate. Any other failure (including a policy
         // mismatch against the template it *does* target) still propagates,
         // preserving fail-closed behavior for genuine misconfiguration.
-        if (error instanceof PullRequestPolicyError && error.code === "PR_POLICY_TEMPLATE_MISMATCH") {
+        if (
+          error instanceof PullRequestPolicyError &&
+          error.code === "PR_POLICY_TEMPLATE_MISMATCH"
+        ) {
           return { compiled: undefined };
         }
         throw error;
       }
-    }),
+    })
   );
-  return outcomes.flatMap(({ compiled }) => (compiled === undefined ? [] : [compiled]));
+  return outcomes.flatMap(({ compiled }) =>
+    compiled === undefined ? [] : [compiled]
+  );
 }
 
 function report(outcome, title, branchClassification) {
@@ -155,7 +187,7 @@ function report(outcome, title, branchClassification) {
       violations.unshift({
         code: "GOVERNANCE_EPIC_PR_TITLE_INVALID",
         path: "$.pull_request.title",
-        message: epicTitle.errors[0],
+        message: epicTitle.errors[0]
       });
     }
   }
@@ -165,43 +197,55 @@ function report(outcome, title, branchClassification) {
     branchClassification,
     result: outcome.result,
     violations,
-    errors: violations.map((violation) => violation.message),
+    errors: violations.map((violation) => violation.message)
   };
 }
 
 async function main() {
   const eventPathArgIndex = process.argv.indexOf("--event");
-  if (eventPathArgIndex === -1) throw new Error("--event <path-to-github-event-json> is required");
+  if (eventPathArgIndex === -1)
+    throw new Error("--event <path-to-github-event-json> is required");
   const eventPath = process.argv[eventPathArgIndex + 1];
   if (eventPath === undefined) throw new Error("--event requires a path");
   const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
   if (!event.pull_request) throw new Error("event has no pull_request");
 
   const templateIndex = process.argv.indexOf("--template");
-  const template = templateIndex === -1 ? undefined : process.argv[templateIndex + 1];
+  const template =
+    templateIndex === -1 ? undefined : process.argv[templateIndex + 1];
   const branchIndex = process.argv.indexOf("--branch");
   const pullRequest = event.pull_request;
-  const branch = branchIndex === -1 ? pullRequest.head?.ref : process.argv[branchIndex + 1];
+  const branch =
+    branchIndex === -1 ? pullRequest.head?.ref : process.argv[branchIndex + 1];
   const result = await validatePullRequest({
     title: pullRequest.title ?? "",
     body: pullRequest.body ?? "",
     root: process.cwd(),
     template,
-    branch,
+    branch
   });
   console.log(
     JSON.stringify({
       valid: result.valid,
-      ...(result.contract === undefined ? {} : { template: result.contract.templateIdentity }),
-      ...(result.branchClassification === undefined ? {} : { branchClassification: result.branchClassification }),
-      ...(result.result === undefined ? {} : { classification: result.result.classification }),
-      violations: result.violations,
-    }),
+      ...(result.contract === undefined
+        ? {}
+        : { template: result.contract.templateIdentity }),
+      ...(result.branchClassification === undefined
+        ? {}
+        : { branchClassification: result.branchClassification }),
+      ...(result.result === undefined
+        ? {}
+        : { classification: result.result.classification }),
+      violations: result.violations
+    })
   );
   if (!result.valid) process.exitCode = 1;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

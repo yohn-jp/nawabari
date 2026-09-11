@@ -47,19 +47,20 @@ export function classifyEpicBranch(branch) {
       valid: true,
       issueNumber: rest.slice(0, separatorIndex),
       slug: rest.slice(separatorIndex + 1),
-      errors: [],
+      errors: []
     };
   }
   return {
     kind: "invalid-epic",
     valid: false,
     errors: [
-      `epic branch "${branch}" must match epic/<issue-number>-<slug> (for example epic/890-runtime-certification)`,
-    ],
+      `epic branch "${branch}" must match epic/<issue-number>-<slug> (for example epic/890-runtime-certification)`
+    ]
   };
 }
 
-export const EPIC_PR_TITLE_PATTERN = /^epic\([a-z0-9](?:[a-z0-9-]*[a-z0-9])?\): .+$/;
+export const EPIC_PR_TITLE_PATTERN =
+  /^epic\([a-z0-9](?:[a-z0-9-]*[a-z0-9])?\): .+$/;
 
 // Only a title that is itself attempting the epic type (starts "epic(" or
 // "epic:") is classified at all. This keeps every other title — including
@@ -86,14 +87,14 @@ export function classifyEpicPrTitle(title) {
       valid: true,
       scope: title.slice("epic(".length, separatorIndex),
       description: title.slice(separatorIndex + "): ".length),
-      errors: [],
+      errors: []
     };
   }
   return {
     kind: "invalid-epic-title",
     valid: false,
     errors: [
-      `PR title "${title}" must match epic(<scope>): <description> (for example epic(runtime): integrate certification pipeline)`,
-    ],
+      `PR title "${title}" must match epic(<scope>): <description> (for example epic(runtime): integrate certification pipeline)`
+    ]
   };
 }
