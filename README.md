@@ -4,7 +4,7 @@ Nawabari is a local governance layer for parallel coding agents. It gives each a
 
 It is for teams and tools that need several agents to work in one repository without silently sharing a worktree, overwriting one another's files, or guessing whether a session is safe to close. Nawabari is local-first: the session registry, Git observations, and authorization decisions do not require GitHub, `gh`, a network connection, or a particular agent runtime.
 
-This README describes the current 0.9.x product model. It is an overview and navigation surface, not a copy of generated contracts or implementation history.
+This README describes the current 0.10.x product model. It is an overview and navigation surface, not a copy of generated contracts or implementation history.
 
 The product model is intentionally small:
 
@@ -29,12 +29,12 @@ The package installs both `nawabari` and `git-nawabari`; `git nawabari ...` work
 
 ## First session
 
-Run from the repository's integration worktree:
+Run from the repository's integration worktree. `src/example.ts` below is a placeholder path; substitute a real file that exists in your repository.
 
 ```bash
 nawabari capabilities --json
 
-created=$(git nawabari session create --branch feature/example --worktree ../example-worktree --json)
+created=$(git nawabari session create --branch feature/example --json)
 session_id=$(printf '%s' "$created" | jq -r .session_id)
 worktree=$(printf '%s' "$created" | jq -r .worktree)
 
@@ -44,6 +44,8 @@ worktree=$(printf '%s' "$created" | jq -r .worktree)
 (cd "$worktree" && git nawabari checkpoint --session "$session_id" --json)
 (cd "$worktree" && git nawabari commit --session "$session_id" --all-claimed --message "Update example" --json)
 ```
+
+`session create` provisions the new worktree under the managed root by default (discoverable via `status --json` as `managed_worktree_root`); pass `--worktree` only with an exact path under that root.
 
 `--all-claimed` is an explicit resource selector. It resolves safely observed Git-changed paths covered by qualifying claims; it does not bypass claim authorization. Use repeated `--resource <path>` when an explicit path list is preferable.
 
@@ -88,7 +90,7 @@ session close  ←────────────────────�
 
 If work is not integrated, `session inspect` reports bounded blockers and safe next actions. Discard is never an implicit fallback for close or garbage collection.
 
-The Session lifecycle is backed by the executable XState authority in 0.9.x and exposed through public state, contract, and manifest projections. Consumers use those projections rather than internal machine nodes or actor objects.
+The Session lifecycle is backed by the executable XState authority in 0.10.x and exposed through public state, contract, and manifest projections. Consumers use those projections rather than internal machine nodes or actor objects.
 
 ### Claims
 
