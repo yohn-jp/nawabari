@@ -826,6 +826,22 @@ export {
   type SandboxInvocation,
   type SandboxLauncherOptions,
 } from "./sandbox-launcher.js";
+
+export {
+  DEFAULT_NIX_PACKAGE_ATTRIBUTES,
+  NIX_RUNTIME_CLOSURE_CONTRACT_ID,
+  NIX_RUNTIME_CLOSURE_SCHEMA_VERSION,
+  isNixRuntimeClosureError,
+  materializeNixRuntimeClosure,
+  materializeNixRuntimeProfile,
+  resolveNixRuntimeClosure,
+  type NixCommandResult,
+  type NixCommandRunner,
+  type NixRuntimeClosure,
+  type NixRuntimeClosureOptions,
+  type NixRuntimeFileSystem,
+  type NixRuntimePackageResolution,
+} from "./nix-runtime-closure.js";
 export {
   CGROUPS_V2_CONTRACT_ID,
   CGROUPS_V2_ROOT,
