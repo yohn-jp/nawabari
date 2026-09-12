@@ -874,3 +874,24 @@ export {
   type FhsRuntimeExecutableDeclaration,
   type FhsRuntimeMaterializationInput,
 } from "./fhs-runtime.js";
+
+export {
+  TGREP_BACKEND_EVIDENCE,
+  TGREP_BACKEND_NAME,
+  TGREP_BACKEND_PROVIDER,
+  TGREP_BACKEND_REQUIREMENT,
+  TGREP_BACKEND_REQUIREMENT_OPERATION,
+  TGREP_BACKEND_VERSION,
+  TGREP_EXECUTABLE_RELATIVE_PATH,
+  TGREP_NIX_INSTALLABLE,
+  TGREP_NIX_PACKAGE_ATTRIBUTE,
+  TGREP_NIXPKGS_REF,
+  TGREP_NIX_SOURCE,
+  TGREP_RUNTIME_MATERIALIZATION_CONTRACT_ID,
+  TGREP_RUNTIME_MATERIALIZATION_SCHEMA_VERSION,
+  materializeTgrepFhsRuntime,
+  materializeTgrepRuntime,
+  materializeTgrepRuntimeProjection,
+  type TgrepRuntimeMaterialization,
+  type TgrepRuntimeMaterializationOptions,
+} from "./tgrep-runtime-materialization.js";

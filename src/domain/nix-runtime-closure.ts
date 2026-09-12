@@ -332,25 +332,35 @@ function isStorePath(value: string, storeRoot: string): boolean {
   return name.length > 0 && name !== "." && name !== "..";
 }
 
+/**
+ * Nix JSON format 1 uses store paths as the result object's top-level keys.
+ * Metadata values also contain store paths (derivers and references), but
+ * those are not query results and must not be mistaken for materialized
+ * closure members.  Accept the equivalent array/key shapes for test doubles
+ * and older wrappers while never descending into a result's metadata.
+ */
 function collectJsonStorePaths(value: unknown, storeRoot: string, paths: Set<string>): void {
-  if (typeof value === "string") {
-    return;
-  }
   if (Array.isArray(value)) {
     for (const item of value) {
-      if (typeof item === "string") {
-        if (isStorePath(item, storeRoot)) paths.add(item);
-      } else {
-        collectJsonStorePaths(item, storeRoot, paths);
+      if (typeof item === "string" && isStorePath(item, storeRoot)) {
+        paths.add(item);
+      } else if (isRecord(item)) {
+        for (const key of Object.keys(item)) {
+          if (isStorePath(key, storeRoot)) paths.add(key);
+        }
+        if (paths.size === 0 && typeof item.path === "string" && isStorePath(item.path, storeRoot)) {
+          paths.add(item.path);
+        }
       }
     }
     return;
   }
   if (!isRecord(value)) return;
-  for (const [key, item] of Object.entries(value)) {
+  for (const key of Object.keys(value)) {
     if (isStorePath(key, storeRoot)) paths.add(key);
-    if (key === "path" && typeof item === "string" && isStorePath(item, storeRoot)) paths.add(item);
-    if (typeof item !== "string") collectJsonStorePaths(item, storeRoot, paths);
+  }
+  if (paths.size === 0 && typeof value.path === "string" && isStorePath(value.path, storeRoot)) {
+    paths.add(value.path);
   }
 }
 

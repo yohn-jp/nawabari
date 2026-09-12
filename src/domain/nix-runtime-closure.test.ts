@@ -167,6 +167,55 @@ test("declared Nix packages resolve with their native closure dependencies only"
   }
 });
 
+test("Nix path-info metadata does not widen the materialized closure", () => {
+  const fixture = makeFixture();
+  try {
+    const result = materializeNixRuntimeClosure(profile(), {
+      store_root: fixture.store,
+      command_runner: (_executable, args) => {
+        const installable = args[args.length - 1];
+        const keyByInstallable: Readonly<Record<string, keyof Fixture["roots"]>> = {
+          "nixpkgs#nodejs": "node",
+          "nixpkgs#git": "git",
+          "nixpkgs#pnpm": "pnpm",
+        };
+        const key = typeof installable === "string" ? keyByInstallable[installable] : undefined;
+        const root = key === undefined ? undefined : fixture.roots[key];
+        if (key === undefined || root === undefined) return { exit_code: 1, stdout: "", stderr: "unknown installable" };
+        const selected = args.includes("--recursive") ? fixture.closures[key] : [root];
+        return {
+          exit_code: 0,
+          stdout: JSON.stringify(
+            Object.fromEntries(
+              selected.map((storePath) => [
+                storePath,
+                {
+                  deriver: `${storePath}.drv`,
+                  references: [path.join(fixture.store, "metadata-reference")],
+                },
+              ]),
+            ),
+          ),
+          stderr: "",
+        };
+      },
+    });
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (!result.ok) return;
+    assert.deepEqual(result.value.store_paths, Object.values(fixture.closures).flat().sort());
+    assert.equal(
+      result.value.store_paths.some((storePath) => storePath.includes("metadata-reference")),
+      false,
+    );
+    assert.equal(
+      result.value.store_paths.some((storePath) => storePath.endsWith(".drv")),
+      false,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("strict closure projections compile through #289 without a broad store mount", () => {
   const fixture = makeFixture();
   let request: SandboxExecutionRequest | null = null;
