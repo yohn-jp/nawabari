@@ -24,7 +24,7 @@ export const TGREP_RUNTIME_MATERIALIZATION_SCHEMA_VERSION = 1 as const;
 
 /** The implementation backend is requested explicitly and is not a default profile member. */
 export const TGREP_BACKEND_NAME = "tgrep" as const;
-export const TGREP_BACKEND_VERSION = "1.0.8" as const;
+export const TGREP_BACKEND_VERSION = "1.0.4" as const;
 export const TGREP_BACKEND_REQUIREMENT: RuntimeRequirement = Object.freeze({
   id: "tgrep-backend",
   kind: "package",
@@ -37,10 +37,20 @@ export const TGREP_BACKEND_REQUIREMENT_OPERATION: RuntimeProfileRequirementOpera
 });
 
 /** Immutable Nixpkgs revision containing the matching tgrep package definition. */
-export const TGREP_NIXPKGS_REF = "github:NixOS/nixpkgs/0fcf36803fcc836b476126432b3334b293538476" as const;
+export const TGREP_NIXPKGS_REF = "github:NixOS/nixpkgs/8804d221b8210f7b2b9e84a450617aac5df80e08" as const;
 export const TGREP_NIX_PACKAGE_ATTRIBUTE = "tgrep" as const;
 export const TGREP_NIX_INSTALLABLE = `${TGREP_NIXPKGS_REF}#${TGREP_NIX_PACKAGE_ATTRIBUTE}` as const;
 export const TGREP_EXECUTABLE_RELATIVE_PATH = "bin/tgrep" as const;
+
+/** Source pin and fixed hashes from the Nixpkgs expression selected above. */
+export const TGREP_NIX_SOURCE = Object.freeze({
+  owner: "microsoft",
+  repository: "tgrep",
+  tag: "v1.0.4",
+  revision: "75894b124c4e53586032d7a41524168dfa02f480",
+  hash: "sha256-t+gtDMpoxuRN2K6xeztNcOJMuc4eGnF8H3sacN21UF4=",
+  cargo_hash: "sha256-Vtqx76DHnsP6gexjTPj0hfCGHnS5yQ5xM+7RbgwrzAA=",
+});
 
 /** Provider identity consumed by #293; it does not create a public tgrep alias. */
 export const TGREP_BACKEND_PROVIDER: RuntimeExecutableProvider = Object.freeze({
@@ -50,7 +60,7 @@ export const TGREP_BACKEND_PROVIDER: RuntimeExecutableProvider = Object.freeze({
 
 /** Only the two bounded CLI observations permitted by the materialization contract. */
 export const TGREP_BACKEND_EVIDENCE = Object.freeze({
-  version: "tgrep 1.0.8\n",
+  version: "tgrep 1.0.4\n",
   help_sha256: "af98560daab3db4eb96b8fc3beafa15f397dbe2a4c6e8f5b0566b07fd0a9255f",
   help_bytes: 9_103,
 });

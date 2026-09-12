@@ -6,20 +6,25 @@ not implement `rg` argument translation.
 
 The backend requirement is explicit:
 
-- requirement: `tgrep-backend`, package `tgrep`, version `1.0.8`;
+- requirement: `tgrep-backend`, package `tgrep`, version `1.0.4`;
 - Nix installable:
-  `github:NixOS/nixpkgs/0fcf36803fcc836b476126432b3334b293538476#tgrep`;
-- upstream source: Microsoft `tgrep` tag `v1.0.8`, commit
-  `b1d0fc2f6245cc78f1943e5864ceeab812452404`;
+  `github:NixOS/nixpkgs/8804d221b8210f7b2b9e84a450617aac5df80e08#tgrep`;
+- Nixpkgs package source: Microsoft `tgrep` tag `v1.0.4`, commit
+  `75894b124c4e53586032d7a41524168dfa02f480`;
+- Nixpkgs source hash:
+  `sha256-t+gtDMpoxuRN2K6xeztNcOJMuc4eGnF8H3sacN21UF4=`;
+- Nixpkgs vendored Cargo hash:
+  `sha256-Vtqx76DHnsP6gexjTPj0hfCGHnS5yQ5xM+7RbgwrzAA=`;
 - executable relative to the resolved Nix package root: `bin/tgrep`;
-- Linux x86_64-musl release archive SHA-256:
-  `2e3de5b7735eb84aa150d3a48e8cff8f27c05795bfccb8b52c9bd8881f7225ce`.
 
 `materializeTgrepRuntime()` fixes the Nixpkgs reference and package attribute,
-then delegates closure resolution to #291. The result contains the exact
-store-path executable source and #293 provider identity. Its projection has
-only the bounded strict closure and no executable aliases; #295 can add its
-own `rg` entrypoint using that source.
+then delegates the offline local-store closure query to #291. The root returned
+by that query is checked as the exact `tgrep` output, and
+`<root>/bin/tgrep` is the only provider source handed to #293. Its projection
+contains only the bounded strict closure and no executable aliases; #295 can
+add its own `rg` entrypoint using that source. The checked-in CLI evidence below
+is validated against that same materialized executable by the Nix conformance
+test; it is not evidence from another release artifact.
 
 The current #292 FHS input accepts an explicit executable path but has no
 version/source pin that can establish this backend contract. The tgrep FHS
@@ -29,7 +34,7 @@ searches FHS roots or falls back to a host executable.
 ## Exact `--version` evidence
 
 ```text
-tgrep 1.0.8
+tgrep 1.0.4
 ```
 
 ## Exact `--help` evidence

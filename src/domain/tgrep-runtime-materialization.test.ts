@@ -5,15 +5,22 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { compileRuntimeExecutableProjection, runtimeExecutableProviderKey } from "./runtime-executable-projection.js";
 import { resolveRuntimeProfile } from "./runtime-profile.js";
+import { LocalSessionBackend } from "./session-backend.js";
 import {
   compileSandboxInvocation,
+  defaultSandboxProbe,
+  discoverSandboxRuntimeLayout,
+  resolveSandboxExecutionRequest,
+  runSandboxedCommand,
   SANDBOX_CONTRACT_ID,
   SANDBOX_CONTRACT_SCHEMA_VERSION,
   sandboxCapabilityBaseline,
   sandboxSeccompProfileMetadata,
+  sandboxDoctorReport,
   type SandboxExecutionRequest,
 } from "./sandbox.js";
 import { projectSessionRuntimeProjection, STRICT_RUNTIME_POLICY } from "./runtime-projection.js";
@@ -30,6 +37,10 @@ import {
 } from "./tgrep-runtime-materialization.js";
 import type { NixCommandRunner } from "./nix-runtime-closure.js";
 
+const CONTROLLED_SANDBOX_EXECUTABLE_SOURCE = fileURLToPath(
+  new URL("../../scripts/test-fixtures/sandbox-launcher-test-stub.sh", import.meta.url),
+);
+
 type Fixture = Readonly<{
   readonly store: string;
   readonly roots: Readonly<{ readonly node: string; readonly tgrep: string }>;
@@ -43,7 +54,7 @@ function makeFixture(): Fixture {
   fs.mkdirSync(store);
   const roots = {
     node: path.join(store, "aaa-nodejs-24"),
-    tgrep: path.join(store, "bbb-tgrep-1.0.8"),
+    tgrep: path.join(store, "bbb-tgrep-1.0.4"),
   };
   const dependencies = {
     node: path.join(store, "ccc-node-runtime-dependency"),
@@ -52,7 +63,7 @@ function makeFixture(): Fixture {
   fs.mkdirSync(path.join(roots.node, "bin"), { recursive: true });
   fs.writeFileSync(path.join(roots.node, "bin", "node"), "#!/bin/sh\n", { mode: 0o755 });
   fs.mkdirSync(path.join(roots.tgrep, "bin"), { recursive: true });
-  fs.writeFileSync(path.join(roots.tgrep, "bin", "tgrep"), "#!/bin/sh\nprintf 'tgrep 1.0.8\\n'\n", { mode: 0o755 });
+  fs.writeFileSync(path.join(roots.tgrep, "bin", "tgrep"), "#!/bin/sh\nprintf 'tgrep 1.0.4\\n'\n", { mode: 0o755 });
   for (const dependency of Object.values(dependencies)) fs.mkdirSync(dependency);
   return {
     store,
@@ -66,6 +77,16 @@ function profile() {
   const result = resolveRuntimeProfile({ profiles: ["base"], operations: [TGREP_BACKEND_REQUIREMENT_OPERATION] });
   assert.equal(result.ok, true, result.ok ? "" : result.error.message);
   if (!result.ok) throw new Error("the tgrep profile could not be resolved");
+  return result.value;
+}
+
+function tgrepOnlyProfile() {
+  const result = resolveRuntimeProfile({
+    profiles: ["base"],
+    operations: [{ operation: "remove", requirement_id: "node-runtime" }, TGREP_BACKEND_REQUIREMENT_OPERATION],
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+  if (!result.ok) throw new Error("the tgrep-only profile could not be resolved");
   return result.value;
 }
 
@@ -114,6 +135,18 @@ function projectionWithRg(materialization: TgrepRuntimeMaterialization) {
 function sandboxRequest(runtimeProjection: SandboxExecutionRequest["runtime_projection"]): SandboxExecutionRequest {
   const repository = fs.mkdtempSync(path.join("/var/tmp", "nawabari-tgrep-sandbox-"));
   const worktree = path.join(repository, "worktree");
+  const sandboxHome = path.join(repository, "sandbox-home");
+  const sandboxBin = path.join(sandboxHome, ".local", "bin");
+  fs.mkdirSync(sandboxBin, { recursive: true, mode: 0o700 });
+  const sandboxExecutableSource = path.join(sandboxBin, "bwrap");
+  fs.copyFileSync(CONTROLLED_SANDBOX_EXECUTABLE_SOURCE, sandboxExecutableSource);
+  fs.chmodSync(sandboxExecutableSource, 0o700);
+  const runtimeLayout = discoverSandboxRuntimeLayout({
+    ...process.env,
+    HOME: sandboxHome,
+    PATH: sandboxBin,
+  });
+  assert.equal(runtimeLayout.bubblewrap, sandboxExecutableSource);
   const filesystem = {
     owned_worktree: worktree,
     home: path.join(repository, "home"),
@@ -122,7 +155,7 @@ function sandboxRequest(runtimeProjection: SandboxExecutionRequest["runtime_proj
     git_metadata: path.join(repository, "git-metadata"),
     git_objects: path.join(repository, "git-objects"),
     user_tool_paths: [],
-    user_tool_home: null,
+    user_tool_home: sandboxHome,
     runtime_paths: [],
     system_paths: [],
   };
@@ -140,7 +173,7 @@ function sandboxRequest(runtimeProjection: SandboxExecutionRequest["runtime_proj
     worktree,
     branch: "feature/tgrep-materialization-test",
     network_mode: "inherited",
-    sandbox_executable: "/usr/bin/bwrap",
+    sandbox_executable: runtimeLayout.bubblewrap,
     identity: { real_uid: 1_000, real_gid: 1_000, namespace_uid: 0, namespace_gid: 0 },
     filesystem,
     required_capabilities: [],
@@ -166,6 +199,85 @@ function evidenceBlock(markdown: string, heading: string): string {
   const end = markdown.indexOf(`\n${fence}`, contentStart);
   assert.notEqual(end, -1, `unterminated ${heading} evidence block`);
   return `${markdown.slice(contentStart, end)}\n`;
+}
+
+function readEvidenceDocument(): { readonly version: string; readonly help: string } {
+  const document = fs.readFileSync(
+    new URL("../../docs/architecture/tgrep-runtime-materialization.md", import.meta.url),
+    "utf8",
+  );
+  return {
+    version: evidenceBlock(document, "Exact `--version` evidence"),
+    help: evidenceBlock(document, "Exact `--help` evidence"),
+  };
+}
+
+function runGit(arguments_: readonly string[], cwd: string): void {
+  execFileSync("git", [...arguments_], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+type ProtectedRequestFixture = Readonly<{
+  readonly backend: LocalSessionBackend;
+  readonly repository: string;
+  readonly worktree: string;
+  readonly session_id: string;
+  readonly request: SandboxExecutionRequest;
+  readonly cleanup: () => void;
+}>;
+
+async function protectedRequest(
+  runtimeProjection: SandboxExecutionRequest["runtime_projection"],
+  runtimeLayout: ReturnType<typeof discoverSandboxRuntimeLayout>,
+): Promise<ProtectedRequestFixture> {
+  const repository = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-tgrep-nix-runtime-"));
+  const worktree = `${repository}-worktree`;
+  try {
+    runGit(["init", "--quiet", "--initial-branch", "main", repository], repository);
+    runGit(["config", "user.name", "Nawabari tgrep Conformance"], repository);
+    runGit(["config", "user.email", "tgrep-conformance@nawabari.invalid"], repository);
+    fs.writeFileSync(path.join(repository, "README.md"), "tgrep conformance\n");
+    runGit(["add", "README.md"], repository);
+    runGit(["commit", "--quiet", "-m", "fixture"], repository);
+
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repository },
+      { branch: "feature/tgrep-runtime-conformance", worktree, label: null, base: null },
+    );
+    if (!created.ok) throw created.error;
+    const resolved = await resolveSandboxExecutionRequest(
+      backend,
+      { cwd: worktree },
+      { session_id: created.value.session_id, enforce: true, runtime_projection: runtimeProjection },
+      defaultSandboxProbe,
+      runtimeLayout,
+    );
+    if (!resolved.ok) throw resolved.error;
+    return {
+      backend,
+      repository,
+      worktree,
+      session_id: created.value.session_id,
+      request: resolved.value,
+      cleanup: () => {
+        try {
+          runGit(["worktree", "remove", "--force", worktree], repository);
+        } catch {
+          // The bounded filesystem cleanup below remains authoritative.
+        }
+        fs.rmSync(worktree, { recursive: true, force: true });
+        fs.rmSync(repository, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    fs.rmSync(worktree, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 test("materializes only the explicitly selected pinned tgrep package", () => {
@@ -338,16 +450,125 @@ test("#293 consumes the exact source as an rg provider without a tgrep public al
   }
 });
 
-test("exact version/help evidence matches the checked-in backend fixture", () => {
-  const document = fs.readFileSync(
-    new URL("../../docs/architecture/tgrep-runtime-materialization.md", import.meta.url),
-    "utf8",
+test("pinned Nix tgrep materializes through the canonical protected runtime", async (t) => {
+  if (process.env.NAWABARI_TGREP_RUNTIME_CONFORMANCE !== "1") {
+    t.skip("set NAWABARI_TGREP_RUNTIME_CONFORMANCE=1 in the Nix materialization conformance environment");
+    return;
+  }
+  if (process.platform !== "linux") {
+    t.skip("canonical protected execution is Linux-only");
+    return;
+  }
+
+  const doctor = sandboxDoctorReport(defaultSandboxProbe);
+  const runtimeLayout = discoverSandboxRuntimeLayout();
+  if (!doctor.ready || runtimeLayout.bubblewrap === null) {
+    t.skip(`protected execution unavailable: ${doctor.missing_required.join(", ") || "bubblewrap"}`);
+    return;
+  }
+
+  // This profile intentionally contains only the backend requirement so the
+  // conformance job can prove tgrep's own Nix closure without building an
+  // unrelated development runtime. #295's caller may compose it with base.
+  const materialized = materializeTgrepRuntime(tgrepOnlyProfile());
+  assert.equal(materialized.ok, true, materialized.ok ? "" : JSON.stringify(materialized.error));
+  if (!materialized.ok) return;
+
+  const tgrepPackage = materialized.value.closure.packages.find(
+    (candidate) => candidate.requirement_id === TGREP_BACKEND_REQUIREMENT.id,
   );
-  const version = evidenceBlock(document, "Exact `--version` evidence");
-  const help = evidenceBlock(document, "Exact `--help` evidence");
-  assert.equal(version, TGREP_BACKEND_EVIDENCE.version);
-  assert.equal(Buffer.byteLength(help, "utf8"), TGREP_BACKEND_EVIDENCE.help_bytes);
-  assert.equal(createHash("sha256").update(help, "utf8").digest("hex"), TGREP_BACKEND_EVIDENCE.help_sha256);
+  assert.ok(tgrepPackage, "the pinned tgrep package must be present in the #291 closure");
+  assert.equal(tgrepPackage?.installable, TGREP_NIX_INSTALLABLE);
+  assert.equal(materialized.value.executable_source, path.join(tgrepPackage?.root ?? "", "bin", "tgrep"));
+  assert.ok(tgrepPackage?.closure.includes(tgrepPackage.root));
+  assert.ok(
+    tgrepPackage?.closure.every((storePath) =>
+      materialized.value.projection.filesystem.some(
+        (entry) => entry.source === storePath && entry.target === storePath,
+      ),
+    ),
+  );
+  assert.equal(
+    materialized.value.projection.filesystem.some((entry) => entry.source === "/nix/store"),
+    false,
+  );
+
+  const checkedInEvidence = readEvidenceDocument();
+  const fixture = await protectedRequest(materialized.value.projection, runtimeLayout);
+  try {
+    const invocation = compileSandboxInvocation(fixture.request, {
+      command: materialized.value.executable_source,
+      args: ["--version"],
+    });
+    assert.equal(invocation.ok, true, invocation.ok ? "" : JSON.stringify(invocation.error));
+    if (!invocation.ok) return;
+    assert.equal(invocation.value.env.PATH, "/nawabari/bin");
+    const terminator = invocation.value.args.indexOf("--");
+    assert.ok(terminator > 0);
+    const mountArgs = invocation.value.args.slice(0, terminator);
+    assert.equal(
+      mountArgs.some((value, index) => value === "--ro-bind" && mountArgs[index + 1] === "/nix/store"),
+      false,
+    );
+    assert.equal(
+      mountArgs.some(
+        (value, index) =>
+          value === "--ro-bind" &&
+          mountArgs[index + 1] === tgrepPackage?.root &&
+          mountArgs[index + 2] === tgrepPackage?.root,
+      ),
+      true,
+    );
+
+    const version = await runSandboxedCommand(fixture.request, {
+      command: materialized.value.executable_source,
+      args: ["--version"],
+    });
+    assert.equal(version.ok, true, version.ok ? "" : JSON.stringify(version.error));
+    if (!version.ok) return;
+    assert.equal(version.value.exit_code, 0, JSON.stringify(version.value));
+    assert.equal(version.value.stdout, checkedInEvidence.version);
+    assert.equal(version.value.stdout, TGREP_BACKEND_EVIDENCE.version);
+
+    const help = await runSandboxedCommand(fixture.request, {
+      command: materialized.value.executable_source,
+      args: ["--help"],
+    });
+    assert.equal(help.ok, true, help.ok ? "" : JSON.stringify(help.error));
+    if (!help.ok) return;
+    assert.equal(help.value.exit_code, 0, JSON.stringify(help.value));
+    assert.equal(help.value.stdout, checkedInEvidence.help);
+    assert.equal(Buffer.byteLength(help.value.stdout, "utf8"), TGREP_BACKEND_EVIDENCE.help_bytes);
+    assert.equal(
+      createHash("sha256").update(help.value.stdout, "utf8").digest("hex"),
+      TGREP_BACKEND_EVIDENCE.help_sha256,
+    );
+
+    const projected = projectionWithRg(materialized.value);
+    const providerRequest = await resolveSandboxExecutionRequest(
+      fixture.backend,
+      { cwd: fixture.worktree },
+      {
+        session_id: fixture.session_id,
+        enforce: true,
+        runtime_projection: projected,
+      },
+      defaultSandboxProbe,
+      runtimeLayout,
+    );
+    assert.equal(providerRequest.ok, true, providerRequest.ok ? "" : JSON.stringify(providerRequest.error));
+    if (!providerRequest.ok) return;
+    const providerVersion = await runSandboxedCommand(providerRequest.value, {
+      command: "/nawabari/bin/rg",
+      args: ["--version"],
+    });
+    assert.equal(providerVersion.ok, true, providerVersion.ok ? "" : JSON.stringify(providerVersion.error));
+    if (!providerVersion.ok) return;
+    assert.equal(providerVersion.value.exit_code, 0, JSON.stringify(providerVersion.value));
+    assert.equal(providerVersion.value.stdout, version.value.stdout);
+  } finally {
+    fixture.cleanup();
+  }
 });
 
 test("FHS tgrep materialization fails closed because #292 has no deterministic pinned artifact input", () => {
