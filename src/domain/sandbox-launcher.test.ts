@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { runCli } from "../cli.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import {
+  buildExplicitCompatibilityRuntimeProjection,
   compileSandboxInvocation,
   compileSandboxSeccompProfile,
   discoverSandboxRuntimeLayout,
@@ -119,10 +120,12 @@ async function resolvedRequest(repository: string, worktree: string, runtimeLayo
     { branch: "feature/sandbox-launcher", worktree, label: null, base: null },
   );
   if (!created.ok) throw created.error;
+  const runtimeProjection = buildExplicitCompatibilityRuntimeProjection(runtimeLayout);
+  if (!runtimeProjection.ok) throw runtimeProjection.error;
   const request = await resolveSandboxExecutionRequest(
     backend,
     { cwd: worktree },
-    { session_id: created.value.session_id, enforce: true },
+    { session_id: created.value.session_id, enforce: true, runtime_projection: runtimeProjection.value },
     readyProbe(),
     runtimeLayout,
   );
@@ -536,6 +539,42 @@ test("compatibility profile selection is explicit and does not silently fall bac
     fixture.cleanup();
     removeWorktree(repository, worktree);
     fs.rmSync(materialRoot, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("explicit compatibility projection is the only enforced legacy visibility and PATH authority", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const projection = request.runtime_projection;
+    assert.ok(projection);
+    const withoutUsr = {
+      ...projection,
+      filesystem: projection.filesystem.filter((entry) => entry.target !== "/usr"),
+    };
+    const compiled = compileSandboxInvocation({ ...request, runtime_projection: withoutUsr }, { command: "true" });
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+
+    assert.equal(request.filesystem.system_paths.includes("/usr"), true);
+    assert.equal(
+      compiled.value.args.some(
+        (value, index, args) => (value === "--ro-bind" || value === "--bind") && args[index + 2] === "/usr",
+      ),
+      false,
+    );
+    assert.equal(compiled.value.env.PATH.includes("/usr/bin"), false);
+    assert.equal(compiled.value.env.PATH.includes("/usr/local/bin"), false);
+
+    const omitted = compileSandboxInvocation({ ...request, runtime_projection: undefined }, { command: "true" });
+    assert.equal(omitted.ok, false);
+    if (!omitted.ok) assert.equal(omitted.error.code, "RUNTIME_PROJECTION_INVALID");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
   }
 });

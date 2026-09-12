@@ -45,20 +45,27 @@ existing `SandboxExecutionRequest` remains the contract that binds an already
 authorized Nawabari session to bubblewrap/capability/namespace execution. A
 future resolver may consume this projection while compiling the sandbox
 topology, but #288 does not add a second executor or change bubblewrap
-behavior. The existing launcher now consumes the projection when present.
-It emits canonical `--ro-bind`/`--bind` entries in target order after the
-backend-owned mounts. An explicit projection is the complete user/runtime
-view; it does not inherit the legacy runtime/system/user-tool mounts. Omitting
-the projection retains the explicit compatibility path for existing callers.
+behavior. The existing launcher consumes the projection as the sole enforced
+user/runtime visibility authority. It emits canonical
+`--ro-bind`/`--bind` entries in target order after the backend-owned mounts. An
+explicit projection is the complete user/runtime view; it does not inherit the
+legacy runtime/system/user-tool mounts. The compatibility builder in
+`src/domain/compatibility-runtime-projection.ts` converts only the existing
+bounded legacy layout into a read-only, compatibility-provenance projection.
+An omitted projection is retained only for non-enforced/advisory request
+compatibility; the protected launcher rejects it rather than selecting broad
+compatibility visibility.
 
 The launcher canonicalizes each materialized source and rejects source
 symlinks, unsafe worktree target parents, backend-owned target overlaps, and
 ambiguous projection targets. Executable providers are resolved from the exact
 materialized filesystem projection; no host `PATH` lookup is performed. Each
 stable name receives one read-only file bind at `/nawabari/bin/<name>`, and
-strict execution sets `PATH` to exactly `/nawabari/bin`. The backing source
-must be a pinned executable outside that surface, so an alias cannot recurse
-through the projected command directory. The one supported backend shadow is
+strict execution sets `PATH` to exactly `/nawabari/bin`; compatibility PATH is
+derived only from explicit compatibility projection targets and never from
+ambient host `PATH`. The backing source must be a pinned executable outside
+that surface, so an alias cannot recurse through the projected command
+directory. The one supported backend shadow is
 an exact canonical worktree source/target, which may be read-only to narrow
 session authority. Other read-write projections may only preserve the same
 relative path within the authorized session worktree; projections can
@@ -121,8 +128,9 @@ directory read-only projections; strict mode never does so.
 
 Unsupported metadata, missing artifacts, and unresolved loaders/libraries
 return recoverable `RUNTIME_MATERIALIZATION_MISSING`; they never select a
-fallback. Legacy omitted-projection behavior remains solely for existing
-callers of the pre-materialization launcher.
+fallback. Legacy omitted-projection behavior remains solely for non-enforced
+callers of the pre-materialization launcher; protected execution requires an
+explicit projection.
 
 ## Projected pnpm middleware
 

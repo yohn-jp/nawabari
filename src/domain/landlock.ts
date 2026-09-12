@@ -195,6 +195,10 @@ export function deriveLandlockRules(
   addDirectoryRule(rules, "/home/nawabari/.nawabari", WRITE_ACCESS);
   addDirectoryRule(rules, "/nawabari/git", WRITE_ACCESS);
   addDirectoryRule(rules, "/nawabari/git/objects", READ_ACCESS);
+  // These are backend-owned namespace mounts, so they remain Landlock-visible
+  // even when an explicit runtime projection replaces the legacy arrays.
+  addDirectoryRule(rules, "/dev", READ_ACCESS);
+  addDirectoryRule(rules, "/proc", READ_ACCESS);
   // `/dev` already grants execute/read_file/read_dir.  Only write_file is
   // needed for subprocesses that open the canonical null device for output.
   addRule(rules, "/dev/null", LANDLOCK_ACCESS_FS.write_file);

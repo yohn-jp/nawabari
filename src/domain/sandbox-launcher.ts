@@ -46,6 +46,11 @@ const SANDBOX_CONFIG_HOME = `${SANDBOX_HOME}/.config`;
 const SANDBOX_LOCAL_HOME = `${SANDBOX_HOME}/.local`;
 const SANDBOX_CACHE_HOME = `${SANDBOX_HOME}/.cache`;
 const SANDBOX_SHARED_HOME = `${SANDBOX_HOME}/.nawabari`;
+const COMPATIBILITY_USER_TOOL_TARGETS = new Set([
+  `${SANDBOX_LOCAL_HOME}/bin`,
+  `${SANDBOX_LOCAL_HOME}/lib`,
+  `${SANDBOX_LOCAL_HOME}/share/pnpm`,
+]);
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_024 * 1_024;
 
@@ -349,7 +354,11 @@ function validateWorktreeProjectionTarget(target: string, topology: ValidatedTop
   return success(null);
 }
 
-function validateProjectionTarget(target: string, topology: ValidatedTopology): DomainResult<null> {
+function validateProjectionTarget(
+  target: string,
+  topology: ValidatedTopology,
+  provenance: RuntimeFilesystemProjection["provenance"],
+): DomainResult<null> {
   if (!path.posix.isAbsolute(target) || target.includes("\0")) {
     return projectionInvalid("filesystem.target", "expected an absolute namespace path", target);
   }
@@ -368,6 +377,9 @@ function validateProjectionTarget(target: string, topology: ValidatedTopology): 
     // intentionally mounted below the private namespace /tmp.  A projection
     // nested in that already-authorized worktree may narrow it.
     if (backendRoot === "/tmp" && insideWorktree) continue;
+    if (backendRoot === SANDBOX_HOME && provenance === "compatibility" && COMPATIBILITY_USER_TOOL_TARGETS.has(target)) {
+      continue;
+    }
     if (namespacePathsOverlap(backendRoot, target)) {
       return projectionAmbiguous("filesystem.target", "target overlaps a backend-owned mount", target);
     }
@@ -390,7 +402,7 @@ function validateProjectionMounts(
   for (const [index, entry] of ordered.entries()) {
     const source = canonicalProjectionSource(entry, index);
     if (!source.ok) return source;
-    const target = validateProjectionTarget(entry.target, topology);
+    const target = validateProjectionTarget(entry.target, topology, entry.provenance);
     if (!target.ok) return target;
     targets.push(entry.target);
 
@@ -578,23 +590,26 @@ function addExecutableProjectionBind(
   args.push("--ro-bind", projection.source, projection.target);
 }
 
-function pathEntriesForEnvironment(request: SandboxExecutionRequest): string[] {
+function pathEntriesForEnvironment(projection: SessionRuntimeProjection): string[] {
   const entries: string[] = [];
-  const sources = new Set(request.filesystem.runtime_paths);
-  const system = new Set(request.filesystem.system_paths);
-  const tools = new Set(request.filesystem.user_tool_paths);
-  const hostHome = request.filesystem.user_tool_home ?? process.env.HOME;
-  if (tools.has(path.join(hostHome ?? "", ".local", "bin"))) entries.push(`${SANDBOX_LOCAL_HOME}/bin`);
-  if (tools.has(path.join(hostHome ?? "", ".local", "share", "pnpm"))) {
+  const targets = new Set(projection.filesystem.map((entry) => entry.target));
+  if (targets.has(`${SANDBOX_LOCAL_HOME}/bin`)) entries.push(`${SANDBOX_LOCAL_HOME}/bin`);
+  if (targets.has(`${SANDBOX_LOCAL_HOME}/share/pnpm`)) {
     entries.push(`${SANDBOX_LOCAL_HOME}/share/pnpm`);
   }
-  if (sources.has("/run/current-system")) entries.push("/run/current-system/sw/bin");
-  if (sources.has("/run/wrappers")) entries.push("/run/wrappers/bin");
-  const profile = [...sources].find((source) => source.startsWith("/etc/profiles/per-user/"));
+  if (targets.has("/run/current-system")) entries.push("/run/current-system/sw/bin");
+  if (targets.has("/run/wrappers")) entries.push("/run/wrappers/bin");
+  const profile = [...targets].sort().find((target) => target.startsWith("/etc/profiles/per-user/"));
   if (profile !== undefined) entries.push(`${profile}/bin`);
-  if (system.has("/usr")) entries.push("/usr/local/bin", "/usr/bin");
-  if (system.has("/bin")) entries.push("/bin");
+  if (targets.has("/usr")) entries.push("/usr/local/bin", "/usr/bin");
+  if (targets.has("/bin")) entries.push("/bin");
   return [...new Set(entries)];
+}
+
+function projectionContainsPath(projection: ValidatedProjectionMount, candidate: string): boolean {
+  if (projection.source === candidate || projection.target === candidate) return true;
+  if (projection.source_kind !== "directory") return false;
+  return isWithin(projection.source, candidate) || isWithinNamespace(projection.target, candidate);
 }
 
 function validateExecutable(request: SandboxExecutionRequest): DomainResult<string> {
@@ -852,7 +867,15 @@ export function compileSandboxInvocation(
   if (!profilePaths.ok) return profilePaths;
   const runtimeProjection =
     request.runtime_projection === undefined
-      ? success<SessionRuntimeProjection | null>(null)
+      ? request.enforce
+        ? failure<SessionRuntimeProjection | null>(
+            new DomainError(
+              "RUNTIME_PROJECTION_INVALID",
+              "An enforced sandbox execution request must carry an explicit runtime projection.",
+              { session_id: request.session_id, enforce: request.enforce },
+            ),
+          )
+        : success<SessionRuntimeProjection | null>(null)
       : validateSessionRuntimeProjection(request.runtime_projection);
   if (!runtimeProjection.ok) return failure(runtimeProjection.error);
   const projectionMounts =
@@ -918,9 +941,7 @@ export function compileSandboxInvocation(
   const landlockAdapterProjected =
     runtimeProjection.value === null ||
     landlockExecutable.value === null ||
-    projectionMounts.value.some(
-      (projection) => projection.target === landlockExecutable.value || projection.source === landlockExecutable.value,
-    );
+    projectionMounts.value.some((projection) => projectionContainsPath(projection, landlockExecutable.value as string));
   if (landlockRequired && !landlockAdapterProjected) {
     return failure(
       new DomainError(
@@ -949,9 +970,12 @@ export function compileSandboxInvocation(
   );
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
-  // An explicit projection owns visibility.  Its executable surface is a
-  // single fixed directory; no host PATH or compatibility entry is retained.
-  const pathValue = legacyProfile ? pathEntriesForEnvironment(request).join(":") : CANONICAL_EXECUTABLE_ROOT;
+  // An explicit strict projection exposes one canonical executable surface;
+  // compatibility PATH is derived from its explicit filesystem targets.
+  const pathValue =
+    runtimeProjection.value?.policy.mode === "compatibility"
+      ? pathEntriesForEnvironment(runtimeProjection.value).join(":")
+      : CANONICAL_EXECUTABLE_ROOT;
 
   const args: string[] = [
     "--die-with-parent",
