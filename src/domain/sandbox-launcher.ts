@@ -913,7 +913,22 @@ export function compileSandboxInvocation(
       }),
     );
   }
-  const landlockEnabled = landlockSupported && landlockExecutable.value !== null;
+  const landlockAdapterProjected =
+    runtimeProjection.value === null ||
+    landlockExecutable.value === null ||
+    projectionMounts.value.some(
+      (projection) => projection.target === landlockExecutable.value || projection.source === landlockExecutable.value,
+    );
+  if (landlockRequired && !landlockAdapterProjected) {
+    return failure(
+      new DomainError(
+        "SANDBOX_CAPABILITY_UNAVAILABLE",
+        "The required Landlock runtime adapter is not visible in the explicit runtime projection.",
+        { session_id: request.session_id, adapter: landlockExecutable.value },
+      ),
+    );
+  }
+  const landlockEnabled = landlockSupported && landlockExecutable.value !== null && landlockAdapterProjected;
   const landlockRules = deriveLandlockRules(
     request.filesystem,
     legacyProfile || runtimeProjection.value === null

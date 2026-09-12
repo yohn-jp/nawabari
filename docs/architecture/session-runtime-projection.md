@@ -110,6 +110,20 @@ stable derived identity when composition or custom operations change the
 material set. Nix and FHS materializers can consume this logical output
 independently; choosing how to resolve or mount it is outside this contract.
 
+## Bounded FHS materialization
+
+`src/domain/fhs-runtime.ts` consumes a resolved profile plus one explicit FHS
+host executable declaration for each requirement. Strict mode resolves the ELF
+`PT_INTERP` and recursive `DT_NEEDED` closure using fixed FHS paths and emits
+only regular-file read-only projections through the existing launcher. An
+explicit compatibility policy may instead emit the existing FHS roots as
+directory read-only projections; strict mode never does so.
+
+Unsupported metadata, missing artifacts, and unresolved loaders/libraries
+return recoverable `RUNTIME_MATERIALIZATION_MISSING`; they never select a
+fallback. Legacy omitted-projection behavior remains solely for existing
+callers of the pre-materialization launcher.
+
 ## Strict Nix closure materialization
 
 Issue #291 implements the Nix materializer in
