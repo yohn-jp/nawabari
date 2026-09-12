@@ -44,6 +44,7 @@ import {
   sandboxDoctorReport,
   type SandboxProbe,
 } from "./sandbox.js";
+import { withRuntimeFileIdentityTestHooks } from "./runtime-file-identity.js";
 
 function readyProbe(): SandboxProbe {
   return {
@@ -294,6 +295,87 @@ test("materializes one exact pnpm launcher through the canonical executable proj
       const pnpmEntry = compiled.value.find((entry) => entry.target === PROJECTED_PNPM_TARGET);
       assert.equal(pnpmEntry?.source, result.value.launcher_source);
     }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an EEXIST launcher race cannot remove the competing file", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-pnpm-middleware-eexist-"));
+  try {
+    fs.mkdirSync(path.join(root, "launcher"));
+    const input = materializationInput(root);
+    const competing = "competing launcher\n";
+    const result = withRuntimeFileIdentityTestHooks(
+      {
+        beforeExclusiveCreate: (destination) => {
+          if (destination !== input.launcher_path) return;
+          fs.writeFileSync(destination, competing, { mode: 0o644 });
+        },
+      },
+      () => materializePnpmMiddleware(input),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+    assert.equal(fs.readFileSync(input.launcher_path, "utf8"), competing);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a destination replaced after the identity check is never deleted", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-pnpm-middleware-replace-"));
+  try {
+    fs.mkdirSync(path.join(root, "launcher"));
+    const input = materializationInput(root);
+    const replacement = "replacement launcher\n";
+    const result = withRuntimeFileIdentityTestHooks(
+      {
+        beforeFinalIdentityCheck: (checkedPath) => {
+          if (checkedPath !== input.launcher_path) return;
+          fs.rmSync(checkedPath);
+          fs.writeFileSync(checkedPath, replacement, { mode: 0o644 });
+        },
+      },
+      () => materializePnpmMiddleware(input),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+    assert.equal(fs.readFileSync(input.launcher_path, "utf8"), replacement);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the generated pnpm launcher reports RTK spawn failure as exit 127", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-pnpm-middleware-spawn-failure-"));
+  try {
+    fs.mkdirSync(path.join(root, "launcher"));
+    const input = materializationInput(root);
+    const missingRtkPath = path.join(root, "missing-rtk");
+    const projection = validateSessionRuntimeProjection({
+      ...input.projection,
+      filesystem: input.projection.filesystem.map((entry) =>
+        entry.source === input.rtk.source ? { ...entry, target: missingRtkPath } : entry,
+      ),
+    });
+    assert.equal(projection.ok, true, projection.ok ? "" : JSON.stringify(projection.error));
+    if (!projection.ok) return;
+    const result = materializePnpmMiddleware({
+      ...input,
+      projection: projection.value,
+      rtk: { ...input.rtk, path: missingRtkPath },
+    });
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (!result.ok) return;
+    const child = spawnSync(process.execPath, [result.value.launcher_source], {
+      cwd: root,
+      env: { ...process.env, PATH: "/nawabari/bin" },
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 127, child.stderr);
+    assert.equal(child.signal, null);
+    assert.match(child.stderr, /pnpm middleware could not start RTK:/u);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

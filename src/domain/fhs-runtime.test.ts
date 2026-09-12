@@ -14,6 +14,7 @@ import {
   runSandboxedCommand,
 } from "./sandbox.js";
 import { FHS_RUNTIME_ROOTS } from "./fhs-runtime.js";
+import { withRuntimeFileIdentityTestHooks } from "./runtime-file-identity.js";
 import { resolveRuntimeProfile } from "./runtime-profile.js";
 import { EXPLICIT_COMPATIBILITY_RUNTIME_POLICY } from "./runtime-projection.js";
 
@@ -318,6 +319,48 @@ test("missing FHS dependencies use the canonical recoverable materialization fai
     assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
     assert.equal(result.error.exitCode, 4);
     assert.equal(result.error.details?.requirement_id, "node-runtime");
+  }
+});
+
+test("FHS materialization fails closed when the inspected executable is replaced before identity verification", (t) => {
+  if (process.platform !== "linux") {
+    t.skip("FHS file identity is Linux-only");
+    return;
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-fhs-identity-"));
+  const executable = path.join(root, "node");
+  const displaced = `${executable}.inspected`;
+  const replacement = "#!/bin/sh\necho competing-fhs-file\n";
+  fs.writeFileSync(executable, "#!/bin/sh\necho original-fhs-file\n", { mode: 0o755 });
+  fs.chmodSync(executable, 0o755);
+  try {
+    const result = withRuntimeFileIdentityTestHooks(
+      {
+        beforeFinalIdentityCheck: (checkedPath) => {
+          if (checkedPath !== executable) return;
+          fs.renameSync(checkedPath, displaced);
+          fs.writeFileSync(checkedPath, replacement, { mode: 0o755 });
+          fs.chmodSync(checkedPath, 0o755);
+        },
+      },
+      () =>
+        materializeFhsRuntime({
+          profile: baseProfile(),
+          executables: [
+            {
+              requirement_id: "node-runtime",
+              path: executable,
+              target: "/usr/local/nawabari-fhs-identity-node",
+            },
+          ],
+          library_search_paths: [],
+        }),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+    assert.equal(fs.readFileSync(executable, "utf8"), replacement);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

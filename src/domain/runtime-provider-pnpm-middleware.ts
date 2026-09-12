@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
+import { createRuntimeFile, inspectRuntimeFile } from "./runtime-file-identity.js";
 import {
   REAL_PNPM_BACKEND_PROVIDER,
   REAL_PNPM_BACKEND_REQUIREMENT,
@@ -112,15 +113,19 @@ function validateExactPath(value: unknown, field: string): DomainResult<string> 
 
 function validateBackendFile(source: string, field: string, requirement: RuntimeRequirement): DomainResult<null> {
   try {
-    const stat = fs.lstatSync(source);
-    if (stat.isSymbolicLink()) return invalid(field, "the backend must not be a symlink", source);
-    if (!stat.isFile()) return materializationMissing(requirement, "not a regular file", source);
-    if ((stat.mode & 0o111) === 0) return materializationMissing(requirement, "not executable", source);
-    if (fs.realpathSync.native(source) !== source) {
-      return invalid(field, "the backend resolves through a symlink", source);
+    inspectRuntimeFile(
+      source,
+      (_descriptor, stat) => {
+        if ((stat.mode & 0o111n) === 0n) throw new Error("not executable");
+        return undefined;
+      },
+      { requireCanonicalPath: true },
+    );
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message.includes("symlink")) {
+      return invalid(field, "the backend must not be a symlink", source);
     }
-  } catch {
-    return materializationMissing(requirement, "the backend is missing", source);
+    return materializationMissing(requirement, "the backend is missing, not regular, or cannot be inspected", source);
   }
   return success(null);
 }
@@ -283,6 +288,7 @@ const child = spawn(rtkPath, ["${PINNED_RTK_BACKEND_BINDING}", realPnpmPath, ...
 });
 
 let childExited = false;
+let spawnFailed = false;
 const signals = ["SIGHUP", "SIGINT", "SIGTERM", "SIGQUIT"];
 const forwardSignal = (signal) => {
   if (!childExited) child.kill(signal);
@@ -290,11 +296,14 @@ const forwardSignal = (signal) => {
 for (const signal of signals) process.on(signal, forwardSignal);
 
 child.once("error", (error) => {
-  process.stderr.write("pnpm middleware could not start RTK: " + error.message + "\\n");
+  spawnFailed = true;
+  process.exitCode = 127;
+  process.stderr.write("pnpm middleware could not start RTK: " + error.message.slice(0, 200) + "\\n");
 });
 child.once("close", (code, signal) => {
   childExited = true;
   for (const forwarded of signals) process.removeListener(forwarded, forwardSignal);
+  if (spawnFailed) return;
   if (signal !== null) {
     process.kill(process.pid, signal);
     return;
@@ -306,15 +315,13 @@ child.once("close", (code, signal) => {
 
 function writeLauncher(source: string, content: string): DomainResult<null> {
   try {
-    fs.writeFileSync(source, content, { encoding: "utf8", mode: 0o755, flag: "wx" });
-    fs.chmodSync(source, 0o755);
+    createRuntimeFile(source, (descriptor) => {
+      fs.writeFileSync(descriptor, content, { encoding: "utf8" });
+      fs.fchmodSync(descriptor, 0o755);
+      return undefined;
+    });
     return success(null);
   } catch (error: unknown) {
-    try {
-      fs.unlinkSync(source);
-    } catch {
-      // Preserve the materialization error; a partial launcher is never used.
-    }
     return failure(
       new DomainError(
         "RUNTIME_MATERIALIZATION_MISSING",
