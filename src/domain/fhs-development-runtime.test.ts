@@ -277,6 +277,35 @@ test("an explicit NAWABARI_FHS_*_EXECUTABLE candidate always wins over fixed-roo
   }
 });
 
+test("a symlinked node/git/pnpm at a fixed default root is never discovered, and default resolution still fails closed", (t) => {
+  const fixture = requireDefaultRootFixture(t);
+  if (fixture === null) return;
+  const symlinkRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-fhs-development-symlink-root-"));
+  try {
+    // Point every fixed-root binary name at a symlink to a genuine, otherwise-valid
+    // executable target. Discovery must reject the symlink itself, not silently
+    // follow it to the target, even though the target alone would be acceptable.
+    for (const name of ["node", "git", "pnpm"]) {
+      fs.symlinkSync(path.join(fixture.root, name), path.join(symlinkRoot, name));
+    }
+
+    const discovered = discoverDefaultFhsDevelopmentExecutableCandidates([symlinkRoot]);
+    assert.deepEqual(discovered, []);
+
+    const merged = readFhsDevelopmentExecutableCandidates({}, [symlinkRoot]);
+    assert.deepEqual(merged, []);
+
+    const resolved = resolveFhsDevelopmentRuntime({ executable_candidates: merged });
+    expectFailure(resolved, "RUNTIME_MATERIALIZATION_MISSING");
+
+    const readiness = fhsDevelopmentRuntimeReadiness("linux", { fhs_executable_candidates: merged });
+    assert.equal(readiness.strict_ready, false);
+  } finally {
+    fixture.cleanup();
+    fs.rmSync(symlinkRoot, { recursive: true, force: true });
+  }
+});
+
 test("genuinely missing authority still fails closed with a single, well-formed diagnostic sentence", () => {
   const resolved = resolveFhsDevelopmentRuntime({ executable_candidates: [] });
   expectFailure(resolved, "RUNTIME_MATERIALIZATION_MISSING");

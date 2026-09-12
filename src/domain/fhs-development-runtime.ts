@@ -114,17 +114,22 @@ const FHS_DEVELOPMENT_EXECUTABLE_NAMES: Readonly<Record<string, string>> = Objec
 export const FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS = Object.freeze(["/usr/bin", "/usr/local/bin", "/bin"] as const);
 
 /**
- * Resolve a single fixed-root candidate to the canonical form the strict
- * validator requires: an absolute, fully symlink-resolved, regular,
- * executable file. Returns null when the root has no usable candidate.
+ * Accept a fixed-root candidate only if it already satisfies the same
+ * symlink-rejecting contract `validateCandidatePath` enforces for explicit
+ * candidates: the leaf itself must not be a symlink, and no path component
+ * may resolve elsewhere. The leaf is lstat'd *before* any realpath
+ * resolution so a symlinked `node`/`git`/`pnpm` at a fixed root is rejected
+ * outright rather than silently followed to its target. Returns null when
+ * the root has no usable candidate (the caller tries the next root).
  */
 function canonicalDefaultExecutable(candidatePath: string): string | null {
+  if (!canonicalAbsolutePath(candidatePath)) return null;
   try {
-    const resolved = fs.realpathSync.native(candidatePath);
-    if (!canonicalAbsolutePath(resolved)) return null;
-    const stat = fs.lstatSync(resolved);
+    const stat = fs.lstatSync(candidatePath);
     if (stat.isSymbolicLink() || !stat.isFile()) return null;
     if ((stat.mode & 0o111) === 0) return null;
+    const resolved = fs.realpathSync.native(candidatePath);
+    if (resolved !== candidatePath || !canonicalAbsolutePath(resolved)) return null;
     return resolved;
   } catch {
     return null;
