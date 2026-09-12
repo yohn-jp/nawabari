@@ -8,6 +8,7 @@ import { test } from "node:test";
 
 import { LocalSessionBackend } from "./session-backend.js";
 import {
+  buildExplicitCompatibilityRuntimeProjection,
   compileSandboxInvocation,
   discoverSandboxRuntimeLayout,
   resolveSandboxExecutionRequest,
@@ -66,10 +67,13 @@ async function createSecurityFixture(): Promise<SecurityFixture> {
   if (!other.ok) throw other.error;
   fs.writeFileSync(path.join(sibling, "secret.txt"), "sibling secret\n");
 
+  const runtimeProjection = buildExplicitCompatibilityRuntimeProjection(discoverSandboxRuntimeLayout());
+  if (!runtimeProjection.ok) throw runtimeProjection.error;
+
   const request = await resolveSandboxExecutionRequest(
     backend,
     { cwd: worktree },
-    { session_id: owned.value.session_id, enforce: true },
+    { session_id: owned.value.session_id, enforce: true, runtime_projection: runtimeProjection.value },
   );
   if (!request.ok) throw request.error;
   return {
@@ -220,6 +224,7 @@ test("canonical protected execution rejects the Issue #93 security-negative matr
         {
           session_id: fixture.sessionId,
           enforce: true,
+          runtime_projection: fixture.request.runtime_projection,
           cgroups: { required: true, execution_id: executionId },
         },
       );

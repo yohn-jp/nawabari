@@ -19,6 +19,27 @@ import {
   sandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
 import type { CgroupLimitProfile } from "./cgroups-v2.js";
+import {
+  DEFAULT_RUNTIME_POLICY,
+  validateRuntimePolicy,
+  validateSessionRuntimeProjection,
+  type RuntimePolicy,
+  type SessionRuntimeProjection,
+} from "./runtime-projection.js";
+import {
+  fhsDevelopmentRuntimeReadiness,
+  readExplicitFhsDevelopmentExecutableCandidates,
+} from "./fhs-development-runtime.js";
+import type { FhsRuntimeExecutableDeclaration } from "./fhs-runtime.js";
+import {
+  resolveRuntimeProjection,
+  runtimeDoctorReport,
+  type RuntimeDoctorReport,
+  type RuntimeResolutionEvidence,
+  type RuntimeResolutionFhsOptions,
+} from "./runtime-resolution.js";
+import type { ResolvedRuntimeProfile, RuntimeProfileSelection } from "./runtime-profile.js";
+import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
 
 /**
  * Versioned identity for the Linux sandbox execution contract (Issue #81).
@@ -94,6 +115,12 @@ export type SandboxDoctorReport = {
   seccomp_profile: ReturnType<typeof sandboxSeccompProfileMetadata>;
   capability_baseline: typeof sandboxCapabilityBaseline;
   landlock: LandlockCapability;
+  /** Strict FHS development readiness from the real materialization resolver. */
+  strict_ready: boolean;
+  strict_ready_reason: string | null;
+  strict_ready_code: ErrorCode | null;
+  strict_ready_details: JsonObject;
+  runtime: RuntimeDoctorReport;
 };
 
 export type { LandlockCapability, LandlockEffectiveState, LandlockRule } from "./landlock.js";
@@ -165,6 +192,10 @@ export type SandboxExecutionRequest = {
   landlock_state?: LandlockEffectiveState;
   /** Required only when the selected protected profile mandates Landlock. */
   landlock_required?: boolean;
+  /** Validated explicit runtime view; protected launch rejects omission. */
+  runtime_projection?: SessionRuntimeProjection;
+  /** Policy/profile/materializer evidence for the resolved runtime. */
+  runtime_resolution?: RuntimeResolutionEvidence;
 };
 
 export type SandboxCgroupConfig = {
@@ -189,6 +220,15 @@ export type SandboxExecutionOptions = {
   landlock?: SandboxLandlockRequirement;
   /** Explicit compatibility spelling for callers that persist profile flags. */
   landlock_required?: boolean;
+  /** Validated runtime projection consumed by the existing sandbox launcher. */
+  runtime_projection?: SessionRuntimeProjection;
+  /** Explicit policy selection; omitted means the strict default. */
+  runtime_policy?: RuntimePolicy;
+  /** Internal validated profile/adapter seams; the CLI uses the canonical default. */
+  runtime_profile?: ResolvedRuntimeProfile;
+  runtime_profile_selection?: RuntimeProfileSelection;
+  runtime_nix_options?: NixRuntimeClosureOptions;
+  runtime_fhs_options?: RuntimeResolutionFhsOptions;
 };
 
 /** Injectable capability probe so doctor/resolution logic stays host-independent and testable. */
@@ -223,6 +263,8 @@ export type SandboxProbe = {
  */
 export type SandboxRuntimeLayout = {
   bubblewrap: string | null;
+  /** Host Nix executable used only for pre-launch closure queries. */
+  nix?: string | null;
   /** Optional interpreter used only to install Landlock inside bubblewrap. */
   landlock_helper?: string | null;
   /** Host HOME used only to resolve the selected read-only tool directories. */
@@ -247,6 +289,10 @@ export type SandboxRuntimeLayout = {
   ssl_certs: string | null;
   pki_certs: string | null;
   ca_certificates: string | null;
+  /** Exact bounded FHS candidates; empty/omitted means no proven baseline. */
+  fhs_executable_candidates?: readonly FhsRuntimeExecutableDeclaration[];
+  /** Optional explicit bounded ELF search paths used by FHS materialization. */
+  fhs_library_search_paths?: readonly string[];
 };
 
 function pathExists(candidate: string): boolean {
@@ -465,14 +511,18 @@ function capabilityCheck(
 }
 
 /**
- * Pure, side-effect-free capability/doctor inspection. Always returns a
- * report; it never throws and never selects an unsandboxed path itself.
+ * Side-effect-free capability/doctor inspection. Always returns a report; it
+ * never throws and never selects an unsandboxed path itself.
  */
-export function sandboxDoctorReport(probe: SandboxProbe = defaultSandboxProbe): SandboxDoctorReport {
+export function sandboxDoctorReport(
+  probe: SandboxProbe = defaultSandboxProbe,
+  runtimeLayout: SandboxRuntimeLayout = discoverSandboxRuntimeLayout(),
+): SandboxDoctorReport {
   const platform = probe.platform();
   const platformSupported = platform === SANDBOX_SUPPORTED_PLATFORM;
   const namespaceSupport = platformSupported && probe.hasNamespaceSupport();
   const landlock = landlockCapability(probe, platformSupported);
+  const strictReadiness = fhsDevelopmentRuntimeReadiness(platform, runtimeLayout);
   const capabilities = [
     ...SANDBOX_REQUIRED_CAPABILITIES.map((id) =>
       capabilityCheck(id, "required", platformSupported, probe, namespaceSupport),
@@ -523,6 +573,11 @@ export function sandboxDoctorReport(probe: SandboxProbe = defaultSandboxProbe): 
     seccomp_profile: sandboxSeccompProfileMetadata(),
     capability_baseline: sandboxCapabilityBaseline,
     landlock,
+    strict_ready: strictReadiness.strict_ready,
+    strict_ready_reason: strictReadiness.reason,
+    strict_ready_code: strictReadiness.code,
+    strict_ready_details: strictReadiness.details,
+    runtime: runtimeDoctorReport(platform, runtimeLayout),
   };
 }
 
@@ -547,6 +602,7 @@ export function discoverSandboxRuntimeLayout(environment: NodeJS.ProcessEnv = pr
   return {
     bubblewrap: executableOnPath("bwrap", environment),
     landlock_helper: executableOnPath("python3", environment),
+    nix: executableOnPath("nix", environment),
     user_home: home,
     user_local_bin: home === null ? null : existingPath(path.join(home, ".local", "bin")),
     user_local_lib: home === null ? null : existingPath(path.join(home, ".local", "lib")),
@@ -568,6 +624,7 @@ export function discoverSandboxRuntimeLayout(environment: NodeJS.ProcessEnv = pr
     ssl_certs: existingPath("/etc/ssl"),
     pki_certs: existingPath("/etc/pki"),
     ca_certificates: existingPath("/etc/ca-certificates"),
+    fhs_executable_candidates: readExplicitFhsDevelopmentExecutableCandidates(environment),
   };
 }
 
@@ -693,7 +750,7 @@ export async function resolveSandboxExecutionRequest(
     );
   }
 
-  const doctor = sandboxDoctorReport(probe);
+  const doctor = sandboxDoctorReport(probe, runtimeLayout);
   if (options.enforce && !doctor.ready) {
     const code: ErrorCode = doctor.platform_supported
       ? "SANDBOX_CAPABILITY_UNAVAILABLE"
@@ -755,6 +812,53 @@ export async function resolveSandboxExecutionRequest(
     );
   }
 
+  const requestedPolicy = validateRuntimePolicy(
+    options.runtime_policy ?? options.runtime_projection?.policy ?? DEFAULT_RUNTIME_POLICY,
+  );
+  if (!requestedPolicy.ok) return failure(requestedPolicy.error);
+  let runtimeProjection: SessionRuntimeProjection | undefined;
+  let runtimeResolution: RuntimeResolutionEvidence | undefined;
+  if (options.runtime_projection !== undefined) {
+    const provided = validateSessionRuntimeProjection(options.runtime_projection);
+    if (!provided.ok) return failure(provided.error);
+    if (provided.value.policy.mode !== requestedPolicy.value.mode) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "The runtime projection policy does not match the requested runtime policy.",
+          { projection_policy: provided.value.policy.mode, requested_policy: requestedPolicy.value.mode },
+        ),
+      );
+    }
+    runtimeProjection = provided.value;
+    runtimeResolution = Object.freeze({
+      policy: provided.value.policy,
+      profile: provided.value.profile,
+      materializer: "provided" as const,
+    });
+  } else if (options.enforce) {
+    const resolved = resolveRuntimeProjection({
+      policy: requestedPolicy.value,
+      profile: options.runtime_profile,
+      profile_selection: options.runtime_profile_selection,
+      platform: doctor.platform,
+      runtime_layout: runtimeLayout,
+      nix: options.runtime_nix_options,
+      fhs: options.runtime_fhs_options,
+    });
+    if (!resolved.ok) return failure(resolved.error);
+    runtimeProjection = resolved.value.projection;
+    runtimeResolution = Object.freeze({
+      policy: resolved.value.policy,
+      profile: resolved.value.profile,
+      materializer: resolved.value.materializer,
+    });
+  } else {
+    // Non-enforced callers retain the advisory shape. The launcher itself
+    // still refuses to execute an enforced request without a projection.
+    runtimeProjection = undefined;
+  }
+
   return success({
     schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
     contract_id: SANDBOX_CONTRACT_ID,
@@ -784,6 +888,8 @@ export async function resolveSandboxExecutionRequest(
     landlock_abi: doctor.landlock.abi,
     landlock_state: doctor.landlock.effective_state,
     landlock_required: landlockRequired,
+    ...(runtimeProjection === undefined ? {} : { runtime_projection: runtimeProjection }),
+    ...(runtimeResolution === undefined ? {} : { runtime_resolution: runtimeResolution }),
   });
 }
 
@@ -806,14 +912,39 @@ export {
 } from "./sandbox-seccomp.js";
 
 export {
+  buildExplicitCompatibilityRuntimeProjection,
+  type CompatibilityRuntimeProjectionOptions,
+  type CompatibilityRuntimeProjectionSource,
+  type LegacyCompatibilityPathInputs,
+} from "./compatibility-runtime-projection.js";
+
+export {
+  CANONICAL_EXECUTABLE_ROOT,
   compileSandboxInvocation,
   deriveLandlockRules,
+  runInteractiveSandboxedCommand,
   runSandboxedCommand,
   type SandboxCommand,
   type SandboxExecutionResult,
   type SandboxInvocation,
   type SandboxLauncherOptions,
 } from "./sandbox-launcher.js";
+
+export {
+  DEFAULT_NIX_PACKAGE_ATTRIBUTES,
+  NIX_RUNTIME_CLOSURE_CONTRACT_ID,
+  NIX_RUNTIME_CLOSURE_SCHEMA_VERSION,
+  isNixRuntimeClosureError,
+  materializeNixRuntimeClosure,
+  materializeNixRuntimeProfile,
+  resolveNixRuntimeClosure,
+  type NixCommandResult,
+  type NixCommandRunner,
+  type NixRuntimeClosure,
+  type NixRuntimeClosureOptions,
+  type NixRuntimeFileSystem,
+  type NixRuntimePackageResolution,
+} from "./nix-runtime-closure.js";
 export {
   CGROUPS_V2_CONTRACT_ID,
   CGROUPS_V2_ROOT,
@@ -833,3 +964,125 @@ export {
 } from "./cgroups-v2.js";
 
 export { LANDLOCK_ACCESS_FS, LANDLOCK_ABI_MINIMUM, LANDLOCK_TRAMPOLINE } from "./landlock.js";
+
+export {
+  FHS_RUNTIME_LIBRARY_SEARCH_PATHS,
+  FHS_RUNTIME_MATERIALIZATION_CONTRACT_ID,
+  FHS_RUNTIME_MATERIALIZATION_SCHEMA_VERSION,
+  FHS_RUNTIME_ROOTS,
+  materializeFhsRuntime,
+  materializeFhsRuntimeProjection,
+  type FhsRuntimeExecutableDeclaration,
+  type FhsRuntimeMaterializationInput,
+} from "./fhs-runtime.js";
+
+export {
+  FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS,
+  FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS,
+  FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS,
+  doctorFhsDevelopmentRuntime,
+  fhsDevelopmentRuntimeReadiness,
+  materializeFhsDevelopmentRuntime,
+  readExplicitFhsDevelopmentExecutableCandidates,
+  resolveFhsDevelopmentRuntime,
+  type FhsDevelopmentRuntimeInput,
+  type FhsDevelopmentRuntimeReadiness,
+  type FhsDevelopmentRuntimeResolution,
+} from "./fhs-development-runtime.js";
+
+export {
+  resolveRuntimeProjection,
+  resolveRuntimeResolution,
+  resolveSessionRuntimeProjection,
+  runtimeDoctorReport,
+  runtimeMaterializerAvailability,
+  type RuntimeDoctorReport,
+  type RuntimeMaterializer,
+  type RuntimeMaterializerAvailability,
+  type RuntimeResolution,
+  type RuntimeResolutionEvidence,
+  type RuntimeResolutionFhsOptions,
+  type RuntimeResolutionOptions,
+} from "./runtime-resolution.js";
+
+export {
+  TGREP_BACKEND_EVIDENCE,
+  TGREP_BACKEND_NAME,
+  TGREP_BACKEND_PROVIDER,
+  TGREP_BACKEND_REQUIREMENT,
+  TGREP_BACKEND_REQUIREMENT_OPERATION,
+  TGREP_BACKEND_VERSION,
+  TGREP_EXECUTABLE_RELATIVE_PATH,
+  TGREP_NIX_INSTALLABLE,
+  TGREP_NIX_PACKAGE_ATTRIBUTE,
+  TGREP_NIXPKGS_REF,
+  TGREP_NIX_SOURCE,
+  TGREP_RUNTIME_MATERIALIZATION_CONTRACT_ID,
+  TGREP_RUNTIME_MATERIALIZATION_SCHEMA_VERSION,
+  materializeTgrepFhsRuntime,
+  materializeTgrepRuntime,
+  materializeTgrepRuntimeProjection,
+  type TgrepRuntimeMaterialization,
+  type TgrepRuntimeMaterializationOptions,
+} from "./tgrep-runtime-materialization.js";
+
+export {
+  TGREP_RG_ADAPTER_TARGET,
+  TGREP_RG_COMPATIBILITY_CONTRACT_ID,
+  TGREP_RG_COMPATIBILITY_MATRIX,
+  TGREP_RG_COMPATIBILITY_SCHEMA_VERSION,
+  TGREP_RG_ENTRYPOINT_NAME,
+  TGREP_RG_PROVIDER,
+  TGREP_RG_PROVIDER_CONTRACT_ID,
+  TGREP_RG_PROVIDER_SCHEMA_VERSION,
+  materializeTgrepRgProvider,
+  materializeTgrepRgRuntime,
+  projectTgrepRgRuntime,
+  translateTgrepRgArguments,
+  type TgrepRgCompatibilityEntry,
+  type TgrepRgProviderMaterialization,
+  type TgrepRgTranslation,
+} from "./runtime-provider-tgrep.js";
+
+export {
+  PNPM_BACKEND_EVIDENCE,
+  PNPM_BUNDLE_RELATIVE_PATH,
+  PNPM_EXECUTABLE_RELATIVE_PATH,
+  PNPM_MIDDLEWARE_BACKEND_MATERIALIZATION_CONTRACT_ID,
+  PNPM_MIDDLEWARE_BACKEND_MATERIALIZATION_SCHEMA_VERSION,
+  PNPM_MIDDLEWARE_PNPM_BUNDLE_TARGET,
+  PNPM_MIDDLEWARE_REAL_PNPM_TARGET,
+  PNPM_MIDDLEWARE_RTK_TARGET,
+  PNPM_NIX_INSTALLABLE,
+  PNPM_NIX_PACKAGE_ATTRIBUTE,
+  PNPM_NIX_SOURCE,
+  PNPM_NIXPKGS_REF,
+  REAL_PNPM_BACKEND_REQUIREMENT,
+  REAL_PNPM_BACKEND_PROVIDER,
+  RTK_BACKEND_EVIDENCE,
+  RTK_BACKEND_REQUIREMENT,
+  RTK_BACKEND_PROVIDER,
+  RTK_EXECUTABLE_RELATIVE_PATH,
+  RTK_NIX_INSTALLABLE,
+  RTK_NIX_PACKAGE_ATTRIBUTE,
+  RTK_NIX_SOURCE,
+  RTK_NIXPKGS_REF,
+  materializePnpmMiddlewareBackendMaterialization,
+  materializePnpmMiddlewareBackends,
+  materializePnpmMiddlewareFhsRuntime,
+  type PnpmMiddlewareBackendDescriptor,
+  type PnpmMiddlewareBackendMaterialization,
+  type PnpmMiddlewareBackendMaterializationOptions,
+} from "./pnpm-middleware-backend-materialization.js";
+
+export {
+  PINNED_RTK_BACKEND_BINDING,
+  PNPM_MIDDLEWARE_LAUNCHER_NODE_TARGET,
+  PNPM_MIDDLEWARE_LAUNCHER_TARGET,
+  PNPM_MIDDLEWARE_PROVIDER_IDS,
+  PROJECTED_PNPM_ENTRYPOINT,
+  PROJECTED_PNPM_TARGET,
+  materializePnpmMiddleware,
+  type PnpmMiddlewareMaterialization,
+  type PnpmMiddlewareMaterializationInput,
+} from "./runtime-provider-pnpm-middleware.js";

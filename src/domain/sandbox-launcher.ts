@@ -22,6 +22,16 @@ import {
 } from "./sandbox-seccomp.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import {
+  CANONICAL_EXECUTABLE_ROOT,
+  compileRuntimeExecutableProjection,
+  type RuntimeExecutableProjectionEntry,
+} from "./runtime-executable-projection.js";
+import {
+  validateSessionRuntimeProjection,
+  type RuntimeFilesystemProjection,
+  type SessionRuntimeProjection,
+} from "./runtime-projection.js";
+import {
   attachProcessToCgroup,
   cleanupCgroupScope,
   cgroupLimitEvents,
@@ -36,6 +46,11 @@ const SANDBOX_CONFIG_HOME = `${SANDBOX_HOME}/.config`;
 const SANDBOX_LOCAL_HOME = `${SANDBOX_HOME}/.local`;
 const SANDBOX_CACHE_HOME = `${SANDBOX_HOME}/.cache`;
 const SANDBOX_SHARED_HOME = `${SANDBOX_HOME}/.nawabari`;
+const COMPATIBILITY_USER_TOOL_TARGETS = new Set([
+  `${SANDBOX_LOCAL_HOME}/bin`,
+  `${SANDBOX_LOCAL_HOME}/lib`,
+  `${SANDBOX_LOCAL_HOME}/share/pnpm`,
+]);
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_024 * 1_024;
 
@@ -82,11 +97,15 @@ export type SandboxExecutionResult = {
     readonly state: LandlockEffectiveState;
     readonly rule_count: number;
   };
+  /** Policy/profile/materializer selected before launch. */
+  readonly runtime_resolution?: SandboxExecutionRequest["runtime_resolution"];
 };
 
 export type SandboxLauncherOptions = {
   readonly timeout_ms?: number;
   readonly max_output_bytes?: number;
+  /** Attach the caller's existing stdio and use no bounded-output timeout. */
+  readonly interactive?: boolean;
 };
 
 type ValidatedTopology = {
@@ -97,6 +116,16 @@ type ValidatedTopology = {
   readonly persistent_home: string;
   readonly git_metadata: string;
   readonly git_objects: string;
+};
+
+type CanonicalProjectionSource = {
+  readonly path: string;
+  readonly kind: "file" | "directory";
+};
+
+type ValidatedProjectionMount = RuntimeFilesystemProjection & {
+  readonly source: string;
+  readonly source_kind: CanonicalProjectionSource["kind"];
 };
 
 export type { LandlockRule } from "./landlock.js";
@@ -236,6 +265,209 @@ function pathMatches(candidate: string, root: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
 
+function projectionInvalid(field: string, reason: string, value?: string): DomainResult<never> {
+  return failure(
+    new DomainError("RUNTIME_PROJECTION_INVALID", `Runtime projection field '${field}' is invalid: ${reason}.`, {
+      field,
+      ...(value === undefined ? {} : { value }),
+    }),
+  );
+}
+
+function projectionAmbiguous(field: string, reason: string, value: string): DomainResult<never> {
+  return failure(
+    new DomainError("RUNTIME_PROJECTION_AMBIGUOUS", `Runtime projection field '${field}' is ambiguous: ${reason}.`, {
+      field,
+      value,
+    }),
+  );
+}
+
+function isWithinNamespace(parent: string, candidate: string): boolean {
+  const relative = path.posix.relative(parent, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith("../") && !path.posix.isAbsolute(relative));
+}
+
+function namespacePathsOverlap(left: string, right: string): boolean {
+  return isWithinNamespace(left, right) || isWithinNamespace(right, left);
+}
+
+function canonicalProjectionSource(
+  projection: RuntimeFilesystemProjection,
+  index: number,
+): DomainResult<CanonicalProjectionSource> {
+  const field = `filesystem[${index}].source`;
+  if (!path.isAbsolute(projection.source) || projection.source.includes("\0")) {
+    return projectionInvalid(field, "expected an absolute path without NUL bytes", projection.source);
+  }
+  const normalized = path.normalize(projection.source);
+  if (normalized !== projection.source || projection.source === "/") {
+    return projectionInvalid(field, "source must be a non-root canonical path", projection.source);
+  }
+  try {
+    const stat = fs.lstatSync(projection.source);
+    if (stat.isSymbolicLink()) {
+      return projectionInvalid(field, "source must not be a symlink", projection.source);
+    }
+    if (!stat.isDirectory() && !stat.isFile()) {
+      return projectionInvalid(field, "source must be a regular file or directory", projection.source);
+    }
+    const resolved = fs.realpathSync.native(projection.source);
+    if (resolved !== normalized) {
+      return projectionInvalid(field, "source resolves through an unproven symlink", projection.source);
+    }
+    return success({ path: resolved, kind: stat.isDirectory() ? "directory" : "file" });
+  } catch (error: unknown) {
+    return projectionInvalid(
+      field,
+      `source does not exist or cannot be canonicalized${error instanceof Error ? ` (${error.message.slice(0, 120)})` : ""}`,
+      projection.source,
+    );
+  }
+}
+
+function existingAncestor(candidate: string): string | null {
+  let current = candidate;
+  while (true) {
+    try {
+      fs.lstatSync(current);
+      return current;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return null;
+      current = parent;
+    }
+  }
+}
+
+function validateWorktreeProjectionTarget(target: string, topology: ValidatedTopology): DomainResult<null> {
+  const relative = path.posix.relative(topology.worktree, target);
+  const hostCandidate = path.join(topology.worktree, relative);
+  const ancestor = existingAncestor(hostCandidate);
+  if (ancestor === null) return projectionInvalid("filesystem.target", "target has no canonicalizable parent", target);
+  try {
+    const resolvedAncestor = fs.realpathSync.native(ancestor);
+    if (resolvedAncestor !== path.normalize(ancestor) || !isWithin(topology.worktree, resolvedAncestor)) {
+      return projectionInvalid("filesystem.target", "target parent would traverse a worktree symlink", target);
+    }
+  } catch {
+    return projectionInvalid("filesystem.target", "target parent cannot be canonicalized", target);
+  }
+  return success(null);
+}
+
+function validateProjectionTarget(
+  target: string,
+  topology: ValidatedTopology,
+  provenance: RuntimeFilesystemProjection["provenance"],
+): DomainResult<null> {
+  if (!path.posix.isAbsolute(target) || target.includes("\0")) {
+    return projectionInvalid("filesystem.target", "expected an absolute namespace path", target);
+  }
+  if (path.posix.normalize(target) !== target || (target !== "/" && target.endsWith("/"))) {
+    return projectionInvalid("filesystem.target", "target must be a canonical normalized namespace path", target);
+  }
+  if (target === "/") return projectionInvalid("filesystem.target", "the sandbox root is backend-owned", target);
+
+  const insideWorktree = isWithinNamespace(topology.worktree, target);
+  if (!insideWorktree && isWithinNamespace(target, topology.worktree)) {
+    return projectionAmbiguous("filesystem.target", "a projection cannot shadow the session worktree", target);
+  }
+
+  for (const backendRoot of ["/dev", "/proc", "/tmp", SANDBOX_HOME, "/nawabari"]) {
+    // The current protected worktree commonly lives below host /tmp and is
+    // intentionally mounted below the private namespace /tmp.  A projection
+    // nested in that already-authorized worktree may narrow it.
+    if (backendRoot === "/tmp" && insideWorktree) continue;
+    if (backendRoot === SANDBOX_HOME && provenance === "compatibility" && COMPATIBILITY_USER_TOOL_TARGETS.has(target)) {
+      continue;
+    }
+    if (namespacePathsOverlap(backendRoot, target)) {
+      return projectionAmbiguous("filesystem.target", "target overlaps a backend-owned mount", target);
+    }
+  }
+
+  return insideWorktree ? validateWorktreeProjectionTarget(target, topology) : success(null);
+}
+
+function validateProjectionMounts(
+  topology: ValidatedTopology,
+  projection: SessionRuntimeProjection,
+): DomainResult<readonly ValidatedProjectionMount[]> {
+  const mounts: ValidatedProjectionMount[] = [];
+  const ordered = [...projection.filesystem].sort((left, right) => {
+    const leftKey = `${left.target}\u0000${left.access_mode}\u0000${left.source}\u0000${left.provenance}`;
+    const rightKey = `${right.target}\u0000${right.access_mode}\u0000${right.source}\u0000${right.provenance}`;
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+  const targets: string[] = [];
+  for (const [index, entry] of ordered.entries()) {
+    const source = canonicalProjectionSource(entry, index);
+    if (!source.ok) return source;
+    const target = validateProjectionTarget(entry.target, topology, entry.provenance);
+    if (!target.ok) return target;
+    targets.push(entry.target);
+
+    if (entry.access_mode === "read-write") {
+      const sourceRelative = path.relative(topology.worktree, source.value.path);
+      const targetRelative = path.posix.relative(topology.worktree, entry.target);
+      if (
+        !isWithin(topology.worktree, source.value.path) ||
+        !isWithinNamespace(topology.worktree, entry.target) ||
+        sourceRelative !== targetRelative
+      ) {
+        return projectionInvalid(
+          `filesystem[${index}]`,
+          "read-write projections may only preserve an existing session worktree path",
+          entry.target,
+        );
+      }
+    }
+    if (isWithinNamespace(topology.worktree, entry.target)) {
+      const targetRelative = path.posix.relative(topology.worktree, entry.target);
+      const targetHostPath = path.join(topology.worktree, targetRelative);
+      try {
+        const targetStat = fs.lstatSync(targetHostPath);
+        const targetKind = targetStat.isDirectory() ? "directory" : targetStat.isFile() ? "file" : "other";
+        if (targetKind !== source.value.kind) {
+          return projectionInvalid(
+            `filesystem[${index}].target`,
+            `target type must match the materialized ${source.value.kind} source`,
+            entry.target,
+          );
+        }
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          return projectionInvalid(
+            `filesystem[${index}].target`,
+            "target type cannot be established safely",
+            entry.target,
+          );
+        }
+        // A missing target is created by the deterministic --dir/bind pair.
+      }
+    }
+    if (entry.target === topology.worktree && source.value.path !== topology.worktree) {
+      return projectionAmbiguous(
+        "filesystem.target",
+        "the session worktree may only be shadowed by its own source",
+        entry.target,
+      );
+    }
+    mounts.push(Object.freeze({ ...entry, source: source.value.path, source_kind: source.value.kind }));
+  }
+
+  for (let index = 1; index < targets.length; index += 1) {
+    const current = targets[index] as string;
+    for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
+      if (namespacePathsOverlap(targets[priorIndex] as string, current)) {
+        return projectionAmbiguous("filesystem.target", "projection targets overlap", current);
+      }
+    }
+  }
+  return success(Object.freeze(mounts));
+}
+
 const BROAD_FHS_SYSTEM_ROOTS = ["/usr", "/bin", "/lib", "/lib64"] as const;
 
 function allowedSystemPath(candidate: string, nixOSRuntime = false): boolean {
@@ -338,23 +570,48 @@ function addReadWriteBind(args: string[], source: string, destination: string, s
   args.push("--bind", source, destination);
 }
 
-function pathEntriesForEnvironment(request: SandboxExecutionRequest): string[] {
+function addProjectionBind(args: string[], projection: ValidatedProjectionMount, seenDirectories: Set<string>): void {
+  addDirectory(args, projection.target, seenDirectories);
+  if (projection.source_kind === "directory" && !seenDirectories.has(projection.target)) {
+    seenDirectories.add(projection.target);
+    args.push("--dir", projection.target);
+  }
+  if (projection.access_mode === "read-only") {
+    args.push("--ro-bind", projection.source, projection.target);
+  } else {
+    args.push("--bind", projection.source, projection.target);
+  }
+}
+
+function addExecutableProjectionBind(
+  args: string[],
+  projection: RuntimeExecutableProjectionEntry,
+  seenDirectories: Set<string>,
+): void {
+  addDirectory(args, projection.target, seenDirectories);
+  args.push("--ro-bind", projection.source, projection.target);
+}
+
+function pathEntriesForEnvironment(projection: SessionRuntimeProjection): string[] {
   const entries: string[] = [];
-  const sources = new Set(request.filesystem.runtime_paths);
-  const system = new Set(request.filesystem.system_paths);
-  const tools = new Set(request.filesystem.user_tool_paths);
-  const hostHome = request.filesystem.user_tool_home ?? process.env.HOME;
-  if (tools.has(path.join(hostHome ?? "", ".local", "bin"))) entries.push(`${SANDBOX_LOCAL_HOME}/bin`);
-  if (tools.has(path.join(hostHome ?? "", ".local", "share", "pnpm"))) {
+  const targets = new Set(projection.filesystem.map((entry) => entry.target));
+  if (targets.has(`${SANDBOX_LOCAL_HOME}/bin`)) entries.push(`${SANDBOX_LOCAL_HOME}/bin`);
+  if (targets.has(`${SANDBOX_LOCAL_HOME}/share/pnpm`)) {
     entries.push(`${SANDBOX_LOCAL_HOME}/share/pnpm`);
   }
-  if (sources.has("/run/current-system")) entries.push("/run/current-system/sw/bin");
-  if (sources.has("/run/wrappers")) entries.push("/run/wrappers/bin");
-  const profile = [...sources].find((source) => source.startsWith("/etc/profiles/per-user/"));
+  if (targets.has("/run/current-system")) entries.push("/run/current-system/sw/bin");
+  if (targets.has("/run/wrappers")) entries.push("/run/wrappers/bin");
+  const profile = [...targets].sort().find((target) => target.startsWith("/etc/profiles/per-user/"));
   if (profile !== undefined) entries.push(`${profile}/bin`);
-  if (system.has("/usr")) entries.push("/usr/local/bin", "/usr/bin");
-  if (system.has("/bin")) entries.push("/bin");
+  if (targets.has("/usr")) entries.push("/usr/local/bin", "/usr/bin");
+  if (targets.has("/bin")) entries.push("/bin");
   return [...new Set(entries)];
+}
+
+function projectionContainsPath(projection: ValidatedProjectionMount, candidate: string): boolean {
+  if (projection.source === candidate || projection.target === candidate) return true;
+  if (projection.source_kind !== "directory") return false;
+  return isWithin(projection.source, candidate) || isWithinNamespace(projection.target, candidate);
 }
 
 function validateExecutable(request: SandboxExecutionRequest): DomainResult<string> {
@@ -610,6 +867,30 @@ export function compileSandboxInvocation(
   if (!topology.ok) return topology;
   const profilePaths = validateProfilePaths(request);
   if (!profilePaths.ok) return profilePaths;
+  const runtimeProjection =
+    request.runtime_projection === undefined
+      ? request.enforce
+        ? failure<SessionRuntimeProjection | null>(
+            new DomainError(
+              "RUNTIME_PROJECTION_INVALID",
+              "An enforced sandbox execution request must carry an explicit runtime projection.",
+              { session_id: request.session_id, enforce: request.enforce },
+            ),
+          )
+        : success<SessionRuntimeProjection | null>(null)
+      : validateSessionRuntimeProjection(request.runtime_projection);
+  if (!runtimeProjection.ok) return failure(runtimeProjection.error);
+  const projectionMounts =
+    runtimeProjection.value === null
+      ? success<readonly ValidatedProjectionMount[]>([])
+      : validateProjectionMounts(topology.value, runtimeProjection.value);
+  if (!projectionMounts.ok) return failure(projectionMounts.error);
+  const executableProjection =
+    runtimeProjection.value === null
+      ? success<readonly RuntimeExecutableProjectionEntry[]>([])
+      : compileRuntimeExecutableProjection(runtimeProjection.value);
+  if (!executableProjection.ok) return failure(executableProjection.error);
+  const legacyProfile = runtimeProjection.value === null;
   if (
     request.seccomp_profile.id !== SANDBOX_SECCOMP_PROFILE_ID ||
     request.seccomp_profile.version !== SANDBOX_SECCOMP_PROFILE_VERSION ||
@@ -659,11 +940,44 @@ export function compileSandboxInvocation(
       }),
     );
   }
-  const landlockEnabled = landlockSupported && landlockExecutable.value !== null;
-  const landlockRules = deriveLandlockRules(request.filesystem);
+  const landlockAdapterProjected =
+    runtimeProjection.value === null ||
+    landlockExecutable.value === null ||
+    projectionMounts.value.some((projection) => projectionContainsPath(projection, landlockExecutable.value as string));
+  if (landlockRequired && !landlockAdapterProjected) {
+    return failure(
+      new DomainError(
+        "SANDBOX_CAPABILITY_UNAVAILABLE",
+        "The required Landlock runtime adapter is not visible in the explicit runtime projection.",
+        { session_id: request.session_id, adapter: landlockExecutable.value },
+      ),
+    );
+  }
+  const landlockEnabled = landlockSupported && landlockExecutable.value !== null && landlockAdapterProjected;
+  const landlockRules = deriveLandlockRules(
+    request.filesystem,
+    legacyProfile || runtimeProjection.value === null
+      ? undefined
+      : {
+          ...runtimeProjection.value,
+          filesystem: [
+            ...projectionMounts.value,
+            ...executableProjection.value.map((entry) => ({
+              target: entry.target,
+              access_mode: "read-only" as const,
+              source_kind: entry.source_kind,
+            })),
+          ],
+        },
+  );
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
-  const pathValue = pathEntriesForEnvironment(request).join(":");
+  // An explicit strict projection exposes one canonical executable surface;
+  // compatibility PATH is derived from its explicit filesystem targets.
+  const pathValue =
+    runtimeProjection.value?.policy.mode === "compatibility"
+      ? pathEntriesForEnvironment(runtimeProjection.value).join(":")
+      : CANONICAL_EXECUTABLE_ROOT;
 
   const args: string[] = [
     "--die-with-parent",
@@ -739,19 +1053,27 @@ export function compileSandboxInvocation(
   addReadWriteBind(args, topology.value.git_metadata, "/nawabari/git", seenDirectories);
   addReadOnlyBind(args, topology.value.git_objects, "/nawabari/git/objects", seenDirectories);
 
-  for (const source of request.filesystem.user_tool_paths) {
-    const kind = allowedUserToolPath(source, request.filesystem.user_tool_home);
-    if (kind === "local_bin") addReadOnlyBind(args, source, `${SANDBOX_LOCAL_HOME}/bin`, seenDirectories);
-    if (kind === "local_lib") addReadOnlyBind(args, source, `${SANDBOX_LOCAL_HOME}/lib`, seenDirectories);
-    if (kind === "pnpm_bin") {
-      addReadOnlyBind(args, source, `${SANDBOX_LOCAL_HOME}/share/pnpm`, seenDirectories);
+  if (legacyProfile) {
+    for (const source of request.filesystem.user_tool_paths) {
+      const kind = allowedUserToolPath(source, request.filesystem.user_tool_home);
+      if (kind === "local_bin") addReadOnlyBind(args, source, `${SANDBOX_LOCAL_HOME}/bin`, seenDirectories);
+      if (kind === "local_lib") addReadOnlyBind(args, source, `${SANDBOX_LOCAL_HOME}/lib`, seenDirectories);
+      if (kind === "pnpm_bin") {
+        addReadOnlyBind(args, source, `${SANDBOX_LOCAL_HOME}/share/pnpm`, seenDirectories);
+      }
     }
+    for (const source of request.filesystem.runtime_paths) {
+      if (source === "/dev" || source === "/proc" || source === "/tmp") continue;
+      addReadOnlyBind(args, source, source, seenDirectories);
+    }
+    for (const source of request.filesystem.system_paths) addReadOnlyBind(args, source, source, seenDirectories);
   }
-  for (const source of request.filesystem.runtime_paths) {
-    if (source === "/dev" || source === "/proc" || source === "/tmp") continue;
-    addReadOnlyBind(args, source, source, seenDirectories);
+  for (const projection of projectionMounts.value) {
+    addProjectionBind(args, projection, seenDirectories);
   }
-  for (const source of request.filesystem.system_paths) addReadOnlyBind(args, source, source, seenDirectories);
+  for (const projection of executableProjection.value) {
+    addExecutableProjectionBind(args, projection, seenDirectories);
+  }
 
   for (const parent of destinationParents(worktreeDestination)) {
     if (seenDirectories.has(parent)) continue;
@@ -914,13 +1236,14 @@ export function runSandboxedCommand(
 ): Promise<DomainResult<SandboxExecutionResult>> {
   const invocation = compileSandboxInvocation(request, command);
   if (!invocation.ok) return Promise.resolve(invocation);
+  const interactive = options.interactive === true;
   const timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
   const maxOutputBytes = options.max_output_bytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   if (
-    !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs < 1 ||
-    !Number.isSafeInteger(maxOutputBytes) ||
-    maxOutputBytes < 1
+    (!interactive && !Number.isSafeInteger(timeoutMs)) ||
+    (!interactive && timeoutMs < 1) ||
+    (!interactive && !Number.isSafeInteger(maxOutputBytes)) ||
+    (!interactive && maxOutputBytes < 1)
   ) {
     return Promise.resolve(
       failure(
@@ -954,7 +1277,9 @@ export function runSandboxedCommand(
       cwd: invocation.value.cwd,
       env: { ...invocation.value.env },
       shell: false,
-      stdio: ["ignore", "pipe", "pipe", profile.value.fd],
+      stdio: interactive
+        ? ["inherit", "inherit", "inherit", profile.value.fd]
+        : ["ignore", "pipe", "pipe", profile.value.fd],
     });
     profile.value.close();
   } catch (error: unknown) {
@@ -1000,15 +1325,39 @@ export function runSandboxedCommand(
     let outputExceeded = false;
     let spawnError: Error | null = null;
     let settled = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
+    let timer: NodeJS.Timeout | null = null;
+    if (!interactive) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
+    }
+
+    const signalHandlers = new Map<NodeJS.Signals, () => void>();
+    const removeSignalHandlers = (): void => {
+      for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler);
+      signalHandlers.clear();
+    };
+    if (interactive) {
+      for (const signal of ["SIGINT", "SIGTERM"] as const) {
+        const handler = (): void => {
+          if (settled) return;
+          try {
+            child.kill(signal);
+          } catch {
+            // The child may have exited between signal delivery and forwarding.
+          }
+        };
+        signalHandlers.set(signal, handler);
+        process.on(signal, handler);
+      }
+    }
 
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
+      removeSignalHandlers();
       const accounting = cgroupScope === null ? null : readCgroupAccounting(cgroupScope);
       if (cgroupScope !== null) {
         const cleaned = cleanupCgroupScope(cgroupScope);
@@ -1117,26 +1466,29 @@ export function runSandboxedCommand(
                 },
               }),
           landlock: invocation.value.landlock,
+          ...(request.runtime_resolution === undefined ? {} : { runtime_resolution: request.runtime_resolution }),
         }),
       );
     };
 
-    child.stdout?.on("data", (value: Buffer | string) => {
-      const collected = boundedOutput(stdout, outputBytes, maxOutputBytes, value);
-      outputBytes = collected.bytes;
-      if (collected.exceeded) {
-        outputExceeded = true;
-        child.kill("SIGKILL");
-      }
-    });
-    child.stderr?.on("data", (value: Buffer | string) => {
-      const collected = boundedOutput(stderr, outputBytes, maxOutputBytes, value);
-      outputBytes = collected.bytes;
-      if (collected.exceeded) {
-        outputExceeded = true;
-        child.kill("SIGKILL");
-      }
-    });
+    if (!interactive) {
+      child.stdout?.on("data", (value: Buffer | string) => {
+        const collected = boundedOutput(stdout, outputBytes, maxOutputBytes, value);
+        outputBytes = collected.bytes;
+        if (collected.exceeded) {
+          outputExceeded = true;
+          child.kill("SIGKILL");
+        }
+      });
+      child.stderr?.on("data", (value: Buffer | string) => {
+        const collected = boundedOutput(stderr, outputBytes, maxOutputBytes, value);
+        outputBytes = collected.bytes;
+        if (collected.exceeded) {
+          outputExceeded = true;
+          child.kill("SIGKILL");
+        }
+      });
+    }
     child.on("error", (error: Error) => {
       spawnError = error;
     });
@@ -1144,4 +1496,13 @@ export function runSandboxedCommand(
   });
 }
 
+/** Execute one projected command with the caller's existing terminal streams. */
+export function runInteractiveSandboxedCommand(
+  request: SandboxExecutionRequest,
+  command: SandboxCommand,
+): Promise<DomainResult<SandboxExecutionResult>> {
+  return runSandboxedCommand(request, command, { interactive: true });
+}
+
+export { CANONICAL_EXECUTABLE_ROOT } from "./runtime-executable-projection.js";
 export { deriveLandlockRules } from "./landlock.js";

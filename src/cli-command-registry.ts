@@ -129,11 +129,35 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     name: "session run",
     aliases: ["session exec"],
     summary: "Run one command inside the protected session sandbox",
-    usage: `${CLI_NAME} session run [--session <id>] -- <command> [args...]`,
-    options: [option("--session", "Select the active owned session", { value: "<id>" })],
+    usage: `${CLI_NAME} session run [--session <id>] [--runtime-policy <strict|compatibility>] -- <command> [args...]`,
+    options: [
+      option("--session", "Select the active owned session", { value: "<id>" }),
+      option("--runtime-policy", "Select strict default-deny or explicit compatibility runtime visibility", {
+        value: "<strict|compatibility>",
+        default: "strict",
+        values: ["strict", "compatibility"],
+      }),
+    ],
     notes: [
       "The -- terminator is mandatory. The command is passed as argv without a shell, and protected execution is fail-closed.",
       "session exec is an alias.",
+    ],
+  },
+  {
+    name: "session shell",
+    summary: "Run an explicitly projected shell inside the protected session sandbox",
+    usage: `${CLI_NAME} session shell [--session <id>] [--runtime-policy <strict|compatibility>] -- <projected-shell> [args...]`,
+    options: [
+      option("--session", "Select the active owned session", { value: "<id>" }),
+      option("--runtime-policy", "Select strict default-deny or explicit compatibility runtime visibility", {
+        value: "<strict|compatibility>",
+        default: "strict",
+        values: ["strict", "compatibility"],
+      }),
+    ],
+    notes: [
+      "The -- terminator is mandatory. The projected shell is resolved only through /nawabari/bin and receives inherited stdio.",
+      "Nawabari does not parse shell syntax or select a host/default shell.",
     ],
   },
   {

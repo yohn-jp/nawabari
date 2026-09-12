@@ -141,6 +141,103 @@ jobs:
       - name: Verify GitHub Actions are pinned by SHA
         run: pnpm run governance:actions
 
+  tgrep-runtime-conformance:
+    needs: changes
+    if: needs.changes.outputs.release_docs_only != 'true'
+    name: pinned tgrep runtime / protected execution conformance (Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 11.18.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          determinate: false
+
+      - name: Materialize and execute the pinned tgrep runtime
+        run: pnpm run test:tgrep:conformance
+
+  pnpm-middleware-runtime-conformance:
+    needs: changes
+    if: needs.changes.outputs.release_docs_only != 'true'
+    name: pinned RTK / pnpm middleware backend conformance (Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 11.18.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          determinate: false
+
+      - name: Project a canonical FHS-rooted Node interpreter
+        # actions/setup-node installs into /opt/hostedtoolcache, which is not
+        # a bounded FHS root that materializeFhsRuntime() accepts. Copy the
+        # exact same pinned Node binary to a canonical /usr/bin location so
+        # the protected conformance test can declare it as a real FHS
+        # artifact without weakening FHS_RUNTIME_ROOTS validation.
+        run: |
+          sudo cp "$(command -v node)" /usr/bin/node
+          echo "NAWABARI_TEST_FHS_NODE_INTERPRETER=/usr/bin/node" >> "$GITHUB_ENV"
+
+      - name: Materialize and verify pinned RTK and pnpm middleware backends
+        run: pnpm run test:pnpm:conformance
+
   package:
     needs: changes
     if: needs.changes.outputs.release_docs_only != 'true'

@@ -60,13 +60,13 @@ Close is conservative. Unintegrated commits, dirty worktrees, ambiguous Git stat
 
 Each boundary has one job and one local authority. README summarizes the product contract; executable code and machine-readable projections remain authoritative for exact schemas, transitions, and failure vocabularies.
 
-| Boundary | What it answers | Typical commands |
-| --- | --- | --- |
-| Session lifecycle | Which session owns a worktree/branch and whether it can safely progress or terminate | `session create`, `session inspect`, `session close` |
-| Resource Claims | Which session may access a canonical repository resource and at what mode | `session claim`, `session claims`, `session update`, `session release` |
-| Mutation authorization | Whether a concrete operation has sufficient claims and no conflicting owner | `guard`, `authorize`, `commit`, `push` |
-| Repository evidence | What Git can observe about revisions, paths, changes, ancestry, and bounded diffs | `checkpoint`, `evidence snapshot`, `diff` |
-| Protected execution | Whether a command runs inside the opt-in Linux process/filesystem boundary | `session run`, `session exec`, `doctor` |
+| Boundary               | What it answers                                                                      | Typical commands                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Session lifecycle      | Which session owns a worktree/branch and whether it can safely progress or terminate | `session create`, `session inspect`, `session close`                   |
+| Resource Claims        | Which session may access a canonical repository resource and at what mode            | `session claim`, `session claims`, `session update`, `session release` |
+| Mutation authorization | Whether a concrete operation has sufficient claims and no conflicting owner          | `guard`, `authorize`, `commit`, `push`                                 |
+| Repository evidence    | What Git can observe about revisions, paths, changes, ancestry, and bounded diffs    | `checkpoint`, `evidence snapshot`, `diff`                              |
+| Protected execution    | Whether a command runs inside the opt-in Linux process/filesystem boundary           | `session run`, `session exec`, `session shell`, `doctor`               |
 
 Claims are not task labels and do not encode GitHub or agent semantics. `write` permits ordinary path changes; `exclusive-write` is required for finalizing operations such as commit and push. Conflicting or ambiguous claims fail closed.
 
@@ -133,11 +133,14 @@ git nawabari push --session "$session_id" --remote origin --branch feature/examp
 Protected execution is an opt-in Linux-only mode beneath the existing Nawabari session and claim authority. It does not create a second session identity and does not turn ordinary `session create` work into a sandbox.
 
 ```bash
-git nawabari session run --session "$session_id" -- node worker.js
+git nawabari session run --session "$session_id" --runtime-policy strict -- node worker.js
 git nawabari session exec --session "$session_id" -- npm test
+git nawabari session shell --session "$session_id" --runtime-policy compatibility
 ```
 
 The `--` terminator is mandatory. The command is passed as argv and is not interpreted by a shell. The canonical profile gives the child a private root, `/tmp`, `/proc`, HOME, and cache state, mounts only the owned worktree read-write, and does not expose sibling worktrees or Nawabari control paths. Network mode is explicitly `inherited`, not isolated. Required Linux capabilities fail closed when unavailable; optional Landlock and cgroups v2 provide defense in depth when available.
+
+Protected execution defaults to the strict `development` runtime profile. Only declared Node, Git, and pnpm material is projected through `/nawabari/bin`; `/usr`, `/bin`, `/nix/store`, the host home, and local user-tool directories are not implicitly visible. Compatibility is available only through the explicit `--runtime-policy compatibility` option.
 
 ```bash
 git nawabari doctor --json
@@ -176,10 +179,7 @@ import {
 
 import { nawabariMachineContract } from "nawabari/contract";
 
-import {
-  generateNawabariProductStateManifest,
-  serializeNawabariProductStateManifest,
-} from "nawabari/manifest";
+import { generateNawabariProductStateManifest, serializeNawabariProductStateManifest } from "nawabari/manifest";
 ```
 
 `nawabari/state` provides transport-neutral lifecycle projection and read-only observation of an existing session. `nawabari/contract` provides the installed machine-contract projection. `nawabari/manifest` provides the deterministic Product State Manifest projection.

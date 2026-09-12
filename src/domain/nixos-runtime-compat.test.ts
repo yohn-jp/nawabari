@@ -9,6 +9,7 @@ import { runCli } from "../cli.js";
 import type { CliIO } from "../presentation.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import {
+  buildExplicitCompatibilityRuntimeProjection,
   compileSandboxInvocation,
   defaultSandboxProbe,
   discoverSandboxRuntimeLayout,
@@ -162,10 +163,17 @@ test("canonical NixOS Runtime runs representative workloads through the protecte
     // Inspect the exact request consumed by the same #145 launcher used by
     // `session run`; this proves the fixture did not add an outer-Runtime bind.
     const backend = new LocalSessionBackend();
+    const runtimeProjection = buildExplicitCompatibilityRuntimeProjection(layout);
+    assert.equal(runtimeProjection.ok, true, runtimeProjection.ok ? "" : runtimeProjection.error.message);
+    if (!runtimeProjection.ok) return;
     const request = await resolveSandboxExecutionRequest(
       backend,
       { cwd: firstWorktree },
-      { session_id: firstSession, enforce: true },
+      {
+        session_id: firstSession,
+        enforce: true,
+        runtime_projection: runtimeProjection.value,
+      },
       defaultSandboxProbe,
       layout,
     );

@@ -28,11 +28,18 @@ import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract }
 import {
   resolveSandboxExecutionRequest,
   runSandboxedCommand,
+  CANONICAL_EXECUTABLE_ROOT,
   type SandboxCommand,
   type SandboxExecutionResult,
+  type SandboxLauncherOptions,
   type SandboxProbe,
   type SandboxRuntimeLayout,
 } from "./domain/sandbox.js";
+import {
+  EXPLICIT_COMPATIBILITY_RUNTIME_POLICY,
+  STRICT_RUNTIME_POLICY,
+  type RuntimePolicyMode,
+} from "./domain/runtime-projection.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -73,6 +80,7 @@ export const DISPATCHER_COMMAND_INVENTORY = [
   "session inspect",
   "session run",
   "session exec",
+  "session shell",
   "session list",
   "session claim",
   "resource claim",
@@ -109,7 +117,8 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session id": [],
   "session show": ["--session"],
   "session inspect": ["--session", "--integrated-revision"],
-  "session run": ["--session"],
+  "session run": ["--session", "--runtime-policy"],
+  "session shell": ["--session", "--runtime-policy"],
   "session list": ["--all", "--history", "--limit", "--offset"],
   "session claim": ["--resource", "--mode", "--session", "--repository"],
   "session update": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
@@ -354,9 +363,12 @@ export type CliDependencies = {
   sandboxRunner?: (
     request: import("./domain/sandbox.js").SandboxExecutionRequest,
     command: SandboxCommand,
+    options?: SandboxLauncherOptions,
   ) => Promise<DomainResult<SandboxExecutionResult>>;
   sandboxProbe?: SandboxProbe;
   sandboxRuntimeLayout?: SandboxRuntimeLayout;
+  /** Validated runtime projection forwarded to sandbox resolution; test/integration seam. */
+  sandboxRuntimeProjection?: import("./domain/sandbox.js").SandboxExecutionOptions["runtime_projection"];
 };
 
 type GlobalArguments = {
@@ -401,6 +413,7 @@ type ParsedOptions = {
   fetch_remote: string | null;
   fetch_branch: string | null;
   preview: boolean;
+  runtime_policy: RuntimePolicyMode | null;
 };
 
 function usageError(
@@ -409,6 +422,17 @@ function usageError(
   details: JsonObject | null = null,
 ): DomainError {
   return new DomainError(code, message, details);
+}
+
+function projectedShellPath(shell: string): DomainResult<string> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9+._-]*$/u.test(shell)) {
+    return failure(
+      usageError("INVALID_ARGUMENT", "session shell requires a projected shell executable basename after --.", {
+        shell,
+      }),
+    );
+  }
+  return { ok: true, value: `${CANONICAL_EXECUTABLE_ROOT}/${shell}` };
 }
 
 function parseGlobalArguments(argv: string[]): DomainResult<GlobalArguments> {
@@ -490,6 +514,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     fetch_remote: null,
     fetch_branch: null,
     preview: false,
+    runtime_policy: null,
   };
   let dryRun = false;
 
@@ -532,7 +557,21 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     if (inlineValue === null) index += 1;
 
     if (name === "--session") options.session_id = value;
-    else if (name === "--branch") options.branch = value;
+    else if (name === "--runtime-policy") {
+      if (options.runtime_policy !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--runtime-policy may be supplied only once.", { option: name }));
+      }
+      if (value !== "strict" && value !== "compatibility") {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--runtime-policy requires strict or compatibility.", {
+            option: name,
+            value,
+            values: ["strict", "compatibility"],
+          }),
+        );
+      }
+      options.runtime_policy = value;
+    } else if (name === "--branch") options.branch = value;
     else if (name === "--worktree") options.worktree = value;
     else if (name === "--worktree-root") options.worktree_root = value;
     else if (name === "--base") options.base = value;
@@ -1281,24 +1320,39 @@ async function executeRelease(
 async function executeProtectedSessionCommand(
   arguments_: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
-    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout">,
+    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout" | "sandboxRuntimeProjection">,
   context: SessionContext,
+  interactive = false,
 ): Promise<DomainResult<JsonObject>> {
+  const commandName = interactive ? "session shell" : "session run";
   const delimiter = arguments_.indexOf("--");
   if (delimiter === -1) {
-    return failure(usageError("MISSING_ARGUMENT", "session run requires a -- terminator before the command."));
+    return failure(usageError("MISSING_ARGUMENT", `${commandName} requires a -- terminator before the command.`));
   }
-  const parsed = parseOptions(arguments_.slice(0, delimiter), new Set(["--session"]));
+  const parsed = parseOptions(arguments_.slice(0, delimiter), new Set(["--session", "--runtime-policy"]));
   if (!parsed.ok) return parsed;
   const command = arguments_[delimiter + 1];
   if (command === undefined || command.length === 0) {
-    return failure(usageError("MISSING_ARGUMENT", "session run requires a command after --."));
+    return failure(usageError("MISSING_ARGUMENT", `${commandName} requires a command after --.`));
   }
+  const executable =
+    interactive && parsed.value.runtime_policy !== "compatibility"
+      ? projectedShellPath(command)
+      : { ok: true as const, value: command };
+  if (!executable.ok) return executable;
 
   const request = await resolveSandboxExecutionRequest(
     dependencies.backend,
     context,
-    { session_id: parsed.value.session_id, enforce: true },
+    {
+      session_id: parsed.value.session_id,
+      enforce: true,
+      runtime_policy:
+        parsed.value.runtime_policy === "compatibility" ? EXPLICIT_COMPATIBILITY_RUNTIME_POLICY : STRICT_RUNTIME_POLICY,
+      ...(dependencies.sandboxRuntimeProjection === undefined
+        ? {}
+        : { runtime_projection: dependencies.sandboxRuntimeProjection }),
+    },
     dependencies.sandboxProbe,
     dependencies.sandboxRuntimeLayout,
   );
@@ -1307,17 +1361,30 @@ async function executeProtectedSessionCommand(
   // `sandboxRunner` is an injection seam for unit tests. Production always
   // reaches the canonical protected launcher exported by #145.
   const runner = dependencies.sandboxRunner ?? runSandboxedCommand;
-  const result = await runner(request.value, {
-    command,
-    args: arguments_.slice(delimiter + 2),
-  });
-  return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  const result = await runner(
+    request.value,
+    {
+      command: executable.value,
+      args: arguments_.slice(delimiter + 2),
+    },
+    interactive ? { interactive: true } : undefined,
+  );
+  if (!result.ok) return result;
+  return {
+    ok: true,
+    value: {
+      ...(result.value as unknown as JsonObject),
+      ...(result.value.runtime_resolution === undefined && request.value.runtime_resolution === undefined
+        ? {}
+        : { runtime_resolution: result.value.runtime_resolution ?? request.value.runtime_resolution }),
+    },
+  };
 }
 
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
-    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout">,
+    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout" | "sandboxRuntimeProjection">,
 ): Promise<DomainResult<JsonObject>> {
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
@@ -1325,6 +1392,9 @@ async function executeCommand(
   if (command === "session") {
     if (subcommand === undefined) {
       return failure(usageError("MISSING_ARGUMENT", "session requires a subcommand."));
+    }
+    if (canonicalCommandForName(`session ${subcommand}`)?.name === "session shell") {
+      return executeProtectedSessionCommand(rest, dependencies, context, true);
     }
     // Resolve the subcommand through the canonical registry before dispatch.
     // This keeps `session exec` an alias of the same protected route instead
@@ -1762,7 +1832,12 @@ async function executeCommand(
   if (command === "doctor") {
     const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
     if (!parsed.ok) return parsed;
-    const report = await runDoctor(dependencies.cwd, dependencies.sandboxProbe);
+    const report = await runDoctor(
+      dependencies.cwd,
+      dependencies.sandboxProbe,
+      undefined,
+      dependencies.sandboxRuntimeLayout,
+    );
     if (!report.ok) return report;
     if (report.value.ok) return { ok: true, value: report.value as unknown as JsonObject };
     return failure(
@@ -1997,6 +2072,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       sandboxRunner: dependencies.sandboxRunner,
       sandboxProbe: dependencies.sandboxProbe,
       sandboxRuntimeLayout: dependencies.sandboxRuntimeLayout,
+      sandboxRuntimeProjection: dependencies.sandboxRuntimeProjection,
     });
     if (!result.ok) {
       const enriched = await enrichInvalidSessionIdError(result.error, backend, sessionContext(cwd));
@@ -2004,9 +2080,10 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     }
     const childExitCode = result.value.exit_code;
     const childSignal = result.value.signal;
-    io.stdout(renderSuccess(mode, command, result.value));
+    const interactive = command === "session shell";
+    if (!interactive) io.stdout(renderSuccess(mode, command, result.value));
     if (
-      (command === "session run" || command === "session exec") &&
+      (command === "session run" || command === "session exec" || interactive) &&
       (childSignal !== null || (typeof childExitCode === "number" && childExitCode !== 0))
     ) {
       if (childSignal !== null) return EXIT_CODES.rejected;

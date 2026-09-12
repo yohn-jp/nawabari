@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { LocalSessionBackend } from "./session-backend.js";
 import { deriveLandlockRules, LANDLOCK_ACCESS_FS, LANDLOCK_ABI_MINIMUM, LANDLOCK_TRAMPOLINE } from "./landlock.js";
 import {
+  buildExplicitCompatibilityRuntimeProjection,
   compileSandboxInvocation,
   discoverSandboxRuntimeLayout,
   resolveSandboxExecutionRequest,
@@ -19,6 +20,7 @@ import {
   type SandboxCapabilityId,
   type SandboxProbe,
 } from "./sandbox.js";
+import { STRICT_RUNTIME_POLICY, validateSessionRuntimeProjection } from "./runtime-projection.js";
 
 function probe(overrides: Partial<SandboxProbe> = {}): SandboxProbe {
   return {
@@ -48,8 +50,15 @@ function topology(root: string): SandboxFilesystemTopology {
     user_tool_paths: [path.join(hostHome, ".local", "bin")],
     user_tool_home: hostHome,
     runtime_paths: ["/dev", "/proc", "/tmp"],
-    system_paths: ["/usr", "/etc/passwd"],
+    system_paths: ["/usr", "/bin", "/etc/passwd"],
   };
+}
+
+function compatibilityProjection(topologyValue: SandboxFilesystemTopology) {
+  const result = buildExplicitCompatibilityRuntimeProjection(topologyValue);
+  if (!result.ok) throw result.error;
+  assert.equal(result.ok, true);
+  return result.value;
 }
 
 test("Landlock rules use fixed namespace destinations and omit host topology paths", () => {
@@ -68,6 +77,70 @@ test("Landlock rules use fixed namespace destinations and omit host topology pat
     );
     assert.equal(byPath.get("/etc/passwd"), LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_file);
     assert.equal(byPath.has("/"), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Landlock follows an explicit projection and omits legacy host profile rules", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-landlock-projection-"));
+  try {
+    const projection = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "projection-test", version: "1" },
+      requirements: [],
+      filesystem: [
+        {
+          source: "/materialized/runtime",
+          target: "/runtime",
+          access_mode: "read-only",
+          provenance: "runtime-profile",
+        },
+      ],
+      executables: [],
+    });
+    assert.equal(projection.ok, true, projection.ok ? "" : projection.error.message);
+    if (!projection.ok) return;
+    const rules = deriveLandlockRules(topology(root), projection.value);
+    const byPath = new Map(rules.map((rule) => [rule.path, rule.allowed_access]));
+    assert.equal(
+      byPath.get("/runtime"),
+      LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_file | LANDLOCK_ACCESS_FS.read_dir,
+    );
+    assert.equal(byPath.has("/usr"), false);
+    assert.equal(byPath.has(path.join(root, "host-home", ".local", "bin")), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Landlock preserves file-vs-directory semantics for a projected target", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-landlock-projection-file-"));
+  try {
+    const projection = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "projection-test", version: "1" },
+      requirements: [],
+      filesystem: [
+        {
+          source: "/materialized/config.json",
+          target: "/etc/app/config.json",
+          access_mode: "read-only",
+          provenance: "package",
+        },
+      ],
+      executables: [],
+    });
+    assert.equal(projection.ok, true, projection.ok ? "" : projection.error.message);
+    if (!projection.ok) return;
+    const rules = deriveLandlockRules(topology(root), {
+      ...projection.value,
+      filesystem: projection.value.filesystem.map((entry) => ({ ...entry, source_kind: "file" as const })),
+    });
+    const byPath = new Map(rules.map((rule) => [rule.path, rule.allowed_access]));
+    assert.equal(byPath.get("/etc/app/config.json"), LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_file);
+    assert.equal(byPath.get("/etc/app"), LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_dir);
+    assert.equal(byPath.has("/usr"), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -125,6 +198,7 @@ test("unsupported optional Landlock leaves the bubblewrap command unchanged and 
       sandbox_executable: bwrap,
       identity: { real_uid: 1_000, real_gid: 1_000, namespace_uid: 0, namespace_gid: 0 },
       filesystem: topologyValue,
+      runtime_projection: compatibilityProjection(topologyValue),
       required_capabilities: [
         "bubblewrap",
         "user_namespaces",
@@ -183,6 +257,7 @@ test("required Landlock fails closed when ABI or the canonical runtime adapter i
       sandbox_executable: bwrap,
       identity: { real_uid: 1_000, real_gid: 1_000, namespace_uid: 0, namespace_gid: 0 },
       filesystem: topologyValue,
+      runtime_projection: compatibilityProjection(topologyValue),
       required_capabilities: [
         "bubblewrap",
         "user_namespaces",
@@ -242,6 +317,7 @@ test("Landlock setup failure is reported once with bounded diagnostics and never
       sandbox_executable: bwrap,
       identity: { real_uid: 1_000, real_gid: 1_000, namespace_uid: 0, namespace_gid: 0 },
       filesystem: topologyValue,
+      runtime_projection: compatibilityProjection(topologyValue),
       required_capabilities: [
         "bubblewrap",
         "user_namespaces",
@@ -297,10 +373,17 @@ test("supported Landlock denies a write outside the canonical topology", async (
     );
     assert.equal(created.ok, true);
     if (!created.ok) return;
+    const runtimeProjection = buildExplicitCompatibilityRuntimeProjection(layout);
+    assert.equal(runtimeProjection.ok, true, runtimeProjection.ok ? "" : runtimeProjection.error.message);
+    if (!runtimeProjection.ok) return;
     const request = await resolveSandboxExecutionRequest(
       backend,
       { cwd: worktree },
-      { session_id: created.value.session_id, enforce: true },
+      {
+        session_id: created.value.session_id,
+        enforce: true,
+        runtime_projection: runtimeProjection.value,
+      },
     );
     assert.equal(request.ok, true, request.ok ? "" : request.error.message);
     if (!request.ok) return;

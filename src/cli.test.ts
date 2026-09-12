@@ -11,6 +11,7 @@ import {
   resolveCliCommandDefinition,
   runCli,
   validateCliRegistryParity,
+  type CliDependencies,
 } from "./cli.js";
 import { DomainError, failure, success } from "./domain/errors.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
@@ -35,7 +36,22 @@ import type {
   UpdateClaimsOptions,
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
-import { discoverSandboxRuntimeLayout, SANDBOX_REQUIRED_CAPABILITIES, type SandboxProbe } from "./domain/sandbox.js";
+import {
+  discoverSandboxRuntimeLayout,
+  SANDBOX_REQUIRED_CAPABILITIES,
+  type SandboxProbe,
+  type SandboxRuntimeLayout,
+} from "./domain/sandbox.js";
+import { resolveRuntimeProfile } from "./domain/runtime-profile.js";
+import {
+  materializeTgrepRuntime,
+  TGREP_BACKEND_REQUIREMENT_OPERATION,
+  TGREP_NIX_INSTALLABLE,
+  TGREP_NIXPKGS_REF,
+} from "./domain/tgrep-runtime-materialization.js";
+import { materializeTgrepRgProvider } from "./domain/runtime-provider-tgrep.js";
+import type { SessionRuntimeProjection } from "./domain/runtime-projection.js";
+import type { NixCommandRunner } from "./domain/nix-runtime-closure.js";
 import type { CliIO } from "./presentation.js";
 
 const sampleSession: SessionRecord = {
@@ -74,6 +90,47 @@ function readySandboxProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe 
     hasSeccomp: () => true,
     hasCapabilities: () => true,
     ...overrides,
+  };
+}
+
+// The strict FHS resolver validates exact executable evidence (regular file,
+// executable, no symlink hop) rather than trusting fixed `/usr/bin/*` paths,
+// which are not guaranteed to exist on every supported runner (e.g. pnpm is
+// not installed at `/usr/bin/pnpm` on the hosted Ubuntu 24.04 CI image). Build
+// real fixture executables once instead of assuming a host package layout.
+const strictRuntimeFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-cli-strict-runtime-"));
+process.on("exit", () => fs.rmSync(strictRuntimeFixtureRoot, { recursive: true, force: true }));
+
+function strictRuntimeExecutableFixture(name: string): string {
+  const target = path.join(strictRuntimeFixtureRoot, name);
+  if (!fs.existsSync(target)) {
+    fs.copyFileSync(process.execPath, target);
+    fs.chmodSync(target, 0o755);
+  }
+  return fs.realpathSync.native(target);
+}
+
+function strictRuntimeLayout(): SandboxRuntimeLayout {
+  const layout = discoverSandboxRuntimeLayout();
+  return {
+    ...layout,
+    fhs_executable_candidates: [
+      {
+        requirement_id: "node-runtime",
+        path: strictRuntimeExecutableFixture("node-runtime"),
+        target: "/usr/local/bin/node",
+      },
+      {
+        requirement_id: "git-package",
+        path: strictRuntimeExecutableFixture("git-package"),
+        target: "/usr/local/bin/git",
+      },
+      {
+        requirement_id: "pnpm-package",
+        path: strictRuntimeExecutableFixture("pnpm-package"),
+        target: "/usr/local/bin/pnpm",
+      },
+    ],
   };
 }
 
@@ -144,7 +201,7 @@ test("session run resolves the existing session authority and preserves command 
         hasSeccomp: () => true,
         hasCapabilities: () => true,
       },
-      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async (request, command) => {
         assert.equal(request.worktree, sampleSession.worktree);
         observedCommand = [command.command, ...(command.args ?? [])];
@@ -163,6 +220,16 @@ test("session run resolves the existing session authority and preserves command 
     stdout: "ok",
     stderr: "",
     duration_ms: 1,
+    runtime_resolution: {
+      policy: {
+        mode: "strict",
+        host_visibility: "default-deny",
+        compatibility: "disabled",
+        unrestricted_host_fallback: "forbidden",
+      },
+      profile: { id: "development", version: "1" },
+      materializer: "fhs",
+    },
   });
 });
 
@@ -183,7 +250,7 @@ test("session run does not interpret a child --json argument as a Nawabari globa
       hasSeccomp: () => true,
       hasCapabilities: () => true,
     },
-    sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+    sandboxRuntimeLayout: strictRuntimeLayout(),
     sandboxRunner: async (_request, command) => {
       assert.deepEqual([command.command, ...(command.args ?? [])], ["printf", "--json"]);
       return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
@@ -192,6 +259,145 @@ test("session run does not interpret a child --json argument as a Nawabari globa
 
   assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
   assert.match(output.stdout[0] ?? "", /^session run: ok/);
+});
+
+test("session run and merged session shell carry explicit compatibility policy through the same protected route", async () => {
+  const observed: Array<{ readonly policy: string; readonly command: string }> = [];
+  const output = capture();
+  const dependencies: CliDependencies = {
+    cwd: sampleSession.worktree,
+    backend: backendForTests(),
+    io: output.io,
+    sandboxProbe: readySandboxProbe(),
+    sandboxRuntimeLayout: strictRuntimeLayout(),
+    sandboxRunner: async (request, command) => {
+      observed.push({ policy: request.runtime_projection?.policy.mode ?? "missing", command: command.command });
+      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+    },
+  };
+
+  assert.equal(
+    await runCli(
+      ["session", "run", "--session", sampleSession.session_id, "--runtime-policy", "compatibility", "--", "node"],
+      dependencies,
+    ),
+    0,
+  );
+  assert.equal(
+    await runCli(
+      ["session", "shell", "--session", sampleSession.session_id, "--runtime-policy", "compatibility", "--", "bash"],
+      dependencies,
+    ),
+    0,
+  );
+  assert.deepEqual(observed, [
+    { policy: "compatibility", command: "node" },
+    { policy: "compatibility", command: "bash" },
+  ]);
+});
+
+test("runtime policy parser rejects unknown and duplicate values before protected execution", async () => {
+  for (const arguments_ of [
+    ["session", "run", "--runtime-policy", "broad", "--", "node"],
+    ["session", "run", "--runtime-policy", "strict", "--runtime-policy", "compatibility", "--", "node"],
+  ]) {
+    let runnerCalls = 0;
+    const output = capture();
+    const exitCode = await runCli(arguments_, {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: output.io,
+      sandboxRunner: async () => {
+        runnerCalls += 1;
+        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      },
+    });
+    assert.equal(exitCode, 2, arguments_.join(" "));
+    assert.equal(runnerCalls, 0, arguments_.join(" "));
+    assert.match(output.stderr.join("\n"), /runtime-policy/u, arguments_.join(" "));
+  }
+});
+
+test("session shell requires -- and passes only the projected shell argv to the interactive launcher", async () => {
+  const output = capture();
+  let observedCommand: string[] = [];
+  let observedInteractive = false;
+  const exitCode = await runCli(
+    ["session", "shell", "--session", sampleSession.session_id, "--", "bash", "-il", "literal; argv"],
+    {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: output.io,
+      sandboxProbe: readySandboxProbe(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
+      sandboxRunner: async (request, command, options) => {
+        assert.equal(request.enforce, true);
+        assert.equal(request.session_id, sampleSession.session_id);
+        observedCommand = [command.command, ...(command.args ?? [])];
+        observedInteractive = options?.interactive === true;
+        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      },
+    },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.deepEqual(observedCommand, ["/nawabari/bin/bash", "-il", "literal; argv"]);
+  assert.equal(observedInteractive, true);
+  assert.deepEqual(output.stdout, []);
+  assert.deepEqual(output.stderr, []);
+});
+
+test("session shell rejects a missing terminator, missing shell, and non-basename shell without launching", async () => {
+  for (const args of [
+    ["session", "shell", "--session", sampleSession.session_id, "bash"],
+    ["session", "shell", "--session", sampleSession.session_id, "--"],
+    ["session", "shell", "--session", sampleSession.session_id, "--", "/bin/bash"],
+  ]) {
+    const output = capture();
+    let launcherCalls = 0;
+    const exitCode = await runCli(args, {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: output.io,
+      sandboxRunner: async () => {
+        launcherCalls += 1;
+        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      },
+    });
+
+    assert.equal(exitCode, 2, args.join(" "));
+    assert.equal(launcherCalls, 0, args.join(" "));
+    assert.match(output.stderr.join("\n"), /session shell .*requires|basename/u, args.join(" "));
+  }
+});
+
+test("session shell propagates a projected shell exit status or signal", async () => {
+  const nonzeroOutput = capture();
+  const nonzero = await runCli(
+    ["session", "shell", "--session", sampleSession.session_id, "--", "sh", "-c", "exit 7"],
+    {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: nonzeroOutput.io,
+      sandboxProbe: readySandboxProbe(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
+      sandboxRunner: async () => success({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
+    },
+  );
+  assert.equal(nonzero, 7);
+  assert.deepEqual(nonzeroOutput.stdout, []);
+
+  const signalOutput = capture();
+  const signal = await runCli(["session", "shell", "--session", sampleSession.session_id, "--", "sh"], {
+    cwd: sampleSession.worktree,
+    backend: backendForTests(),
+    io: signalOutput.io,
+    sandboxProbe: readySandboxProbe(),
+    sandboxRuntimeLayout: strictRuntimeLayout(),
+    sandboxRunner: async () => success({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
+  });
+  assert.equal(signal, 3);
+  assert.deepEqual(signalOutput.stdout, []);
 });
 
 test("session exec routes through the canonical protected launcher and never falls back after launch failure", async () => {
@@ -204,7 +410,7 @@ test("session exec routes through the canonical protected launcher and never fal
       backend: backendForTests(),
       io: output.io,
       sandboxProbe: readySandboxProbe(),
-      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async (request, command) => {
         launcherCalls += 1;
         assert.equal(request.enforce, true);
@@ -225,6 +431,112 @@ test("session exec routes through the canonical protected launcher and never fal
   });
 });
 
+function makeTgrepRgProviderFixture(): {
+  readonly projection: SessionRuntimeProjection;
+  readonly cleanup: () => void;
+} {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-cli-tgrep-rg-"));
+  const store = path.join(root, "store");
+  const nodeRoot = path.join(store, "aaa-nodejs-24");
+  const tgrepRoot = path.join(store, "bbb-tgrep-1.0.4");
+  const nodeDependency = path.join(store, "ccc-node-runtime-dependency");
+  const tgrepDependency = path.join(store, "ddd-tgrep-runtime-dependency");
+  const node = path.join(nodeRoot, "bin", "node");
+  const backend = path.join(tgrepRoot, "bin", "tgrep");
+  fs.mkdirSync(path.dirname(node), { recursive: true });
+  fs.mkdirSync(path.dirname(backend), { recursive: true });
+  fs.copyFileSync(process.execPath, node);
+  fs.chmodSync(node, 0o755);
+  fs.writeFileSync(backend, `#!${process.execPath}\nprocess.stdout.write("stub tgrep\\n");\n`, { mode: 0o755 });
+  fs.mkdirSync(nodeDependency);
+  fs.mkdirSync(tgrepDependency);
+
+  const profileResult = resolveRuntimeProfile({
+    profiles: ["base"],
+    operations: [TGREP_BACKEND_REQUIREMENT_OPERATION],
+  });
+  if (!profileResult.ok) throw profileResult.error;
+  const roots: Readonly<Record<string, string>> = {
+    [`${TGREP_NIXPKGS_REF}#nodejs`]: nodeRoot,
+    [TGREP_NIX_INSTALLABLE]: tgrepRoot,
+  };
+  const runner: NixCommandRunner = (_executable, args) => {
+    const installable = args[args.length - 1];
+    const selectedRoot = typeof installable === "string" ? roots[installable] : undefined;
+    if (selectedRoot === undefined) return { exit_code: 1, stdout: "", stderr: "unknown installable" };
+    const dependency = selectedRoot === nodeRoot ? nodeDependency : tgrepDependency;
+    const paths = args.includes("--recursive") ? [selectedRoot, dependency] : [selectedRoot];
+    return {
+      exit_code: 0,
+      stdout: JSON.stringify(Object.fromEntries(paths.map((value) => [value, null]))),
+      stderr: "",
+    };
+  };
+  const materialized = materializeTgrepRuntime(profileResult.value, {
+    store_root: store,
+    command_runner: runner,
+    nix_executable: "/nix/store/pinned-nix/bin/nix",
+  });
+  if (!materialized.ok) throw materialized.error;
+  const provider = materializeTgrepRgProvider(materialized.value, { artifact_root: path.join(root, "adapter") });
+  if (!provider.ok) throw provider.error;
+  return {
+    projection: provider.value.projection,
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+test("session run and session shell dispatch the identical projected rg provider adapter", async () => {
+  const fixture = makeTgrepRgProviderFixture();
+  try {
+    const runOutput = capture();
+    let runObservedCommand: string[] = [];
+    const runExitCode = await runCli(
+      ["session", "run", "--session", sampleSession.session_id, "--", "rg", "needle", "src"],
+      {
+        cwd: sampleSession.worktree,
+        backend: backendForTests(),
+        io: runOutput.io,
+        sandboxProbe: readySandboxProbe(),
+        sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+        sandboxRuntimeProjection: fixture.projection,
+        sandboxRunner: async (_request, command, options) => {
+          runObservedCommand = [command.command, ...(command.args ?? [])];
+          assert.equal(options?.interactive ?? false, false);
+          return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        },
+      },
+    );
+    assert.equal(runExitCode, 0, runOutput.stderr.join("\n"));
+    assert.deepEqual(runObservedCommand, ["rg", "needle", "src"]);
+
+    const shellOutput = capture();
+    let shellObservedCommand: string[] = [];
+    let shellObservedInteractive = false;
+    const shellExitCode = await runCli(
+      ["session", "shell", "--session", sampleSession.session_id, "--", "rg", "needle", "src"],
+      {
+        cwd: sampleSession.worktree,
+        backend: backendForTests(),
+        io: shellOutput.io,
+        sandboxProbe: readySandboxProbe(),
+        sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+        sandboxRuntimeProjection: fixture.projection,
+        sandboxRunner: async (_request, command, options) => {
+          shellObservedCommand = [command.command, ...(command.args ?? [])];
+          shellObservedInteractive = options?.interactive === true;
+          return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        },
+      },
+    );
+    assert.equal(shellExitCode, 0, shellOutput.stderr.join("\n"));
+    assert.deepEqual(shellObservedCommand, ["/nawabari/bin/rg", "needle", "src"]);
+    assert.equal(shellObservedInteractive, true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("session run returns a rejected exit status for a signaled child and never falls back when protection is unavailable", async () => {
   const signalOutput = capture();
   const signalExitCode = await runCli(
@@ -234,6 +546,7 @@ test("session run returns a rejected exit status for a signaled child and never 
       backend: backendForTests(),
       io: signalOutput.io,
       sandboxProbe: readySandboxProbe(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async () =>
         success({ exit_code: null, signal: "SIGTERM", stdout: "", stderr: "", duration_ms: 1 }),
     },
@@ -248,6 +561,16 @@ test("session run returns a rejected exit status for a signaled child and never 
     stdout: "",
     stderr: "",
     duration_ms: 1,
+    runtime_resolution: {
+      policy: {
+        mode: "strict",
+        host_visibility: "default-deny",
+        compatibility: "disabled",
+        unrestricted_host_fallback: "forbidden",
+      },
+      profile: { id: "development", version: "1" },
+      materializer: "fhs",
+    },
   });
 
   const unavailableOutput = capture();
@@ -359,6 +682,7 @@ test("canonical command registry resolves aliases without duplicating option def
     "session inspect",
     "session run",
     "session exec",
+    "session shell",
     "session list",
     "session claim",
     "resource claim",
@@ -396,7 +720,7 @@ test("dispatcher command and option inventory is structurally bound to the canon
     [...dispatcherAllowedOptions("resource update")],
     ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
   );
-  assert.deepEqual([...dispatcherAllowedOptions("session exec")], ["--session"]);
+  assert.deepEqual([...dispatcherAllowedOptions("session exec")], ["--session", "--runtime-policy"]);
 });
 
 test("session list discovery describes the implemented bounded pagination and history semantics", async () => {
@@ -566,6 +890,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session inspect",
       "session run",
       "session exec",
+      "session shell",
       "session list",
       "session claim",
       "resource claim",
@@ -604,6 +929,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--label",
       "--session",
       "--integrated-revision",
+      "--runtime-policy",
       "--limit",
       "--offset",
       "--resource",
@@ -1263,6 +1589,14 @@ test("doctor JSON exposes protected-execution readiness without resolving a sess
         ready: boolean;
         missing_required: string[];
         capabilities: Array<{ id: string; requirement: string; status: string }>;
+        runtime: {
+          default_policy: { mode: string };
+          default_profile: { id: string; version: string };
+          selected: string | null;
+          available: string[];
+          strict_ready: boolean;
+          compatibility_policy: { mode: string };
+        };
       };
     };
     assert.equal(response.ok, true);
@@ -1271,6 +1605,11 @@ test("doctor JSON exposes protected-execution readiness without resolving a sess
     assert.equal(response.sandbox.schema_version, 1);
     assert.equal(response.sandbox.platform_supported, true);
     assert.equal(response.sandbox.network_mode, "inherited");
+    assert.equal(response.sandbox.runtime.default_policy.mode, "strict");
+    assert.deepEqual(response.sandbox.runtime.default_profile, { id: "development", version: "1" });
+    assert.equal(response.sandbox.runtime.compatibility_policy.mode, "compatibility");
+    assert.ok(response.sandbox.runtime.selected === null || ["nix", "fhs"].includes(response.sandbox.runtime.selected));
+    assert.ok(response.sandbox.runtime.available.every((materializer) => ["nix", "fhs"].includes(materializer)));
     assert.equal(response.sandbox.ready, false);
     assert.deepEqual(response.sandbox.missing_required, [
       "user_namespaces",

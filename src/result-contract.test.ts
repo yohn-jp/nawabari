@@ -255,7 +255,18 @@ test("protected-execution public output remains reachable through the canonical 
   } as unknown as SessionBackend;
   const output = outputCapture();
   const exitCode = await runCli(
-    ["--json", "session", "run", "--session", sessionId, "--", "printf", "literal; $HOME"],
+    [
+      "--json",
+      "session",
+      "run",
+      "--session",
+      sessionId,
+      "--runtime-policy",
+      "compatibility",
+      "--",
+      "printf",
+      "literal; $HOME",
+    ],
     {
       cwd: "/tmp/result-contract-worktree",
       backend,
