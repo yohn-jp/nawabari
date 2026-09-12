@@ -43,6 +43,216 @@ function nodeArtifact(): string {
   return candidate;
 }
 
+type FhsElfFixture = Readonly<{
+  readonly root: string;
+  readonly executable: string;
+  readonly direct: string;
+  readonly transitive: string;
+  readonly escape: string;
+}>;
+
+function createFhsElfFixture(): FhsElfFixture | null {
+  if (process.platform !== "linux") return null;
+  const compiler = "cc";
+  try {
+    execFileSync(compiler, ["--version"], { stdio: "ignore" });
+  } catch {
+    return null;
+  }
+  let root: string;
+  try {
+    root = fs.mkdtempSync(path.join("/usr/local", "nawabari-fhs-elf-"));
+  } catch {
+    return null;
+  }
+  const transitiveSource = path.join(root, "transitive.c");
+  const directSource = path.join(root, "direct.c");
+  const executableSource = path.join(root, "main.c");
+  const escapeSource = path.join(root, "escape.c");
+  const transitive = path.join(root, "libnawabari-transitive.so");
+  const direct = path.join(root, "libnawabari-direct.so");
+  const executable = path.join(root, "nawabari-main");
+  const escape = path.join(root, "nawabari-escape");
+  try {
+    fs.writeFileSync(transitiveSource, "int nawabari_transitive(void) { return 7; }\n");
+    fs.writeFileSync(
+      directSource,
+      "extern int nawabari_transitive(void); int nawabari_direct(void) { return nawabari_transitive(); }\n",
+    );
+    fs.writeFileSync(
+      executableSource,
+      "extern int nawabari_direct(void); int main(void) { return nawabari_direct() != 7; }\n",
+    );
+    fs.writeFileSync(escapeSource, "int main(void) { return 0; }\n");
+    execFileSync(compiler, [
+      "-shared",
+      "-fPIC",
+      "-Wl,-soname,libnawabari-transitive.so",
+      "-o",
+      transitive,
+      transitiveSource,
+    ]);
+    execFileSync(compiler, [
+      "-shared",
+      "-fPIC",
+      "-Wl,-soname,libnawabari-direct.so",
+      "-Wl,-rpath,$ORIGIN",
+      "-L",
+      root,
+      "-o",
+      direct,
+      directSource,
+      "-lnawabari-transitive",
+    ]);
+    execFileSync(compiler, ["-Wl,-rpath,$ORIGIN", "-L", root, "-o", executable, executableSource, "-lnawabari-direct"]);
+    execFileSync(compiler, ["-Wl,-rpath,$ORIGIN/../../../../tmp", "-o", escape, escapeSource]);
+    return Object.freeze({ root, executable, direct, transitive, escape });
+  } catch {
+    fs.rmSync(root, { recursive: true, force: true });
+    return null;
+  }
+}
+
+function systemOriginRunpathFixture(): string | null {
+  if (process.platform !== "linux") return null;
+  const directory = "/usr/lib/x86_64-linux-gnu";
+  try {
+    const candidate = fs
+      .readdirSync(directory)
+      .filter((name) => name.startsWith("libabsl_base.so."))
+      .sort()
+      .map((name) => path.join(directory, name))
+      .find((candidate) => fs.statSync(candidate).isFile());
+    return candidate ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function systemUnsupportedRunpathFixture(): string | null {
+  const candidate = "/usr/lib/wsl/lib/libd3d12.so";
+  try {
+    return fs.statSync(candidate).isFile() ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
+function fixtureSearchPaths(): readonly string[] {
+  return ["/lib", "/lib64", "/lib/x86_64-linux-gnu"];
+}
+
+test("resolves a direct DT_RUNPATH $ORIGIN dependency in the declaring object's directory", (t) => {
+  if (process.platform !== "linux") {
+    t.skip("ELF materialization is Linux-only");
+    return;
+  }
+  const fixture = createFhsElfFixture();
+  if (fixture !== null) {
+    try {
+      const result = materializeFhsRuntime({
+        profile: baseProfile(),
+        executables: [{ requirement_id: "node-runtime", path: fixture.executable }],
+        library_search_paths: fixtureSearchPaths(),
+      });
+      assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+      if (result.ok) assert.ok(result.value.filesystem.some((entry) => entry.source === fixture.direct));
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+    return;
+  }
+  const systemFixture = systemOriginRunpathFixture();
+  if (systemFixture === null) {
+    t.skip("no writable FHS fixture root or bounded system RUNPATH fixture is available");
+    return;
+  }
+  const result = materializeFhsRuntime({
+    profile: baseProfile(),
+    executables: [{ requirement_id: "node-runtime", path: systemFixture }],
+    library_search_paths: fixtureSearchPaths(),
+  });
+  assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+  if (result.ok)
+    assert.ok(result.value.filesystem.some((entry) => entry.source.includes("libabsl_raw_logging_internal")));
+});
+
+test("resolves a transitive colocated dependency through object-specific RUNPATH", (t) => {
+  if (process.platform !== "linux") {
+    t.skip("ELF materialization is Linux-only");
+    return;
+  }
+  const fixture = createFhsElfFixture();
+  if (fixture === null) {
+    const systemFixture = systemOriginRunpathFixture();
+    if (systemFixture === null) {
+      t.skip("a writable FHS fixture root or bounded system RUNPATH fixture is unavailable");
+      return;
+    }
+    const result = materializeFhsRuntime({
+      profile: baseProfile(),
+      executables: [{ requirement_id: "node-runtime", path: systemFixture }],
+      library_search_paths: fixtureSearchPaths(),
+    });
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (result.ok) {
+      const colocated = result.value.filesystem.filter((entry) => entry.source.includes("libabsl_"));
+      assert.ok(colocated.some((entry) => entry.source.includes("libabsl_raw_logging_internal")));
+      assert.ok(colocated.some((entry) => entry.source.includes("libabsl_spinlock_wait")));
+    }
+    return;
+  }
+  try {
+    const result = materializeFhsRuntime({
+      profile: baseProfile(),
+      executables: [{ requirement_id: "node-runtime", path: fixture.executable }],
+      library_search_paths: fixtureSearchPaths(),
+    });
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (result.ok) assert.ok(result.value.filesystem.some((entry) => entry.source === fixture.transitive));
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("rejects a DT_RUNPATH $ORIGIN escape before host fallback", (t) => {
+  if (process.platform !== "linux") {
+    t.skip("ELF materialization is Linux-only");
+    return;
+  }
+  const fixture = createFhsElfFixture();
+  if (fixture === null) {
+    const systemFixture = systemUnsupportedRunpathFixture();
+    if (systemFixture === null) {
+      t.skip("a writable FHS fixture root or bounded system unsupported-token fixture is unavailable");
+      return;
+    }
+    const result = materializeFhsRuntime({
+      profile: baseProfile(),
+      executables: [{ requirement_id: "node-runtime", path: systemFixture }],
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+      assert.match(String(result.error.details?.reason), /unsupported token|escapes the bounded FHS roots/u);
+    }
+    return;
+  }
+  try {
+    const result = materializeFhsRuntime({
+      profile: baseProfile(),
+      executables: [{ requirement_id: "node-runtime", path: fixture.escape }],
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+      assert.match(String(result.error.details?.reason), /escapes the bounded FHS roots/u);
+    }
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("bounded FHS materialization is deterministic and projects loader/library files explicitly", (t) => {
   if (process.platform !== "linux") {
     t.skip("FHS materialization is Linux-only");

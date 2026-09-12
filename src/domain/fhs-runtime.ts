@@ -84,6 +84,8 @@ type ElfProgramHeader = Readonly<{
 type ElfMetadata = Readonly<{
   readonly interpreter: string | null;
   readonly needed: readonly string[];
+  readonly rpath: string | null;
+  readonly runpath: string | null;
 }>;
 
 type CanonicalFile = Readonly<{
@@ -311,12 +313,12 @@ function boundedRange(offset: number, size: number, length: number): boolean {
   );
 }
 
-function readString(data: Buffer, offset: number, maxLength: number): string | null {
+function readString(data: Buffer, offset: number, maxLength: number, allowEmpty = false): string | null {
   if (!boundedRange(offset, maxLength, data.length)) return null;
   const end = data.indexOf(0, offset);
   if (end === -1 || end >= offset + maxLength) return null;
   const value = data.subarray(offset, end).toString("utf8");
-  return value.length === 0 || value.includes("\u0000") ? null : value;
+  return (!allowEmpty && value.length === 0) || value.includes("\u0000") ? null : value;
 }
 
 function virtualToFileOffset(
@@ -417,7 +419,7 @@ function parseElf(candidate: string, requirement: RequirementContext): DomainRes
   }
 
   const dynamic = headers.find((header) => header.type === 2);
-  if (dynamic === undefined) return success({ interpreter, needed: Object.freeze([]) });
+  if (dynamic === undefined) return success({ interpreter, needed: Object.freeze([]), rpath: null, runpath: null });
 
   const dynamicEntrySize = is64 ? 16 : 8;
   if (dynamic.file_size < dynamicEntrySize || dynamic.file_size % dynamicEntrySize !== 0) {
@@ -426,7 +428,8 @@ function parseElf(candidate: string, requirement: RequirementContext): DomainRes
   let stringTableAddress: number | null = null;
   let stringTableSize: number | null = null;
   const neededOffsets: number[] = [];
-  const searchOverrideOffsets: number[] = [];
+  let rpathOffset: number | null = null;
+  let runpathOffset: number | null = null;
   let hasNull = false;
   for (let offset = dynamic.offset; offset < dynamic.offset + dynamic.file_size; offset += dynamicEntrySize) {
     const tag = readInteger(data, offset, is64 ? 8 : 4);
@@ -439,22 +442,44 @@ function parseElf(candidate: string, requirement: RequirementContext): DomainRes
     if (tag === 1) neededOffsets.push(value);
     if (tag === 5) stringTableAddress = value;
     if (tag === 10) stringTableSize = value;
-    if (tag === 15 || tag === 29) searchOverrideOffsets.push(value);
+    if (tag === 15) {
+      if (rpathOffset !== null) return materializationFailure(requirement, "ELF has multiple DT_RPATH entries");
+      rpathOffset = value;
+    }
+    if (tag === 29) {
+      if (runpathOffset !== null) return materializationFailure(requirement, "ELF has multiple DT_RUNPATH entries");
+      runpathOffset = value;
+    }
   }
   if (!hasNull) return materializationFailure(requirement, "ELF dynamic section has no terminator");
-  if (neededOffsets.length === 0) return success({ interpreter, needed: Object.freeze([]) });
+  if (neededOffsets.length === 0 && rpathOffset === null && runpathOffset === null)
+    return success({ interpreter, needed: Object.freeze([]), rpath: null, runpath: null });
   if (stringTableAddress === null || stringTableSize === null || stringTableSize === 0) {
     return materializationFailure(requirement, "ELF shared-library names have no valid string table");
   }
   const stringTableOffset = virtualToFileOffset(stringTableAddress, stringTableSize, loads, data.length);
   if (stringTableOffset === null) return materializationFailure(requirement, "ELF string table is not file-backed");
 
-  for (const overrideOffset of searchOverrideOffsets) {
-    const override = readString(data, stringTableOffset + overrideOffset, stringTableSize - overrideOffset);
-    if (override === null) return materializationFailure(requirement, "ELF library search override is invalid");
-    if (override.length > 0) {
-      return materializationFailure(requirement, "ELF RPATH/RUNPATH is unsupported by bounded FHS resolution");
+  const readSearchPath = (offset: number | null, tag: "DT_RPATH" | "DT_RUNPATH"): string | null => {
+    if (offset === null) return null;
+    if (offset >= stringTableSize) {
+      throw new Error(`${tag} string offset is out of range`);
     }
+    const value = readString(data, stringTableOffset + offset, stringTableSize - offset, true);
+    if (value === null) throw new Error(`${tag} string is invalid`);
+    return value;
+  };
+  let rpath: string | null;
+  let runpath: string | null;
+  try {
+    rpath = readSearchPath(rpathOffset, "DT_RPATH");
+    runpath = readSearchPath(runpathOffset, "DT_RUNPATH");
+  } catch (error: unknown) {
+    return materializationFailure(requirement, error instanceof Error ? error.message : "ELF search path is invalid");
+  }
+
+  if (neededOffsets.length === 0) {
+    return success({ interpreter, needed: Object.freeze([]), rpath, runpath });
   }
 
   const needed: string[] = [];
@@ -465,7 +490,7 @@ function parseElf(candidate: string, requirement: RequirementContext): DomainRes
     if (name === null) return materializationFailure(requirement, "ELF shared-library name is invalid");
     needed.push(name);
   }
-  return success({ interpreter, needed: Object.freeze(needed) });
+  return success({ interpreter, needed: Object.freeze(needed), rpath, runpath });
 }
 
 function validateLibrarySearchPaths(value: unknown): DomainResult<readonly string[]> {
@@ -475,6 +500,7 @@ function validateLibrarySearchPaths(value: unknown): DomainResult<readonly strin
   for (const [index, item] of value.entries()) {
     const checked = validateFhsTarget(item, `library_search_paths[${index}]`, true);
     if (!checked.ok) return checked;
+    let boundedPath = checked.value;
     try {
       const stat = fs.statSync(checked.value);
       if (!stat.isDirectory())
@@ -487,6 +513,7 @@ function validateLibrarySearchPaths(value: unknown): DomainResult<readonly strin
           resolved,
         );
       }
+      boundedPath = resolved;
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         return invalidMaterialization(
@@ -496,7 +523,7 @@ function validateLibrarySearchPaths(value: unknown): DomainResult<readonly strin
         );
       }
     }
-    paths.add(checked.value);
+    paths.add(boundedPath);
   }
   return success(Object.freeze([...paths].sort(compareText)));
 }
@@ -552,6 +579,107 @@ function safeLibraryName(name: string): boolean {
   return name.length > 0 && !name.includes("\u0000") && !name.startsWith(".") && !name.includes("/") && name !== "..";
 }
 
+function canonicalSearchDirectory(
+  candidate: string,
+  requirement: RequirementContext,
+  field: string,
+): DomainResult<string> {
+  let probe = candidate;
+  const missingTail: string[] = [];
+  for (;;) {
+    try {
+      const stat = fs.statSync(probe);
+      if (!stat.isDirectory()) {
+        return materializationFailure(requirement, "ELF search path is not a directory", {
+          field,
+          search_path: candidate,
+        });
+      }
+      const resolved = fs.realpathSync.native(probe);
+      if (!isFhsPath(resolved, true)) {
+        return materializationFailure(requirement, "ELF search path resolves outside the bounded FHS roots", {
+          field,
+          search_path: candidate,
+          resolved_source: resolved,
+        });
+      }
+      const bounded = missingTail.reduce((directory, part) => posix.join(directory, part), resolved);
+      if (!isFhsPath(bounded, true)) {
+        return materializationFailure(requirement, "ELF search path escapes the bounded FHS roots", {
+          field,
+          search_path: candidate,
+          resolved_source: bounded,
+        });
+      }
+      return success(bounded);
+    } catch (error: unknown) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        return materializationFailure(requirement, "ELF search path cannot be canonicalized", {
+          field,
+          search_path: candidate,
+        });
+      }
+      const parent = posix.dirname(probe);
+      if (parent === probe) {
+        return materializationFailure(requirement, "ELF search path cannot be canonicalized", {
+          field,
+          search_path: candidate,
+        });
+      }
+      missingTail.unshift(posix.basename(probe));
+      probe = parent;
+    }
+  }
+}
+
+function boundedElfSearchPaths(
+  value: string | null,
+  objectSource: string,
+  requirement: RequirementContext,
+  field: "DT_RPATH" | "DT_RUNPATH",
+): DomainResult<readonly string[]> {
+  if (value === null || value.length === 0) return success(Object.freeze([]));
+  const origin = posix.dirname(objectSource);
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const [index, entry] of value.split(":").entries()) {
+    if (entry.length === 0) {
+      return materializationFailure(requirement, "ELF search path contains an ambient empty element", {
+        field,
+        search_path_index: index,
+      });
+    }
+    const expanded = entry.replaceAll("$ORIGIN", origin);
+    if (expanded.includes("$")) {
+      return materializationFailure(requirement, "ELF search path contains an unsupported token", {
+        field,
+        search_path: entry,
+      });
+    }
+    if (!posix.isAbsolute(expanded)) {
+      return materializationFailure(requirement, "ELF search path is not absolute after bounded expansion", {
+        field,
+        search_path: entry,
+      });
+    }
+    const normalized = posix.normalize(expanded);
+    if (!isFhsPath(normalized, true)) {
+      return materializationFailure(requirement, "ELF search path escapes the bounded FHS roots", {
+        field,
+        search_path: entry,
+        resolved_source: normalized,
+      });
+    }
+    const bounded = canonicalSearchDirectory(normalized, requirement, field);
+    if (!bounded.ok) return bounded;
+    if (seen.has(bounded.value)) continue;
+    seen.add(bounded.value);
+    paths.push(bounded.value);
+  }
+  return success(Object.freeze(paths));
+}
+
 function canonicalDependency(
   candidate: string,
   requirement: RequirementContext,
@@ -594,7 +722,7 @@ function resolveLibrary(
     }
     return canonicalHostFile(candidate, requirement, "dependency");
   }
-  return materializationFailure(requirement, "shared library was not found in fixed FHS search paths", {
+  return materializationFailure(requirement, "shared library was not found in bounded FHS search paths", {
     dependency: name,
   });
 }
@@ -685,6 +813,7 @@ export function materializeFhsRuntime(input: unknown): DomainResult<SessionRunti
     target: string,
     requirement: RequirementContext,
     depth: number,
+    inheritedRpath: readonly string[],
   ): DomainResult<null> => {
     if (depth > MAX_DEPENDENCY_DEPTH)
       return materializationFailure(requirement, "dependency graph exceeds the bounded depth");
@@ -726,16 +855,39 @@ export function materializeFhsRuntime(input: unknown): DomainResult<SessionRunti
       metadata = parsedMetadata.value;
       parsed.set(source.value.source, metadata);
     }
+
+    const rpath = boundedElfSearchPaths(metadata.rpath, source.value.source, requirement, "DT_RPATH");
+    if (!rpath.ok) return rpath;
+    const runpath = boundedElfSearchPaths(metadata.runpath, source.value.source, requirement, "DT_RUNPATH");
+    if (!runpath.ok) return runpath;
+    const objectSearchPaths = [
+      ...(metadata.runpath === null ? rpath.value : runpath.value),
+      ...inheritedRpath,
+      ...searchPaths.value,
+    ];
+    const childInheritedRpath = metadata.runpath === null ? [...rpath.value, ...inheritedRpath] : [...inheritedRpath];
     if (metadata.interpreter !== null) {
       const interpreter = canonicalDependency(metadata.interpreter, requirement, "interpreter");
       if (!interpreter.ok) return interpreter;
-      const addedInterpreter = addArtifact(interpreter.value.source, interpreter.value.target, requirement, depth + 1);
+      const addedInterpreter = addArtifact(
+        interpreter.value.source,
+        interpreter.value.target,
+        requirement,
+        depth + 1,
+        childInheritedRpath,
+      );
       if (!addedInterpreter.ok) return addedInterpreter;
     }
     for (const needed of [...metadata.needed].sort(compareText)) {
-      const dependency = resolveLibrary(needed, searchPaths.value, requirement);
+      const dependency = resolveLibrary(needed, objectSearchPaths, requirement);
       if (!dependency.ok) return dependency;
-      const addedDependency = addArtifact(dependency.value.source, dependency.value.target, requirement, depth + 1);
+      const addedDependency = addArtifact(
+        dependency.value.source,
+        dependency.value.target,
+        requirement,
+        depth + 1,
+        childInheritedRpath,
+      );
       if (!addedDependency.ok) return addedDependency;
     }
     return success(null);
@@ -748,7 +900,7 @@ export function materializeFhsRuntime(input: unknown): DomainResult<SessionRunti
     const requirement = requirements.get(profileRequirement.id) as RequirementContext;
     const target = validateFhsTarget(declaration.path, `executables.${profileRequirement.id}.path`);
     if (!target.ok) return target;
-    const added = addArtifact(target.value, target.value, requirement, 0);
+    const added = addArtifact(target.value, target.value, requirement, 0, []);
     if (!added.ok) return added;
   }
 
