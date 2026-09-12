@@ -74,3 +74,9 @@ run("nix", [
 run(process.execPath, ["--test", "--import", "tsx", "src/domain/tgrep-runtime-materialization.test.ts"], {
   env: { ...process.env, NAWABARI_TGREP_RUNTIME_CONFORMANCE: "1" },
 });
+// Proves the #295 rg provider preserves rg semantics against this exact
+// backend for the supported compatibility matrix, not a synthetic stub.
+run("nix", ["build", "--no-link", `${materializer.TGREP_NIXPKGS_REF}#nodejs`]);
+run(process.execPath, ["--test", "--import", "tsx", "src/domain/runtime-provider-tgrep.test.ts"], {
+  env: { ...process.env, NAWABARI_TGREP_RUNTIME_CONFORMANCE: "1" },
+});
