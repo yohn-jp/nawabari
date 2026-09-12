@@ -32,6 +32,7 @@
     "start": "node dist/index.js",
     "test": "node --test --import tsx src/*.test.ts src/**/*.test.ts scripts/**/*.test.mjs",
     "test:tgrep:conformance": "node --import tsx scripts/run-tgrep-runtime-conformance.mjs",
+    "test:pnpm:conformance": "node --import tsx scripts/run-pnpm-middleware-runtime-conformance.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint 'src/**/*.ts' 'scripts/**/*.mjs' 'eslint.config.mjs'",
     "format": "prettier --write .",
