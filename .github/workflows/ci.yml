@@ -270,6 +270,35 @@ jobs:
       - name: Package contents and smoke test
         run: node scripts/run-package-suite.mjs
 
+  release-build:
+    needs: changes
+    if: needs.changes.outputs.release_docs_only != 'true' && startsWith(github.head_ref, 'release/')
+    name: release tarball build (Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 11.18.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and validate the exact release tarball
+        run: pnpm run build && node scripts/run-package-suite.mjs --keep-tarball
+
   mottainai-uid-handoff:
     needs: changes
     if: needs.changes.outputs.release_docs_only != 'true'
