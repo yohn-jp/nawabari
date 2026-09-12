@@ -25,7 +25,8 @@ has selected:
 - `filesystem` describes explicit source-to-sandbox projections, access mode,
   and provenance;
 - `executables` describes stable entrypoint names and their abstract provider
-  identities.
+  identities. Materialized providers are projected as pinned read-only files
+  at `/nawabari/bin/<name>`; this is the canonical command surface.
 
 Runtime profiles and executable projections are intentionally separate. A
 profile does not implicitly expose every executable in its material, and an
@@ -52,11 +53,16 @@ the projection retains the explicit compatibility path for existing callers.
 
 The launcher canonicalizes each materialized source and rejects source
 symlinks, unsafe worktree target parents, backend-owned target overlaps, and
-ambiguous projection targets. The one supported backend shadow is an exact
-canonical worktree source/target, which may be read-only to narrow session
-authority. Other read-write projections may only preserve the same relative
-path within the authorized session worktree; projections can therefore narrow
-that authority but cannot add a new writable host tree.
+ambiguous projection targets. Executable providers are resolved from the exact
+materialized filesystem projection; no host `PATH` lookup is performed. Each
+stable name receives one read-only file bind at `/nawabari/bin/<name>`, and
+strict execution sets `PATH` to exactly `/nawabari/bin`. The backing source
+must be a pinned executable outside that surface, so an alias cannot recurse
+through the projected command directory. The one supported backend shadow is
+an exact canonical worktree source/target, which may be read-only to narrow
+session authority. Other read-write projections may only preserve the same
+relative path within the authorized session worktree; projections can
+therefore narrow that authority but cannot add a new writable host tree.
 
 Missing providers and missing materialization are represented by the typed
 `RUNTIME_PROVIDER_MISSING` and `RUNTIME_MATERIALIZATION_MISSING` errors. They

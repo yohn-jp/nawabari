@@ -255,7 +255,7 @@ test("explicit projections compile deterministic RO/RW mounts without legacy hos
     assert.equal(compiled.value.args.includes("/bin"), false);
     assert.equal(compiled.value.args.includes(fixture.layout.user_local_bin ?? ""), false);
     const pathSetting = compiled.value.args.indexOf("PATH");
-    assert.deepEqual(compiled.value.args.slice(pathSetting, pathSetting + 2), ["PATH", ""]);
+    assert.deepEqual(compiled.value.args.slice(pathSetting, pathSetting + 2), ["PATH", "/nawabari/bin"]);
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
@@ -302,6 +302,78 @@ test("explicit projections compile a regular-file source without misrepresenting
       "a file projection target must not be pre-created as a directory",
     );
     assert.ok(dirArgs.includes("/etc/app"), "the file projection's parent directory must be pre-created");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(materialRoot, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("declared executables bind once at the canonical surface for direct and PATH lookup", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  const materialRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-executable-"));
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const runtimeRoot = path.join(materialRoot, "runtime");
+    const executable = path.join(runtimeRoot, "bin", "node");
+    fs.mkdirSync(path.dirname(executable), { recursive: true });
+    fs.writeFileSync(executable, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n", { mode: 0o755 });
+    const projectionResult = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "node-runtime", version: "1" },
+      requirements: [{ id: "node-runtime", kind: "runtime", name: "node", version: ">=24" }],
+      filesystem: [
+        {
+          source: runtimeRoot,
+          target: "/runtime/node",
+          access_mode: "read-only",
+          provenance: "runtime-profile",
+        },
+      ],
+      executables: [
+        {
+          name: "node",
+          target: "/runtime/node/bin/node",
+          provider: { id: "node-provider", requirement_id: "node-runtime" },
+          provenance: "runtime-profile",
+        },
+      ],
+    });
+    assert.equal(projectionResult.ok, true, projectionResult.ok ? "" : JSON.stringify(projectionResult.error));
+    if (!projectionResult.ok) return;
+    const projectedRequest = { ...request, runtime_projection: projectionResult.value };
+
+    const direct = compileSandboxInvocation(projectedRequest, {
+      command: "node",
+      args: ["--version"],
+    });
+    const absolute = compileSandboxInvocation(projectedRequest, {
+      command: "/nawabari/bin/node",
+      args: ["--version"],
+    });
+    assert.equal(direct.ok, true, direct.ok ? "" : JSON.stringify(direct.error));
+    assert.equal(absolute.ok, true, absolute.ok ? "" : JSON.stringify(absolute.error));
+    if (!direct.ok || !absolute.ok) return;
+
+    assert.equal(direct.value.env.PATH, "/nawabari/bin");
+    assert.equal(absolute.value.env.PATH, "/nawabari/bin");
+    const canonicalBinds = direct.value.args.reduce<string[]>((targets, value, index, args) => {
+      if (value === "--ro-bind" && args[index + 1] === executable) targets.push(args[index + 2] as string);
+      return targets;
+    }, []);
+    assert.deepEqual(canonicalBinds, ["/nawabari/bin/node"]);
+    assert.deepEqual(direct.value.args.slice(direct.value.args.indexOf("--")), ["--", "node", "--version"]);
+    assert.deepEqual(absolute.value.args.slice(absolute.value.args.indexOf("--")), [
+      "--",
+      "/nawabari/bin/node",
+      "--version",
+    ]);
+    assert.equal(direct.value.args.includes("/usr/bin"), false);
+    assert.equal(direct.value.args.includes("/bin"), false);
+    assert.equal(direct.value.args.includes(fixture.layout.user_local_bin ?? ""), false);
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
