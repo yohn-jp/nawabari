@@ -35,6 +35,7 @@ export const DEFAULT_NIX_PACKAGE_ATTRIBUTES: Readonly<Record<string, string>> = 
   node: "nodejs",
   git: "git",
   pnpm: "pnpm",
+  tgrep: "tgrep",
 });
 
 export type NixCommandResult = Readonly<{

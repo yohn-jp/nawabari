@@ -161,6 +161,7 @@ test("declared Nix packages resolve with their native closure dependencies only"
       node: "nodejs",
       git: "git",
       pnpm: "pnpm",
+      tgrep: "tgrep",
     });
   } finally {
     fixture.cleanup();
