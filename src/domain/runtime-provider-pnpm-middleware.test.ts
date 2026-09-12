@@ -323,6 +323,30 @@ test("an EEXIST launcher race cannot remove the competing file", () => {
   }
 });
 
+test("a destination replaced after the identity check is never deleted", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-pnpm-middleware-replace-"));
+  try {
+    fs.mkdirSync(path.join(root, "launcher"));
+    const input = materializationInput(root);
+    const replacement = "replacement launcher\n";
+    const result = withRuntimeFileIdentityTestHooks(
+      {
+        beforeFinalIdentityCheck: (checkedPath) => {
+          if (checkedPath !== input.launcher_path) return;
+          fs.rmSync(checkedPath);
+          fs.writeFileSync(checkedPath, replacement, { mode: 0o644 });
+        },
+      },
+      () => materializePnpmMiddleware(input),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+    assert.equal(fs.readFileSync(input.launcher_path, "utf8"), replacement);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the generated pnpm launcher reports RTK spawn failure as exit 127", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-pnpm-middleware-spawn-failure-"));
   try {

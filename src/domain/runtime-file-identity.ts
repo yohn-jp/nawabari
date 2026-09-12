@@ -26,16 +26,6 @@ function sameIdentity(left: RuntimeFileIdentity, right: RuntimeFileIdentity): bo
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function unlinkIfOwned(destination: string, identity: RuntimeFileIdentity): void {
-  try {
-    const pathStat = fs.lstatSync(destination, { bigint: true });
-    if (pathStat.isFile() && sameIdentity(identity, identityOf(pathStat))) fs.unlinkSync(destination);
-  } catch {
-    // Preserve the original materialization failure and never remove an
-    // artifact whose identity is no longer the one created by this call.
-  }
-}
-
 function verifyCanonicalIdentity(
   candidate: string,
   source: string,
@@ -102,25 +92,24 @@ export function readRuntimeFile(descriptor: number, size: bigint, maximum: numbe
 }
 
 /**
- * Exclusively create, write, chmod, and identity-check one file. If any step
- * fails, only the file still bearing this invocation's identity is removed.
+ * Exclusively create, write, chmod, and identity-check one file. On failure,
+ * the invocation-owned partial artifact is left in place rather than removed
+ * by pathname: a pathname-based unlink after the identity check would race
+ * against a replacement at that path and could delete a competing file. The
+ * next materialization attempt fails closed on the existing destination.
  */
 export function createRuntimeFile<T>(destination: string, write: (descriptor: number, stat: fs.BigIntStats) => T): T {
   let descriptor: number | null = null;
-  let createdIdentity: RuntimeFileIdentity | null = null;
   try {
     testHooks?.beforeExclusiveCreate?.(destination);
     descriptor = fs.openSync(destination, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o755);
     const descriptorStat = fs.fstatSync(descriptor, { bigint: true });
     if (!descriptorStat.isFile()) throw new Error("the created file is not regular");
-    createdIdentity = identityOf(descriptorStat);
+    const createdIdentity = identityOf(descriptorStat);
     const value = write(descriptor, descriptorStat);
     const source = fs.realpathSync.native(destination);
     verifyCanonicalIdentity(destination, source, createdIdentity, true);
     return value;
-  } catch (error: unknown) {
-    if (createdIdentity !== null) unlinkIfOwned(destination, createdIdentity);
-    throw error;
   } finally {
     if (descriptor !== null) {
       try {
