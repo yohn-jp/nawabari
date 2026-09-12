@@ -78,8 +78,27 @@ function createRepository(): string {
   return repository;
 }
 
+// The process running this test suite is whatever Node the invoking
+// environment set up, which on hosted CI runners (actions/setup-node) lives
+// under /opt/hostedtoolcache and is not a valid materializeFhsRuntime()
+// source: the FHS materializer only ever accepts FHS_RUNTIME_ROOTS
+// (/usr, /bin, /lib, /lib64), by design, and hostedtoolcache is not one of
+// them. NAWABARI_TEST_FHS_NODE_INTERPRETER lets the CI job point this at a
+// canonical, already-bounded Node artifact instead (see ci.yml); anywhere
+// else, process.execPath is assumed to already resolve under an FHS root.
+function resolveCanonicalNodeInterpreter(): string {
+  const override = process.env.NAWABARI_TEST_FHS_NODE_INTERPRETER;
+  return fs.realpathSync.native(override && override.length > 0 ? override : process.execPath);
+}
+
 function removeWorktree(repository: string, worktree: string): void {
-  runGit(["worktree", "remove", "--force", worktree], repository, false);
+  try {
+    runGit(["worktree", "remove", "--force", worktree], repository, false);
+  } catch {
+    // Best-effort cleanup: the repository directory is removed right after
+    // this call regardless, so a worktree that is already gone or was never
+    // fully registered must not mask the test's real pass/fail result.
+  }
 }
 
 function executable(root: string, name: string, body: string): string {
@@ -516,7 +535,7 @@ test("the launcher transport stays isolated under a bounded real runtime with sy
   // (materializeFhsRuntime): only the node/sh interpreters and their exact
   // computed shared-library closures are projected, never a wholesale
   // /usr, /lib, /lib64, or /bin host-root mount.
-  const nodeInterpreter = fs.realpathSync.native(process.execPath);
+  const nodeInterpreter = resolveCanonicalNodeInterpreter();
   const shInterpreter = fs.realpathSync.native("/bin/sh");
   const repository = createRepository();
   const worktree = `${repository}-owned`;
@@ -793,7 +812,7 @@ test("the canonical #311 artifacts execute through the #306 launcher under prote
   assert.equal(backendResult.ok, true, backendResult.ok ? "" : JSON.stringify(backendResult.error));
   if (!backendResult.ok) return;
 
-  const nodeInterpreter = fs.realpathSync.native(process.execPath);
+  const nodeInterpreter = resolveCanonicalNodeInterpreter();
   const shInterpreter = fs.realpathSync.native("/bin/sh");
   const runtimeProfileResult = resolveRuntimeProfile({
     profiles: ["base"],
