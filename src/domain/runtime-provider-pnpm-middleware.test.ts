@@ -19,9 +19,11 @@ import {
   type SessionRuntimeProjection,
 } from "./runtime-projection.js";
 import { compileRuntimeExecutableProjection } from "./runtime-executable-projection.js";
+import { resolveRuntimeProfile } from "./runtime-profile.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import {
   discoverSandboxRuntimeLayout,
+  materializeFhsRuntime,
   resolveSandboxExecutionRequest,
   runSandboxedCommand,
   type SandboxProbe,
@@ -427,9 +429,13 @@ test("the governed /nawabari/bin/pnpm -> pinned RTK -> pinned real pnpm path res
   // exercised through the same production resolveSandboxExecutionRequest ->
   // runSandboxedCommand path used by `session run`/`session shell`, under a
   // strict projection that also carries a real canonical node entrypoint.
+  //
+  // The projection is bounded through #292's ELF-closure materializer
+  // (materializeFhsRuntime): only the node/sh interpreters and their exact
+  // computed shared-library closures are projected, never a wholesale
+  // /usr, /lib, /lib64, or /bin host-root mount.
   const nodeInterpreter = fs.realpathSync.native(process.execPath);
   const shInterpreter = fs.realpathSync.native("/bin/sh");
-  const dependencyRoots = ["/usr", "/lib", "/lib64", "/bin"].filter((root) => fs.existsSync(root));
   const repository = createRepository();
   const worktree = `${repository}-owned`;
   const undeclaredRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-pnpm-undeclared-host-bin-"));
@@ -451,28 +457,40 @@ test("the governed /nawabari/bin/pnpm -> pinned RTK -> pinned real pnpm path res
       "#!/bin/sh\nprintf 'resolved-pnpm argv=%s\\n' \"$*\"\n",
     );
 
+    const shRequirement = { id: "sh-runtime", kind: "runtime" as const, name: "sh", version: "1" };
+    const profile = resolveRuntimeProfile({
+      profiles: ["base"],
+      operations: [{ operation: "add", requirement: shRequirement }],
+    });
+    assert.equal(profile.ok, true, profile.ok ? "" : JSON.stringify(profile.error));
+    if (!profile.ok) return;
+
+    const fhsProjection = materializeFhsRuntime({
+      profile: profile.value,
+      executables: [
+        { requirement_id: "node-runtime", path: nodeInterpreter },
+        { requirement_id: "sh-runtime", path: "/bin/sh" },
+      ],
+    });
+    assert.equal(fhsProjection.ok, true, fhsProjection.ok ? "" : JSON.stringify(fhsProjection.error));
+    if (!fhsProjection.ok) return;
+    for (const root of ["/usr", "/bin", "/lib", "/lib64"]) {
+      assert.ok(
+        fhsProjection.value.filesystem.every((entry) => entry.target !== root),
+        `bounded FHS materialization must not project the whole ${root} root`,
+      );
+    }
+
     const preProjection = validateSessionRuntimeProjection({
       policy: STRICT_RUNTIME_POLICY,
       profile: { id: "pnpm-middleware-real-isolation", version: "1" },
       requirements: [
-        { id: "node-runtime", kind: "runtime", name: "node", version: ">=24" },
-        { id: "sh-runtime", kind: "runtime", name: "sh", version: "1" },
+        ...fhsProjection.value.requirements,
         PNPM_MIDDLEWARE_REQUIREMENTS.rtk,
         PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm,
       ],
       filesystem: [
-        ...dependencyRoots.map((root) => ({
-          source: fs.realpathSync.native(root),
-          target: root,
-          access_mode: "read-only" as const,
-          provenance: "runtime-profile" as const,
-        })),
-        {
-          source: nodeInterpreter,
-          target: "/materialized/node",
-          access_mode: "read-only" as const,
-          provenance: "runtime-profile" as const,
-        },
+        ...fhsProjection.value.filesystem,
         {
           source: rtkSource,
           target: "/materialized/rtk",
@@ -485,23 +503,17 @@ test("the governed /nawabari/bin/pnpm -> pinned RTK -> pinned real pnpm path res
           access_mode: "read-only" as const,
           provenance: "package" as const,
         },
-        {
-          source: shInterpreter,
-          target: "/materialized/sh",
-          access_mode: "read-only" as const,
-          provenance: "runtime-profile" as const,
-        },
       ],
       executables: [
         {
           name: "node",
-          target: "/materialized/node",
+          target: nodeInterpreter,
           provider: { id: "node-runtime-provider", requirement_id: "node-runtime" },
           provenance: "runtime-profile" as const,
         },
         {
           name: "sh",
-          target: "/materialized/sh",
+          target: "/bin/sh",
           provider: { id: "sh-provider", requirement_id: "sh-runtime" },
           provenance: "runtime-profile" as const,
         },
