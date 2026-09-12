@@ -13,6 +13,7 @@ import {
   resolveSandboxExecutionRequest,
   runSandboxedCommand,
 } from "./sandbox.js";
+import { FHS_RUNTIME_ROOTS } from "./fhs-runtime.js";
 import { resolveRuntimeProfile } from "./runtime-profile.js";
 import { EXPLICIT_COMPATIBILITY_RUNTIME_POLICY } from "./runtime-projection.js";
 
@@ -40,7 +41,14 @@ function baseProfile() {
 function nodeArtifact(): string {
   const candidate = process.execPath;
   assert.ok(path.posix.normalize(candidate) === candidate && candidate.startsWith("/"));
-  return candidate;
+  if (FHS_RUNTIME_ROOTS.some((root) => candidate === root || candidate.startsWith(`${root}/`))) {
+    return candidate;
+  }
+  const boundedCopy = path.join("/usr/local/bin", `nawabari-fhs-node-${process.pid}`);
+  fs.copyFileSync(candidate, boundedCopy);
+  fs.chmodSync(boundedCopy, 0o755);
+  process.on("exit", () => fs.rmSync(boundedCopy, { force: true }));
+  return boundedCopy;
 }
 
 type FhsElfFixture = Readonly<{
