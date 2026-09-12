@@ -699,11 +699,11 @@ export async function resolveSandboxExecutionRequest(
     );
   }
 
-  const runtimeProjection =
+  const providedRuntimeProjection =
     options.runtime_projection === undefined
       ? success<SessionRuntimeProjection | undefined>(undefined)
       : validateSessionRuntimeProjection(options.runtime_projection);
-  if (!runtimeProjection.ok) return failure(runtimeProjection.error);
+  if (!providedRuntimeProjection.ok) return failure(providedRuntimeProjection.error);
 
   const doctor = sandboxDoctorReport(probe);
   if (options.enforce && !doctor.ready) {
@@ -766,6 +766,16 @@ export async function resolveSandboxExecutionRequest(
       }),
     );
   }
+
+  // Until the runtime-policy resolver selects strict or explicit compatibility,
+  // the existing protected path is the legacy compatibility path. Materialize
+  // that path into the same explicit projection contract before returning the
+  // request; the launcher never treats omission as compatibility visibility.
+  const runtimeProjection =
+    providedRuntimeProjection.value === undefined && options.enforce
+      ? buildExplicitCompatibilityRuntimeProjection(runtimeLayout)
+      : providedRuntimeProjection;
+  if (!runtimeProjection.ok) return failure(runtimeProjection.error);
 
   return success({
     schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,

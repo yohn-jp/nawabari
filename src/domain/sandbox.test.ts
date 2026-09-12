@@ -132,6 +132,12 @@ test("resolveSandboxExecutionRequest binds an owned active session and derives i
     assert.equal(result.value.identity.real_uid, 1_000);
     assert.equal(result.value.identity.namespace_uid, 0);
     assert.equal(result.value.filesystem.owned_worktree, created.value.worktree);
+    assert.equal(result.value.runtime_projection?.policy.mode, "compatibility");
+    assert.ok(result.value.runtime_projection?.filesystem.length);
+    assert.equal(
+      result.value.runtime_projection?.filesystem.every((entry) => entry.provenance === "compatibility"),
+      true,
+    );
     assert.equal(
       result.value.filesystem.home.startsWith(path.join(created.value.repository, "nawabari", "sandbox")),
       true,
