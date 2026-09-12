@@ -93,16 +93,41 @@ function readySandboxProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe 
   };
 }
 
+// The strict FHS resolver validates exact executable evidence (regular file,
+// executable, no symlink hop) rather than trusting fixed `/usr/bin/*` paths,
+// which are not guaranteed to exist on every supported runner (e.g. pnpm is
+// not installed at `/usr/bin/pnpm` on the hosted Ubuntu 24.04 CI image). Build
+// real fixture executables once instead of assuming a host package layout.
+const strictRuntimeFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-cli-strict-runtime-"));
+process.on("exit", () => fs.rmSync(strictRuntimeFixtureRoot, { recursive: true, force: true }));
+
+function strictRuntimeExecutableFixture(name: string): string {
+  const target = path.join(strictRuntimeFixtureRoot, name);
+  if (!fs.existsSync(target)) {
+    fs.copyFileSync(process.execPath, target);
+    fs.chmodSync(target, 0o755);
+  }
+  return fs.realpathSync.native(target);
+}
+
 function strictRuntimeLayout(): SandboxRuntimeLayout {
   const layout = discoverSandboxRuntimeLayout();
   return {
     ...layout,
     fhs_executable_candidates: [
-      { requirement_id: "node-runtime", path: fs.realpathSync.native(process.execPath), target: "/usr/local/bin/node" },
-      { requirement_id: "git-package", path: "/usr/bin/git", target: "/usr/local/bin/git" },
+      {
+        requirement_id: "node-runtime",
+        path: strictRuntimeExecutableFixture("node-runtime"),
+        target: "/usr/local/bin/node",
+      },
+      {
+        requirement_id: "git-package",
+        path: strictRuntimeExecutableFixture("git-package"),
+        target: "/usr/local/bin/git",
+      },
       {
         requirement_id: "pnpm-package",
-        path: fs.realpathSync.native("/usr/bin/pnpm"),
+        path: strictRuntimeExecutableFixture("pnpm-package"),
         target: "/usr/local/bin/pnpm",
       },
     ],

@@ -3,7 +3,7 @@ import { posix } from "node:path";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import { buildExplicitCompatibilityRuntimeProjection } from "./compatibility-runtime-projection.js";
 import { compileRuntimeExecutableProjection } from "./runtime-executable-projection.js";
-import { materializeFhsDevelopmentRuntime } from "./fhs-development-runtime.js";
+import { fhsDevelopmentRuntimeReadiness, materializeFhsDevelopmentRuntime } from "./fhs-development-runtime.js";
 import {
   materializeNixRuntimeClosure,
   type NixRuntimeClosure,
@@ -128,10 +128,6 @@ function hasNixMaterializer(layout: SandboxRuntimeLayout): boolean {
   );
 }
 
-function hasFhsMaterializer(platform: string, layout: SandboxRuntimeLayout): boolean {
-  return platform === "linux" && layout.usr !== null;
-}
-
 /**
  * Select a materializer from explicit host-layout evidence. The selection is
  * made once; callers must not retry a failed selected materializer with the
@@ -150,16 +146,20 @@ export function runtimeMaterializerAvailability(
     });
   }
 
+  const fhsReadiness = fhsDevelopmentRuntimeReadiness(platform, layout);
   const available = [
     ...(hasNixMaterializer(layout) ? (["nix"] as const) : []),
-    ...(hasFhsMaterializer(platform, layout) ? (["fhs"] as const) : []),
+    ...(fhsReadiness.strict_ready ? (["fhs"] as const) : []),
   ];
   const selected = available[0] ?? null;
   return Object.freeze({
     selected,
     available: Object.freeze(available),
     strict_ready: selected !== null,
-    reason: selected === null ? "no supported Nix or standalone FHS materializer is available" : null,
+    reason:
+      selected !== null
+        ? null
+        : (fhsReadiness.reason ?? "no supported Nix or standalone FHS materializer is available"),
   });
 }
 

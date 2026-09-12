@@ -52,6 +52,37 @@ function emptyLayout(overrides: Partial<SandboxRuntimeLayout> = {}): SandboxRunt
   };
 }
 
+type CandidateFixture = Readonly<{
+  readonly root: string;
+  readonly candidates: readonly { readonly requirement_id: string; readonly path: string }[];
+  readonly cleanup: () => void;
+}>;
+
+/**
+ * Real, bounded FHS development-baseline executables. `runtimeMaterializerAvailability`
+ * now calls the same resolver used for execution (#314), so a bare `usr: "/usr"`
+ * host-layout hint is no longer sufficient to make FHS available in tests.
+ */
+function createCandidateFixture(): CandidateFixture {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-resolution-fhs-"));
+  const node = path.join(root, "node-runtime");
+  const git = path.join(root, "git-package");
+  const pnpm = path.join(root, "pnpm-package");
+  fs.copyFileSync(process.execPath, node);
+  fs.chmodSync(node, 0o755);
+  fs.writeFileSync(git, "#!/bin/sh\nprintf 'git-package-ok\\n'\n", { mode: 0o755 });
+  fs.writeFileSync(pnpm, "#!/bin/sh\nprintf 'pnpm-package-ok\\n'\n", { mode: 0o755 });
+  return {
+    root,
+    candidates: Object.freeze([
+      Object.freeze({ requirement_id: "node-runtime", path: node }),
+      Object.freeze({ requirement_id: "git-package", path: git }),
+      Object.freeze({ requirement_id: "pnpm-package", path: pnpm }),
+    ]),
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
 type NixFixture = Readonly<{
   readonly root: string;
   readonly store: string;
@@ -182,20 +213,40 @@ test("the default resolution is development + strict and contains only the canon
 });
 
 test("materializer selection is deterministic and does not use an installed standalone Nix store as FHS fallback", () => {
+  const candidates = createCandidateFixture();
+  try {
+    const fhs = emptyLayout({
+      usr: "/usr",
+      nix_store: "/nix/store",
+      nix: "/usr/bin/nix",
+      fhs_executable_candidates: candidates.candidates,
+    });
+    const selected = runtimeMaterializerAvailability("linux", fhs);
+    assert.deepEqual(selected.available, ["fhs"]);
+    assert.equal(selected.selected, "fhs");
+
+    const nix = emptyLayout({
+      nix: "/usr/bin/nix",
+      nix_store: "/nix/store",
+      nix_current_system: "/run/current-system",
+      usr: "/usr",
+      fhs_executable_candidates: candidates.candidates,
+    });
+    const native = runtimeMaterializerAvailability("linux", nix);
+    assert.deepEqual(native.available, ["nix", "fhs"]);
+    assert.equal(native.selected, "nix");
+  } finally {
+    candidates.cleanup();
+  }
+});
+
+test("materializer selection reports FHS unavailable when no real development baseline evidence exists", () => {
   const fhs = emptyLayout({ usr: "/usr", nix_store: "/nix/store", nix: "/usr/bin/nix" });
   const selected = runtimeMaterializerAvailability("linux", fhs);
-  assert.deepEqual(selected.available, ["fhs"]);
-  assert.equal(selected.selected, "fhs");
-
-  const nix = emptyLayout({
-    nix: "/usr/bin/nix",
-    nix_store: "/nix/store",
-    nix_current_system: "/run/current-system",
-    usr: "/usr",
-  });
-  const native = runtimeMaterializerAvailability("linux", nix);
-  assert.deepEqual(native.available, ["nix", "fhs"]);
-  assert.equal(native.selected, "nix");
+  assert.deepEqual(selected.available, []);
+  assert.equal(selected.selected, null);
+  assert.equal(selected.strict_ready, false);
+  assert.match(selected.reason ?? "", /candidate/u);
 });
 
 test("failure of the selected strict materializer is fail-closed without trying FHS", () => {
@@ -268,14 +319,30 @@ test("compatibility remains explicit and unavailable layouts fail closed", () =>
 });
 
 test("doctor exposes the strict default, canonical profile, selected materializer, and explicit compatibility policy", () => {
+  const candidates = createCandidateFixture();
+  try {
+    const report = runtimeDoctorReport(
+      "linux",
+      emptyLayout({ usr: "/usr", fhs_executable_candidates: candidates.candidates }),
+    );
+    assert.deepEqual(report.default_policy, STRICT_RUNTIME_POLICY);
+    assert.deepEqual(report.default_profile, { id: "development", version: "1" });
+    assert.equal(report.selected, "fhs");
+    assert.deepEqual(report.available, ["fhs"]);
+    assert.equal(report.strict_ready, true);
+    assert.equal(report.compatibility_available, true);
+    assert.deepEqual(report.compatibility_policy, EXPLICIT_COMPATIBILITY_RUNTIME_POLICY);
+  } finally {
+    candidates.cleanup();
+  }
+});
+
+test("doctor reports strict_ready false with an actionable reason when /usr exists but no development baseline evidence does", () => {
   const report = runtimeDoctorReport("linux", emptyLayout({ usr: "/usr" }));
-  assert.deepEqual(report.default_policy, STRICT_RUNTIME_POLICY);
-  assert.deepEqual(report.default_profile, { id: "development", version: "1" });
-  assert.equal(report.selected, "fhs");
-  assert.deepEqual(report.available, ["fhs"]);
-  assert.equal(report.strict_ready, true);
-  assert.equal(report.compatibility_available, true);
-  assert.deepEqual(report.compatibility_policy, EXPLICIT_COMPATIBILITY_RUNTIME_POLICY);
+  assert.equal(report.selected, null);
+  assert.deepEqual(report.available, []);
+  assert.equal(report.strict_ready, false);
+  assert.match(report.reason ?? "", /candidate/u);
 });
 
 test("the default strict FHS projection keeps the development baseline functional without host visibility", async (t) => {
