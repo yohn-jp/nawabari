@@ -5,14 +5,27 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { runCli } from "../cli.js";
 import {
   materializePnpmMiddleware,
   PNPM_MIDDLEWARE_LAUNCHER_TARGET,
   PNPM_MIDDLEWARE_PROVIDER_IDS,
-  PNPM_MIDDLEWARE_REQUIREMENTS,
   PROJECTED_PNPM_TARGET,
-  type PnpmMiddlewareBackend,
 } from "./runtime-provider-pnpm-middleware.js";
+import {
+  materializePnpmMiddlewareBackends,
+  PNPM_NIX_INSTALLABLE,
+  PNPM_MIDDLEWARE_PNPM_BUNDLE_TARGET,
+  PNPM_MIDDLEWARE_REAL_PNPM_TARGET,
+  PNPM_MIDDLEWARE_RTK_TARGET,
+  RTK_NIX_INSTALLABLE,
+  REAL_PNPM_BACKEND_PROVIDER,
+  REAL_PNPM_BACKEND_REQUIREMENT,
+  RTK_BACKEND_PROVIDER,
+  RTK_BACKEND_REQUIREMENT,
+  type PnpmMiddlewareBackendDescriptor,
+} from "./pnpm-middleware-backend-materialization.js";
+import type { NixCommandRunner } from "./nix-runtime-closure.js";
 import {
   STRICT_RUNTIME_POLICY,
   validateSessionRuntimeProjection,
@@ -84,8 +97,8 @@ function baseProjection(
     profile: { id: "pnpm-middleware-test", version: "1" },
     requirements: [
       { id: "node-runtime", kind: "runtime", name: "node", version: ">=24" },
-      PNPM_MIDDLEWARE_REQUIREMENTS.rtk,
-      PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm,
+      RTK_BACKEND_REQUIREMENT,
+      REAL_PNPM_BACKEND_REQUIREMENT,
     ],
     filesystem: [
       {
@@ -128,7 +141,7 @@ function backend(
   source: string,
   providerId: string,
   requirementId: string,
-): PnpmMiddlewareBackend {
+): PnpmMiddlewareBackendDescriptor {
   return {
     path: pathInSandbox,
     source,
@@ -142,8 +155,8 @@ function materializationInput(
 ): {
   readonly projection: SessionRuntimeProjection;
   readonly launcher_path: string;
-  readonly rtk: PnpmMiddlewareBackend;
-  readonly real_pnpm: PnpmMiddlewareBackend;
+  readonly rtk: PnpmMiddlewareBackendDescriptor;
+  readonly real_pnpm: PnpmMiddlewareBackendDescriptor;
 } {
   const rtkSource = executable(
     root,
@@ -158,14 +171,79 @@ function materializationInput(
   return {
     projection: baseProjection(rtkSource, pnpmSource, process.execPath, options),
     launcher_path: path.join(root, "launcher", "pnpm"),
-    rtk: backend("/materialized/rtk", rtkSource, PNPM_MIDDLEWARE_PROVIDER_IDS.rtk, PNPM_MIDDLEWARE_REQUIREMENTS.rtk.id),
+    rtk: backend("/materialized/rtk", rtkSource, RTK_BACKEND_PROVIDER.id, RTK_BACKEND_REQUIREMENT.id),
     real_pnpm: backend(
       "/materialized/pnpm",
       pnpmSource,
-      PNPM_MIDDLEWARE_PROVIDER_IDS.real_pnpm,
-      PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.id,
+      REAL_PNPM_BACKEND_PROVIDER.id,
+      REAL_PNPM_BACKEND_REQUIREMENT.id,
     ),
   };
+}
+
+/** Build a hermetic #311 handoff so launcher tests never invent backend authority. */
+function canonicalBackendMaterialization(root: string) {
+  const store = path.join(root, "store");
+  fs.mkdirSync(store);
+  const roots = {
+    rtk: path.join(store, "aaa-rtk-0.45.0"),
+    pnpm: path.join(store, "bbb-pnpm-11.18.0"),
+  } as const;
+  const dependencies = {
+    rtk: path.join(store, "ccc-rtk-runtime-dependency"),
+    pnpm: path.join(store, "ddd-pnpm-runtime-dependency"),
+  } as const;
+  const rtkSource = path.join(roots.rtk, "bin", "rtk");
+  const pnpmSource = path.join(roots.pnpm, "libexec", "pnpm", "bin", "pnpm.mjs");
+  fs.mkdirSync(path.dirname(rtkSource), { recursive: true });
+  fs.mkdirSync(path.dirname(pnpmSource), { recursive: true });
+  fs.mkdirSync(path.join(roots.pnpm, "libexec", "pnpm", "dist"), { recursive: true });
+  fs.writeFileSync(rtkSource, '#!/bin/sh\nset -eu\ntest "$1" = proxy\nbackend=$2\nshift 2\nexec "$backend" "$@"\n', {
+    mode: 0o755,
+  });
+  fs.writeFileSync(pnpmSource, "#!/bin/sh\nprintf 'resolved-pnpm argv=%s\\n' \"$*\"\n", { mode: 0o755 });
+  fs.writeFileSync(path.join(roots.pnpm, "libexec", "pnpm", "dist", "pnpm.mjs"), "bundle\n");
+  for (const dependency of Object.values(dependencies)) fs.mkdirSync(dependency);
+
+  const profileResult = resolveRuntimeProfile({
+    profiles: ["base"],
+    operations: [
+      { operation: "remove", requirement_id: "node-runtime" },
+      { operation: "add", requirement: RTK_BACKEND_REQUIREMENT },
+      { operation: "add", requirement: REAL_PNPM_BACKEND_REQUIREMENT },
+    ],
+  });
+  if (!profileResult.ok) throw profileResult.error;
+  assert.equal(profileResult.ok, true);
+
+  const rootsByInstallable: Readonly<Record<string, "rtk" | "pnpm">> = {
+    [RTK_NIX_INSTALLABLE]: "rtk",
+    [PNPM_NIX_INSTALLABLE]: "pnpm",
+  };
+  const closures = {
+    rtk: [roots.rtk, dependencies.rtk],
+    pnpm: [roots.pnpm, dependencies.pnpm],
+  } as const;
+  const commandRunner: NixCommandRunner = (_executable, args) => {
+    const installable = args.at(-1);
+    const key = typeof installable === "string" ? rootsByInstallable[installable] : undefined;
+    if (key === undefined) return { exit_code: 1, stdout: "", stderr: "unknown installable" };
+    const selected = args.includes("--recursive") ? closures[key] : [roots[key]];
+    return {
+      exit_code: 0,
+      stdout: JSON.stringify(Object.fromEntries(selected.map((storePath) => [storePath, null]))),
+      stderr: "",
+    };
+  };
+  const materialized = materializePnpmMiddlewareBackends(profileResult.value, {
+    store_root: store,
+    command_runner: commandRunner,
+  });
+  if (!materialized.ok) throw materialized.error;
+  assert.equal(materialized.ok, true);
+  assert.equal(materialized.value.rtk.path, PNPM_MIDDLEWARE_RTK_TARGET);
+  assert.equal(materialized.value.real_pnpm.path, PNPM_MIDDLEWARE_REAL_PNPM_TARGET);
+  return materialized.value;
 }
 
 test("materializes one exact pnpm launcher through the canonical executable projection", () => {
@@ -442,20 +520,13 @@ test("the governed /nawabari/bin/pnpm -> pinned RTK -> pinned real pnpm path res
   const undeclaredExecutable = path.join(undeclaredRoot, "host-only-marker");
   fs.copyFileSync(shInterpreter, undeclaredExecutable);
   fs.chmodSync(undeclaredExecutable, 0o755);
+  executable(undeclaredRoot, "pnpm", "#!/bin/sh\necho host-pnpm\n");
+  executable(undeclaredRoot, "rtk", "#!/bin/sh\necho host-rtk\n");
   const originalHostPath = process.env.PATH;
   const materializationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-pnpm-materialization-"));
   try {
     fs.mkdirSync(path.join(materializationRoot, "launcher"));
-    const rtkSource = executable(
-      materializationRoot,
-      "rtk",
-      '#!/bin/sh\nset -eu\ntest "$1" = proxy\nbackend=$2\nshift 2\nexec "$backend" "$@"\n',
-    );
-    const pnpmSource = executable(
-      materializationRoot,
-      "real-pnpm",
-      "#!/bin/sh\nprintf 'resolved-pnpm argv=%s\\n' \"$*\"\n",
-    );
+    const backendMaterialization = canonicalBackendMaterialization(materializationRoot);
 
     const shRequirement = { id: "sh-runtime", kind: "runtime" as const, name: "sh", version: "1" };
     const profile = resolveRuntimeProfile({
@@ -474,35 +545,29 @@ test("the governed /nawabari/bin/pnpm -> pinned RTK -> pinned real pnpm path res
     });
     assert.equal(fhsProjection.ok, true, fhsProjection.ok ? "" : JSON.stringify(fhsProjection.error));
     if (!fhsProjection.ok) return;
-    for (const root of ["/usr", "/bin", "/lib", "/lib64"]) {
+    for (const root of ["/usr", "/bin", "/lib", "/lib64", "/nix/store"]) {
       assert.ok(
         fhsProjection.value.filesystem.every((entry) => entry.target !== root),
-        `bounded FHS materialization must not project the whole ${root} root`,
+        `bounded FHS/backend materialization must not project the whole ${root} root`,
       );
     }
 
     const preProjection = validateSessionRuntimeProjection({
       policy: STRICT_RUNTIME_POLICY,
       profile: { id: "pnpm-middleware-real-isolation", version: "1" },
-      requirements: [
-        ...fhsProjection.value.requirements,
-        PNPM_MIDDLEWARE_REQUIREMENTS.rtk,
-        PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm,
-      ],
+      requirements: [...fhsProjection.value.requirements, ...backendMaterialization.requirements],
       filesystem: [
         ...fhsProjection.value.filesystem,
-        {
-          source: rtkSource,
-          target: "/materialized/rtk",
-          access_mode: "read-only" as const,
-          provenance: "package" as const,
-        },
-        {
-          source: pnpmSource,
-          target: "/materialized/pnpm",
-          access_mode: "read-only" as const,
-          provenance: "package" as const,
-        },
+        // The hermetic fake outputs are shell scripts and need only the exact
+        // file-level handoff. #311's conformance test covers its full Nix
+        // closure projection against /nix/store.
+        ...backendMaterialization.projection.filesystem.filter((entry) =>
+          new Set<string>([
+            PNPM_MIDDLEWARE_RTK_TARGET,
+            PNPM_MIDDLEWARE_REAL_PNPM_TARGET,
+            PNPM_MIDDLEWARE_PNPM_BUNDLE_TARGET,
+          ]).has(entry.target),
+        ),
       ],
       executables: [
         {
@@ -525,19 +590,8 @@ test("the governed /nawabari/bin/pnpm -> pinned RTK -> pinned real pnpm path res
     const materialized = materializePnpmMiddleware({
       projection: preProjection.value,
       launcher_path: path.join(materializationRoot, "launcher", "pnpm"),
-      rtk: {
-        path: "/materialized/rtk",
-        source: rtkSource,
-        provider: { id: PNPM_MIDDLEWARE_PROVIDER_IDS.rtk, requirement_id: PNPM_MIDDLEWARE_REQUIREMENTS.rtk.id },
-      },
-      real_pnpm: {
-        path: "/materialized/pnpm",
-        source: pnpmSource,
-        provider: {
-          id: PNPM_MIDDLEWARE_PROVIDER_IDS.real_pnpm,
-          requirement_id: PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.id,
-        },
-      },
+      rtk: backendMaterialization.rtk,
+      real_pnpm: backendMaterialization.real_pnpm,
     });
     assert.equal(materialized.ok, true, materialized.ok ? "" : JSON.stringify(materialized.error));
     if (!materialized.ok) return;
@@ -579,6 +633,109 @@ test("the governed /nawabari/bin/pnpm -> pinned RTK -> pinned real pnpm path res
     }
 
     process.env.PATH = `${originalHostPath ?? ""}:${path.dirname(undeclaredExecutable)}`;
+    const sessionRunOutput: string[] = [];
+    const sessionRunExit = await runCli(
+      ["--json", "session", "run", "--session", created.value.session_id, "--", "pnpm", "run", "session-run"],
+      {
+        backend,
+        cwd: worktree,
+        io: { stdout: (line) => sessionRunOutput.push(line), stderr: () => {} },
+        sandboxProbe: readyProbe(),
+        sandboxRuntimeLayout: report,
+        sandboxRuntimeProjection: materialized.value.projection,
+      },
+    );
+    assert.equal(sessionRunExit, 0, sessionRunOutput.join("\n"));
+    const sessionRunResult = JSON.parse(sessionRunOutput[0] ?? "{}") as { stdout?: string; stderr?: string };
+    assert.match(sessionRunResult.stdout ?? "", /^resolved-pnpm argv=run session-run\n/u);
+    assert.equal(sessionRunResult.stderr, "");
+
+    const basenameRunOutput: string[] = [];
+    const basenameRunExit = await runCli(
+      [
+        "--json",
+        "session",
+        "run",
+        "--session",
+        created.value.session_id,
+        "--",
+        "sh",
+        "-c",
+        'printf "resolved=%s\\n" "$(command -v pnpm)"; exec "$(command -v pnpm)" run basename-run',
+      ],
+      {
+        backend,
+        cwd: worktree,
+        io: { stdout: (line) => basenameRunOutput.push(line), stderr: () => {} },
+        sandboxProbe: readyProbe(),
+        sandboxRuntimeLayout: report,
+        sandboxRuntimeProjection: materialized.value.projection,
+      },
+    );
+    assert.equal(basenameRunExit, 0, basenameRunOutput.join("\n"));
+    const basenameRunResult = JSON.parse(basenameRunOutput[0] ?? "{}") as { stdout?: string };
+    assert.match(
+      basenameRunResult.stdout ?? "",
+      /^resolved=\/nawabari\/bin\/pnpm\nresolved-pnpm argv=run basename-run\n/u,
+    );
+
+    const shellEvidence = path.join(worktree, "pnpm-session-shell-evidence.txt");
+    const shellExit = await runCli(
+      [
+        "session",
+        "shell",
+        "--session",
+        created.value.session_id,
+        "--",
+        "sh",
+        "-c",
+        [
+          "set -eu",
+          `printf 'provider=%s\\n' \"$(command -v pnpm)\" > ${JSON.stringify(shellEvidence)}`,
+          `pnpm shell-run >> ${JSON.stringify(shellEvidence)} 2>&1`,
+          `printf 'path=%s\\n' \"$PATH\" >> ${JSON.stringify(shellEvidence)}`,
+        ].join("\n"),
+      ],
+      {
+        backend,
+        cwd: worktree,
+        sandboxProbe: readyProbe(),
+        sandboxRuntimeLayout: report,
+        sandboxRuntimeProjection: materialized.value.projection,
+      },
+    );
+    assert.equal(shellExit, 0);
+    assert.equal(
+      fs.readFileSync(shellEvidence, "utf8"),
+      "provider=/nawabari/bin/pnpm\nresolved-pnpm argv=shell-run\npath=/nawabari/bin\n",
+    );
+
+    const hostPathProofOutput: string[] = [];
+    const hostPathProofExit = await runCli(
+      [
+        "--json",
+        "session",
+        "run",
+        "--session",
+        created.value.session_id,
+        "--",
+        "sh",
+        "-c",
+        'printf "pnpm=%s\\n" "$(command -v pnpm)"; if command -v rtk >/dev/null 2>&1; then echo rtk=visible; else echo rtk=hidden; fi; printf "path=%s\\n" "$PATH"',
+      ],
+      {
+        backend,
+        cwd: worktree,
+        io: { stdout: (line) => hostPathProofOutput.push(line), stderr: () => {} },
+        sandboxProbe: readyProbe(),
+        sandboxRuntimeLayout: report,
+        sandboxRuntimeProjection: materialized.value.projection,
+      },
+    );
+    assert.equal(hostPathProofExit, 0, hostPathProofOutput.join("\n"));
+    const hostPathProof = JSON.parse(hostPathProofOutput[0] ?? "{}") as { stdout?: string };
+    assert.equal(hostPathProof.stdout, "pnpm=/nawabari/bin/pnpm\nrtk=hidden\npath=/nawabari/bin\n");
+
     const ambientPathIsolated = await runSandboxedCommand(projectedRequest, {
       command: "sh",
       args: ["-c", "command -v host-only-marker >/dev/null 2>&1 && echo leaked || echo isolated"],

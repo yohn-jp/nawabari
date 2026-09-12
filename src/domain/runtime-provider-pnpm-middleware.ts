@@ -2,6 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
+import {
+  REAL_PNPM_BACKEND_PROVIDER,
+  REAL_PNPM_BACKEND_REQUIREMENT,
+  RTK_BACKEND_PROVIDER,
+  RTK_BACKEND_REQUIREMENT,
+  type PnpmMiddlewareBackendDescriptor,
+} from "./pnpm-middleware-backend-materialization.js";
 import { CANONICAL_EXECUTABLE_ROOT, compileRuntimeExecutableProjection } from "./runtime-executable-projection.js";
 import {
   runtimeMaterializationMissingError,
@@ -20,50 +27,22 @@ export const PROJECTED_PNPM_TARGET = `${CANONICAL_EXECUTABLE_ROOT}/${PROJECTED_P
 export const PNPM_MIDDLEWARE_LAUNCHER_TARGET = "/runtime/pnpm-middleware/pnpm-launcher" as const;
 export const PNPM_MIDDLEWARE_LAUNCHER_NODE_TARGET = `${CANONICAL_EXECUTABLE_ROOT}/node` as const;
 
-/**
- * These are deliberately concrete adapter requirements, not additions to the
- * backend-neutral runtime-profile vocabulary.  Callers add them explicitly to
- * the selected materialization input.
- */
-export const PNPM_MIDDLEWARE_REQUIREMENTS = Object.freeze({
-  rtk: Object.freeze({
-    id: "rtk-pnpm-middleware",
-    kind: "package" as const,
-    name: "rtk",
-    version: "0.45.0",
-  }),
-  real_pnpm: Object.freeze({
-    id: "pnpm-pinned-backend",
-    kind: "package" as const,
-    name: "pnpm",
-    version: "11.18.0",
-  }),
-});
-
+/** The launcher provider is owned here; backend provider identities come from #311. */
 export const PNPM_MIDDLEWARE_PROVIDER_IDS = Object.freeze({
-  rtk: "rtk-pnpm",
-  real_pnpm: "pnpm-real-backend",
   launcher: "rtk-pnpm-launcher",
 });
 
 /** The command supported by the pinned RTK adapter. */
 export const PINNED_RTK_BACKEND_BINDING = "proxy" as const;
 
-/** A backend is identified by its exact sandbox path and its exact host source. */
-export type PnpmMiddlewareBackend = Readonly<{
-  /** Exact path visible inside the sandbox. */
-  readonly path: string;
-  /** Exact already-materialized host source bound at `path`. */
-  readonly source: string;
-  readonly provider: RuntimeExecutableProvider;
-}>;
-
 export type PnpmMiddlewareMaterializationInput = Readonly<{
   readonly projection: SessionRuntimeProjection;
   /** New launcher file; it must not already exist. */
   readonly launcher_path: string;
-  readonly rtk: PnpmMiddlewareBackend;
-  readonly real_pnpm: PnpmMiddlewareBackend;
+  /** Exact backend handoff produced by #311. */
+  readonly rtk: PnpmMiddlewareBackendDescriptor;
+  /** Exact backend handoff produced by #311. */
+  readonly real_pnpm: PnpmMiddlewareBackendDescriptor;
 }>;
 
 export type PnpmMiddlewareMaterialization = Readonly<{
@@ -196,20 +175,16 @@ function validateBackend(
   projection: SessionRuntimeProjection,
   backend: unknown,
   requirement: RuntimeRequirement,
-  providerId: string,
   field: string,
-): DomainResult<PnpmMiddlewareBackend> {
+  expectedProvider: RuntimeExecutableProvider,
+): DomainResult<PnpmMiddlewareBackendDescriptor> {
   if (typeof backend !== "object" || backend === null) return invalid(field, "expected an exact backend descriptor");
-  const candidate = backend as Partial<PnpmMiddlewareBackend>;
+  const candidate = backend as Partial<PnpmMiddlewareBackendDescriptor>;
   const target = validateExactPath(candidate.path, `${field}.path`);
   if (!target.ok) return target;
   const source = validateExactPath(candidate.source, `${field}.source`);
   if (!source.ok) return source;
-  const provider = validateProvider(
-    candidate.provider,
-    { id: providerId, requirement_id: requirement.id },
-    `${field}.provider`,
-  );
+  const provider = validateProvider(candidate.provider, expectedProvider, `${field}.provider`);
   if (!provider.ok) return provider;
   const selected = requirementFor(projection, requirement);
   if (!selected.ok) return selected;
@@ -280,7 +255,7 @@ function validateLauncherPath(
     if (fs.realpathSync.native(parent) !== parent)
       return invalid("launcher_path", "the parent is not canonical", parent);
   } catch {
-    return materializationMissing(PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm, "the launcher parent is unavailable", parent);
+    return materializationMissing(REAL_PNPM_BACKEND_REQUIREMENT, "the launcher parent is unavailable", parent);
   }
   try {
     fs.lstatSync(value);
@@ -343,10 +318,10 @@ function writeLauncher(source: string, content: string): DomainResult<null> {
     return failure(
       new DomainError(
         "RUNTIME_MATERIALIZATION_MISSING",
-        "Runtime package requirement 'pnpm-pinned-backend' was not materialized: the fixed launcher could not be written.",
+        `Runtime package requirement '${REAL_PNPM_BACKEND_REQUIREMENT.id}' was not materialized: the fixed launcher could not be written.`,
         {
-          requirement_id: PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.id,
-          requirement_kind: PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.kind,
+          requirement_id: REAL_PNPM_BACKEND_REQUIREMENT.id,
+          requirement_kind: REAL_PNPM_BACKEND_REQUIREMENT.kind,
           reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
           source,
         },
@@ -368,20 +343,14 @@ export function materializePnpmMiddleware(input: unknown): DomainResult<PnpmMidd
   const candidate = input as Partial<PnpmMiddlewareMaterializationInput>;
   if (candidate.projection === undefined) return invalid("projection", "is required");
   const projection = candidate.projection;
-  const rtk = validateBackend(
-    projection,
-    candidate.rtk,
-    PNPM_MIDDLEWARE_REQUIREMENTS.rtk,
-    PNPM_MIDDLEWARE_PROVIDER_IDS.rtk,
-    "rtk",
-  );
+  const rtk = validateBackend(projection, candidate.rtk, RTK_BACKEND_REQUIREMENT, "rtk", RTK_BACKEND_PROVIDER);
   if (!rtk.ok) return rtk;
   const realPnpm = validateBackend(
     projection,
     candidate.real_pnpm,
-    PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm,
-    PNPM_MIDDLEWARE_PROVIDER_IDS.real_pnpm,
+    REAL_PNPM_BACKEND_REQUIREMENT,
     "real_pnpm",
+    REAL_PNPM_BACKEND_PROVIDER,
   );
   if (!realPnpm.ok) return realPnpm;
   if (rtk.value.path === realPnpm.value.path || rtk.value.source === realPnpm.value.source) {
@@ -401,30 +370,10 @@ export function materializePnpmMiddleware(input: unknown): DomainResult<PnpmMidd
   const node = validateNodeInterpreter(projection);
   if (!node.ok) return node;
 
-  const requirements = [...projection.requirements];
-  for (const requirement of [PNPM_MIDDLEWARE_REQUIREMENTS.rtk, PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm]) {
-    const existing = requirements.find((candidateRequirement) => candidateRequirement.id === requirement.id);
-    if (existing !== undefined) {
-      if (
-        existing.kind !== requirement.kind ||
-        existing.name !== requirement.name ||
-        existing.version !== requirement.version
-      ) {
-        return invalid(
-          "requirements",
-          "a pinned middleware requirement conflicts with the selected projection",
-          requirement.id,
-        );
-      }
-      continue;
-    }
-    requirements.push(requirement);
-  }
-
   const projected = {
     policy: projection.policy,
     profile: projection.profile,
-    requirements,
+    requirements: projection.requirements,
     filesystem: [
       ...projection.filesystem,
       {
@@ -441,7 +390,7 @@ export function materializePnpmMiddleware(input: unknown): DomainResult<PnpmMidd
         target: PNPM_MIDDLEWARE_LAUNCHER_TARGET,
         provider: {
           id: PNPM_MIDDLEWARE_PROVIDER_IDS.launcher,
-          requirement_id: PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.id,
+          requirement_id: realPnpm.value.provider.requirement_id,
         },
         provenance: "package" as const,
       },
