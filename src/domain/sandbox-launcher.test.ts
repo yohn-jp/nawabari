@@ -831,7 +831,11 @@ test("direct execution and PATH-based child lookup resolve the same projected ex
       command: "probe",
       args: ["-c", `exec "${undeclaredExecutable}" -c 'echo unreachable'`],
     });
-    assert.equal(undeclaredHostBinary.ok, true, undeclaredHostBinary.ok ? "" : JSON.stringify(undeclaredHostBinary.error));
+    assert.equal(
+      undeclaredHostBinary.ok,
+      true,
+      undeclaredHostBinary.ok ? "" : JSON.stringify(undeclaredHostBinary.error),
+    );
     if (undeclaredHostBinary.ok) {
       assert.notEqual(undeclaredHostBinary.value.exit_code, 0, JSON.stringify(undeclaredHostBinary.value));
       assert.match(undeclaredHostBinary.value.stderr, /not found|No such file or directory/u);
@@ -840,7 +844,7 @@ test("direct execution and PATH-based child lookup resolve the same projected ex
     process.env.PATH = `${originalHostPath ?? ""}:${path.dirname(undeclaredExecutable)}`;
     const ambientPathIsolated = await runSandboxedCommand(projectedRequest, {
       command: "probe",
-      args: ["-c", 'command -v host-only-marker >/dev/null 2>&1 && echo leaked || echo isolated'],
+      args: ["-c", "command -v host-only-marker >/dev/null 2>&1 && echo leaked || echo isolated"],
     });
     assert.equal(ambientPathIsolated.ok, true, ambientPathIsolated.ok ? "" : JSON.stringify(ambientPathIsolated.error));
     if (ambientPathIsolated.ok) assert.equal(ambientPathIsolated.value.stdout.trim(), "isolated");
