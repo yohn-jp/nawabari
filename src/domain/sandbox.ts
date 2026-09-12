@@ -20,7 +20,10 @@ import {
 } from "./sandbox-seccomp.js";
 import type { CgroupLimitProfile } from "./cgroups-v2.js";
 import { validateSessionRuntimeProjection, type SessionRuntimeProjection } from "./runtime-projection.js";
-import { fhsDevelopmentRuntimeReadiness } from "./fhs-development-runtime.js";
+import {
+  fhsDevelopmentRuntimeReadiness,
+  readExplicitFhsDevelopmentExecutableCandidates,
+} from "./fhs-development-runtime.js";
 import type { FhsRuntimeExecutableDeclaration } from "./fhs-runtime.js";
 
 /**
@@ -592,7 +595,7 @@ export function discoverSandboxRuntimeLayout(environment: NodeJS.ProcessEnv = pr
     ssl_certs: existingPath("/etc/ssl"),
     pki_certs: existingPath("/etc/pki"),
     ca_certificates: existingPath("/etc/ca-certificates"),
-    fhs_executable_candidates: Object.freeze([]),
+    fhs_executable_candidates: readExplicitFhsDevelopmentExecutableCandidates(environment),
   };
 }
 
@@ -896,11 +899,13 @@ export {
 } from "./fhs-runtime.js";
 
 export {
+  FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS,
   FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS,
   FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS,
   doctorFhsDevelopmentRuntime,
   fhsDevelopmentRuntimeReadiness,
   materializeFhsDevelopmentRuntime,
+  readExplicitFhsDevelopmentExecutableCandidates,
   resolveFhsDevelopmentRuntime,
   type FhsDevelopmentRuntimeInput,
   type FhsDevelopmentRuntimeReadiness,

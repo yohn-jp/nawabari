@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { posix } from "node:path";
+import process from "node:process";
 
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import { materializeFhsRuntime, type FhsRuntimeExecutableDeclaration } from "./fhs-runtime.js";
@@ -32,6 +33,17 @@ export const FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS = Object.freeze([
   "git-package",
   "pnpm-package",
 ] as const);
+
+/**
+ * Explicit host/runtime evidence keys. These are exact executable sources,
+ * not search roots or package-manager configuration; absence is meaningful and
+ * leaves the strict baseline unavailable.
+ */
+export const FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS = Object.freeze({
+  "node-runtime": "NAWABARI_FHS_NODE_EXECUTABLE",
+  "git-package": "NAWABARI_FHS_GIT_EXECUTABLE",
+  "pnpm-package": "NAWABARI_FHS_PNPM_EXECUTABLE",
+} as const);
 
 /** Stable provider identities consumed by #293's executable projection. */
 export const FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS: Readonly<Record<string, string>> = Object.freeze({
@@ -67,6 +79,24 @@ export type FhsDevelopmentRuntimeReadiness = Readonly<{
   readonly code: ErrorCode | null;
   readonly details: JsonObject;
 }>;
+
+/**
+ * Read only the three explicit executable-source declarations exposed by the
+ * host/runtime boundary. In particular, this function never consults PATH,
+ * HOME, profile directories, or Corepack state.
+ */
+export function readExplicitFhsDevelopmentExecutableCandidates(
+  environment: NodeJS.ProcessEnv = process.env,
+): readonly FhsRuntimeExecutableDeclaration[] {
+  const candidates = FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS.flatMap((requirementId) => {
+    const candidate = environment[FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS[requirementId]];
+    return typeof candidate === "string" && candidate.length > 0
+      ? [{ requirement_id: requirementId, path: candidate } satisfies FhsRuntimeExecutableDeclaration]
+      : [];
+  });
+  candidates.sort((left, right) => compareText(left.requirement_id, right.requirement_id));
+  return Object.freeze(candidates.map((candidate) => Object.freeze(candidate)));
+}
 
 type UnknownRecord = Record<string, unknown>;
 

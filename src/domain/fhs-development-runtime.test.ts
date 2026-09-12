@@ -9,6 +9,7 @@ import { test } from "node:test";
 import {
   defaultSandboxProbe,
   discoverSandboxRuntimeLayout,
+  FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS,
   fhsDevelopmentRuntimeReadiness,
   resolveFhsDevelopmentRuntime,
   resolveSandboxExecutionRequest,
@@ -96,6 +97,21 @@ function expectFailure(result: ReturnType<typeof resolveFhsDevelopmentRuntime>, 
   if (!result.ok) assert.equal(result.error.code, code, result.error.message);
 }
 
+function environmentWithFhsEvidence(
+  candidates: readonly FhsRuntimeExecutableDeclaration[],
+  pathValue = "/tmp/host-path-must-not-matter",
+): NodeJS.ProcessEnv {
+  const byRequirement = new Map(candidates.map((candidate) => [candidate.requirement_id, candidate.path]));
+  return {
+    PATH: pathValue,
+    HOME: "/tmp/host-home-must-not-matter",
+    COREPACK_HOME: "/tmp/host-corepack-must-not-matter",
+    [FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS["node-runtime"]]: byRequirement.get("node-runtime"),
+    [FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS["git-package"]]: byRequirement.get("git-package"),
+    [FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS["pnpm-package"]]: byRequirement.get("pnpm-package"),
+  };
+}
+
 test("development FHS materialization resolves explicit candidates outside /usr/bin", (t) => {
   const fixture = requireFixture(t);
   if (fixture === null) return;
@@ -148,13 +164,22 @@ test("FHS candidate ordering is deterministic and selection is independent of PA
     });
     assert.deepEqual(discovered.fhs_executable_candidates, []);
 
-    const withEvidence = {
-      ...discovered,
-      fhs_executable_candidates: fixture.candidates,
-    };
-    const readiness = fhsDevelopmentRuntimeReadiness("linux", withEvidence);
+    const productionLayout = discoverSandboxRuntimeLayout(environmentWithFhsEvidence(fixture.candidates));
+    assert.deepEqual(
+      productionLayout.fhs_executable_candidates?.map((candidate) => candidate.requirement_id),
+      ["git-package", "node-runtime", "pnpm-package"],
+    );
+    const materialized = resolveFhsDevelopmentRuntime({
+      executable_candidates: productionLayout.fhs_executable_candidates,
+    });
+    assert.equal(materialized.ok, true, materialized.ok ? "" : JSON.stringify(materialized.error));
+
+    const readiness = fhsDevelopmentRuntimeReadiness("linux", productionLayout);
     assert.equal(readiness.strict_ready, true, readiness.reason ?? "strict FHS runtime was not ready");
     assert.equal(readiness.reason, null);
+
+    const doctor = sandboxDoctorReport(readyProbe(), productionLayout);
+    assert.equal(doctor.strict_ready, true, doctor.strict_ready_reason ?? "doctor did not consume host evidence");
   } finally {
     fixture.cleanup();
   }
@@ -241,12 +266,17 @@ test("standalone Linux protected execution runs the materialized Node/Git/pnpm b
   const { repository, worktree } = createRepository();
   const backend = new LocalSessionBackend();
   try {
-    const materialized = resolveFhsDevelopmentRuntime({ executable_candidates: fixture.candidates });
+    const layout = discoverSandboxRuntimeLayout(environmentWithFhsEvidence(fixture.candidates, process.env.PATH ?? ""));
+    assert.deepEqual(
+      layout.fhs_executable_candidates?.map((candidate) => candidate.requirement_id),
+      ["git-package", "node-runtime", "pnpm-package"],
+    );
+    const materialized = resolveFhsDevelopmentRuntime({
+      executable_candidates: layout.fhs_executable_candidates,
+    });
     assert.equal(materialized.ok, true, materialized.ok ? "" : JSON.stringify(materialized.error));
     if (!materialized.ok) return;
 
-    const discovered = discoverSandboxRuntimeLayout();
-    const layout = { ...discovered, fhs_executable_candidates: fixture.candidates };
     const doctor = sandboxDoctorReport(defaultSandboxProbe, layout);
     assert.equal(doctor.strict_ready, true, doctor.strict_ready_reason ?? "strict FHS runtime was not ready");
 
