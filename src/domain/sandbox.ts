@@ -845,3 +845,14 @@ export {
 } from "./cgroups-v2.js";
 
 export { LANDLOCK_ACCESS_FS, LANDLOCK_ABI_MINIMUM, LANDLOCK_TRAMPOLINE } from "./landlock.js";
+
+export {
+  FHS_RUNTIME_LIBRARY_SEARCH_PATHS,
+  FHS_RUNTIME_MATERIALIZATION_CONTRACT_ID,
+  FHS_RUNTIME_MATERIALIZATION_SCHEMA_VERSION,
+  FHS_RUNTIME_ROOTS,
+  materializeFhsRuntime,
+  materializeFhsRuntimeProjection,
+  type FhsRuntimeExecutableDeclaration,
+  type FhsRuntimeMaterializationInput,
+} from "./fhs-runtime.js";
