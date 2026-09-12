@@ -19,6 +19,7 @@ import {
   sandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
 import type { CgroupLimitProfile } from "./cgroups-v2.js";
+import { buildExplicitCompatibilityRuntimeProjection } from "./compatibility-runtime-projection.js";
 import { validateSessionRuntimeProjection, type SessionRuntimeProjection } from "./runtime-projection.js";
 
 /**
@@ -166,7 +167,7 @@ export type SandboxExecutionRequest = {
   landlock_state?: LandlockEffectiveState;
   /** Required only when the selected protected profile mandates Landlock. */
   landlock_required?: boolean;
-  /** Validated explicit runtime view; omission retains the legacy compatibility profile. */
+  /** Validated explicit runtime view; protected launch rejects omission. */
   runtime_projection?: SessionRuntimeProjection;
 };
 
@@ -816,6 +817,13 @@ export {
   type SandboxCapabilityBaseline,
   type SandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
+
+export {
+  buildExplicitCompatibilityRuntimeProjection,
+  type CompatibilityRuntimeProjectionOptions,
+  type CompatibilityRuntimeProjectionSource,
+  type LegacyCompatibilityPathInputs,
+} from "./compatibility-runtime-projection.js";
 
 export {
   CANONICAL_EXECUTABLE_ROOT,

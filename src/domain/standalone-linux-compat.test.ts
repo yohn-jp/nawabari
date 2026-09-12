@@ -8,6 +8,7 @@ import { test } from "node:test";
 
 import { LocalSessionBackend } from "./session-backend.js";
 import {
+  buildExplicitCompatibilityRuntimeProjection,
   discoverSandboxRuntimeLayout,
   resolveSandboxExecutionRequest,
   runSandboxedCommand,
@@ -63,10 +64,13 @@ async function createProtectedSession(
     { branch: `feature/sandbox-${suffix}`, worktree, label: null, base: null },
   );
   expectSuccess(created, `create ${suffix}`);
+  const runtimeLayout = discoverSandboxRuntimeLayout();
+  const runtimeProjection = buildExplicitCompatibilityRuntimeProjection(runtimeLayout);
+  expectSuccess(runtimeProjection, `compatibility projection ${suffix}`);
   const resolved = await resolveSandboxExecutionRequest(
     backend,
     { cwd: worktree },
-    { session_id: created.value.session_id, enforce: true },
+    { session_id: created.value.session_id, enforce: true, runtime_projection: runtimeProjection.value },
   );
   expectSuccess(resolved, `resolve ${suffix}`);
   return {

@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { LocalSessionBackend } from "./session-backend.js";
 import { deriveLandlockRules, LANDLOCK_ACCESS_FS, LANDLOCK_ABI_MINIMUM, LANDLOCK_TRAMPOLINE } from "./landlock.js";
 import {
+  buildExplicitCompatibilityRuntimeProjection,
   compileSandboxInvocation,
   discoverSandboxRuntimeLayout,
   resolveSandboxExecutionRequest,
@@ -49,8 +50,15 @@ function topology(root: string): SandboxFilesystemTopology {
     user_tool_paths: [path.join(hostHome, ".local", "bin")],
     user_tool_home: hostHome,
     runtime_paths: ["/dev", "/proc", "/tmp"],
-    system_paths: ["/usr", "/etc/passwd"],
+    system_paths: ["/usr", "/bin", "/etc/passwd"],
   };
+}
+
+function compatibilityProjection(topologyValue: SandboxFilesystemTopology) {
+  const result = buildExplicitCompatibilityRuntimeProjection(topologyValue);
+  if (!result.ok) throw result.error;
+  assert.equal(result.ok, true);
+  return result.value;
 }
 
 test("Landlock rules use fixed namespace destinations and omit host topology paths", () => {
@@ -190,6 +198,7 @@ test("unsupported optional Landlock leaves the bubblewrap command unchanged and 
       sandbox_executable: bwrap,
       identity: { real_uid: 1_000, real_gid: 1_000, namespace_uid: 0, namespace_gid: 0 },
       filesystem: topologyValue,
+      runtime_projection: compatibilityProjection(topologyValue),
       required_capabilities: [
         "bubblewrap",
         "user_namespaces",
@@ -248,6 +257,7 @@ test("required Landlock fails closed when ABI or the canonical runtime adapter i
       sandbox_executable: bwrap,
       identity: { real_uid: 1_000, real_gid: 1_000, namespace_uid: 0, namespace_gid: 0 },
       filesystem: topologyValue,
+      runtime_projection: compatibilityProjection(topologyValue),
       required_capabilities: [
         "bubblewrap",
         "user_namespaces",
@@ -307,6 +317,7 @@ test("Landlock setup failure is reported once with bounded diagnostics and never
       sandbox_executable: bwrap,
       identity: { real_uid: 1_000, real_gid: 1_000, namespace_uid: 0, namespace_gid: 0 },
       filesystem: topologyValue,
+      runtime_projection: compatibilityProjection(topologyValue),
       required_capabilities: [
         "bubblewrap",
         "user_namespaces",
@@ -362,10 +373,17 @@ test("supported Landlock denies a write outside the canonical topology", async (
     );
     assert.equal(created.ok, true);
     if (!created.ok) return;
+    const runtimeProjection = buildExplicitCompatibilityRuntimeProjection(layout);
+    assert.equal(runtimeProjection.ok, true, runtimeProjection.ok ? "" : runtimeProjection.error.message);
+    if (!runtimeProjection.ok) return;
     const request = await resolveSandboxExecutionRequest(
       backend,
       { cwd: worktree },
-      { session_id: created.value.session_id, enforce: true },
+      {
+        session_id: created.value.session_id,
+        enforce: true,
+        runtime_projection: runtimeProjection.value,
+      },
     );
     assert.equal(request.ok, true, request.ok ? "" : request.error.message);
     if (!request.ok) return;
