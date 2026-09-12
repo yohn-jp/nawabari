@@ -48,6 +48,8 @@ function emptyLayout(overrides: Partial<SandboxRuntimeLayout> = {}): SandboxRunt
     ssl_certs: null,
     pki_certs: null,
     ca_certificates: null,
+    git_user_name: null,
+    git_user_email: null,
     ...overrides,
   };
 }

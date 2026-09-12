@@ -202,3 +202,26 @@ undeclared absolute store path therefore has no mount in the private root.
 Missing, invalid, or unavailable material uses the recoverable
 `RUNTIME_MATERIALIZATION_MISSING` error. The legacy broad store mount is
 emitted only when the caller explicitly selects the compatibility policy.
+
+## Projected Git author identity
+
+Issue #325 projects only the minimum Git author identity a commit needs
+(`user.name`/`user.email`) into the session-private Git config already
+described above; it never mounts host `HOME` or a caller's real global Git
+config.
+
+`discoverSandboxRuntimeLayout()` reads exactly two host global config keys
+through bounded `git config --global --get user.name`/`user.email` queries
+and carries the result as `git_identity` on `SandboxExecutionRequest`. The
+sandbox launcher's `prepareGitMetadata` step separately reads
+`user.name`/`user.email` from the authoritative host worktree with
+`git config --local --get`, which — per key — takes precedence over the
+projected host global value, then writes only the resolved keys into the
+existing session-private `git_metadata/config` file with
+`git config --file`. Neither read ever opens or copies a full config file,
+so credential helpers, hooks, aliases, and every other global/local setting
+are never imported. Identity absent at both scopes leaves the projected
+config without a `[user]` section, so a sandboxed commit fails exactly as an
+unconfigured Git would; `session-registry.ts` recognizes that specific
+failure and adds a remediation hint instead of a generic Git failure
+message.

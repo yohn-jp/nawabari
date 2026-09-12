@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -795,6 +795,54 @@ function copyIfRegular(source: string, destination: string): void {
   }
 }
 
+/**
+ * Read exactly one repository-local Git config key (`user.name`/`user.email`)
+ * from the authoritative host worktree via `git config --local --get`.
+ * `--local` scopes the query to that repository's own config file, so this
+ * never reads global/system config, credential helpers, hooks, or aliases. A
+ * missing key or command failure is a normal, non-fatal "not set" result.
+ */
+function readRepoLocalGitIdentityValue(key: "user.name" | "user.email", worktree: string): string | null {
+  try {
+    const output = execFileSync("git", ["config", "--local", "--get", key], {
+      cwd: worktree,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+    }).trim();
+    return output.length > 0 ? output : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Write exactly one key into the session-private Git config file. */
+function writeProjectedGitIdentityValue(configPath: string, key: "user.name" | "user.email", value: string): void {
+  execFileSync("git", ["config", "--file", configPath, key, value], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 2_000,
+  });
+}
+
+/**
+ * Project the minimum Git author identity a commit needs: `user.name` and
+ * `user.email`. Repository-local identity on the authoritative host worktree
+ * takes precedence, per key, over the host's projected global identity; the
+ * host's full global/system config, credentials, hooks, and aliases are
+ * never imported. Absent identity is left unset so commit semantics fail
+ * closed exactly as an unconfigured Git would.
+ */
+function projectGitIdentity(request: SandboxExecutionRequest, topology: ValidatedTopology): void {
+  const resolvedName =
+    readRepoLocalGitIdentityValue("user.name", topology.worktree) ?? request.git_identity.host_global_name;
+  const resolvedEmail =
+    readRepoLocalGitIdentityValue("user.email", topology.worktree) ?? request.git_identity.host_global_email;
+  const configPath = path.join(topology.git_metadata, "config");
+  if (resolvedName !== null) writeProjectedGitIdentityValue(configPath, "user.name", resolvedName);
+  if (resolvedEmail !== null) writeProjectedGitIdentityValue(configPath, "user.email", resolvedEmail);
+}
+
 function prepareGitMetadata(request: SandboxExecutionRequest, topology: ValidatedTopology): DomainResult<null> {
   try {
     fs.mkdirSync(topology.git_metadata, { recursive: true, mode: 0o700 });
@@ -833,6 +881,7 @@ function prepareGitMetadata(request: SandboxExecutionRequest, topology: Validate
     if (!fs.existsSync(path.join(topology.git_metadata, "HEAD"))) {
       fs.writeFileSync(path.join(topology.git_metadata, "HEAD"), "ref: refs/heads/main\n", { mode: 0o600 });
     }
+    projectGitIdentity(request, topology);
     return success(null);
   } catch (error: unknown) {
     return topologyError("Session-private Git metadata could not be prepared.", {
