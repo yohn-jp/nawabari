@@ -19,6 +19,7 @@ import {
   sandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
 import type { CgroupLimitProfile } from "./cgroups-v2.js";
+import { validateSessionRuntimeProjection, type SessionRuntimeProjection } from "./runtime-projection.js";
 
 /**
  * Versioned identity for the Linux sandbox execution contract (Issue #81).
@@ -165,6 +166,8 @@ export type SandboxExecutionRequest = {
   landlock_state?: LandlockEffectiveState;
   /** Required only when the selected protected profile mandates Landlock. */
   landlock_required?: boolean;
+  /** Validated explicit runtime view; omission retains the legacy compatibility profile. */
+  runtime_projection?: SessionRuntimeProjection;
 };
 
 export type SandboxCgroupConfig = {
@@ -189,6 +192,8 @@ export type SandboxExecutionOptions = {
   landlock?: SandboxLandlockRequirement;
   /** Explicit compatibility spelling for callers that persist profile flags. */
   landlock_required?: boolean;
+  /** Validated runtime projection consumed by the existing sandbox launcher. */
+  runtime_projection?: SessionRuntimeProjection;
 };
 
 /** Injectable capability probe so doctor/resolution logic stays host-independent and testable. */
@@ -693,6 +698,12 @@ export async function resolveSandboxExecutionRequest(
     );
   }
 
+  const runtimeProjection =
+    options.runtime_projection === undefined
+      ? success<SessionRuntimeProjection | undefined>(undefined)
+      : validateSessionRuntimeProjection(options.runtime_projection);
+  if (!runtimeProjection.ok) return failure(runtimeProjection.error);
+
   const doctor = sandboxDoctorReport(probe);
   if (options.enforce && !doctor.ready) {
     const code: ErrorCode = doctor.platform_supported
@@ -784,6 +795,7 @@ export async function resolveSandboxExecutionRequest(
     landlock_abi: doctor.landlock.abi,
     landlock_state: doctor.landlock.effective_state,
     landlock_required: landlockRequired,
+    ...(runtimeProjection.value === undefined ? {} : { runtime_projection: runtimeProjection.value }),
   });
 }
 

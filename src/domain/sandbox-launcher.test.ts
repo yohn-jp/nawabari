@@ -15,6 +15,12 @@ import {
   runSandboxedCommand,
   type SandboxProbe,
 } from "./sandbox.js";
+import {
+  EXPLICIT_COMPATIBILITY_RUNTIME_POLICY,
+  STRICT_RUNTIME_POLICY,
+  type RuntimePolicy,
+  validateSessionRuntimeProjection,
+} from "./runtime-projection.js";
 
 test("the seccomp baseline is versioned, deterministic, and uses bounded EPERM denials", () => {
   const first = compileSandboxSeccompProfile("x64");
@@ -122,6 +128,29 @@ async function resolvedRequest(repository: string, worktree: string, runtimeLayo
   return request.value;
 }
 
+function projectionInput(
+  filesystem: readonly Record<string, unknown>[],
+  policy: RuntimePolicy = STRICT_RUNTIME_POLICY,
+) {
+  return {
+    policy,
+    profile: { id: "explicit-test", version: "1" },
+    requirements: [],
+    filesystem,
+    executables: [],
+  };
+}
+
+function validatedProjection(
+  filesystem: readonly Record<string, unknown>[],
+  policy: RuntimePolicy = STRICT_RUNTIME_POLICY,
+) {
+  const result = validateSessionRuntimeProjection(projectionInput(filesystem, policy));
+  if (!result.ok) throw result.error;
+  assert.equal(result.ok, true);
+  return result.value;
+}
+
 test("compileSandboxInvocation emits fixed namespace/topology argv and terminates before command argv", async () => {
   const repository = createRepository();
   const worktree = `${repository}-owned`;
@@ -156,6 +185,283 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("explicit projections compile deterministic RO/RW mounts without legacy host visibility", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  const materialRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-material-"));
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const readAlpha = path.join(materialRoot, "zeta");
+    const readZeta = path.join(materialRoot, "alpha");
+    fs.mkdirSync(readAlpha);
+    fs.mkdirSync(readZeta);
+    const writable = path.join(worktree, "writable");
+    fs.mkdirSync(writable);
+    const projection = validatedProjection([
+      {
+        source: readAlpha,
+        target: "/runtime/zeta",
+        access_mode: "read-only",
+        provenance: "runtime-profile",
+      },
+      {
+        source: writable,
+        target: `${worktree}/writable`,
+        access_mode: "read-write",
+        provenance: "session",
+      },
+      {
+        source: readZeta,
+        target: "/runtime/alpha",
+        access_mode: "read-only",
+        provenance: "package",
+      },
+    ]);
+    const compiled = compileSandboxInvocation({ ...request, runtime_projection: projection }, { command: "true" });
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+
+    const alpha = compiled.value.args.findIndex(
+      (value, index, args) => value === "--ro-bind" && args[index + 2] === "/runtime/alpha",
+    );
+    const zeta = compiled.value.args.findIndex(
+      (value, index, args) => value === "--ro-bind" && args[index + 2] === "/runtime/zeta",
+    );
+    assert.ok(alpha > 0 && zeta > alpha, "projection mounts must sort by namespace target");
+    assert.deepEqual(compiled.value.args.slice(alpha - 2, alpha), ["--dir", "/runtime/alpha"]);
+    assert.deepEqual(compiled.value.args.slice(zeta - 2, zeta), ["--dir", "/runtime/zeta"]);
+    assert.deepEqual(compiled.value.args.slice(alpha, alpha + 3), ["--ro-bind", readZeta, "/runtime/alpha"]);
+    assert.deepEqual(compiled.value.args.slice(zeta, zeta + 3), ["--ro-bind", readAlpha, "/runtime/zeta"]);
+    const writableIndex = compiled.value.args.findIndex(
+      (value, index, args) => value === "--bind" && args[index + 1] === writable,
+    );
+    assert.deepEqual(compiled.value.args.slice(writableIndex, writableIndex + 3), [
+      "--bind",
+      writable,
+      `${worktree}/writable`,
+    ]);
+
+    // An explicit projection is the complete user/runtime view. The fixed
+    // backend mounts remain, while the discovered FHS/user-tool mounts do not.
+    assert.equal(compiled.value.args.includes("/dev"), true);
+    assert.equal(compiled.value.args.includes("/proc"), true);
+    assert.equal(compiled.value.args.includes("/tmp"), true);
+    assert.equal(compiled.value.args.includes("/usr"), false);
+    assert.equal(compiled.value.args.includes("/bin"), false);
+    assert.equal(compiled.value.args.includes(fixture.layout.user_local_bin ?? ""), false);
+    const pathSetting = compiled.value.args.indexOf("PATH");
+    assert.deepEqual(compiled.value.args.slice(pathSetting, pathSetting + 2), ["PATH", ""]);
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(materialRoot, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("explicit projections compile a regular-file source without misrepresenting it as a directory", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  const materialRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-material-"));
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const fileSource = path.join(materialRoot, "config.json");
+    fs.writeFileSync(fileSource, '{"ok":true}');
+    const projection = validatedProjection([
+      { source: fileSource, target: "/etc/app/config.json", access_mode: "read-only", provenance: "package" },
+    ]);
+    const compiled = compileSandboxInvocation({ ...request, runtime_projection: projection }, { command: "true" });
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+
+    const bindIndex = compiled.value.args.findIndex(
+      (value, index, args) => value === "--ro-bind" && args[index + 2] === "/etc/app/config.json",
+    );
+    assert.ok(bindIndex > 0, "the file projection must be bound");
+    assert.deepEqual(compiled.value.args.slice(bindIndex, bindIndex + 3), [
+      "--ro-bind",
+      fileSource,
+      "/etc/app/config.json",
+    ]);
+    // Only the parent directories are pre-created; the target itself must
+    // never be turned into a `--dir` or the bind would demand a directory
+    // where the projection promises a regular file.
+    assert.equal(compiled.value.args.includes("/etc/app/config.json"), true);
+    const dirArgs = compiled.value.args.reduce<string[]>((acc, value, index, args) => {
+      if (value === "--dir") acc.push(args[index + 1] as string);
+      return acc;
+    }, []);
+    assert.ok(
+      !dirArgs.includes("/etc/app/config.json"),
+      "a file projection target must not be pre-created as a directory",
+    );
+    assert.ok(dirArgs.includes("/etc/app"), "the file projection's parent directory must be pre-created");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(materialRoot, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("explicit projection source/target escapes, collisions, and unauthorized writes fail closed", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  const materialRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-material-"));
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const material = path.join(materialRoot, "material");
+    const outside = path.join(materialRoot, "outside");
+    fs.mkdirSync(material);
+    fs.mkdirSync(outside);
+
+    const sourceLink = path.join(materialRoot, "source-link");
+    fs.symlinkSync(outside, sourceLink, "dir");
+    const escapedSource = compileSandboxInvocation(
+      {
+        ...request,
+        runtime_projection: validatedProjection([
+          { source: sourceLink, target: "/runtime/source", access_mode: "read-only", provenance: "package" },
+        ]),
+      },
+      { command: "true" },
+    );
+    assert.equal(escapedSource.ok, false);
+    if (!escapedSource.ok) assert.equal(escapedSource.error.code, "RUNTIME_PROJECTION_INVALID");
+
+    const targetLink = path.join(worktree, "target-link");
+    fs.symlinkSync(outside, targetLink, "dir");
+    const escapedTarget = compileSandboxInvocation(
+      {
+        ...request,
+        runtime_projection: validatedProjection([
+          {
+            source: material,
+            target: `${worktree}/target-link/file`,
+            access_mode: "read-only",
+            provenance: "package",
+          },
+        ]),
+      },
+      { command: "true" },
+    );
+    assert.equal(escapedTarget.ok, false);
+    if (!escapedTarget.ok) assert.equal(escapedTarget.error.code, "RUNTIME_PROJECTION_INVALID");
+
+    const duplicate = compileSandboxInvocation(
+      {
+        ...request,
+        runtime_projection: projectionInput([
+          { source: material, target: "/runtime/same", access_mode: "read-only", provenance: "package" },
+          { source: outside, target: "/runtime/same", access_mode: "read-write", provenance: "session" },
+        ]) as never,
+      },
+      { command: "true" },
+    );
+    assert.equal(duplicate.ok, false);
+    if (!duplicate.ok) assert.equal(duplicate.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
+
+    // Lexicographic target order places a sibling between an ancestor and its
+    // descendant ("/runtime" < "/runtime-alt" < "/runtime/tool"), so overlap
+    // detection must compare every pair, not just adjacent ones in sort order.
+    const nonAdjacentOverlap = compileSandboxInvocation(
+      {
+        ...request,
+        runtime_projection: projectionInput([
+          { source: material, target: "/runtime", access_mode: "read-only", provenance: "package" },
+          { source: material, target: "/runtime-alt", access_mode: "read-only", provenance: "package" },
+          { source: material, target: "/runtime/tool", access_mode: "read-only", provenance: "package" },
+        ]) as never,
+      },
+      { command: "true" },
+    );
+    assert.equal(nonAdjacentOverlap.ok, false);
+    if (!nonAdjacentOverlap.ok) assert.equal(nonAdjacentOverlap.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
+
+    const backendCollision = compileSandboxInvocation(
+      {
+        ...request,
+        runtime_projection: validatedProjection([
+          { source: material, target: "/dev/host", access_mode: "read-only", provenance: "package" },
+        ]),
+      },
+      { command: "true" },
+    );
+    assert.equal(backendCollision.ok, false);
+    if (!backendCollision.ok) assert.equal(backendCollision.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
+
+    const broadWrite = compileSandboxInvocation(
+      {
+        ...request,
+        runtime_projection: validatedProjection([
+          { source: material, target: "/runtime/write", access_mode: "read-write", provenance: "package" },
+        ]),
+      },
+      { command: "true" },
+    );
+    assert.equal(broadWrite.ok, false);
+    if (!broadWrite.ok) assert.equal(broadWrite.error.code, "RUNTIME_PROJECTION_INVALID");
+
+    const traversal = compileSandboxInvocation(
+      {
+        ...request,
+        runtime_projection: projectionInput([
+          { source: material, target: "/runtime/../escape", access_mode: "read-only", provenance: "package" },
+        ]) as never,
+      },
+      { command: "true" },
+    );
+    assert.equal(traversal.ok, false);
+    if (!traversal.ok) assert.equal(traversal.error.code, "RUNTIME_PROJECTION_INVALID");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(materialRoot, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("compatibility profile selection is explicit and does not silently fall back from projection validation", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  const materialRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-material-"));
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const material = path.join(materialRoot, "material");
+    fs.mkdirSync(material);
+    const compatibility = validatedProjection(
+      [{ source: material, target: "/compat/material", access_mode: "read-only", provenance: "compatibility" }],
+      EXPLICIT_COMPATIBILITY_RUNTIME_POLICY,
+    );
+    const compiled = compileSandboxInvocation({ ...request, runtime_projection: compatibility }, { command: "true" });
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+    assert.ok(compiled.value.args.includes("/compat/material"));
+    assert.equal(compiled.value.args.includes("/usr"), false);
+
+    const invalidStrict = compileSandboxInvocation(
+      {
+        ...request,
+        runtime_projection: projectionInput([
+          { source: material, target: "/compat/material", access_mode: "read-only", provenance: "compatibility" },
+        ]) as never,
+      },
+      { command: "true" },
+    );
+    assert.equal(invalidStrict.ok, false);
+    if (!invalidStrict.ok) assert.equal(invalidStrict.error.code, "RUNTIME_PROJECTION_INVALID");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(materialRoot, { recursive: true, force: true });
     fs.rmSync(repository, { recursive: true, force: true });
   }
 });

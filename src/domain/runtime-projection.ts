@@ -318,13 +318,15 @@ function assertUniqueRequirements(requirements: readonly RuntimeRequirement[]): 
 function assertUniqueFilesystemTargets(filesystem: readonly RuntimeFilesystemProjection[]): DomainResult<null> {
   const ordered = [...filesystem].sort((left, right) => compareText(left.target, right.target));
   for (let index = 1; index < ordered.length; index += 1) {
-    const previous = ordered[index - 1];
     const current = ordered[index];
-    if (previous.target === current.target) {
-      return ambiguousProjection("filesystem.target", "multiple projections select the same target", current.target);
-    }
-    if (current.target.startsWith(`${previous.target}/`)) {
-      return ambiguousProjection("filesystem.target", "nested targets have overlapping visibility", current.target);
+    for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
+      const prior = ordered[priorIndex];
+      if (prior.target === current.target) {
+        return ambiguousProjection("filesystem.target", "multiple projections select the same target", current.target);
+      }
+      if (current.target.startsWith(`${prior.target}/`) || prior.target.startsWith(`${current.target}/`)) {
+        return ambiguousProjection("filesystem.target", "nested targets have overlapping visibility", current.target);
+      }
     }
   }
   return success(null);
