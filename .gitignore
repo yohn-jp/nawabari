@@ -29,3 +29,6 @@ test-artifacts/
 .codegraph
 .claude/worktrees/
 .worktrees/
+
+# publish.yml's release-tag self-verification checkout (see .prettierignore)
+.workflow-source/
