@@ -19,13 +19,27 @@ import {
   sandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
 import type { CgroupLimitProfile } from "./cgroups-v2.js";
-import { buildExplicitCompatibilityRuntimeProjection } from "./compatibility-runtime-projection.js";
-import { validateSessionRuntimeProjection, type SessionRuntimeProjection } from "./runtime-projection.js";
+import {
+  DEFAULT_RUNTIME_POLICY,
+  validateRuntimePolicy,
+  validateSessionRuntimeProjection,
+  type RuntimePolicy,
+  type SessionRuntimeProjection,
+} from "./runtime-projection.js";
 import {
   fhsDevelopmentRuntimeReadiness,
   readExplicitFhsDevelopmentExecutableCandidates,
 } from "./fhs-development-runtime.js";
 import type { FhsRuntimeExecutableDeclaration } from "./fhs-runtime.js";
+import {
+  resolveRuntimeProjection,
+  runtimeDoctorReport,
+  type RuntimeDoctorReport,
+  type RuntimeResolutionEvidence,
+  type RuntimeResolutionFhsOptions,
+} from "./runtime-resolution.js";
+import type { ResolvedRuntimeProfile, RuntimeProfileSelection } from "./runtime-profile.js";
+import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
 
 /**
  * Versioned identity for the Linux sandbox execution contract (Issue #81).
@@ -106,6 +120,7 @@ export type SandboxDoctorReport = {
   strict_ready_reason: string | null;
   strict_ready_code: ErrorCode | null;
   strict_ready_details: JsonObject;
+  runtime: RuntimeDoctorReport;
 };
 
 export type { LandlockCapability, LandlockEffectiveState, LandlockRule } from "./landlock.js";
@@ -179,6 +194,8 @@ export type SandboxExecutionRequest = {
   landlock_required?: boolean;
   /** Validated explicit runtime view; protected launch rejects omission. */
   runtime_projection?: SessionRuntimeProjection;
+  /** Policy/profile/materializer evidence for the resolved runtime. */
+  runtime_resolution?: RuntimeResolutionEvidence;
 };
 
 export type SandboxCgroupConfig = {
@@ -205,6 +222,13 @@ export type SandboxExecutionOptions = {
   landlock_required?: boolean;
   /** Validated runtime projection consumed by the existing sandbox launcher. */
   runtime_projection?: SessionRuntimeProjection;
+  /** Explicit policy selection; omitted means the strict default. */
+  runtime_policy?: RuntimePolicy;
+  /** Internal validated profile/adapter seams; the CLI uses the canonical default. */
+  runtime_profile?: ResolvedRuntimeProfile;
+  runtime_profile_selection?: RuntimeProfileSelection;
+  runtime_nix_options?: NixRuntimeClosureOptions;
+  runtime_fhs_options?: RuntimeResolutionFhsOptions;
 };
 
 /** Injectable capability probe so doctor/resolution logic stays host-independent and testable. */
@@ -239,6 +263,8 @@ export type SandboxProbe = {
  */
 export type SandboxRuntimeLayout = {
   bubblewrap: string | null;
+  /** Host Nix executable used only for pre-launch closure queries. */
+  nix?: string | null;
   /** Optional interpreter used only to install Landlock inside bubblewrap. */
   landlock_helper?: string | null;
   /** Host HOME used only to resolve the selected read-only tool directories. */
@@ -551,6 +577,7 @@ export function sandboxDoctorReport(
     strict_ready_reason: strictReadiness.reason,
     strict_ready_code: strictReadiness.code,
     strict_ready_details: strictReadiness.details,
+    runtime: runtimeDoctorReport(platform, runtimeLayout),
   };
 }
 
@@ -575,6 +602,7 @@ export function discoverSandboxRuntimeLayout(environment: NodeJS.ProcessEnv = pr
   return {
     bubblewrap: executableOnPath("bwrap", environment),
     landlock_helper: executableOnPath("python3", environment),
+    nix: executableOnPath("nix", environment),
     user_home: home,
     user_local_bin: home === null ? null : existingPath(path.join(home, ".local", "bin")),
     user_local_lib: home === null ? null : existingPath(path.join(home, ".local", "lib")),
@@ -722,12 +750,6 @@ export async function resolveSandboxExecutionRequest(
     );
   }
 
-  const providedRuntimeProjection =
-    options.runtime_projection === undefined
-      ? success<SessionRuntimeProjection | undefined>(undefined)
-      : validateSessionRuntimeProjection(options.runtime_projection);
-  if (!providedRuntimeProjection.ok) return failure(providedRuntimeProjection.error);
-
   const doctor = sandboxDoctorReport(probe, runtimeLayout);
   if (options.enforce && !doctor.ready) {
     const code: ErrorCode = doctor.platform_supported
@@ -790,15 +812,52 @@ export async function resolveSandboxExecutionRequest(
     );
   }
 
-  // Until the runtime-policy resolver selects strict or explicit compatibility,
-  // the existing protected path is the legacy compatibility path. Materialize
-  // that path into the same explicit projection contract before returning the
-  // request; the launcher never treats omission as compatibility visibility.
-  const runtimeProjection =
-    providedRuntimeProjection.value === undefined && options.enforce
-      ? buildExplicitCompatibilityRuntimeProjection(runtimeLayout)
-      : providedRuntimeProjection;
-  if (!runtimeProjection.ok) return failure(runtimeProjection.error);
+  const requestedPolicy = validateRuntimePolicy(
+    options.runtime_policy ?? options.runtime_projection?.policy ?? DEFAULT_RUNTIME_POLICY,
+  );
+  if (!requestedPolicy.ok) return failure(requestedPolicy.error);
+  let runtimeProjection: SessionRuntimeProjection | undefined;
+  let runtimeResolution: RuntimeResolutionEvidence | undefined;
+  if (options.runtime_projection !== undefined) {
+    const provided = validateSessionRuntimeProjection(options.runtime_projection);
+    if (!provided.ok) return failure(provided.error);
+    if (provided.value.policy.mode !== requestedPolicy.value.mode) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "The runtime projection policy does not match the requested runtime policy.",
+          { projection_policy: provided.value.policy.mode, requested_policy: requestedPolicy.value.mode },
+        ),
+      );
+    }
+    runtimeProjection = provided.value;
+    runtimeResolution = Object.freeze({
+      policy: provided.value.policy,
+      profile: provided.value.profile,
+      materializer: "provided" as const,
+    });
+  } else if (options.enforce) {
+    const resolved = resolveRuntimeProjection({
+      policy: requestedPolicy.value,
+      profile: options.runtime_profile,
+      profile_selection: options.runtime_profile_selection,
+      platform: doctor.platform,
+      runtime_layout: runtimeLayout,
+      nix: options.runtime_nix_options,
+      fhs: options.runtime_fhs_options,
+    });
+    if (!resolved.ok) return failure(resolved.error);
+    runtimeProjection = resolved.value.projection;
+    runtimeResolution = Object.freeze({
+      policy: resolved.value.policy,
+      profile: resolved.value.profile,
+      materializer: resolved.value.materializer,
+    });
+  } else {
+    // Non-enforced callers retain the advisory shape. The launcher itself
+    // still refuses to execute an enforced request without a projection.
+    runtimeProjection = undefined;
+  }
 
   return success({
     schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
@@ -829,7 +888,8 @@ export async function resolveSandboxExecutionRequest(
     landlock_abi: doctor.landlock.abi,
     landlock_state: doctor.landlock.effective_state,
     landlock_required: landlockRequired,
-    ...(runtimeProjection.value === undefined ? {} : { runtime_projection: runtimeProjection.value }),
+    ...(runtimeProjection === undefined ? {} : { runtime_projection: runtimeProjection }),
+    ...(runtimeResolution === undefined ? {} : { runtime_resolution: runtimeResolution }),
   });
 }
 
@@ -929,6 +989,21 @@ export {
   type FhsDevelopmentRuntimeReadiness,
   type FhsDevelopmentRuntimeResolution,
 } from "./fhs-development-runtime.js";
+
+export {
+  resolveRuntimeProjection,
+  resolveRuntimeResolution,
+  resolveSessionRuntimeProjection,
+  runtimeDoctorReport,
+  runtimeMaterializerAvailability,
+  type RuntimeDoctorReport,
+  type RuntimeMaterializer,
+  type RuntimeMaterializerAvailability,
+  type RuntimeResolution,
+  type RuntimeResolutionEvidence,
+  type RuntimeResolutionFhsOptions,
+  type RuntimeResolutionOptions,
+} from "./runtime-resolution.js";
 
 export {
   TGREP_BACKEND_EVIDENCE,

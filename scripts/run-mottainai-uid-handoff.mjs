@@ -196,6 +196,27 @@ function makeWorldReadable(root) {
   }
 }
 
+// #297's strict resolver only trusts exact, bounded Node/Git/pnpm executable
+// evidence; it never discovers PATH, Corepack, or a fixed `/usr/bin/*` host
+// layout. Build that evidence once and forward it through the UID-swapping
+// runner so the packed principal invocation resolves the same way the smoke
+// test's protected-execution path does.
+function resolveFhsDevelopmentEvidence(root) {
+  const fixtureRoot = path.join(root, "fhs-development-evidence");
+  fs.mkdirSync(fixtureRoot, { recursive: true, mode: 0o777 });
+  const gitExecutable = fs.realpathSync.native(run("which", ["git"]).stdout.trim());
+  const pnpmExecutable = path.join(fixtureRoot, "fhs-pnpm");
+  fs.writeFileSync(pnpmExecutable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  fs.chmodSync(pnpmExecutable, 0o755);
+  const evidence = {
+    NAWABARI_FHS_NODE_EXECUTABLE: fs.realpathSync.native(process.execPath),
+    NAWABARI_FHS_GIT_EXECUTABLE: gitExecutable,
+    NAWABARI_FHS_PNPM_EXECUTABLE: fs.realpathSync.native(pnpmExecutable),
+  };
+  makeWorldReadable(fixtureRoot);
+  return evidence;
+}
+
 function gitEnv(home) {
   return {
     PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
@@ -242,7 +263,7 @@ function parseCli(result, label) {
   }
 }
 
-function invoke(runner, root, cwd, home, uid, binary, args) {
+function invoke(runner, root, cwd, home, uid, binary, args, fhsEvidence) {
   const environment = {
     ...gitEnv(home),
     PATH: `${path.dirname(binary)}${path.delimiter}${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}`,
@@ -250,6 +271,7 @@ function invoke(runner, root, cwd, home, uid, binary, args) {
     XDG_CONFIG_HOME: path.join(home, ".config"),
     XDG_CACHE_HOME: path.join(home, ".cache"),
     NAWABARI_UID_HANDOFF_FIXTURE: "1",
+    ...fhsEvidence,
   };
   const result = spawnSync(runner, ["--uid", String(uid), "--root", root, "--cwd", cwd, "--", binary, ...args], {
     cwd,
@@ -297,11 +319,11 @@ function assertNoPrincipalRegistry(repository) {
   }
 }
 
-function invokePrincipal({ runner, root, binary, uid, context }) {
+function invokePrincipal({ runner, root, binary, uid, context, fhsEvidence }) {
   const { repository, home, worktree } = context;
   const repositoryId = path.join(repository, ".git");
   const common = (args, label, cwd = repository) => {
-    const invocation = invoke(runner, root, cwd, home, uid, binary, ["--json", ...args]);
+    const invocation = invoke(runner, root, cwd, home, uid, binary, ["--json", ...args], fhsEvidence);
     return assertOk(invocation, `${uid} ${label}`);
   };
   const callerIdentity = invoke(runner, root, repository, home, uid, process.execPath, [
@@ -561,6 +583,7 @@ function main() {
     const binary = path.join(consumer, "node_modules", ".bin", "nawabari");
     if (!fs.existsSync(binary)) throw new Error("packed Nawabari binary was not installed in the fixture consumer");
 
+    const fhsEvidence = resolveFhsDevelopmentEvidence(tempRoot);
     const principals = [];
     for (const uid of options.uids) {
       const contextRoot = path.join(tempRoot, "principal-contexts", String(uid));
@@ -579,6 +602,7 @@ function main() {
           binary,
           uid,
           context: { repository, remote, home, worktree },
+          fhsEvidence,
         }),
       );
     }

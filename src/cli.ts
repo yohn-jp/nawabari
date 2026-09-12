@@ -35,6 +35,11 @@ import {
   type SandboxProbe,
   type SandboxRuntimeLayout,
 } from "./domain/sandbox.js";
+import {
+  EXPLICIT_COMPATIBILITY_RUNTIME_POLICY,
+  STRICT_RUNTIME_POLICY,
+  type RuntimePolicyMode,
+} from "./domain/runtime-projection.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -112,8 +117,8 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session id": [],
   "session show": ["--session"],
   "session inspect": ["--session", "--integrated-revision"],
-  "session run": ["--session"],
-  "session shell": ["--session"],
+  "session run": ["--session", "--runtime-policy"],
+  "session shell": ["--session", "--runtime-policy"],
   "session list": ["--all", "--history", "--limit", "--offset"],
   "session claim": ["--resource", "--mode", "--session", "--repository"],
   "session update": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
@@ -408,6 +413,7 @@ type ParsedOptions = {
   fetch_remote: string | null;
   fetch_branch: string | null;
   preview: boolean;
+  runtime_policy: RuntimePolicyMode | null;
 };
 
 function usageError(
@@ -508,6 +514,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     fetch_remote: null,
     fetch_branch: null,
     preview: false,
+    runtime_policy: null,
   };
   let dryRun = false;
 
@@ -550,7 +557,21 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     if (inlineValue === null) index += 1;
 
     if (name === "--session") options.session_id = value;
-    else if (name === "--branch") options.branch = value;
+    else if (name === "--runtime-policy") {
+      if (options.runtime_policy !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--runtime-policy may be supplied only once.", { option: name }));
+      }
+      if (value !== "strict" && value !== "compatibility") {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--runtime-policy requires strict or compatibility.", {
+            option: name,
+            value,
+            values: ["strict", "compatibility"],
+          }),
+        );
+      }
+      options.runtime_policy = value;
+    } else if (name === "--branch") options.branch = value;
     else if (name === "--worktree") options.worktree = value;
     else if (name === "--worktree-root") options.worktree_root = value;
     else if (name === "--base") options.base = value;
@@ -1308,13 +1329,16 @@ async function executeProtectedSessionCommand(
   if (delimiter === -1) {
     return failure(usageError("MISSING_ARGUMENT", `${commandName} requires a -- terminator before the command.`));
   }
-  const parsed = parseOptions(arguments_.slice(0, delimiter), new Set(["--session"]));
+  const parsed = parseOptions(arguments_.slice(0, delimiter), new Set(["--session", "--runtime-policy"]));
   if (!parsed.ok) return parsed;
   const command = arguments_[delimiter + 1];
   if (command === undefined || command.length === 0) {
     return failure(usageError("MISSING_ARGUMENT", `${commandName} requires a command after --.`));
   }
-  const executable = interactive ? projectedShellPath(command) : { ok: true as const, value: command };
+  const executable =
+    interactive && parsed.value.runtime_policy !== "compatibility"
+      ? projectedShellPath(command)
+      : { ok: true as const, value: command };
   if (!executable.ok) return executable;
 
   const request = await resolveSandboxExecutionRequest(
@@ -1323,6 +1347,8 @@ async function executeProtectedSessionCommand(
     {
       session_id: parsed.value.session_id,
       enforce: true,
+      runtime_policy:
+        parsed.value.runtime_policy === "compatibility" ? EXPLICIT_COMPATIBILITY_RUNTIME_POLICY : STRICT_RUNTIME_POLICY,
       ...(dependencies.sandboxRuntimeProjection === undefined
         ? {}
         : { runtime_projection: dependencies.sandboxRuntimeProjection }),
@@ -1343,7 +1369,16 @@ async function executeProtectedSessionCommand(
     },
     interactive ? { interactive: true } : undefined,
   );
-  return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  if (!result.ok) return result;
+  return {
+    ok: true,
+    value: {
+      ...(result.value as unknown as JsonObject),
+      ...(result.value.runtime_resolution === undefined && request.value.runtime_resolution === undefined
+        ? {}
+        : { runtime_resolution: result.value.runtime_resolution ?? request.value.runtime_resolution }),
+    },
+  };
 }
 
 async function executeCommand(
@@ -1797,7 +1832,12 @@ async function executeCommand(
   if (command === "doctor") {
     const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
     if (!parsed.ok) return parsed;
-    const report = await runDoctor(dependencies.cwd, dependencies.sandboxProbe);
+    const report = await runDoctor(
+      dependencies.cwd,
+      dependencies.sandboxProbe,
+      undefined,
+      dependencies.sandboxRuntimeLayout,
+    );
     if (!report.ok) return report;
     if (report.value.ok) return { ok: true, value: report.value as unknown as JsonObject };
     return failure(

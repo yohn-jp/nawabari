@@ -1,10 +1,15 @@
 # Standalone Linux protected-session compatibility
 
-The executable conformance evidence for Issue #147 is
+The executable compatibility conformance evidence for Issue #147 is
 `src/domain/standalone-linux-compat.test.ts`. It resolves a real session with
-`enforce: true`, uses the runtime layout discovered by the canonical profile,
-and executes commands through `runSandboxedCommand`; it does not use the
-controlled bubblewrap test stub.
+`enforce: true` and the explicit `EXPLICIT_COMPATIBILITY_RUNTIME_POLICY`, uses
+the discovered runtime layout, and executes commands through
+`runSandboxedCommand`; it does not use the controlled bubblewrap test stub.
+
+The default protected path is strict `development` runtime resolution. Its
+policy/materializer wiring and default-deny projection are covered by
+`src/domain/runtime-resolution.test.ts` and the protected-runtime package
+coverage; this compatibility suite intentionally opts into the legacy layout.
 
 Run the evidence on a supported standalone Linux host with:
 

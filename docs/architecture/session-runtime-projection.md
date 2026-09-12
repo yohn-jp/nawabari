@@ -3,7 +3,7 @@
 Issue #287 defines the target protected-session model as:
 
 ```text
-Session authority -> Runtime projection -> Existing isolation backend -> Process
+Session authority -> profile/materializer resolver -> Runtime projection -> Existing isolation backend -> Process
 ```
 
 Issue #288 establishes the typed contract at the middle boundary. The
@@ -35,17 +35,19 @@ and third-party tools remain outside this stable domain vocabulary.
 
 Strict policy is the default and encodes `host_visibility: "default-deny"`
 with `unrestricted_host_fallback: "forbidden"`. Compatibility projections
-must carry compatibility provenance and use the explicit compatibility policy.
-An omitted policy cannot select compatibility behavior.
+must carry compatibility provenance and use
+`EXPLICIT_COMPATIBILITY_RUNTIME_POLICY`; an omitted policy or projection
+cannot select compatibility behavior for an enforced request.
 
 ## Sandbox ownership
 
 `SessionRuntimeProjection` is resolved before the isolation backend. The
 existing `SandboxExecutionRequest` remains the contract that binds an already
-authorized Nawabari session to bubblewrap/capability/namespace execution. A
-future resolver may consume this projection while compiling the sandbox
-topology, but #288 does not add a second executor or change bubblewrap
-behavior. The existing launcher consumes the projection as the sole enforced
+authorized Nawabari session to bubblewrap/capability/namespace execution.
+Issue #297 composes the canonical profile, the selected Nix/FHS materializer,
+and the #293 executable surface before attaching the validated projection to
+that request. It does not add a second executor or change bubblewrap's
+authority. The existing launcher consumes the projection as the sole enforced
 user/runtime visibility authority. It emits canonical
 `--ro-bind`/`--bind` entries in target order after the backend-owned mounts. An
 explicit projection is the complete user/runtime view; it does not inherit the
@@ -119,6 +121,13 @@ independently; choosing how to resolve or mount it is outside this contract.
 
 ## Bounded FHS materialization
 
+Issue #314 owns the standalone Linux development materialization and strict
+readiness path in `src/domain/fhs-development-runtime.ts`. It accepts only
+explicit executable evidence, delegates bounded ELF/shebang closure work to
+`src/domain/fhs-runtime.ts`, and compiles the result through #293. Issue #297
+selects and invokes that authority; it does not add another FHS declaration or
+readiness implementation.
+
 `src/domain/fhs-runtime.ts` consumes a resolved profile plus one explicit FHS
 host executable declaration for each requirement. Strict mode resolves the ELF
 `PT_INTERP` and recursive `DT_NEEDED` closure using fixed FHS paths and emits
@@ -131,6 +140,27 @@ return recoverable `RUNTIME_MATERIALIZATION_MISSING`; they never select a
 fallback. Legacy omitted-projection behavior remains solely for non-enforced
 callers of the pre-materialization launcher; protected execution requires an
 explicit projection.
+
+## Default runtime resolution
+
+Issue #297 owns only the convergence wiring in
+`src/domain/runtime-resolution.ts`. An enforced `session run`, `session exec`,
+or `session shell` request uses `STRICT_RUNTIME_POLICY` and the canonical
+`development` profile unless the caller supplies
+`--runtime-policy compatibility`. Resolution selects exactly one strict
+materializer: native Nix closure materialization when the Nix store, current
+system, and Nix executable are available; otherwise bounded standalone-Linux
+FHS materialization. A selected materializer failure is terminal; the
+resolver never retries with broad mounts, host `PATH`, or another materializer.
+
+Strict Nix selection delegates to #291, strict FHS selection delegates to the
+#314 materialization/readiness path, and explicit compatibility delegates to
+the #315/#316 `buildExplicitCompatibilityRuntimeProjection` authority. The
+selected result is validated through #293 and attached as
+`runtime_projection` before protected launch. Runtime-resolution evidence
+retains policy, profile, and materializer. Provider leaves such as #295,
+#296, and #309 remain opt-in and are not selected by the canonical
+`development` default.
 
 ## Projected pnpm middleware
 

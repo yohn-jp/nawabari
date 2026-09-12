@@ -74,7 +74,14 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
     command: "doctor",
     report_field: "sandbox",
     authority: "sandboxDoctorReport",
-    fields: ["platform", "platform_supported", "capabilities", "ready", "missing_required", "network_mode"],
+    fields: ["platform", "platform_supported", "capabilities", "ready", "missing_required", "network_mode", "runtime"],
+  },
+  runtime: {
+    default_policy: "strict",
+    default_profile: "development",
+    compatibility: "explicit-only",
+    materializers: ["nix", "fhs"],
+    projection_required_when_enforced: true,
   },
   failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["protected-execution"],
   failure_code_policy: {
@@ -712,6 +719,7 @@ export function machineContract(packageVersion: string): JsonObject {
             fail_closed: capability.fail_closed,
             ambient_fallback: capability.ambient_fallback,
             readiness: jsonClone(capability.readiness),
+            runtime: jsonClone(capability.runtime),
           }
         : {}),
     })),

@@ -97,6 +97,8 @@ export type SandboxExecutionResult = {
     readonly state: LandlockEffectiveState;
     readonly rule_count: number;
   };
+  /** Policy/profile/materializer selected before launch. */
+  readonly runtime_resolution?: SandboxExecutionRequest["runtime_resolution"];
 };
 
 export type SandboxLauncherOptions = {
@@ -1464,6 +1466,7 @@ export function runSandboxedCommand(
                 },
               }),
           landlock: invocation.value.landlock,
+          ...(request.runtime_resolution === undefined ? {} : { runtime_resolution: request.runtime_resolution }),
         }),
       );
     };

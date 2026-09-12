@@ -14,6 +14,7 @@ import {
   SANDBOX_REQUIRED_CAPABILITIES,
   type SandboxProbe,
 } from "./sandbox.js";
+import { EXPLICIT_COMPATIBILITY_RUNTIME_POLICY } from "./runtime-projection.js";
 
 function readyProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe {
   return {
@@ -118,7 +119,11 @@ test("resolveSandboxExecutionRequest binds an owned active session and derives i
     const result = await resolveSandboxExecutionRequest(
       backend,
       { cwd: worktreePath },
-      { session_id: created.value.session_id, enforce: true },
+      {
+        session_id: created.value.session_id,
+        enforce: true,
+        runtime_policy: EXPLICIT_COMPATIBILITY_RUNTIME_POLICY,
+      },
       readyProbe(),
     );
 
@@ -225,7 +230,12 @@ test("resolveSandboxExecutionRequest treats cgroups as a profile requirement, no
     const unavailable = await resolveSandboxExecutionRequest(
       backend,
       { cwd: worktreePath },
-      { session_id: created.value.session_id, enforce: true, cgroups: { required: true, execution_id: "run-1" } },
+      {
+        session_id: created.value.session_id,
+        enforce: true,
+        runtime_policy: EXPLICIT_COMPATIBILITY_RUNTIME_POLICY,
+        cgroups: { required: true, execution_id: "run-1" },
+      },
       readyProbe({ hasCgroupsV2: () => false }),
     );
     assert.equal(unavailable.ok, false);
@@ -234,7 +244,12 @@ test("resolveSandboxExecutionRequest treats cgroups as a profile requirement, no
     const available = await resolveSandboxExecutionRequest(
       backend,
       { cwd: worktreePath },
-      { session_id: created.value.session_id, enforce: true, cgroups: { required: true, execution_id: "run-1" } },
+      {
+        session_id: created.value.session_id,
+        enforce: true,
+        runtime_policy: EXPLICIT_COMPATIBILITY_RUNTIME_POLICY,
+        cgroups: { required: true, execution_id: "run-1" },
+      },
       readyProbe(),
     );
     assert.equal(available.ok, true);
