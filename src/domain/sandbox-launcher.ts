@@ -22,6 +22,11 @@ import {
 } from "./sandbox-seccomp.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import {
+  CANONICAL_EXECUTABLE_ROOT,
+  compileRuntimeExecutableProjection,
+  type RuntimeExecutableProjectionEntry,
+} from "./runtime-executable-projection.js";
+import {
   validateSessionRuntimeProjection,
   type RuntimeFilesystemProjection,
   type SessionRuntimeProjection,
@@ -562,6 +567,15 @@ function addProjectionBind(args: string[], projection: ValidatedProjectionMount,
   }
 }
 
+function addExecutableProjectionBind(
+  args: string[],
+  projection: RuntimeExecutableProjectionEntry,
+  seenDirectories: Set<string>,
+): void {
+  addDirectory(args, projection.target, seenDirectories);
+  args.push("--ro-bind", projection.source, projection.target);
+}
+
 function pathEntriesForEnvironment(request: SandboxExecutionRequest): string[] {
   const entries: string[] = [];
   const sources = new Set(request.filesystem.runtime_paths);
@@ -844,6 +858,11 @@ export function compileSandboxInvocation(
       ? success<readonly ValidatedProjectionMount[]>([])
       : validateProjectionMounts(topology.value, runtimeProjection.value);
   if (!projectionMounts.ok) return failure(projectionMounts.error);
+  const executableProjection =
+    runtimeProjection.value === null
+      ? success<readonly RuntimeExecutableProjectionEntry[]>([])
+      : compileRuntimeExecutableProjection(runtimeProjection.value);
+  if (!executableProjection.ok) return failure(executableProjection.error);
   const legacyProfile = runtimeProjection.value === null;
   if (
     request.seccomp_profile.id !== SANDBOX_SECCOMP_PROFILE_ID ||
@@ -899,14 +918,23 @@ export function compileSandboxInvocation(
     request.filesystem,
     legacyProfile || runtimeProjection.value === null
       ? undefined
-      : { ...runtimeProjection.value, filesystem: projectionMounts.value },
+      : {
+          ...runtimeProjection.value,
+          filesystem: [
+            ...projectionMounts.value,
+            ...executableProjection.value.map((entry) => ({
+              target: entry.target,
+              access_mode: "read-only" as const,
+              source_kind: entry.source_kind,
+            })),
+          ],
+        },
   );
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
-  // An explicit projection owns visibility.  No legacy PATH entries are
-  // retained when the projection is present; executable surface selection is
-  // a later contract and must not become an implicit host fallback here.
-  const pathValue = legacyProfile ? pathEntriesForEnvironment(request).join(":") : "";
+  // An explicit projection owns visibility.  Its executable surface is a
+  // single fixed directory; no host PATH or compatibility entry is retained.
+  const pathValue = legacyProfile ? pathEntriesForEnvironment(request).join(":") : CANONICAL_EXECUTABLE_ROOT;
 
   const args: string[] = [
     "--die-with-parent",
@@ -999,6 +1027,9 @@ export function compileSandboxInvocation(
   }
   for (const projection of projectionMounts.value) {
     addProjectionBind(args, projection, seenDirectories);
+  }
+  for (const projection of executableProjection.value) {
+    addExecutableProjectionBind(args, projection, seenDirectories);
   }
 
   for (const parent of destinationParents(worktreeDestination)) {

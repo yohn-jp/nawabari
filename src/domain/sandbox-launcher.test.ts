@@ -255,7 +255,7 @@ test("explicit projections compile deterministic RO/RW mounts without legacy hos
     assert.equal(compiled.value.args.includes("/bin"), false);
     assert.equal(compiled.value.args.includes(fixture.layout.user_local_bin ?? ""), false);
     const pathSetting = compiled.value.args.indexOf("PATH");
-    assert.deepEqual(compiled.value.args.slice(pathSetting, pathSetting + 2), ["PATH", ""]);
+    assert.deepEqual(compiled.value.args.slice(pathSetting, pathSetting + 2), ["PATH", "/nawabari/bin"]);
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
@@ -302,6 +302,78 @@ test("explicit projections compile a regular-file source without misrepresenting
       "a file projection target must not be pre-created as a directory",
     );
     assert.ok(dirArgs.includes("/etc/app"), "the file projection's parent directory must be pre-created");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(materialRoot, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("declared executables bind once at the canonical surface for direct and PATH lookup", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  const materialRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-executable-"));
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const runtimeRoot = path.join(materialRoot, "runtime");
+    const executable = path.join(runtimeRoot, "bin", "node");
+    fs.mkdirSync(path.dirname(executable), { recursive: true });
+    fs.writeFileSync(executable, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n", { mode: 0o755 });
+    const projectionResult = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "node-runtime", version: "1" },
+      requirements: [{ id: "node-runtime", kind: "runtime", name: "node", version: ">=24" }],
+      filesystem: [
+        {
+          source: runtimeRoot,
+          target: "/runtime/node",
+          access_mode: "read-only",
+          provenance: "runtime-profile",
+        },
+      ],
+      executables: [
+        {
+          name: "node",
+          target: "/runtime/node/bin/node",
+          provider: { id: "node-provider", requirement_id: "node-runtime" },
+          provenance: "runtime-profile",
+        },
+      ],
+    });
+    assert.equal(projectionResult.ok, true, projectionResult.ok ? "" : JSON.stringify(projectionResult.error));
+    if (!projectionResult.ok) return;
+    const projectedRequest = { ...request, runtime_projection: projectionResult.value };
+
+    const direct = compileSandboxInvocation(projectedRequest, {
+      command: "node",
+      args: ["--version"],
+    });
+    const absolute = compileSandboxInvocation(projectedRequest, {
+      command: "/nawabari/bin/node",
+      args: ["--version"],
+    });
+    assert.equal(direct.ok, true, direct.ok ? "" : JSON.stringify(direct.error));
+    assert.equal(absolute.ok, true, absolute.ok ? "" : JSON.stringify(absolute.error));
+    if (!direct.ok || !absolute.ok) return;
+
+    assert.equal(direct.value.env.PATH, "/nawabari/bin");
+    assert.equal(absolute.value.env.PATH, "/nawabari/bin");
+    const canonicalBinds = direct.value.args.reduce<string[]>((targets, value, index, args) => {
+      if (value === "--ro-bind" && args[index + 1] === executable) targets.push(args[index + 2] as string);
+      return targets;
+    }, []);
+    assert.deepEqual(canonicalBinds, ["/nawabari/bin/node"]);
+    assert.deepEqual(direct.value.args.slice(direct.value.args.indexOf("--")), ["--", "node", "--version"]);
+    assert.deepEqual(absolute.value.args.slice(absolute.value.args.indexOf("--")), [
+      "--",
+      "/nawabari/bin/node",
+      "--version",
+    ]);
+    assert.equal(direct.value.args.includes("/usr/bin"), false);
+    assert.equal(direct.value.args.includes("/bin"), false);
+    assert.equal(direct.value.args.includes(fixture.layout.user_local_bin ?? ""), false);
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
@@ -670,5 +742,116 @@ test("a protected session runs with a private root/tmp/proc view and only its ow
     removeWorktree(repository, worktree);
     fs.rmSync(sibling, { recursive: true, force: true });
     fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("direct execution and PATH-based child lookup resolve the same projected executable under real isolation", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("bubblewrap profile is Linux-only");
+    return;
+  }
+  const report = discoverSandboxRuntimeLayout();
+  if (report.bubblewrap === null) {
+    t.skip("bubblewrap is unavailable in this test environment");
+    return;
+  }
+  // The projected entrypoint is a real dynamically linked interpreter, so its
+  // full dependency closure (libc, the ELF interpreter) must be visible under
+  // its own canonical host paths for execve() to succeed — the same
+  // same-path dependency binds a real Nix/FHS materializer would supply.
+  const hostInterpreter = fs.realpathSync.native("/usr/bin/dash");
+  const dependencyRoots = ["/usr", "/lib", "/lib64"].filter((root) => fs.existsSync(root));
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const undeclaredRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-undeclared-host-bin-"));
+  const undeclaredExecutable = path.join(undeclaredRoot, "host-only-marker");
+  fs.copyFileSync(hostInterpreter, undeclaredExecutable);
+  fs.chmodSync(undeclaredExecutable, 0o755);
+  const originalHostPath = process.env.PATH;
+  try {
+    const request = await resolvedRequest(repository, worktree);
+    const secondStageScript = 'printf "second-stage argv1=%s pwd=%s path=%s\\n" "$1" "$PWD" "$PATH"';
+    const firstStageScript = [
+      "set -eu",
+      'printf "resolved=%s\\n" "$(command -v probe)"',
+      `PATH=/definitely/not/a/real/path:/nawabari/bin exec probe -c '${secondStageScript}' probe-stage2 child-argument`,
+    ].join("\n");
+    const projectionResult = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "probe-runtime", version: "1" },
+      requirements: [{ id: "probe-runtime", kind: "runtime", name: "probe", version: "1" }],
+      filesystem: [
+        ...dependencyRoots.map((root) => ({
+          source: fs.realpathSync.native(root),
+          target: root,
+          access_mode: "read-only" as const,
+          provenance: "runtime-profile" as const,
+        })),
+        {
+          source: hostInterpreter,
+          target: "/runtime/probe/bin/probe",
+          access_mode: "read-only",
+          provenance: "runtime-profile",
+        },
+      ],
+      executables: [
+        {
+          name: "probe",
+          target: "/runtime/probe/bin/probe",
+          provider: { id: "probe-provider", requirement_id: "probe-runtime" },
+          provenance: "runtime-profile",
+        },
+      ],
+    });
+    assert.equal(projectionResult.ok, true, projectionResult.ok ? "" : JSON.stringify(projectionResult.error));
+    if (!projectionResult.ok) return;
+    const projectedRequest = { ...request, runtime_projection: projectionResult.value };
+
+    const direct = await runSandboxedCommand(projectedRequest, { command: "probe", args: ["-c", firstStageScript] });
+    assert.equal(direct.ok, true, direct.ok ? "" : JSON.stringify(direct.error));
+    if (!direct.ok) return;
+    assert.equal(direct.value.exit_code, 0, JSON.stringify(direct.value));
+    assert.match(direct.value.stdout, /^resolved=\/nawabari\/bin\/probe\n/u);
+    assert.match(
+      direct.value.stdout,
+      /second-stage argv1=child-argument pwd=\S+ path=\/definitely\/not\/a\/real\/path:\/nawabari\/bin\n$/mu,
+    );
+
+    const absolute = await runSandboxedCommand(projectedRequest, {
+      command: "/nawabari/bin/probe",
+      args: ["-c", 'printf "resolved=%s\\n" "$(command -v probe)"'],
+    });
+    assert.equal(absolute.ok, true, absolute.ok ? "" : JSON.stringify(absolute.error));
+    if (absolute.ok) {
+      assert.equal(absolute.value.exit_code, 0, JSON.stringify(absolute.value));
+      assert.match(absolute.value.stdout, /^resolved=\/nawabari\/bin\/probe\n/u);
+    }
+
+    const undeclaredHostBinary = await runSandboxedCommand(projectedRequest, {
+      command: "probe",
+      args: ["-c", `exec "${undeclaredExecutable}" -c 'echo unreachable'`],
+    });
+    assert.equal(
+      undeclaredHostBinary.ok,
+      true,
+      undeclaredHostBinary.ok ? "" : JSON.stringify(undeclaredHostBinary.error),
+    );
+    if (undeclaredHostBinary.ok) {
+      assert.notEqual(undeclaredHostBinary.value.exit_code, 0, JSON.stringify(undeclaredHostBinary.value));
+      assert.match(undeclaredHostBinary.value.stderr, /not found|No such file or directory/u);
+    }
+
+    process.env.PATH = `${originalHostPath ?? ""}:${path.dirname(undeclaredExecutable)}`;
+    const ambientPathIsolated = await runSandboxedCommand(projectedRequest, {
+      command: "probe",
+      args: ["-c", "command -v host-only-marker >/dev/null 2>&1 && echo leaked || echo isolated"],
+    });
+    assert.equal(ambientPathIsolated.ok, true, ambientPathIsolated.ok ? "" : JSON.stringify(ambientPathIsolated.error));
+    if (ambientPathIsolated.ok) assert.equal(ambientPathIsolated.value.stdout.trim(), "isolated");
+  } finally {
+    process.env.PATH = originalHostPath;
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+    fs.rmSync(undeclaredRoot, { recursive: true, force: true });
   }
 });
