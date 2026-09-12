@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,20 +7,6 @@ import test from "node:test";
 
 import { compileRuntimeExecutableProjection, runtimeExecutableProviderKey } from "./runtime-executable-projection.js";
 import { resolveRuntimeProfile } from "./runtime-profile.js";
-import { LocalSessionBackend } from "./session-backend.js";
-import {
-  compileSandboxInvocation,
-  defaultSandboxProbe,
-  discoverSandboxRuntimeLayout,
-  resolveSandboxExecutionRequest,
-  runSandboxedCommand,
-  SANDBOX_CONTRACT_ID,
-  SANDBOX_CONTRACT_SCHEMA_VERSION,
-  sandboxCapabilityBaseline,
-  sandboxDoctorReport,
-  sandboxSeccompProfileMetadata,
-  type SandboxExecutionRequest,
-} from "./sandbox.js";
 import { projectSessionRuntimeProjection, STRICT_RUNTIME_POLICY } from "./runtime-projection.js";
 import type { NixCommandRunner } from "./nix-runtime-closure.js";
 import {
@@ -30,22 +15,19 @@ import {
   PNPM_BACKEND_EVIDENCE,
   PNPM_BUNDLE_RELATIVE_PATH,
   PNPM_EXECUTABLE_RELATIVE_PATH,
-  PNPM_MIDDLEWARE_LAUNCHER_TARGET,
-  PNPM_MIDDLEWARE_LAUNCHER_NODE_TARGET,
   PNPM_MIDDLEWARE_PNPM_BUNDLE_TARGET,
-  PNPM_MIDDLEWARE_PROVIDER_IDS,
   PNPM_MIDDLEWARE_REAL_PNPM_TARGET,
-  PNPM_MIDDLEWARE_REQUIREMENTS,
   PNPM_MIDDLEWARE_RTK_TARGET,
   PNPM_NIX_INSTALLABLE,
   PNPM_NIXPKGS_REF,
-  PROJECTED_PNPM_TARGET,
+  REAL_PNPM_BACKEND_REQUIREMENT,
   REAL_PNPM_BACKEND_PROVIDER,
   RTK_BACKEND_EVIDENCE,
+  RTK_BACKEND_REQUIREMENT,
   RTK_BACKEND_PROVIDER,
   RTK_NIX_INSTALLABLE,
   RTK_NIXPKGS_REF,
-  type PnpmMiddlewareBackendMaterialization,
+  type PnpmMiddlewareBackendDescriptor,
 } from "./pnpm-middleware-backend-materialization.js";
 
 type Fixture = Readonly<{
@@ -92,8 +74,8 @@ function profile() {
     profiles: ["base"],
     operations: [
       { operation: "remove", requirement_id: "node-runtime" },
-      { operation: "add", requirement: PNPM_MIDDLEWARE_REQUIREMENTS.rtk },
-      { operation: "add", requirement: PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm },
+      { operation: "add", requirement: RTK_BACKEND_REQUIREMENT },
+      { operation: "add", requirement: REAL_PNPM_BACKEND_REQUIREMENT },
     ],
   });
   assert.equal(result.ok, true, result.ok ? "" : result.error.message);
@@ -160,6 +142,10 @@ function checkedInEvidence(): Readonly<Record<string, string>> {
   };
 }
 
+function sha256(source: string): string {
+  return createHash("sha256").update(fs.readFileSync(source)).digest("hex");
+}
+
 test("materializes exact RTK and real pnpm sources for #306", () => {
   const fixture = makeFixture();
   try {
@@ -167,16 +153,13 @@ test("materializes exact RTK and real pnpm sources for #306", () => {
     assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
     if (!result.ok) return;
 
-    assert.deepEqual(result.value.requirements, [
-      PNPM_MIDDLEWARE_REQUIREMENTS.rtk,
-      PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm,
-    ]);
+    assert.deepEqual(result.value.requirements, [RTK_BACKEND_REQUIREMENT, REAL_PNPM_BACKEND_REQUIREMENT]);
     assert.equal(result.value.rtk.path, PNPM_MIDDLEWARE_RTK_TARGET);
     assert.equal(result.value.rtk.source, path.join(fixture.roots.rtk, "bin", "rtk"));
-    assert.equal(result.value.rtk.provider.id, PNPM_MIDDLEWARE_PROVIDER_IDS.rtk);
+    assert.equal(result.value.rtk.provider, RTK_BACKEND_PROVIDER);
     assert.equal(result.value.real_pnpm.path, PNPM_MIDDLEWARE_REAL_PNPM_TARGET);
     assert.equal(result.value.real_pnpm.source, path.join(fixture.roots.pnpm, PNPM_EXECUTABLE_RELATIVE_PATH));
-    assert.equal(result.value.real_pnpm.provider.id, PNPM_MIDDLEWARE_PROVIDER_IDS.real_pnpm);
+    assert.equal(result.value.real_pnpm.provider, REAL_PNPM_BACKEND_PROVIDER);
     assert.equal(result.value.projection.policy, STRICT_RUNTIME_POLICY);
     assert.equal(result.value.projection.executables.length, 0);
     assert.equal(
@@ -267,10 +250,6 @@ test("#293 consumes the exact file sources without creating backend aliases", ()
         [materialized.value.rtk.source, "/nawabari/bin/rtk-backend"],
       ].sort((left, right) => left[1].localeCompare(right[1])),
     );
-    assert.equal(
-      compiled.value.some((entry) => entry.target === PROJECTED_PNPM_TARGET),
-      false,
-    );
   } finally {
     fixture.cleanup();
   }
@@ -318,7 +297,7 @@ test("pins both immutable sources, canonicalizes ordering, and fails closed on d
     assert.equal(missing.ok, false);
     if (!missing.ok) {
       assert.equal(missing.error.code, "RUNTIME_MATERIALIZATION_MISSING");
-      assert.equal(missing.error.details?.requirement_id, PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.id);
+      assert.equal(missing.error.details?.requirement_id, REAL_PNPM_BACKEND_REQUIREMENT.id);
     }
 
     const driftRoot = path.join(fixture.store, "eee-pnpm-11.19.0");
@@ -342,7 +321,7 @@ test("pins both immutable sources, canonicalizes ordering, and fails closed on d
 
 test("#292 FHS input fails closed with the precise missing immutable binding", () => {
   const result = materializePnpmMiddlewareFhsRuntime({
-    executables: [{ requirement_id: PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.id, path: "/usr/bin/pnpm" }],
+    executables: [{ requirement_id: REAL_PNPM_BACKEND_REQUIREMENT.id, path: "/usr/bin/pnpm" }],
   });
   assert.equal(result.ok, false);
   if (!result.ok) {
@@ -352,146 +331,42 @@ test("#292 FHS input fails closed with the precise missing immutable binding", (
   }
 });
 
-function runGit(arguments_: readonly string[], cwd: string): void {
-  execFileSync("git", [...arguments_], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-}
-
-type ProtectedRequestFixture = Readonly<{
-  readonly backend: LocalSessionBackend;
-  readonly worktree: string;
-  readonly session_id: string;
-  readonly request: SandboxExecutionRequest;
-  readonly cleanup: () => void;
-}>;
-
-async function protectedRequest(
-  projection: SandboxExecutionRequest["runtime_projection"],
-  runtimeLayout: ReturnType<typeof discoverSandboxRuntimeLayout>,
-): Promise<ProtectedRequestFixture> {
-  const repository = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-pnpm-backend-runtime-"));
-  const worktree = `${repository}-worktree`;
+test("returns backend descriptors at the stable #306 handoff boundary", () => {
+  const fixture = makeFixture();
   try {
-    runGit(["init", "--quiet", "--initial-branch", "main", repository], repository);
-    runGit(["config", "user.name", "Nawabari pnpm conformance"], repository);
-    runGit(["config", "user.email", "pnpm-conformance@nawabari.invalid"], repository);
-    fs.writeFileSync(path.join(repository, "README.md"), "pnpm backend conformance\n");
-    runGit(["add", "README.md"], repository);
-    runGit(["commit", "--quiet", "-m", "fixture"], repository);
+    const materialized = materializeFixture(fixture);
+    assert.equal(materialized.ok, true, materialized.ok ? "" : materialized.error.message);
+    if (!materialized.ok) return;
 
-    const backend = new LocalSessionBackend();
-    const created = await backend.createSession(
-      { cwd: repository },
-      { branch: "feature/pnpm-backend-conformance", worktree, label: null, base: null },
-    );
-    if (!created.ok) throw created.error;
-    const resolved = await resolveSandboxExecutionRequest(
-      backend,
-      { cwd: worktree },
-      { session_id: created.value.session_id, enforce: true, runtime_projection: projection },
-      defaultSandboxProbe,
-      runtimeLayout,
-    );
-    if (!resolved.ok) throw resolved.error;
-    return {
-      backend,
-      worktree,
-      session_id: created.value.session_id,
-      request: resolved.value,
-      cleanup: () => {
-        try {
-          runGit(["worktree", "remove", "--force", worktree], repository);
-        } catch {
-          // The bounded filesystem cleanup below remains authoritative.
-        }
-        fs.rmSync(worktree, { recursive: true, force: true });
-        fs.rmSync(repository, { recursive: true, force: true });
+    const handoff = {
+      rtk: materialized.value.rtk,
+      real_pnpm: materialized.value.real_pnpm,
+    } satisfies Readonly<{
+      readonly rtk: PnpmMiddlewareBackendDescriptor;
+      readonly real_pnpm: PnpmMiddlewareBackendDescriptor;
+    }>;
+    assert.deepEqual(handoff, {
+      rtk: {
+        path: PNPM_MIDDLEWARE_RTK_TARGET,
+        source: materialized.value.rtk.source,
+        provider: RTK_BACKEND_PROVIDER,
       },
-    };
-  } catch (error) {
-    fs.rmSync(worktree, { recursive: true, force: true });
-    fs.rmSync(repository, { recursive: true, force: true });
-    throw error;
+      real_pnpm: {
+        path: PNPM_MIDDLEWARE_REAL_PNPM_TARGET,
+        source: materialized.value.real_pnpm.source,
+        provider: REAL_PNPM_BACKEND_PROVIDER,
+      },
+    });
+    assert.deepEqual(Object.keys(handoff.rtk).sort(), ["path", "provider", "source"]);
+    assert.deepEqual(Object.keys(handoff.real_pnpm).sort(), ["path", "provider", "source"]);
+  } finally {
+    fixture.cleanup();
   }
-}
-
-function renderLauncher(rtkPath: string, realPnpmPath: string): string {
-  return `#!${PNPM_MIDDLEWARE_LAUNCHER_NODE_TARGET}
-import { spawn } from "node:child_process";
-import process from "node:process";
-
-const child = spawn(${JSON.stringify(rtkPath)}, ["proxy", ${JSON.stringify(realPnpmPath)}, ...process.argv.slice(2)], {
-  cwd: process.cwd(),
-  env: process.env,
-  shell: false,
-  stdio: "inherit",
 });
-child.once("error", (error) => {
-  process.stderr.write("pnpm middleware could not start RTK: " + error.message + "\\n");
-});
-child.once("close", (code, signal) => {
-  if (signal !== null) process.kill(process.pid, signal);
-  else process.exitCode = code ?? 127;
-});
-`;
-}
 
-function addLauncherAndNode(
-  materialized: PnpmMiddlewareBackendMaterialization,
-  launcherSource: string,
-): ReturnType<typeof projectSessionRuntimeProjection> {
-  const nodeRoots = materialized.real_pnpm_closure.store_paths.filter((candidate) =>
-    path.posix.basename(candidate).endsWith("-nodejs-slim-24.18.0"),
-  );
-  assert.deepEqual(nodeRoots.length, 1, "the exact pnpm closure must contain one Node 24.18.0 output");
-  const nodeRoot = nodeRoots[0] as string;
-  const nodeSource = path.posix.join(nodeRoot, "bin/node");
-  const nodeRequirement = { id: "node-runtime", kind: "runtime" as const, name: "node", version: ">=24" };
-  return projectSessionRuntimeProjection({
-    policy: STRICT_RUNTIME_POLICY,
-    profile: materialized.projection.profile,
-    requirements: [...materialized.projection.requirements, nodeRequirement],
-    filesystem: [
-      ...materialized.projection.filesystem,
-      {
-        source: launcherSource,
-        target: PNPM_MIDDLEWARE_LAUNCHER_TARGET,
-        access_mode: "read-only" as const,
-        provenance: "package" as const,
-      },
-    ],
-    executables: [
-      {
-        name: "node",
-        target: nodeSource,
-        provider: { id: "node-runtime-provider", requirement_id: nodeRequirement.id },
-        provenance: "runtime-profile" as const,
-      },
-      {
-        name: "pnpm",
-        target: PNPM_MIDDLEWARE_LAUNCHER_TARGET,
-        provider: {
-          id: PNPM_MIDDLEWARE_PROVIDER_IDS.launcher,
-          requirement_id: PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.id,
-        },
-        provenance: "package" as const,
-      },
-    ],
-  });
-}
-
-test("executes exact RTK -> real pnpm through the strict protected runtime", async (t) => {
+test("verifies exact pinned artifact hashes and checked-in evidence", (t) => {
   if (process.env.NAWABARI_PNPM_MIDDLEWARE_RUNTIME_CONFORMANCE !== "1") {
-    t.skip("set NAWABARI_PNPM_MIDDLEWARE_RUNTIME_CONFORMANCE=1 in the Nix materialization conformance environment");
-    return;
-  }
-  if (process.platform !== "linux") {
-    t.skip("protected execution is Linux-only");
-    return;
-  }
-  const doctor = sandboxDoctorReport(defaultSandboxProbe);
-  const runtimeLayout = discoverSandboxRuntimeLayout();
-  if (!doctor.ready || runtimeLayout.bubblewrap === null) {
-    t.skip(`protected execution unavailable: ${doctor.missing_required.join(", ") || "bubblewrap"}`);
+    t.skip("set NAWABARI_PNPM_MIDDLEWARE_RUNTIME_CONFORMANCE=1 for Nix artifact conformance");
     return;
   }
 
@@ -499,124 +374,21 @@ test("executes exact RTK -> real pnpm through the strict protected runtime", asy
   assert.equal(materialized.ok, true, materialized.ok ? "" : JSON.stringify(materialized.error));
   if (!materialized.ok) return;
 
-  const launcherRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-pnpm-launcher-"));
-  const launcherSource = path.join(launcherRoot, "pnpm-launcher");
-  fs.writeFileSync(launcherSource, renderLauncher(materialized.value.rtk.path, materialized.value.real_pnpm.path), {
-    mode: 0o755,
-  });
-  fs.chmodSync(launcherSource, 0o755);
-  let fixture: ProtectedRequestFixture | null = null;
-  try {
-    const projected = addLauncherAndNode(materialized.value, launcherSource);
-    assert.equal(projected.ok, true, projected.ok ? "" : JSON.stringify(projected.error));
-    if (!projected.ok) return;
-    fixture = await protectedRequest(projected.value, runtimeLayout);
-    const evidence = checkedInEvidence();
+  assert.equal(sha256(materialized.value.rtk.source), RTK_BACKEND_EVIDENCE.executable_sha256);
+  assert.equal(sha256(materialized.value.real_pnpm.source), PNPM_BACKEND_EVIDENCE.executable_sha256);
+  const pnpmRoot = materialized.value.real_pnpm_closure.packages.find(
+    (candidate) => candidate.requirement_id === REAL_PNPM_BACKEND_REQUIREMENT.id,
+  )?.root;
+  assert.notEqual(pnpmRoot, undefined);
+  if (pnpmRoot === undefined) return;
+  assert.equal(sha256(path.posix.join(pnpmRoot, PNPM_BUNDLE_RELATIVE_PATH)), PNPM_BACKEND_EVIDENCE.bundle_sha256);
 
-    assert.equal(
-      createHash("sha256").update(fs.readFileSync(materialized.value.rtk.source)).digest("hex"),
-      RTK_BACKEND_EVIDENCE.executable_sha256,
-    );
-    assert.equal(
-      createHash("sha256").update(fs.readFileSync(materialized.value.real_pnpm.source)).digest("hex"),
-      PNPM_BACKEND_EVIDENCE.executable_sha256,
-    );
-    const pnpmBundleSource = path.posix.join(
-      materialized.value.real_pnpm_closure.packages.find(
-        (candidate) => candidate.requirement_id === PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.id,
-      )?.root ?? "",
-      PNPM_BUNDLE_RELATIVE_PATH,
-    );
-    assert.equal(
-      createHash("sha256").update(fs.readFileSync(pnpmBundleSource)).digest("hex"),
-      PNPM_BACKEND_EVIDENCE.bundle_sha256,
-    );
-
-    const invocation = compileSandboxInvocation(fixture.request, {
-      command: PROJECTED_PNPM_TARGET,
-      args: ["--version"],
-    });
-    assert.equal(invocation.ok, true, invocation.ok ? "" : JSON.stringify(invocation.error));
-    if (!invocation.ok) return;
-    assert.equal(invocation.value.env.PATH, "/nawabari/bin");
-    const terminator = invocation.value.args.indexOf("--");
-    assert.ok(terminator > 0);
-    const mountArgs = invocation.value.args.slice(0, terminator);
-    assert.equal(
-      mountArgs.some((value, index) => value === "--ro-bind" && mountArgs[index + 1] === "/nix/store"),
-      false,
-    );
-    assert.equal(
-      mountArgs.some(
-        (value, index) =>
-          value === "--ro-bind" &&
-          mountArgs[index + 1] === materialized.value.rtk.source &&
-          mountArgs[index + 2] === PNPM_MIDDLEWARE_RTK_TARGET,
-      ),
-      true,
-    );
-    assert.equal(
-      mountArgs.some(
-        (value, index) =>
-          value === "--ro-bind" &&
-          mountArgs[index + 1] === materialized.value.real_pnpm.source &&
-          mountArgs[index + 2] === PNPM_MIDDLEWARE_REAL_PNPM_TARGET,
-      ),
-      true,
-    );
-
-    const rtkVersion = await runSandboxedCommand(fixture.request, {
-      command: materialized.value.rtk.path,
-      args: ["--version"],
-    });
-    assert.equal(rtkVersion.ok, true, rtkVersion.ok ? "" : JSON.stringify(rtkVersion.error));
-    if (!rtkVersion.ok) return;
-    assert.equal(rtkVersion.value.exit_code, 0, JSON.stringify(rtkVersion.value));
-    assert.equal(rtkVersion.value.stdout, RTK_BACKEND_EVIDENCE.version);
-    assert.equal(rtkVersion.value.stdout, evidence.rtk_version);
-    assert.equal(Buffer.byteLength(rtkVersion.value.stdout), RTK_BACKEND_EVIDENCE.version_bytes);
-
-    const rtkProxyHelp = await runSandboxedCommand(fixture.request, {
-      command: materialized.value.rtk.path,
-      args: ["proxy", "--help"],
-    });
-    assert.equal(rtkProxyHelp.ok, true, rtkProxyHelp.ok ? "" : JSON.stringify(rtkProxyHelp.error));
-    if (!rtkProxyHelp.ok) return;
-    assert.equal(rtkProxyHelp.value.exit_code, 0, JSON.stringify(rtkProxyHelp.value));
-    assert.equal(Buffer.byteLength(rtkProxyHelp.value.stdout), RTK_BACKEND_EVIDENCE.proxy_help_bytes);
-    assert.equal(rtkProxyHelp.value.stdout, evidence.rtk_proxy_help);
-    assert.equal(
-      createHash("sha256").update(rtkProxyHelp.value.stdout).digest("hex"),
-      RTK_BACKEND_EVIDENCE.proxy_help_sha256,
-    );
-
-    const throughPnpm = await runSandboxedCommand(fixture.request, {
-      command: PROJECTED_PNPM_TARGET,
-      args: ["--version"],
-    });
-    assert.equal(throughPnpm.ok, true, throughPnpm.ok ? "" : JSON.stringify(throughPnpm.error));
-    if (!throughPnpm.ok) return;
-    assert.equal(throughPnpm.value.exit_code, 0, JSON.stringify(throughPnpm.value));
-    assert.equal(throughPnpm.value.stdout, PNPM_BACKEND_EVIDENCE.version);
-    assert.equal(throughPnpm.value.stdout, evidence.pnpm_version);
-    assert.equal(Buffer.byteLength(throughPnpm.value.stdout), PNPM_BACKEND_EVIDENCE.version_bytes);
-    assert.equal(
-      createHash("sha256").update(throughPnpm.value.stdout).digest("hex"),
-      PNPM_BACKEND_EVIDENCE.version_sha256,
-    );
-
-    const pnpmHelp = await runSandboxedCommand(fixture.request, {
-      command: PROJECTED_PNPM_TARGET,
-      args: ["--help"],
-    });
-    assert.equal(pnpmHelp.ok, true, pnpmHelp.ok ? "" : JSON.stringify(pnpmHelp.error));
-    if (!pnpmHelp.ok) return;
-    assert.equal(pnpmHelp.value.exit_code, 0, JSON.stringify(pnpmHelp.value));
-    assert.equal(pnpmHelp.value.stdout, evidence.pnpm_help);
-    assert.equal(Buffer.byteLength(pnpmHelp.value.stdout), PNPM_BACKEND_EVIDENCE.help_bytes);
-    assert.equal(createHash("sha256").update(pnpmHelp.value.stdout).digest("hex"), PNPM_BACKEND_EVIDENCE.help_sha256);
-  } finally {
-    fixture?.cleanup();
-    fs.rmSync(launcherRoot, { recursive: true, force: true });
-  }
+  const evidence = checkedInEvidence();
+  assert.equal(evidence.rtk_version, RTK_BACKEND_EVIDENCE.version);
+  assert.equal(evidence.pnpm_version, PNPM_BACKEND_EVIDENCE.version);
+  assert.equal(
+    createHash("sha256").update(evidence.rtk_proxy_help).digest("hex"),
+    RTK_BACKEND_EVIDENCE.proxy_help_sha256,
+  );
+  assert.equal(createHash("sha256").update(evidence.pnpm_help).digest("hex"), PNPM_BACKEND_EVIDENCE.help_sha256);
 });

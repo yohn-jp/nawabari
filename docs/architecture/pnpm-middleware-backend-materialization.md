@@ -9,7 +9,7 @@ or install anything during session launch.
 - RTK requirement: `rtk-pnpm-middleware`, package `rtk`, version `0.45.0`.
 - Real pnpm requirement: `pnpm-pinned-backend`, package `pnpm`, version
   `11.18.0`.
-- Provider IDs: `rtk-pnpm` and `pnpm-real-backend`.
+- Backend provider identities: `rtk-pnpm` and `pnpm-real-backend`.
 - Backend targets supplied to #306:
   `/runtime/pnpm-middleware/rtk` and
   `/runtime/pnpm-middleware/pnpm/bin/pnpm.mjs`.
@@ -150,10 +150,10 @@ Options:
 ```
 
 The exact observations above are checked against the same resolved Nix output
-files in the opt-in protected-runtime conformance test. The check also binds
-the executable and pnpm bundle content hashes, then executes
-`/nawabari/bin/pnpm --version` through the strict sandbox. That command is the
-#306 launcher chain: fixed launcher → `rtk proxy` → exact pnpm entrypoint.
+files in the opt-in backend conformance test. The check binds the executable
+and pnpm bundle content hashes. It does not implement or execute the launcher;
+#306 owns the end-to-end `/nawabari/bin/pnpm` → `rtk proxy` → exact pnpm path
+after rebasing onto this backend contract.
 
 The checked artifact hashes are:
 

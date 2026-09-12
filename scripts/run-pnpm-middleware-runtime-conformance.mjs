@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Preseed the exact pinned Nix outputs, then execute the opt-in strict-runtime
-// conformance test. The production materializer only performs offline,
-// read-only path-info queries and never downloads during session launch.
+// Preseed the exact pinned Nix outputs, then execute the opt-in backend
+// producer conformance test. The production materializer only performs
+// offline, read-only path-info queries and never downloads during launch.
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
@@ -51,7 +51,7 @@ const rtkEvidence = {
   cargo_hash: evaluate(materializer.RTK_NIX_INSTALLABLE, "cargoHash"),
 };
 assertExact("RTK Nixpkgs", rtkEvidence, {
-  version: materializer.PNPM_MIDDLEWARE_REQUIREMENTS.rtk.version,
+  version: materializer.RTK_BACKEND_REQUIREMENT.version,
   source_owner: materializer.RTK_NIX_SOURCE.owner,
   source_repository: materializer.RTK_NIX_SOURCE.repository,
   source_revision: materializer.RTK_NIX_SOURCE.revision,
@@ -66,7 +66,7 @@ const pnpmEvidence = {
   source_hash: evaluate(materializer.PNPM_NIX_INSTALLABLE, "src.outputHash"),
 };
 assertExact("pnpm Nixpkgs", pnpmEvidence, {
-  version: materializer.PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.version,
+  version: materializer.REAL_PNPM_BACKEND_REQUIREMENT.version,
   source_url: materializer.PNPM_NIX_SOURCE.url,
   source_hash: materializer.PNPM_NIX_SOURCE.hash,
 });

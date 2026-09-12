@@ -26,38 +26,28 @@ export const PNPM_MIDDLEWARE_BACKEND_MATERIALIZATION_CONTRACT_ID =
   "nawabari.pnpm-middleware-backend-materialization.v1" as const;
 export const PNPM_MIDDLEWARE_BACKEND_MATERIALIZATION_SCHEMA_VERSION = 1 as const;
 
-/** Stable targets consumed by #306; the public /nawabari/bin/pnpm alias is added by #306. */
+/** Stable backend targets consumed by #306; its public executable alias is separate. */
 export const PNPM_MIDDLEWARE_RTK_TARGET = "/runtime/pnpm-middleware/rtk" as const;
 export const PNPM_MIDDLEWARE_REAL_PNPM_TARGET = "/runtime/pnpm-middleware/pnpm/bin/pnpm.mjs" as const;
 export const PNPM_MIDDLEWARE_PNPM_BUNDLE_TARGET = "/runtime/pnpm-middleware/pnpm/dist/pnpm.mjs" as const;
-export const PNPM_MIDDLEWARE_LAUNCHER_TARGET = "/runtime/pnpm-middleware/pnpm-launcher" as const;
-export const PNPM_MIDDLEWARE_LAUNCHER_NODE_TARGET = "/nawabari/bin/node" as const;
-export const PROJECTED_PNPM_ENTRYPOINT = "pnpm" as const;
-export const PROJECTED_PNPM_TARGET = "/nawabari/bin/pnpm" as const;
 
-/** These IDs and values are the adapter contract declared by #306. */
-export const PNPM_MIDDLEWARE_REQUIREMENTS = Object.freeze({
-  rtk: Object.freeze({
-    id: "rtk-pnpm-middleware",
-    kind: "package" as const,
-    name: "rtk",
-    version: "0.45.0",
-  }),
-  real_pnpm: Object.freeze({
-    id: "pnpm-pinned-backend",
-    kind: "package" as const,
-    name: "pnpm",
-    version: "11.18.0",
-  }),
+/**
+ * Backend identities owned by #309.  The public launcher requirements and
+ * provider/entrypoint constants remain owned by #306.
+ */
+export const RTK_BACKEND_REQUIREMENT = Object.freeze({
+  id: "rtk-pnpm-middleware",
+  kind: "package" as const,
+  name: "rtk",
+  version: "0.45.0",
 });
 
-export const PNPM_MIDDLEWARE_PROVIDER_IDS = Object.freeze({
-  rtk: "rtk-pnpm",
-  real_pnpm: "pnpm-real-backend",
-  launcher: "rtk-pnpm-launcher",
+export const REAL_PNPM_BACKEND_REQUIREMENT = Object.freeze({
+  id: "pnpm-pinned-backend",
+  kind: "package" as const,
+  name: "pnpm",
+  version: "11.18.0",
 });
-
-export const PINNED_RTK_BACKEND_BINDING = "proxy" as const;
 
 export const RTK_NIXPKGS_REF = "github:NixOS/nixpkgs/bb92730f6e97ca1c19e285a872cdd62a1a25c467" as const;
 export const RTK_NIX_PACKAGE_ATTRIBUTE = "rtk" as const;
@@ -91,13 +81,13 @@ export const PNPM_NIX_SOURCE = Object.freeze({
 });
 
 export const RTK_BACKEND_PROVIDER: RuntimeExecutableProvider = Object.freeze({
-  id: PNPM_MIDDLEWARE_PROVIDER_IDS.rtk,
-  requirement_id: PNPM_MIDDLEWARE_REQUIREMENTS.rtk.id,
+  id: "rtk-pnpm",
+  requirement_id: RTK_BACKEND_REQUIREMENT.id,
 });
 
 export const REAL_PNPM_BACKEND_PROVIDER: RuntimeExecutableProvider = Object.freeze({
-  id: PNPM_MIDDLEWARE_PROVIDER_IDS.real_pnpm,
-  requirement_id: PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm.id,
+  id: "pnpm-real-backend",
+  requirement_id: REAL_PNPM_BACKEND_REQUIREMENT.id,
 });
 
 /** Bounded observations recorded from the exact resolved Nix output files. */
@@ -129,6 +119,11 @@ export type PnpmMiddlewareBackendDescriptor = Readonly<{
   readonly provider: RuntimeExecutableProvider;
 }>;
 
+/**
+ * Structural backend-only handoff consumed by #306's materialize API.  This
+ * boundary intentionally contains no launcher, entrypoint, or public provider
+ * contract so the two Issues have one-way ownership.
+ */
 export type PnpmMiddlewareBackendMaterializationOptions = Omit<
   NixRuntimeClosureOptions,
   "nixpkgs" | "nixpkgs_ref" | "package_attributes"
@@ -176,13 +171,13 @@ function materializationFailure(
 
 function validatePinnedOptions(options: unknown): DomainResult<null> {
   if (!isRecord(options))
-    return materializationFailure(PNPM_MIDDLEWARE_REQUIREMENTS.rtk, "the materializer options are invalid");
+    return materializationFailure(RTK_BACKEND_REQUIREMENT, "the materializer options are invalid");
   if (options.policy !== undefined && (!isRecord(options.policy) || options.policy.mode !== "strict")) {
-    return materializationFailure(PNPM_MIDDLEWARE_REQUIREMENTS.rtk, "the backend requires the strict runtime policy");
+    return materializationFailure(RTK_BACKEND_REQUIREMENT, "the backend requires the strict runtime policy");
   }
   if ("nixpkgs" in options || "nixpkgs_ref" in options || "package_attributes" in options) {
     return materializationFailure(
-      PNPM_MIDDLEWARE_REQUIREMENTS.rtk,
+      RTK_BACKEND_REQUIREMENT,
       "the RTK and pnpm Nix sources and attributes are pinned by contract",
     );
   }
@@ -191,10 +186,10 @@ function validatePinnedOptions(options: unknown): DomainResult<null> {
 
 function declaredRequirements(profile: unknown): DomainResult<readonly [RuntimeRequirement, RuntimeRequirement]> {
   if (!isRecord(profile) || !Array.isArray(profile.requirements)) {
-    return materializationFailure(PNPM_MIDDLEWARE_REQUIREMENTS.rtk, "the resolved profile has no logical requirements");
+    return materializationFailure(RTK_BACKEND_REQUIREMENT, "the resolved profile has no logical requirements");
   }
   const selected: RuntimeRequirement[] = [];
-  for (const requirement of [PNPM_MIDDLEWARE_REQUIREMENTS.rtk, PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm]) {
+  for (const requirement of [RTK_BACKEND_REQUIREMENT, REAL_PNPM_BACKEND_REQUIREMENT]) {
     const candidate = profile.requirements.find((value) => isRecord(value) && value.id === requirement.id);
     if (!isRecord(candidate)) {
       return materializationFailure(requirement, "the backend requirement was not explicitly selected");
@@ -472,7 +467,7 @@ export function materializePnpmMiddlewareBackends(
 /** #292 accepts only a host path; it cannot prove these pinned package artifacts. */
 export function materializePnpmMiddlewareFhsRuntime(_input?: unknown): DomainResult<never> {
   return materializationFailure(
-    PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm,
+    REAL_PNPM_BACKEND_REQUIREMENT,
     "the explicit #292 FHS declaration lacks the immutable source, version, and provenance binding required by this backend",
     {
       authority: "nawabari.fhs-runtime-materialization.v1",
