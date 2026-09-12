@@ -124,6 +124,27 @@ return recoverable `RUNTIME_MATERIALIZATION_MISSING`; they never select a
 fallback. Legacy omitted-projection behavior remains solely for existing
 callers of the pre-materialization launcher.
 
+## Projected pnpm middleware
+
+Issue #296 adds one concrete provider in
+`src/domain/runtime-provider-pnpm-middleware.ts`. It is opt-in: callers add
+the pinned `rtk 0.45.0` and `pnpm 11.18.0` package requirements and supply an
+exact, already materialized read-only source-to-target pair for each backend.
+The provider writes one small Node launcher and feeds it back through the
+canonical #293 executable projection:
+
+```text
+/nawabari/bin/pnpm -> exact RTK path (`rtk proxy`) -> exact real pnpm path
+```
+
+The launcher embeds both sandbox-visible paths, passes the original argv after
+the fixed `proxy` binding arguments, inherits cwd/environment/stdio, and never
+constructs a shell command. Backend paths that are relative, projected,
+self-referential, equal, missing, non-executable, or not exactly materialized
+fail before launcher creation. The provider adds only one regular-file
+projection; it does not expose a host PATH, a host pnpm fallback, or a general
+middleware graph.
+
 ## Strict Nix closure materialization
 
 Issue #291 implements the Nix materializer in

@@ -926,3 +926,17 @@ export {
   type PnpmMiddlewareBackendMaterialization,
   type PnpmMiddlewareBackendMaterializationOptions,
 } from "./pnpm-middleware-backend-materialization.js";
+
+export {
+  PINNED_RTK_BACKEND_BINDING,
+  PNPM_MIDDLEWARE_LAUNCHER_NODE_TARGET,
+  PNPM_MIDDLEWARE_LAUNCHER_TARGET,
+  PNPM_MIDDLEWARE_PROVIDER_IDS,
+  PNPM_MIDDLEWARE_REQUIREMENTS,
+  PROJECTED_PNPM_ENTRYPOINT,
+  PROJECTED_PNPM_TARGET,
+  materializePnpmMiddleware,
+  type PnpmMiddlewareBackend,
+  type PnpmMiddlewareMaterialization,
+  type PnpmMiddlewareMaterializationInput,
+} from "./runtime-provider-pnpm-middleware.js";
