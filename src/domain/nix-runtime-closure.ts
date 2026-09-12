@@ -303,7 +303,7 @@ function createDefaultNixCommandRunner(maxOutputBytes: number, timeoutMs: number
   };
 }
 
-const NIX_ATTRIBUTE_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_+.-]*(?:\.[A-Za-z0-9_][A-Za-z0-9_+.-]*)*$/u;
+const NIX_ATTRIBUTE_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_+-]*(?:\.[A-Za-z0-9_][A-Za-z0-9_+-]*)*$/u;
 
 function nixAttributeForRequirement(
   requirement: RuntimeRequirement,
