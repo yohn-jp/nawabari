@@ -44,7 +44,19 @@ existing `SandboxExecutionRequest` remains the contract that binds an already
 authorized Nawabari session to bubblewrap/capability/namespace execution. A
 future resolver may consume this projection while compiling the sandbox
 topology, but #288 does not add a second executor or change bubblewrap
-behavior.
+behavior. The existing launcher now consumes the projection when present.
+It emits canonical `--ro-bind`/`--bind` entries in target order after the
+backend-owned mounts. An explicit projection is the complete user/runtime
+view; it does not inherit the legacy runtime/system/user-tool mounts. Omitting
+the projection retains the explicit compatibility path for existing callers.
+
+The launcher canonicalizes each materialized source and rejects source
+symlinks, unsafe worktree target parents, backend-owned target overlaps, and
+ambiguous projection targets. The one supported backend shadow is an exact
+canonical worktree source/target, which may be read-only to narrow session
+authority. Other read-write projections may only preserve the same relative
+path within the authorized session worktree; projections can therefore narrow
+that authority but cannot add a new writable host tree.
 
 Missing providers and missing materialization are represented by the typed
 `RUNTIME_PROVIDER_MISSING` and `RUNTIME_MATERIALIZATION_MISSING` errors. They
