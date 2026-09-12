@@ -106,6 +106,38 @@ test("Landlock follows an explicit projection and omits legacy host profile rule
   }
 });
 
+test("Landlock preserves file-vs-directory semantics for a projected target", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-landlock-projection-file-"));
+  try {
+    const projection = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "projection-test", version: "1" },
+      requirements: [],
+      filesystem: [
+        {
+          source: "/materialized/config.json",
+          target: "/etc/app/config.json",
+          access_mode: "read-only",
+          provenance: "package",
+        },
+      ],
+      executables: [],
+    });
+    assert.equal(projection.ok, true, projection.ok ? "" : projection.error.message);
+    if (!projection.ok) return;
+    const rules = deriveLandlockRules(topology(root), {
+      ...projection.value,
+      filesystem: projection.value.filesystem.map((entry) => ({ ...entry, source_kind: "file" as const })),
+    });
+    const byPath = new Map(rules.map((rule) => [rule.path, rule.allowed_access]));
+    assert.equal(byPath.get("/etc/app/config.json"), LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_file);
+    assert.equal(byPath.get("/etc/app"), LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_dir);
+    assert.equal(byPath.has("/usr"), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Landlock capability reports exact ABI and reduced/incompatible states", () => {
   const supported = sandboxDoctorReport(probe());
   assert.deepEqual(supported.landlock, { abi: 3, supported: true, effective_state: "available" });

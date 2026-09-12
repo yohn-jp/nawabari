@@ -892,7 +892,12 @@ export function compileSandboxInvocation(
     );
   }
   const landlockEnabled = landlockSupported && landlockExecutable.value !== null;
-  const landlockRules = deriveLandlockRules(request.filesystem, legacyProfile ? undefined : runtimeProjection.value);
+  const landlockRules = deriveLandlockRules(
+    request.filesystem,
+    legacyProfile || runtimeProjection.value === null
+      ? undefined
+      : { ...runtimeProjection.value, filesystem: projectionMounts.value },
+  );
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
   // An explicit projection owns visibility.  No legacy PATH entries are

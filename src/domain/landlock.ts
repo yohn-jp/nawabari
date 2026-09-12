@@ -1,7 +1,7 @@
 import path from "node:path";
 
 import type { SandboxFilesystemTopology } from "./sandbox.js";
-import type { SessionRuntimeProjection } from "./runtime-projection.js";
+import type { RuntimeFilesystemProjection, SessionRuntimeProjection } from "./runtime-projection.js";
 
 /**
  * Landlock is an optional second filesystem boundary.  The bubblewrap
@@ -51,6 +51,11 @@ const LANDLOCK_ACCESS_FS_ABI3 = LANDLOCK_ACCESS_FS_ABI2 | LANDLOCK_ACCESS_FS.tru
 
 const READ_ACCESS = LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_file | LANDLOCK_ACCESS_FS.read_dir;
 const WRITE_ACCESS = LANDLOCK_ACCESS_FS_ABI3;
+// A regular file can never be listed, created-into, or hold child entries, so
+// file rules must not carry the directory-only bits baked into READ_ACCESS
+// and WRITE_ACCESS above.
+const FILE_READ_ACCESS = LANDLOCK_ACCESS_FS.execute | LANDLOCK_ACCESS_FS.read_file;
+const FILE_WRITE_ACCESS = FILE_READ_ACCESS | LANDLOCK_ACCESS_FS.write_file | LANDLOCK_ACCESS_FS.truncate;
 
 export type LandlockRule = {
   readonly path: string;
@@ -166,6 +171,11 @@ function userToolDestination(source: string, userHome: string | null | undefined
   return null;
 }
 
+/** A projection entry as known to Landlock: namespace target plus its materialized source kind. */
+export type LandlockProjectionEntry = Pick<RuntimeFilesystemProjection, "target" | "access_mode"> & {
+  readonly source_kind?: "file" | "directory";
+};
+
 /**
  * Compile only namespace-visible paths from the canonical topology. Host
  * paths that are mounted at a fixed destination are translated to that
@@ -174,7 +184,7 @@ function userToolDestination(source: string, userHome: string | null | undefined
  */
 export function deriveLandlockRules(
   topology: SandboxFilesystemTopology,
-  runtimeProjection?: SessionRuntimeProjection | null,
+  runtimeProjection?: (Omit<SessionRuntimeProjection, "filesystem"> & { filesystem: readonly LandlockProjectionEntry[] }) | null,
 ): readonly LandlockRule[] {
   const rules = new Map<string, number>();
 
@@ -207,7 +217,13 @@ export function deriveLandlockRules(
     }
   } else if (runtimeProjection !== null) {
     for (const projection of runtimeProjection.filesystem) {
-      addDirectoryRule(rules, projection.target, projection.access_mode === "read-write" ? WRITE_ACCESS : READ_ACCESS);
+      const readWrite = projection.access_mode === "read-write";
+      if (projection.source_kind === "file") {
+        addParentRules(rules, projection.target);
+        addRule(rules, projection.target, readWrite ? FILE_WRITE_ACCESS : FILE_READ_ACCESS);
+      } else {
+        addDirectoryRule(rules, projection.target, readWrite ? WRITE_ACCESS : READ_ACCESS);
+      }
     }
   }
 

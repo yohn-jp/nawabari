@@ -264,6 +264,49 @@ test("explicit projections compile deterministic RO/RW mounts without legacy hos
   }
 });
 
+test("explicit projections compile a regular-file source without misrepresenting it as a directory", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  const materialRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-material-"));
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const fileSource = path.join(materialRoot, "config.json");
+    fs.writeFileSync(fileSource, '{"ok":true}');
+    const projection = validatedProjection([
+      { source: fileSource, target: "/etc/app/config.json", access_mode: "read-only", provenance: "package" },
+    ]);
+    const compiled = compileSandboxInvocation({ ...request, runtime_projection: projection }, { command: "true" });
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+
+    const bindIndex = compiled.value.args.findIndex(
+      (value, index, args) => value === "--ro-bind" && args[index + 2] === "/etc/app/config.json",
+    );
+    assert.ok(bindIndex > 0, "the file projection must be bound");
+    assert.deepEqual(compiled.value.args.slice(bindIndex, bindIndex + 3), [
+      "--ro-bind",
+      fileSource,
+      "/etc/app/config.json",
+    ]);
+    // Only the parent directories are pre-created; the target itself must
+    // never be turned into a `--dir` or the bind would demand a directory
+    // where the projection promises a regular file.
+    assert.equal(compiled.value.args.includes("/etc/app/config.json"), true);
+    const dirArgs = compiled.value.args.reduce<string[]>((acc, value, index, args) => {
+      if (value === "--dir") acc.push(args[index + 1] as string);
+      return acc;
+    }, []);
+    assert.ok(!dirArgs.includes("/etc/app/config.json"), "a file projection target must not be pre-created as a directory");
+    assert.ok(dirArgs.includes("/etc/app"), "the file projection's parent directory must be pre-created");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(materialRoot, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
 test("explicit projection source/target escapes, collisions, and unauthorized writes fail closed", async () => {
   const repository = createRepository();
   const worktree = `${repository}-owned`;
@@ -609,3 +652,4 @@ test("a protected session runs with a private root/tmp/proc view and only its ow
     fs.rmSync(repository, { recursive: true, force: true });
   }
 });
+
