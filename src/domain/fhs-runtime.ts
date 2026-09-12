@@ -58,8 +58,10 @@ const MAX_DEPENDENCY_DEPTH = 64;
 export type FhsRuntimeExecutableDeclaration = Readonly<{
   /** Profile requirement satisfied by this explicitly declared host artifact. */
   readonly requirement_id: string;
-  /** Absolute host path. Its namespace target is derived from this path. */
+  /** Absolute canonical host path. */
   readonly path: string;
+  /** Optional bounded namespace target; omitted for legacy same-path declarations. */
+  readonly target?: string;
 }>;
 
 export type FhsRuntimeMaterializationInput = Readonly<{
@@ -238,6 +240,7 @@ function canonicalHostFile(
   candidate: string,
   requirement: RequirementContext,
   field: string,
+  allowExternalSource = false,
 ): DomainResult<CanonicalFile> {
   try {
     const stat = fs.lstatSync(candidate);
@@ -249,7 +252,7 @@ function canonicalHostFile(
     if (!resolvedStat.isFile()) {
       return materializationFailure(requirement, "declared artifact does not resolve to a regular file", { field });
     }
-    if (!isFhsPath(source)) {
+    if (!allowExternalSource && !isFhsPath(source)) {
       return materializationFailure(requirement, "declared artifact resolves outside the bounded FHS roots", {
         field,
         resolved_source: source,
@@ -493,6 +496,38 @@ function parseElf(candidate: string, requirement: RequirementContext): DomainRes
   return success({ interpreter, needed: Object.freeze(needed), rpath, runpath });
 }
 
+/**
+ * FHS package entrypoints may be executable scripts (notably pnpm). Their
+ * shebang interpreter is another bounded artifact; the script itself has no
+ * ELF loader or DT_NEEDED closure to inspect.
+ */
+function parseScriptInterpreter(candidate: string, requirement: RequirementContext): DomainResult<string | null> {
+  let handle: number | null = null;
+  try {
+    handle = fs.openSync(candidate, fs.constants.O_RDONLY);
+    const buffer = Buffer.alloc(4_096);
+    const bytes = fs.readSync(handle, buffer, 0, buffer.length, 0);
+    const firstLine = buffer.subarray(0, bytes).toString("utf8").split("\n", 1)[0] ?? "";
+    if (!firstLine.startsWith("#!")) return success(null);
+    const shebang = firstLine.slice(2).trim();
+    const interpreter = shebang.split(/\s+/u, 1)[0] ?? "";
+    if (interpreter.length === 0 || !posix.isAbsolute(interpreter) || posix.normalize(interpreter) !== interpreter) {
+      return materializationFailure(requirement, "script interpreter is not a bounded absolute path");
+    }
+    return success(interpreter);
+  } catch {
+    return materializationFailure(requirement, "executable script cannot be inspected");
+  } finally {
+    if (handle !== null) {
+      try {
+        fs.closeSync(handle);
+      } catch {
+        // Preserve the original materialization result.
+      }
+    }
+  }
+}
+
 function validateLibrarySearchPaths(value: unknown): DomainResult<readonly string[]> {
   if (value === undefined) return success(Object.freeze([...FHS_RUNTIME_LIBRARY_SEARCH_PATHS].sort(compareText)));
   if (!Array.isArray(value)) return invalidMaterialization("library_search_paths", "expected an array");
@@ -556,7 +591,14 @@ function validateExecutableDeclarations(
         ),
       );
     }
-    const target = validateFhsTarget(item.path, `executables[${index}].path`);
+    const source = item.path;
+    if (!posix.isAbsolute(source) || posix.normalize(source) !== source) {
+      return invalidMaterialization(`executables[${index}].path`, "expected a normalized absolute POSIX path", source);
+    }
+    const target =
+      item.target === undefined
+        ? validateFhsTarget(source, `executables[${index}].path`)
+        : validateFhsTarget(item.target, `executables[${index}].target`);
     if (!target.ok) return target;
     if (declarations.has(item.requirement_id)) {
       return ambiguousMaterialization(
@@ -565,7 +607,14 @@ function validateExecutableDeclarations(
         item.requirement_id,
       );
     }
-    declarations.set(item.requirement_id, Object.freeze({ requirement_id: requirement.id, path: target.value }));
+    declarations.set(
+      item.requirement_id,
+      Object.freeze({
+        requirement_id: requirement.id,
+        path: source,
+        ...(item.target === undefined ? {} : { target: target.value }),
+      }),
+    );
   }
   for (const requirement of requirements) {
     if (!declarations.has(requirement.id)) {
@@ -814,12 +863,13 @@ export function materializeFhsRuntime(input: unknown): DomainResult<SessionRunti
     requirement: RequirementContext,
     depth: number,
     inheritedRpath: readonly string[],
+    allowExternalSource = false,
   ): DomainResult<null> => {
     if (depth > MAX_DEPENDENCY_DEPTH)
       return materializationFailure(requirement, "dependency graph exceeds the bounded depth");
     const checkedTarget = validateFhsTarget(target, "filesystem.target");
     if (!checkedTarget.ok) return checkedTarget;
-    const source = canonicalHostFile(candidate, requirement, "filesystem.source");
+    const source = canonicalHostFile(candidate, requirement, "filesystem.source", allowExternalSource);
     if (!source.ok) return source;
     const previous = mounts.get(checkedTarget.value);
     if (previous !== undefined) {
@@ -851,8 +901,14 @@ export function materializeFhsRuntime(input: unknown): DomainResult<SessionRunti
     let metadata = parsed.get(source.value.source);
     if (metadata === undefined) {
       const parsedMetadata = parseElf(source.value.source, requirement);
-      if (!parsedMetadata.ok) return parsedMetadata;
-      metadata = parsedMetadata.value;
+      if (parsedMetadata.ok) {
+        metadata = parsedMetadata.value;
+      } else {
+        const scriptInterpreter = parseScriptInterpreter(source.value.source, requirement);
+        if (!scriptInterpreter.ok) return parsedMetadata;
+        if (scriptInterpreter.value === null) return parsedMetadata;
+        metadata = { interpreter: scriptInterpreter.value, needed: Object.freeze([]), rpath: null, runpath: null };
+      }
       parsed.set(source.value.source, metadata);
     }
 
@@ -898,9 +954,12 @@ export function materializeFhsRuntime(input: unknown): DomainResult<SessionRunti
   )) {
     const declaration = declarations.value.get(profileRequirement.id) as FhsRuntimeExecutableDeclaration;
     const requirement = requirements.get(profileRequirement.id) as RequirementContext;
-    const target = validateFhsTarget(declaration.path, `executables.${profileRequirement.id}.path`);
+    const target = validateFhsTarget(
+      declaration.target ?? declaration.path,
+      `executables.${profileRequirement.id}.target`,
+    );
     if (!target.ok) return target;
-    const added = addArtifact(target.value, target.value, requirement, 0, []);
+    const added = addArtifact(declaration.path, target.value, requirement, 0, [], declaration.target !== undefined);
     if (!added.ok) return added;
   }
 

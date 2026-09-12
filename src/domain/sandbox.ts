@@ -20,6 +20,8 @@ import {
 } from "./sandbox-seccomp.js";
 import type { CgroupLimitProfile } from "./cgroups-v2.js";
 import { validateSessionRuntimeProjection, type SessionRuntimeProjection } from "./runtime-projection.js";
+import { fhsDevelopmentRuntimeReadiness } from "./fhs-development-runtime.js";
+import type { FhsRuntimeExecutableDeclaration } from "./fhs-runtime.js";
 
 /**
  * Versioned identity for the Linux sandbox execution contract (Issue #81).
@@ -95,6 +97,11 @@ export type SandboxDoctorReport = {
   seccomp_profile: ReturnType<typeof sandboxSeccompProfileMetadata>;
   capability_baseline: typeof sandboxCapabilityBaseline;
   landlock: LandlockCapability;
+  /** Strict FHS development readiness from the real materialization resolver. */
+  strict_ready: boolean;
+  strict_ready_reason: string | null;
+  strict_ready_code: ErrorCode | null;
+  strict_ready_details: JsonObject;
 };
 
 export type { LandlockCapability, LandlockEffectiveState, LandlockRule } from "./landlock.js";
@@ -252,6 +259,10 @@ export type SandboxRuntimeLayout = {
   ssl_certs: string | null;
   pki_certs: string | null;
   ca_certificates: string | null;
+  /** Exact bounded FHS candidates; empty/omitted means no proven baseline. */
+  fhs_executable_candidates?: readonly FhsRuntimeExecutableDeclaration[];
+  /** Optional explicit bounded ELF search paths used by FHS materialization. */
+  fhs_library_search_paths?: readonly string[];
 };
 
 function pathExists(candidate: string): boolean {
@@ -470,14 +481,18 @@ function capabilityCheck(
 }
 
 /**
- * Pure, side-effect-free capability/doctor inspection. Always returns a
- * report; it never throws and never selects an unsandboxed path itself.
+ * Side-effect-free capability/doctor inspection. Always returns a report; it
+ * never throws and never selects an unsandboxed path itself.
  */
-export function sandboxDoctorReport(probe: SandboxProbe = defaultSandboxProbe): SandboxDoctorReport {
+export function sandboxDoctorReport(
+  probe: SandboxProbe = defaultSandboxProbe,
+  runtimeLayout: SandboxRuntimeLayout = discoverSandboxRuntimeLayout(),
+): SandboxDoctorReport {
   const platform = probe.platform();
   const platformSupported = platform === SANDBOX_SUPPORTED_PLATFORM;
   const namespaceSupport = platformSupported && probe.hasNamespaceSupport();
   const landlock = landlockCapability(probe, platformSupported);
+  const strictReadiness = fhsDevelopmentRuntimeReadiness(platform, runtimeLayout);
   const capabilities = [
     ...SANDBOX_REQUIRED_CAPABILITIES.map((id) =>
       capabilityCheck(id, "required", platformSupported, probe, namespaceSupport),
@@ -528,6 +543,10 @@ export function sandboxDoctorReport(probe: SandboxProbe = defaultSandboxProbe): 
     seccomp_profile: sandboxSeccompProfileMetadata(),
     capability_baseline: sandboxCapabilityBaseline,
     landlock,
+    strict_ready: strictReadiness.strict_ready,
+    strict_ready_reason: strictReadiness.reason,
+    strict_ready_code: strictReadiness.code,
+    strict_ready_details: strictReadiness.details,
   };
 }
 
@@ -573,6 +592,7 @@ export function discoverSandboxRuntimeLayout(environment: NodeJS.ProcessEnv = pr
     ssl_certs: existingPath("/etc/ssl"),
     pki_certs: existingPath("/etc/pki"),
     ca_certificates: existingPath("/etc/ca-certificates"),
+    fhs_executable_candidates: Object.freeze([]),
   };
 }
 
@@ -704,7 +724,7 @@ export async function resolveSandboxExecutionRequest(
       : validateSessionRuntimeProjection(options.runtime_projection);
   if (!runtimeProjection.ok) return failure(runtimeProjection.error);
 
-  const doctor = sandboxDoctorReport(probe);
+  const doctor = sandboxDoctorReport(probe, runtimeLayout);
   if (options.enforce && !doctor.ready) {
     const code: ErrorCode = doctor.platform_supported
       ? "SANDBOX_CAPABILITY_UNAVAILABLE"
@@ -874,6 +894,18 @@ export {
   type FhsRuntimeExecutableDeclaration,
   type FhsRuntimeMaterializationInput,
 } from "./fhs-runtime.js";
+
+export {
+  FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS,
+  FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS,
+  doctorFhsDevelopmentRuntime,
+  fhsDevelopmentRuntimeReadiness,
+  materializeFhsDevelopmentRuntime,
+  resolveFhsDevelopmentRuntime,
+  type FhsDevelopmentRuntimeInput,
+  type FhsDevelopmentRuntimeReadiness,
+  type FhsDevelopmentRuntimeResolution,
+} from "./fhs-development-runtime.js";
 
 export {
   TGREP_BACKEND_EVIDENCE,

@@ -9,7 +9,14 @@ import { projectSessionLifecycleActions } from "../session-lifecycle-actions.js"
 import { availableLifecycleOperations } from "../session-lifecycle-classification.js";
 import { success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import { supportsRuntime } from "./runtime.js";
-import { defaultSandboxProbe, sandboxDoctorReport, type SandboxDoctorReport, type SandboxProbe } from "./sandbox.js";
+import {
+  defaultSandboxProbe,
+  discoverSandboxRuntimeLayout,
+  sandboxDoctorReport,
+  type SandboxDoctorReport,
+  type SandboxProbe,
+  type SandboxRuntimeLayout,
+} from "./sandbox.js";
 
 export type DoctorCheckStatus = "ok" | "warning" | "error" | "not_configured" | "not_applicable";
 
@@ -185,9 +192,10 @@ export async function runDoctor(
   cwd = process.cwd(),
   sandboxProbe: SandboxProbe = defaultSandboxProbe,
   runtimeVersion = process.versions.node,
+  runtimeLayout: SandboxRuntimeLayout = discoverSandboxRuntimeLayout(),
 ): Promise<DomainResult<DoctorReport>> {
   const checks: DoctorCheck[] = [];
-  const sandbox = sandboxDoctorReport(sandboxProbe);
+  const sandbox = sandboxDoctorReport(sandboxProbe, runtimeLayout);
   const runtimeOk = supportsRuntime(runtimeVersion);
   checks.push(
     runtimeOk
