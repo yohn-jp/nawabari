@@ -225,6 +225,16 @@ jobs:
         with:
           determinate: false
 
+      - name: Project a canonical FHS-rooted Node interpreter
+        # actions/setup-node installs into /opt/hostedtoolcache, which is not
+        # a bounded FHS root that materializeFhsRuntime() accepts. Copy the
+        # exact same pinned Node binary to a canonical /usr/bin location so
+        # the protected conformance test can declare it as a real FHS
+        # artifact without weakening FHS_RUNTIME_ROOTS validation.
+        run: |
+          sudo cp "$(command -v node)" /usr/bin/node
+          echo "NAWABARI_TEST_FHS_NODE_INTERPRETER=/usr/bin/node" >> "$GITHUB_ENV"
+
       - name: Materialize and verify pinned RTK and pnpm middleware backends
         run: pnpm run test:pnpm:conformance
 
