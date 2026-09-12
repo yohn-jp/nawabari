@@ -101,6 +101,33 @@ function createRepository(): string {
   return repository;
 }
 
+/**
+ * A repository with no repository-local or ambient identity at all. The
+ * initial commit is made with explicit author/committer environment
+ * variables so fixture setup never depends on the identity under test.
+ */
+function createRepositoryWithoutIdentity(): string {
+  const repository = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-sandbox-launcher-no-identity-"));
+  runGit(["init", "--quiet", "--initial-branch", "main", repository], repository);
+  fs.writeFileSync(path.join(repository, "README.md"), "sandbox\n");
+  runGit(["add", "README.md"], repository);
+  execFileSync("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repository,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_AUTHOR_NAME: "Nawabari Fixture Setup",
+      GIT_AUTHOR_EMAIL: "fixture-setup@nawabari.invalid",
+      GIT_COMMITTER_NAME: "Nawabari Fixture Setup",
+      GIT_COMMITTER_EMAIL: "fixture-setup@nawabari.invalid",
+    },
+  });
+  return repository;
+}
+
 function removeWorktree(repository: string, worktree: string): void {
   runGit(["worktree", "remove", "--force", worktree], repository, false);
 }
@@ -1165,5 +1192,109 @@ test("session shell CLI path shares the compiled strict-projection authority wit
     removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
     fs.rmSync(undeclaredRoot, { recursive: true, force: true });
+  }
+});
+
+function projectedIdentityConfig(gitMetadata: string): string {
+  return fs.readFileSync(path.join(gitMetadata, "config"), "utf8");
+}
+
+test("the session-private Git config projects the host global identity when no repository-local identity is set", async () => {
+  const repository = createRepositoryWithoutIdentity();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const layout = {
+      ...fixture.layout,
+      git_user_name: "Host Global Author",
+      git_user_email: "host-global@example.invalid",
+    };
+    const request = await resolvedRequest(repository, worktree, layout);
+    const compiled = compileSandboxInvocation(request, { command: "true" });
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+
+    const config = projectedIdentityConfig(request.filesystem.git_metadata);
+    assert.match(config, /\[user\]/u);
+    assert.equal(
+      execFileSync(
+        "git",
+        ["config", "--file", path.join(request.filesystem.git_metadata, "config"), "--get", "user.name"],
+        {
+          encoding: "utf8",
+        },
+      ).trim(),
+      "Host Global Author",
+    );
+    assert.equal(
+      execFileSync(
+        "git",
+        ["config", "--file", path.join(request.filesystem.git_metadata, "config"), "--get", "user.email"],
+        { encoding: "utf8" },
+      ).trim(),
+      "host-global@example.invalid",
+    );
+    // Only the two identity keys are ever projected; no credential helper,
+    // alias, hook, or other global setting is imported alongside them.
+    assert.doesNotMatch(config, /credential/iu);
+    assert.doesNotMatch(config, /alias/iu);
+    assert.doesNotMatch(config, /hooksPath/iu);
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("repository-local identity on the authoritative host worktree takes precedence over the projected host global identity", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const layout = {
+      ...fixture.layout,
+      git_user_name: "Host Global Other",
+      git_user_email: "host-global-other@example.invalid",
+    };
+    const request = await resolvedRequest(repository, worktree, layout);
+    const compiled = compileSandboxInvocation(request, { command: "true" });
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+
+    const configPath = path.join(request.filesystem.git_metadata, "config");
+    assert.equal(
+      execFileSync("git", ["config", "--file", configPath, "--get", "user.name"], { encoding: "utf8" }).trim(),
+      "Nawabari Tests",
+    );
+    assert.equal(
+      execFileSync("git", ["config", "--file", configPath, "--get", "user.email"], { encoding: "utf8" }).trim(),
+      "tests@nawabari.invalid",
+    );
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("the session-private Git config carries no identity when neither repository-local nor host global identity is available", async () => {
+  const repository = createRepositoryWithoutIdentity();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const layout = { ...fixture.layout, git_user_name: null, git_user_email: null };
+    const request = await resolvedRequest(repository, worktree, layout);
+    const compiled = compileSandboxInvocation(request, { command: "true" });
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+
+    const config = projectedIdentityConfig(request.filesystem.git_metadata);
+    assert.doesNotMatch(config, /\[user\]/u);
+    assert.doesNotMatch(config, /name\s*=/u);
+    assert.doesNotMatch(config, /email\s*=/u);
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
   }
 });

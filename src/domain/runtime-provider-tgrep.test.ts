@@ -135,6 +135,7 @@ function sandboxRequest(projection: TgrepRuntimeMaterialization["projection"]): 
     network_mode: "inherited",
     sandbox_executable: bwrap,
     identity: { real_uid: 1_000, real_gid: 1_000, namespace_uid: 0, namespace_gid: 0 },
+    git_identity: { host_global_name: null, host_global_email: null },
     filesystem: {
       owned_worktree: worktree,
       home,

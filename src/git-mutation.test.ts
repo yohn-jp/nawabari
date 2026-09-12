@@ -61,6 +61,53 @@ function createFixture(withRemote = false): Fixture {
   };
 }
 
+/**
+ * A repository with no repository-local or global Git identity at all. The
+ * initial commit is made with explicit author/committer environment
+ * variables so fixture setup never depends on the identity under test.
+ */
+function createFixtureWithoutIdentity(): Fixture {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-mutation-no-identity-"));
+  const worktree = `${root}-worktree`;
+  runGit(["init", "-b", "main", root], root);
+  runGit(["config", "commit.gpgsign", "false"], root);
+  runGit(["config", "core.hooksPath", "/dev/null"], root);
+  fs.writeFileSync(path.join(root, "file.txt"), "initial\n");
+  runGit(["add", "file.txt"], root);
+  execFileSync("git", ["commit", "-m", "initial"], {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_AUTHOR_NAME: "Nawabari Fixture Setup",
+      GIT_AUTHOR_EMAIL: "fixture-setup@nawabari.invalid",
+      GIT_COMMITTER_NAME: "Nawabari Fixture Setup",
+      GIT_COMMITTER_EMAIL: "fixture-setup@nawabari.invalid",
+    },
+  });
+  const registry = new SessionRegistry({ cwd: root });
+  const session = registry.provision({ worktreePath: worktree, branchName: "feature/mutation-no-identity" });
+  return {
+    root,
+    worktree,
+    session,
+    registry,
+    current: new SessionRegistry({ cwd: worktree }),
+    cleanup(): void {
+      try {
+        runGit(["worktree", "remove", "--force", worktree], root);
+      } catch {
+        // Directory cleanup remains safe when Git already removed the worktree.
+      }
+      fs.rmSync(worktree, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
 function claim(fixture: Fixture, resource = "file.txt"): void {
   fixture.registry.claimResources({
     sessionId: fixture.session.sessionId,
@@ -499,6 +546,32 @@ test("commit reports partial staging and commit failures and can be retried", ()
       resources: ["file.txt"],
     });
     assert.match(retried.commitSha, /^[0-9a-f]{40}$/u);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("commit fails closed with an identity hint when Git author identity is genuinely unavailable", () => {
+  const fixture = createFixtureWithoutIdentity();
+  try {
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "no-identity\n");
+    assert.throws(
+      () =>
+        fixture.current.commit({
+          sessionId: fixture.session.sessionId,
+          message: "no identity",
+          resources: ["file.txt"],
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "COMMIT_FAILED");
+        assert.match(error.message, /identity/iu);
+        assert.equal(typeof error.details.hint, "string");
+        assert.match(error.details.hint as string, /git config user\.name/iu);
+        return true;
+      },
+    );
   } finally {
     fixture.cleanup();
   }

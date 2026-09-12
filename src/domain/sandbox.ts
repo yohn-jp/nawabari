@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
@@ -159,6 +160,17 @@ export type SandboxFilesystemTopology = {
   system_paths: string[];
 };
 
+/**
+ * Host global Git author identity, read only via bounded `git config
+ * --global --get user.name`/`user.email` queries. Never the full global
+ * config file contents, and never credentials, hooks, aliases, or any other
+ * global setting.
+ */
+export type SandboxGitIdentity = {
+  readonly host_global_name: string | null;
+  readonly host_global_email: string | null;
+};
+
 export type SandboxExecutionRequest = {
   schema_version: number;
   contract_id: string;
@@ -178,6 +190,8 @@ export type SandboxExecutionRequest = {
   /** Resolved host path to bubblewrap; null is valid only for advisory requests. */
   sandbox_executable: string | null;
   identity: SandboxIdentity;
+  /** Minimum host Git author identity projected for commit semantics; never a full config file. */
+  git_identity: SandboxGitIdentity;
   filesystem: SandboxFilesystemTopology;
   required_capabilities: SandboxCapabilityId[];
   seccomp_profile: ReturnType<typeof sandboxSeccompProfileMetadata>;
@@ -293,6 +307,10 @@ export type SandboxRuntimeLayout = {
   fhs_executable_candidates?: readonly FhsRuntimeExecutableDeclaration[];
   /** Optional explicit bounded ELF search paths used by FHS materialization. */
   fhs_library_search_paths?: readonly string[];
+  /** Host global `user.name`, read via a bounded `git config --global` query only. */
+  git_user_name: string | null;
+  /** Host global `user.email`, read via a bounded `git config --global` query only. */
+  git_user_email: string | null;
 };
 
 function pathExists(candidate: string): boolean {
@@ -320,6 +338,32 @@ function executableOnPath(command: string, environment: NodeJS.ProcessEnv = proc
     if (pathExists(candidate)) return candidate;
   }
   return null;
+}
+
+/**
+ * Read exactly one host global Git config key (`user.name`/`user.email`)
+ * through `git config --global --get`. This never opens or copies the global
+ * config file itself: `--global` scopes the query to that one file and
+ * `--get` returns only the single requested key, so credential helpers,
+ * hooks, aliases, and every other global setting stay unread. A missing key
+ * or unavailable `git` is a normal, non-fatal "no identity" result.
+ */
+function resolveHostGlobalGitConfigValue(
+  key: "user.name" | "user.email",
+  environment: NodeJS.ProcessEnv,
+): string | null {
+  try {
+    const output = execFileSync("git", ["config", "--global", "--get", key], {
+      cwd: os.tmpdir(),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+      env: environment,
+    }).trim();
+    return output.length > 0 ? output : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -625,6 +669,8 @@ export function discoverSandboxRuntimeLayout(environment: NodeJS.ProcessEnv = pr
     pki_certs: existingPath("/etc/pki"),
     ca_certificates: existingPath("/etc/ca-certificates"),
     fhs_executable_candidates: readExplicitFhsDevelopmentExecutableCandidates(environment),
+    git_user_name: resolveHostGlobalGitConfigValue("user.name", environment),
+    git_user_email: resolveHostGlobalGitConfigValue("user.email", environment),
   };
 }
 
@@ -870,6 +916,10 @@ export async function resolveSandboxExecutionRequest(
     network_mode: doctor.network_mode,
     sandbox_executable: runtimeLayout.bubblewrap,
     identity: resolveIdentity(probe),
+    git_identity: {
+      host_global_name: runtimeLayout.git_user_name,
+      host_global_email: runtimeLayout.git_user_email,
+    },
     filesystem: deriveFilesystemTopology(decision.repository, decision.worktree, decision.session_id, runtimeLayout),
     required_capabilities: [...SANDBOX_REQUIRED_CAPABILITIES, ...(cgroupsRequired ? (["cgroups_v2"] as const) : [])],
     seccomp_profile: sandboxSeccompProfileMetadata(),

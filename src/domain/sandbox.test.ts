@@ -154,6 +154,78 @@ test("resolveSandboxExecutionRequest binds an owned active session and derives i
   }
 });
 
+test("discoverSandboxRuntimeLayout projects only the host global user.name/user.email, never the full config", () => {
+  const configDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-host-global-identity-"));
+  const globalConfigPath = path.join(configDirectory, "gitconfig");
+  try {
+    fs.writeFileSync(
+      globalConfigPath,
+      [
+        "[user]",
+        "\tname = Host Global Author",
+        "\temail = host-global@example.invalid",
+        "[credential]",
+        "\thelper = store --file=/should/never/be/read",
+        "[alias]",
+        "\tco = checkout",
+        "",
+      ].join("\n"),
+    );
+    const layout = discoverSandboxRuntimeLayout({ ...process.env, GIT_CONFIG_GLOBAL: globalConfigPath });
+    assert.equal(layout.git_user_name, "Host Global Author");
+    assert.equal(layout.git_user_email, "host-global@example.invalid");
+  } finally {
+    fs.rmSync(configDirectory, { recursive: true, force: true });
+  }
+});
+
+test("discoverSandboxRuntimeLayout reports null identity, not a fallback value, when no host global identity is set", () => {
+  const layout = discoverSandboxRuntimeLayout({ ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" });
+  assert.equal(layout.git_user_name, null);
+  assert.equal(layout.git_user_email, null);
+});
+
+test("resolveSandboxExecutionRequest carries the discovered host global Git identity onto the request", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-sandbox-git-identity`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      { branch: "feature/sandbox-git-identity", worktree: worktreePath, label: null, base: null },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const layout = {
+      ...discoverSandboxRuntimeLayout(),
+      git_user_name: "Projected Author",
+      git_user_email: "projected@example.invalid",
+    };
+    const result = await resolveSandboxExecutionRequest(
+      backend,
+      { cwd: worktreePath },
+      {
+        session_id: created.value.session_id,
+        enforce: true,
+        runtime_policy: EXPLICIT_COMPATIBILITY_RUNTIME_POLICY,
+      },
+      readyProbe(),
+      layout,
+    );
+
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepEqual(result.value.git_identity, {
+      host_global_name: "Projected Author",
+      host_global_email: "projected@example.invalid",
+    });
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("resolveSandboxExecutionRequest returns an enforce:false request instead of failing when protection was not requested", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-sandbox-not-enforced`;

@@ -5874,8 +5874,23 @@ function runMutationGit(
       ...(error instanceof SessionRegistryError ? error.details : {}),
       ...(error instanceof SessionRegistryError ? { gitCode: error.code } : {}),
     };
+    if (failureCode === "COMMIT_FAILED" && isMissingGitIdentityFailure(details.stderr)) {
+      throw new SessionRegistryError(
+        failureCode,
+        `${phase} Git operation failed: Git author identity (user.name/user.email) is unavailable`,
+        {
+          ...details,
+          hint: "Set repository-local identity with `git config user.name`/`git config user.email`, or configure the host's global Git identity before starting the session.",
+        },
+        error,
+      );
+    }
     throw new SessionRegistryError(failureCode, `${phase} Git operation failed`, details, error);
   }
+}
+
+function isMissingGitIdentityFailure(stderr: RegistryErrorDetailValue | undefined): boolean {
+  return typeof stderr === "string" && /Please tell me who you are|unable to auto-detect email address/u.test(stderr);
 }
 
 /**
