@@ -1,2 +1,11 @@
 # pnpm owns this generated lockfile's layout; source formatting checks do not rewrite it.
 pnpm-lock.yaml
+
+# These scripts are byte-synchronized from yohn-jp/.github and use the
+# authority repository's formatter profile rather than this repository's
+# source formatter configuration.
+scripts/epic-branch.mjs
+scripts/pr-contract-routing.mjs
+scripts/release-branch.mjs
+scripts/validate-issue.mjs
+scripts/validate-pr.mjs
