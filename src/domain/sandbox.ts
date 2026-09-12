@@ -818,8 +818,10 @@ export {
 } from "./sandbox-seccomp.js";
 
 export {
+  CANONICAL_EXECUTABLE_ROOT,
   compileSandboxInvocation,
   deriveLandlockRules,
+  runInteractiveSandboxedCommand,
   runSandboxedCommand,
   type SandboxCommand,
   type SandboxExecutionResult,

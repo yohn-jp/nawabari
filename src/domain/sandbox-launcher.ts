@@ -97,6 +97,8 @@ export type SandboxExecutionResult = {
 export type SandboxLauncherOptions = {
   readonly timeout_ms?: number;
   readonly max_output_bytes?: number;
+  /** Attach the caller's existing stdio and use no bounded-output timeout. */
+  readonly interactive?: boolean;
 };
 
 type ValidatedTopology = {
@@ -1208,13 +1210,14 @@ export function runSandboxedCommand(
 ): Promise<DomainResult<SandboxExecutionResult>> {
   const invocation = compileSandboxInvocation(request, command);
   if (!invocation.ok) return Promise.resolve(invocation);
+  const interactive = options.interactive === true;
   const timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
   const maxOutputBytes = options.max_output_bytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   if (
-    !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs < 1 ||
-    !Number.isSafeInteger(maxOutputBytes) ||
-    maxOutputBytes < 1
+    (!interactive && !Number.isSafeInteger(timeoutMs)) ||
+    (!interactive && timeoutMs < 1) ||
+    (!interactive && !Number.isSafeInteger(maxOutputBytes)) ||
+    (!interactive && maxOutputBytes < 1)
   ) {
     return Promise.resolve(
       failure(
@@ -1248,7 +1251,9 @@ export function runSandboxedCommand(
       cwd: invocation.value.cwd,
       env: { ...invocation.value.env },
       shell: false,
-      stdio: ["ignore", "pipe", "pipe", profile.value.fd],
+      stdio: interactive
+        ? ["inherit", "inherit", "inherit", profile.value.fd]
+        : ["ignore", "pipe", "pipe", profile.value.fd],
     });
     profile.value.close();
   } catch (error: unknown) {
@@ -1294,15 +1299,39 @@ export function runSandboxedCommand(
     let outputExceeded = false;
     let spawnError: Error | null = null;
     let settled = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
+    let timer: NodeJS.Timeout | null = null;
+    if (!interactive) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
+    }
+
+    const signalHandlers = new Map<NodeJS.Signals, () => void>();
+    const removeSignalHandlers = (): void => {
+      for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler);
+      signalHandlers.clear();
+    };
+    if (interactive) {
+      for (const signal of ["SIGINT", "SIGTERM"] as const) {
+        const handler = (): void => {
+          if (settled) return;
+          try {
+            child.kill(signal);
+          } catch {
+            // The child may have exited between signal delivery and forwarding.
+          }
+        };
+        signalHandlers.set(signal, handler);
+        process.on(signal, handler);
+      }
+    }
 
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
+      removeSignalHandlers();
       const accounting = cgroupScope === null ? null : readCgroupAccounting(cgroupScope);
       if (cgroupScope !== null) {
         const cleaned = cleanupCgroupScope(cgroupScope);
@@ -1415,22 +1444,24 @@ export function runSandboxedCommand(
       );
     };
 
-    child.stdout?.on("data", (value: Buffer | string) => {
-      const collected = boundedOutput(stdout, outputBytes, maxOutputBytes, value);
-      outputBytes = collected.bytes;
-      if (collected.exceeded) {
-        outputExceeded = true;
-        child.kill("SIGKILL");
-      }
-    });
-    child.stderr?.on("data", (value: Buffer | string) => {
-      const collected = boundedOutput(stderr, outputBytes, maxOutputBytes, value);
-      outputBytes = collected.bytes;
-      if (collected.exceeded) {
-        outputExceeded = true;
-        child.kill("SIGKILL");
-      }
-    });
+    if (!interactive) {
+      child.stdout?.on("data", (value: Buffer | string) => {
+        const collected = boundedOutput(stdout, outputBytes, maxOutputBytes, value);
+        outputBytes = collected.bytes;
+        if (collected.exceeded) {
+          outputExceeded = true;
+          child.kill("SIGKILL");
+        }
+      });
+      child.stderr?.on("data", (value: Buffer | string) => {
+        const collected = boundedOutput(stderr, outputBytes, maxOutputBytes, value);
+        outputBytes = collected.bytes;
+        if (collected.exceeded) {
+          outputExceeded = true;
+          child.kill("SIGKILL");
+        }
+      });
+    }
     child.on("error", (error: Error) => {
       spawnError = error;
     });
@@ -1438,4 +1469,13 @@ export function runSandboxedCommand(
   });
 }
 
+/** Execute one projected command with the caller's existing terminal streams. */
+export function runInteractiveSandboxedCommand(
+  request: SandboxExecutionRequest,
+  command: SandboxCommand,
+): Promise<DomainResult<SandboxExecutionResult>> {
+  return runSandboxedCommand(request, command, { interactive: true });
+}
+
+export { CANONICAL_EXECUTABLE_ROOT } from "./runtime-executable-projection.js";
 export { deriveLandlockRules } from "./landlock.js";

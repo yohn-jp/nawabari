@@ -66,7 +66,7 @@ Each boundary has one job and one local authority. README summarizes the product
 | Resource Claims        | Which session may access a canonical repository resource and at what mode            | `session claim`, `session claims`, `session update`, `session release` |
 | Mutation authorization | Whether a concrete operation has sufficient claims and no conflicting owner          | `guard`, `authorize`, `commit`, `push`                                 |
 | Repository evidence    | What Git can observe about revisions, paths, changes, ancestry, and bounded diffs    | `checkpoint`, `evidence snapshot`, `diff`                              |
-| Protected execution    | Whether a command runs inside the opt-in Linux process/filesystem boundary           | `session run`, `session exec`, `doctor`                                |
+| Protected execution    | Whether a command runs inside the opt-in Linux process/filesystem boundary           | `session run`, `session exec`, `session shell`, `doctor`               |
 
 Claims are not task labels and do not encode GitHub or agent semantics. `write` permits ordinary path changes; `exclusive-write` is required for finalizing operations such as commit and push. Conflicting or ambiguous claims fail closed.
 

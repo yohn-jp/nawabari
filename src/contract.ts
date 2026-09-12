@@ -53,7 +53,7 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
   id: "protected-execution",
   contract_id: SANDBOX_CONTRACT_ID,
   schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
-  commands: ["session run", "session exec"],
+  commands: ["session run", "session exec", "session shell"],
   command_aliases: [{ alias: "session exec", canonical: "session run" }],
   result_schema: "sandbox-execution.v1",
   result_schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
@@ -61,7 +61,7 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
     {
       schema: "sandbox-execution.v1",
       version: SANDBOX_CONTRACT_SCHEMA_VERSION,
-      commands: ["session run", "session exec"],
+      commands: ["session run", "session exec", "session shell"],
     },
   ],
   identities: ["session_id", "repository", "worktree", "branch", "network_mode"],

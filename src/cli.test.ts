@@ -194,6 +194,88 @@ test("session run does not interpret a child --json argument as a Nawabari globa
   assert.match(output.stdout[0] ?? "", /^session run: ok/);
 });
 
+test("session shell requires -- and passes only the projected shell argv to the interactive launcher", async () => {
+  const output = capture();
+  let observedCommand: string[] = [];
+  let observedInteractive = false;
+  const exitCode = await runCli(
+    ["session", "shell", "--session", sampleSession.session_id, "--", "bash", "-il", "literal; argv"],
+    {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: output.io,
+      sandboxProbe: readySandboxProbe(),
+      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRunner: async (request, command, options) => {
+        assert.equal(request.enforce, true);
+        assert.equal(request.session_id, sampleSession.session_id);
+        observedCommand = [command.command, ...(command.args ?? [])];
+        observedInteractive = options?.interactive === true;
+        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      },
+    },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.deepEqual(observedCommand, ["/nawabari/bin/bash", "-il", "literal; argv"]);
+  assert.equal(observedInteractive, true);
+  assert.deepEqual(output.stdout, []);
+  assert.deepEqual(output.stderr, []);
+});
+
+test("session shell rejects a missing terminator, missing shell, and non-basename shell without launching", async () => {
+  for (const args of [
+    ["session", "shell", "--session", sampleSession.session_id, "bash"],
+    ["session", "shell", "--session", sampleSession.session_id, "--"],
+    ["session", "shell", "--session", sampleSession.session_id, "--", "/bin/bash"],
+  ]) {
+    const output = capture();
+    let launcherCalls = 0;
+    const exitCode = await runCli(args, {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: output.io,
+      sandboxRunner: async () => {
+        launcherCalls += 1;
+        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      },
+    });
+
+    assert.equal(exitCode, 2, args.join(" "));
+    assert.equal(launcherCalls, 0, args.join(" "));
+    assert.match(output.stderr.join("\n"), /session shell .*requires|basename/u, args.join(" "));
+  }
+});
+
+test("session shell propagates a projected shell exit status or signal", async () => {
+  const nonzeroOutput = capture();
+  const nonzero = await runCli(
+    ["session", "shell", "--session", sampleSession.session_id, "--", "sh", "-c", "exit 7"],
+    {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: nonzeroOutput.io,
+      sandboxProbe: readySandboxProbe(),
+      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRunner: async () => success({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
+    },
+  );
+  assert.equal(nonzero, 7);
+  assert.deepEqual(nonzeroOutput.stdout, []);
+
+  const signalOutput = capture();
+  const signal = await runCli(["session", "shell", "--session", sampleSession.session_id, "--", "sh"], {
+    cwd: sampleSession.worktree,
+    backend: backendForTests(),
+    io: signalOutput.io,
+    sandboxProbe: readySandboxProbe(),
+    sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+    sandboxRunner: async () => success({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
+  });
+  assert.equal(signal, 3);
+  assert.deepEqual(signalOutput.stdout, []);
+});
+
 test("session exec routes through the canonical protected launcher and never falls back after launch failure", async () => {
   const output = capture();
   let launcherCalls = 0;
@@ -359,6 +441,7 @@ test("canonical command registry resolves aliases without duplicating option def
     "session inspect",
     "session run",
     "session exec",
+    "session shell",
     "session list",
     "session claim",
     "resource claim",
@@ -566,6 +649,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session inspect",
       "session run",
       "session exec",
+      "session shell",
       "session list",
       "session claim",
       "resource claim",
