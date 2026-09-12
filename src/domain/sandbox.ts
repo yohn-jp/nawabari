@@ -895,3 +895,21 @@ export {
   type TgrepRuntimeMaterialization,
   type TgrepRuntimeMaterializationOptions,
 } from "./tgrep-runtime-materialization.js";
+
+export {
+  TGREP_RG_ADAPTER_TARGET,
+  TGREP_RG_COMPATIBILITY_CONTRACT_ID,
+  TGREP_RG_COMPATIBILITY_MATRIX,
+  TGREP_RG_COMPATIBILITY_SCHEMA_VERSION,
+  TGREP_RG_ENTRYPOINT_NAME,
+  TGREP_RG_PROVIDER,
+  TGREP_RG_PROVIDER_CONTRACT_ID,
+  TGREP_RG_PROVIDER_SCHEMA_VERSION,
+  materializeTgrepRgProvider,
+  materializeTgrepRgRuntime,
+  projectTgrepRgRuntime,
+  translateTgrepRgArguments,
+  type TgrepRgCompatibilityEntry,
+  type TgrepRgProviderMaterialization,
+  type TgrepRgTranslation,
+} from "./runtime-provider-tgrep.js";
