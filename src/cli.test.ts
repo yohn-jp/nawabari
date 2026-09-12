@@ -36,6 +36,16 @@ import type {
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
 import { discoverSandboxRuntimeLayout, SANDBOX_REQUIRED_CAPABILITIES, type SandboxProbe } from "./domain/sandbox.js";
+import { resolveRuntimeProfile } from "./domain/runtime-profile.js";
+import {
+  materializeTgrepRuntime,
+  TGREP_BACKEND_REQUIREMENT_OPERATION,
+  TGREP_NIX_INSTALLABLE,
+  TGREP_NIXPKGS_REF,
+} from "./domain/tgrep-runtime-materialization.js";
+import { materializeTgrepRgProvider } from "./domain/runtime-provider-tgrep.js";
+import type { SessionRuntimeProjection } from "./domain/runtime-projection.js";
+import type { NixCommandRunner } from "./domain/nix-runtime-closure.js";
 import type { CliIO } from "./presentation.js";
 
 const sampleSession: SessionRecord = {
@@ -305,6 +315,112 @@ test("session exec routes through the canonical protected launcher and never fal
     code: "SANDBOX_EXECUTION_FAILED",
     message: "launcher failed",
   });
+});
+
+function makeTgrepRgProviderFixture(): {
+  readonly projection: SessionRuntimeProjection;
+  readonly cleanup: () => void;
+} {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-cli-tgrep-rg-"));
+  const store = path.join(root, "store");
+  const nodeRoot = path.join(store, "aaa-nodejs-24");
+  const tgrepRoot = path.join(store, "bbb-tgrep-1.0.4");
+  const nodeDependency = path.join(store, "ccc-node-runtime-dependency");
+  const tgrepDependency = path.join(store, "ddd-tgrep-runtime-dependency");
+  const node = path.join(nodeRoot, "bin", "node");
+  const backend = path.join(tgrepRoot, "bin", "tgrep");
+  fs.mkdirSync(path.dirname(node), { recursive: true });
+  fs.mkdirSync(path.dirname(backend), { recursive: true });
+  fs.copyFileSync(process.execPath, node);
+  fs.chmodSync(node, 0o755);
+  fs.writeFileSync(backend, `#!${process.execPath}\nprocess.stdout.write("stub tgrep\\n");\n`, { mode: 0o755 });
+  fs.mkdirSync(nodeDependency);
+  fs.mkdirSync(tgrepDependency);
+
+  const profileResult = resolveRuntimeProfile({
+    profiles: ["base"],
+    operations: [TGREP_BACKEND_REQUIREMENT_OPERATION],
+  });
+  if (!profileResult.ok) throw profileResult.error;
+  const roots: Readonly<Record<string, string>> = {
+    [`${TGREP_NIXPKGS_REF}#nodejs`]: nodeRoot,
+    [TGREP_NIX_INSTALLABLE]: tgrepRoot,
+  };
+  const runner: NixCommandRunner = (_executable, args) => {
+    const installable = args[args.length - 1];
+    const selectedRoot = typeof installable === "string" ? roots[installable] : undefined;
+    if (selectedRoot === undefined) return { exit_code: 1, stdout: "", stderr: "unknown installable" };
+    const dependency = selectedRoot === nodeRoot ? nodeDependency : tgrepDependency;
+    const paths = args.includes("--recursive") ? [selectedRoot, dependency] : [selectedRoot];
+    return {
+      exit_code: 0,
+      stdout: JSON.stringify(Object.fromEntries(paths.map((value) => [value, null]))),
+      stderr: "",
+    };
+  };
+  const materialized = materializeTgrepRuntime(profileResult.value, {
+    store_root: store,
+    command_runner: runner,
+    nix_executable: "/nix/store/pinned-nix/bin/nix",
+  });
+  if (!materialized.ok) throw materialized.error;
+  const provider = materializeTgrepRgProvider(materialized.value, { artifact_root: path.join(root, "adapter") });
+  if (!provider.ok) throw provider.error;
+  return {
+    projection: provider.value.projection,
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+test("session run and session shell dispatch the identical projected rg provider adapter", async () => {
+  const fixture = makeTgrepRgProviderFixture();
+  try {
+    const runOutput = capture();
+    let runObservedCommand: string[] = [];
+    const runExitCode = await runCli(
+      ["session", "run", "--session", sampleSession.session_id, "--", "rg", "needle", "src"],
+      {
+        cwd: sampleSession.worktree,
+        backend: backendForTests(),
+        io: runOutput.io,
+        sandboxProbe: readySandboxProbe(),
+        sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+        sandboxRuntimeProjection: fixture.projection,
+        sandboxRunner: async (_request, command, options) => {
+          runObservedCommand = [command.command, ...(command.args ?? [])];
+          assert.equal(options?.interactive ?? false, false);
+          return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        },
+      },
+    );
+    assert.equal(runExitCode, 0, runOutput.stderr.join("\n"));
+    assert.deepEqual(runObservedCommand, ["rg", "needle", "src"]);
+
+    const shellOutput = capture();
+    let shellObservedCommand: string[] = [];
+    let shellObservedInteractive = false;
+    const shellExitCode = await runCli(
+      ["session", "shell", "--session", sampleSession.session_id, "--", "rg", "needle", "src"],
+      {
+        cwd: sampleSession.worktree,
+        backend: backendForTests(),
+        io: shellOutput.io,
+        sandboxProbe: readySandboxProbe(),
+        sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+        sandboxRuntimeProjection: fixture.projection,
+        sandboxRunner: async (_request, command, options) => {
+          shellObservedCommand = [command.command, ...(command.args ?? [])];
+          shellObservedInteractive = options?.interactive === true;
+          return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        },
+      },
+    );
+    assert.equal(shellExitCode, 0, shellOutput.stderr.join("\n"));
+    assert.deepEqual(shellObservedCommand, ["/nawabari/bin/rg", "needle", "src"]);
+    assert.equal(shellObservedInteractive, true);
+  } finally {
+    fixture.cleanup();
+  }
 });
 
 test("session run returns a rejected exit status for a signaled child and never falls back when protection is unavailable", async () => {
