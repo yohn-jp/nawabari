@@ -12,6 +12,7 @@ import {
   compileSandboxSeccompProfile,
   discoverSandboxRuntimeLayout,
   resolveSandboxExecutionRequest,
+  runInteractiveSandboxedCommand,
   runSandboxedCommand,
   type SandboxProbe,
 } from "./sandbox.js";
@@ -662,6 +663,70 @@ test("sandboxed child limits are bounded and fail with stable errors", async () 
     );
     assert.equal(unicodeOutput.ok, false);
     if (!unicodeOutput.ok) assert.equal(unicodeOutput.error.code, "SANDBOX_OUTPUT_LIMIT");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("interactive execution inherits the caller streams, preserves the protected environment, and skips bounded limits", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  const marker = path.join(worktree, "interactive-marker.json");
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const parentStdout = fs.fstatSync(1);
+    const script = [
+      "const fs = require('node:fs')",
+      `fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ cwd: process.cwd(), home: process.env.HOME, path: process.env.PATH, stdout: ((stat) => ({ dev: stat.dev, ino: stat.ino }))(fs.fstatSync(1)) }))`,
+      "process.exit(9)",
+    ].join(";");
+    const result = await runInteractiveSandboxedCommand(request, { command: "node", args: ["-e", script] });
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (!result.ok) return;
+    assert.equal(result.value.exit_code, 9);
+    assert.equal(result.value.signal, null);
+    assert.equal(result.value.stdout, "");
+    assert.equal(result.value.stderr, "");
+    const observed = JSON.parse(fs.readFileSync(marker, "utf8")) as {
+      cwd: string;
+      home: string;
+      path: string;
+      stdout: { dev: number; ino: number };
+    };
+    assert.equal(observed.cwd, worktree);
+    assert.equal(observed.home, "/home/nawabari");
+    assert.match(observed.path, /(?:^|:)\/usr\/bin(?:$|:)/u);
+    assert.deepEqual(observed.stdout, { dev: parentStdout.dev, ino: parentStdout.ino });
+
+    const signal = await runInteractiveSandboxedCommand(request, {
+      command: "node",
+      args: ["-e", "process.kill(process.ppid, 'SIGTERM'); setTimeout(() => {}, 1000)"],
+    });
+    assert.equal(signal.ok, true, signal.ok ? "" : JSON.stringify(signal.error));
+    if (signal.ok) {
+      assert.equal(signal.value.exit_code, null);
+      assert.equal(signal.value.signal, "SIGTERM");
+    }
+
+    const interrupt = await runInteractiveSandboxedCommand(request, {
+      command: "node",
+      args: ["-e", "process.kill(process.ppid, 'SIGINT'); setTimeout(() => {}, 1000)"],
+    });
+    assert.equal(interrupt.ok, true, interrupt.ok ? "" : JSON.stringify(interrupt.error));
+    if (interrupt.ok) {
+      assert.equal(interrupt.value.exit_code, null);
+      assert.equal(interrupt.value.signal, "SIGINT");
+    }
+
+    const invalidLimits = await runSandboxedCommand(
+      request,
+      { command: "node", args: ["-e", "process.exit(0)"] },
+      { interactive: true, timeout_ms: 0, max_output_bytes: 0 },
+    );
+    assert.equal(invalidLimits.ok, true, invalidLimits.ok ? "" : JSON.stringify(invalidLimits.error));
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);

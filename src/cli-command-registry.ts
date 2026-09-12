@@ -137,6 +137,16 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     ],
   },
   {
+    name: "session shell",
+    summary: "Run an explicitly projected shell inside the protected session sandbox",
+    usage: `${CLI_NAME} session shell [--session <id>] -- <projected-shell> [args...]`,
+    options: [option("--session", "Select the active owned session", { value: "<id>" })],
+    notes: [
+      "The -- terminator is mandatory. The projected shell is resolved only through /nawabari/bin and receives inherited stdio.",
+      "Nawabari does not parse shell syntax or select a host/default shell.",
+    ],
+  },
+  {
     name: "session list",
     summary: "List bounded repository session records",
     usage: `${CLI_NAME} session list [--all|--history] [--limit <n>] [--offset <n>]`,
