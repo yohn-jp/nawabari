@@ -76,6 +76,12 @@ for (const installable of [materializer.RTK_NIX_INSTALLABLE, materializer.PNPM_N
   run("nix", ["path-info", "--offline", "--json", "--json-format", "1", "--no-pretty", "--recursive", installable]);
 }
 
-run(process.execPath, ["--test", "--import", "tsx", "src/domain/pnpm-middleware-backend-materialization.test.ts"], {
-  env: { ...process.env, NAWABARI_PNPM_MIDDLEWARE_RUNTIME_CONFORMANCE: "1" },
-});
+const conformanceEnv = { ...process.env, NAWABARI_PNPM_MIDDLEWARE_RUNTIME_CONFORMANCE: "1" };
+for (const testFile of [
+  "src/domain/pnpm-middleware-backend-materialization.test.ts",
+  // The #306 acceptance test consumes the real #311 handoff under this same
+  // Nix-preseeded and protected-runtime conformance gate.
+  "src/domain/runtime-provider-pnpm-middleware.test.ts",
+]) {
+  run(process.execPath, ["--test", "--import", "tsx", testFile], { env: conformanceEnv });
+}
