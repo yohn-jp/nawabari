@@ -297,7 +297,10 @@ test("explicit projections compile a regular-file source without misrepresenting
       if (value === "--dir") acc.push(args[index + 1] as string);
       return acc;
     }, []);
-    assert.ok(!dirArgs.includes("/etc/app/config.json"), "a file projection target must not be pre-created as a directory");
+    assert.ok(
+      !dirArgs.includes("/etc/app/config.json"),
+      "a file projection target must not be pre-created as a directory",
+    );
     assert.ok(dirArgs.includes("/etc/app"), "the file projection's parent directory must be pre-created");
   } finally {
     fixture.cleanup();
@@ -652,4 +655,3 @@ test("a protected session runs with a private root/tmp/proc view and only its ow
     fs.rmSync(repository, { recursive: true, force: true });
   }
 });
-

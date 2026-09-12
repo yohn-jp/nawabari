@@ -184,7 +184,8 @@ export type LandlockProjectionEntry = Pick<RuntimeFilesystemProjection, "target"
  */
 export function deriveLandlockRules(
   topology: SandboxFilesystemTopology,
-  runtimeProjection?: (Omit<SessionRuntimeProjection, "filesystem"> & { filesystem: readonly LandlockProjectionEntry[] }) | null,
+  runtimeProjection?:
+    (Omit<SessionRuntimeProjection, "filesystem"> & { filesystem: readonly LandlockProjectionEntry[] }) | null,
 ): readonly LandlockRule[] {
   const rules = new Map<string, number>();
 
