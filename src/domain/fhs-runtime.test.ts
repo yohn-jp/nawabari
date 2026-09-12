@@ -344,7 +344,11 @@ test("a strict FHS projection executes its declared runtime and hides absolute-p
     const request = await resolveSandboxExecutionRequest(
       backend,
       { cwd: worktree },
-      { session_id: created.value.session_id, enforce: true },
+      {
+        session_id: created.value.session_id,
+        enforce: true,
+        runtime_policy: EXPLICIT_COMPATIBILITY_RUNTIME_POLICY,
+      },
       defaultSandboxProbe,
     );
     assert.equal(request.ok, true, request.ok ? "" : JSON.stringify(request.error));

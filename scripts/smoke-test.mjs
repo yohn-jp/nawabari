@@ -290,9 +290,17 @@ async function main() {
       }
     }
 
+    // Protected execution defaults to the strict development profile. Supply
+    // the exact evidence-bound FHS candidates consumed by #314; this fixture
+    // does not discover PATH, Corepack, or profile directories.
+    const fhsPnpmExecutable = path.join(installDirectory, "fhs-pnpm");
+    fs.writeFileSync(fhsPnpmExecutable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     const gitEnvironment = {
       ...process.env,
       PATH: `${binDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+      NAWABARI_FHS_NODE_EXECUTABLE: fs.realpathSync.native(process.execPath),
+      NAWABARI_FHS_GIT_EXECUTABLE: fs.realpathSync.native("/usr/bin/git"),
+      NAWABARI_FHS_PNPM_EXECUTABLE: fhsPnpmExecutable,
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_SYSTEM: "/dev/null",
       GIT_TERMINAL_PROMPT: "0",

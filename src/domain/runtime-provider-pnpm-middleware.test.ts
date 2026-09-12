@@ -628,7 +628,12 @@ test("the launcher transport stays isolated under a bounded real runtime with sy
     const request = await resolveSandboxExecutionRequest(
       backend,
       { cwd: worktree },
-      { session_id: created.value.session_id, enforce: true },
+      {
+        session_id: created.value.session_id,
+        enforce: true,
+        runtime_policy: STRICT_RUNTIME_POLICY,
+        runtime_projection: preProjection.value,
+      },
       readyProbe(),
       discoverSandboxRuntimeLayout(),
     );

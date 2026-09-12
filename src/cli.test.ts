@@ -11,6 +11,7 @@ import {
   resolveCliCommandDefinition,
   runCli,
   validateCliRegistryParity,
+  type CliDependencies,
 } from "./cli.js";
 import { DomainError, failure, success } from "./domain/errors.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
@@ -35,7 +36,12 @@ import type {
   UpdateClaimsOptions,
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
-import { discoverSandboxRuntimeLayout, SANDBOX_REQUIRED_CAPABILITIES, type SandboxProbe } from "./domain/sandbox.js";
+import {
+  discoverSandboxRuntimeLayout,
+  SANDBOX_REQUIRED_CAPABILITIES,
+  type SandboxProbe,
+  type SandboxRuntimeLayout,
+} from "./domain/sandbox.js";
 import { resolveRuntimeProfile } from "./domain/runtime-profile.js";
 import {
   materializeTgrepRuntime,
@@ -84,6 +90,22 @@ function readySandboxProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe 
     hasSeccomp: () => true,
     hasCapabilities: () => true,
     ...overrides,
+  };
+}
+
+function strictRuntimeLayout(): SandboxRuntimeLayout {
+  const layout = discoverSandboxRuntimeLayout();
+  return {
+    ...layout,
+    fhs_executable_candidates: [
+      { requirement_id: "node-runtime", path: fs.realpathSync.native(process.execPath), target: "/usr/local/bin/node" },
+      { requirement_id: "git-package", path: "/usr/bin/git", target: "/usr/local/bin/git" },
+      {
+        requirement_id: "pnpm-package",
+        path: fs.realpathSync.native("/usr/bin/pnpm"),
+        target: "/usr/local/bin/pnpm",
+      },
+    ],
   };
 }
 
@@ -154,7 +176,7 @@ test("session run resolves the existing session authority and preserves command 
         hasSeccomp: () => true,
         hasCapabilities: () => true,
       },
-      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async (request, command) => {
         assert.equal(request.worktree, sampleSession.worktree);
         observedCommand = [command.command, ...(command.args ?? [])];
@@ -173,6 +195,16 @@ test("session run resolves the existing session authority and preserves command 
     stdout: "ok",
     stderr: "",
     duration_ms: 1,
+    runtime_resolution: {
+      policy: {
+        mode: "strict",
+        host_visibility: "default-deny",
+        compatibility: "disabled",
+        unrestricted_host_fallback: "forbidden",
+      },
+      profile: { id: "development", version: "1" },
+      materializer: "fhs",
+    },
   });
 });
 
@@ -193,7 +225,7 @@ test("session run does not interpret a child --json argument as a Nawabari globa
       hasSeccomp: () => true,
       hasCapabilities: () => true,
     },
-    sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+    sandboxRuntimeLayout: strictRuntimeLayout(),
     sandboxRunner: async (_request, command) => {
       assert.deepEqual([command.command, ...(command.args ?? [])], ["printf", "--json"]);
       return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
@@ -202,6 +234,63 @@ test("session run does not interpret a child --json argument as a Nawabari globa
 
   assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
   assert.match(output.stdout[0] ?? "", /^session run: ok/);
+});
+
+test("session run and merged session shell carry explicit compatibility policy through the same protected route", async () => {
+  const observed: Array<{ readonly policy: string; readonly command: string }> = [];
+  const output = capture();
+  const dependencies: CliDependencies = {
+    cwd: sampleSession.worktree,
+    backend: backendForTests(),
+    io: output.io,
+    sandboxProbe: readySandboxProbe(),
+    sandboxRuntimeLayout: strictRuntimeLayout(),
+    sandboxRunner: async (request, command) => {
+      observed.push({ policy: request.runtime_projection?.policy.mode ?? "missing", command: command.command });
+      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+    },
+  };
+
+  assert.equal(
+    await runCli(
+      ["session", "run", "--session", sampleSession.session_id, "--runtime-policy", "compatibility", "--", "node"],
+      dependencies,
+    ),
+    0,
+  );
+  assert.equal(
+    await runCli(
+      ["session", "shell", "--session", sampleSession.session_id, "--runtime-policy", "compatibility", "--", "bash"],
+      dependencies,
+    ),
+    0,
+  );
+  assert.deepEqual(observed, [
+    { policy: "compatibility", command: "node" },
+    { policy: "compatibility", command: "bash" },
+  ]);
+});
+
+test("runtime policy parser rejects unknown and duplicate values before protected execution", async () => {
+  for (const arguments_ of [
+    ["session", "run", "--runtime-policy", "broad", "--", "node"],
+    ["session", "run", "--runtime-policy", "strict", "--runtime-policy", "compatibility", "--", "node"],
+  ]) {
+    let runnerCalls = 0;
+    const output = capture();
+    const exitCode = await runCli(arguments_, {
+      cwd: sampleSession.worktree,
+      backend: backendForTests(),
+      io: output.io,
+      sandboxRunner: async () => {
+        runnerCalls += 1;
+        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      },
+    });
+    assert.equal(exitCode, 2, arguments_.join(" "));
+    assert.equal(runnerCalls, 0, arguments_.join(" "));
+    assert.match(output.stderr.join("\n"), /runtime-policy/u, arguments_.join(" "));
+  }
 });
 
 test("session shell requires -- and passes only the projected shell argv to the interactive launcher", async () => {
@@ -215,7 +304,7 @@ test("session shell requires -- and passes only the projected shell argv to the 
       backend: backendForTests(),
       io: output.io,
       sandboxProbe: readySandboxProbe(),
-      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async (request, command, options) => {
         assert.equal(request.enforce, true);
         assert.equal(request.session_id, sampleSession.session_id);
@@ -266,7 +355,7 @@ test("session shell propagates a projected shell exit status or signal", async (
       backend: backendForTests(),
       io: nonzeroOutput.io,
       sandboxProbe: readySandboxProbe(),
-      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async () => success({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
     },
   );
@@ -279,7 +368,7 @@ test("session shell propagates a projected shell exit status or signal", async (
     backend: backendForTests(),
     io: signalOutput.io,
     sandboxProbe: readySandboxProbe(),
-    sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+    sandboxRuntimeLayout: strictRuntimeLayout(),
     sandboxRunner: async () => success({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
   });
   assert.equal(signal, 3);
@@ -296,7 +385,7 @@ test("session exec routes through the canonical protected launcher and never fal
       backend: backendForTests(),
       io: output.io,
       sandboxProbe: readySandboxProbe(),
-      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async (request, command) => {
         launcherCalls += 1;
         assert.equal(request.enforce, true);
@@ -432,6 +521,7 @@ test("session run returns a rejected exit status for a signaled child and never 
       backend: backendForTests(),
       io: signalOutput.io,
       sandboxProbe: readySandboxProbe(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async () =>
         success({ exit_code: null, signal: "SIGTERM", stdout: "", stderr: "", duration_ms: 1 }),
     },
@@ -446,6 +536,16 @@ test("session run returns a rejected exit status for a signaled child and never 
     stdout: "",
     stderr: "",
     duration_ms: 1,
+    runtime_resolution: {
+      policy: {
+        mode: "strict",
+        host_visibility: "default-deny",
+        compatibility: "disabled",
+        unrestricted_host_fallback: "forbidden",
+      },
+      profile: { id: "development", version: "1" },
+      materializer: "fhs",
+    },
   });
 
   const unavailableOutput = capture();
@@ -595,7 +695,7 @@ test("dispatcher command and option inventory is structurally bound to the canon
     [...dispatcherAllowedOptions("resource update")],
     ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
   );
-  assert.deepEqual([...dispatcherAllowedOptions("session exec")], ["--session"]);
+  assert.deepEqual([...dispatcherAllowedOptions("session exec")], ["--session", "--runtime-policy"]);
 });
 
 test("session list discovery describes the implemented bounded pagination and history semantics", async () => {
@@ -804,6 +904,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--label",
       "--session",
       "--integrated-revision",
+      "--runtime-policy",
       "--limit",
       "--offset",
       "--resource",
@@ -1463,6 +1564,14 @@ test("doctor JSON exposes protected-execution readiness without resolving a sess
         ready: boolean;
         missing_required: string[];
         capabilities: Array<{ id: string; requirement: string; status: string }>;
+        runtime: {
+          default_policy: { mode: string };
+          default_profile: { id: string; version: string };
+          selected: string | null;
+          available: string[];
+          strict_ready: boolean;
+          compatibility_policy: { mode: string };
+        };
       };
     };
     assert.equal(response.ok, true);
@@ -1471,6 +1580,11 @@ test("doctor JSON exposes protected-execution readiness without resolving a sess
     assert.equal(response.sandbox.schema_version, 1);
     assert.equal(response.sandbox.platform_supported, true);
     assert.equal(response.sandbox.network_mode, "inherited");
+    assert.equal(response.sandbox.runtime.default_policy.mode, "strict");
+    assert.deepEqual(response.sandbox.runtime.default_profile, { id: "development", version: "1" });
+    assert.equal(response.sandbox.runtime.compatibility_policy.mode, "compatibility");
+    assert.ok(response.sandbox.runtime.selected === null || ["nix", "fhs"].includes(response.sandbox.runtime.selected));
+    assert.ok(response.sandbox.runtime.available.every((materializer) => ["nix", "fhs"].includes(materializer)));
     assert.equal(response.sandbox.ready, false);
     assert.deepEqual(response.sandbox.missing_required, [
       "user_namespaces",

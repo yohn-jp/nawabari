@@ -133,11 +133,14 @@ git nawabari push --session "$session_id" --remote origin --branch feature/examp
 Protected execution is an opt-in Linux-only mode beneath the existing Nawabari session and claim authority. It does not create a second session identity and does not turn ordinary `session create` work into a sandbox.
 
 ```bash
-git nawabari session run --session "$session_id" -- node worker.js
+git nawabari session run --session "$session_id" --runtime-policy strict -- node worker.js
 git nawabari session exec --session "$session_id" -- npm test
+git nawabari session shell --session "$session_id" --runtime-policy compatibility
 ```
 
 The `--` terminator is mandatory. The command is passed as argv and is not interpreted by a shell. The canonical profile gives the child a private root, `/tmp`, `/proc`, HOME, and cache state, mounts only the owned worktree read-write, and does not expose sibling worktrees or Nawabari control paths. Network mode is explicitly `inherited`, not isolated. Required Linux capabilities fail closed when unavailable; optional Landlock and cgroups v2 provide defense in depth when available.
+
+Protected execution defaults to the strict `development` runtime profile. Only declared Node, Git, and pnpm material is projected through `/nawabari/bin`; `/usr`, `/bin`, `/nix/store`, the host home, and local user-tool directories are not implicitly visible. Compatibility is available only through the explicit `--runtime-policy compatibility` option.
 
 ```bash
 git nawabari doctor --json
