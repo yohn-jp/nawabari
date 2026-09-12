@@ -60,13 +60,13 @@ Close is conservative. Unintegrated commits, dirty worktrees, ambiguous Git stat
 
 Each boundary has one job and one local authority. README summarizes the product contract; executable code and machine-readable projections remain authoritative for exact schemas, transitions, and failure vocabularies.
 
-| Boundary | What it answers | Typical commands |
-| --- | --- | --- |
-| Session lifecycle | Which session owns a worktree/branch and whether it can safely progress or terminate | `session create`, `session inspect`, `session close` |
-| Resource Claims | Which session may access a canonical repository resource and at what mode | `session claim`, `session claims`, `session update`, `session release` |
-| Mutation authorization | Whether a concrete operation has sufficient claims and no conflicting owner | `guard`, `authorize`, `commit`, `push` |
-| Repository evidence | What Git can observe about revisions, paths, changes, ancestry, and bounded diffs | `checkpoint`, `evidence snapshot`, `diff` |
-| Protected execution | Whether a command runs inside the opt-in Linux process/filesystem boundary | `session run`, `session exec`, `doctor` |
+| Boundary               | What it answers                                                                      | Typical commands                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Session lifecycle      | Which session owns a worktree/branch and whether it can safely progress or terminate | `session create`, `session inspect`, `session close`                   |
+| Resource Claims        | Which session may access a canonical repository resource and at what mode            | `session claim`, `session claims`, `session update`, `session release` |
+| Mutation authorization | Whether a concrete operation has sufficient claims and no conflicting owner          | `guard`, `authorize`, `commit`, `push`                                 |
+| Repository evidence    | What Git can observe about revisions, paths, changes, ancestry, and bounded diffs    | `checkpoint`, `evidence snapshot`, `diff`                              |
+| Protected execution    | Whether a command runs inside the opt-in Linux process/filesystem boundary           | `session run`, `session exec`, `doctor`                                |
 
 Claims are not task labels and do not encode GitHub or agent semantics. `write` permits ordinary path changes; `exclusive-write` is required for finalizing operations such as commit and push. Conflicting or ambiguous claims fail closed.
 
@@ -176,10 +176,7 @@ import {
 
 import { nawabariMachineContract } from "nawabari/contract";
 
-import {
-  generateNawabariProductStateManifest,
-  serializeNawabariProductStateManifest,
-} from "nawabari/manifest";
+import { generateNawabariProductStateManifest, serializeNawabariProductStateManifest } from "nawabari/manifest";
 ```
 
 `nawabari/state` provides transport-neutral lifecycle projection and read-only observation of an existing session. `nawabari/contract` provides the installed machine-contract projection. `nawabari/manifest` provides the deterministic Product State Manifest projection.

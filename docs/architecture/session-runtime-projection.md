@@ -1,0 +1,52 @@
+# Session Runtime Projection
+
+Issue #287 defines the target protected-session model as:
+
+```text
+Session authority -> Runtime projection -> Existing isolation backend -> Process
+```
+
+Issue #288 establishes the typed contract at the middle boundary. The
+implementation is `src/domain/runtime-projection.ts` and is deliberately pure:
+it validates and canonically orders a declaration. It does not discover
+packages, materialize files, probe the host, compile mounts, or launch a
+process.
+
+## Contract boundary
+
+`SessionRuntimeProjection` describes the runtime view that a later resolver
+has selected:
+
+- `policy` distinguishes strict default-deny from explicitly selected
+  compatibility behavior;
+- `profile` identifies what runtime material exists;
+- `requirements` declares the runtime and package material required by that
+  profile;
+- `filesystem` describes explicit source-to-sandbox projections, access mode,
+  and provenance;
+- `executables` describes stable entrypoint names and their abstract provider
+  identities.
+
+Runtime profiles and executable projections are intentionally separate. A
+profile does not implicitly expose every executable in its material, and an
+executable provider is not a package-discovery mechanism. Concrete providers
+and third-party tools remain outside this stable domain vocabulary.
+
+Strict policy is the default and encodes `host_visibility: "default-deny"`
+with `unrestricted_host_fallback: "forbidden"`. Compatibility projections
+must carry compatibility provenance and use the explicit compatibility policy.
+An omitted policy cannot select compatibility behavior.
+
+## Sandbox ownership
+
+`SessionRuntimeProjection` is resolved before the isolation backend. The
+existing `SandboxExecutionRequest` remains the contract that binds an already
+authorized Nawabari session to bubblewrap/capability/namespace execution. A
+future resolver may consume this projection while compiling the sandbox
+topology, but #288 does not add a second executor or change bubblewrap
+behavior.
+
+Missing providers and missing materialization are represented by the typed
+`RUNTIME_PROVIDER_MISSING` and `RUNTIME_MATERIALIZATION_MISSING` errors. They
+are recoverable failures; strict resolution must not turn either into an
+unrestricted host fallback.
