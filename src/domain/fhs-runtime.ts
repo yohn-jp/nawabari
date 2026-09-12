@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { posix } from "node:path";
 
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
+import { inspectRuntimeFile, readRuntimeFile } from "./runtime-file-identity.js";
 import {
   RUNTIME_PROFILE_CONTRACT_ID,
   RUNTIME_PROFILE_SCHEMA_VERSION,
@@ -93,6 +94,7 @@ type ElfMetadata = Readonly<{
 type CanonicalFile = Readonly<{
   readonly source: string;
   readonly target: string;
+  readonly inspection?: DomainResult<ElfMetadata>;
 }>;
 
 type RequirementContext = Readonly<{
@@ -241,24 +243,19 @@ function canonicalHostFile(
   requirement: RequirementContext,
   field: string,
   allowExternalSource = false,
+  inspect?: (descriptor: number, stat: fs.BigIntStats) => DomainResult<ElfMetadata>,
 ): DomainResult<CanonicalFile> {
   try {
-    const stat = fs.lstatSync(candidate);
-    if (!stat.isFile() && !stat.isSymbolicLink()) {
-      return materializationFailure(requirement, "declared artifact is not a regular file", { field });
-    }
-    const source = fs.realpathSync.native(candidate);
-    const resolvedStat = fs.statSync(source);
-    if (!resolvedStat.isFile()) {
-      return materializationFailure(requirement, "declared artifact does not resolve to a regular file", { field });
-    }
+    const inspected = inspectRuntimeFile(candidate, inspect ?? (() => undefined));
+    const source = inspected.source;
     if (!allowExternalSource && !isFhsPath(source)) {
       return materializationFailure(requirement, "declared artifact resolves outside the bounded FHS roots", {
         field,
         resolved_source: source,
       });
     }
-    return success({ source, target: candidate });
+    const inspection = inspect === undefined ? undefined : inspected.value;
+    return success({ source, target: candidate, ...(inspection === undefined ? {} : { inspection }) });
   } catch (error: unknown) {
     return materializationFailure(requirement, "declared artifact is missing or cannot be canonicalized", {
       field,
@@ -343,22 +340,7 @@ function virtualToFileOffset(
   return null;
 }
 
-function parseElf(candidate: string, requirement: RequirementContext): DomainResult<ElfMetadata> {
-  let data: Buffer;
-  try {
-    const size = fs.statSync(candidate).size;
-    if (!Number.isSafeInteger(size) || size > MAX_ELF_BYTES) {
-      return materializationFailure(requirement, "ELF artifact exceeds the bounded inspection size", {
-        artifact_size: size,
-      });
-    }
-    data = fs.readFileSync(candidate);
-  } catch (error: unknown) {
-    return materializationFailure(requirement, "ELF artifact cannot be read", {
-      reason_detail: error instanceof Error ? error.message.slice(0, 120) : "unknown",
-    });
-  }
-
+function parseElf(data: Buffer, requirement: RequirementContext): DomainResult<ElfMetadata> {
   if (data.length < 52 || data[0] !== 0x7f || data[1] !== 0x45 || data[2] !== 0x4c || data[3] !== 0x46) {
     return materializationFailure(requirement, "unsupported non-ELF executable format");
   }
@@ -501,31 +483,40 @@ function parseElf(candidate: string, requirement: RequirementContext): DomainRes
  * shebang interpreter is another bounded artifact; the script itself has no
  * ELF loader or DT_NEEDED closure to inspect.
  */
-function parseScriptInterpreter(candidate: string, requirement: RequirementContext): DomainResult<string | null> {
-  let handle: number | null = null;
-  try {
-    handle = fs.openSync(candidate, fs.constants.O_RDONLY);
-    const buffer = Buffer.alloc(4_096);
-    const bytes = fs.readSync(handle, buffer, 0, buffer.length, 0);
-    const firstLine = buffer.subarray(0, bytes).toString("utf8").split("\n", 1)[0] ?? "";
-    if (!firstLine.startsWith("#!")) return success(null);
-    const shebang = firstLine.slice(2).trim();
-    const interpreter = shebang.split(/\s+/u, 1)[0] ?? "";
-    if (interpreter.length === 0 || !posix.isAbsolute(interpreter) || posix.normalize(interpreter) !== interpreter) {
-      return materializationFailure(requirement, "script interpreter is not a bounded absolute path");
-    }
-    return success(interpreter);
-  } catch {
-    return materializationFailure(requirement, "executable script cannot be inspected");
-  } finally {
-    if (handle !== null) {
-      try {
-        fs.closeSync(handle);
-      } catch {
-        // Preserve the original materialization result.
-      }
-    }
+function parseScriptInterpreter(data: Buffer, requirement: RequirementContext): DomainResult<string | null> {
+  const firstLine = data.subarray(0, 4_096).toString("utf8").split("\n", 1)[0] ?? "";
+  if (!firstLine.startsWith("#!")) return success(null);
+  const shebang = firstLine.slice(2).trim();
+  const interpreter = shebang.split(/\s+/u, 1)[0] ?? "";
+  if (interpreter.length === 0 || !posix.isAbsolute(interpreter) || posix.normalize(interpreter) !== interpreter) {
+    return materializationFailure(requirement, "script interpreter is not a bounded absolute path");
   }
+  return success(interpreter);
+}
+
+function inspectArtifact(
+  descriptor: number,
+  stat: fs.BigIntStats,
+  requirement: RequirementContext,
+): DomainResult<ElfMetadata> {
+  if (stat.size > BigInt(MAX_ELF_BYTES)) {
+    return materializationFailure(requirement, "ELF artifact exceeds the bounded inspection size", {
+      artifact_size: Number(stat.size),
+    });
+  }
+  let data: Buffer;
+  try {
+    data = readRuntimeFile(descriptor, stat.size, MAX_ELF_BYTES);
+  } catch (error: unknown) {
+    return materializationFailure(requirement, "ELF artifact cannot be read", {
+      reason_detail: error instanceof Error ? error.message.slice(0, 120) : "unknown",
+    });
+  }
+  const parsed = parseElf(data, requirement);
+  if (parsed.ok) return parsed;
+  const scriptInterpreter = parseScriptInterpreter(data, requirement);
+  if (!scriptInterpreter.ok || scriptInterpreter.value === null) return parsed;
+  return success({ interpreter: scriptInterpreter.value, needed: Object.freeze([]), rpath: null, runpath: null });
 }
 
 function validateLibrarySearchPaths(value: unknown): DomainResult<readonly string[]> {
@@ -869,7 +860,13 @@ export function materializeFhsRuntime(input: unknown): DomainResult<SessionRunti
       return materializationFailure(requirement, "dependency graph exceeds the bounded depth");
     const checkedTarget = validateFhsTarget(target, "filesystem.target");
     if (!checkedTarget.ok) return checkedTarget;
-    const source = canonicalHostFile(candidate, requirement, "filesystem.source", allowExternalSource);
+    const source = canonicalHostFile(
+      candidate,
+      requirement,
+      "filesystem.source",
+      allowExternalSource,
+      (descriptor, stat) => inspectArtifact(descriptor, stat, requirement),
+    );
     if (!source.ok) return source;
     const previous = mounts.get(checkedTarget.value);
     if (previous !== undefined) {
@@ -900,15 +897,12 @@ export function materializeFhsRuntime(input: unknown): DomainResult<SessionRunti
 
     let metadata = parsed.get(source.value.source);
     if (metadata === undefined) {
-      const parsedMetadata = parseElf(source.value.source, requirement);
-      if (parsedMetadata.ok) {
-        metadata = parsedMetadata.value;
-      } else {
-        const scriptInterpreter = parseScriptInterpreter(source.value.source, requirement);
-        if (!scriptInterpreter.ok) return parsedMetadata;
-        if (scriptInterpreter.value === null) return parsedMetadata;
-        metadata = { interpreter: scriptInterpreter.value, needed: Object.freeze([]), rpath: null, runpath: null };
+      const inspected = source.value.inspection;
+      if (inspected === undefined) {
+        return materializationFailure(requirement, "ELF artifact inspection did not produce metadata");
       }
+      if (!inspected.ok) return inspected;
+      metadata = inspected.value;
       parsed.set(source.value.source, metadata);
     }
 

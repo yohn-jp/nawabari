@@ -39,6 +39,7 @@ import {
   TGREP_RG_PROVIDER,
   translateTgrepRgArguments,
 } from "./runtime-provider-tgrep.js";
+import { withRuntimeFileIdentityTestHooks } from "./runtime-file-identity.js";
 import type { NixCommandRunner } from "./nix-runtime-closure.js";
 
 type Fixture = Readonly<{
@@ -480,6 +481,34 @@ test("generated rg artifact is projected once and is shared by direct, child, an
     });
     assert.equal(absolutePath.status, 2);
     assert.match(absolutePath.stderr, /repository-relative paths/u);
+  } finally {
+    fs.rmSync(sandboxRoot, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("tgrep adapter materialization fails closed when its created file is replaced before identity verification", () => {
+  const fixture = makeMaterializationFixture();
+  const sandboxRoot = fs.mkdtempSync(path.join("/var/tmp", "nawabari-tgrep-provider-identity-"));
+  const artifactRoot = path.join(sandboxRoot, "adapter");
+  const adapterSource = path.join(artifactRoot, "rg");
+  const displaced = `${adapterSource}.created`;
+  const replacement = "competing rg adapter\n";
+  try {
+    fs.mkdirSync(artifactRoot, { recursive: true });
+    const result = withRuntimeFileIdentityTestHooks(
+      {
+        beforeFinalIdentityCheck: (checkedPath) => {
+          if (checkedPath !== adapterSource) return;
+          fs.renameSync(checkedPath, displaced);
+          fs.writeFileSync(checkedPath, replacement, { mode: 0o644 });
+        },
+      },
+      () => materializeTgrepRgProvider(fixture.materialization, { artifact_root: artifactRoot }),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+    assert.equal(fs.readFileSync(adapterSource, "utf8"), replacement);
   } finally {
     fs.rmSync(sandboxRoot, { recursive: true, force: true });
     fixture.cleanup();

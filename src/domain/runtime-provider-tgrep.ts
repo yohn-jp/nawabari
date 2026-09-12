@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import type { RuntimeExecutableProviderMaterialization } from "./runtime-executable-projection.js";
+import { createRuntimeFile, inspectRuntimeFile } from "./runtime-file-identity.js";
 import {
   CANONICAL_EXECUTABLE_ROOT,
   compileRuntimeExecutableProjection,
@@ -125,6 +126,13 @@ const OPTION_SPECS: readonly OptionSpec[] = TGREP_RG_COMPATIBILITY_MATRIX.filter
   (entry): entry is TgrepRgCompatibilityEntry & { readonly status: "supported" } =>
     entry.status === "supported" && entry.id !== "pattern-and-paths",
 );
+const MAX_ADAPTER_BYTES = 16 * 1024 * 1024;
+
+class AdapterContentConflict extends Error {
+  public constructor() {
+    super("the existing rg adapter artifact conflicts with the pinned materialization");
+  }
+}
 
 const OPTION_BY_SPELLING = new Map(OPTION_SPECS.flatMap((entry) => entry.rg.map((spelling) => [spelling, entry])));
 
@@ -344,12 +352,15 @@ function exactNodeSource(materialization: TgrepRuntimeMaterialization): DomainRe
     });
   }
   try {
-    const stat = fs.statSync(source);
-    const resolved = fs.realpathSync.native(source);
+    const inspected = inspectRuntimeFile(source, (_descriptor, stat) => {
+      if ((stat.mode & 0o111n) === 0n) throw new Error("not executable");
+      return undefined;
+    });
+    const resolved = inspected.source;
     const inClosure = materialization.closure.store_paths.some(
       (storePath) => resolved === storePath || resolved.startsWith(`${storePath}/`),
     );
-    if (!stat.isFile() || (stat.mode & 0o111) === 0 || !inClosure) {
+    if (!inClosure) {
       return materializationError("The selected node-runtime executable is not a regular executable file.", {
         node_source: source,
         ...(inClosure ? {} : { resolved_source: resolved }),
@@ -561,28 +572,31 @@ export function materializeTgrepRgProvider(
   const adapterSource = path.join(artifactRoot.value, TGREP_RG_ENTRYPOINT_NAME);
   const content = renderAdapterSource(node.value, backendSource);
   try {
-    if (fs.existsSync(adapterSource)) {
-      const stat = fs.lstatSync(adapterSource);
-      if (stat.isSymbolicLink() || !stat.isFile()) {
-        return materializationError("The existing rg adapter artifact is not a regular file.", {
-          adapter_source: adapterSource,
-        });
-      }
-      if (fs.readFileSync(adapterSource, "utf8") !== content) {
-        return materializationError("The existing rg adapter artifact conflicts with the pinned materialization.", {
-          adapter_source: adapterSource,
-        });
-      }
-    } else {
-      fs.writeFileSync(adapterSource, content, { mode: 0o755, flag: "wx" });
+    try {
+      inspectRuntimeFile(
+        adapterSource,
+        (descriptor, stat) => {
+          if (stat.size > BigInt(MAX_ADAPTER_BYTES)) throw new Error("the adapter exceeds the bounded size");
+          if (fs.readFileSync(descriptor, "utf8") !== content) throw new AdapterContentConflict();
+          fs.fchmodSync(descriptor, 0o755);
+          return undefined;
+        },
+        { requireCanonicalPath: true },
+      );
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      createRuntimeFile(adapterSource, (descriptor) => {
+        fs.writeFileSync(descriptor, content, { encoding: "utf8" });
+        fs.fchmodSync(descriptor, 0o755);
+        return undefined;
+      });
     }
-    fs.chmodSync(adapterSource, 0o755);
-    if (fs.realpathSync.native(adapterSource) !== adapterSource) {
-      return materializationError("The rg adapter artifact resolves through a symlink.", {
+  } catch (error: unknown) {
+    if (error instanceof AdapterContentConflict) {
+      return materializationError("The existing rg adapter artifact conflicts with the pinned materialization.", {
         adapter_source: adapterSource,
       });
     }
-  } catch {
     return materializationError("The rg adapter artifact could not be materialized.", {
       adapter_source: adapterSource,
     });
