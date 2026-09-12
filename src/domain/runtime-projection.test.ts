@@ -6,6 +6,7 @@ import {
   STRICT_RUNTIME_POLICY,
   projectSessionRuntimeProjection,
   runtimeMaterializationMissingError,
+  runtimeProviderMissingError,
   serializeSessionRuntimeProjection,
   validateRuntimePolicy,
   validateSessionRuntimeProjection,
@@ -176,7 +177,7 @@ test("duplicate or nested filesystem targets fail as deterministic ambiguity err
   if (!nested.ok) assert.equal(nested.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
 });
 
-test("missing provider references fail through the canonical provider error", () => {
+test("dangling provider references fail validation, not runtime provider resolution", () => {
   const result = validateSessionRuntimeProjection(
     projection({
       executables: [
@@ -190,14 +191,15 @@ test("missing provider references fail through the canonical provider error", ()
     }),
   );
   assert.equal(result.ok, false);
-  if (!result.ok) {
-    assert.equal(result.error.code, "RUNTIME_PROVIDER_MISSING");
-    assert.deepEqual(result.error.details, {
-      provider_id: "missing-provider",
-      entrypoint: "node",
-      requirement_id: "not-declared",
-    });
-  }
+  if (!result.ok) assert.equal(result.error.code, "RUNTIME_PROJECTION_INVALID");
+
+  const runtimeFailure = runtimeProviderMissingError("missing-provider", "node", "node-runtime");
+  assert.equal(runtimeFailure.code, "RUNTIME_PROVIDER_MISSING");
+  assert.deepEqual(runtimeFailure.details, {
+    provider_id: "missing-provider",
+    entrypoint: "node",
+    requirement_id: "node-runtime",
+  });
 });
 
 test("invalid paths and missing materialization use typed deterministic failures", () => {

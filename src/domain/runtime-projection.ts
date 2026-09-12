@@ -277,7 +277,11 @@ function validateExecutable(
     return invalidProjection(`${field}.provider.requirement_id`, "expected a stable requirement id");
   }
   if (!requirements.has(value.provider.requirement_id)) {
-    return failure(runtimeProviderMissingError(value.provider.id, value.name, value.provider.requirement_id));
+    return invalidProjection(
+      `${field}.provider.requirement_id`,
+      "must reference a declared requirement",
+      value.provider.requirement_id,
+    );
   }
   if (!RUNTIME_PROJECTION_PROVENANCES.includes(value.provenance as RuntimeProjectionProvenance)) {
     return invalidProjection(`${field}.provenance`, "expected a canonical projection provenance");
