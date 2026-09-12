@@ -117,3 +117,24 @@ Unsupported metadata, missing artifacts, and unresolved loaders/libraries
 return recoverable `RUNTIME_MATERIALIZATION_MISSING`; they never select a
 fallback. Legacy omitted-projection behavior remains solely for existing
 callers of the pre-materialization launcher.
+
+## Strict Nix closure materialization
+
+Issue #291 implements the Nix materializer in
+`src/domain/nix-runtime-closure.ts`. It maps logical requirements to explicit
+Nix installables and queries `nix path-info --recursive --offline` for the
+native runtime closure. The resolver accepts only canonical direct children
+of the selected store root, verifies that each path is materialized and
+non-symlinked, applies bounded requirement/path/output limits, and returns
+deterministically ordered evidence.
+
+Strict output contains one read-only `RuntimeFilesystemProjection` per
+required store path, with source and target retaining the exact store-path
+identity needed by dynamic loaders and absolute Nix references. It never
+projects the store root, `/run/current-system`, wrapper trees, or user
+profiles, and it creates no executable aliases. The result is passed to the
+generic #289 projection compiler through `SessionRuntimeProjection`; an
+undeclared absolute store path therefore has no mount in the private root.
+Missing, invalid, or unavailable material uses the recoverable
+`RUNTIME_MATERIALIZATION_MISSING` error. The legacy broad store mount is
+emitted only when the caller explicitly selects the compatibility policy.
