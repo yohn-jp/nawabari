@@ -195,7 +195,16 @@ async function protectedRgRequest(
     fs.writeFileSync(path.join(repository, ".hidden", "secret.txt"), "needle in hidden\n");
     fs.mkdirSync(path.join(repository, "sub"));
     fs.writeFileSync(path.join(repository, "sub", "b.log"), "another needle\nNEEDLE\n");
-    runGit(["add", "tracked.txt", ".gitignore", "sub/b.log"], repository);
+    fs.writeFileSync(path.join(repository, "words.txt"), "sub-needle-word\nneedleword\nanother needle line\n");
+    fs.writeFileSync(path.join(repository, "literal.txt"), "a.b\naxb\n");
+    fs.writeFileSync(path.join(repository, "smartcase.txt"), "Needle here\nneedle lower\nNEEDLE UPPER\n");
+    fs.mkdirSync(path.join(repository, "globcase"));
+    fs.writeFileSync(path.join(repository, "globcase", "FILE.TXT"), "needle in upper ext\n");
+    fs.writeFileSync(path.join(repository, "globcase", "file2.txt"), "needle in lower ext\n");
+    runGit(
+      ["add", "tracked.txt", ".gitignore", "sub/b.log", "words.txt", "literal.txt", "smartcase.txt", "globcase"],
+      repository,
+    );
     runGit(["commit", "--quiet", "-m", "fixture"], repository);
 
     const backend = new LocalSessionBackend();
@@ -477,7 +486,7 @@ test("generated rg artifact is projected once and is shared by direct, child, an
   }
 });
 
-test("projected rg preserves rg semantics against the real pinned tgrep backend across direct and interactive session-shell execution", async (t) => {
+test("projected rg preserves rg semantics against the real pinned tgrep backend across direct, interactive, and child-process PATH lookup execution", async (t) => {
   if (process.env.NAWABARI_TGREP_RUNTIME_CONFORMANCE !== "1") {
     t.skip("set NAWABARI_TGREP_RUNTIME_CONFORMANCE=1 in the Nix materialization conformance environment");
     return;
@@ -511,8 +520,39 @@ test("projected rg preserves rg semantics against the real pinned tgrep backend 
   try {
     const provider = providerProjection(materialized.value, artifactRoot);
 
-    fixture = await protectedRgRequest(provider.projection, runtimeLayout);
+    // Add a second, test-only entrypoint that runs the same exact
+    // node-runtime already present in the #308 closure, so a real child
+    // process (not this test's own harness process) can resolve `rg` by
+    // basename through the strict PATH=/nawabari/bin, exactly as a program
+    // spawned inside a session would. `node_source` is the shebang path (a
+    // Nix symlink into a separate closure member); the executable
+    // projection requires a resolved regular-file target.
+    const withNodeLauncher = projectSessionRuntimeProjection({
+      ...provider.projection,
+      executables: [
+        ...provider.projection.executables,
+        {
+          name: "node",
+          target: fs.realpathSync.native(provider.node_source),
+          provider: { id: "test-node-launcher", requirement_id: "node-runtime" },
+          provenance: "package" as const,
+        },
+      ],
+    });
+    assert.equal(withNodeLauncher.ok, true, withNodeLauncher.ok ? "" : withNodeLauncher.error.message);
+    if (!withNodeLauncher.ok) return;
+
+    fixture = await protectedRgRequest(withNodeLauncher.value, runtimeLayout);
     const { request, worktree } = fixture;
+
+    const childLookupScript = path.join(worktree, "child-rg-lookup.mjs");
+    fs.writeFileSync(
+      childLookupScript,
+      "const { execFileSync } = await import('node:child_process');\n" +
+        "const args = process.argv.slice(2);\n" +
+        "const output = execFileSync('rg', args, { encoding: 'utf8' });\n" +
+        "process.stdout.write(output);\n",
+    );
 
     async function rg(args: readonly string[], interactive = false) {
       const result = await runSandboxedCommand(request, { command: "rg", args }, { interactive });
@@ -559,11 +599,55 @@ test("projected rg preserves rg semantics against the real pinned tgrep backend 
     const withHidden = await rg(["-i", "--hidden", "needle", "."]);
     assert.match(withHidden.stdout, /\.hidden\/secret\.txt/u);
 
+    // -S/--smart-case is case-insensitive for an all-lowercase pattern and
+    // case-sensitive once the pattern contains an uppercase character.
+    const smartCaseLower = await rg(["-S", "needle", "smartcase.txt"]);
+    assert.equal(smartCaseLower.exit_code, 0);
+    assert.equal(smartCaseLower.stdout.trim().split("\n").length, 3);
+    const smartCaseMixed = await rg(["-S", "Needle", "smartcase.txt"]);
+    assert.equal(smartCaseMixed.stdout.trim(), "Needle here");
+
+    // -F/--fixed-strings treats '.' as a literal character, not a wildcard.
+    const fixedStrings = await rg(["-s", "-F", "a.b", "literal.txt"]);
+    assert.equal(fixedStrings.stdout.trim(), "a.b");
+    assert.doesNotMatch(fixedStrings.stdout, /axb/u);
+
+    // -w/--word-regexp matches only at word boundaries: a hyphen is a
+    // boundary but a bare substring inside another word is not.
+    const wordRegexp = await rg(["-s", "-w", "needle", "words.txt"]);
+    assert.match(wordRegexp.stdout, /sub-needle-word/u);
+    assert.match(wordRegexp.stdout, /another needle line/u);
+    assert.doesNotMatch(wordRegexp.stdout, /needleword$/mu);
+
+    // -v/--invert-match prints only non-matching lines.
+    const invertMatch = await rg(["-s", "-v", "Needle", "tracked.txt"]);
+    assert.equal(invertMatch.stdout.trim(), "no match line");
+
+    // --iglob matches a glob case-insensitively, unlike --glob.
+    const iglob = await rg(["-i", "--iglob", "*.txt", "needle", "globcase"]);
+    assert.match(iglob.stdout, /FILE\.TXT/u);
+    assert.match(iglob.stdout, /file2\.txt/u);
+
+    // --no-messages suppresses the backend's own diagnostic for an
+    // unreadable path while the exit code is unaffected.
+    const withMessages = await rg(["-s", "needle", "does-not-exist.txt"]);
+    assert.equal(withMessages.exit_code, 2);
+    assert.match(withMessages.stderr, /does-not-exist\.txt/u);
+    const noMessages = await rg(["-s", "--no-messages", "needle", "does-not-exist.txt"]);
+    assert.equal(noMessages.exit_code, 2);
+    assert.doesNotMatch(noMessages.stderr, /does-not-exist\.txt/u);
+
     // -H/-I filename mode and -n/-N line-number mode toggle rg-shaped output
     // prefixes rather than search results.
     const noFilename = await rg(["-s", "-I", "Needle", "tracked.txt"]);
     assert.equal(noFilename.exit_code, 0);
     assert.equal(noFilename.stdout.trim(), "Needle here");
+    const withFilename = await rg(["-s", "-H", "Needle", "tracked.txt"]);
+    assert.equal(withFilename.stdout.trim(), "tracked.txt:Needle here");
+    const lineNumber = await rg(["-s", "-n", "Needle", "tracked.txt"]);
+    assert.equal(lineNumber.stdout.trim(), "1:Needle here");
+    const noLineNumber = await rg(["-s", "-N", "Needle", "tracked.txt"]);
+    assert.equal(noLineNumber.stdout.trim(), "Needle here");
 
     // -l/--files-with-matches and --files-without-match report file identity,
     // not line content.
@@ -620,6 +704,18 @@ test("projected rg preserves rg semantics against the real pinned tgrep backend 
     assert.equal(shell.exit_code, 0);
     const shellNoMatch = await rg(["-s", "zzz-not-present", "."], true);
     assert.equal(shellNoMatch.exit_code, 1);
+
+    // A real child process spawned inside the protected runtime (not this
+    // test's own harness process, and not `runSandboxedCommand`'s own
+    // top-level `command`) must resolve `rg` by basename through the strict
+    // PATH=/nawabari/bin, exactly like a program running inside a session.
+    const childLookup = await runSandboxedCommand(request, {
+      command: "node",
+      args: [childLookupScript, "-s", "Needle", "tracked.txt"],
+    });
+    if (!childLookup.ok) throw new Error(JSON.stringify(childLookup.error));
+    assert.equal(childLookup.value.exit_code, 0);
+    assert.equal(childLookup.value.stdout.trim(), "Needle here");
 
     assert.equal(fs.existsSync(path.join(worktree, ".hidden", "secret.txt")), true);
   } finally {
