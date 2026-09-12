@@ -362,6 +362,8 @@ export type CliDependencies = {
   ) => Promise<DomainResult<SandboxExecutionResult>>;
   sandboxProbe?: SandboxProbe;
   sandboxRuntimeLayout?: SandboxRuntimeLayout;
+  /** Validated runtime projection forwarded to sandbox resolution; test/integration seam. */
+  sandboxRuntimeProjection?: import("./domain/sandbox.js").SandboxExecutionOptions["runtime_projection"];
 };
 
 type GlobalArguments = {
@@ -1297,7 +1299,7 @@ async function executeRelease(
 async function executeProtectedSessionCommand(
   arguments_: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
-    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout">,
+    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout" | "sandboxRuntimeProjection">,
   context: SessionContext,
   interactive = false,
 ): Promise<DomainResult<JsonObject>> {
@@ -1318,7 +1320,13 @@ async function executeProtectedSessionCommand(
   const request = await resolveSandboxExecutionRequest(
     dependencies.backend,
     context,
-    { session_id: parsed.value.session_id, enforce: true },
+    {
+      session_id: parsed.value.session_id,
+      enforce: true,
+      ...(dependencies.sandboxRuntimeProjection === undefined
+        ? {}
+        : { runtime_projection: dependencies.sandboxRuntimeProjection }),
+    },
     dependencies.sandboxProbe,
     dependencies.sandboxRuntimeLayout,
   );
@@ -1341,7 +1349,7 @@ async function executeProtectedSessionCommand(
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
-    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout">,
+    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout" | "sandboxRuntimeProjection">,
 ): Promise<DomainResult<JsonObject>> {
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
@@ -2024,6 +2032,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       sandboxRunner: dependencies.sandboxRunner,
       sandboxProbe: dependencies.sandboxProbe,
       sandboxRuntimeLayout: dependencies.sandboxRuntimeLayout,
+      sandboxRuntimeProjection: dependencies.sandboxRuntimeProjection,
     });
     if (!result.ok) {
       const enriched = await enrichInvalidSessionIdError(result.error, backend, sessionContext(cwd));

@@ -255,6 +255,8 @@ test("session shell propagates a projected shell exit status or signal", async (
       cwd: sampleSession.worktree,
       backend: backendForTests(),
       io: nonzeroOutput.io,
+      sandboxProbe: readySandboxProbe(),
+      sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
       sandboxRunner: async () => success({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
     },
   );
@@ -266,6 +268,8 @@ test("session shell propagates a projected shell exit status or signal", async (
     cwd: sampleSession.worktree,
     backend: backendForTests(),
     io: signalOutput.io,
+    sandboxProbe: readySandboxProbe(),
+    sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
     sandboxRunner: async () => success({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
   });
   assert.equal(signal, 3);

@@ -375,7 +375,7 @@ async function main() {
       protectedExecution?.network_mode !== "inherited" ||
       protectedExecution?.fail_closed !== true ||
       protectedExecution?.ambient_fallback !== false ||
-      protectedExecution?.commands?.join(",") !== "session run,session exec" ||
+      protectedExecution?.commands?.join(",") !== "session run,session exec,session shell" ||
       protectedExecution?.command_aliases?.[0]?.alias !== "session exec"
     ) {
       fail("installed capabilities did not expose the protected-execution contract");
