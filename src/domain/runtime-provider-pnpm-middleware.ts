@@ -2,9 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
-import { CANONICAL_EXECUTABLE_ROOT } from "./runtime-executable-projection.js";
+import { CANONICAL_EXECUTABLE_ROOT, compileRuntimeExecutableProjection } from "./runtime-executable-projection.js";
 import {
   runtimeMaterializationMissingError,
+  runtimeProviderMissingError,
   validateSessionRuntimeProjection,
   type RuntimeExecutableProvider,
   type RuntimeRequirement,
@@ -230,6 +231,29 @@ function validateBackend(
   );
 }
 
+/**
+ * The launcher's shebang is a hard, undeclared dependency on a canonical
+ * `node` entrypoint. Confirm the incoming projection declares and resolves
+ * a `node` executable at `PNPM_MIDDLEWARE_LAUNCHER_NODE_TARGET` through the
+ * same strict compiler used for the executable surface, before this adapter
+ * ever writes a launcher whose interpreter may not exist inside the sandbox.
+ */
+function validateNodeInterpreter(projection: SessionRuntimeProjection): DomainResult<null> {
+  const entrypoint = projection.executables.find((candidate) => candidate.name === "node");
+  if (entrypoint === undefined) {
+    return failure(runtimeProviderMissingError("node", "node", "node-runtime"));
+  }
+  const compiled = compileRuntimeExecutableProjection(projection);
+  if (!compiled.ok) return compiled;
+  const resolved = compiled.value.find((entry) => entry.target === PNPM_MIDDLEWARE_LAUNCHER_NODE_TARGET);
+  if (resolved === undefined) {
+    return failure(
+      runtimeProviderMissingError(entrypoint.provider.id, entrypoint.name, entrypoint.provider.requirement_id),
+    );
+  }
+  return success(null);
+}
+
 function validateLauncherPath(
   value: unknown,
   backendSources: readonly string[],
@@ -373,6 +397,9 @@ export function materializePnpmMiddleware(input: unknown): DomainResult<PnpmMidd
 
   const launcher = validateLauncherPath(candidate.launcher_path, [rtk.value.source, realPnpm.value.source], projection);
   if (!launcher.ok) return launcher;
+
+  const node = validateNodeInterpreter(projection);
+  if (!node.ok) return node;
 
   const requirements = [...projection.requirements];
   for (const requirement of [PNPM_MIDDLEWARE_REQUIREMENTS.rtk, PNPM_MIDDLEWARE_REQUIREMENTS.real_pnpm]) {
