@@ -175,6 +175,21 @@ test("duplicate or nested filesystem targets fail as deterministic ambiguity err
   );
   assert.equal(nested.ok, false);
   if (!nested.ok) assert.equal(nested.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
+
+  // Lexicographic target order places a sibling between an ancestor and its
+  // descendant ("/runtime" < "/runtime-alt" < "/runtime/tool"), so overlap
+  // detection must compare every pair, not just adjacent ones in sort order.
+  const nonAdjacentOverlap = validateSessionRuntimeProjection(
+    projection({
+      filesystem: [
+        { source: "/one", target: "/runtime", access_mode: "read-only", provenance: "runtime-profile" },
+        { source: "/two", target: "/runtime-alt", access_mode: "read-only", provenance: "package" },
+        { source: "/three", target: "/runtime/tool", access_mode: "read-only", provenance: "package" },
+      ],
+    }),
+  );
+  assert.equal(nonAdjacentOverlap.ok, false);
+  if (!nonAdjacentOverlap.ok) assert.equal(nonAdjacentOverlap.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
 });
 
 test("dangling provider references fail validation, not runtime provider resolution", () => {

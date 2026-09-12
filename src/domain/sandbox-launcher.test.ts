@@ -368,6 +368,23 @@ test("explicit projection source/target escapes, collisions, and unauthorized wr
     assert.equal(duplicate.ok, false);
     if (!duplicate.ok) assert.equal(duplicate.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
 
+    // Lexicographic target order places a sibling between an ancestor and its
+    // descendant ("/runtime" < "/runtime-alt" < "/runtime/tool"), so overlap
+    // detection must compare every pair, not just adjacent ones in sort order.
+    const nonAdjacentOverlap = compileSandboxInvocation(
+      {
+        ...request,
+        runtime_projection: projectionInput([
+          { source: material, target: "/runtime", access_mode: "read-only", provenance: "package" },
+          { source: material, target: "/runtime-alt", access_mode: "read-only", provenance: "package" },
+          { source: material, target: "/runtime/tool", access_mode: "read-only", provenance: "package" },
+        ]) as never,
+      },
+      { command: "true" },
+    );
+    assert.equal(nonAdjacentOverlap.ok, false);
+    if (!nonAdjacentOverlap.ok) assert.equal(nonAdjacentOverlap.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
+
     const backendCollision = compileSandboxInvocation(
       {
         ...request,

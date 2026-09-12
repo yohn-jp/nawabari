@@ -437,8 +437,11 @@ function validateProjectionMounts(
   }
 
   for (let index = 1; index < targets.length; index += 1) {
-    if (namespacePathsOverlap(targets[index - 1] as string, targets[index] as string)) {
-      return projectionAmbiguous("filesystem.target", "projection targets overlap", targets[index] as string);
+    const current = targets[index] as string;
+    for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
+      if (namespacePathsOverlap(targets[priorIndex] as string, current)) {
+        return projectionAmbiguous("filesystem.target", "projection targets overlap", current);
+      }
     }
   }
   return success(Object.freeze(mounts));
