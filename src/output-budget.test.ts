@@ -13,7 +13,12 @@ import { captureGitCheckpoint } from "./git.js";
 import { CHECKPOINT_MAX_PATHS } from "./operation-authorization.js";
 import { renderFailure } from "./presentation.js";
 import { boundOutputDetails, FAILURE_DETAIL_ARRAY_LIMIT, FAILURE_MESSAGE_LENGTH_LIMIT } from "./output-budget.js";
-import { canonicalClaimId } from "./resource-claims.js";
+
+// Keep the full closed-history population so the pagination assertion retains
+// its original scale. The active row exercises the status diagnostic path;
+// claims are not part of either response and are covered by resource-claim
+// tests, so repeating 256 unobserved claim records only adds fixture parsing.
+const PERSISTED_CLOSED_HISTORY_FIXTURE_SIZE = 1_000;
 
 test("default session discovery excludes closed history and exposes bounded continuation metadata", () => {
   const active = makeSession("0190f1e0-0000-7000-8000-000000000001", "active");
@@ -50,7 +55,7 @@ test("CLI status and session list remain bounded as closed registry history grow
   const repositoryPath = createRepository();
   try {
     const registry = new SessionRegistry({ cwd: repositoryPath });
-    const sessions = Array.from({ length: 1_000 }, (_, index) =>
+    const sessions = Array.from({ length: PERSISTED_CLOSED_HISTORY_FIXTURE_SIZE }, (_, index) =>
       makePersistedSession(
         `0190f1e0-0000-7000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
         registry.repository.repositoryId,
@@ -58,20 +63,6 @@ test("CLI status and session list remain bounded as closed registry history grow
       ),
     );
     const active = makeActivePersistedSession("0190f1e0-0000-7000-8000-000000000000", registry.repository.repositoryId);
-    const claims = Array.from({ length: 256 }, (_, index) => {
-      const resource = `stress/resource-${index}.txt`;
-      return {
-        schema_version: 2,
-        claim_id: canonicalClaimId(active.session_id, resource, "read"),
-        session_id: active.session_id,
-        repository_id: active.repository_id,
-        worktree_path: active.worktree_path,
-        resource,
-        mode: "read" as const,
-        created_at: "2026-08-10T00:00:00.000Z",
-        updated_at: "2026-08-10T00:00:00.000Z",
-      };
-    });
     fs.mkdirSync(registry.paths.directory, { recursive: true });
     fs.writeFileSync(
       registry.paths.registry,
@@ -79,7 +70,7 @@ test("CLI status and session list remain bounded as closed registry history grow
         schema_version: 1,
         repository_id: registry.repository.repositoryId,
         claims_schema_version: 2,
-        claims,
+        claims: [],
         sessions: [active, ...sessions],
       })}\n`,
     );

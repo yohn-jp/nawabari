@@ -27,20 +27,7 @@ jobs:
 
       - name: Check whether this is a release/<semver> branch touching only docs/releases
         id: check
-        env:
-          HEAD_REF: ${{ github.head_ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [ -z "$BASE_SHA" ] || [[ ! "$HEAD_REF" =~ ^release/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "release_docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          changed_files="$(git diff --name-only "$BASE_SHA"...HEAD)"
-          if [ -n "$changed_files" ] && ! grep -qv '^docs/releases/' <<< "$changed_files"; then
-            echo "release_docs_only=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "release_docs_only=false" >> "$GITHUB_OUTPUT"
-          fi
+        uses: ./.github/actions/release-docs-check
 
   release-docs-format:
     needs: changes
@@ -74,8 +61,6 @@ jobs:
         run: pnpm run format:check
 
   typecheck:
-    needs: changes
-    if: needs.changes.outputs.release_docs_only != 'true'
     name: typecheck (Node 24)
     runs-on: ubuntu-latest
     steps:
@@ -84,27 +69,33 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Detect release-docs-only change
+        id: release_docs_check
+        uses: ./.github/actions/release-docs-check
+
       - name: Setup pnpm
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.18.0
 
       - name: Setup Node.js
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm run typecheck
 
-  test:
-    needs: changes
-    if: needs.changes.outputs.release_docs_only != 'true'
-    name: format / lint / test (Node 24)
+  static-checks:
+    name: format / lint (Node 24)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -112,38 +103,78 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Detect release-docs-only change
+        id: release_docs_check
+        uses: ./.github/actions/release-docs-check
+
       - name: Setup pnpm
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.18.0
 
       - name: Setup Node.js
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Format check
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm run format:check
 
       - name: Verify generated Product State Manifest diagram
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm run manifest:check
 
       - name: Lint
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm run lint
 
-      - name: Test
-        run: pnpm test
-
       - name: Verify GitHub Actions are pinned by SHA
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm run governance:actions
 
+  test:
+    name: test (Node 24)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect release-docs-only change
+        id: release_docs_check
+        uses: ./.github/actions/release-docs-check
+
+      - name: Setup pnpm
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 11.18.0
+
+      - name: Setup Node.js
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        run: pnpm test
+
   tgrep-runtime-conformance:
-    needs: changes
-    if: needs.changes.outputs.release_docs_only != 'true'
     name: pinned tgrep runtime / protected execution conformance (Node 24)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -153,40 +184,67 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Detect release-docs-only change
+        id: release_docs_check
+        uses: ./.github/actions/release-docs-check
+
       - name: Setup pnpm
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.18.0
 
       - name: Setup Node.js
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        run: |
+          if command -v bwrap >/dev/null 2>&1; then
+            bwrap --version
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
 
       - name: Enable unprivileged user namespaces
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
+      - name: Detect usable Nix installation
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        id: nix_check
+        run: |
+          if command -v nix >/dev/null 2>&1 && nix --version && \
+            nix store info >/dev/null 2>&1 && \
+            nix eval --offline --expr 'true' >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Nix
+        if: steps.release_docs_check.outputs.release_docs_only != 'true' && steps.nix_check.outputs.available != 'true'
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           determinate: false
 
       - name: Materialize and execute the pinned tgrep runtime
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm run test:tgrep:conformance
 
   pnpm-middleware-runtime-conformance:
-    needs: changes
-    if: needs.changes.outputs.release_docs_only != 'true'
     name: pinned RTK / pnpm middleware backend conformance (Node 24)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -195,37 +253,72 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
+
+      - name: Detect release-docs-only change
+        id: release_docs_check
+        uses: ./.github/actions/release-docs-check
 
       - name: Setup pnpm
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.18.0
 
       - name: Setup Node.js
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        run: |
+          if command -v bwrap >/dev/null 2>&1; then
+            bwrap --version
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
 
       - name: Enable unprivileged user namespaces
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
+      - name: Detect usable Nix installation
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        id: nix_check
+        run: |
+          if command -v nix >/dev/null 2>&1 && nix --version && \
+            nix store info >/dev/null 2>&1 && \
+            nix eval --offline --expr 'true' >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Nix
+        if: steps.release_docs_check.outputs.release_docs_only != 'true' && steps.nix_check.outputs.available != 'true'
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           determinate: false
 
+      - name: Restore pinned Nix input cache
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: /home/runner/.cache/nix/tarball-cache-v2
+          key: nawabari-nix-inputs-v2-${{ runner.os }}-rtk-bb92730f6e97ca1c19e285a872cdd62a1a25c467-pnpm-44cc5cdbf88deb1d20243d1d5e3b46ad008b6139
+
       - name: Project a canonical FHS-rooted Node interpreter
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         # actions/setup-node installs into /opt/hostedtoolcache, which is not
         # a bounded FHS root that materializeFhsRuntime() accepts. Copy the
         # exact same pinned Node binary to a canonical /usr/bin location so
@@ -236,11 +329,10 @@ jobs:
           echo "NAWABARI_TEST_FHS_NODE_INTERPRETER=/usr/bin/node" >> "$GITHUB_ENV"
 
       - name: Materialize and verify pinned RTK and pnpm middleware backends
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm run test:pnpm:conformance
 
   package:
-    needs: changes
-    if: needs.changes.outputs.release_docs_only != 'true'
     name: build / package contents / smoke test (Node 24)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -250,29 +342,36 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Detect release-docs-only change
+        id: release_docs_check
+        uses: ./.github/actions/release-docs-check
+
       - name: Setup pnpm
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.18.0
 
       - name: Setup Node.js
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Build
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm run build
 
       - name: Package contents and smoke test
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: node scripts/run-package-suite.mjs
 
   mottainai-uid-handoff:
-    needs: changes
-    if: needs.changes.outputs.release_docs_only != 'true'
     name: packed Mottainai UID handoff evidence (Node 24)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -282,28 +381,44 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Detect release-docs-only change
+        id: release_docs_check
+        uses: ./.github/actions/release-docs-check
+
       - name: Setup pnpm
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 11.18.0
 
       - name: Setup Node.js
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: pnpm
 
       - name: Install dependencies
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
+        run: |
+          if command -v bwrap >/dev/null 2>&1; then
+            bwrap --version
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
 
       - name: Enable unprivileged user namespaces
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
       - name: Packed Mottainai UID handoff evidence
+        if: steps.release_docs_check.outputs.release_docs_only != 'true'
         run: pnpm run test:package:mottainai
