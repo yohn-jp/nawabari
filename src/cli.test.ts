@@ -1023,6 +1023,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--label",
       "--session",
       "--integrated-revision",
+      "--schema-version",
       "--runtime-policy",
       "--limit",
       "--offset",
@@ -1716,6 +1717,20 @@ test("doctor JSON exposes protected-execution readiness without resolving a sess
       response.sandbox.capabilities.filter((entry) => entry.requirement === "required").length,
       SANDBOX_REQUIRED_CAPABILITIES.length,
     );
+
+    const summaryOutput = capture();
+    const summaryExitCode = await runCli(["doctor", "--summary", "--json"], {
+      cwd: directory,
+      io: summaryOutput.io,
+      sandboxProbe: readySandboxProbe({ hasNamespaceSupport: () => false }),
+    });
+    assert.equal(summaryExitCode, 0);
+    const summaryResponse = JSON.parse(summaryOutput.stdout[0] ?? "") as {
+      summary?: { representation?: string };
+      checks?: Array<{ name: string; details?: unknown }>;
+    };
+    assert.equal(summaryResponse.summary?.representation, "compact");
+    assert.equal(summaryResponse.checks?.find((check) => check.name === "runtime")?.details, undefined);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

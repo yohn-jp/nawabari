@@ -121,7 +121,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
   {
     name: "session inspect",
     summary: "Report side-effect-free close/cleanup readiness for a session",
-    usage: `${CLI_NAME} session inspect [<session-id>|--session <id>] [--integrated-revision <rev>]`,
+    usage: `${CLI_NAME} session inspect [<session-id>|--session <id>] [--integrated-revision <rev>] [--schema-version <1|2>]`,
     options: [
       option("--session", "Select a session instead of the current worktree owner", { value: "<id>" }),
       option(
@@ -129,10 +129,16 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         "Externally evidenced revision to test for non-ancestry (squash/rebase) integration; independently re-verified via exact Git tree-object equivalence, never trusted blindly",
         { value: "<rev>" },
       ),
+      option(
+        "--schema-version",
+        "Select the public diagnostic result schema; v2 is the single-authority default and v1 preserves the legacy nested lifecycle copy",
+        { value: "<1|2>", default: "2", values: ["1", "2"] },
+      ),
     ],
     notes: [
       "Read-only: never mutates session, claim, Git, worktree, branch, or registry state. Repeated calls are idempotent.",
       "Derived from the same authoritative close/cleanup Git evidence as session close; does not duplicate or diverge from that logic.",
+      "Schema v2 exposes lifecycle and next_actions once at the top level; garbage_collection retains explicit references to those authorities. Use --schema-version 1 only for legacy consumers that require the duplicated v1 shape.",
       "Nawabari never queries GitHub or any remote provider; --integrated-revision only names a local revision for Nawabari to independently verify.",
       "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],
@@ -563,8 +569,11 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
   {
     name: "doctor",
     summary: "Check local Nawabari prerequisites and reconciliation",
-    usage: `${CLI_NAME} doctor`,
-    options: [],
+    usage: `${CLI_NAME} doctor [--summary]`,
+    options: [option("--summary", "Emit a bounded summary with counts and actionable drift/error diagnostics")],
+    notes: [
+      "The default report retains the complete machine-readable check details. --summary omits healthy and closed history rows while retaining all actionable reconciliation issues.",
+    ],
   },
   {
     name: "migrate",

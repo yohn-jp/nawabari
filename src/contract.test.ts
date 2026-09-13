@@ -222,9 +222,24 @@ test("session-diagnostics lifecycle projection is the live XState-derived table,
       candidate.id === "session-diagnostics",
   ) as JsonRecord | undefined;
   assert.ok(diagnostics);
+  assert.equal(diagnostics?.result_schema, "session-diagnostic.v2");
+  assert.equal(diagnostics?.result_schema_version, 2);
+  const compatibilitySchemas = diagnostics?.compatibility_result_schemas as JsonRecord[];
+  assert.deepEqual(compatibilitySchemas, [
+    {
+      schema: "session-diagnostic.v1",
+      version: 1,
+      commands: ["session inspect"],
+      selector: "--schema-version 1",
+    },
+  ]);
   const lifecycle = diagnostics?.lifecycle as JsonRecord;
   assert.deepEqual(lifecycle.states, [...SESSION_LIFECYCLE_STATES]);
   assert.deepEqual(lifecycle.transition_table, SESSION_LIFECYCLE_TRANSITION_TABLE);
+  const resultProjection = lifecycle.result_projection as JsonRecord;
+  assert.equal(resultProjection.default_schema_version, 2);
+  assert.equal(resultProjection.selector, "--schema-version");
+  assert.equal(resultProjection.canonical_field, "lifecycle");
 
   // close-ready.gc is guard-dependent (#266): the published JSON discovery
   // surface itself — not merely the exported constant — must not flatten it

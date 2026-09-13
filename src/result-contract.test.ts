@@ -223,10 +223,28 @@ test("lifecycle, diagnostic, and cleanup schemas are checked against reachable p
     assert.deepEqual(statusSession.lifecycle, diagnostic.lifecycle);
     assert.deepEqual(statusSession.next_actions, diagnostic.next_actions);
     const diagnosticGarbageCollection = object(diagnostic.garbage_collection, "diagnostic garbage collection");
-    assert.deepEqual(diagnosticGarbageCollection.lifecycle, diagnostic.lifecycle);
-    assert.deepEqual(diagnosticGarbageCollection.next_actions, diagnostic.next_actions);
+    assert.equal(diagnostic.schema_version, 2);
+    assert.deepEqual(diagnosticGarbageCollection.lifecycle, {
+      schema_version: 2,
+      authority: "session_diagnostic.lifecycle",
+      ref: "#/lifecycle",
+    });
+    assert.deepEqual(diagnosticGarbageCollection.next_actions, {
+      schema_version: 2,
+      authority: "session_diagnostic.next_actions",
+      ref: "#/next_actions",
+    });
     const diagnosticLifecycle = object(diagnostic.lifecycle, "diagnostic lifecycle");
     assert.ok(Array.isArray(diagnosticLifecycle.transitions));
+
+    const legacyDiagnostic = await invokeJson(
+      ["session", "inspect", "--session", sessionId as string, "--schema-version", "1"],
+      worktree as string,
+    );
+    assert.equal(legacyDiagnostic.schema_version, 1);
+    const legacyGarbageCollection = object(legacyDiagnostic.garbage_collection, "legacy diagnostic garbage collection");
+    assert.deepEqual(legacyGarbageCollection.lifecycle, legacyDiagnostic.lifecycle);
+    assert.deepEqual(legacyGarbageCollection.next_actions, legacyDiagnostic.next_actions);
 
     const doctor = await invokeJson(["doctor"], fixture.repository);
     assert.ok(Array.isArray(doctor.checks));
