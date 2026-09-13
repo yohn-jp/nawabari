@@ -3,22 +3,20 @@
 import { classifyReleaseBranch } from "./release-branch.mjs";
 
 /**
- * Resolve the PR contract from the trusted pull_request head ref.
+ * Classify the trusted pull_request head ref into its own independent
+ * branch-name contract.
  *
- * A release branch always selects the canonical release contract, even when a
- * caller supplied another template input. Ordinary PRs retain the caller's
- * explicit template or the existing generic auto-detection behavior.
+ * This is branch-name validation only (Issue #211): it never selects the PR
+ * body template. A release branch must still look like release/<semver>, but
+ * which contract the PR body itself must satisfy is resolved solely from the
+ * body's own gh-inari template-identity marker.
  *
- * @param {{branch?: string, template?: string}} options
- * @returns {{classification: string, template?: string, version?: string, errors: string[]}}
+ * @param {{branch?: string}} options
+ * @returns {{classification: string, version?: string, errors: string[]}}
  */
-export function resolvePullRequestTemplate({ branch, template } = {}) {
+export function classifyPullRequestBranch({ branch } = {}) {
   if (branch === undefined || branch === "") {
-    return {
-      classification: "unclassified",
-      ...(template === undefined ? {} : { template }),
-      errors: []
-    };
+    return { classification: "unclassified", errors: [] };
   }
 
   const release = classifyReleaseBranch(branch);
@@ -31,14 +29,9 @@ export function resolvePullRequestTemplate({ branch, template } = {}) {
   if (release?.kind === "release") {
     return {
       classification: release.kind,
-      template: "release",
       version: release.version,
       errors: []
     };
   }
-  return {
-    classification: "ordinary",
-    ...(template === undefined ? {} : { template }),
-    errors: []
-  };
+  return { classification: "ordinary", errors: [] };
 }

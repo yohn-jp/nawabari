@@ -4,13 +4,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  extractTemplateIdentityMarker,
   validateExistingPullRequestArtifact,
   validateRequiredMetadataString
 } from "gh-inari/artifact";
 import { compileLocalGovernedContract } from "gh-inari/governance";
-import { compilePullRequestTemplate } from "gh-inari/pull-request-template";
-import { PullRequestPolicyError } from "gh-inari/pr-policy";
-import { resolvePullRequestTemplate } from "./pr-contract-routing.mjs";
+import { classifyPullRequestBranch } from "./pr-contract-routing.mjs";
+import { countTemplateIdentityMarkerAttempts } from "./pr-template-marker.mjs";
 import { classifyEpicPrTitle } from "./epic-branch.mjs";
 
 const REPOSITORY_ROOT = path.resolve(
@@ -21,21 +21,28 @@ const REPOSITORY_ROOT = path.resolve(
 /**
  * Validate a pull-request event against the checked-out repository's local
  * Inari snapshot. The workflow owns event plumbing; gh-inari owns contract
- * compilation, Markdown parsing, and semantic validation. gh-inari itself only
- * checks that a title is non-empty; the canonical epic(<scope>): <description>
- * title form (Issue #177) is a separate, narrow addition owned directly here,
- * exactly like branch-name validation — see epic-branch.mjs. It only ever
- * classifies a title that is itself attempting the epic type; every
- * ordinary/release title remains unaffected.
+ * compilation, Markdown parsing, and semantic validation.
+ *
+ * Template selection (Issue #211) is resolved directly from the PR body's
+ * own gh-inari template-identity marker: `default`, `release`, `epic`, and
+ * `authority` all go through the same marker mechanism, and there is no
+ * branch/path/body-shape inference here. Branch-name governance
+ * (classifyPullRequestBranch) still validates the head ref as its own
+ * independent contract, but it no longer participates in template
+ * selection. gh-inari itself only checks that a title is non-empty; the
+ * canonical epic(<scope>): <description> title form (Issue #177) is a
+ * separate, narrow addition owned directly here, exactly like branch-name
+ * validation — see epic-branch.mjs. It only ever classifies a title that is
+ * itself attempting the epic type; every ordinary/release title remains
+ * unaffected.
  */
 export async function validatePullRequest({
   title,
   body,
   root = REPOSITORY_ROOT,
-  template,
   branch
 }) {
-  const routing = resolvePullRequestTemplate({ branch, template });
+  const routing = classifyPullRequestBranch({ branch });
   if (routing.errors.length > 0) {
     const violations = routing.errors.map((message) => ({
       code: "GOVERNANCE_RELEASE_BRANCH_INVALID",
@@ -50,128 +57,111 @@ export async function validatePullRequest({
     };
   }
 
-  const contracts = await candidateContracts(
-    root,
-    routing.template,
-    routing.classification
-  );
-  const outcomes = contracts.map((contract) => ({
-    contract,
-    result: validateExistingPullRequestArtifact(contract, body)
-  }));
-  const valid = outcomes.filter(({ result }) => result.valid);
-  if (valid.length === 1)
-    return report(valid[0], title, routing.classification);
-  if (valid.length > 1) {
-    return report(
-      {
-        contract: valid[0].contract,
-        result: {
-          valid: false,
-          classification: "wrong-template",
-          violations: [
-            {
-              code: "GOVERNANCE_TEMPLATE_AMBIGUOUS",
-              path: "$.template",
-              message:
-                "Pull-request body matches more than one repository-native PR template."
-            }
-          ]
-        }
-      },
-      title,
-      routing.classification
-    );
+  const resolution = await resolveTemplateContract(root, body);
+  if (!resolution.valid) {
+    return {
+      valid: false,
+      branchClassification: routing.classification,
+      violations: resolution.violations,
+      errors: resolution.violations.map((violation) => violation.message)
+    };
   }
 
-  const selected = [...outcomes].sort((left, right) => {
-    const leftParsed = left.result.parse.parsed ? 0 : 1;
-    const rightParsed = right.result.parse.parsed ? 0 : 1;
-    if (leftParsed !== rightParsed) return leftParsed - rightParsed;
-    if (left.result.violations.length !== right.result.violations.length) {
-      return left.result.violations.length - right.result.violations.length;
-    }
-    return left.contract.templateIdentity.id.localeCompare(
-      right.contract.templateIdentity.id
-    );
-  })[0];
+  const result = validateExistingPullRequestArtifact(
+    resolution.contract,
+    resolution.body
+  );
+  return report(
+    { contract: resolution.contract, result },
+    title,
+    routing.classification
+  );
+}
 
-  if (selected === undefined) {
+/**
+ * Parse exactly one valid `inari:template` marker from the PR body and
+ * resolve the referenced template/semantic contract directly from its
+ * declared identity/path. Every failure mode is deterministic: there is no
+ * fallback to inference or candidate matching once a marker is expected.
+ */
+async function resolveTemplateContract(root, body) {
+  if (countTemplateIdentityMarkerAttempts(body) > 1) {
+    return {
+      valid: false,
+      violations: [
+        {
+          code: "GOVERNANCE_TEMPLATE_MARKER_AMBIGUOUS",
+          path: "$.pull_request.body",
+          message:
+            "Pull-request body contains more than one inari:template marker."
+        }
+      ]
+    };
+  }
+
+  const extracted = extractTemplateIdentityMarker(body ?? "");
+  if (extracted.status === "absent") {
+    return {
+      valid: false,
+      violations: [
+        {
+          code: "GOVERNANCE_TEMPLATE_MARKER_MISSING",
+          path: "$.pull_request.body",
+          message:
+            "Pull-request body is missing the required inari:template marker."
+        }
+      ]
+    };
+  }
+  if (
+    extracted.status === "malformed" ||
+    extracted.status === "unsupported-version"
+  ) {
+    return {
+      valid: false,
+      violations: [
+        {
+          code: "GOVERNANCE_TEMPLATE_MARKER_INVALID",
+          path: "$.pull_request.body",
+          message: "Pull-request body has a malformed inari:template marker."
+        }
+      ]
+    };
+  }
+
+  const { marker } = extracted;
+  if (marker.kind !== "pull_request") {
+    return {
+      valid: false,
+      violations: [
+        {
+          code: "GOVERNANCE_TEMPLATE_MARKER_WRONG_KIND",
+          path: "$.pull_request.body",
+          message: `Pull-request body's inari:template marker declares kind "${marker.kind}", not "pull_request".`
+        }
+      ]
+    };
+  }
+
+  try {
+    const contract = await compileLocalGovernedContract(
+      "pr",
+      root,
+      marker.path
+    );
+    return { valid: true, contract, body: extracted.body };
+  } catch {
     return {
       valid: false,
       violations: [
         {
           code: "GOVERNANCE_TEMPLATE_UNAVAILABLE",
-          path: "$.template",
-          message:
-            "No repository-native PR template is available for validation."
+          path: "$.pull_request.body",
+          message: `Pull-request body's inari:template marker references an unavailable template: "${marker.path}".`
         }
       ]
     };
   }
-  return report(selected, title, routing.classification);
-}
-
-async function candidateContracts(root, template, classification) {
-  if (template !== undefined && template.length > 0) {
-    // release/<semver> is already an explicit, deterministic template route.
-    // Repository pr-policy.yml commonly targets the ordinary `default`
-    // template and must not be projected onto the independent release
-    // contract merely because both are pull-request artifacts.
-    if (classification === "release") {
-      const contract = await compilePullRequestTemplate(root, template);
-      // gh-inari's native compiler derives an identity from the filesystem
-      // path. Branch routing, however, selects the repository's canonical
-      // contract id (the local Inari snapshot uses `release`).
-      return [
-        {
-          ...contract,
-          templateIdentity: {
-            ...contract.templateIdentity,
-            id: template
-          }
-        }
-      ];
-    }
-    return [await compileLocalGovernedContract("pr", root, template)];
-  }
-
-  const directory = path.join(root, ".github", "inari", "pull-requests");
-  const names = fs
-    .readdirSync(directory)
-    .filter((name) => name.endsWith(".json"))
-    .sort();
-  const outcomes = await Promise.all(
-    names.map(async (name) => {
-      try {
-        return {
-          compiled: await compileLocalGovernedContract(
-            "pr",
-            root,
-            path.basename(name, ".json")
-          )
-        };
-      } catch (error) {
-        // A repository PR policy commonly binds to one native template (e.g.
-        // `template: default`). During auto-detection every native template is
-        // a candidate, so an unrelated candidate this policy does not target
-        // is expected and must not abort discovery of the applicable one; it
-        // is simply not a candidate. Any other failure (including a policy
-        // mismatch against the template it *does* target) still propagates,
-        // preserving fail-closed behavior for genuine misconfiguration.
-        if (
-          error instanceof PullRequestPolicyError &&
-          error.code === "PR_POLICY_TEMPLATE_MISMATCH"
-        ) {
-          return { compiled: undefined };
-        }
-        throw error;
-      }
-    })
-  );
-  return outcomes.flatMap(({ compiled }) =>
-    compiled === undefined ? [] : [compiled]
-  );
 }
 
 function report(outcome, title, branchClassification) {
@@ -210,9 +200,6 @@ async function main() {
   const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
   if (!event.pull_request) throw new Error("event has no pull_request");
 
-  const templateIndex = process.argv.indexOf("--template");
-  const template =
-    templateIndex === -1 ? undefined : process.argv[templateIndex + 1];
   const branchIndex = process.argv.indexOf("--branch");
   const pullRequest = event.pull_request;
   const branch =
@@ -221,7 +208,6 @@ async function main() {
     title: pullRequest.title ?? "",
     body: pullRequest.body ?? "",
     root: process.cwd(),
-    template,
     branch
   });
   console.log(
