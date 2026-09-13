@@ -41,6 +41,44 @@ test("provision creates one dedicated worktree and one mutable branch", () => {
   }
 });
 
+test("provision creates the safe default managed root only when it is needed", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-default-root-"));
+  const repositoryPath = path.join(parent, "repository");
+  fs.mkdirSync(repositoryPath);
+  runGit(["init", "-b", "main", repositoryPath], repositoryPath);
+  runGit(["config", "user.email", "nawabari-tests@example.invalid"], repositoryPath);
+  runGit(["config", "user.name", "Nawabari Tests"], repositoryPath);
+  fs.writeFileSync(path.join(repositoryPath, "README.md"), "fixture\n");
+  runGit(["add", "README.md"], repositoryPath);
+  runGit(["commit", "-m", "initial"], repositoryPath);
+  const managedRoot = path.join(parent, ".nawabari", "worktrees");
+  let worktreePath: string | undefined;
+  try {
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    assert.equal(registry.managedWorktreeRoot, managedRoot);
+    assert.equal(fs.existsSync(managedRoot), false);
+
+    const session = registry.provision({ branchName: "feature/default-root" });
+    worktreePath = session.worktreePath;
+    assert.equal(path.dirname(session.worktreePath), managedRoot);
+    assert.equal(fs.existsSync(managedRoot), true);
+    assert.equal(fs.statSync(managedRoot).isDirectory(), true);
+
+    // A historical absolute sibling override remains readable/provisionable;
+    // the safe subdirectory is only the new default.
+    const legacyWorktree = path.join(parent, "legacy-worktree");
+    const legacySession = registry.provision({
+      worktreePath: legacyWorktree,
+      branchName: "feature/legacy-worktree",
+    });
+    assert.equal(legacySession.worktreePath, fs.realpathSync.native(legacyWorktree));
+    removeWorktree(repositoryPath, legacyWorktree);
+  } finally {
+    if (worktreePath !== undefined) removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test("invalid base refs expose bounded recovery metadata", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-invalid-base");

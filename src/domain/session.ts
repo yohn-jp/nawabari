@@ -267,7 +267,7 @@ export type SessionDiagnostic = {
   /** All bounded actions available for the observed lifecycle state. */
   next_actions?: SessionLifecycleAction[];
   integration_evidence: SessionDiagnosticIntegrationEvidence;
-  garbage_collection?: GarbageCollectCandidate;
+  garbage_collection?: GarbageCollectAssessment;
   /** Canonical read-only termination/recovery classification. */
   lifecycle_state?: SessionLifecycleState;
   lifecycle?: SessionLifecycleProjection;
@@ -515,7 +515,7 @@ export type GarbageCollectOptions = {
   apply: boolean;
 };
 
-export type GarbageCollectCandidate = SessionRecord & {
+export type GarbageCollectAssessment = SessionRecord & {
   physical_state: string;
   suspicion: "none" | "age" | "lifecycle" | "physical";
   suspicion_reason:
@@ -528,6 +528,9 @@ export type GarbageCollectCandidate = SessionRecord & {
     | "explicit-closing-state"
     | "prunable-missing-worktree"
     | "physical-state-ambiguous";
+};
+
+export type GarbageCollectCandidate = GarbageCollectAssessment & {
   /** Canonical read-only lifecycle projection for the GC observation. */
   lifecycle?: SessionLifecycleProjection;
   next_actions?: SessionLifecycleAction[];

@@ -1,4 +1,8 @@
-import { claimModeGrantsAccess as resourceClaimModeGrantsAccess, type ResourceClaimMode } from "./resource-claims.js";
+import {
+  claimModeGrantsAccess as resourceClaimModeGrantsAccess,
+  RESOURCE_CLAIM_MODES,
+  type ResourceClaimMode,
+} from "./resource-claims.js";
 import type { RegistryErrorCode, RegistryErrorDetails } from "./errors.js";
 
 /** Version of the local operation vocabulary and its access policy. */
@@ -108,6 +112,31 @@ export function isOperationName(value: unknown): value is OperationName {
 
 export function requiredAccessForOperation(operation: OperationName): ResourceClaimMode {
   return OPERATION_AUTHORIZATION_POLICY[operation].requiredAccess;
+}
+
+export type ClaimModeOperationRequirements = {
+  readonly mode: ResourceClaimMode;
+  readonly operations: readonly OperationName[];
+};
+
+/**
+ * Derive the operation vocabulary available at each claim strength from the
+ * two canonical authorities. Stronger modes include the capabilities of
+ * weaker modes; no second claim-to-operation table is maintained here.
+ */
+export function claimModeOperationRequirements(): readonly ClaimModeOperationRequirements[] {
+  return Object.freeze(
+    RESOURCE_CLAIM_MODES.map((mode) =>
+      Object.freeze({
+        mode,
+        operations: Object.freeze(
+          OPERATION_VOCABULARY.filter((operation) =>
+            resourceClaimModeGrantsAccess(mode, requiredAccessForOperation(operation)),
+          ),
+        ),
+      }),
+    ),
+  );
 }
 
 /**

@@ -25,6 +25,7 @@ import {
   type ClaimDeltasOptions,
   type ClaimDeltasResult,
   type GarbageCollectOptions,
+  type GarbageCollectAssessment,
   type GarbageCollectResult,
   type GuardDecision,
   type GuardOptions,
@@ -834,6 +835,19 @@ function toDomainGarbageCollectCandidate(
   };
 }
 
+function toDomainGarbageCollectAssessment(
+  assessment: import("../session-registry.js").GarbageCollectAssessment,
+): GarbageCollectAssessment {
+  return {
+    ...toDomainRecord(assessment),
+    physical_state: assessment.physicalState,
+    suspicion: assessment.suspicion,
+    suspicion_reason: assessment.suspicionReason,
+    destructive_eligibility: assessment.destructiveEligibility,
+    destructive_eligibility_reason: assessment.destructiveEligibilityReason,
+  };
+}
+
 function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").SessionDiagnostic): SessionDiagnostic {
   const nextActions = diagnostic.nextActions.map(toDomainSessionLifecycleAction);
   return {
@@ -877,7 +891,7 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
           lifecycle_state: diagnostic.lifecycle.state,
           lifecycle: toDomainLifecycleProjection(diagnostic.lifecycle),
         }),
-    garbage_collection: toDomainGarbageCollectCandidate(diagnostic.garbageCollection),
+    garbage_collection: toDomainGarbageCollectAssessment(diagnostic.garbageCollection),
   };
 }
 

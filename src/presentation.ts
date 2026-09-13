@@ -28,8 +28,12 @@ function jsonFailure(command: string, error: DomainError): string {
     message: message.value,
   };
   if (error.details !== null) {
-    if (typeof error.details.allowed === "boolean") response.allowed = error.details.allowed;
-    response.details = boundOutputDetails(error.details);
+    const details = { ...error.details };
+    if (typeof details.allowed === "boolean") {
+      response.allowed = details.allowed;
+      delete details.allowed;
+    }
+    response.details = boundOutputDetails(details);
   }
   if (message.truncated) {
     const details: JsonObject =

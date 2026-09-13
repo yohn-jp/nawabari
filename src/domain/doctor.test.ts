@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { runDoctor } from "./doctor.js";
 import type { SandboxProbe } from "./sandbox.js";
+import { SessionRegistry } from "../session-registry.js";
 
 function sandboxProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe {
   return {
@@ -131,6 +132,48 @@ test("doctor accepts the Node 24 baseline and later major versions", async () =>
       assert.equal(runtime?.code, null);
     }
   } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor keeps closed-session reconciliation rows compact and deterministic", async () => {
+  const directory = temporaryRepository();
+  const worktree = `${directory}-closed-session`;
+  try {
+    execFileSync("git", ["config", "user.email", "nawabari-doctor@example.invalid"], { cwd: directory });
+    execFileSync("git", ["config", "user.name", "Nawabari Doctor"], { cwd: directory });
+    writeFileSync(path.join(directory, "README.md"), "doctor fixture\n");
+    execFileSync("git", ["add", "README.md"], { cwd: directory });
+    execFileSync("git", ["commit", "--quiet", "-m", "initial"], { cwd: directory });
+
+    const registry = new SessionRegistry({ cwd: directory });
+    const session = registry.provision({ worktreePath: worktree, branchName: "feature/doctor-closed" });
+    registry.close(session.sessionId);
+
+    const first = await runDoctor(directory, sandboxProbe());
+    const second = await runDoctor(directory, sandboxProbe());
+    assert.equal(first.ok, true);
+    assert.equal(second.ok, true);
+    if (!first.ok || !second.ok) return;
+    assert.deepEqual(second.value, first.value);
+
+    const reconciliation = first.value.checks.find((check) => check.name === "reconciliation");
+    const sessions = reconciliation?.details.lifecycle_sessions;
+    assert.ok(Array.isArray(sessions));
+    const closed = sessions.find(
+      (candidate) =>
+        candidate !== null &&
+        typeof candidate === "object" &&
+        !Array.isArray(candidate) &&
+        (candidate as { session_id?: string }).session_id === session.sessionId,
+    ) as Record<string, unknown> | undefined;
+    assert.ok(closed);
+    assert.deepEqual(Object.keys(closed), ["session_id", "status", "physical_state", "lifecycle_state"]);
+    assert.equal(closed.lifecycle, undefined);
+    assert.equal(closed.next_actions, undefined);
+    assert.equal(closed.transitions, undefined);
+  } finally {
+    rmSync(worktree, { recursive: true, force: true });
     rmSync(directory, { recursive: true, force: true });
   }
 });

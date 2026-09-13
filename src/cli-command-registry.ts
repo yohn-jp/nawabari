@@ -1,8 +1,15 @@
 import { DEFAULT_SESSION_LIST_LIMIT, MAX_SESSION_LIST_LIMIT } from "./domain/session.js";
-import { OPERATION_VOCABULARY } from "./operation-authorization.js";
+import { claimModeOperationRequirements, OPERATION_VOCABULARY } from "./operation-authorization.js";
 import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS } from "./repository-evidence.js";
 
 const CLI_NAME = "nawabari";
+
+function claimModeRequirementsNote(): string {
+  const mapping = claimModeOperationRequirements()
+    .map(({ mode, operations }) => `${mode}: ${operations.length === 0 ? "none" : operations.join(", ")}`)
+    .join("; ");
+  return `Claim modes are cumulative. Canonical operation requirements by granted mode: ${mapping}. This is derived from OPERATION_AUTHORIZATION_POLICY.`;
+}
 
 export type CliHelpOptionSpec = {
   readonly name: string;
@@ -74,14 +81,18 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         value: "<name>",
         default: "nawabari/session/<session_id>",
       }),
-      option("--worktree", "Exact managed worktree path override; mutually exclusive with --worktree-root", {
-        value: "<path>",
-        default: "<managed_worktree_root>/<repository>-<session_id>",
-      }),
+      option(
+        "--worktree",
+        "Exact managed worktree path override; new paths must be under the managed root; historical absolute sibling paths remain compatible; mutually exclusive with --worktree-root",
+        {
+          value: "<path>",
+          default: "<managed_worktree_root>/<repository>-<session_id>",
+        },
+      ),
       option(
         "--worktree-root",
         "Managed root to place the worktree under; Nawabari derives the final path. Mutually exclusive with --worktree",
-        { value: "<path>", default: "resolved repository-local root" },
+        { value: "<path>", default: "<repository-parent>/.nawabari/worktrees" },
       ),
       option("--base", "Commit-resolving base ref for the new worktree", { value: "<ref>", default: "HEAD" }),
       option("--label", "Optional display label; never used as an identity", { value: "<text>", default: "omitted" }),
@@ -89,6 +100,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     notes: [
       "All create options are optional. Use status --json to discover managed_worktree_root.",
       "--worktree and --worktree-root cannot be combined.",
+      "Without an override, Nawabari creates the safe managed root <repository-parent>/.nawabari/worktrees on first use. Existing absolute worktree paths directly under the repository parent remain accepted for compatibility.",
     ],
   },
   {
@@ -197,6 +209,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     notes: [
       "Exactly one --resource/--mode pair is required; --mode must immediately follow its own --resource.",
       "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
+      claimModeRequirementsNote(),
     ],
   },
   {
@@ -395,6 +408,10 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         repeatable: true,
       }),
     ],
+    notes: [
+      "Read-only claim decision: checks the canonical operation policy and concrete resource claims; it does not grant, persist, or mutate claims.",
+      "Use guard to verify current worktree/session ownership without an operation; use authorize for the canonical claim-aware operation decision. guard --operation is a compatibility convenience for the combined check.",
+    ],
   },
   {
     name: "checkpoint",
@@ -516,7 +533,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
   },
   {
     name: "guard",
-    summary: "Authorize the current worktree or operation",
+    summary: "Verify current worktree/session ownership",
     usage: `${CLI_NAME} guard [--session <id>] [--operation <name> --resource <path>]`,
     options: [
       option("--session", "Assert the current session identity", { value: "<id>" }),
@@ -525,6 +542,10 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         values: OPERATION_VOCABULARY,
       }),
       option("--resource", "Concrete resource; repeatable with --operation", { value: "<path>" }),
+    ],
+    notes: [
+      "Without --operation, verifies the current worktree, branch, and session ownership/context only; it does not evaluate resource claims.",
+      "With --operation and --resource, performs the combined claim-aware authorization check for compatibility. Use authorize when the operation decision is the intended boundary.",
     ],
   },
   {

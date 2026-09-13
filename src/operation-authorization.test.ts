@@ -10,6 +10,7 @@ import { SessionRegistryError } from "./errors.js";
 import { defaultGit, type GitCommandRunner } from "./git.js";
 import {
   CHECKPOINT_MAX_PATHS,
+  claimModeOperationRequirements,
   claimModeGrantsAccess,
   OPERATION_AUTHORIZATION_POLICY,
   OPERATION_REQUIRED_ACCESS,
@@ -61,6 +62,17 @@ test("the policy records current public enforcement separately from vocabulary-o
   // operation authorization are SessionRegistry.commit and .push.
   assert.deepEqual(publicExecution, ["commit", "push"]);
   assert.deepEqual(vocabularyOnly, ["source-write", "stage", "branch-mutation", "cleanup"]);
+});
+
+test("claim-mode operation requirements are derived from the canonical policy", () => {
+  assert.deepEqual(claimModeOperationRequirements(), [
+    { mode: "read", operations: [] },
+    { mode: "write", operations: ["source-write", "stage"] },
+    {
+      mode: "exclusive-write",
+      operations: ["source-write", "stage", "commit", "branch-mutation", "push", "cleanup"],
+    },
+  ]);
 });
 
 test("one registry authority authorizes every operation class against concrete claims", () => {
