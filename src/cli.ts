@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { runDoctor } from "./domain/doctor.js";
+import { runDoctor, summarizeDoctorReport } from "./domain/doctor.js";
 import {
   DomainError,
   EXIT_CODES,
@@ -19,6 +19,7 @@ import {
   type SessionContext,
   type SessionCreateOptions,
   type SessionDiagnosticOptions,
+  type SessionDiagnosticSchemaVersion,
   type SessionListOptions,
   type ClaimDeltasOptions,
   type ReleaseClaimsOptions,
@@ -124,7 +125,7 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session create": ["--branch", "--worktree", "--worktree-root", "--base", "--label"],
   "session id": [],
   "session show": ["--session"],
-  "session inspect": ["--session", "--integrated-revision"],
+  "session inspect": ["--session", "--integrated-revision", "--schema-version"],
   "session run": ["--session", "--runtime-policy"],
   "session shell": ["--session", "--runtime-policy"],
   "session list": ["--all", "--history", "--limit", "--offset"],
@@ -162,7 +163,7 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   status: ["--all", "--history", "--limit", "--offset"],
   guard: ["--session", "--operation", "--resource"],
   gc: ["--apply", "--dry-run"],
-  doctor: [],
+  doctor: ["--summary"],
   migrate: [],
   capabilities: [],
 };
@@ -422,6 +423,8 @@ type ParsedOptions = {
   fetch_branch: string | null;
   preview: boolean;
   runtime_policy: RuntimePolicyMode | null;
+  schema_version: SessionDiagnosticSchemaVersion | null;
+  summary: boolean;
 };
 
 function usageError(
@@ -523,6 +526,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     fetch_branch: null,
     preview: false,
     runtime_policy: null,
+    schema_version: null,
+    summary: false,
   };
   let dryRun = false;
 
@@ -541,7 +546,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       name === "--all" ||
       name === "--history" ||
       name === "--patch" ||
-      name === "--preview"
+      name === "--preview" ||
+      name === "--summary"
     ) {
       if (inlineValue !== null) {
         return failure(usageError("INVALID_ARGUMENT", `${name} does not accept a value.`, { option: name }));
@@ -554,7 +560,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       else if (name === "--all") options.all = true;
       else if (name === "--history") options.history = true;
       else if (name === "--patch") options.patch = true;
-      else options.preview = true;
+      else if (name === "--preview") options.preview = true;
+      else options.summary = true;
       continue;
     }
 
@@ -603,7 +610,17 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--max-bytes") options.max_bytes = value;
     else if (name === "--max-hunks") options.max_hunks = value;
     else if (name === "--integrated-revision") options.integrated_revision = value;
-    else if (name === "--fetch-remote") options.fetch_remote = value;
+    else if (name === "--schema-version") {
+      if (value !== "1" && value !== "2") {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--schema-version requires 1 or 2.", {
+            option: "--schema-version",
+            values: ["1", "2"],
+          }),
+        );
+      }
+      options.schema_version = value === "1" ? 1 : 2;
+    } else if (name === "--fetch-remote") options.fetch_remote = value;
     else if (name === "--fetch-branch") options.fetch_branch = value;
   }
 
@@ -1478,6 +1495,7 @@ async function executeCommand(
       const options: SessionDiagnosticOptions = {
         session_id: parsed.value.session_id,
         integrated_revision: parsed.value.integrated_revision,
+        ...(parsed.value.schema_version === null ? {} : { schema_version: parsed.value.schema_version }),
       };
       const result = await dependencies.backend.sessionDiagnostic(context, options);
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
@@ -1828,7 +1846,10 @@ async function executeCommand(
   }
 
   if (command === "doctor") {
-    const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
+    const parsed = parseOptions(
+      [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
+      dispatcherAllowedOptions("doctor"),
+    );
     if (!parsed.ok) return parsed;
     const report = await runDoctor(
       dependencies.cwd,
@@ -1837,12 +1858,13 @@ async function executeCommand(
       dependencies.sandboxRuntimeLayout,
     );
     if (!report.ok) return report;
-    if (report.value.ok) return { ok: true, value: report.value as unknown as JsonObject };
+    const projected = parsed.value.summary
+      ? summarizeDoctorReport(report.value)
+      : (report.value as unknown as JsonObject);
+    if (report.value.ok) return { ok: true, value: projected };
     return failure(
       new DomainError("DOCTOR_FAILED", "One or more local Nawabari checks failed.", {
-        checks: report.value.checks,
-        repository: report.value.repository,
-        sandbox: report.value.sandbox as unknown as JsonObject,
+        ...projected,
       }),
     );
   }

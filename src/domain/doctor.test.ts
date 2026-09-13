@@ -4,9 +4,10 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { runDoctor } from "./doctor.js";
+import { runDoctor, summarizeDoctorReport } from "./doctor.js";
 import type { SandboxProbe } from "./sandbox.js";
 import { SessionRegistry } from "../session-registry.js";
+import { renderSuccess } from "../presentation.js";
 
 function sandboxProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe {
   return {
@@ -138,7 +139,6 @@ test("doctor accepts the Node 24 baseline and later major versions", async () =>
 
 test("doctor keeps closed-session reconciliation rows compact and deterministic", async () => {
   const directory = temporaryRepository();
-  const worktree = `${directory}-closed-session`;
   try {
     execFileSync("git", ["config", "user.email", "nawabari-doctor@example.invalid"], { cwd: directory });
     execFileSync("git", ["config", "user.name", "Nawabari Doctor"], { cwd: directory });
@@ -147,8 +147,15 @@ test("doctor keeps closed-session reconciliation rows compact and deterministic"
     execFileSync("git", ["commit", "--quiet", "-m", "initial"], { cwd: directory });
 
     const registry = new SessionRegistry({ cwd: directory });
-    const session = registry.provision({ worktreePath: worktree, branchName: "feature/doctor-closed" });
-    registry.close(session.sessionId);
+    const closedSessions: Array<{ sessionId: string }> = [];
+    for (let index = 0; index < 24; index += 1) {
+      const session = registry.provision({
+        worktreePath: `${directory}-closed-${index}`,
+        branchName: `feature/doctor-closed-${index}`,
+      });
+      registry.close(session.sessionId);
+      closedSessions.push(session);
+    }
 
     const first = await runDoctor(directory, sandboxProbe());
     const second = await runDoctor(directory, sandboxProbe());
@@ -158,22 +165,72 @@ test("doctor keeps closed-session reconciliation rows compact and deterministic"
     assert.deepEqual(second.value, first.value);
 
     const reconciliation = first.value.checks.find((check) => check.name === "reconciliation");
-    const sessions = reconciliation?.details.lifecycle_sessions;
-    assert.ok(Array.isArray(sessions));
-    const closed = sessions.find(
+    const lifecycleSessions = reconciliation?.details.lifecycle_sessions;
+    assert.ok(Array.isArray(lifecycleSessions));
+    const closed = lifecycleSessions.find(
       (candidate) =>
         candidate !== null &&
         typeof candidate === "object" &&
         !Array.isArray(candidate) &&
-        (candidate as { session_id?: string }).session_id === session.sessionId,
+        (candidate as { session_id?: string }).session_id === closedSessions[0]?.sessionId,
     ) as Record<string, unknown> | undefined;
     assert.ok(closed);
     assert.deepEqual(Object.keys(closed), ["session_id", "status", "physical_state", "lifecycle_state"]);
     assert.equal(closed.lifecycle, undefined);
     assert.equal(closed.next_actions, undefined);
     assert.equal(closed.transitions, undefined);
+
+    const compact = summarizeDoctorReport(first.value) as unknown as {
+      summary: {
+        reconciliation: {
+          lifecycle_sessions_total: number;
+          lifecycle_sessions_included: number;
+          lifecycle_sessions_omitted: number;
+        };
+      };
+      checks: Array<{ name: string; details: { lifecycle_sessions?: unknown[] } }>;
+    };
+    assert.equal(compact.summary.reconciliation.lifecycle_sessions_total, closedSessions.length);
+    assert.equal(compact.summary.reconciliation.lifecycle_sessions_included, 0);
+    assert.equal(compact.summary.reconciliation.lifecycle_sessions_omitted, closedSessions.length);
+    const compactReconciliation = compact.checks.find((check) => check.name === "reconciliation");
+    assert.deepEqual(compactReconciliation?.details.lifecycle_sessions, []);
+    assert.ok(renderSuccess("human", "doctor", summarizeDoctorReport(first.value)).split("\n").length < 100);
   } finally {
-    rmSync(worktree, { recursive: true, force: true });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor summary retains actionable reconciliation drift", async () => {
+  const directory = temporaryRepository();
+  try {
+    execFileSync("git", ["config", "user.email", "nawabari-doctor@example.invalid"], { cwd: directory });
+    execFileSync("git", ["config", "user.name", "Nawabari Doctor"], { cwd: directory });
+    execFileSync("git", ["commit", "--quiet", "--allow-empty", "-m", "initial"], { cwd: directory });
+
+    const registry = new SessionRegistry({ cwd: directory });
+    const session = registry.provision({
+      worktreePath: `${directory}-drift-worktree`,
+      branchName: "feature/doctor-drift",
+    });
+    registry.close(session.sessionId);
+    execFileSync("git", ["branch", session.branchName], { cwd: directory });
+
+    const result = await runDoctor(directory, sandboxProbe());
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    const compact = summarizeDoctorReport(result.value) as unknown as {
+      summary: { reconciliation: { lifecycle_sessions_included: number } };
+      checks: Array<{
+        name: string;
+        details?: { lifecycle_sessions?: Array<{ status?: string }>; issues?: Array<{ code?: string }> };
+      }>;
+    };
+    assert.equal(compact.summary.reconciliation.lifecycle_sessions_included, 1);
+    const reconciliation = compact.checks.find((check) => check.name === "reconciliation");
+    assert.equal(reconciliation?.details?.lifecycle_sessions?.[0]?.status, "drift");
+    assert.equal(reconciliation?.details?.issues?.[0]?.code, "OWNERSHIP_MISMATCH");
+  } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 });

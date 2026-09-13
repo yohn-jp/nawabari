@@ -158,7 +158,21 @@ export type SessionDiagnosticOptions = {
   session_id: string | null;
   /** Same non-ancestry integration evidence accepted by session close; independently re-verified, never trusted blindly. */
   integrated_revision?: string | null;
+  /** Public result schema; omitted preserves the established nested v1 shape. */
+  schema_version?: SessionDiagnosticSchemaVersion;
 };
+
+/**
+ * Public `session inspect` result generations. Version 1 retains the
+ * historical nested lifecycle copy for unqualified callers; version 2
+ * exposes one lifecycle authority and references it from the GC compatibility
+ * field when explicitly selected.
+ */
+export const SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION = 1 as const;
+export const SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION = 1 as const;
+export const SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION = 2 as const;
+export type SessionDiagnosticSchemaVersion =
+  typeof SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION | typeof SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION;
 
 /**
  * Explicit close/cleanup readiness states. `external_evidence_required`
@@ -267,7 +281,7 @@ export type SessionDiagnostic = {
   /** All bounded actions available for the observed lifecycle state. */
   next_actions?: SessionLifecycleAction[];
   integration_evidence: SessionDiagnosticIntegrationEvidence;
-  garbage_collection?: GarbageCollectAssessment;
+  garbage_collection?: SessionDiagnosticGarbageCollection;
   /** Canonical read-only termination/recovery classification. */
   lifecycle_state?: SessionLifecycleState;
   lifecycle?: SessionLifecycleProjection;
@@ -531,6 +545,24 @@ export type GarbageCollectAssessment = SessionRecord & {
   /** Canonical read-only lifecycle projection for the GC observation. */
   lifecycle?: SessionLifecycleProjection;
   next_actions?: SessionLifecycleAction[];
+};
+
+export type SessionLifecycleProjectionReference = {
+  schema_version: typeof SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION;
+  authority: "session_diagnostic.lifecycle";
+  ref: "#/lifecycle";
+};
+
+export type SessionLifecycleActionsReference = {
+  schema_version: typeof SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION;
+  authority: "session_diagnostic.next_actions";
+  ref: "#/next_actions";
+};
+
+/** GC fields in `session inspect`, with v2 references instead of copies. */
+export type SessionDiagnosticGarbageCollection = Omit<GarbageCollectAssessment, "lifecycle" | "next_actions"> & {
+  lifecycle?: SessionLifecycleProjection | SessionLifecycleProjectionReference;
+  next_actions?: SessionLifecycleAction[] | SessionLifecycleActionsReference;
 };
 
 export type GarbageCollectCandidate = GarbageCollectAssessment;

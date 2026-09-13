@@ -43,7 +43,13 @@ import {
   type SessionCreateOptions,
   type SessionDiagnostic,
   type SessionDiagnosticOptions,
+  type SessionDiagnosticSchemaVersion,
   type SessionLifecycleAction,
+  type SessionLifecycleProjection,
+  type SessionDiagnosticGarbageCollection,
+  SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
+  SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION,
+  SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION,
   type SessionListResult,
   type SessionListOptions,
   type SessionRecord,
@@ -427,7 +433,7 @@ export class LocalSessionBackend implements SessionBackend {
         sessionId,
         integratedRevision: options.integrated_revision ?? undefined,
       });
-      return Promise.resolve(success(toDomainSessionDiagnostic(diagnostic)));
+      return Promise.resolve(success(toDomainSessionDiagnostic(diagnostic, options.schema_version)));
     } catch (error: unknown) {
       return Promise.resolve(failure(toDomainError(error, "NO_CURRENT_SESSION")));
     }
@@ -847,16 +853,38 @@ function toDomainGarbageCollectCandidate(
 
 /**
  * Diagnostics carry one canonical lifecycle projection (`diagnostic.lifecycle`
- * / `diagnostic.nextActions`) rather than a copy computed for the nested GC
- * assessment. `lifecycle`/`next_actions` remain part of the public
- * `garbage_collection` JSON contract, though, so they are re-attached here
- * from that same canonical snapshot instead of being dropped.
+ * / `diagnostic.nextActions`). The explicit v1 compatibility projection keeps
+ * the established nested fields; v2 retains those fields as references to
+ * the canonical top-level values instead of serializing a second graph.
  */
 function toDomainGarbageCollectAssessment(
   assessment: import("../session-registry.js").GarbageCollectAssessment,
-  lifecycle: import("../session-registry.js").SessionLifecycleClassification | undefined,
-  nextActions: readonly RegistrySessionLifecycleAction[],
-): GarbageCollectAssessment {
+  lifecycle: SessionLifecycleProjection | undefined,
+  nextActions: readonly SessionLifecycleAction[],
+  schemaVersion: SessionDiagnosticSchemaVersion,
+): SessionDiagnosticGarbageCollection {
+  const lifecycleCompatibility =
+    lifecycle === undefined
+      ? {}
+      : schemaVersion === SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION
+        ? { lifecycle }
+        : {
+            lifecycle: {
+              schema_version: SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION,
+              authority: "session_diagnostic.lifecycle" as const,
+              ref: "#/lifecycle" as const,
+            },
+          };
+  const nextActionsCompatibility =
+    schemaVersion === SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION
+      ? { next_actions: [...nextActions] }
+      : {
+          next_actions: {
+            schema_version: SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION,
+            authority: "session_diagnostic.next_actions" as const,
+            ref: "#/next_actions" as const,
+          },
+        };
   return {
     ...toDomainRecord(assessment),
     physical_state: assessment.physicalState,
@@ -864,15 +892,19 @@ function toDomainGarbageCollectAssessment(
     suspicion_reason: assessment.suspicionReason,
     destructive_eligibility: assessment.destructiveEligibility,
     destructive_eligibility_reason: assessment.destructiveEligibilityReason,
-    ...(lifecycle === undefined ? {} : { lifecycle: toDomainLifecycleProjection(lifecycle) }),
-    next_actions: nextActions.map(toDomainSessionLifecycleAction),
+    ...lifecycleCompatibility,
+    ...nextActionsCompatibility,
   };
 }
 
-function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").SessionDiagnostic): SessionDiagnostic {
+function toDomainSessionDiagnostic(
+  diagnostic: import("../session-registry.js").SessionDiagnostic,
+  schemaVersion: SessionDiagnosticSchemaVersion = SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
+): SessionDiagnostic {
   const nextActions = diagnostic.nextActions.map(toDomainSessionLifecycleAction);
+  const lifecycle = diagnostic.lifecycle === undefined ? undefined : toDomainLifecycleProjection(diagnostic.lifecycle);
   return {
-    schema_version: diagnostic.schemaVersion,
+    schema_version: schemaVersion,
     session_id: diagnostic.session.sessionId,
     repository: diagnostic.repositoryId,
     worktree: diagnostic.worktreePath,
@@ -906,16 +938,17 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
             proof: toDomainIntegrationProof(diagnostic.integrationEvidence.proof),
           }),
     },
-    ...(diagnostic.lifecycle === undefined
+    ...(lifecycle === undefined
       ? {}
       : {
-          lifecycle_state: diagnostic.lifecycle.state,
-          lifecycle: toDomainLifecycleProjection(diagnostic.lifecycle),
+          lifecycle_state: lifecycle.state,
+          lifecycle,
         }),
     garbage_collection: toDomainGarbageCollectAssessment(
       diagnostic.garbageCollection,
-      diagnostic.lifecycle,
-      diagnostic.nextActions,
+      lifecycle,
+      nextActions,
+      schemaVersion,
     ),
   };
 }

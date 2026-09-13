@@ -7,7 +7,7 @@ import { isSessionRegistryError } from "../errors.js";
 import { SessionRegistry, type ReconciliationSession } from "../session-registry.js";
 import { projectSessionLifecycleActions } from "../session-lifecycle-actions.js";
 import { availableLifecycleOperations } from "../session-lifecycle-classification.js";
-import { success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
+import { success, type DomainResult, type ErrorCode, type JsonObject, type JsonValue } from "./errors.js";
 import { supportsRuntime } from "./runtime.js";
 import {
   defaultSandboxProbe,
@@ -41,6 +41,122 @@ export type DoctorReport = {
   /** Runtime protected-execution readiness from the canonical sandbox probe. */
   sandbox: SandboxDoctorReport;
 };
+
+function isJsonObject(value: JsonValue | undefined): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function compactReconciliationDetails(details: JsonObject): JsonObject {
+  const sessions = Array.isArray(details.lifecycle_sessions) ? details.lifecycle_sessions.filter(isJsonObject) : [];
+  const actionableSessions = sessions.filter((session) => session.status === "candidate" || session.status === "drift");
+  const byStatus: JsonObject = {};
+  const byLifecycleState: JsonObject = {};
+  for (const session of sessions) {
+    const status = typeof session.status === "string" ? session.status : "unknown";
+    const statusCount = byStatus[status];
+    byStatus[status] = typeof statusCount === "number" ? statusCount + 1 : 1;
+    const lifecycleState = typeof session.lifecycle_state === "string" ? session.lifecycle_state : "unknown";
+    const lifecycleStateCount = byLifecycleState[lifecycleState];
+    byLifecycleState[lifecycleState] = typeof lifecycleStateCount === "number" ? lifecycleStateCount + 1 : 1;
+  }
+
+  return {
+    clean: details.clean ?? null,
+    sessions: details.sessions ?? sessions.length,
+    worktrees: details.worktrees ?? 0,
+    lifecycle_sessions: actionableSessions,
+    lifecycle_sessions_summary: {
+      total: sessions.length,
+      included: actionableSessions.length,
+      omitted: sessions.length - actionableSessions.length,
+      by_status: byStatus,
+      by_lifecycle_state: byLifecycleState,
+    },
+    issues: Array.isArray(details.issues) ? details.issues : [],
+  };
+}
+
+function compactSandboxReport(sandbox: SandboxDoctorReport): JsonObject {
+  const capabilityStatuses = Object.fromEntries(sandbox.capabilities.map(({ id, status }) => [id, status]));
+  return {
+    schema_version: sandbox.schema_version,
+    contract_id: sandbox.contract_id,
+    platform: sandbox.platform,
+    platform_supported: sandbox.platform_supported,
+    network_mode: sandbox.network_mode,
+    ready: sandbox.ready,
+    missing_required: [...sandbox.missing_required],
+    capabilities: capabilityStatuses,
+    landlock: {
+      abi: sandbox.landlock.abi,
+      supported: sandbox.landlock.supported,
+      effective_state: sandbox.landlock.effective_state,
+    },
+    strict_ready: sandbox.strict_ready,
+    strict_ready_reason: sandbox.strict_ready_reason,
+    strict_ready_code: sandbox.strict_ready_code,
+    runtime: {
+      selected: sandbox.runtime.selected,
+      available: [...sandbox.runtime.available],
+      strict_ready: sandbox.runtime.strict_ready,
+      reason: sandbox.runtime.reason,
+      default_policy: sandbox.runtime.default_policy.mode,
+      default_profile: { ...sandbox.runtime.default_profile },
+      compatibility_available: sandbox.runtime.compatibility_available,
+      compatibility_policy: sandbox.runtime.compatibility_policy.mode,
+    },
+  };
+}
+
+/**
+ * Project the full doctor report into a bounded, actionable summary. The
+ * established full report remains available by default; this explicit
+ * projection omits healthy/closed history rows while retaining all drift and
+ * error diagnostics and their recovery details.
+ */
+export function summarizeDoctorReport(report: DoctorReport): JsonObject {
+  const reconciliation = report.checks.find((candidate) => candidate.name === "reconciliation");
+  const reconciliationDetails =
+    reconciliation === undefined ? null : compactReconciliationDetails(reconciliation.details);
+  const checkCounts: JsonObject = {};
+  for (const check of report.checks) {
+    const checkCount = checkCounts[check.status];
+    checkCounts[check.status] = typeof checkCount === "number" ? checkCount + 1 : 1;
+  }
+
+  return {
+    ok: report.ok,
+    summary: {
+      schema_version: 1,
+      representation: "compact",
+      check_counts: checkCounts,
+      reconciliation:
+        reconciliationDetails === null
+          ? null
+          : {
+              clean: reconciliationDetails.clean,
+              sessions: reconciliationDetails.sessions,
+              worktrees: reconciliationDetails.worktrees,
+              lifecycle_sessions_total: (reconciliationDetails.lifecycle_sessions_summary as JsonObject).total,
+              lifecycle_sessions_included: (reconciliationDetails.lifecycle_sessions_summary as JsonObject).included,
+              lifecycle_sessions_omitted: (reconciliationDetails.lifecycle_sessions_summary as JsonObject).omitted,
+            },
+    },
+    checks: report.checks.map((check) => ({
+      name: check.name,
+      status: check.status,
+      code: check.code,
+      message: check.message,
+      ...(check.name === "reconciliation"
+        ? { details: compactReconciliationDetails(check.details) }
+        : check.status === "ok"
+          ? {}
+          : { details: { ...check.details } }),
+    })),
+    repository: report.repository,
+    sandbox: compactSandboxReport(report.sandbox),
+  };
+}
 
 function check(
   name: DoctorCheck["name"],

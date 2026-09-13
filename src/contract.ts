@@ -25,6 +25,7 @@ import {
 } from "./domain/sandbox.js";
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
 import { DISCARD_PREVIEW_SCHEMA_VERSION } from "./session-registry.js";
+import { SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION, SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION } from "./domain/session.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -362,8 +363,22 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "session-diagnostics",
     commands: ["session inspect"],
     result_schema: "session-diagnostic.v1",
-    result_schema_version: 1,
-    result_schemas: [{ schema: "session-diagnostic.v1", version: 1, commands: ["session inspect"] }],
+    result_schema_version: SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
+    result_schemas: [
+      {
+        schema: "session-diagnostic.v1",
+        version: SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
+        commands: ["session inspect"],
+      },
+    ],
+    compatibility_result_schemas: [
+      {
+        schema: "session-diagnostic.v2",
+        version: SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION,
+        commands: ["session inspect"],
+        selector: "--schema-version 2",
+      },
+    ],
     identities: [
       "session_id",
       "repository",
@@ -388,6 +403,15 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       states: [...SESSION_LIFECYCLE_STATES],
       transition_table: SESSION_LIFECYCLE_TRANSITION_TABLE,
       authority: "local-session-registry-observation",
+      result_projection: {
+        default_schema_version: SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
+        selector: "--schema-version",
+        canonical_field: "lifecycle",
+        garbage_collection: {
+          v2: "reference-to-top-level-lifecycle-and-next-actions",
+          v1: "legacy-nested-lifecycle-and-next-actions-copy",
+        },
+      },
       age_rule: "elapsed-age-is-diagnostic-only",
       recovery_actions: {
         schema_version: SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION,
@@ -663,6 +687,9 @@ export function machineContract(packageVersion: string): JsonObject {
             result_schema_version: capability.result_schema_version,
             result_schemas: registryResultSchemas(capability.result_schemas),
           }
+        : {}),
+      ...(capability.id === "session-diagnostics"
+        ? { compatibility_result_schemas: jsonClone(capability.compatibility_result_schemas) }
         : {}),
       identities: [...capability.identities],
       failure_codes: [...capability.failure_codes],

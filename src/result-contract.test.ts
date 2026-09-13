@@ -215,7 +215,9 @@ test("lifecycle, diagnostic, and cleanup schemas are checked against reachable p
     assert.equal(typeof statusSession.lifecycle_state, "string");
     assert.ok(Object.hasOwn(statusSession, "next_actions"));
 
-    const diagnostic = await invokeJson(["session", "inspect", "--session", sessionId as string], worktree as string);
+    // Existing consumers omit --schema-version and must retain the exact v1
+    // nested lifecycle/next_actions result.
+    const diagnostic = await invokeJson(["session", "inspect"], worktree as string);
     assert.equal(diagnostic.session_id, sessionId);
     assert.ok(Object.hasOwn(diagnostic, "lifecycle_state"));
     assert.ok(Object.hasOwn(diagnostic, "close_readiness"));
@@ -223,10 +225,36 @@ test("lifecycle, diagnostic, and cleanup schemas are checked against reachable p
     assert.deepEqual(statusSession.lifecycle, diagnostic.lifecycle);
     assert.deepEqual(statusSession.next_actions, diagnostic.next_actions);
     const diagnosticGarbageCollection = object(diagnostic.garbage_collection, "diagnostic garbage collection");
+    assert.equal(diagnostic.schema_version, 1);
     assert.deepEqual(diagnosticGarbageCollection.lifecycle, diagnostic.lifecycle);
     assert.deepEqual(diagnosticGarbageCollection.next_actions, diagnostic.next_actions);
     const diagnosticLifecycle = object(diagnostic.lifecycle, "diagnostic lifecycle");
     assert.ok(Array.isArray(diagnosticLifecycle.transitions));
+
+    const explicitV1Diagnostic = await invokeJson(
+      ["session", "inspect", "--session", sessionId as string, "--schema-version", "1"],
+      worktree as string,
+    );
+    assert.deepEqual(diagnostic, explicitV1Diagnostic);
+
+    const v2Diagnostic = await invokeJson(
+      ["session", "inspect", "--session", sessionId as string, "--schema-version", "2"],
+      worktree as string,
+    );
+    assert.equal(v2Diagnostic.schema_version, 2);
+    const v2GarbageCollection = object(v2Diagnostic.garbage_collection, "v2 diagnostic garbage collection");
+    assert.deepEqual(v2GarbageCollection.lifecycle, {
+      schema_version: 2,
+      authority: "session_diagnostic.lifecycle",
+      ref: "#/lifecycle",
+    });
+    assert.deepEqual(v2GarbageCollection.next_actions, {
+      schema_version: 2,
+      authority: "session_diagnostic.next_actions",
+      ref: "#/next_actions",
+    });
+    const v2Lifecycle = object(v2Diagnostic.lifecycle, "v2 diagnostic lifecycle");
+    assert.ok(Array.isArray(v2Lifecycle.transitions));
 
     const doctor = await invokeJson(["doctor"], fixture.repository);
     assert.ok(Array.isArray(doctor.checks));
