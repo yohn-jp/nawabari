@@ -57,10 +57,13 @@ import {
   type StatusResult,
   type UpdateClaimsOptions,
 } from "./session.js";
+import type { SandboxGitIdentity } from "./sandbox.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
-  readonly registry?: Omit<SessionRegistryOptions, "cwd" | "git">;
+  /** Minimal host Git identity projected into governed commit operations. */
+  readonly gitIdentity?: SandboxGitIdentity;
+  readonly registry?: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
 }
 
 export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
@@ -156,10 +159,12 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
 /** SessionBackend implementation backed only by the local Git repository. */
 export class LocalSessionBackend implements SessionBackend {
   private readonly git: SessionRegistryOptions["git"];
-  private readonly registryOptions: Omit<SessionRegistryOptions, "cwd" | "git">;
+  private readonly gitIdentity: SandboxGitIdentity | undefined;
+  private readonly registryOptions: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
 
   public constructor(options: LocalSessionBackendOptions = {}) {
     this.git = options.git;
+    this.gitIdentity = options.gitIdentity;
     this.registryOptions = options.registry ?? {};
   }
 
@@ -547,7 +552,12 @@ export class LocalSessionBackend implements SessionBackend {
   }
 
   private registryFor(context: SessionContext): SessionRegistry {
-    return new SessionRegistry({ ...this.registryOptions, cwd: context.cwd, git: this.git });
+    return new SessionRegistry({
+      ...this.registryOptions,
+      cwd: context.cwd,
+      git: this.git,
+      gitIdentity: this.gitIdentity,
+    });
   }
 }
 

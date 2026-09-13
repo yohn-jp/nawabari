@@ -35,6 +35,7 @@ import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract }
 import {
   resolveSandboxExecutionRequest,
   runSandboxedCommand,
+  discoverSandboxRuntimeLayout,
   CANONICAL_EXECUTABLE_ROOT,
   type SandboxCommand,
   type SandboxExecutionResult,
@@ -2151,13 +2152,31 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   const command = commandName(parsed.value.commandArguments);
   const cwd = dependencies.cwd ?? process.cwd();
   try {
-    const backend = dependencies.backend ?? createLocalSessionBackend();
+    // Managed commits use the same bounded host-identity discovery as the
+    // sandbox request path. The resulting backend projection contains only
+    // user.name/user.email; the host HOME and full global Git config remain
+    // outside the governed subprocess.
+    const runtimeLayout =
+      dependencies.sandboxRuntimeLayout ??
+      (dependencies.backend === undefined && command === "commit" ? discoverSandboxRuntimeLayout() : undefined);
+    const backend =
+      dependencies.backend ??
+      createLocalSessionBackend({
+        ...(runtimeLayout === undefined
+          ? {}
+          : {
+              gitIdentity: {
+                host_global_name: runtimeLayout.git_user_name,
+                host_global_email: runtimeLayout.git_user_email,
+              },
+            }),
+      });
     const result = await executeCommand(parsed.value.commandArguments, {
       backend,
       cwd,
       sandboxRunner: dependencies.sandboxRunner,
       sandboxProbe: dependencies.sandboxProbe,
-      sandboxRuntimeLayout: dependencies.sandboxRuntimeLayout,
+      sandboxRuntimeLayout: runtimeLayout,
       sandboxRuntimeProjection: dependencies.sandboxRuntimeProjection,
     });
     if (!result.ok) {
