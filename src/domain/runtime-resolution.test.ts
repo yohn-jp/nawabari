@@ -11,6 +11,7 @@ import {
   resolveSandboxExecutionRequest,
   runSandboxedCommand,
   type SandboxRuntimeLayout,
+  type SandboxProbe,
 } from "./sandbox.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import {
@@ -59,6 +60,20 @@ type CandidateFixture = Readonly<{
   readonly candidates: readonly { readonly requirement_id: string; readonly path: string }[];
   readonly cleanup: () => void;
 }>;
+
+function deterministicReadySandboxProbe(): SandboxProbe {
+  return {
+    platform: () => "linux",
+    uid: () => (typeof process.getuid === "function" ? process.getuid() : null),
+    gid: () => (typeof process.getgid === "function" ? process.getgid() : null),
+    hasBubblewrap: () => true,
+    hasNamespaceSupport: () => true,
+    hasCgroupsV2: () => false,
+    hasLandlock: () => false,
+    hasSeccomp: () => true,
+    hasCapabilities: () => true,
+  };
+}
 
 /**
  * Real, bounded FHS development-baseline executables. `runtimeMaterializerAvailability`
@@ -236,6 +251,7 @@ test("a plain non-pnpm repository resolves the default strict profile without pn
 
   try {
     const backend = new LocalSessionBackend();
+    const sandboxProbe = deterministicReadySandboxProbe();
     const created = await backend.createSession(
       { cwd: repository },
       { branch: "feature/plain-non-pnpm", worktree, label: null, base: null },
@@ -259,7 +275,7 @@ test("a plain non-pnpm repository resolves the default strict profile without pn
       backend,
       { cwd: worktree },
       { session_id: created.value.session_id, enforce: true },
-      defaultSandboxProbe,
+      sandboxProbe,
       layout,
     );
     assert.equal(request.ok, true, request.ok ? "" : JSON.stringify(request.error));
@@ -273,7 +289,11 @@ test("a plain non-pnpm repository resolves the default strict profile without pn
       request.value.runtime_projection?.executables.map((entrypoint) => entrypoint.name),
       ["git", "ls", "node"],
     );
-    if (defaultSandboxProbe.hasBubblewrap() && defaultSandboxProbe.hasNamespaceSupport()) {
+    if (
+      process.platform === "linux" &&
+      defaultSandboxProbe.hasBubblewrap() &&
+      defaultSandboxProbe.hasNamespaceSupport()
+    ) {
       const ls = await runSandboxedCommand(request.value, { command: "ls" });
       assert.equal(ls.ok, true, ls.ok ? "" : JSON.stringify(ls.error));
       if (ls.ok) {
