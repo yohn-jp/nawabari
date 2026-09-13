@@ -10,6 +10,7 @@ import { runCli } from "./cli.js";
 import { SessionRegistry } from "./session-registry.js";
 import { SessionRegistryError } from "./errors.js";
 import { RepositoryLock } from "./registry/lock.js";
+import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
 
 interface Fixture {
   readonly root: string;
@@ -463,6 +464,123 @@ test("CLI commit preserves the JSON mutation result contract", async () => {
     assert.match(result.commit_sha, /^[0-9a-f]{40}$/u);
   } finally {
     fixture.cleanup();
+  }
+});
+
+test("CLI commit succeeds with only the host-global Git identity after session creation", async () => {
+  const configDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-host-global-commit-"));
+  const globalConfigPath = path.join(configDirectory, "gitconfig");
+  fs.writeFileSync(
+    globalConfigPath,
+    [
+      "[user]",
+      "\tname = Host Global Commit Author",
+      "\temail = host-global-commit@example.invalid",
+      "[credential]",
+      "\thelper = store --file=/must-not-be-imported",
+      "[alias]",
+      "\tco = checkout",
+      "",
+    ].join("\n"),
+  );
+
+  let fixture: Fixture | undefined;
+  try {
+    // The host identity is available before the managed session is created.
+    const runtimeLayout = discoverSandboxRuntimeLayout({
+      ...process.env,
+      GIT_CONFIG_GLOBAL: globalConfigPath,
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    });
+    assert.equal(runtimeLayout.git_user_name, "Host Global Commit Author");
+    assert.equal(runtimeLayout.git_user_email, "host-global-commit@example.invalid");
+
+    fixture = createFixtureWithoutIdentity();
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "host-global-only\n");
+
+    const stdout: string[] = [];
+    const exitCode = await runCli(
+      [
+        "commit",
+        "--session",
+        fixture.session.sessionId,
+        "--message",
+        "host global identity",
+        "--resource",
+        "file.txt",
+        "--json",
+      ],
+      {
+        cwd: fixture.worktree,
+        sandboxRuntimeLayout: runtimeLayout,
+        io: { stdout: (line) => stdout.push(line), stderr: () => undefined },
+      },
+    );
+
+    assert.equal(exitCode, 0, stdout.join("\n"));
+    const result = JSON.parse(stdout[0] ?? "") as { ok: boolean; commit_sha: string };
+    assert.equal(result.ok, true);
+    assert.match(result.commit_sha, /^[0-9a-f]{40}$/u);
+    assert.equal(
+      runGit(["show", "--no-patch", "--format=%an <%ae>", result.commit_sha], fixture.worktree),
+      "Host Global Commit Author <host-global-commit@example.invalid>",
+    );
+  } finally {
+    fixture?.cleanup();
+    fs.rmSync(configDirectory, { recursive: true, force: true });
+  }
+});
+
+test("CLI commit resolves host identity per key without overriding repository-local identity", async () => {
+  const configDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-host-global-per-key-"));
+  const globalConfigPath = path.join(configDirectory, "gitconfig");
+  fs.writeFileSync(
+    globalConfigPath,
+    ["[user]", "\tname = Host Global Other", "\temail = host-global-other@example.invalid", ""].join("\n"),
+  );
+
+  let fixture: Fixture | undefined;
+  try {
+    const runtimeLayout = discoverSandboxRuntimeLayout({
+      ...process.env,
+      GIT_CONFIG_GLOBAL: globalConfigPath,
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    });
+    fixture = createFixtureWithoutIdentity();
+    runGit(["config", "user.name", "Repository Local Author"], fixture.worktree);
+    claim(fixture);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "local-name-host-email\n");
+
+    const stdout: string[] = [];
+    const exitCode = await runCli(
+      [
+        "commit",
+        "--session",
+        fixture.session.sessionId,
+        "--message",
+        "per-key identity",
+        "--resource",
+        "file.txt",
+        "--json",
+      ],
+      {
+        cwd: fixture.worktree,
+        sandboxRuntimeLayout: runtimeLayout,
+        io: { stdout: (line) => stdout.push(line), stderr: () => undefined },
+      },
+    );
+
+    assert.equal(exitCode, 0, stdout.join("\n"));
+    const result = JSON.parse(stdout[0] ?? "") as { ok: boolean; commit_sha: string };
+    assert.equal(result.ok, true);
+    assert.equal(
+      runGit(["show", "--no-patch", "--format=%an <%ae>", result.commit_sha], fixture.worktree),
+      "Repository Local Author <host-global-other@example.invalid>",
+    );
+  } finally {
+    fixture?.cleanup();
+    fs.rmSync(configDirectory, { recursive: true, force: true });
   }
 });
 

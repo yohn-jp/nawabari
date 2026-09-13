@@ -84,6 +84,7 @@ import {
   type RepositoryEvidenceOptions,
   type RepositoryEvidenceSnapshot,
 } from "./repository-evidence.js";
+import type { SandboxGitIdentity } from "./domain/sandbox.js";
 import {
   classifySessionLifecycle,
   type SessionLifecycleClassification,
@@ -814,6 +815,8 @@ export interface SessionRegistryOptions {
   readonly cwd?: string;
   readonly repository?: RepositoryContext;
   readonly git?: GitCommandRunner;
+  /** Minimal host Git identity available as a fallback for governed commits. */
+  readonly gitIdentity?: SandboxGitIdentity;
   readonly clock?: () => Date;
   readonly idGenerator?: () => string;
   readonly lockTimeoutMs?: number;
@@ -904,6 +907,7 @@ export class SessionRegistry {
   readonly paths: RegistryPaths;
 
   private readonly git: GitCommandRunner;
+  private readonly gitIdentity: SandboxGitIdentity | undefined;
   private readonly clock: () => Date;
   private readonly idGenerator: () => string;
   private readonly lockTimeoutMs: number;
@@ -920,6 +924,13 @@ export class SessionRegistry {
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
     this.git = options.git ?? defaultGit;
+    this.gitIdentity =
+      options.gitIdentity === undefined
+        ? undefined
+        : Object.freeze({
+            host_global_name: options.gitIdentity.host_global_name,
+            host_global_email: options.gitIdentity.host_global_email,
+          });
     this.clock = options.clock ?? (() => new Date());
     this.idGenerator = options.idGenerator ?? generateSessionId;
     this.lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
@@ -2017,7 +2028,13 @@ export class SessionRegistry {
       }
 
       try {
-        runMutationGit(this.git, ["commit", "-m", options.message], initial.worktreePath, "commit", "COMMIT_FAILED");
+        runMutationGit(
+          this.git,
+          commitGitArguments(this.git, initial.worktreePath, this.gitIdentity, options.message),
+          initial.worktreePath,
+          "commit",
+          "COMMIT_FAILED",
+        );
       } catch (error: unknown) {
         if (
           error instanceof SessionRegistryError &&
@@ -5809,6 +5826,46 @@ function reverifyMutationContext(
 
 function isBoundedGitFailure(code: RegistryErrorCode): boolean {
   return code === "GIT_SPAWN_FAILED" || code === "GIT_TIMEOUT" || code === "GIT_OUTPUT_LIMIT";
+}
+
+/**
+ * Read one repository-local identity key without re-enabling global config.
+ * The caller only uses a host-global fallback when this key is absent, so a
+ * local value retains Git's intended per-key precedence over the projection.
+ */
+function readLocalGitIdentityValue(git: GitCommandRunner, key: "user.name" | "user.email", cwd: string): string | null {
+  try {
+    const value = git.run(["config", "--local", "--get", key], cwd).trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Add only missing identity keys to the commit invocation. Git command-line
+ * config has higher precedence than repository-local config, therefore each
+ * fallback is added only after its local key was independently observed to be
+ * absent. No other host Git configuration enters the subprocess.
+ */
+function commitGitArguments(
+  git: GitCommandRunner,
+  cwd: string,
+  gitIdentity: SandboxGitIdentity | undefined,
+  message: string,
+): readonly string[] {
+  const identityArguments: string[] = [];
+  if (gitIdentity !== undefined) {
+    const localName = readLocalGitIdentityValue(git, "user.name", cwd);
+    const localEmail = readLocalGitIdentityValue(git, "user.email", cwd);
+    if (localName === null && gitIdentity.host_global_name !== null) {
+      identityArguments.push("-c", `user.name=${gitIdentity.host_global_name}`);
+    }
+    if (localEmail === null && gitIdentity.host_global_email !== null) {
+      identityArguments.push("-c", `user.email=${gitIdentity.host_global_email}`);
+    }
+  }
+  return [...identityArguments, "commit", "-m", message];
 }
 
 function readCommitParent(git: GitCommandRunner, cwd: string, commitSha: string): string {
