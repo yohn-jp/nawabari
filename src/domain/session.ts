@@ -528,13 +528,12 @@ export type GarbageCollectAssessment = SessionRecord & {
     | "explicit-closing-state"
     | "prunable-missing-worktree"
     | "physical-state-ambiguous";
-};
-
-export type GarbageCollectCandidate = GarbageCollectAssessment & {
   /** Canonical read-only lifecycle projection for the GC observation. */
   lifecycle?: SessionLifecycleProjection;
   next_actions?: SessionLifecycleAction[];
 };
+
+export type GarbageCollectCandidate = GarbageCollectAssessment;
 
 export type BackendCapabilities = {
   session_registry: boolean;

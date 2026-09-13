@@ -223,8 +223,8 @@ test("lifecycle, diagnostic, and cleanup schemas are checked against reachable p
     assert.deepEqual(statusSession.lifecycle, diagnostic.lifecycle);
     assert.deepEqual(statusSession.next_actions, diagnostic.next_actions);
     const diagnosticGarbageCollection = object(diagnostic.garbage_collection, "diagnostic garbage collection");
-    assert.equal(Object.hasOwn(diagnosticGarbageCollection, "lifecycle"), false);
-    assert.equal(Object.hasOwn(diagnosticGarbageCollection, "next_actions"), false);
+    assert.deepEqual(diagnosticGarbageCollection.lifecycle, diagnostic.lifecycle);
+    assert.deepEqual(diagnosticGarbageCollection.next_actions, diagnostic.next_actions);
     const diagnosticLifecycle = object(diagnostic.lifecycle, "diagnostic lifecycle");
     assert.ok(Array.isArray(diagnosticLifecycle.transitions));
 
