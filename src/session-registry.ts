@@ -430,12 +430,20 @@ export type GarbageCollectEligibilityReason =
   | "physical-state-ambiguous";
 
 /** Bounded machine-readable GC assessment. Session identity stays flat for API compatibility. */
-export interface GarbageCollectCandidate extends SessionRecord {
+export interface GarbageCollectAssessment extends SessionRecord {
   readonly physicalState: string;
   readonly suspicion: GarbageCollectSuspicion;
   readonly suspicionReason: GarbageCollectSuspicionReason;
   readonly destructiveEligibility: GarbageCollectEligibility;
   readonly destructiveEligibilityReason: GarbageCollectEligibilityReason;
+}
+
+/**
+ * A GC result adds lifecycle actions to the assessment. Diagnostics use the
+ * assessment alone so inspect has one canonical lifecycle projection rather
+ * than a copied nested projection.
+ */
+export interface GarbageCollectCandidate extends GarbageCollectAssessment {
   /** Canonical read-only lifecycle projection for this GC observation. */
   readonly lifecycle?: SessionLifecycleClassification;
   /** Typed caller actions projected from the same lifecycle snapshot. */
@@ -529,7 +537,7 @@ export interface SessionDiagnostic {
   /** All bounded actions available for the observed state, in deterministic order. */
   readonly nextActions: readonly SessionLifecycleAction[];
   readonly integrationEvidence: SessionDiagnosticIntegrationEvidence;
-  readonly garbageCollection: GarbageCollectCandidate;
+  readonly garbageCollection: GarbageCollectAssessment;
   /** Canonical termination/recovery projection; additive for old consumers. */
   readonly lifecycle?: SessionLifecycleClassification;
 }
@@ -903,6 +911,7 @@ export class SessionRegistry {
   private readonly protectedBranchNames: readonly string[];
   private readonly protectedWorktreePaths: readonly string[];
   private readonly worktreeRoot: string;
+  private readonly worktreeRootIsDefault: boolean;
   private readonly staleAfterMs: number;
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
@@ -917,7 +926,13 @@ export class SessionRegistry {
     this.defaultBranchName = options.defaultBranchName;
     this.protectedBranchNames = Object.freeze([...(options.protectedBranchNames ?? [])]);
     this.protectedWorktreePaths = Object.freeze([...(options.protectedWorktreePaths ?? [])]);
-    this.worktreeRoot = resolveManagedWorktreeRoot(options.worktreeRoot ?? path.dirname(this.repository.worktreePath));
+    const configuredWorktreeRoot = options.worktreeRoot;
+    this.worktreeRootIsDefault = configuredWorktreeRoot === undefined;
+    if (configuredWorktreeRoot === undefined) {
+      this.worktreeRoot = defaultManagedWorktreeRoot(this.repository.worktreePath);
+    } else {
+      this.worktreeRoot = resolveManagedWorktreeRoot(configuredWorktreeRoot);
+    }
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
     this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
@@ -949,7 +964,7 @@ export class SessionRegistry {
     });
   }
 
-  /** Resolved repository-local root used for default managed session worktrees. */
+  /** Resolved managed root used for default session worktrees. */
   get managedWorktreeRoot(): string {
     return this.worktreeRoot;
   }
@@ -2941,8 +2956,8 @@ export class SessionRegistry {
       const eligible = assessments.filter((assessment) => {
         if (assessment.terminalOperation === "discard") return false;
         // Eligibility is evaluated from the GC authority's own bounded
-        // evidence. Full cleanup blockers remain on `assessment.lifecycle`
-        // and are applied by the existing preflight below.
+        // evidence. Full cleanup blockers are applied by the existing
+        // preflight below.
         const gcLifecycle = projectGarbageCollectAuthorization(assessment);
         if (
           assessment.destructiveEligibility === "eligible" &&
@@ -4111,8 +4126,7 @@ export class SessionRegistry {
         phase: "termination",
       });
       const nextActions = projectSessionLifecycleActions({ classification: lifecycle, sessionId: record.sessionId });
-      const garbageCollection = closedGarbageCollectionAssessment(record, now);
-      const projectedGarbageCollection = projectGarbageCollectCandidateLifecycle(garbageCollection, lifecycle, []);
+      const garbageCollection = closedGarbageCollectionAssessment(record);
       return Object.freeze({
         schemaVersion: SESSION_DIAGNOSTIC_SCHEMA_VERSION,
         operation: "diagnostic" as const,
@@ -4131,7 +4145,7 @@ export class SessionRegistry {
         ...(nextActions.length === 0 ? {} : { nextAction: nextActions[0] }),
         nextActions,
         integrationEvidence: Object.freeze(integrationEvidence),
-        garbageCollection: projectedGarbageCollection,
+        garbageCollection,
         lifecycle,
       });
     }
@@ -4166,7 +4180,6 @@ export class SessionRegistry {
       ageSuspicious: Date.parse(now) - Date.parse(record.updatedAt) >= this.staleAfterMs,
       phase: "termination",
     });
-    garbageCollection = projectGarbageCollectCandidateLifecycle(garbageCollection, lifecycle, blockers);
     const safeActions =
       blockers.length > 0
         ? sortStrings(Array.from(new Set(blockers.flatMap((blocker) => blocker.safeActions))))
@@ -4592,10 +4605,25 @@ export class SessionRegistry {
         : options.worktreeRoot !== undefined
           ? resolveManagedWorktreeRoot(options.worktreeRoot)
           : this.worktreeRoot;
-    const requestedWorktreePath = resolveProvisionedWorktreePath(
-      options.worktreePath ?? path.join(effectiveRoot, `${path.basename(this.repository.worktreePath)}-${sessionId}`),
-      effectiveRoot,
-    );
+    const legacyRoot = path.dirname(this.repository.worktreePath);
+    const legacyCompatibilityEnabled = this.worktreeRootIsDefault && options.worktreeRoot === undefined;
+    const defaultRootSelected =
+      legacyCompatibilityEnabled &&
+      (options.worktreePath === undefined ||
+        !path.isAbsolute(options.worktreePath) ||
+        isPathInside(this.worktreeRoot, path.resolve(options.worktreePath)));
+    if (defaultRootSelected) ensureManagedWorktreeRoot(this.worktreeRoot);
+    const requestedWorktreePath =
+      options.worktreePath === undefined
+        ? resolveProvisionedWorktreePath(
+            path.join(effectiveRoot, `${path.basename(this.repository.worktreePath)}-${sessionId}`),
+            effectiveRoot,
+          )
+        : resolveProvisionedWorktreePathWithLegacyCompatibility(
+            options.worktreePath,
+            effectiveRoot,
+            legacyCompatibilityEnabled ? legacyRoot : undefined,
+          );
     const defaultWorktreePath =
       worktrees.find((worktree) => !worktree.prunable)?.worktreePath ?? this.repository.worktreePath;
     const configuredProtectedWorktrees = [
@@ -5065,7 +5093,7 @@ function assessGarbageCollection(
   now: string,
   staleAfterMs: number,
   worktrees: readonly GitWorktreeInfo[],
-): GarbageCollectCandidate {
+): GarbageCollectAssessment {
   const ageMs = Math.max(0, Date.parse(now) - Date.parse(record.updatedAt));
   const worktreeState = inspectWorktreeState(record.worktreePath, worktrees);
   const branchIdentityAmbiguous =
@@ -5110,18 +5138,6 @@ function assessGarbageCollection(
     destructiveEligibilityReason = "age-only";
   }
 
-  const lifecycle = projectGarbageCollectAuthorization({
-    state: record.state,
-    physicalState: worktreeState.kind,
-    terminalOperation: record.terminalOperation,
-    suspicion,
-    destructiveEligibility,
-  });
-  const nextActions = projectSessionLifecycleActions({
-    classification: lifecycle,
-    sessionId: record.sessionId,
-  });
-
   return Object.freeze({
     ...cloneSessionRecord(record),
     physicalState: worktreeState.kind,
@@ -5129,15 +5145,13 @@ function assessGarbageCollection(
     suspicionReason,
     destructiveEligibility,
     destructiveEligibilityReason,
-    lifecycle,
-    nextActions,
   });
 }
 
 /** Evaluate GC's independent authorization through the canonical machine. */
 function projectGarbageCollectAuthorization(
   candidate: Pick<
-    GarbageCollectCandidate,
+    GarbageCollectAssessment,
     "state" | "physicalState" | "terminalOperation" | "suspicion" | "destructiveEligibility"
   >,
 ): SessionLifecycleClassification {
@@ -5153,18 +5167,7 @@ function projectGarbageCollectAuthorization(
   });
 }
 
-function closedGarbageCollectionAssessment(record: SessionRecord, now: string): GarbageCollectCandidate {
-  const lifecycle = classifySessionLifecycle({
-    sessionState: record.state,
-    physicalState: "closed",
-    closeReadiness: "ready",
-    terminalOperation: record.terminalOperation,
-    phase: "termination",
-  });
-  const nextActions = projectSessionLifecycleActions({
-    classification: lifecycle,
-    sessionId: record.sessionId,
-  });
+function closedGarbageCollectionAssessment(record: SessionRecord): GarbageCollectAssessment {
   return Object.freeze({
     ...cloneSessionRecord(record),
     physicalState: "closed",
@@ -5172,8 +5175,6 @@ function closedGarbageCollectionAssessment(record: SessionRecord, now: string): 
     suspicionReason: "none",
     destructiveEligibility: "ineligible",
     destructiveEligibilityReason: "not-suspected",
-    lifecycle,
-    nextActions,
   });
 }
 
@@ -5371,20 +5372,6 @@ function toCleanupBlocker(error: unknown): CleanupBlocker {
     details: error.details,
     recoveryHints: Object.freeze(recoveryHints),
   });
-}
-
-/** Keep the nested GC assessment on the same observed lifecycle snapshot. */
-function projectGarbageCollectCandidateLifecycle(
-  candidate: GarbageCollectCandidate,
-  lifecycle: SessionLifecycleClassification,
-  blockers: readonly { readonly code: string; readonly details?: Readonly<Record<string, unknown>> }[],
-): GarbageCollectCandidate {
-  const nextActions = projectSessionLifecycleActions({
-    classification: lifecycle,
-    sessionId: candidate.sessionId,
-    blockers,
-  });
-  return Object.freeze({ ...candidate, lifecycle, nextActions });
 }
 
 function toDiagnosticBlocker(error: unknown): SessionDiagnosticBlocker {
@@ -6541,6 +6528,28 @@ function generateUniqueSessionId(records: readonly SessionRecord[], idGenerator:
   );
 }
 
+function defaultManagedWorktreeRoot(repositoryWorktreePath: string): string {
+  const resolved = path.resolve(path.dirname(repositoryWorktreePath), ".nawabari", "worktrees");
+  assertNoSymlinkPath(resolved);
+  return resolved;
+}
+
+function ensureManagedWorktreeRoot(candidate: string): string {
+  try {
+    assertNoSymlinkPath(candidate);
+    fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
+    return resolveManagedWorktreeRoot(candidate);
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw new SessionRegistryError(
+      "INVALID_WORKTREE_PATH",
+      `Could not create managed worktree root: ${candidate}`,
+      { worktree: candidate },
+      error,
+    );
+  }
+}
+
 function resolveManagedWorktreeRoot(candidate: string): string {
   if (candidate.includes("\u0000") || candidate.trim().length === 0) {
     throw new SessionRegistryError("INVALID_WORKTREE_PATH", `Invalid managed worktree root: ${candidate}`, {
@@ -6565,6 +6574,20 @@ function resolveManagedWorktreeRoot(candidate: string): string {
       error,
     );
   }
+}
+
+function resolveProvisionedWorktreePathWithLegacyCompatibility(
+  candidate: string,
+  managedRoot: string,
+  legacyRoot: string | undefined,
+): string {
+  if (legacyRoot !== undefined && path.isAbsolute(candidate)) {
+    const resolved = path.resolve(candidate);
+    if (!isPathInside(managedRoot, resolved) && isPathInside(legacyRoot, resolved)) {
+      return resolveProvisionedWorktreePath(candidate, legacyRoot);
+    }
+  }
+  return resolveProvisionedWorktreePath(candidate, managedRoot);
 }
 
 function resolveProvisionedWorktreePath(candidate: string, managedRoot: string): string {

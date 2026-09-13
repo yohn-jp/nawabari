@@ -46,7 +46,10 @@ test("status exposes the resolved managed root and bounded history selection", a
     const status = await backend.status({ cwd: repositoryPath });
     assert.equal(status.ok, true);
     if (!status.ok) return;
-    assert.equal(status.value.managed_worktree_root, path.dirname(fs.realpathSync.native(repositoryPath)));
+    assert.equal(
+      status.value.managed_worktree_root,
+      path.join(path.dirname(fs.realpathSync.native(repositoryPath)), ".nawabari", "worktrees"),
+    );
     assert.equal(status.value.history_included, false);
     assert.equal(
       status.value.sessions.some((session) => session.session_id === created.value.session_id),

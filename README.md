@@ -45,7 +45,7 @@ worktree=$(printf '%s' "$created" | jq -r .worktree)
 (cd "$worktree" && git nawabari commit --session "$session_id" --all-claimed --message "Update example" --json)
 ```
 
-`session create` provisions the new worktree under the managed root by default (discoverable via `status --json` as `managed_worktree_root`); pass `--worktree` only with an exact path under that root.
+`session create` provisions the new worktree under `<repository-parent>/.nawabari/worktrees` by default (discoverable via `status --json` as `managed_worktree_root`). Nawabari creates that managed subdirectory on first default placement. New exact `--worktree` paths must be under the reported root; an absolute path directly under the repository parent remains accepted for compatibility with older callers and persisted sessions.
 
 `--all-claimed` is an explicit resource selector. It resolves safely observed Git-changed paths covered by qualifying claims; it does not bypass claim authorization. Use repeated `--resource <path>` when an explicit path list is preferable.
 
@@ -105,6 +105,14 @@ git nawabari session release --session "$session_id" --all --force --json
 
 Resource aliases are discoverable through help. Use `--help --json` rather than copying option metadata into an integration.
 
+Claim modes are cumulative. The canonical operation requirements are derived from the operation authorization policy and are shown by `session claim --help`:
+
+- `read`: no governed operation
+- `write`: `source-write`, `stage`
+- `exclusive-write`: `source-write`, `stage`, `commit`, `branch-mutation`, `push`, `cleanup`
+
+The policy requires `exclusive-write` for operations that finalize or remove shared state. This mapping is documentation of the executable authority, not a second claim policy; integrations should discover the current values from help or the machine contract.
+
 ### Inspect, close, discard, and garbage collection
 
 `session inspect` is read-only and uses the same close/cleanup evidence as `session close`.
@@ -120,7 +128,13 @@ git nawabari session discard --session "$session_id" --preview --json
 
 ## Governed Git work
 
-Use `guard` or `authorize` when an orchestrator needs a decision before mutation. The operation vocabulary is discoverable from the CLI and includes `source-write`, `stage`, `commit`, `branch-mutation`, `push`, and `cleanup`.
+`guard` and `authorize` are separate read-only boundaries:
+
+- `guard` without an operation verifies the current physical worktree, branch, and session ownership/context. It does not evaluate resource claims.
+- `authorize` evaluates a named operation against concrete resources, using the canonical operation policy and active claims. It does not grant or persist claims.
+- `guard --operation <name> --resource <path>` remains a compatibility convenience for the combined claim-aware check. Use `authorize` when the operation decision itself is the intended boundary.
+
+The operation vocabulary is discoverable from the CLI and includes `source-write`, `stage`, `commit`, `branch-mutation`, `push`, and `cleanup`.
 
 `checkpoint` and `evidence snapshot` describe Git-observable facts only. They do not infer task meaning, Issue ownership, or review status. `diff` requires explicit concrete paths and bounds optional patch output.
 

@@ -1,6 +1,13 @@
 import { createRequire } from "node:module";
 import { runDoctor } from "./domain/doctor.js";
-import { DomainError, EXIT_CODES, failure, type DomainResult, type JsonObject } from "./domain/errors.js";
+import {
+  DomainError,
+  EXIT_CODES,
+  failure,
+  type DomainResult,
+  type JsonObject,
+  type JsonValue,
+} from "./domain/errors.js";
 import {
   type GarbageCollectOptions,
   type CheckpointOptions,
@@ -1804,17 +1811,7 @@ async function executeCommand(
 
     const code = result.value.code === "ALLOWED" ? "OPERATION_REJECTED" : result.value.code;
     return failure(
-      new DomainError(code, `Guard denied the current worktree: ${code}.`, {
-        allowed: false,
-        repository: result.value.repository,
-        worktree: result.value.worktree,
-        branch: result.value.branch,
-        session_id: result.value.session_id,
-        owner_session_id: result.value.owner_session_id,
-        requested_session_id: result.value.requested_session_id,
-        state: result.value.state,
-        details: result.value.details,
-      }),
+      new DomainError(code, `Guard denied the current worktree: ${code}.`, guardRejectionDetails(result.value)),
     );
   }
 
@@ -1938,31 +1935,120 @@ function deniedAuthorization(
   decision: import("./domain/session.js").OperationAuthorizationDecision,
 ): DomainResult<JsonObject> {
   const code = decision.code === "ALLOWED" ? "OPERATION_REJECTED" : decision.code;
-  const diagnosticDetails =
-    code === "INSUFFICIENT_CLAIM_MODE"
-      ? {
-          resource: decision.details.resource,
-          granted_modes: decision.details.grantedModes,
-        }
-      : {};
   return failure(
     new DomainError(code, `Operation denied: ${code}.`, {
-      allowed: false,
-      schema_version: decision.schema_version,
-      operation: decision.operation,
-      required_access: decision.required_access,
-      repository: decision.repository,
-      worktree: decision.worktree,
-      branch: decision.branch,
-      session_id: decision.session_id,
-      owner_session_id: decision.owner_session_id,
-      requested_session_id: decision.requested_session_id,
-      state: decision.state,
-      resources: decision.resources,
-      ...diagnosticDetails,
-      details: decision.details,
-    } as JsonObject),
+      ...authorizationRejectionDetails(decision, code === "RESOURCE_CLAIM_CONFLICT"),
+    }),
   );
+}
+
+const AUTHORIZATION_DETAIL_KEYS = new Set([
+  "allowed",
+  "schema_version",
+  "operation",
+  "required_access",
+  "repository",
+  "worktree",
+  "branch",
+  "session_id",
+  "owner_session_id",
+  "requested_session_id",
+  "state",
+  "resources",
+  "details",
+  "mode",
+]);
+
+function guardRejectionDetails(decision: import("./domain/session.js").GuardDecision): JsonObject {
+  return {
+    allowed: false,
+    repository: decision.repository,
+    worktree: decision.worktree,
+    branch: decision.branch,
+    session_id: decision.session_id,
+    owner_session_id: decision.owner_session_id,
+    requested_session_id: decision.requested_session_id,
+    state: decision.state,
+    ...normalizeRejectionDetails(decision.details, false),
+  };
+}
+
+function authorizationRejectionDetails(
+  decision: import("./domain/session.js").OperationAuthorizationDecision,
+  mapConflictOwner: boolean,
+): JsonObject {
+  return {
+    allowed: false,
+    schema_version: decision.schema_version,
+    operation: decision.operation,
+    required_access: decision.required_access,
+    repository: decision.repository,
+    worktree: decision.worktree,
+    branch: decision.branch,
+    session_id: decision.session_id,
+    owner_session_id: decision.owner_session_id,
+    requested_session_id: decision.requested_session_id,
+    state: decision.state,
+    resources: decision.resources,
+    ...normalizeRejectionDetails(decision.details, mapConflictOwner),
+  };
+}
+
+function normalizeRejectionDetails(details: JsonObject, mapConflictOwner: boolean): JsonObject {
+  const normalized: JsonObject = {};
+  const visit = (source: JsonObject): void => {
+    for (const [key, value] of Object.entries(source).sort(([left], [right]) => compareCliKeys(left, right))) {
+      const snakeKey = snakeCaseCliKey(key);
+      if (snakeKey === "details" && value !== null && typeof value === "object" && !Array.isArray(value)) {
+        visit(value as JsonObject);
+        continue;
+      }
+      const canonicalKey = mapConflictOwner ? conflictOwnerKey(snakeKey) : snakeKey;
+      if (AUTHORIZATION_DETAIL_KEYS.has(canonicalKey) || canonicalKey === "allowed") continue;
+      if (!(canonicalKey in normalized)) normalized[canonicalKey] = normalizeRejectionValue(value);
+    }
+  };
+  visit(details);
+  return normalized;
+}
+
+function conflictOwnerKey(key: string): string {
+  return (
+    (
+      {
+        owner_session_id: "blocking_session_id",
+        owner_claim_id: "blocking_claim_id",
+        owner_resource: "blocking_resource",
+        owner_mode: "blocking_mode",
+        owner_worktree: "blocking_worktree",
+        owner_branch: "blocking_branch",
+        owner_state: "blocking_state",
+        owner_label: "blocking_label",
+      } as Readonly<Record<string, string>>
+    )[key] ?? key
+  );
+}
+
+function normalizeRejectionValue(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) return value.map(normalizeRejectionValue);
+  if (value === null || typeof value !== "object") return value;
+  const normalized: JsonObject = {};
+  for (const [key, child] of Object.entries(value).sort(([left], [right]) => compareCliKeys(left, right))) {
+    normalized[snakeCaseCliKey(key)] = normalizeRejectionValue(child);
+  }
+  return normalized;
+}
+
+function snakeCaseCliKey(key: string): string {
+  return key
+    .replace(/([A-Z]+)([A-Z][a-z])/gu, "$1_$2")
+    .replace(/([a-z0-9])([A-Z])/gu, "$1_$2")
+    .replace(/[\s-]+/gu, "_")
+    .toLowerCase();
+}
+
+function compareCliKeys(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function emitFailure(mode: CliMode, command: string, error: DomainError, io: CliIO): number {

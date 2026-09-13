@@ -181,6 +181,18 @@ test("--help exits 0 and prints the nawabari usage", async () => {
   assert.equal(output.stderr.length, 0);
 });
 
+test("session claim help documents the policy-derived claim-mode mapping", async () => {
+  const output = capture();
+  assert.equal(await runCli(["--json", "session", "claim", "--help"], { io: output.io }), 0);
+  const response = JSON.parse(output.stdout[0] ?? "") as { notes: string[] };
+  const notes = response.notes.join("\n");
+  assert.match(notes, /Claim modes are cumulative/u);
+  assert.match(notes, /read: none/u);
+  assert.match(notes, /write: source-write, stage/u);
+  assert.match(notes, /exclusive-write: source-write, stage, commit, branch-mutation, push, cleanup/u);
+  assert.match(notes, /OPERATION_AUTHORIZATION_POLICY/u);
+});
+
 test("session run resolves the existing session authority and preserves command argv after --", async () => {
   const output = capture();
   let observedCommand: string[] = [];
@@ -626,7 +638,7 @@ test("command-specific help is projected from one spec and marks session create 
   assert.deepEqual(response.defaults, {
     "--branch": "nawabari/session/<session_id>",
     "--worktree": "<managed_worktree_root>/<repository>-<session_id>",
-    "--worktree-root": "resolved repository-local root",
+    "--worktree-root": "<repository-parent>/.nawabari/worktrees",
     "--base": "HEAD",
     "--label": "omitted",
   });
@@ -821,7 +833,89 @@ test("authorize and guard operation help project the authoritative vocabulary in
     assert.deepEqual(operation.values, [...OPERATION_VOCABULARY]);
     const text = human.stdout.join("\n");
     for (const value of OPERATION_VOCABULARY) assert.ok(text.includes(value), `${command} help should list ${value}`);
+    if (command === "authorize") {
+      assert.match(text, /canonical operation policy/u);
+      assert.match(text, /guard --operation/u);
+    } else {
+      assert.match(text, /Without --operation/u);
+      assert.match(text, /claim-aware authorization/u);
+    }
   }
+});
+
+test("authorization rejection JSON has one deterministic, normalized details schema", async () => {
+  const output = capture();
+  const blockingSession = "0190f1e0-0000-7000-8000-0000000000bb";
+  const exitCode = await runCli(["--json", "authorize", "--operation", "commit", "--resource", "src/a.ts"], {
+    backend: backendForTests({
+      authorizeOperation: async () =>
+        success({
+          schema_version: 1,
+          allowed: false,
+          code: "RESOURCE_CLAIM_CONFLICT",
+          operation: "commit",
+          required_access: "exclusive-write",
+          repository: sampleSession.repository,
+          worktree: sampleSession.worktree,
+          branch: sampleSession.branch,
+          session_id: sampleSession.session_id,
+          owner_session_id: sampleSession.session_id,
+          requested_session_id: null,
+          state: "active",
+          resources: [{ resource: "src/a.ts", claim_ids: [] }],
+          details: {
+            resource: "src/a.ts",
+            mode: "exclusive-write",
+            ownerSessionId: blockingSession,
+            ownerClaimId: "claim-1",
+            ownerResource: "src/a.ts",
+            ownerMode: "exclusive-write",
+            ownerWorktree: "/tmp/blocking-worktree",
+            ownerBranch: "feature/blocking",
+            ownerState: "active",
+            safeActions: ["inspect-blocking-session"],
+            recoveryHints: ["retry-after-owner-releases"],
+          },
+        }),
+    }),
+    io: output.io,
+  });
+
+  assert.equal(exitCode, 3);
+  const response = JSON.parse(output.stdout[0] ?? "") as {
+    allowed: boolean;
+    details: Record<string, unknown>;
+  };
+  assert.equal(response.allowed, false);
+  assert.equal(response.details.allowed, undefined);
+  assert.equal(response.details.details, undefined);
+  assert.deepEqual(response.details, {
+    schema_version: 1,
+    operation: "commit",
+    required_access: "exclusive-write",
+    repository: sampleSession.repository,
+    worktree: sampleSession.worktree,
+    branch: sampleSession.branch,
+    session_id: sampleSession.session_id,
+    owner_session_id: sampleSession.session_id,
+    requested_session_id: null,
+    state: "active",
+    resources: [{ resource: "src/a.ts", claim_ids: [] }],
+    resource: "src/a.ts",
+    blocking_session_id: blockingSession,
+    blocking_claim_id: "claim-1",
+    blocking_resource: "src/a.ts",
+    blocking_mode: "exclusive-write",
+    blocking_worktree: "/tmp/blocking-worktree",
+    blocking_branch: "feature/blocking",
+    blocking_state: "active",
+    recovery_hints: ["retry-after-owner-releases"],
+    safe_actions: ["inspect-blocking-session"],
+  });
+  assert.equal(
+    Object.keys(response.details).some((key) => /[A-Z]/u.test(key)),
+    false,
+  );
 });
 
 test("all-claimed is an explicit additive mutation selector and cannot combine with --resource", async () => {

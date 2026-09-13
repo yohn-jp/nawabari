@@ -25,6 +25,7 @@ import {
   type ClaimDeltasOptions,
   type ClaimDeltasResult,
   type GarbageCollectOptions,
+  type GarbageCollectAssessment,
   type GarbageCollectResult,
   type GuardDecision,
   type GuardOptions,
@@ -834,6 +835,30 @@ function toDomainGarbageCollectCandidate(
   };
 }
 
+/**
+ * Diagnostics carry one canonical lifecycle projection (`diagnostic.lifecycle`
+ * / `diagnostic.nextActions`) rather than a copy computed for the nested GC
+ * assessment. `lifecycle`/`next_actions` remain part of the public
+ * `garbage_collection` JSON contract, though, so they are re-attached here
+ * from that same canonical snapshot instead of being dropped.
+ */
+function toDomainGarbageCollectAssessment(
+  assessment: import("../session-registry.js").GarbageCollectAssessment,
+  lifecycle: import("../session-registry.js").SessionLifecycleClassification | undefined,
+  nextActions: readonly RegistrySessionLifecycleAction[],
+): GarbageCollectAssessment {
+  return {
+    ...toDomainRecord(assessment),
+    physical_state: assessment.physicalState,
+    suspicion: assessment.suspicion,
+    suspicion_reason: assessment.suspicionReason,
+    destructive_eligibility: assessment.destructiveEligibility,
+    destructive_eligibility_reason: assessment.destructiveEligibilityReason,
+    ...(lifecycle === undefined ? {} : { lifecycle: toDomainLifecycleProjection(lifecycle) }),
+    next_actions: nextActions.map(toDomainSessionLifecycleAction),
+  };
+}
+
 function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").SessionDiagnostic): SessionDiagnostic {
   const nextActions = diagnostic.nextActions.map(toDomainSessionLifecycleAction);
   return {
@@ -877,7 +902,11 @@ function toDomainSessionDiagnostic(diagnostic: import("../session-registry.js").
           lifecycle_state: diagnostic.lifecycle.state,
           lifecycle: toDomainLifecycleProjection(diagnostic.lifecycle),
         }),
-    garbage_collection: toDomainGarbageCollectCandidate(diagnostic.garbageCollection),
+    garbage_collection: toDomainGarbageCollectAssessment(
+      diagnostic.garbageCollection,
+      diagnostic.lifecycle,
+      diagnostic.nextActions,
+    ),
   };
 }
 

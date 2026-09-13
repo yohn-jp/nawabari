@@ -179,7 +179,7 @@ test("renders status and doctor-style check records without a command-specific b
   assert.doesNotMatch(doctorOutput, /\[\{"name"/u);
 });
 
-test("keeps JSON success and failure rendering unchanged", () => {
+test("keeps JSON success rendering and promotes failure allowed without duplicating it", () => {
   const payload = { session, flags: [true, false] };
   assert.equal(
     renderSuccess("json", "session close", payload),
@@ -198,7 +198,7 @@ test("keeps JSON success and failure rendering unchanged", () => {
       code: "OPERATION_REJECTED",
       message: "Operation rejected.",
       allowed: false,
-      details: error.details,
+      details: { details: { reason: "owner_mismatch", retryable: false } },
     }),
   );
 });

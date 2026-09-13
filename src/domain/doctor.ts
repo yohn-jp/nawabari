@@ -4,7 +4,7 @@ import process from "node:process";
 
 import { defaultGit, resolveRepositoryContext, type RepositoryContext } from "../git.js";
 import { isSessionRegistryError } from "../errors.js";
-import { SessionRegistry } from "../session-registry.js";
+import { SessionRegistry, type ReconciliationSession } from "../session-registry.js";
 import { projectSessionLifecycleActions } from "../session-lifecycle-actions.js";
 import { availableLifecycleOperations } from "../session-lifecycle-classification.js";
 import { success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
@@ -58,6 +58,77 @@ function repositoryInfo(context: RepositoryContext): RepositoryInfo {
     common_dir: context.commonGitDirectory,
     registry_path: path.join(context.commonGitDirectory, "nawabari", "session-registry.json"),
   };
+}
+
+function doctorReconciliationSession(session: ReconciliationSession): JsonObject {
+  const lifecycle = session.lifecycle;
+  const summary: JsonObject = {
+    session_id: session.session.sessionId,
+    status: session.status,
+    physical_state: session.physicalState,
+    lifecycle_state: lifecycle?.state ?? null,
+  };
+
+  // Closed history is useful for reconciliation counts and drift diagnosis,
+  // but it has no actionable lifecycle branch. Keep its stable identity and
+  // physical summary while omitting the repeated transition/action graph.
+  if (session.session.state === "closed") {
+    if (session.blockers.length > 0) {
+      summary.blockers = session.blockers.map((blocker) => ({
+        code: blocker.code,
+        message: blocker.message,
+        details: { ...blocker.details },
+        recovery_hints: [...blocker.recoveryHints],
+      }));
+    }
+    return summary;
+  }
+
+  if (lifecycle === undefined) {
+    summary.lifecycle = null;
+    return summary;
+  }
+  summary.lifecycle = {
+    schema_version: lifecycle.schemaVersion,
+    state: lifecycle.state,
+    session_state: lifecycle.sessionState,
+    physical_state: lifecycle.physicalState,
+    close_readiness: lifecycle.closeReadiness,
+    blockers: lifecycle.blockers.map((blocker) => ({
+      code: blocker.code,
+      ...(blocker.classification === undefined ? {} : { classification: blocker.classification }),
+    })),
+    recoverability: lifecycle.recoverability,
+    age_suspicious: lifecycle.ageSuspicious,
+    gc_authorized: lifecycle.gcAuthorized,
+    destructive_cleanup_eligible: lifecycle.destructiveCleanupEligible,
+    available_operations: [...availableLifecycleOperations(lifecycle)],
+    transitions: lifecycle.transitions.map((transition) => ({ ...transition })),
+    next_actions: projectSessionLifecycleActions({
+      classification: lifecycle,
+      sessionId: session.session.sessionId,
+      blockers: session.blockers.map((blocker) => ({ code: blocker.code, details: blocker.details })),
+    }).map((action) => ({
+      schema_version: action.schemaVersion,
+      action_id: action.actionId,
+      kind: action.kind,
+      command: action.command,
+      ...(action.kind === "integrated-revision"
+        ? { integrated_revision: action.integratedRevision }
+        : action.kind === "bounded-integration-fetch"
+          ? {
+              integrated_revision: action.integratedRevision,
+              fetch_remote: action.fetchRemote,
+              fetch_branch: action.fetchBranch,
+            }
+          : action.kind === "explicit-discard"
+            ? { session_id: action.sessionId, requires_explicit_intent: action.requiresExplicitIntent }
+            : action.kind === "reconcile"
+              ? { session_id: action.sessionId, mutates: action.mutates }
+              : { reason: action.reason }),
+    })),
+  };
+  return summary;
 }
 
 async function inspectRegistry(repository: RepositoryInfo, context: RepositoryContext): Promise<DoctorCheck> {
@@ -124,55 +195,7 @@ async function inspectReconciliation(context: RepositoryContext): Promise<Doctor
       {
         clean: result.clean,
         sessions: result.sessions.length,
-        lifecycle_sessions: result.sessions.map((session) => ({
-          session_id: session.session.sessionId,
-          status: session.status,
-          physical_state: session.physicalState,
-          lifecycle_state: session.lifecycle?.state ?? null,
-          lifecycle:
-            session.lifecycle === undefined
-              ? null
-              : {
-                  schema_version: session.lifecycle.schemaVersion,
-                  state: session.lifecycle.state,
-                  session_state: session.lifecycle.sessionState,
-                  physical_state: session.lifecycle.physicalState,
-                  close_readiness: session.lifecycle.closeReadiness,
-                  blockers: session.lifecycle.blockers.map((blocker) => ({
-                    code: blocker.code,
-                    ...(blocker.classification === undefined ? {} : { classification: blocker.classification }),
-                  })),
-                  recoverability: session.lifecycle.recoverability,
-                  age_suspicious: session.lifecycle.ageSuspicious,
-                  gc_authorized: session.lifecycle.gcAuthorized,
-                  destructive_cleanup_eligible: session.lifecycle.destructiveCleanupEligible,
-                  available_operations: [...availableLifecycleOperations(session.lifecycle)],
-                  transitions: session.lifecycle.transitions.map((transition) => ({ ...transition })),
-                  next_actions: projectSessionLifecycleActions({
-                    classification: session.lifecycle,
-                    sessionId: session.session.sessionId,
-                    blockers: session.blockers.map((blocker) => ({ code: blocker.code, details: blocker.details })),
-                  }).map((action) => ({
-                    schema_version: action.schemaVersion,
-                    action_id: action.actionId,
-                    kind: action.kind,
-                    command: action.command,
-                    ...(action.kind === "integrated-revision"
-                      ? { integrated_revision: action.integratedRevision }
-                      : action.kind === "bounded-integration-fetch"
-                        ? {
-                            integrated_revision: action.integratedRevision,
-                            fetch_remote: action.fetchRemote,
-                            fetch_branch: action.fetchBranch,
-                          }
-                        : action.kind === "explicit-discard"
-                          ? { session_id: action.sessionId, requires_explicit_intent: action.requiresExplicitIntent }
-                          : action.kind === "reconcile"
-                            ? { session_id: action.sessionId, mutates: action.mutates }
-                            : { reason: action.reason }),
-                  })),
-                },
-        })),
+        lifecycle_sessions: result.sessions.map(doctorReconciliationSession),
         worktrees: result.worktrees.length,
         issues,
       },

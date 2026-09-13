@@ -54,7 +54,6 @@ test("guard denies cross-session claims and the protected integration worktree",
       message: "Guard denied the current worktree: WORKTREE_OWNED_BY_OTHER_SESSION.",
       allowed: false,
       details: {
-        allowed: false,
         repository: fs.realpathSync.native(path.join(fixture, ".git")),
         worktree: fs.realpathSync.native(firstWorktree),
         branch: "feature/guard-first",
@@ -62,11 +61,6 @@ test("guard denies cross-session claims and the protected integration worktree",
         owner_session_id: first.sessionId,
         requested_session_id: second.sessionId,
         state: "active",
-        details: {
-          worktree: fs.realpathSync.native(firstWorktree),
-          sessionId: second.sessionId,
-          ownerSessionId: first.sessionId,
-        },
       },
     });
 

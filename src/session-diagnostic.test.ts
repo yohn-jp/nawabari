@@ -25,6 +25,8 @@ test("diagnose reports ready close readiness and not-due cleanup readiness for a
     assert.deepEqual([...diagnostic.safeActions], ["close-session"]);
     assert.equal(diagnostic.session.sessionId, session.sessionId);
     assert.equal(diagnostic.integrationEvidence.supplied, false);
+    assert.equal("lifecycle" in diagnostic.garbageCollection, false);
+    assert.equal("nextActions" in diagnostic.garbageCollection, false);
 
     // Purely observational: repeated inspection of unchanged state returns
     // the exact same payload (no observation-time field to drift on).
