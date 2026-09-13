@@ -126,6 +126,11 @@ function strictRuntimeLayout(): SandboxRuntimeLayout {
         target: "/usr/local/bin/git",
       },
       {
+        requirement_id: "ls-runtime",
+        path: strictRuntimeExecutableFixture("ls-runtime"),
+        target: "/usr/local/bin/ls",
+      },
+      {
         requirement_id: "pnpm-package",
         path: strictRuntimeExecutableFixture("pnpm-package"),
         target: "/usr/local/bin/pnpm",

@@ -484,7 +484,7 @@ export const DEVELOPMENT_RUNTIME_PROFILE: RuntimeProfileDefinition = Object.free
   extends: Object.freeze(["base"]),
   requirements: Object.freeze([
     Object.freeze({ id: "git-package", kind: "package", name: "git", version: ">=2" }),
-    Object.freeze({ id: "pnpm-package", kind: "package", name: "pnpm", version: ">=11" }),
+    Object.freeze({ id: "ls-runtime", kind: "runtime", name: "ls", version: ">=1" }),
   ]),
 });
 

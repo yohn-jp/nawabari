@@ -34,12 +34,14 @@ function makeFixture(): Fixture {
   const roots = {
     node: path.join(store, "aaa-nodejs-24"),
     git: path.join(store, "bbb-git-2"),
-    pnpm: path.join(store, "ccc-pnpm-11"),
+    ls: path.join(store, "ccc-coreutils-9"),
+    pnpm: path.join(store, "ddd-pnpm-11"),
   };
   const dependencies = {
     node: path.join(store, "ddd-node-runtime-dependency"),
     git: path.join(store, "eee-git-runtime-dependency"),
-    pnpm: path.join(store, "fff-pnpm-runtime-dependency"),
+    ls: path.join(store, "fff-coreutils-runtime-dependency"),
+    pnpm: path.join(store, "ggg-pnpm-runtime-dependency"),
   };
   const unrelated = path.join(store, "zzz-unrelated-host-package");
   for (const storePath of [...Object.values(roots), ...Object.values(dependencies), unrelated]) {
@@ -52,6 +54,7 @@ function makeFixture(): Fixture {
     closures: {
       node: [roots.node, dependencies.node],
       git: [roots.git, dependencies.git],
+      ls: [roots.ls, dependencies.ls],
       pnpm: [roots.pnpm, dependencies.pnpm],
     },
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
@@ -59,7 +62,12 @@ function makeFixture(): Fixture {
 }
 
 function profile(): ResolvedRuntimeProfile {
-  const result = resolveRuntimeProfile({ profiles: ["development"] });
+  const result = resolveRuntimeProfile({
+    profiles: ["development"],
+    operations: [
+      { operation: "add", requirement: { id: "pnpm-package", kind: "package", name: "pnpm", version: ">=11" } },
+    ],
+  });
   assert.equal(result.ok, true, result.ok ? "" : result.error.message);
   if (!result.ok) throw new Error("the canonical development profile could not be resolved");
   return result.value;
@@ -69,6 +77,7 @@ function runnerFor(fixture: Fixture, reverse = false): NixCommandRunner {
   const rootsByInstallable: Readonly<Record<string, keyof Fixture["roots"]>> = {
     "nixpkgs#nodejs": "node",
     "nixpkgs#git": "git",
+    "nixpkgs#coreutils": "ls",
     "nixpkgs#pnpm": "pnpm",
   };
   return (_executable, args) => {
@@ -161,6 +170,7 @@ test("declared Nix packages resolve with their native closure dependencies only"
     assert.deepEqual(DEFAULT_NIX_PACKAGE_ATTRIBUTES, {
       node: "nodejs",
       git: "git",
+      ls: "coreutils",
       pnpm: "pnpm",
     });
   } finally {
@@ -178,6 +188,7 @@ test("Nix path-info metadata does not widen the materialized closure", () => {
         const keyByInstallable: Readonly<Record<string, keyof Fixture["roots"]>> = {
           "nixpkgs#nodejs": "node",
           "nixpkgs#git": "git",
+          "nixpkgs#coreutils": "ls",
           "nixpkgs#pnpm": "pnpm",
         };
         const key = typeof installable === "string" ? keyByInstallable[installable] : undefined;

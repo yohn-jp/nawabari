@@ -25,7 +25,7 @@ test("canonical base and development profiles resolve to logical material only",
   if (!development.ok) return;
   assert.deepEqual(development.value.requirements, [
     { id: "git-package", kind: "package", name: "git", version: ">=2" },
-    { id: "pnpm-package", kind: "package", name: "pnpm", version: ">=11" },
+    { id: "ls-runtime", kind: "runtime", name: "ls", version: ">=1" },
     { id: "node-runtime", kind: "runtime", name: "node", version: ">=24" },
   ]);
   assert.deepEqual(development.value.selected_profiles, [{ id: "development", version: "1" }]);
@@ -51,8 +51,8 @@ test("profile resolution is deterministic and canonicalizes selection and requir
       version: "1",
       extends: ["base"],
       requirements: [
-        { id: "pnpm-package", kind: "package", name: "pnpm", version: ">=11" },
         { id: "git-package", kind: "package", name: "git", version: ">=2" },
+        { id: "ls-runtime", kind: "runtime", name: "ls", version: ">=1" },
       ],
     },
     {
@@ -68,6 +68,19 @@ test("profile resolution is deterministic and canonicalizes selection and requir
   assert.equal(canonical.ok, true);
   if (!reordered.ok || !canonical.ok) return;
   assert.deepEqual(reordered.value, canonical.value);
+});
+
+test("pnpm remains an explicit opt-in requirement instead of part of the default development baseline", () => {
+  const result = composeRuntimeProfiles(
+    ["development"],
+    [{ operation: "add", requirement: { id: "pnpm-package", kind: "package", name: "pnpm", version: ">=11" } }],
+  );
+  assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+  if (!result.ok) return;
+  assert.deepEqual(
+    result.value.requirements.map((requirement) => requirement.id),
+    ["git-package", "pnpm-package", "ls-runtime", "node-runtime"],
+  );
 });
 
 test("explicit add, remove, and override operations are deterministic and visible in identity", () => {

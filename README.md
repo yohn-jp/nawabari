@@ -156,7 +156,7 @@ git nawabari session shell --session "$session_id" --runtime-policy compatibilit
 
 The `--` terminator is mandatory. The command is passed as argv and is not interpreted by a shell. The canonical profile gives the child a private root, `/tmp`, `/proc`, HOME, and cache state, mounts only the owned worktree read-write, and does not expose sibling worktrees or Nawabari control paths. Network mode is explicitly `inherited`, not isolated. Required Linux capabilities fail closed when unavailable; optional Landlock and cgroups v2 provide defense in depth when available.
 
-Protected execution defaults to the strict `development` runtime profile. Only declared Node, Git, and pnpm material is projected through `/nawabari/bin`; `/usr`, `/bin`, `/nix/store`, the host home, and local user-tool directories are not implicitly visible. Compatibility is available only through the explicit `--runtime-policy compatibility` option.
+Protected execution defaults to the strict `development` runtime profile. Only declared Node, Git, and the deterministic `ls` baseline utility are projected through `/nawabari/bin`; `/usr`, `/bin`, `/nix/store`, the host home, and local user-tool directories are not implicitly visible. pnpm is an explicit opt-in development requirement. Compatibility is available only through the explicit `--runtime-policy compatibility` option.
 
 ```bash
 git nawabari doctor --json

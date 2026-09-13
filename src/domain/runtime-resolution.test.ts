@@ -69,16 +69,19 @@ function createCandidateFixture(): CandidateFixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-resolution-fhs-"));
   const node = path.join(root, "node-runtime");
   const git = path.join(root, "git-package");
+  const ls = path.join(root, "ls-runtime");
   const pnpm = path.join(root, "pnpm-package");
   fs.copyFileSync(process.execPath, node);
   fs.chmodSync(node, 0o755);
   fs.writeFileSync(git, "#!/bin/sh\nprintf 'git-package-ok\\n'\n", { mode: 0o755 });
+  fs.writeFileSync(ls, "#!/bin/sh\nprintf 'ls-runtime-ok\\n'\n", { mode: 0o755 });
   fs.writeFileSync(pnpm, "#!/bin/sh\nprintf 'pnpm-package-ok\\n'\n", { mode: 0o755 });
   return {
     root,
     candidates: Object.freeze([
       Object.freeze({ requirement_id: "node-runtime", path: node }),
       Object.freeze({ requirement_id: "git-package", path: git }),
+      Object.freeze({ requirement_id: "ls-runtime", path: ls }),
       Object.freeze({ requirement_id: "pnpm-package", path: pnpm }),
     ]),
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
@@ -103,16 +106,19 @@ function nixFixture(): NixFixture {
   const roots = {
     node: path.join(store, "aaa-nodejs-24"),
     git: path.join(store, "bbb-git-2"),
-    pnpm: path.join(store, "ccc-pnpm-11"),
+    ls: path.join(store, "ccc-coreutils-9"),
+    pnpm: path.join(store, "ddd-pnpm-11"),
   };
   const dependencies = {
     node: path.join(store, "ddd-node-dependency"),
     git: path.join(store, "eee-git-dependency"),
-    pnpm: path.join(store, "fff-pnpm-dependency"),
+    ls: path.join(store, "fff-coreutils-dependency"),
+    pnpm: path.join(store, "ggg-pnpm-dependency"),
   };
   const attributes: Readonly<Record<string, keyof typeof roots>> = {
     "nixpkgs#nodejs": "node",
     "nixpkgs#git": "git",
+    "nixpkgs#coreutils": "ls",
     "nixpkgs#pnpm": "pnpm",
   };
   for (const [key, storePath] of Object.entries(roots)) {
@@ -169,11 +175,11 @@ test("the default resolution is development + strict and contains only the canon
     assert.equal(result.value.materializer, "nix");
     assert.deepEqual(
       result.value.projection.requirements.map((requirement) => requirement.id),
-      ["git-package", "pnpm-package", "node-runtime"],
+      ["git-package", "ls-runtime", "node-runtime"],
     );
     assert.deepEqual(
       result.value.projection.executables.map((executable) => executable.name),
-      ["git", "node", "pnpm"],
+      ["git", "ls", "node"],
     );
     assert.equal(
       result.value.projection.filesystem.some((entry) => entry.source === fixture.store),
@@ -207,10 +213,82 @@ test("the default resolution is development + strict and contains only the canon
     if (!executableSurface.ok) return;
     assert.deepEqual(
       executableSurface.value.map((executable) => executable.target),
-      ["/nawabari/bin/git", "/nawabari/bin/node", "/nawabari/bin/pnpm"],
+      ["/nawabari/bin/git", "/nawabari/bin/ls", "/nawabari/bin/node"],
     );
   } finally {
     fixture.cleanup();
+  }
+});
+
+test("a plain non-pnpm repository resolves the default strict profile without pnpm evidence", async () => {
+  const fixture = createCandidateFixture();
+  const repository = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-runtime-resolution-plain-repository-"));
+  const worktree = `${repository}-worktree`;
+  const git = (args: readonly string[], cwd = repository): void => {
+    execFileSync("git", [...args], { cwd, stdio: ["ignore", "ignore", "ignore"] });
+  };
+  git(["init", "--quiet", "--initial-branch", "main", repository]);
+  git(["config", "user.name", "Nawabari plain repository"]);
+  git(["config", "user.email", "plain-repository@nawabari.invalid"]);
+  fs.writeFileSync(path.join(repository, "README.md"), "plain repository\n");
+  git(["add", "README.md"]);
+  git(["commit", "--quiet", "-m", "initial"]);
+
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repository },
+      { branch: "feature/plain-non-pnpm", worktree, label: null, base: null },
+    );
+    assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+    if (!created.ok) return;
+
+    const discovered = discoverSandboxRuntimeLayout();
+    const layout = {
+      ...discovered,
+      bubblewrap: discovered.bubblewrap,
+      nix: null,
+      nix_store: null,
+      nix_current_system: null,
+      nix_wrappers: null,
+      nix_user_profile: null,
+      usr: "/usr",
+      fhs_executable_candidates: fixture.candidates.filter((candidate) => candidate.requirement_id !== "pnpm-package"),
+    } satisfies SandboxRuntimeLayout;
+    const request = await resolveSandboxExecutionRequest(
+      backend,
+      { cwd: worktree },
+      { session_id: created.value.session_id, enforce: true },
+      defaultSandboxProbe,
+      layout,
+    );
+    assert.equal(request.ok, true, request.ok ? "" : JSON.stringify(request.error));
+    if (!request.ok) return;
+    assert.deepEqual(request.value.runtime_resolution, {
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "development", version: "1" },
+      materializer: "fhs",
+    });
+    assert.deepEqual(
+      request.value.runtime_projection?.executables.map((entrypoint) => entrypoint.name),
+      ["git", "ls", "node"],
+    );
+    if (defaultSandboxProbe.hasBubblewrap() && defaultSandboxProbe.hasNamespaceSupport()) {
+      const ls = await runSandboxedCommand(request.value, { command: "ls" });
+      assert.equal(ls.ok, true, ls.ok ? "" : JSON.stringify(ls.error));
+      if (ls.ok) {
+        assert.equal(ls.value.exit_code, 0, JSON.stringify(ls.value));
+        assert.equal(ls.value.stdout, "ls-runtime-ok\n");
+      }
+    }
+  } finally {
+    try {
+      git(["worktree", "remove", "--force", worktree]);
+    } catch {
+      // Cleanup is best-effort after a failed protected setup.
+    }
+    fixture.cleanup();
+    fs.rmSync(repository, { recursive: true, force: true });
   }
 });
 
@@ -399,6 +477,7 @@ test("the default strict FHS projection keeps the development baseline functiona
   const executables = {
     "node-runtime": path.join(materialRoot, "node"),
     "git-package": path.join(materialRoot, "git"),
+    "ls-runtime": path.join(materialRoot, "ls"),
     "pnpm-package": path.join(materialRoot, "pnpm"),
   };
   for (const [name, executable] of Object.entries(executables)) {
@@ -437,6 +516,7 @@ test("the default strict FHS projection keeps the development baseline functiona
       fhs_executable_candidates: [
         { requirement_id: "node-runtime", path: executables["node-runtime"], target: "/usr/local/bin/node" },
         { requirement_id: "git-package", path: executables["git-package"], target: "/usr/local/bin/git" },
+        { requirement_id: "ls-runtime", path: executables["ls-runtime"], target: "/usr/local/bin/ls" },
         { requirement_id: "pnpm-package", path: executables["pnpm-package"], target: "/usr/local/bin/pnpm" },
       ],
     } satisfies SandboxRuntimeLayout;
@@ -465,17 +545,17 @@ test("the default strict FHS projection keeps the development baseline functiona
     });
     assert.deepEqual(
       request.value.runtime_projection?.executables.map((entrypoint) => entrypoint.name),
-      ["git", "node", "pnpm"],
+      ["git", "ls", "node"],
     );
 
-    for (const command of ["node", "git", "pnpm"] as const) {
+    for (const command of ["node", "git", "ls"] as const) {
       const result = await runSandboxedCommand(request.value, { command, args: ["--version"] });
       assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
       if (!result.ok) continue;
       assert.equal(result.value.exit_code, 0, JSON.stringify(result.value));
       assert.equal(
         result.value.stdout,
-        `${command === "node" ? "node-runtime" : command === "git" ? "git-package" : "pnpm-package"}-ok\n`,
+        `${command === "node" ? "node-runtime" : command === "git" ? "git-package" : "ls-runtime"}-ok\n`,
       );
     }
 

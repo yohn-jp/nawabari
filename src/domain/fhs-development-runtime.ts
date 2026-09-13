@@ -31,7 +31,15 @@ import type { SandboxRuntimeLayout } from "./sandbox.js";
 export const FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS = Object.freeze([
   "node-runtime",
   "git-package",
-  "pnpm-package",
+  "ls-runtime",
+] as const);
+
+/** Optional development tooling supported by explicit profile composition. */
+export const FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS = Object.freeze(["pnpm-package"] as const);
+
+const FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS = Object.freeze([
+  ...FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS,
+  ...FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS,
 ] as const);
 
 /**
@@ -42,6 +50,7 @@ export const FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS = Object.freeze([
 export const FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS = Object.freeze({
   "node-runtime": "NAWABARI_FHS_NODE_EXECUTABLE",
   "git-package": "NAWABARI_FHS_GIT_EXECUTABLE",
+  "ls-runtime": "NAWABARI_FHS_LS_EXECUTABLE",
   "pnpm-package": "NAWABARI_FHS_PNPM_EXECUTABLE",
 } as const);
 
@@ -49,6 +58,7 @@ export const FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS = Object.freeze({
 export const FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS: Readonly<Record<string, string>> = Object.freeze({
   "node-runtime": "fhs-node-runtime-provider",
   "git-package": "fhs-git-package-provider",
+  "ls-runtime": "fhs-ls-runtime-provider",
   "pnpm-package": "fhs-pnpm-package-provider",
 });
 
@@ -81,14 +91,14 @@ export type FhsDevelopmentRuntimeReadiness = Readonly<{
 }>;
 
 /**
- * Read only the three explicit executable-source declarations exposed by the
+ * Read only the explicit executable-source declarations exposed by the
  * host/runtime boundary. In particular, this function never consults PATH,
  * HOME, profile directories, or Corepack state.
  */
 export function readExplicitFhsDevelopmentExecutableCandidates(
   environment: NodeJS.ProcessEnv = process.env,
 ): readonly FhsRuntimeExecutableDeclaration[] {
-  const candidates = FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS.flatMap((requirementId) => {
+  const candidates = FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS.flatMap((requirementId) => {
     const candidate = environment[FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS[requirementId]];
     return typeof candidate === "string" && candidate.length > 0
       ? [{ requirement_id: requirementId, path: candidate } satisfies FhsRuntimeExecutableDeclaration]
@@ -102,6 +112,7 @@ export function readExplicitFhsDevelopmentExecutableCandidates(
 const FHS_DEVELOPMENT_EXECUTABLE_NAMES: Readonly<Record<string, string>> = Object.freeze({
   "node-runtime": "node",
   "git-package": "git",
+  "ls-runtime": "ls",
   "pnpm-package": "pnpm",
 });
 
@@ -114,22 +125,35 @@ const FHS_DEVELOPMENT_EXECUTABLE_NAMES: Readonly<Record<string, string>> = Objec
 export const FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS = Object.freeze(["/usr/bin", "/usr/local/bin", "/bin"] as const);
 
 /**
- * Accept a fixed-root candidate only if it already satisfies the same
- * symlink-rejecting contract `validateCandidatePath` enforces for explicit
- * candidates: the leaf itself must not be a symlink, and no path component
- * may resolve elsewhere. The leaf is lstat'd *before* any realpath
- * resolution so a symlinked `node`/`git`/`pnpm` at a fixed root is rejected
- * outright rather than silently followed to its target. Returns null when
- * the root has no usable candidate (the caller tries the next root).
+ * Accept a fixed-root candidate only when it satisfies the bounded default
+ * discovery contract. Explicit evidence remains strictly symlink-rejecting;
+ * the fixed-root `ls` utility additionally permits a canonical system alias
+ * such as `/usr/bin/ls`, but only after resolving it to a regular executable
+ * within a bounded FHS root. This accommodates ordinary hosts whose
+ * coreutils entrypoint is a system-managed alias without consulting PATH or
+ * following an attacker-controlled path.
  */
-function canonicalDefaultExecutable(candidatePath: string): string | null {
+function canonicalDefaultExecutable(candidatePath: string, allowCanonicalSystemAlias = false): string | null {
   if (!canonicalAbsolutePath(candidatePath)) return null;
   try {
     const stat = fs.lstatSync(candidatePath);
-    if (stat.isSymbolicLink() || !stat.isFile()) return null;
-    if ((stat.mode & 0o111) === 0) return null;
+    const isAlias = stat.isSymbolicLink();
+    if (!isAlias && !stat.isFile()) return null;
+    if (!isAlias && (stat.mode & 0o111) === 0) return null;
     const resolved = fs.realpathSync.native(candidatePath);
-    if (resolved !== candidatePath || !canonicalAbsolutePath(resolved)) return null;
+    if (!canonicalAbsolutePath(resolved)) return null;
+    if (isAlias) {
+      if (
+        !allowCanonicalSystemAlias ||
+        !["/usr", "/bin", "/lib", "/lib64"].some((root) => resolved.startsWith(`${root}/`))
+      ) {
+        return null;
+      }
+      const target = fs.statSync(resolved);
+      if (!target.isFile() || (target.mode & 0o111) === 0) return null;
+    } else if (resolved !== candidatePath) {
+      return null;
+    }
     return resolved;
   } catch {
     return null;
@@ -147,10 +171,10 @@ function canonicalDefaultExecutable(candidatePath: string): string | null {
 export function discoverDefaultFhsDevelopmentExecutableCandidates(
   roots: readonly string[] = FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS,
 ): readonly FhsRuntimeExecutableDeclaration[] {
-  const candidates = FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS.flatMap((requirementId) => {
+  const candidates = FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS.flatMap((requirementId) => {
     const name = FHS_DEVELOPMENT_EXECUTABLE_NAMES[requirementId];
     for (const root of roots) {
-      const resolved = canonicalDefaultExecutable(posix.join(root, name));
+      const resolved = canonicalDefaultExecutable(posix.join(root, name), requirementId === "ls-runtime");
       if (resolved !== null)
         return [{ requirement_id: requirementId, path: resolved } satisfies FhsRuntimeExecutableDeclaration];
     }
@@ -181,7 +205,7 @@ export function readFhsDevelopmentExecutableCandidates(
   const discovered = new Map(
     discoverDefaultFhsDevelopmentExecutableCandidates(roots).map((candidate) => [candidate.requirement_id, candidate]),
   );
-  const candidates = FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS.flatMap((requirementId) => {
+  const candidates = FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS.flatMap((requirementId) => {
     const candidate = explicit.get(requirementId) ?? discovered.get(requirementId);
     return candidate === undefined ? [] : [candidate];
   });
@@ -338,7 +362,7 @@ function resolvedProfile(input: UnknownRecord): DomainResult<ResolvedRuntimeProf
         candidate.id === requirementId,
     );
     if (requirement === undefined) {
-      const kind = requirementId === "node-runtime" ? "runtime" : "package";
+      const kind = requirementId === "node-runtime" || requirementId === "ls-runtime" ? "runtime" : "package";
       return missing({ id: requirementId, kind }, "the canonical development baseline requirement is absent", {
         requirement_id: requirementId,
       });
@@ -365,6 +389,18 @@ function validatedCandidates(
       return invalid(`executable_candidates[${index}]`, "expected requirement_id and path");
     }
     const requirement = requirements.get(item.requirement_id);
+    if (
+      requirement === undefined &&
+      FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS.includes(
+        item.requirement_id as (typeof FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS)[number],
+      )
+    ) {
+      // Host evidence is collected for supported optional tools as well as
+      // the default baseline. An optional tool that was not selected by the
+      // profile is deliberately ignored rather than making the baseline
+      // unavailable.
+      continue;
+    }
     if (requirement === undefined)
       return missing(null, "the candidate references an unknown profile requirement", {
         requirement_id: item.requirement_id,
