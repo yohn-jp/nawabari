@@ -98,6 +98,97 @@ export function readExplicitFhsDevelopmentExecutableCandidates(
   return Object.freeze(candidates.map((candidate) => Object.freeze(candidate)));
 }
 
+/** Stable executable file name backing each canonical development requirement. */
+const FHS_DEVELOPMENT_EXECUTABLE_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  "node-runtime": "node",
+  "git-package": "git",
+  "pnpm-package": "pnpm",
+});
+
+/**
+ * Fixed, bounded FHS binary directories consulted when no explicit host
+ * evidence env var is supplied. This is a small deterministic allowlist, not a
+ * PATH search: it never reflects process PATH, HOME, profile files, or
+ * Corepack state, so it cannot be redirected by an attacker-controlled PATH.
+ */
+export const FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS = Object.freeze(["/usr/bin", "/usr/local/bin", "/bin"] as const);
+
+/**
+ * Accept a fixed-root candidate only if it already satisfies the same
+ * symlink-rejecting contract `validateCandidatePath` enforces for explicit
+ * candidates: the leaf itself must not be a symlink, and no path component
+ * may resolve elsewhere. The leaf is lstat'd *before* any realpath
+ * resolution so a symlinked `node`/`git`/`pnpm` at a fixed root is rejected
+ * outright rather than silently followed to its target. Returns null when
+ * the root has no usable candidate (the caller tries the next root).
+ */
+function canonicalDefaultExecutable(candidatePath: string): string | null {
+  if (!canonicalAbsolutePath(candidatePath)) return null;
+  try {
+    const stat = fs.lstatSync(candidatePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+    if ((stat.mode & 0o111) === 0) return null;
+    const resolved = fs.realpathSync.native(candidatePath);
+    if (resolved !== candidatePath || !canonicalAbsolutePath(resolved)) return null;
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Discover a default candidate for each canonical development requirement
+ * from a small fixed set of FHS binary directories (default:
+ * `FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS`). This is the fallback used only
+ * when no explicit `NAWABARI_FHS_*_EXECUTABLE` evidence is supplied; every
+ * discovered candidate is still re-validated by the same strict pipeline that
+ * validates explicit candidates.
+ */
+export function discoverDefaultFhsDevelopmentExecutableCandidates(
+  roots: readonly string[] = FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS,
+): readonly FhsRuntimeExecutableDeclaration[] {
+  const candidates = FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS.flatMap((requirementId) => {
+    const name = FHS_DEVELOPMENT_EXECUTABLE_NAMES[requirementId];
+    for (const root of roots) {
+      const resolved = canonicalDefaultExecutable(posix.join(root, name));
+      if (resolved !== null)
+        return [{ requirement_id: requirementId, path: resolved } satisfies FhsRuntimeExecutableDeclaration];
+    }
+    return [];
+  });
+  candidates.sort((left, right) => compareText(left.requirement_id, right.requirement_id));
+  return Object.freeze(candidates.map((candidate) => Object.freeze(candidate)));
+}
+
+/**
+ * The canonical host/runtime evidence source for standalone FHS development
+ * materialization: explicit `NAWABARI_FHS_*_EXECUTABLE` evidence always wins
+ * per requirement; a fixed-root default candidate (see
+ * `discoverDefaultFhsDevelopmentExecutableCandidates`) fills any requirement
+ * left unset so strict execution succeeds out of the box on a supported
+ * host. A requirement with neither source still fails closed.
+ */
+export function readFhsDevelopmentExecutableCandidates(
+  environment: NodeJS.ProcessEnv = process.env,
+  roots: readonly string[] = FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS,
+): readonly FhsRuntimeExecutableDeclaration[] {
+  const explicit = new Map(
+    readExplicitFhsDevelopmentExecutableCandidates(environment).map((candidate) => [
+      candidate.requirement_id,
+      candidate,
+    ]),
+  );
+  const discovered = new Map(
+    discoverDefaultFhsDevelopmentExecutableCandidates(roots).map((candidate) => [candidate.requirement_id, candidate]),
+  );
+  const candidates = FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS.flatMap((requirementId) => {
+    const candidate = explicit.get(requirementId) ?? discovered.get(requirementId);
+    return candidate === undefined ? [] : [candidate];
+  });
+  candidates.sort((left, right) => compareText(left.requirement_id, right.requirement_id));
+  return Object.freeze(candidates.map((candidate) => Object.freeze(candidate)));
+}
+
 type UnknownRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -112,6 +203,11 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+/** Strip a reason's own trailing period so it nests into a sentence exactly once. */
+function reasonSentence(reason: string): string {
+  return reason.endsWith(".") ? reason.slice(0, -1) : reason;
+}
+
 function missing(
   requirement: Pick<RuntimeRequirement, "id" | "kind"> | null,
   reason: string,
@@ -122,7 +218,7 @@ function missing(
   return failure(
     new DomainError(
       canonical.code,
-      `${canonical.message.slice(0, -1)}: ${reason}.`,
+      `${canonical.message.slice(0, -1)}: ${reasonSentence(reason)}.`,
       { ...(canonical.details ?? {}), reason, ...details },
       canonical.exitCode,
     ),

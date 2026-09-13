@@ -162,6 +162,26 @@ retains policy, profile, and materializer. Provider leaves such as #295,
 #296, and #309 remain opt-in and are not selected by the canonical
 `development` default.
 
+Issue #324 owns the FHS host/runtime evidence layer in
+`readFhsDevelopmentExecutableCandidates()`
+(`src/domain/fhs-development-runtime.ts`). Per canonical requirement, an
+explicit `NAWABARI_FHS_*_EXECUTABLE` environment declaration always wins.
+Absent that, the resolver falls back to
+`discoverDefaultFhsDevelopmentExecutableCandidates()`: a small, fixed,
+deterministic allowlist of FHS binary directories
+(`FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS`, currently `/usr/bin`,
+`/usr/local/bin`, and `/bin`)
+is checked for a canonically resolved, non-symlink, regular, executable file
+named after the requirement (`node`, `git`, `pnpm`). This is a fixed-root
+allowlist, not a `PATH` search: it never consults process `PATH`, `HOME`,
+profile directories, or Corepack state, so it cannot be redirected by an
+attacker-controlled `PATH`. Every discovered candidate is re-validated by the
+same strict pipeline that validates an explicit candidate; a requirement with
+neither an explicit nor a discovered candidate still fails closed with
+`RUNTIME_MATERIALIZATION_MISSING`. This lets `session run`/`session exec`/
+`session shell` succeed under the documented default `--runtime-policy
+strict` on a supported host without requiring any explicit configuration.
+
 ## Projected pnpm middleware
 
 Issue #311 is the sole producer of the pinned RTK and pnpm backend material.

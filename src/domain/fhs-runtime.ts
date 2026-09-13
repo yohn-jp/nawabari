@@ -129,6 +129,11 @@ function isFhsPath(candidate: string, allowRoot = false): boolean {
   return FHS_RUNTIME_ROOTS.some((root) => (allowRoot && candidate === root) || pathMatches(candidate, root));
 }
 
+/** Strip a reason's own trailing period so it nests into a sentence exactly once. */
+function reasonSentence(reason: string): string {
+  return reason.endsWith(".") ? reason.slice(0, -1) : reason;
+}
+
 function materializationFailure(
   requirement: RequirementContext,
   reason: string,
@@ -138,7 +143,7 @@ function materializationFailure(
   return failure(
     new DomainError(
       canonical.code,
-      `${canonical.message.slice(0, -1)}: ${reason}.`,
+      `${canonical.message.slice(0, -1)}: ${reasonSentence(reason)}.`,
       { ...(canonical.details ?? {}), reason, ...details },
       canonical.exitCode,
     ),

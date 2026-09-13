@@ -8,9 +8,11 @@ import { test } from "node:test";
 
 import {
   defaultSandboxProbe,
+  discoverDefaultFhsDevelopmentExecutableCandidates,
   discoverSandboxRuntimeLayout,
   FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS,
   fhsDevelopmentRuntimeReadiness,
+  readFhsDevelopmentExecutableCandidates,
   resolveFhsDevelopmentRuntime,
   resolveSandboxExecutionRequest,
   runSandboxedCommand,
@@ -92,6 +94,40 @@ function requireFixture(t: { skip: (reason?: string) => void }): CandidateFixtur
   return fixture;
 }
 
+/** A fixed-root fixture using the real binary names (`node`/`git`/`pnpm`) default discovery looks for. */
+function createDefaultRootFixture(): CandidateFixture | null {
+  if (process.platform !== "linux") return null;
+  let root: string | null = null;
+  try {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-fhs-development-default-root-"));
+    const node = path.join(root, "node");
+    const git = path.join(root, "git");
+    const pnpm = path.join(root, "pnpm");
+    fs.copyFileSync(process.execPath, node);
+    fs.chmodSync(node, 0o755);
+    fs.writeFileSync(git, "#!/bin/sh\nprintf 'git-package-ok\\n'\n", { mode: 0o755 });
+    fs.writeFileSync(pnpm, "#!/bin/sh\nprintf 'pnpm-package-ok\\n'\n", { mode: 0o755 });
+    return Object.freeze({
+      root: root as string,
+      candidates: Object.freeze([
+        Object.freeze({ requirement_id: "node-runtime", path: node }),
+        Object.freeze({ requirement_id: "git-package", path: git }),
+        Object.freeze({ requirement_id: "pnpm-package", path: pnpm }),
+      ]),
+      cleanup: () => fs.rmSync(root as string, { recursive: true, force: true }),
+    });
+  } catch {
+    if (root !== null) fs.rmSync(root, { recursive: true, force: true });
+    return null;
+  }
+}
+
+function requireDefaultRootFixture(t: { skip: (reason?: string) => void }): CandidateFixture | null {
+  const fixture = createDefaultRootFixture();
+  if (fixture === null) t.skip("a writable default-root FHS fixture root is unavailable");
+  return fixture;
+}
+
 function expectFailure(result: ReturnType<typeof resolveFhsDevelopmentRuntime>, code: string): void {
   assert.equal(result.ok, false, result.ok ? "expected failure" : JSON.stringify(result.error));
   if (!result.ok) assert.equal(result.error.code, code, result.error.message);
@@ -156,13 +192,19 @@ test("FHS candidate ordering is deterministic and selection is independent of PA
     if (!first.ok || !second.ok) return;
     assert.deepEqual(first.value, second.value);
 
-    const discovered = discoverSandboxRuntimeLayout({
+    const garbageEnvironment = {
       HOME: "/tmp/fake-home",
       PATH: "/tmp/fake-path",
       COREPACK_HOME: "/tmp/fake-corepack",
       USER: "fake-user",
-    });
-    assert.deepEqual(discovered.fhs_executable_candidates, []);
+    };
+    const emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-fhs-development-empty-root-"));
+    try {
+      assert.deepEqual(readFhsDevelopmentExecutableCandidates(garbageEnvironment, [emptyRoot]), []);
+      assert.deepEqual(discoverDefaultFhsDevelopmentExecutableCandidates([emptyRoot]), []);
+    } finally {
+      fs.rmSync(emptyRoot, { recursive: true, force: true });
+    }
 
     const productionLayout = discoverSandboxRuntimeLayout(environmentWithFhsEvidence(fixture.candidates));
     assert.deepEqual(
@@ -183,6 +225,94 @@ test("FHS candidate ordering is deterministic and selection is independent of PA
   } finally {
     fixture.cleanup();
   }
+});
+
+test("default strict execution succeeds out of the box from fixed-root discovery alone, no explicit evidence supplied", (t) => {
+  const fixture = requireDefaultRootFixture(t);
+  if (fixture === null) return;
+  try {
+    const discovered = discoverDefaultFhsDevelopmentExecutableCandidates([fixture.root]);
+    assert.deepEqual(
+      discovered.map((candidate) => candidate.requirement_id),
+      ["git-package", "node-runtime", "pnpm-package"],
+    );
+
+    // No NAWABARI_FHS_*_EXECUTABLE evidence is supplied; the fixed root alone must be enough.
+    const merged = readFhsDevelopmentExecutableCandidates({}, [fixture.root]);
+    assert.deepEqual(merged, discovered);
+
+    const resolved = resolveFhsDevelopmentRuntime({ executable_candidates: merged });
+    assert.equal(resolved.ok, true, resolved.ok ? "" : JSON.stringify(resolved.error));
+
+    const readiness = fhsDevelopmentRuntimeReadiness("linux", { fhs_executable_candidates: merged });
+    assert.equal(
+      readiness.strict_ready,
+      true,
+      readiness.reason ?? "default discovery did not satisfy strict readiness",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("an explicit NAWABARI_FHS_*_EXECUTABLE candidate always wins over fixed-root default discovery", (t) => {
+  const fixture = requireDefaultRootFixture(t);
+  if (fixture === null) return;
+  const overrideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-fhs-development-override-"));
+  try {
+    const overrideGit = path.join(overrideRoot, "git-override");
+    fs.writeFileSync(overrideGit, "#!/bin/sh\nprintf 'git-override-ok\\n'\n", { mode: 0o755 });
+
+    const merged = readFhsDevelopmentExecutableCandidates(
+      { [FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS["git-package"]]: overrideGit },
+      [fixture.root],
+    );
+    const gitCandidate = merged.find((candidate) => candidate.requirement_id === "git-package");
+    assert.equal(gitCandidate?.path, overrideGit);
+    const nodeCandidate = merged.find((candidate) => candidate.requirement_id === "node-runtime");
+    assert.equal(nodeCandidate?.path, path.join(fixture.root, "node"));
+  } finally {
+    fixture.cleanup();
+    fs.rmSync(overrideRoot, { recursive: true, force: true });
+  }
+});
+
+test("a symlinked node/git/pnpm at a fixed default root is never discovered, and default resolution still fails closed", (t) => {
+  const fixture = requireDefaultRootFixture(t);
+  if (fixture === null) return;
+  const symlinkRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-fhs-development-symlink-root-"));
+  try {
+    // Point every fixed-root binary name at a symlink to a genuine, otherwise-valid
+    // executable target. Discovery must reject the symlink itself, not silently
+    // follow it to the target, even though the target alone would be acceptable.
+    for (const name of ["node", "git", "pnpm"]) {
+      fs.symlinkSync(path.join(fixture.root, name), path.join(symlinkRoot, name));
+    }
+
+    const discovered = discoverDefaultFhsDevelopmentExecutableCandidates([symlinkRoot]);
+    assert.deepEqual(discovered, []);
+
+    const merged = readFhsDevelopmentExecutableCandidates({}, [symlinkRoot]);
+    assert.deepEqual(merged, []);
+
+    const resolved = resolveFhsDevelopmentRuntime({ executable_candidates: merged });
+    expectFailure(resolved, "RUNTIME_MATERIALIZATION_MISSING");
+
+    const readiness = fhsDevelopmentRuntimeReadiness("linux", { fhs_executable_candidates: merged });
+    assert.equal(readiness.strict_ready, false);
+  } finally {
+    fixture.cleanup();
+    fs.rmSync(symlinkRoot, { recursive: true, force: true });
+  }
+});
+
+test("genuinely missing authority still fails closed with a single, well-formed diagnostic sentence", () => {
+  const resolved = resolveFhsDevelopmentRuntime({ executable_candidates: [] });
+  expectFailure(resolved, "RUNTIME_MATERIALIZATION_MISSING");
+  if (resolved.ok) return;
+  assert.doesNotMatch(resolved.error.message, /runtime runtime requirement/iu);
+  assert.doesNotMatch(resolved.error.message, /\.\./u);
+  assert.match(resolved.error.message, /was not materialized: no explicit candidate was supplied\.$/u);
 });
 
 test("missing, ambiguous, non-executable, and symlink FHS candidates fail closed", (t) => {

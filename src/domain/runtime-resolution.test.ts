@@ -284,6 +284,36 @@ test("failure of the selected FHS materializer is fail-closed without trying Nix
   if (!result.ok) assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
 });
 
+test("no strict materializer available produces a single well-formed diagnostic, not a duplicated/double-punctuated one", () => {
+  const result = resolveRuntimeProjection({
+    platform: "linux",
+    runtime_layout: emptyLayout({ usr: "/usr", nix: null }),
+  });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+  assert.doesNotMatch(result.error.message, /runtime runtime requirement/iu);
+  assert.doesNotMatch(result.error.message, /'runtime-profile'/u);
+  assert.doesNotMatch(result.error.message, /\.\./u);
+  assert.match(result.error.message, /^Strict runtime materialization is unavailable: .+\.$/u);
+});
+
+test("the canonical development baseline succeeds by default from fixed-root FHS discovery alone", () => {
+  const fixture = createCandidateFixture();
+  try {
+    const result = resolveRuntimeProjection({
+      platform: "linux",
+      runtime_layout: emptyLayout({ usr: "/usr", fhs_executable_candidates: fixture.candidates }),
+    });
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (!result.ok) return;
+    assert.deepEqual(result.value.policy, STRICT_RUNTIME_POLICY);
+    assert.equal(result.value.materializer, "fhs");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("explicit compatibility produces a complete compatibility projection instead of an omitted projection", () => {
   if (process.platform !== "linux") return;
   const layout = discoverSandboxRuntimeLayout();

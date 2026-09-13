@@ -94,17 +94,33 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+/** Strip a reason's own trailing period so it nests into a sentence exactly once. */
+function reasonSentence(reason: string): string {
+  return reason.endsWith(".") ? reason.slice(0, -1) : reason;
+}
+
 function resolutionFailure(
   requirement: RuntimeRequirement | null,
   reason: string,
   details: JsonObject = {},
 ): DomainResult<never> {
-  const fallback = requirement ?? { id: "runtime-profile", kind: "runtime" as const };
-  const canonical = runtimeMaterializationMissingError(fallback.id, fallback.kind);
+  if (requirement === null) {
+    return failure(
+      new DomainError(
+        "RUNTIME_MATERIALIZATION_MISSING",
+        `Strict runtime materialization is unavailable: ${reasonSentence(reason)}.`,
+        {
+          reason,
+          ...details,
+        },
+      ),
+    );
+  }
+  const canonical = runtimeMaterializationMissingError(requirement.id, requirement.kind);
   return failure(
     new DomainError(
       canonical.code,
-      `${canonical.message.slice(0, -1)}: ${reason}.`,
+      `${canonical.message.slice(0, -1)}: ${reasonSentence(reason)}.`,
       { ...(canonical.details ?? {}), reason, ...details },
       canonical.exitCode,
     ),
