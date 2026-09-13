@@ -131,14 +131,14 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
       ),
       option(
         "--schema-version",
-        "Select the public diagnostic result schema; v2 is the single-authority default and v1 preserves the legacy nested lifecycle copy",
-        { value: "<1|2>", default: "2", values: ["1", "2"] },
+        "Select the public diagnostic result schema; v1 preserves the legacy nested lifecycle copy and v2 is the single-authority projection",
+        { value: "<1|2>", default: "1", values: ["1", "2"] },
       ),
     ],
     notes: [
       "Read-only: never mutates session, claim, Git, worktree, branch, or registry state. Repeated calls are idempotent.",
       "Derived from the same authoritative close/cleanup Git evidence as session close; does not duplicate or diverge from that logic.",
-      "Schema v2 exposes lifecycle and next_actions once at the top level; garbage_collection retains explicit references to those authorities. Use --schema-version 1 only for legacy consumers that require the duplicated v1 shape.",
+      "The established unqualified result is schema v1. Schema v2 exposes lifecycle and next_actions once at the top level; garbage_collection retains explicit references to those authorities. Use --schema-version 2 to opt into v2.",
       "Nawabari never queries GitHub or any remote provider; --integrated-revision only names a local revision for Nawabari to independently verify.",
       "Target grammar: optional first positional <session-id> is an alias for --session <id>; do not supply both.",
     ],

@@ -25,10 +25,7 @@ import {
 } from "./domain/sandbox.js";
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
 import { DISCARD_PREVIEW_SCHEMA_VERSION } from "./session-registry.js";
-import {
-  SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
-  SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION,
-} from "./domain/session.js";
+import { SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION, SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION } from "./domain/session.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -365,21 +362,21 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
   {
     id: "session-diagnostics",
     commands: ["session inspect"],
-    result_schema: "session-diagnostic.v2",
+    result_schema: "session-diagnostic.v1",
     result_schema_version: SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
     result_schemas: [
       {
-        schema: "session-diagnostic.v2",
+        schema: "session-diagnostic.v1",
         version: SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
         commands: ["session inspect"],
       },
     ],
     compatibility_result_schemas: [
       {
-        schema: "session-diagnostic.v1",
-        version: SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION,
+        schema: "session-diagnostic.v2",
+        version: SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION,
         commands: ["session inspect"],
-        selector: "--schema-version 1",
+        selector: "--schema-version 2",
       },
     ],
     identities: [

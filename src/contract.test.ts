@@ -18,6 +18,7 @@ import {
   SANDBOX_REQUIRED_CAPABILITIES,
 } from "./domain/sandbox.js";
 import { RESOURCE_CLAIM_SCHEMA_VERSION } from "./resource-claims.js";
+import { SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION, SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION } from "./domain/session.js";
 import {
   classifySessionLifecycle,
   lifecycleTransition,
@@ -222,22 +223,22 @@ test("session-diagnostics lifecycle projection is the live XState-derived table,
       candidate.id === "session-diagnostics",
   ) as JsonRecord | undefined;
   assert.ok(diagnostics);
-  assert.equal(diagnostics?.result_schema, "session-diagnostic.v2");
-  assert.equal(diagnostics?.result_schema_version, 2);
+  assert.equal(diagnostics?.result_schema, "session-diagnostic.v1");
+  assert.equal(diagnostics?.result_schema_version, SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION);
   const compatibilitySchemas = diagnostics?.compatibility_result_schemas as JsonRecord[];
   assert.deepEqual(compatibilitySchemas, [
     {
-      schema: "session-diagnostic.v1",
-      version: 1,
+      schema: "session-diagnostic.v2",
+      version: SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION,
       commands: ["session inspect"],
-      selector: "--schema-version 1",
+      selector: "--schema-version 2",
     },
   ]);
   const lifecycle = diagnostics?.lifecycle as JsonRecord;
   assert.deepEqual(lifecycle.states, [...SESSION_LIFECYCLE_STATES]);
   assert.deepEqual(lifecycle.transition_table, SESSION_LIFECYCLE_TRANSITION_TABLE);
   const resultProjection = lifecycle.result_projection as JsonRecord;
-  assert.equal(resultProjection.default_schema_version, 2);
+  assert.equal(resultProjection.default_schema_version, SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION);
   assert.equal(resultProjection.selector, "--schema-version");
   assert.equal(resultProjection.canonical_field, "lifecycle");
 

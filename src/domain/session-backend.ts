@@ -48,6 +48,8 @@ import {
   type SessionLifecycleProjection,
   type SessionDiagnosticGarbageCollection,
   SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
+  SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION,
+  SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION,
   type SessionListResult,
   type SessionListOptions,
   type SessionRecord,
@@ -864,21 +866,21 @@ function toDomainGarbageCollectAssessment(
   const lifecycleCompatibility =
     lifecycle === undefined
       ? {}
-      : schemaVersion === 1
+      : schemaVersion === SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION
         ? { lifecycle }
         : {
             lifecycle: {
-              schema_version: SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
+              schema_version: SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION,
               authority: "session_diagnostic.lifecycle" as const,
               ref: "#/lifecycle" as const,
             },
           };
   const nextActionsCompatibility =
-    schemaVersion === 1
+    schemaVersion === SESSION_DIAGNOSTIC_LEGACY_SCHEMA_VERSION
       ? { next_actions: [...nextActions] }
       : {
           next_actions: {
-            schema_version: SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
+            schema_version: SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION,
             authority: "session_diagnostic.next_actions" as const,
             ref: "#/next_actions" as const,
           },
