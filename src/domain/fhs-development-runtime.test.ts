@@ -22,6 +22,7 @@ import {
 } from "./sandbox.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import { compileSandboxInvocation } from "./sandbox-launcher.js";
+import { resolveRuntimeProfile } from "./runtime-profile.js";
 
 function readyProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe {
   return {
@@ -67,14 +68,17 @@ function createCandidateFixture(): CandidateFixture | null {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-fhs-development-"));
     const node = path.join(root, "node-runtime");
     const git = path.join(root, "git-package");
+    const ls = path.join(root, "ls-runtime");
     const pnpm = path.join(root, "pnpm-package");
     fs.copyFileSync(process.execPath, node);
     fs.chmodSync(node, 0o755);
     fs.writeFileSync(git, "#!/bin/sh\nprintf 'git-package-ok\\n'\n", { mode: 0o755 });
+    fs.writeFileSync(ls, "#!/bin/sh\nprintf 'ls-runtime-ok\\n'\n", { mode: 0o755 });
     fs.writeFileSync(pnpm, "#!/bin/sh\nprintf 'pnpm-package-ok\\n'\n", { mode: 0o755 });
     const candidates = Object.freeze([
       Object.freeze({ requirement_id: "node-runtime", path: node }),
       Object.freeze({ requirement_id: "git-package", path: git }),
+      Object.freeze({ requirement_id: "ls-runtime", path: ls }),
       Object.freeze({ requirement_id: "pnpm-package", path: pnpm }),
     ]);
     return Object.freeze({
@@ -102,16 +106,19 @@ function createDefaultRootFixture(): CandidateFixture | null {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-fhs-development-default-root-"));
     const node = path.join(root, "node");
     const git = path.join(root, "git");
+    const ls = path.join(root, "ls");
     const pnpm = path.join(root, "pnpm");
     fs.copyFileSync(process.execPath, node);
     fs.chmodSync(node, 0o755);
     fs.writeFileSync(git, "#!/bin/sh\nprintf 'git-package-ok\\n'\n", { mode: 0o755 });
+    fs.writeFileSync(ls, "#!/bin/sh\nprintf 'ls-runtime-ok\\n'\n", { mode: 0o755 });
     fs.writeFileSync(pnpm, "#!/bin/sh\nprintf 'pnpm-package-ok\\n'\n", { mode: 0o755 });
     return Object.freeze({
       root: root as string,
       candidates: Object.freeze([
         Object.freeze({ requirement_id: "node-runtime", path: node }),
         Object.freeze({ requirement_id: "git-package", path: git }),
+        Object.freeze({ requirement_id: "ls-runtime", path: ls }),
         Object.freeze({ requirement_id: "pnpm-package", path: pnpm }),
       ]),
       cleanup: () => fs.rmSync(root as string, { recursive: true, force: true }),
@@ -144,6 +151,7 @@ function environmentWithFhsEvidence(
     COREPACK_HOME: "/tmp/host-corepack-must-not-matter",
     [FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS["node-runtime"]]: byRequirement.get("node-runtime"),
     [FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS["git-package"]]: byRequirement.get("git-package"),
+    [FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS["ls-runtime"]]: byRequirement.get("ls-runtime"),
     [FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS["pnpm-package"]]: byRequirement.get("pnpm-package"),
   };
 }
@@ -158,16 +166,16 @@ test("development FHS materialization resolves explicit candidates outside /usr/
 
     assert.deepEqual(
       resolved.value.projection.executables.map((entrypoint) => entrypoint.name),
-      ["git", "node", "pnpm"],
+      ["git", "ls", "node"],
     );
     assert.deepEqual(
       resolved.value.executable_projection.map((entrypoint) => entrypoint.target),
-      ["/nawabari/bin/git", "/nawabari/bin/node", "/nawabari/bin/pnpm"],
+      ["/nawabari/bin/git", "/nawabari/bin/ls", "/nawabari/bin/node"],
     );
     assert.ok(
-      fixture.candidates.every((candidate) =>
-        resolved.value.projection.filesystem.some((entry) => entry.source === candidate.path),
-      ),
+      fixture.candidates
+        .filter((candidate) => candidate.requirement_id !== "pnpm-package")
+        .every((candidate) => resolved.value.projection.filesystem.some((entry) => entry.source === candidate.path)),
     );
     for (const root of ["/usr", "/bin", "/lib", "/lib64"]) {
       assert.equal(
@@ -209,7 +217,7 @@ test("FHS candidate ordering is deterministic and selection is independent of PA
     const productionLayout = discoverSandboxRuntimeLayout(environmentWithFhsEvidence(fixture.candidates));
     assert.deepEqual(
       productionLayout.fhs_executable_candidates?.map((candidate) => candidate.requirement_id),
-      ["git-package", "node-runtime", "pnpm-package"],
+      ["git-package", "ls-runtime", "node-runtime", "pnpm-package"],
     );
     const materialized = resolveFhsDevelopmentRuntime({
       executable_candidates: productionLayout.fhs_executable_candidates,
@@ -234,7 +242,7 @@ test("default strict execution succeeds out of the box from fixed-root discovery
     const discovered = discoverDefaultFhsDevelopmentExecutableCandidates([fixture.root]);
     assert.deepEqual(
       discovered.map((candidate) => candidate.requirement_id),
-      ["git-package", "node-runtime", "pnpm-package"],
+      ["git-package", "ls-runtime", "node-runtime", "pnpm-package"],
     );
 
     // No NAWABARI_FHS_*_EXECUTABLE evidence is supplied; the fixed root alone must be enough.
@@ -285,7 +293,7 @@ test("a symlinked node/git/pnpm at a fixed default root is never discovered, and
     // Point every fixed-root binary name at a symlink to a genuine, otherwise-valid
     // executable target. Discovery must reject the symlink itself, not silently
     // follow it to the target, even though the target alone would be acceptable.
-    for (const name of ["node", "git", "pnpm"]) {
+    for (const name of ["node", "git", "ls", "pnpm"]) {
       fs.symlinkSync(path.join(fixture.root, name), path.join(symlinkRoot, name));
     }
 
@@ -315,15 +323,29 @@ test("genuinely missing authority still fails closed with a single, well-formed 
   assert.match(resolved.error.message, /was not materialized: no explicit candidate was supplied\.$/u);
 });
 
-test("missing, ambiguous, non-executable, and symlink FHS candidates fail closed", (t) => {
+test("missing mandatory FHS candidates fail closed while unselected pnpm remains optional", (t) => {
   const fixture = requireFixture(t);
   if (fixture === null) return;
   try {
     const missing = resolveFhsDevelopmentRuntime({
       executable_candidates: fixture.candidates.filter((candidate) => candidate.requirement_id !== "pnpm-package"),
     });
-    expectFailure(missing, "RUNTIME_MATERIALIZATION_MISSING");
-    if (!missing.ok) assert.equal(missing.error.details?.requirement_id, "pnpm-package");
+    assert.equal(missing.ok, true, missing.ok ? "" : JSON.stringify(missing.error));
+
+    const withPnpm = resolveRuntimeProfile({
+      profiles: ["development"],
+      operations: [
+        { operation: "add", requirement: { id: "pnpm-package", kind: "package", name: "pnpm", version: ">=11" } },
+      ],
+    });
+    assert.equal(withPnpm.ok, true, withPnpm.ok ? "" : JSON.stringify(withPnpm.error));
+    if (!withPnpm.ok) return;
+    const missingOptIn = resolveFhsDevelopmentRuntime({
+      profile: withPnpm.value,
+      executable_candidates: fixture.candidates.filter((candidate) => candidate.requirement_id !== "pnpm-package"),
+    });
+    expectFailure(missingOptIn, "RUNTIME_MATERIALIZATION_MISSING");
+    if (!missingOptIn.ok) assert.equal(missingOptIn.error.details?.requirement_id, "pnpm-package");
 
     const ambiguous = resolveFhsDevelopmentRuntime({
       executable_candidates: [
@@ -341,13 +363,13 @@ test("missing, ambiguous, non-executable, and symlink FHS candidates fail closed
     if (!nonExecutableResult.ok) assert.match(nonExecutableResult.error.message, /not executable/u);
     fs.chmodSync(nonExecutable.path, 0o755);
 
-    const link = path.join(fixture.root, "pnpm-link");
-    const pnpm = fixture.candidates.find((candidate) => candidate.requirement_id === "pnpm-package");
-    assert.ok(pnpm);
-    fs.symlinkSync(pnpm.path, link);
+    const link = path.join(fixture.root, "git-link");
+    const git = fixture.candidates.find((candidate) => candidate.requirement_id === "git-package");
+    assert.ok(git);
+    fs.symlinkSync(git.path, link);
     const symlinkResult = resolveFhsDevelopmentRuntime({
       executable_candidates: fixture.candidates.map((candidate) =>
-        candidate.requirement_id === "pnpm-package" ? { ...candidate, path: link } : candidate,
+        candidate.requirement_id === "git-package" ? { ...candidate, path: link } : candidate,
       ),
     });
     expectFailure(symlinkResult, "RUNTIME_MATERIALIZATION_MISSING");
@@ -382,7 +404,7 @@ test("doctor strict_ready and its reason are projections of the same FHS resolve
   }
 });
 
-test("standalone Linux protected execution runs the materialized Node/Git/pnpm baseline", async (t) => {
+test("standalone Linux protected execution runs the materialized Node/Git baseline", async (t) => {
   if (process.platform !== "linux") {
     t.skip("protected FHS execution is Linux-only");
     return;
@@ -399,7 +421,7 @@ test("standalone Linux protected execution runs the materialized Node/Git/pnpm b
     const layout = discoverSandboxRuntimeLayout(environmentWithFhsEvidence(fixture.candidates, process.env.PATH ?? ""));
     assert.deepEqual(
       layout.fhs_executable_candidates?.map((candidate) => candidate.requirement_id),
-      ["git-package", "node-runtime", "pnpm-package"],
+      ["git-package", "ls-runtime", "node-runtime", "pnpm-package"],
     );
     const materialized = resolveFhsDevelopmentRuntime({
       executable_candidates: layout.fhs_executable_candidates,
@@ -447,7 +469,6 @@ test("standalone Linux protected execution runs the materialized Node/Git/pnpm b
     for (const [command, expected] of [
       ["node", "node-ok"],
       ["git", "git-package-ok\n"],
-      ["pnpm", "pnpm-package-ok\n"],
     ] as const) {
       const result = await runSandboxedCommand(request.value, {
         command,
@@ -460,6 +481,13 @@ test("standalone Linux protected execution runs the materialized Node/Git/pnpm b
       if (!result.ok) continue;
       assert.equal(result.value.exit_code, 0, JSON.stringify(result.value));
       assert.equal(result.value.stdout, expected);
+    }
+
+    const ls = await runSandboxedCommand(request.value, { command: "ls", args: ["-1"] });
+    assert.equal(ls.ok, true, ls.ok ? "" : JSON.stringify(ls.error));
+    if (ls.ok) {
+      assert.equal(ls.value.exit_code, 0, JSON.stringify(ls.value));
+      assert.equal(ls.value.stdout, "ls-runtime-ok\n");
     }
 
     const visibility = await runSandboxedCommand(request.value, {

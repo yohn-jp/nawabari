@@ -83,6 +83,7 @@ export type RuntimeDoctorReport = Readonly<
 const DEVELOPMENT_EXECUTABLE_RELATIVE_PATHS: Readonly<Record<string, string>> = Object.freeze({
   "node-runtime": "bin/node",
   "git-package": "bin/git",
+  "ls-runtime": "bin/ls",
   "pnpm-package": "bin/pnpm",
 });
 

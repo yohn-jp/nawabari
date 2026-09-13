@@ -84,8 +84,13 @@ Issue #290 defines the material-only profile contract in
 `src/domain/runtime-profile.ts`. The canonical catalog contains:
 
 - `base`: the minimal Node runtime requirement (`node >=24`);
-- `development`: `base` plus logical `git >=2` and `pnpm >=11` package
-  requirements.
+- `development`: `base` plus logical Git (`git >=2`) and the deterministic
+  `ls` runtime utility.
+
+The default profile does not select pnpm. Callers that explicitly compose a
+`pnpm >=11` package requirement receive the same canonical materializer and
+executable projection, but an absent pnpm candidate cannot make an unrelated
+protected command unavailable.
 
 A repository or session selects profiles explicitly, for example
 `resolveRuntimeProfile({ profiles: ["development"] })`. The resolver is pure:
@@ -172,15 +177,16 @@ deterministic allowlist of FHS binary directories
 (`FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS`, currently `/usr/bin`,
 `/usr/local/bin`, and `/bin`)
 is checked for a canonically resolved, non-symlink, regular, executable file
-named after the requirement (`node`, `git`, `pnpm`). This is a fixed-root
-allowlist, not a `PATH` search: it never consults process `PATH`, `HOME`,
-profile directories, or Corepack state, so it cannot be redirected by an
-attacker-controlled `PATH`. Every discovered candidate is re-validated by the
-same strict pipeline that validates an explicit candidate; a requirement with
-neither an explicit nor a discovered candidate still fails closed with
-`RUNTIME_MATERIALIZATION_MISSING`. This lets `session run`/`session exec`/
-`session shell` succeed under the documented default `--runtime-policy
-strict` on a supported host without requiring any explicit configuration.
+named after the requirement (`node`, `git`, `ls`, and supported opt-in `pnpm`).
+This is a fixed-root allowlist, not a `PATH` search: it never consults process
+`PATH`, `HOME`, profile directories, or Corepack state, so it cannot be
+redirected by an attacker-controlled `PATH`. Every discovered candidate is
+re-validated by the same strict pipeline that validates an explicit candidate;
+a selected requirement with neither an explicit nor a discovered candidate
+still fails closed with `RUNTIME_MATERIALIZATION_MISSING`. Unselected optional
+pnpm evidence is ignored. This lets `session run`/`session exec`/`session shell`
+succeed under the documented default `--runtime-policy strict` on a supported
+host without requiring any explicit configuration.
 
 ## Projected pnpm middleware
 

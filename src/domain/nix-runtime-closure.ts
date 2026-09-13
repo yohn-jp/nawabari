@@ -34,6 +34,7 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 export const DEFAULT_NIX_PACKAGE_ATTRIBUTES: Readonly<Record<string, string>> = Object.freeze({
   node: "nodejs",
   git: "git",
+  ls: "coreutils",
   pnpm: "pnpm",
 });
 
