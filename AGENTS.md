@@ -8,10 +8,13 @@ For multi-Issue/Epic work or runtime-specific orchestration, use the synchronize
 ## 1. Scope is closed by default
 
 - The latest explicit user request and accepted Issue define task intent, scope, and requested lifecycle.
+- A later explicit user instruction that changes runtime/tool choice, worktree strategy, or prohibited operations takes effect immediately and supersedes the earlier execution method. Stop issuing superseded operations; perform only the minimum transition needed to preserve valid work and continue safely.
 - Do not add adjacent features, cleanup, refactors, documentation, or follow-up work unless required to satisfy that scope.
 - A design/review/analysis-only request is read-only unless the user explicitly requests a mutation such as creating an Issue or PR.
 - If the prompt or Issue already identifies the relevant file, symbol, failure, or validation command, start there. Do not rediscover known facts.
 - Current repository/GitHub state overrides stale plans, memories, or earlier reports for volatile facts. Reconcile existing Issues, PRs, branches, worktrees, and current bases before creating duplicates or choosing an obsolete execution order.
+- For write-capable work, do that reconciliation as one bounded preflight whenever possible: confirm the target Issue/PR state, base/head, existing task branch/worktree, and whether the requested outcome is already present before creating new execution state.
+- If the live target already satisfies the requested outcome, do not create a duplicate branch, worktree, commit, or PR merely to perform activity. Report the evidence and continue only with any remaining requested lifecycle work.
 - When evidence is sufficient to implement or decide, stop exploring and act.
 - A newly noticed out-of-scope problem is reported, not implemented.
 - Before write-capable implementation, establish a small implementation envelope: semantic outcome, expected write-set/derived files, dependencies/base, forbidden escalation, validation, and requested lifecycle end state. Reconcile the final diff to that envelope.
@@ -38,11 +41,15 @@ Use the narrowest available evidence and stop at the first sufficient level:
 
 Rules:
 
+- Before each read, know which next decision its result can change. If no pending decision depends on that evidence, skip the read.
+- Batch independent, already-known reads or state checks into one tool round when the runtime supports it; do not serialize them only to narrate progress.
 - No repository-wide scan merely for orientation.
 - No unbounded `find`, `tree`, `rg --files`, full-log dump, full-PR JSON, or full multi-file diff unless the task specifically requires it and narrower evidence is insufficient.
 - Do not read an unchanged file/result twice in the same decision state.
 - Do not rerun an unchanged command merely for confidence.
 - Structural search is a locator, not a second repository read. Once target symbols/files are known, stop querying it.
+- Once the acceptance gap and target files/symbols are known, enter implementation. Issue history, related Issues, comments, blame, broad documentation, and architecture archaeology are out of scope unless a concrete unresolved question requires them.
+- For a bounded implementation, one live-state/preflight batch plus one target-evidence batch is the default exploration budget before the first edit or focused test. Exceed it only to resolve a named ambiguity, dependency, safety concern, or blocker.
 - If a guard rejects a read as too broad, narrow the path/range. Do not evade the rejection with an equivalent command or another tool.
 
 ## 4. Long-running commands are awaited, not polled
@@ -68,7 +75,9 @@ Rules:
 - If the task/Issue specifies validation commands, use those commands. Do not first survey testing documentation.
 - If validation is unspecified, choose the smallest existing command that directly covers the changed scope; inspect package/workflow metadata only when needed to identify it.
 - Run targeted tests during implementation. Run the required final validation once after relevant mutations are complete.
+- Treat full-suite validation as an end-of-change gate, not an exploratory probe. Run it after focused tests pass and the write-set is stable; rerun it only after a change that can affect the failed or stale result.
 - Rerun validation only after a change that can affect its result.
+- Do not add an optional self-review, second verification layer, or extra test matrix when the user explicitly forbids it or no policy/acceptance criterion requires it.
 - Do not call an unexecuted, pending, hung, unavailable, stale, or environment-blocked check `passed`.
 - Remote CI and local validation are separate evidence.
 - Green CI is not a substitute for semantic, scope, architecture, security, or current-base review.
@@ -78,6 +87,8 @@ Rules:
 ## 7. Complete exactly the requested lifecycle
 
 Do not stop at diagnosis, planning, or a partial implementation when the user requested execution and the next requested lifecycle step is available. Do not continue into implementation, merge, release, or monitoring when the user requested only an earlier phase.
+
+Explicit downstream lifecycle requests such as `push`, `open the PR`, `through PR completion`, or `merge` authorize those exact governed steps in the current execution. They are not extra confirmation gates.
 
 Before completion, use bounded checks only, such as:
 
@@ -108,7 +119,9 @@ Then finish the requested lifecycle:
 ## 9. Inari is the canonical path for governed GitHub operations
 
 - For governed Issue, PR, template, normalization, and related lifecycle operations, use Inari when that surface is supported.
-- Before guessing Inari flags, command sequences, template fields, recovery steps, or workflow behavior, consult `inari skill` or the relevant `inari skill <scenario>`.
+- Before guessing Inari flags, command sequences, template fields, recovery steps, or workflow behavior, consult the smallest relevant `inari skill <scenario>`; use generic `inari skill` only when the scenario is not yet known.
+- Treat consulted skill output as cached evidence for the current decision state. Do not repeatedly run generic skill, scenario skill, and `--help` discovery for the same operation unless the prior guidance is insufficient, a command fails, or the relevant state changes.
+- If the user explicitly prohibits an Inari capability or names an unavailable one, do not probe or call that capability. Use the supported governed fallback already identified by the task or live skill output.
 - Live Inari skill output and repository governance schema such as `.github/inari/**` are authoritative for exact behavior. Do not duplicate leaf-command flags or static playbooks here.
 - Do not silently substitute raw `gh` for an operation that Inari governs.
 - Raw `gh` is appropriate only for operations outside Inari's governed surface or when Inari is unavailable. When falling back because Inari is unavailable, state that fallback explicitly.
@@ -137,6 +150,8 @@ Core expectations:
 - `codex-scoped`: one bounded implementation authority by default; do not assume orchestration capabilities not exposed by the active runtime.
 
 A runtime profile never authorizes bypass of Issue scope, worktree isolation, branch/base routing, Inari, validation, or repository guards.
+
+When the user requests multiple targets and the active runtime supports orchestration, start every dependency- and write-set-independent leaf as soon as it is runnable. Do not serialize independent setup, implementation, or validation behind another leaf solely for convenience.
 
 ## 12. Operational truthfulness
 
