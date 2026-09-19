@@ -99,6 +99,8 @@ import type { SessionMachineInput } from "./state/session/types.js";
 import {
   primarySessionLifecycleAction,
   projectSessionLifecycleActions,
+  reconciliationApplyAction,
+  type SessionLifecycleApplyAction,
   type SessionLifecycleAction,
 } from "./session-lifecycle-actions.js";
 
@@ -108,10 +110,13 @@ export {
   primarySessionLifecycleNextAction,
   projectSessionLifecycleActions,
   projectSessionLifecycleNextActions,
+  reconciliationApplyAction,
   SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION,
+  SESSION_LIFECYCLE_APPLY_ACTION_SCHEMA_VERSION,
 } from "./session-lifecycle-actions.js";
 export type {
   SessionLifecycleAction,
+  SessionLifecycleApplyAction,
   SessionLifecycleActionId,
   SessionLifecycleNextAction,
   SessionLifecycleNextActionId,
@@ -159,6 +164,7 @@ export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
 export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
 export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
+export const RECONCILIATION_APPLY_SCHEMA_VERSION = 1 as const;
 export const SESSION_DIAGNOSTIC_SCHEMA_VERSION = 1 as const;
 export const DISCARD_RESULT_SCHEMA_VERSION = 1 as const;
 export const DISCARD_PREVIEW_SCHEMA_VERSION = 1 as const;
@@ -571,6 +577,26 @@ export interface ReconciliationResult {
   readonly sessions: readonly ReconciliationSession[];
   readonly issues: readonly ReconciliationIssue[];
   readonly clean: boolean;
+}
+
+/** Result of applying one identity-bound lifecycle reconciliation. */
+export interface ReconciliationApplyResult {
+  readonly schemaVersion: typeof RECONCILIATION_APPLY_SCHEMA_VERSION;
+  readonly operation: "reconcile-apply";
+  readonly outcome: "completed" | "already-terminal";
+  readonly repositoryId: string;
+  readonly sessionId: string;
+  readonly action: SessionLifecycleApplyAction;
+  readonly session: SessionRecord;
+  readonly lifecycle: SessionLifecycleClassification;
+  readonly physicalState: string;
+  readonly claims: readonly ResourceClaim[];
+  readonly releasedClaims: readonly ResourceClaim[];
+  readonly releasedClaimCount: number;
+  readonly worktreeRemoved: boolean;
+  readonly branchRemoved: boolean;
+  readonly claimSetGeneration: number;
+  readonly reconciliation?: CleanupReconciliation;
 }
 
 export interface ClaimResourcesOptions {
@@ -2799,6 +2825,181 @@ export class SessionRegistry {
     operation?: "close" | "discard" | "gc",
   ): CleanupReconciliation {
     return this.reconcileCleanup(sessionIdOrOptions, operation);
+  }
+
+  /**
+   * Apply one explicitly selected, identity-bound lifecycle reconciliation.
+   *
+   * This is intentionally narrower than garbage collection: elapsed age never
+   * authorizes it, and every physical effect is delegated to the existing
+   * cleanup actor. The selected session is required so a destructive target is
+   * never inferred from the current worktree.
+   */
+  reconcileApply(sessionId: string): ReconciliationApplyResult {
+    return this.withLock(() => {
+      assertSessionId(sessionId);
+      const state = this.readStateUnsafe();
+      const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+      if (record === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+
+      const ownedClaims = state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim);
+      const applyAction = reconciliationApplyAction(sessionId);
+      if (record.state === "closed") {
+        const reconciliation = this.observeCleanupReconciliation(record, "gc");
+        if (reconciliation.outcome !== "completed" || ownedClaims.length > 0) {
+          throw new SessionRegistryError(
+            "RECONCILIATION_DRIFT",
+            "A terminal session did not re-observe a fully converged physical and claim state",
+            {
+              sessionId,
+              action: applyAction as unknown as RegistryErrorDetailValue,
+              physicalState: "closed",
+              claims: ownedClaims as unknown as RegistryErrorDetailValue,
+              reconciliation: reconciliation as unknown as RegistryErrorDetailValue,
+              nextActions: ["retain-session", "reconcile-physical-state"],
+            },
+          );
+        }
+        const lifecycle = classifySessionLifecycle({
+          sessionState: record.state,
+          physicalState: "closed",
+          closeReadiness: "ready",
+          terminalOperation: record.terminalOperation,
+          phase: "termination",
+        });
+        return {
+          schemaVersion: RECONCILIATION_APPLY_SCHEMA_VERSION,
+          operation: "reconcile-apply",
+          outcome: "already-terminal",
+          repositoryId: this.repository.repositoryId,
+          sessionId,
+          action: applyAction,
+          session: cloneSessionRecord(record),
+          lifecycle,
+          physicalState: "closed",
+          claims: Object.freeze([]),
+          releasedClaims: Object.freeze([]),
+          releasedClaimCount: 0,
+          worktreeRemoved: false,
+          branchRemoved: false,
+          claimSetGeneration: state.claimSetGeneration,
+          reconciliation,
+        };
+      }
+
+      const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
+      const now = toTimestamp(this.clock());
+      const assessment = assessGarbageCollection(record, now, this.staleAfterMs, worktrees);
+      const decision = this.cleanupDecisionUnsafe(record, state);
+      const lifecycle =
+        decision.lifecycle ??
+        classifySessionLifecycle({
+          sessionState: record.state,
+          physicalState: decision.physicalState,
+          closeReadiness: decision.allowed ? "ready" : "blocked",
+          terminalOperation: record.terminalOperation,
+          phase: "termination",
+        });
+      const nextActions = projectSessionLifecycleActions({
+        classification: lifecycle!,
+        sessionId,
+        blockers: decision.blockers.map((blocker) => ({ code: blocker.code, details: blocker.details })),
+      });
+
+      if (!decision.allowed) {
+        const blocker = decision.blockers[0];
+        if (blocker === undefined) {
+          throw new SessionRegistryError("OPERATION_REJECTED", "Lifecycle reconciliation was rejected", {
+            sessionId,
+            action: applyAction as unknown as RegistryErrorDetailValue,
+            physicalState: decision.physicalState,
+            lifecycle: lifecycle as unknown as RegistryErrorDetailValue,
+            claims: ownedClaims as unknown as RegistryErrorDetailValue,
+            nextActions: nextActions as unknown as RegistryErrorDetailValue,
+          });
+        }
+        throw new SessionRegistryError(blocker.code, blocker.message, {
+          ...blocker.details,
+          sessionId,
+          action: applyAction as unknown as RegistryErrorDetailValue,
+          physicalState: decision.physicalState,
+          lifecycle: lifecycle as unknown as RegistryErrorDetailValue,
+          claims: ownedClaims as unknown as RegistryErrorDetailValue,
+          nextActions: nextActions as unknown as RegistryErrorDetailValue,
+        });
+      }
+
+      // Physical absence can be positively recoverable when the cleanup
+      // authority proves the registered branch is still the owned, integrated
+      // branch. Healthy age-only observations remain ineligible.
+      const unregisteredMissingRecovery =
+        assessment.physicalState === "unregistered-missing" &&
+        // An absent path is not ownership evidence. For this state the
+        // existing cleanup authority must also observe the registered branch;
+        // its integration proof is evaluated by cleanupDecisionUnsafe above.
+        localBranchExists(this.git, this.repository.worktreePath, record.branchId);
+      const interruptedDiscardRecovery =
+        record.terminalOperation === "discard" && record.state === "closing" && unregisteredMissingRecovery;
+      const interruptedCleanupRecovery =
+        record.state === "closing" &&
+        assessment.physicalState === "unregistered-missing" &&
+        (record.cleanupHead !== undefined || record.discardedHead !== undefined);
+      const independentlyAuthorized =
+        assessment.destructiveEligibility === "eligible" ||
+        unregisteredMissingRecovery ||
+        interruptedDiscardRecovery ||
+        interruptedCleanupRecovery;
+      if (!independentlyAuthorized) {
+        const code: RegistryErrorCode =
+          assessment.destructiveEligibility === "ambiguous" ? "GIT_STATE_AMBIGUOUS" : "OPERATION_REJECTED";
+        throw new SessionRegistryError(code, "Lifecycle reconciliation has no independent destructive authority", {
+          sessionId,
+          action: applyAction as unknown as RegistryErrorDetailValue,
+          physicalState: assessment.physicalState,
+          destructiveEligibility: assessment.destructiveEligibility,
+          destructiveEligibilityReason: assessment.destructiveEligibilityReason,
+          lifecycle: lifecycle as unknown as RegistryErrorDetailValue,
+          claims: ownedClaims as unknown as RegistryErrorDetailValue,
+          nextActions: nextActions as unknown as RegistryErrorDetailValue,
+          recoveryHints: ["retain-session", "reconcile-physical-state"],
+        });
+      }
+
+      const operation =
+        record.terminalOperation === "discard"
+          ? "discard"
+          : unregisteredMissingRecovery || interruptedCleanupRecovery
+            ? "close"
+            : "gc";
+      const result =
+        operation === "discard"
+          ? this.coordinateCleanupUnsafe("discard", sessionId)
+          : operation === "close"
+            ? this.coordinateCleanupUnsafe("close", sessionId)
+            : this.coordinateCleanupUnsafe("gc", sessionId);
+      const terminalSession = result.session;
+      const releasedClaims = operation === "discard" ? (result as DiscardSessionResult).releasedClaims : ownedClaims;
+      return {
+        schemaVersion: RECONCILIATION_APPLY_SCHEMA_VERSION,
+        operation: "reconcile-apply",
+        outcome: "completed",
+        repositoryId: this.repository.repositoryId,
+        sessionId,
+        action: applyAction,
+        session: cloneSessionRecord(terminalSession),
+        lifecycle,
+        physicalState: assessment.physicalState,
+        claims: Object.freeze(ownedClaims),
+        releasedClaims: Object.freeze(releasedClaims.map(cloneResourceClaim)),
+        releasedClaimCount: releasedClaims.length,
+        worktreeRemoved: result.worktreeRemoved,
+        branchRemoved: result.branchRemoved,
+        claimSetGeneration: result.claimSetGeneration,
+        ...(result.reconciliation === undefined ? {} : { reconciliation: result.reconciliation }),
+      };
+    });
   }
 
   /** Close one session only after its ownership and recoverability are proven safe. */

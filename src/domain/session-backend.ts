@@ -38,6 +38,8 @@ import {
   type SessionCloseResult,
   type SessionDiscardResult,
   type SessionDiscardPreview,
+  type ReconciliationApplyResult,
+  type SessionLifecycleApplyAction,
   type CleanupReconciliation,
   type SessionContext,
   type SessionCreateOptions,
@@ -439,6 +441,15 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
+  public reconcileApply(context: SessionContext, sessionId: string): Promise<DomainResult<ReconciliationApplyResult>> {
+    try {
+      const result = this.registryFor(context).reconcileApply(sessionId);
+      return Promise.resolve(success(toDomainReconciliationApplyResult(result)));
+    } catch (error: unknown) {
+      return Promise.resolve(failure(toDomainError(error)));
+    }
+  }
+
   public garbageCollect(
     context: SessionContext,
     options: GarbageCollectOptions,
@@ -831,6 +842,46 @@ function toDomainGarbageCollectResult(result: RegistryGarbageCollectResult): Gar
       details: { ...blocked.details },
       recovery_hints: [...blocked.recoveryHints],
     })),
+  };
+}
+
+function toDomainReconciliationApplyResult(
+  result: import("../session-registry.js").ReconciliationApplyResult,
+): ReconciliationApplyResult {
+  return {
+    schema_version: result.schemaVersion,
+    operation: result.operation,
+    outcome: result.outcome,
+    repository: result.repositoryId,
+    session_id: result.sessionId,
+    action: toDomainSessionLifecycleApplyAction(result.action),
+    session: toDomainRecord(result.session),
+    lifecycle: toDomainLifecycleProjection(result.lifecycle),
+    physical_state: result.physicalState,
+    claims: result.claims.map(toDomainClaim),
+    released_claims: result.releasedClaims.map(toDomainClaim),
+    released_claim_count: result.releasedClaimCount,
+    worktree_removed: result.worktreeRemoved,
+    branch_removed: result.branchRemoved,
+    claim_set_generation: result.claimSetGeneration,
+    ...(result.reconciliation === undefined
+      ? {}
+      : { reconciliation: toDomainCleanupReconciliation(result.reconciliation) }),
+  };
+}
+
+function toDomainSessionLifecycleApplyAction(
+  action: import("../session-lifecycle-actions.js").SessionLifecycleApplyAction,
+): SessionLifecycleApplyAction {
+  return {
+    schema_version: action.schemaVersion,
+    action_id: action.actionId,
+    kind: action.kind,
+    command: action.command,
+    session_id: action.sessionId,
+    required_args: [...action.requiredArgs] as ["--session", string, "--apply"],
+    requires_explicit_intent: action.requiresExplicitIntent,
+    mutates: action.mutates,
   };
 }
 

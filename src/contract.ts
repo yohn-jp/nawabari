@@ -16,7 +16,11 @@ import {
   SESSION_LIFECYCLE_STATES,
   SESSION_LIFECYCLE_TRANSITION_TABLE,
 } from "./session-lifecycle-classification.js";
-import { SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION, type SessionLifecycleActionId } from "./session-lifecycle-actions.js";
+import {
+  SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION,
+  SESSION_LIFECYCLE_APPLY_ACTION_SCHEMA_VERSION,
+  type SessionLifecycleActionId,
+} from "./session-lifecycle-actions.js";
 import {
   SANDBOX_CONTRACT_ID,
   SANDBOX_CONTRACT_SCHEMA_VERSION,
@@ -24,7 +28,7 @@ import {
   SANDBOX_REQUIRED_CAPABILITIES,
 } from "./domain/sandbox.js";
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
-import { DISCARD_PREVIEW_SCHEMA_VERSION } from "./session-registry.js";
+import { DISCARD_PREVIEW_SCHEMA_VERSION, RECONCILIATION_APPLY_SCHEMA_VERSION } from "./session-registry.js";
 import { SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION, SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION } from "./domain/session.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
@@ -424,11 +428,61 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
         ] satisfies readonly SessionLifecycleActionId[],
         execution: "caller-must-invoke-explicit-command",
         ambiguity: "retain-or-reconcile; no-destructive-action",
+        apply_actions: {
+          schema_version: SESSION_LIFECYCLE_APPLY_ACTION_SCHEMA_VERSION,
+          action_ids: ["reconcile-physical-state-apply"],
+          command: "session reconcile",
+          required_args: ["--session <id>", "--apply"],
+          explicit_intent: true,
+        },
       },
     },
     failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-diagnostics"],
     failure_code_policy: {
       source: "implementation-owned session-diagnostics vocabulary",
+      missing_or_extra: "deterministic conformance failure",
+      internal_exceptions: [],
+    },
+  },
+  {
+    id: "session-reconciliation",
+    commands: ["session reconcile"],
+    result_schema: "session-reconcile-apply.v1",
+    result_schema_version: RECONCILIATION_APPLY_SCHEMA_VERSION,
+    result_schemas: [
+      {
+        schema: "session-reconcile-apply.v1",
+        version: RECONCILIATION_APPLY_SCHEMA_VERSION,
+        commands: ["session reconcile"],
+      },
+    ],
+    identities: [
+      "session_id",
+      "repository",
+      "session",
+      "lifecycle",
+      "physical_state",
+      "claims",
+      "released_claims",
+      "outcome",
+      "reconciliation",
+      "action",
+    ],
+    authority: "existing-session-lifecycle-and-cleanup-actor",
+    target: "explicit-session-required",
+    apply_flag: "--apply",
+    action: {
+      schema_version: SESSION_LIFECYCLE_APPLY_ACTION_SCHEMA_VERSION,
+      action_id: "reconcile-physical-state-apply",
+      command: "session reconcile",
+      required_args: ["--session <id>", "--apply"],
+      explicit_intent: true,
+    },
+    age_rule: "elapsed-age-is-diagnostic-only",
+    fail_closed: true,
+    failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-reconciliation"],
+    failure_code_policy: {
+      source: "implementation-owned session-reconciliation vocabulary",
       missing_or_extra: "deterministic conformance failure",
       internal_exceptions: [],
     },

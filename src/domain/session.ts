@@ -261,6 +261,17 @@ export type SessionLifecycleAction =
       mutates: false;
     };
 
+export type SessionLifecycleApplyAction = {
+  schema_version: 2;
+  action_id: "reconcile-physical-state-apply";
+  kind: "reconcile-apply";
+  command: "session reconcile";
+  session_id: string;
+  required_args: ["--session", string, "--apply"];
+  requires_explicit_intent: true;
+  mutates: true;
+};
+
 export type SessionDiagnostic = {
   schema_version: number;
   session_id: string;
@@ -769,6 +780,25 @@ export type GarbageCollectResult = {
   blocked?: GarbageCollectBlocked[];
 };
 
+export type ReconciliationApplyResult = {
+  schema_version: number;
+  operation: "reconcile-apply";
+  outcome: "completed" | "already-terminal";
+  repository: string;
+  session_id: string;
+  action: SessionLifecycleApplyAction;
+  session: SessionRecord;
+  lifecycle: SessionLifecycleProjection;
+  physical_state: string;
+  claims: ResourceClaim[];
+  released_claims: ResourceClaim[];
+  released_claim_count: number;
+  worktree_removed: boolean;
+  branch_removed: boolean;
+  claim_set_generation: number;
+  reconciliation?: CleanupReconciliation;
+};
+
 /** Result of explicitly upgrading the persisted resource-claim schema. */
 export type RegistryMigrationResult = {
   migrated: boolean;
@@ -805,6 +835,7 @@ export interface SessionBackend {
     context: SessionContext,
     options: SessionDiagnosticOptions,
   ): Promise<DomainResult<SessionDiagnostic>>;
+  reconcileApply?(context: SessionContext, sessionId: string): Promise<DomainResult<ReconciliationApplyResult>>;
   garbageCollect(context: SessionContext, options: GarbageCollectOptions): Promise<DomainResult<GarbageCollectResult>>;
   claimResources?(context: SessionContext, options: ClaimResourcesOptions): Promise<DomainResult<ClaimResourcesResult>>;
   updateClaims?(context: SessionContext, options: UpdateClaimsOptions): Promise<DomainResult<ClaimResourcesResult>>;
@@ -883,6 +914,10 @@ class UnavailableSessionBackend implements SessionBackend {
 
   discardSession(_context: SessionContext, _sessionId: string): Promise<DomainResult<SessionDiscardResult>> {
     return this.unavailable("session.discard");
+  }
+
+  reconcileApply(_context: SessionContext, _sessionId: string): Promise<DomainResult<ReconciliationApplyResult>> {
+    return this.unavailable("session.reconcile");
   }
 
   garbageCollect(

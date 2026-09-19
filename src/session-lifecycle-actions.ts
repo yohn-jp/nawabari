@@ -6,6 +6,8 @@ import { lifecycleTransition, type SessionLifecycleClassification } from "./sess
  * authority or performs the action.
  */
 export const SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION = 1 as const;
+/** Versioned action descriptor for the mutating reconciliation command. */
+export const SESSION_LIFECYCLE_APPLY_ACTION_SCHEMA_VERSION = 2 as const;
 
 export type SessionLifecycleActionId =
   | "retain-session"
@@ -107,6 +109,31 @@ function reconcileAction(sessionId: string): SessionLifecycleAction {
     command: "doctor",
     sessionId,
     mutates: false,
+  });
+}
+
+export type SessionLifecycleApplyAction = {
+  readonly schemaVersion: typeof SESSION_LIFECYCLE_APPLY_ACTION_SCHEMA_VERSION;
+  readonly actionId: "reconcile-physical-state-apply";
+  readonly kind: "reconcile-apply";
+  readonly command: "session reconcile";
+  readonly sessionId: string;
+  readonly requiredArgs: readonly ["--session", string, "--apply"];
+  readonly requiresExplicitIntent: true;
+  readonly mutates: true;
+};
+
+/** Build the explicit v2 action descriptor for mutating reconciliation. */
+export function reconciliationApplyAction(sessionId: string): SessionLifecycleApplyAction {
+  return Object.freeze({
+    schemaVersion: SESSION_LIFECYCLE_APPLY_ACTION_SCHEMA_VERSION,
+    actionId: "reconcile-physical-state-apply",
+    kind: "reconcile-apply",
+    command: "session reconcile",
+    sessionId,
+    requiredArgs: Object.freeze(["--session", sessionId, "--apply"] as const),
+    requiresExplicitIntent: true,
+    mutates: true,
   });
 }
 
