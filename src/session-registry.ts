@@ -212,6 +212,8 @@ export interface ProvisionSessionOptions {
   readonly branchName?: string;
   readonly baseRef?: string;
   readonly label?: string;
+  /** Complete initial claim declaration committed with the new session. */
+  readonly initialClaims?: readonly ResourceClaimInput[];
   readonly defaultBranchName?: string;
   readonly protectedBranchNames?: readonly string[];
   readonly protectedWorktreePaths?: readonly string[];
@@ -1427,7 +1429,16 @@ export class SessionRegistry {
           branchName: resources.branchName,
           git: this.git,
         });
-        this.writeUnsafe([...state.sessions, record], state.claims, state.claimSetGeneration);
+        const owner: ClaimOwner = { ...record, record };
+        const initialClaims =
+          options.initialClaims === undefined
+            ? []
+            : this.canonicalClaimInputs(options.initialClaims, owner, true).map((input) =>
+                createResourceClaim(input, owner, toTimestamp(this.clock())),
+              );
+        this.assertCompleteClaimSet(initialClaims, owner, state.claims, [...state.sessions, record]);
+        const nextClaims = sortResourceClaims([...state.claims, ...initialClaims]);
+        this.writeUnsafe([...state.sessions, record], nextClaims, nextClaimSetGeneration(state, nextClaims));
         return cloneSessionRecord(record);
       } catch (error: unknown) {
         if (gitProvisioned && this.absenceProvenAfterProvisioningFailure(error, sessionId)) {

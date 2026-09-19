@@ -36,6 +36,8 @@ export type SessionCreateOptions = {
   worktree_root?: string | null;
   label: string | null;
   base?: string | null;
+  /** Explicit initial claims to commit with the provisioned session. */
+  claims?: ResourceClaimInput[] | null;
 };
 
 export type ResourceClaimMode = "read" | "write" | "exclusive-write";

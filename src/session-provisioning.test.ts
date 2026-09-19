@@ -41,6 +41,104 @@ test("provision creates one dedicated worktree and one mutable branch", () => {
   }
 });
 
+test("provision commits the complete initial claim set with the session", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-initial-claims");
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({
+      worktreePath,
+      branchName: "feature/provisioned-initial-claims",
+      initialClaims: [
+        { resource: "README.md", mode: "write" },
+        { resource: "src/**", mode: "read" },
+      ],
+    });
+
+    assert.deepEqual(
+      registry.listClaims(session.sessionId).map((claim) => [claim.resource, claim.mode]),
+      [
+        ["README.md", "write"],
+        ["src/**", "read"],
+      ],
+    );
+    assert.equal(registry.getClaimSetGeneration(), 1);
+    assert.equal(registry.list().length, 1);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("invalid initial claims roll back newly provisioned Git resources", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-invalid-claim");
+  const branchName = "feature/provisioned-invalid-claim";
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    assertRegistryError(
+      () =>
+        registry.provision({
+          worktreePath,
+          branchName,
+          initialClaims: [{ resource: "../outside", mode: "write" }],
+        }),
+      "CLAIM_PATH_TRAVERSAL",
+    );
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], fixture.repositoryPath),
+      false,
+    );
+    assert.deepEqual(registry.list(), []);
+    assert.deepEqual(registry.listClaims(), []);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
+test("conflicting initial claims reject without leaving a second session", () => {
+  const fixture = createRepositoryFixture();
+  const firstPath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-claim-owner");
+  const secondPath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-claim-conflict");
+  const secondBranch = "feature/provisioned-claim-conflict";
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const first = registry.provision({
+      worktreePath: firstPath,
+      branchName: "feature/provisioned-claim-owner",
+      initialClaims: [{ resource: "README.md", mode: "write" }],
+    });
+
+    assertRegistryError(
+      () =>
+        registry.provision({
+          worktreePath: secondPath,
+          branchName: secondBranch,
+          initialClaims: [{ resource: "README.md", mode: "write" }],
+        }),
+      "RESOURCE_CLAIM_CONFLICT",
+    );
+    assert.equal(fs.existsSync(secondPath), false);
+    assert.equal(
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${secondBranch}`], fixture.repositoryPath),
+      false,
+    );
+    assert.deepEqual(
+      registry.list().map((record) => record.sessionId),
+      [first.sessionId],
+    );
+    assert.equal(registry.listClaims().length, 1);
+  } finally {
+    removeWorktree(fixture.repositoryPath, firstPath);
+    removeWorktree(fixture.repositoryPath, secondPath);
+    runGitQuiet(["branch", "-D", "--", secondBranch], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
 test("provision creates the safe default managed root only when it is needed", () => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-default-root-"));
   const repositoryPath = path.join(parent, "repository");
@@ -345,7 +443,7 @@ test("a durability-uncertain registry write after provisioning does not roll bac
     assert.throws(
       () => {
         session = withDirectoryFsyncFailure(registry.paths.directory, "EIO", () =>
-          registry.provision({ worktreePath, branchName }),
+          registry.provision({ worktreePath, branchName, initialClaims: [{ resource: "README.md", mode: "write" }] }),
         );
       },
       (error: unknown) => {
@@ -370,6 +468,10 @@ test("a durability-uncertain registry write after provisioning does not roll bac
     assert.equal(records.length, 1);
     assert.equal(records[0].worktreePath, fs.realpathSync.native(worktreePath));
     assert.equal(records[0].branchName, branchName);
+    assert.deepEqual(
+      reread.listClaims(records[0].sessionId).map((claim) => [claim.resource, claim.mode]),
+      [["README.md", "write"]],
+    );
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
     runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);

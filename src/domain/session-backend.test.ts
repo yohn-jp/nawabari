@@ -31,6 +31,36 @@ test("local session backend provisions through the domain contract", async () =>
   }
 });
 
+test("local session backend provisions initial claims in the same registry mutation", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-domain-initial-claims`;
+  try {
+    const backend = new LocalSessionBackend();
+    const result = await backend.createSession(
+      { cwd: repositoryPath },
+      {
+        branch: "feature/domain-initial-claims",
+        worktree: worktreePath,
+        label: null,
+        base: null,
+        claims: [{ resource: "README.md", mode: "write" }],
+      },
+    );
+
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    assert.deepEqual(
+      registry.listClaims(result.value.session_id).map((claim) => claim.mode),
+      ["write"],
+    );
+    assert.equal(registry.listClaims(result.value.session_id)[0]?.resource, "README.md");
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("status exposes the resolved managed root and bounded history selection", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-status-root`;
