@@ -17,6 +17,8 @@ permissions:
 
 jobs:
   validate-pr:
-    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@main
+    # The provider revision is immutable; validation still executes against
+    # this repository's checked-in .github/inari snapshot.
+    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@1231c1ba59f5eb2ab053f39327b0d6cf64fee809
     permissions:
       contents: read

@@ -23,17 +23,27 @@ test("accepts immutable external actions and repository-local actions", () => {
   assert.equal(result.references.filter((reference) => reference.local).length, 1);
 });
 
-test("accepts the pinned canonical reusable governance workflows", () => {
+test("accepts immutable canonical reusable governance workflows", () => {
   const result = validateActionText(
     [
-      "    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@main",
-      "    uses: yohn-jp/.github/.github/workflows/issue-governance.yml@main",
+      "    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@" + sha,
+      "    uses: yohn-jp/.github/.github/workflows/issue-governance.yml@" + sha,
     ].join("\n"),
     ".github/workflows/example.yml",
   );
 
   assert.deepEqual(result.errors, []);
   assert.equal(result.references.filter((reference) => reference.trustedReusableWorkflow).length, 2);
+});
+
+test("rejects mutable canonical reusable governance workflows", () => {
+  const result = validateActionText(
+    "    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@main",
+    ".github/workflows/example.yml",
+  );
+
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /full 40-character commit SHA/u);
 });
 
 test("rejects mutable untrusted reusable workflow references", () => {
