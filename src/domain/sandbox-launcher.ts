@@ -32,6 +32,11 @@ import {
   type SessionRuntimeProjection,
 } from "./runtime-projection.js";
 import {
+  resolveWorkingSetPaths,
+  workingSetNamespacePath,
+  type WorkingSetRuntimeProjection,
+} from "./working-set-runtime-projection.js";
+import {
   attachProcessToCgroup,
   cleanupCgroupScope,
   cgroupLimitEvents,
@@ -560,6 +565,151 @@ function addDirectory(args: string[], destination: string, seen: Set<string>): v
   }
 }
 
+// Landlock is an allowlist.  Working-set directories therefore receive only
+// traversal/listing access; file content and file mutation access are granted
+// per materialized path.  This keeps an omitted/denied sibling outside the
+// agent's read and write boundary without replacing the authoritative bind.
+const WORKING_SET_EXECUTE = 1 << 0;
+const WORKING_SET_WRITE_FILE = 1 << 1;
+const WORKING_SET_READ_FILE = 1 << 2;
+const WORKING_SET_READ_DIR = 1 << 3;
+const WORKING_SET_REMOVE_DIR = 1 << 4;
+const WORKING_SET_REMOVE_FILE = 1 << 5;
+const WORKING_SET_MAKE_DIR = 1 << 7;
+const WORKING_SET_MAKE_REG = 1 << 8;
+const WORKING_SET_REFER = 1 << 13;
+const WORKING_SET_TRUNCATE = 1 << 14;
+const WORKING_SET_DIRECTORY_TRAVERSE = WORKING_SET_EXECUTE | WORKING_SET_READ_DIR;
+const WORKING_SET_FILE_READ = WORKING_SET_EXECUTE | WORKING_SET_READ_FILE;
+const WORKING_SET_FILE_WRITE = WORKING_SET_FILE_READ | WORKING_SET_WRITE_FILE | WORKING_SET_TRUNCATE;
+const WORKING_SET_CREATE = WORKING_SET_DIRECTORY_TRAVERSE | WORKING_SET_MAKE_DIR | WORKING_SET_MAKE_REG;
+const WORKING_SET_DELETE =
+  WORKING_SET_DIRECTORY_TRAVERSE | WORKING_SET_REMOVE_DIR | WORKING_SET_REMOVE_FILE | WORKING_SET_REFER;
+
+function workingSetParentRules(rules: Map<string, number>, candidate: string): void {
+  let parent = path.posix.dirname(candidate);
+  while (parent !== "/" && parent !== ".") {
+    rules.set(parent, (rules.get(parent) ?? 0) | WORKING_SET_DIRECTORY_TRAVERSE);
+    parent = path.posix.dirname(parent);
+  }
+}
+
+function workingSetRule(rules: Map<string, number>, candidate: string, access: number): void {
+  if (!path.posix.isAbsolute(candidate) || candidate === "/" || candidate.includes("\0")) return;
+  workingSetParentRules(rules, candidate);
+  rules.set(candidate, (rules.get(candidate) ?? 0) | access);
+}
+
+function workingSetDenied(projection: WorkingSetRuntimeProjection, relative: string): boolean {
+  // The runtime projection has already validated selector syntax.  Matching
+  // is intentionally local and bounded; no repository contents are placed in
+  // an error or diagnostic payload.
+  const glob = (selector: string): RegExp => {
+    let source = "^";
+    for (let index = 0; index < selector.length; index += 1) {
+      const character = selector[index] as string;
+      if (character === "*" && selector[index + 1] === "*") {
+        source += ".*";
+        index += 1;
+      } else if (character === "*") source += "[^/]*";
+      else if (character === "?") source += "[^/]";
+      else source += character.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    }
+    return new RegExp(`${source}$`, "u");
+  };
+  return projection.scope.deny.some((selector) => glob(selector).test(relative));
+}
+
+function workingSetSelectors(
+  projection: WorkingSetRuntimeProjection,
+  operation: "readOnly" | "write" | "create" | "delete",
+) {
+  return projection.scope[operation];
+}
+
+function deriveWorkingSetRules(
+  topology: ValidatedTopology,
+  projection: WorkingSetRuntimeProjection,
+): readonly LandlockRule[] {
+  const rules = new Map<string, number>();
+  // chdir and path lookup must remain possible even when the set is empty;
+  // this grants no file-content access.
+  workingSetRule(rules, topology.worktree, WORKING_SET_DIRECTORY_TRAVERSE);
+
+  for (const operation of ["readOnly", "write"] as const) {
+    const paths = resolveWorkingSetPaths(topology.worktree, workingSetSelectors(projection, operation));
+    for (const candidate of paths) {
+      const relative = path.relative(topology.worktree, candidate).split(path.sep).join("/");
+      if (relative === "" || workingSetDenied(projection, relative)) continue;
+      const namespace = workingSetNamespacePath(topology.worktree, relative);
+      let directory = false;
+      try {
+        directory = fs.lstatSync(candidate).isDirectory();
+      } catch {
+        continue;
+      }
+      if (directory) workingSetRule(rules, namespace, WORKING_SET_DIRECTORY_TRAVERSE);
+      else workingSetRule(rules, namespace, operation === "write" ? WORKING_SET_FILE_WRITE : WORKING_SET_FILE_READ);
+    }
+  }
+
+  // CREATE and DELETE are operation-specific directory permissions.  They do
+  // not imply READ or WRITE, and exact non-existent create targets still get
+  // their parent directory rule.  A DENY selector is checked before any rule
+  // is emitted, so it can never win by ordering or by a later broad grant.
+  for (const operation of ["create", "delete"] as const) {
+    for (const selector of workingSetSelectors(projection, operation)) {
+      if (workingSetDenied(projection, selector)) continue;
+      const matches = resolveWorkingSetPaths(topology.worktree, [selector]);
+      const candidates =
+        matches.length > 0
+          ? matches
+          : selector.includes("*") || selector.includes("?")
+            ? []
+            : [path.resolve(topology.worktree, selector)];
+      for (const candidate of candidates) {
+        const relative = path.relative(topology.worktree, candidate).split(path.sep).join("/");
+        if (relative === "" || workingSetDenied(projection, relative)) continue;
+        const namespace = workingSetNamespacePath(topology.worktree, relative);
+        let directory = false;
+        try {
+          directory = fs.lstatSync(candidate).isDirectory();
+        } catch {
+          directory = false;
+        }
+        const target = directory && operation === "create" ? namespace : path.posix.dirname(namespace);
+        workingSetRule(rules, target, operation === "create" ? WORKING_SET_CREATE : WORKING_SET_DELETE);
+      }
+    }
+  }
+
+  return [...rules.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([rulePath, allowed_access]) => ({ path: rulePath, allowed_access }));
+}
+
+function isNamespaceChild(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}/`);
+}
+
+function boundedBaselineRules(rules: readonly LandlockRule[]): readonly LandlockRule[] {
+  const result: LandlockRule[] = [];
+  for (const rule of rules) {
+    // Git metadata/object access is Nawabari lifecycle authority, not an
+    // implicit agent visibility grant. The authoritative worktree remains
+    // mounted and truthful; lifecycle/Git callers run outside this process.
+    if (isNamespaceChild(rule.path, "/nawabari/git")) continue;
+    // Auxiliary state is separately declared. Keep only traversal at HOME so
+    // a bounded agent cannot use its private/shared mounts as a side channel.
+    if (rule.path === "/home/nawabari" || isNamespaceChild(rule.path, "/home/nawabari/.nawabari")) {
+      result.push({ path: rule.path, allowed_access: WORKING_SET_DIRECTORY_TRAVERSE });
+      continue;
+    }
+    result.push(rule);
+  }
+  return result;
+}
+
 function addReadOnlyBind(args: string[], source: string, destination: string, seenDirectories: Set<string>): void {
   addDirectory(args, destination, seenDirectories);
   args.push("--ro-bind", source, destination);
@@ -967,7 +1117,20 @@ export function compileSandboxInvocation(
       : landlockAbi === null
         ? "reduced-defense"
         : "incompatible";
-  const landlockRequired = request.landlock_required === true;
+  const boundedWorkingSet = runtimeProjection.value?.working_set;
+  if (boundedWorkingSet !== undefined && runtimeProjection.value?.policy.mode !== "strict") {
+    return failure(
+      new DomainError(
+        "RUNTIME_PROJECTION_INVALID",
+        "A bounded working set requires the strict runtime policy; compatibility visibility is not an implicit fallback.",
+        { session_id: request.session_id },
+      ),
+    );
+  }
+  // A bounded working set is meaningful only when the second filesystem
+  // boundary is actually installed.  If Landlock or its adapter is absent,
+  // reject the protected request instead of returning an unbounded worktree.
+  const landlockRequired = request.landlock_required === true || boundedWorkingSet !== undefined;
   if (landlockRequired && !landlockSupported) {
     return failure(
       new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The required Landlock ABI is unavailable or incompatible.", {
@@ -1003,22 +1166,33 @@ export function compileSandboxInvocation(
     );
   }
   const landlockEnabled = landlockSupported && landlockExecutable.value !== null && landlockAdapterProjected;
-  const landlockRules = deriveLandlockRules(
-    request.filesystem,
+  const landlockProjection =
     legacyProfile || runtimeProjection.value === null
       ? undefined
       : {
           ...runtimeProjection.value,
+          // Worktree projections are subject to the bounded working-set
+          // rules below. Runtime/package mounts outside the worktree retain
+          // their existing projection authority.
           filesystem: [
-            ...projectionMounts.value,
+            ...projectionMounts.value.filter(
+              (projection) => !isWithinNamespace(topology.value.worktree, projection.target),
+            ),
             ...executableProjection.value.map((entry) => ({
               target: entry.target,
               access_mode: "read-only" as const,
               source_kind: entry.source_kind,
             })),
           ],
-        },
+        };
+  const landlockRules = deriveLandlockRules(
+    boundedWorkingSet === undefined ? request.filesystem : { ...request.filesystem, owned_worktree: "/nawabari/git" },
+    landlockProjection,
   );
+  const boundedLandlockRules =
+    boundedWorkingSet === undefined
+      ? landlockRules
+      : [...boundedBaselineRules(landlockRules), ...deriveWorkingSetRules(topology.value, boundedWorkingSet)];
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
   // An explicit strict projection exposes one canonical executable surface;
@@ -1134,7 +1308,7 @@ export function compileSandboxInvocation(
         landlockExecutable.value as string,
         "-c",
         LANDLOCK_TRAMPOLINE,
-        JSON.stringify(landlockRules),
+        JSON.stringify(boundedLandlockRules),
         "--",
         command.command,
         ...commandArgs,
@@ -1163,7 +1337,7 @@ export function compileSandboxInvocation(
     landlock: {
       abi: landlockAbi,
       state: landlockEnabled ? "enforced" : landlockUnavailableState,
-      rule_count: landlockRules.length,
+      rule_count: boundedLandlockRules.length,
     },
   });
 }
