@@ -21,6 +21,7 @@ import {
   type SandboxProbe,
 } from "./sandbox.js";
 import { LocalSessionBackend } from "./session-backend.js";
+import type { SessionBackend } from "./session.js";
 import { compileSandboxInvocation } from "./sandbox-launcher.js";
 import { resolveRuntimeProfile } from "./runtime-profile.js";
 
@@ -217,7 +218,7 @@ test("FHS candidate ordering is deterministic and selection is independent of PA
     const productionLayout = discoverSandboxRuntimeLayout(environmentWithFhsEvidence(fixture.candidates));
     assert.deepEqual(
       productionLayout.fhs_executable_candidates?.map((candidate) => candidate.requirement_id),
-      ["git-package", "ls-runtime", "node-runtime", "pnpm-package"],
+      ["git-package", "landlock-helper", "ls-runtime", "node-runtime", "pnpm-package"],
     );
     const materialized = resolveFhsDevelopmentRuntime({
       executable_candidates: productionLayout.fhs_executable_candidates,
@@ -421,7 +422,7 @@ test("standalone Linux protected execution runs the materialized Node/Git baseli
     const layout = discoverSandboxRuntimeLayout(environmentWithFhsEvidence(fixture.candidates, process.env.PATH ?? ""));
     assert.deepEqual(
       layout.fhs_executable_candidates?.map((candidate) => candidate.requirement_id),
-      ["git-package", "ls-runtime", "node-runtime", "pnpm-package"],
+      ["git-package", "landlock-helper", "ls-runtime", "node-runtime", "pnpm-package"],
     );
     const materialized = resolveFhsDevelopmentRuntime({
       executable_candidates: layout.fhs_executable_candidates,
@@ -510,6 +511,106 @@ test("standalone Linux protected execution runs the materialized Node/Git baseli
       assert.equal(visibility.value.exit_code, 0, JSON.stringify(visibility.value));
       assert.equal(visibility.value.stdout, "protected-fhs-development-ok");
     }
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", worktree], repository);
+    } catch {
+      // Cleanup below is sufficient if the session lifecycle already removed it.
+    }
+    fixture.cleanup();
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+/** Issue #398 regression: a bounded (working-set-constrained) session must actually execute on a strict FHS host. */
+test("a bounded session under the default strict FHS profile actually executes, with Landlock enforced", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("protected FHS execution is Linux-only");
+    return;
+  }
+  if (defaultSandboxProbe.hasBubblewrap() === false || defaultSandboxProbe.hasNamespaceSupport() === false) {
+    t.skip("bubblewrap namespace support is unavailable");
+    return;
+  }
+  const fixture = requireFixture(t);
+  if (fixture === null) return;
+  const { repository, worktree } = createRepository();
+  const realBackend = new LocalSessionBackend();
+  const created = await realBackend.createSession(
+    { cwd: repository },
+    { branch: "feature/issue-398", worktree, label: null, base: null },
+  );
+  assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+  if (!created.ok) return;
+  const sessionId = created.value.session_id;
+  fs.writeFileSync(path.join(worktree, "in-scope.txt"), "bounded-session-ok\n");
+  const workingSet = Object.freeze({
+    version: 1 as const,
+    kind: "effective-working-set" as const,
+    revision: 1,
+    id: "ews-issue-398",
+    repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+    base: { branch: "main", revision: "a".repeat(40) },
+    scope: { readOnly: ["in-scope.txt"], write: [], create: [], delete: [], deny: [] },
+    provenance: {
+      executionScope: {
+        kind: "implementation-execution-scope" as const,
+        version: 1,
+        digest: "a".repeat(64),
+        identity: "body",
+      },
+      candidateWorkingSet: {
+        kind: "candidate-working-set" as const,
+        version: 1,
+        digest: "b".repeat(64),
+        identity: "candidate",
+      },
+      repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+      base: { branch: "main", revision: "a".repeat(40) },
+    },
+  });
+  const backend: SessionBackend = {
+    guard: realBackend.guard.bind(realBackend),
+    getSession: async (context: { cwd: string }, id: string) => {
+      const result = await realBackend.getSession(context, id);
+      return result.ok ? { ok: true as const, value: { ...result.value, working_set: workingSet } } : result;
+    },
+  } as unknown as SessionBackend;
+  try {
+    const layout = discoverSandboxRuntimeLayout(environmentWithFhsEvidence(fixture.candidates, process.env.PATH ?? ""));
+    const doctor = sandboxDoctorReport(defaultSandboxProbe, layout);
+    assert.equal(doctor.strict_ready, true, doctor.strict_ready_reason ?? "strict FHS runtime was not ready");
+    assert.equal(doctor.landlock.supported, true, "Landlock must be supported to prove the bounded path end-to-end");
+
+    const request = await resolveSandboxExecutionRequest(
+      backend,
+      { cwd: worktree },
+      { session_id: sessionId, enforce: true, landlock: "required" },
+      defaultSandboxProbe,
+      layout,
+    );
+    assert.equal(request.ok, true, request.ok ? "" : JSON.stringify(request.error));
+    if (!request.ok) return;
+    assert.equal(request.value.landlock_required, true);
+
+    const result = await runSandboxedCommand(request.value, {
+      command: "/bin/sh",
+      args: ["-ceu", "IFS= read -r line < in-scope.txt; printf '%s\\n' \"$line\""],
+    });
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (!result.ok) return;
+    assert.equal(result.value.exit_code, 0, JSON.stringify(result.value));
+    assert.equal(result.value.stdout, "bounded-session-ok\n");
+    assert.equal(result.value.landlock?.state, "enforced");
+
+    // Landlock, not merely the working set's own advisory scope, is the
+    // boundary: a namespace path outside every granted rule must stay denied.
+    const denied = await runSandboxedCommand(request.value, {
+      command: "/bin/sh",
+      args: ["-ceu", "test ! -e /nawabari/landlock-outside; mkdir /nawabari/landlock-outside"],
+    });
+    assert.equal(denied.ok, true, denied.ok ? "" : JSON.stringify(denied.error));
+    if (denied.ok) assert.notEqual(denied.value.exit_code, 0, "an out-of-scope namespace write must not succeed");
   } finally {
     try {
       runGit(["worktree", "remove", "--force", worktree], repository);

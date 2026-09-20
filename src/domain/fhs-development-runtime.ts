@@ -1,9 +1,10 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { posix } from "node:path";
 import process from "node:process";
 
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
-import { materializeFhsRuntime, type FhsRuntimeExecutableDeclaration } from "./fhs-runtime.js";
+import { FHS_RUNTIME_ROOTS, materializeFhsRuntime, type FhsRuntimeExecutableDeclaration } from "./fhs-runtime.js";
 import {
   compileRuntimeExecutableProjection,
   type RuntimeExecutableProjectionEntry,
@@ -20,6 +21,7 @@ import {
   runtimeMaterializationMissingError,
   STRICT_RUNTIME_POLICY,
   validateRuntimePolicy,
+  type RuntimeFilesystemProjection,
   type RuntimePolicy,
   type RuntimeProfileIdentity,
   type RuntimeRequirement,
@@ -37,6 +39,18 @@ export const FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS = Object.freeze([
 /** Optional development tooling supported by explicit profile composition. */
 export const FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS = Object.freeze(["pnpm-package"] as const);
 
+/**
+ * The Landlock runtime adapter (a bounded Python/ctypes shim, see sandbox.ts)
+ * is not a logical development-profile requirement: it is never exposed on
+ * the canonical executable surface and is required by the sandbox launcher
+ * itself, independent of `DEVELOPMENT_RUNTIME_PROFILE`. It is resolved here,
+ * alongside the other host-evidence-backed executables, so strict FHS hosts
+ * gain the same explicit-evidence-then-fixed-root discovery contract without
+ * coupling the Nix materializer (which has no package mapping for it) to a
+ * sandbox-launcher implementation detail.
+ */
+export const FHS_LANDLOCK_HELPER_REQUIREMENT_ID = "landlock-helper" as const;
+
 const FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS = Object.freeze([
   ...FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS,
   ...FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS,
@@ -52,6 +66,7 @@ export const FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS = Object.freeze({
   "git-package": "NAWABARI_FHS_GIT_EXECUTABLE",
   "ls-runtime": "NAWABARI_FHS_LS_EXECUTABLE",
   "pnpm-package": "NAWABARI_FHS_PNPM_EXECUTABLE",
+  [FHS_LANDLOCK_HELPER_REQUIREMENT_ID]: "NAWABARI_FHS_LANDLOCK_EXECUTABLE",
 } as const);
 
 /** Stable provider identities consumed by #293's executable projection. */
@@ -60,6 +75,7 @@ export const FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS: Readonly<Record<string, strin
   "git-package": "fhs-git-package-provider",
   "ls-runtime": "fhs-ls-runtime-provider",
   "pnpm-package": "fhs-pnpm-package-provider",
+  [FHS_LANDLOCK_HELPER_REQUIREMENT_ID]: "fhs-landlock-helper-provider",
 });
 
 export type FhsDevelopmentRuntimeInput = Readonly<{
@@ -91,6 +107,19 @@ export type FhsDevelopmentRuntimeReadiness = Readonly<{
 }>;
 
 /**
+ * Requirement ids discovered by the host-evidence helpers below. This
+ * includes the Landlock helper alongside the logical development-profile
+ * requirements, since both are resolved through the same explicit-evidence
+ * then fixed-root discovery contract; `FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS`
+ * (profile requirements only) stays separate so profile validation never
+ * expects a `landlock-helper` requirement.
+ */
+const FHS_DISCOVERABLE_REQUIREMENT_IDS = Object.freeze([
+  ...FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS,
+  FHS_LANDLOCK_HELPER_REQUIREMENT_ID,
+] as const);
+
+/**
  * Read only the explicit executable-source declarations exposed by the
  * host/runtime boundary. In particular, this function never consults PATH,
  * HOME, profile directories, or Corepack state.
@@ -98,7 +127,7 @@ export type FhsDevelopmentRuntimeReadiness = Readonly<{
 export function readExplicitFhsDevelopmentExecutableCandidates(
   environment: NodeJS.ProcessEnv = process.env,
 ): readonly FhsRuntimeExecutableDeclaration[] {
-  const candidates = FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS.flatMap((requirementId) => {
+  const candidates = FHS_DISCOVERABLE_REQUIREMENT_IDS.flatMap((requirementId) => {
     const candidate = environment[FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS[requirementId]];
     return typeof candidate === "string" && candidate.length > 0
       ? [{ requirement_id: requirementId, path: candidate } satisfies FhsRuntimeExecutableDeclaration]
@@ -114,6 +143,7 @@ const FHS_DEVELOPMENT_EXECUTABLE_NAMES: Readonly<Record<string, string>> = Objec
   "git-package": "git",
   "ls-runtime": "ls",
   "pnpm-package": "pnpm",
+  [FHS_LANDLOCK_HELPER_REQUIREMENT_ID]: "python3",
 });
 
 /**
@@ -171,10 +201,11 @@ function canonicalDefaultExecutable(candidatePath: string, allowCanonicalSystemA
 export function discoverDefaultFhsDevelopmentExecutableCandidates(
   roots: readonly string[] = FHS_DEVELOPMENT_DEFAULT_EXECUTABLE_ROOTS,
 ): readonly FhsRuntimeExecutableDeclaration[] {
-  const candidates = FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS.flatMap((requirementId) => {
+  const allowCanonicalSystemAlias = new Set<string>(["ls-runtime", FHS_LANDLOCK_HELPER_REQUIREMENT_ID]);
+  const candidates = FHS_DISCOVERABLE_REQUIREMENT_IDS.flatMap((requirementId) => {
     const name = FHS_DEVELOPMENT_EXECUTABLE_NAMES[requirementId];
     for (const root of roots) {
-      const resolved = canonicalDefaultExecutable(posix.join(root, name), requirementId === "ls-runtime");
+      const resolved = canonicalDefaultExecutable(posix.join(root, name), allowCanonicalSystemAlias.has(requirementId));
       if (resolved !== null)
         return [{ requirement_id: requirementId, path: resolved } satisfies FhsRuntimeExecutableDeclaration];
     }
@@ -205,12 +236,19 @@ export function readFhsDevelopmentExecutableCandidates(
   const discovered = new Map(
     discoverDefaultFhsDevelopmentExecutableCandidates(roots).map((candidate) => [candidate.requirement_id, candidate]),
   );
-  const candidates = FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS.flatMap((requirementId) => {
+  const candidates = FHS_DISCOVERABLE_REQUIREMENT_IDS.flatMap((requirementId) => {
     const candidate = explicit.get(requirementId) ?? discovered.get(requirementId);
     return candidate === undefined ? [] : [candidate];
   });
   candidates.sort((left, right) => compareText(left.requirement_id, right.requirement_id));
   return Object.freeze(candidates.map((candidate) => Object.freeze(candidate)));
+}
+
+/** Only the Landlock helper candidate, when the host evidence resolved one. */
+function readLandlockHelperExecutableCandidate(
+  candidates: readonly FhsRuntimeExecutableDeclaration[],
+): FhsRuntimeExecutableDeclaration | null {
+  return candidates.find((candidate) => candidate.requirement_id === FHS_LANDLOCK_HELPER_REQUIREMENT_ID) ?? null;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -269,6 +307,14 @@ function invalid(field: string, reason: string, value?: string): DomainResult<ne
 
 function canonicalAbsolutePath(candidate: string): boolean {
   return posix.isAbsolute(candidate) && posix.normalize(candidate) === candidate && candidate !== "/";
+}
+
+function isExistingDirectory(candidate: string): boolean {
+  try {
+    return fs.statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function validateCandidatePath(
@@ -466,6 +512,153 @@ function developmentEntrypoints(
 }
 
 /**
+ * Ask the already-resolved, already-canonicalized interpreter for its own
+ * standard-library directory. `sysconfig` is the only correct source: the
+ * layout (a combined `lib/pythonX.Y`, or a distribution that splits out
+ * `lib-dynload`) is distro-specific, and the trampoline needs `encodings`,
+ * `ctypes`, and `json` to boot at all, not just its own ELF dependencies.
+ */
+function landlockHelperStandardLibraryDirectory(interpreterPath: string): string | null {
+  try {
+    const output = execFileSync(interpreterPath, ["-c", "import sysconfig; print(sysconfig.get_path('stdlib'))"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+    }).trim();
+    if (output.length === 0) return null;
+    const resolved = fs.realpathSync.native(output);
+    if (!canonicalAbsolutePath(resolved)) return null;
+    const stat = fs.statSync(resolved);
+    if (!stat.isDirectory()) return null;
+    if (!FHS_RUNTIME_ROOTS.some((root) => resolved === root || resolved.startsWith(`${root}/`))) return null;
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The interpreter's own ELF closure always includes libc (every dynamically
+ * linked ELF binary depends on it), and libc always lives in the platform's
+ * shared-library directory (e.g. `/usr/lib/x86_64-linux-gnu`) alongside every
+ * other multiarch shared library on an FHS host. Stdlib C-extension modules
+ * (`_ctypes` -> libffi, `_ssl` -> libssl, `zlib`, ...) `dlopen` further
+ * libraries from that same directory at runtime, invisible to static ELF
+ * `NEEDED` closure walking. Projecting the whole directory read-only, rather
+ * than trying to enumerate every C-extension's runtime dependency, keeps this
+ * bounded to a single well-known FHS root and avoids a per-extension,
+ * per-distro closure that breaks every time the stdlib gains a new import.
+ */
+function multiarchLibraryDirectory(elfClosure: readonly RuntimeFilesystemProjection[]): string | null {
+  const libc = elfClosure.find((entry) => posix.basename(entry.source).startsWith("libc.so"));
+  if (libc === undefined) return null;
+  const directory = posix.dirname(libc.source);
+  if (!canonicalAbsolutePath(directory)) return null;
+  if (!FHS_RUNTIME_ROOTS.some((root) => directory === root || directory.startsWith(`${root}/`))) return null;
+  try {
+    if (!fs.statSync(directory).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  return directory;
+}
+
+/**
+ * Best-effort Landlock runtime adapter mount. It reuses the same explicit
+ * host-evidence and ELF-closure materialization pipeline as every other FHS
+ * development requirement, but is resolved as its own single-requirement
+ * profile rather than a `DEVELOPMENT_RUNTIME_PROFILE` member: the Landlock
+ * helper is a sandbox-launcher implementation detail (see sandbox.ts),
+ * never a development-profile requirement, and the Nix materializer has no
+ * package mapping for it. Absence or an invalid candidate is not fatal here
+ * — unbounded protected execution never required Landlock visibility, and
+ * `sandbox-launcher.ts` independently fails closed when a bounded working
+ * set actually needs the adapter and finds it unprojected.
+ */
+function landlockHelperFilesystemProjection(
+  executableCandidates: readonly FhsRuntimeExecutableDeclaration[],
+  policy: RuntimePolicy,
+  librarySearchPaths: readonly string[] | undefined,
+): readonly RuntimeFilesystemProjection[] {
+  const candidate = readLandlockHelperExecutableCandidate(executableCandidates);
+  if (candidate === null) return [];
+  const requirement = {
+    id: FHS_LANDLOCK_HELPER_REQUIREMENT_ID,
+    kind: "runtime" as const,
+    name: "python3",
+    version: ">=3",
+  };
+  const materialized = materializeFhsRuntime({
+    profile: {
+      contract_id: RUNTIME_PROFILE_CONTRACT_ID,
+      schema_version: RUNTIME_PROFILE_SCHEMA_VERSION,
+      profile: { id: "landlock-helper", version: "1" },
+      selected_profiles: [{ id: "landlock-helper", version: "1" }],
+      requirements: [requirement],
+    },
+    policy,
+    executables: [{ requirement_id: requirement.id, path: candidate.path }],
+    ...(librarySearchPaths === undefined ? {} : { library_search_paths: librarySearchPaths }),
+  });
+  if (!materialized.ok) return [];
+  const directories: string[] = [];
+  const stdlib = landlockHelperStandardLibraryDirectory(candidate.path);
+  if (stdlib !== null) directories.push(stdlib);
+  const multiarchLib = multiarchLibraryDirectory(materialized.value.filesystem);
+  if (multiarchLib !== null) directories.push(multiarchLib);
+  // A directory mount below supersedes any individual file mount the ELF
+  // closure already produced under that same directory; keeping both would
+  // be a nested-target projection, which the launcher rejects as ambiguous.
+  const files = materialized.value.filesystem.filter(
+    (entry) => !directories.some((directory) => entry.target === directory || entry.target.startsWith(`${directory}/`)),
+  );
+  const directoryMounts = directories.map((directory): RuntimeFilesystemProjection =>
+    Object.freeze({ source: directory, target: directory, access_mode: "read-only", provenance: "runtime-profile" }),
+  );
+  return [...files, ...directoryMounts];
+}
+
+/**
+ * Combine two independently materialized closures (the development baseline
+ * and the Landlock helper). Both may resolve the same shared ELF dependency
+ * (e.g. the platform loader or libc) to the same target; that agreement is
+ * expected and kept once, not reported as an ambiguous duplicate target. The
+ * Landlock helper's own broad directory mounts (see
+ * `landlockHelperFilesystemProjection`) also supersede any individual file
+ * mount the development baseline separately produced beneath them.
+ */
+function mergeFilesystemProjections(
+  base: readonly RuntimeFilesystemProjection[],
+  additional: readonly RuntimeFilesystemProjection[],
+): readonly RuntimeFilesystemProjection[] {
+  const additionalDirectories = additional
+    .filter((entry) => entry.source === entry.target && isExistingDirectory(entry.source))
+    .map((entry) => entry.target);
+  const filteredBase = base.filter(
+    (entry) =>
+      !additionalDirectories.some(
+        (directory) => entry.target === directory || entry.target.startsWith(`${directory}/`),
+      ),
+  );
+  const byTarget = new Map(filteredBase.map((entry) => [entry.target, entry]));
+  const merged = [...filteredBase];
+  for (const entry of additional) {
+    const existing = byTarget.get(entry.target);
+    if (existing === undefined) {
+      byTarget.set(entry.target, entry);
+      merged.push(entry);
+    } else if (existing.source !== entry.source) {
+      // A conflicting source for the same target is a real ambiguity; keep
+      // both so the existing `assertUniqueFilesystemTargets` validation
+      // rejects it explicitly instead of this merge silently picking one.
+      merged.push(entry);
+    }
+    // Otherwise both closures agree on this shared dependency; keep it once.
+  }
+  return Object.freeze(merged);
+}
+
+/**
  * Resolve the canonical standalone Linux development baseline from explicit
  * candidates, materialize its bounded ELF/shebang closure, and compile the
  * exact result through #293's executable projection.
@@ -478,7 +671,15 @@ export function resolveFhsDevelopmentRuntime(input: unknown): DomainResult<FhsDe
     return invalid("policy", "the FHS development resolver only supports strict policy");
   const profile = resolvedProfile(input);
   if (!profile.ok) return profile;
-  const candidates = validatedCandidates(input.executable_candidates, profile.value);
+  const executableCandidatesInput: readonly FhsRuntimeExecutableDeclaration[] = Array.isArray(
+    input.executable_candidates,
+  )
+    ? (input.executable_candidates as readonly FhsRuntimeExecutableDeclaration[])
+    : [];
+  const developmentCandidatesInput = executableCandidatesInput.filter(
+    (candidate) => !isRecord(candidate) || candidate.requirement_id !== FHS_LANDLOCK_HELPER_REQUIREMENT_ID,
+  );
+  const candidates = validatedCandidates(developmentCandidatesInput, profile.value);
   if (!candidates.ok) return candidates;
   const materialized = materializeFhsRuntime({
     profile: profile.value,
@@ -489,11 +690,19 @@ export function resolveFhsDevelopmentRuntime(input: unknown): DomainResult<FhsDe
   if (!materialized.ok) return failure(materialized.error);
   const entrypoints = developmentEntrypoints(profile.value, policy.value, candidates.value);
   if (!entrypoints.ok) return entrypoints;
+  const librarySearchPaths = Array.isArray(input.library_search_paths)
+    ? (input.library_search_paths as readonly string[])
+    : undefined;
+  const landlockFilesystem = landlockHelperFilesystemProjection(
+    executableCandidatesInput,
+    policy.value,
+    librarySearchPaths,
+  );
   const projection = projectSessionRuntimeProjection({
     policy: policy.value,
     profile: profile.value.profile,
     requirements: profile.value.requirements,
-    filesystem: materialized.value.filesystem,
+    filesystem: mergeFilesystemProjections(materialized.value.filesystem, landlockFilesystem),
     executables: entrypoints.value,
   });
   if (!projection.ok) return failure(projection.error);
