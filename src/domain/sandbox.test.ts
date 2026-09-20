@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { SessionRegistry, toPersistedSessionRecord, REGISTRY_SCHEMA_VERSION } from "../session-registry.js";
+import type { SessionBackend } from "./session.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import {
   discoverSandboxRuntimeLayout,
@@ -15,6 +16,7 @@ import {
   type SandboxProbe,
 } from "./sandbox.js";
 import { EXPLICIT_COMPATIBILITY_RUNTIME_POLICY } from "./runtime-projection.js";
+import { compileWorkingSetRuntimeProjection } from "./working-set-runtime-projection.js";
 
 function readyProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe {
   return {
@@ -29,6 +31,73 @@ function readyProbe(overrides: Partial<SandboxProbe> = {}): SandboxProbe {
     hasCapabilities: () => true,
     ...overrides,
   };
+}
+
+function effectiveWorkingSet(revision = 1, readOnly: readonly string[] = ["README.md"]) {
+  return {
+    version: 1 as const,
+    kind: "effective-working-set" as const,
+    revision,
+    id: "ews-sandbox-test",
+    repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+    base: { branch: "main", revision: "a".repeat(40) },
+    scope: { readOnly, write: [], create: [], delete: [], deny: [".env"] },
+    provenance: {
+      executionScope: { kind: "implementation-execution-scope", version: 1, digest: "b".repeat(64), identity: "body" },
+      candidateWorkingSet: { kind: "candidate-working-set", version: 1, digest: "c".repeat(64), identity: "candidate" },
+      repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+      base: { branch: "main", revision: "a".repeat(40) },
+    },
+  };
+}
+
+function strictProjection() {
+  return {
+    contract_id: "nawabari.session-runtime-projection.v1" as const,
+    schema_version: 1 as const,
+    policy: {
+      mode: "strict" as const,
+      host_visibility: "default-deny" as const,
+      compatibility: "disabled" as const,
+      unrestricted_host_fallback: "forbidden" as const,
+    },
+    profile: { id: "sandbox-test", version: "1" },
+    requirements: [],
+    filesystem: [],
+    executables: [],
+  };
+}
+
+function boundedBackend(currentWorkingSet: () => ReturnType<typeof effectiveWorkingSet>): SessionBackend {
+  const session = {
+    schema_version: 1,
+    session_id: "0190f1e0-0000-7000-8000-000000000391",
+    repository: "/tmp/sandbox-working-set-repository",
+    worktree: "/tmp/sandbox-working-set-worktree",
+    branch: "feature/sandbox-working-set",
+    state: "active" as const,
+    created_at: "2026-09-20T00:00:00.000Z",
+    updated_at: "2026-09-20T00:00:00.000Z",
+    working_set: currentWorkingSet(),
+  };
+  return {
+    guard: async () => ({
+      ok: true as const,
+      value: {
+        allowed: true,
+        code: "ALLOWED" as const,
+        repository: session.repository,
+        worktree: session.worktree,
+        branch: session.branch,
+        session_id: session.session_id,
+        owner_session_id: session.session_id,
+        requested_session_id: session.session_id,
+        state: session.state,
+        details: {},
+      },
+    }),
+    getSession: async () => ({ ok: true as const, value: { ...session, working_set: currentWorkingSet() } }),
+  } as unknown as SessionBackend;
 }
 
 test("sandbox doctor reports ready when every required and optional capability is present on Linux", () => {
@@ -87,6 +156,62 @@ test("sandbox doctor marks every capability not_applicable on an unsupported pla
     ),
     true,
   );
+});
+
+test("protected resolution composes the current persisted working set and rejects caller replacement", async () => {
+  let currentWorkingSet = effectiveWorkingSet();
+  const backend = boundedBackend(() => currentWorkingSet);
+  const first = await resolveSandboxExecutionRequest(
+    backend,
+    { cwd: "/tmp/sandbox-working-set-worktree" },
+    {
+      session_id: "0190f1e0-0000-7000-8000-000000000391",
+      enforce: true,
+      runtime_projection: strictProjection(),
+    },
+    readyProbe(),
+  );
+
+  assert.equal(first.ok, true, first.ok ? "" : first.error.message);
+  if (!first.ok) return;
+  assert.equal(first.value.runtime_projection?.working_set?.working_set_id, "ews-sandbox-test");
+  assert.equal(first.value.runtime_projection?.working_set?.revision, 1);
+  assert.deepEqual(first.value.runtime_projection?.working_set?.scope.readOnly, ["README.md"]);
+
+  const widened = compileWorkingSetRuntimeProjection({
+    ...currentWorkingSet,
+    scope: { ...currentWorkingSet.scope, readOnly: ["**"] },
+  });
+  assert.equal(widened.ok, true, widened.ok ? "" : widened.error.message);
+  if (!widened.ok) return;
+  const replaced = await resolveSandboxExecutionRequest(
+    backend,
+    { cwd: "/tmp/sandbox-working-set-worktree" },
+    {
+      session_id: "0190f1e0-0000-7000-8000-000000000391",
+      enforce: true,
+      runtime_projection: { ...strictProjection(), working_set: widened.value },
+    },
+    readyProbe(),
+  );
+  assert.equal(replaced.ok, false);
+  if (!replaced.ok) assert.equal(replaced.error.code, "RUNTIME_PROJECTION_INVALID");
+
+  currentWorkingSet = effectiveWorkingSet(2, ["README.md", "src/**"]);
+  const expanded = await resolveSandboxExecutionRequest(
+    backend,
+    { cwd: "/tmp/sandbox-working-set-worktree" },
+    {
+      session_id: "0190f1e0-0000-7000-8000-000000000391",
+      enforce: true,
+      runtime_projection: strictProjection(),
+    },
+    readyProbe(),
+  );
+  assert.equal(expanded.ok, true, expanded.ok ? "" : expanded.error.message);
+  if (!expanded.ok) return;
+  assert.equal(expanded.value.runtime_projection?.working_set?.revision, 2);
+  assert.deepEqual(expanded.value.runtime_projection?.working_set?.scope.readOnly, ["README.md", "src/**"]);
 });
 
 test("NixOS discovery uses explicit closure roots instead of broad FHS views", (t) => {

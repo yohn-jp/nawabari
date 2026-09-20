@@ -68,6 +68,24 @@ const sampleSession: SessionRecord = {
   updated_at: "2026-08-10T00:00:00.000Z",
 };
 
+function boundedWorkingSet(revision = 1): NonNullable<SessionRecord["working_set"]> {
+  return {
+    version: 1,
+    kind: "effective-working-set",
+    revision,
+    id: "ews-cli-test",
+    repository: { repositoryHost: "test", repositoryId: "sample", repository: sampleSession.repository },
+    base: { branch: "main", revision: "a".repeat(40) },
+    scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [".env"] },
+    provenance: {
+      executionScope: { kind: "implementation-execution-scope", version: 1, digest: "b".repeat(64), identity: "body" },
+      candidateWorkingSet: { kind: "candidate-working-set", version: 1, digest: "c".repeat(64), identity: "candidate" },
+      repository: { repositoryHost: "test", repositoryId: "sample", repository: sampleSession.repository },
+      base: { branch: "main", revision: "a".repeat(40) },
+    },
+  } as unknown as NonNullable<SessionRecord["working_set"]>;
+}
+
 function capture(): { stdout: string[]; stderr: string[]; io: CliIO } {
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -199,6 +217,31 @@ test("session claim help documents the policy-derived claim-mode mapping", async
   assert.match(notes, /write: source-write, stage/u);
   assert.match(notes, /exclusive-write: source-write, stage, commit, branch-mutation, push, cleanup/u);
   assert.match(notes, /OPERATION_AUTHORIZATION_POLICY/u);
+});
+
+test("bounded session run carries the persisted working-set boundary into the protected runner", async () => {
+  const output = capture();
+  const boundedSession = { ...sampleSession, working_set: boundedWorkingSet() };
+  let observedWorkingSet: SessionRuntimeProjection["working_set"] | undefined;
+  const exitCode = await runCli(
+    ["--json", "session", "run", "--session", sampleSession.session_id, "--", "printf", "outside"],
+    {
+      cwd: sampleSession.worktree,
+      backend: backendForTests({ getSession: async () => success(boundedSession) }),
+      io: output.io,
+      sandboxProbe: readySandboxProbe(),
+      sandboxRuntimeLayout: strictRuntimeLayout(),
+      sandboxRunner: async (request) => {
+        observedWorkingSet = request.runtime_projection?.working_set;
+        return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+      },
+    },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.equal(observedWorkingSet?.working_set_id, "ews-cli-test");
+  assert.equal(observedWorkingSet?.revision, 1);
+  assert.deepEqual(observedWorkingSet?.scope.readOnly, ["README.md"]);
 });
 
 test("session run resolves the existing session authority and preserves command argv after --", async () => {
