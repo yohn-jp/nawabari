@@ -57,5 +57,7 @@ test("public contract exposes isolated verification authority", () => {
   assert.deepEqual(contract.read_visibility, ["declared", "repository"]);
   assert.equal(contract.write_policy, "deny");
   assert.equal(contract.execution, "fixed-argv-no-shell");
+  assert.equal(contract.filesystem_boundary, "invocation-local-read-only-working-set");
+  assert.equal(contract.enforcement, "strict-protected-execution-landlock");
   assert.equal(contract.mutates_working_set, false);
 });

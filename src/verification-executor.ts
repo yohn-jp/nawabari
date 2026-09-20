@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult } from "./domain/errors.js";
+import {
+  validateWorkingSetRuntimeProjection,
+  type WorkingSetRuntimeProjection,
+} from "./domain/working-set-runtime-projection.js";
+import { validateSessionRuntimeProjection, type SessionRuntimeProjection } from "./domain/runtime-projection.js";
 import { runSandboxedCommand, type SandboxCommand, type SandboxExecutionResult } from "./domain/sandbox-launcher.js";
 import type { SandboxExecutionRequest } from "./domain/sandbox.js";
 
@@ -167,8 +172,12 @@ function validateReadSelectors(
     const parsed = boundedText(selector, `declared_read[${index}]`, MAX_READ_SELECTOR_LENGTH);
     if (!parsed.ok) return parsed;
     const normalized = parsed.value.replaceAll("\\", "/");
-    if (normalized.startsWith("/") || normalized.split("/").some((part) => part === "..")) {
-      return invalid(`declared_read[${index}]`, "expected a repository-relative selector");
+    if (
+      normalized.startsWith("/") ||
+      normalized.includes("//") ||
+      normalized.split("/").some((part) => part === "" || part === "." || part === "..")
+    ) {
+      return invalid(`declared_read[${index}]`, "expected a canonical repository-relative selector");
     }
     selectors.push(normalized);
   }
@@ -271,6 +280,58 @@ function failureResult(profile: VerificationProfile, error: DomainError): Verifi
   });
 }
 
+function verificationScope(profile: VerificationProfile): WorkingSetRuntimeProjection["scope"] {
+  return {
+    readOnly: profile.read_visibility === "repository" ? ["**"] : profile.declared_read,
+    write: [],
+    create: [],
+    delete: [],
+    deny: [],
+  };
+}
+
+/**
+ * Derive the verifier's invocation-only working-set projection. The caller's
+ * agent projection remains untouched; the existing launcher owns enforcement.
+ */
+function deriveVerificationRuntimeProjection(
+  profile: VerificationProfile,
+  request: SandboxExecutionRequest,
+): DomainResult<SessionRuntimeProjection> {
+  const runtimeProjection = request.runtime_projection;
+  if (runtimeProjection === undefined) {
+    return failure(
+      new DomainError(
+        "RUNTIME_PROJECTION_INVALID",
+        "Verification requires an explicit runtime projection for protected execution.",
+        { session_id: request.session_id },
+      ),
+    );
+  }
+
+  const workingSet = runtimeProjection.working_set;
+  if (workingSet === undefined) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "Verification requires a bounded working-set runtime projection.", {
+        session_id: request.session_id,
+      }),
+    );
+  }
+
+  const projectedWorkingSet = validateWorkingSetRuntimeProjection({
+    ...workingSet,
+    scope: verificationScope(profile),
+  });
+  if (!projectedWorkingSet.ok) return failure(projectedWorkingSet.error);
+
+  const projected = validateSessionRuntimeProjection({
+    ...runtimeProjection,
+    working_set: projectedWorkingSet.value,
+  });
+  if (!projected.ok) return failure(projected.error);
+  return projected;
+}
+
 /**
  * Execute a trusted verification profile through the existing protected
  * launcher. The caller supplies an already-authoritative sandbox request;
@@ -290,21 +351,11 @@ export async function executeVerification(
   if (!request.enforce) {
     return failure(new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "Verification requires protected execution.", {}));
   }
-  // A repository-wide verifier view is a derived execution input. It is
-  // never written back to the caller's session projection or registry.
-  // Declared profiles are likewise executed from a fresh request when an
-  // agent working-set projection is present; the profile's explicit read
-  // declaration is the verifier authority for that invocation.
-  const verifierRequest =
-    request.runtime_projection?.working_set === undefined
-      ? request
-      : {
-          ...request,
-          runtime_projection: {
-            ...request.runtime_projection,
-            working_set: undefined,
-          },
-        };
+  const verifierProjection = deriveVerificationRuntimeProjection(profile.value, request);
+  if (!verifierProjection.ok) return verifierProjection;
+  // This request is invocation-local. It never writes the verifier scope back
+  // to the caller's agent Effective Working Set or session registry.
+  const verifierRequest = { ...request, runtime_projection: verifierProjection.value };
   const command: SandboxCommand = { command: profile.value.executable, args: profile.value.argv };
   const execute =
     dependencies.execute ??

@@ -118,6 +118,8 @@ function writeEvidence(outputPath, artifact) {
       verification_route: "versioned fixed-argv executor",
       verification_read_visibility: ["declared", "repository"],
       verification_write_policy: "deny",
+      verification_filesystem_boundary: "invocation-local-read-only-working-set",
+      verification_enforcement: "strict-protected-execution-landlock",
       lifecycle: ["session create", "session id", "session claim", "checkpoint", "commit", "push", "session close"],
       discovery: ["capabilities --json", "doctor --json"],
     },
