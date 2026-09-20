@@ -5,6 +5,7 @@ import {
   CANDIDATE_WORKING_SET_KIND,
   EFFECTIVE_WORKING_SET_KIND,
   composeEffectiveWorkingSet,
+  evaluateWorkingSetExpansion,
   parseCandidateWorkingSet,
   parseImplementationExecutionScope,
   serializeEffectiveWorkingSet,
@@ -124,4 +125,39 @@ test("unresolved candidate context never silently becomes an effective set", () 
   });
   assert.equal(result.status, "unsatisfiable");
   if (result.status === "unsatisfiable") assert.equal(result.code, "UNRESOLVED_REQUIRED_CONTEXT");
+});
+
+test("explicit expansion distinguishes unresolved and denied requests and advances only grants", () => {
+  const initial = composeEffectiveWorkingSet({
+    executionScope: executionScope(),
+    candidateWorkingSet: candidate([entry("required", "src/working-set.ts")]),
+    repository,
+    base,
+  });
+  assert.equal(initial.status, "satisfied");
+  if (initial.status !== "satisfied") return;
+
+  const denied = evaluateWorkingSetExpansion(initial.workingSet, {
+    currentRevision: 1,
+    executionScope: executionScope(),
+    entries: [
+      { path: "src/secret.ts", operation: "READONLY", reason: "denied fixture" },
+      { path: "src/new.ts", operation: "READONLY", reason: "unresolved fixture", resolution: "unresolved" },
+    ],
+  });
+  assert.deepEqual(
+    denied.outcomes.map((outcome) => outcome.status),
+    ["unresolved", "denied"],
+  );
+  assert.equal(denied.nextWorkingSet, undefined);
+  assert.equal(denied.nextRevision, 1);
+
+  const granted = evaluateWorkingSetExpansion(initial.workingSet, {
+    currentRevision: 1,
+    executionScope: executionScope(),
+    entries: [{ path: "src/working-set.test.ts", operation: "READONLY", reason: "legitimate context" }],
+  });
+  assert.equal(granted.outcomes[0]?.status, "granted");
+  assert.equal(granted.nextWorkingSet?.revision, 2);
+  assert.deepEqual(granted.nextWorkingSet?.scope.readOnly, ["src/working-set.test.ts", "src/working-set.ts"]);
 });

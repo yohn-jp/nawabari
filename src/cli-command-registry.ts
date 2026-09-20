@@ -173,6 +173,49 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     ],
   },
   {
+    name: "session scope expand",
+    summary: "Explicitly expand a bounded session working set",
+    usage:
+      `${CLI_NAME} session scope expand <session-id>|--session <id> --repository <id> ` +
+      `--repository-host <host> --revision <n> --execution-scope-file <path> ` +
+      `--path <repository-relative-path> --operation <READONLY|WRITE|CREATE|DELETE> ` +
+      `[--reason <text>] [--evidence <text>] [--unresolved]`,
+    options: [
+      option("--session", "Explicit target session; expansion never infers the current owner", {
+        value: "<id>",
+        required: true,
+      }),
+      option("--repository", "Exact repository identity", { value: "<id>", required: true }),
+      option("--repository-host", "Repository identity host", { value: "<host>", required: true }),
+      option("--revision", "Mandatory current working-set revision CAS token", { value: "<n>", required: true }),
+      option("--execution-scope-file", "The bounded Inari execution-scope artifact used at bootstrap", {
+        value: "<path>",
+        required: true,
+      }),
+      option("--path", "Exact repository-relative path to request; repeatable", {
+        value: "<path>",
+        required: true,
+        repeatable: true,
+      }),
+      option("--operation", "Operation class for each path", {
+        value: "<READONLY|WRITE|CREATE|DELETE>",
+        required: true,
+        values: ["READONLY", "WRITE", "CREATE", "DELETE"],
+      }),
+      option("--reason", "Bounded semantic reason accompanying the request", {
+        value: "<text>",
+        default: "explicit-working-set-expansion",
+      }),
+      option("--evidence", "Bounded evidence reference; never an authority", { value: "<text>" }),
+      option("--unresolved", "Mark the request's semantic path identity unresolved"),
+    ],
+    notes: [
+      "The current working-set revision is a mandatory CAS token; stale requests are rejected without mutation.",
+      "READONLY is evaluated independently. Mutation classes also require the existing session claim authority.",
+      "The execution-scope artifact must match the session's established provenance; it cannot widen Inari maximum authority.",
+    ],
+  },
+  {
     name: "session reconcile",
     summary: "Apply bounded lifecycle reconciliation for one selected session",
     usage: `${CLI_NAME} session reconcile --session <id> --apply`,

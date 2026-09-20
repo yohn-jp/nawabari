@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
+import { resolveRepositoryContext } from "./git.js";
 import { RepositoryLock } from "./registry/lock.js";
 import { SessionRegistry, toPersistedSessionRecord, type PersistedRegistry } from "./session-registry.js";
 import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
@@ -46,6 +47,98 @@ test("round-trips session metadata through common Git state", () => {
     assert.equal(persisted.sessions.length, 2);
     assert.equal(persisted.sessions[0].session_id, mainSession.sessionId);
   } finally {
+    fixture.cleanup();
+  }
+});
+
+test("expands a governed working set atomically with revision CAS and claim checks", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-expansion");
+  try {
+    const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
+    const revision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+    const identity = { repositoryHost: "local", repositoryId: repository.repositoryId };
+    const executionScope = {
+      version: 1,
+      kind: "implementation-execution-scope",
+      authorization: {
+        version: 1,
+        kind: "implementation-authorization",
+        contractVersion: 1,
+        implementation: { ...identity, number: 376 },
+        governedBodyDigest: "b".repeat(64),
+      },
+      repository: identity,
+      base: { branch: "main", revision },
+      scope: {
+        readOnly: ["README.md", "src/**"],
+        write: ["src/new.ts"],
+        create: [],
+        delete: [],
+        deny: ["src/secret.ts"],
+      },
+    };
+    const candidateWorkingSet = {
+      kind: "candidate-working-set",
+      schemaVersion: 1,
+      workingSetId: "candidate-376",
+      repository: { ...identity, repository: "local/nawabari" },
+      revision,
+      entries: [
+        {
+          state: "required",
+          target: { kind: "file", locator: "README.md" },
+          reason: { id: "test:bootstrap", summary: "bounded fixture" },
+          evidence: [],
+        },
+      ],
+    };
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({
+      worktreePath,
+      branchName: "feature/expansion",
+      executionScope,
+      candidateWorkingSet,
+      initialClaims: [{ resource: "src/new.ts", mode: "write" }],
+    });
+    const expanded = registry.expandWorkingSet({
+      sessionId: session.sessionId,
+      repository: identity,
+      currentRevision: 1,
+      executionScope,
+      entries: [{ path: "src/new.ts", operation: "WRITE", reason: "legitimate mutation context" }],
+    });
+    assert.equal(expanded.status, "granted");
+    assert.equal(expanded.revision, 2);
+    assert.deepEqual(expanded.workingSet.scope.write, ["src/new.ts"]);
+
+    assertRegistryError(
+      () =>
+        registry.expandWorkingSet({
+          sessionId: session.sessionId,
+          repository: identity,
+          currentRevision: 1,
+          executionScope,
+          entries: [{ path: "src/other.ts", operation: "READONLY", reason: "stale" }],
+        }),
+      "STALE_REGISTRY",
+    );
+    const denied = registry.expandWorkingSet({
+      sessionId: session.sessionId,
+      repository: identity,
+      currentRevision: 2,
+      executionScope,
+      entries: [{ path: "src/secret.ts", operation: "READONLY", reason: "denied" }],
+    });
+    assert.equal(denied.status, "denied");
+    assert.equal(denied.revision, 2);
+    assert.equal(registry.get(session.sessionId)?.workingSet?.revision, 2);
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
+    } catch {
+      fs.rmSync(worktreePath, { recursive: true, force: true });
+    }
     fixture.cleanup();
   }
 });

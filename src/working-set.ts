@@ -61,12 +61,55 @@ export type EffectiveWorkingSet = {
   readonly version: typeof EFFECTIVE_WORKING_SET_VERSION;
   readonly kind: typeof EFFECTIVE_WORKING_SET_KIND;
   /** Deterministic state revision. Initial composition always produces 1. */
-  readonly revision: 1;
+  readonly revision: number;
   readonly id: string;
   readonly repository: RepositoryIdentity;
   readonly base: BaseIdentity;
   readonly scope: EffectiveWorkingSetScope;
   readonly provenance: EffectiveWorkingSetProvenance;
+  /** Bounded evidence of explicit expansions; never an authorization source. */
+  readonly history?: readonly WorkingSetExpansionHistoryEntry[];
+};
+
+export type WorkingSetExpansionOperation = Exclude<EffectiveWorkingSetOperation, "DENY">;
+
+export type WorkingSetExpansionRequestEntry = {
+  readonly path: string;
+  readonly operation: WorkingSetExpansionOperation;
+  readonly reason: string;
+  readonly evidence?: string;
+  /** Unresolved semantic identity is never granted, even when authorized. */
+  readonly resolution?: "resolved" | "unresolved";
+};
+
+export type WorkingSetExpansionHistoryEntry = {
+  readonly revision: number;
+  readonly paths: readonly string[];
+  readonly operations: readonly WorkingSetExpansionOperation[];
+  readonly reason: string;
+  readonly evidence?: string;
+  readonly requestDigest: string;
+};
+
+export type WorkingSetExpansionOutcome = {
+  readonly path: string;
+  readonly operation: WorkingSetExpansionOperation;
+  readonly status: "granted" | "denied" | "unresolved";
+  readonly reason: string;
+};
+
+export type WorkingSetExpansionEvaluation = {
+  readonly outcomes: readonly WorkingSetExpansionOutcome[];
+  readonly nextWorkingSet?: EffectiveWorkingSet;
+  readonly nextRevision: number;
+  readonly idempotent: boolean;
+  readonly executionScope: ImplementationExecutionScopeArtifact;
+};
+
+export type WorkingSetExpansionInput = {
+  readonly currentRevision: number;
+  readonly entries: readonly WorkingSetExpansionRequestEntry[];
+  readonly executionScope: unknown;
 };
 
 export type WorkingSetUnsatisfiableCode =
@@ -512,6 +555,181 @@ export function composeEffectiveWorkingSet(input: WorkingSetCompositionInput): E
       provenance,
     }),
   };
+}
+
+/** Digest an externally supplied bounded artifact for provenance matching. */
+export function digestWorkingSetArtifact(input: unknown): string {
+  return artifactDigest(input);
+}
+
+function normalizeExpansionEntries(
+  entries: readonly WorkingSetExpansionRequestEntry[],
+): WorkingSetExpansionRequestEntry[] {
+  if (!Array.isArray(entries) || entries.length === 0 || entries.length > 256) {
+    throw new Error("working-set expansion requires between 1 and 256 entries");
+  }
+  const normalized = entries.map((entry, index) => {
+    if (!isRecord(entry)) throw new Error(`working-set expansion.entries[${index}] is invalid`);
+    allowedKeys(
+      entry,
+      ["path", "operation", "reason", "evidence", "resolution"],
+      `working-set expansion.entries[${index}]`,
+    );
+    const path = selector(entry.path, `working-set expansion.entries[${index}].path`);
+    if (/[?*]/u.test(path)) {
+      throw new Error(`working-set expansion.entries[${index}].path must be an exact repository path`);
+    }
+    const operation = entry.operation;
+    if (!["READONLY", "WRITE", "CREATE", "DELETE"].includes(String(operation))) {
+      throw new Error(`working-set expansion.entries[${index}].operation is unsupported`);
+    }
+    const resolution = entry.resolution === undefined ? "resolved" : entry.resolution;
+    if (resolution !== "resolved" && resolution !== "unresolved") {
+      throw new Error(`working-set expansion.entries[${index}].resolution is unsupported`);
+    }
+    return Object.freeze({
+      path,
+      operation: operation as WorkingSetExpansionOperation,
+      reason: text(entry.reason, `working-set expansion.entries[${index}].reason`),
+      ...(entry.evidence === undefined
+        ? {}
+        : { evidence: text(entry.evidence, `working-set expansion.entries[${index}].evidence`) }),
+      resolution,
+    });
+  });
+  return normalized.sort((left, right) => {
+    const leftKey = `${left.path}\u0000${left.operation}`;
+    const rightKey = `${right.path}\u0000${right.operation}`;
+    return compareStrings(leftKey, rightKey);
+  });
+}
+
+function scopeEntries(
+  scopeValue: EffectiveWorkingSetScope,
+  operation: WorkingSetExpansionOperation,
+): readonly string[] {
+  return scopeValue[operation === "READONLY" ? "readOnly" : (operation.toLowerCase() as "write" | "create" | "delete")];
+}
+
+function scopeHas(
+  scopeValue: EffectiveWorkingSetScope,
+  operation: WorkingSetExpansionOperation,
+  path: string,
+): boolean {
+  return scopeEntries(scopeValue, operation).includes(path);
+}
+
+function expansionOutcome(
+  entry: WorkingSetExpansionRequestEntry,
+  status: WorkingSetExpansionOutcome["status"],
+  reason: string,
+): WorkingSetExpansionOutcome {
+  return Object.freeze({ path: entry.path, operation: entry.operation, status, reason });
+}
+
+/**
+ * Evaluate and, only when every entry is grantable, apply an explicit scope
+ * expansion. Claims are deliberately evaluated by SessionRegistry; this
+ * reducer owns only bounded Inari maximum/DENY and working-set state.
+ */
+export function evaluateWorkingSetExpansion(
+  current: EffectiveWorkingSet,
+  input: WorkingSetExpansionInput,
+): WorkingSetExpansionEvaluation {
+  if (!Number.isSafeInteger(current.revision) || current.revision < 1) {
+    throw new Error("working-set revision is invalid");
+  }
+  if (!Number.isSafeInteger(input.currentRevision) || input.currentRevision < 1) {
+    throw new Error("working-set expansion current revision is invalid");
+  }
+  const executionScope = validateExecutionScope(input.executionScope);
+  const entries = normalizeExpansionEntries(input.entries);
+  const scopeValue = current.scope;
+  const outcomes: WorkingSetExpansionOutcome[] = [];
+  const additions = new Map<WorkingSetExpansionOperation, Set<string>>([
+    ["READONLY", new Set(scopeValue.readOnly)],
+    ["WRITE", new Set(scopeValue.write)],
+    ["CREATE", new Set(scopeValue.create)],
+    ["DELETE", new Set(scopeValue.delete)],
+  ]);
+
+  for (const entry of entries) {
+    if (entry.resolution === "unresolved") {
+      outcomes.push(expansionOutcome(entry, "unresolved", "semantic path identity is unresolved"));
+      continue;
+    }
+    if (current.revision !== input.currentRevision) {
+      outcomes.push(expansionOutcome(entry, "denied", "current working-set revision does not match the CAS revision"));
+      continue;
+    }
+    if (artifactDigest(input.executionScope) !== current.provenance.executionScope.digest) {
+      outcomes.push(
+        expansionOutcome(entry, "denied", "execution-scope provenance does not match the session working set"),
+      );
+      continue;
+    }
+    if (!authorized(entry.operation, entry.path, executionScope)) {
+      outcomes.push(expansionOutcome(entry, "denied", "path is outside the Inari maximum scope or is denied"));
+      continue;
+    }
+    outcomes.push(expansionOutcome(entry, "granted", "path is within the bounded execution scope"));
+    additions.get(entry.operation)?.add(entry.path);
+  }
+
+  const hasBlocked = outcomes.some((outcome) => outcome.status !== "granted");
+  const changed = outcomes.some(
+    (outcome) => outcome.status === "granted" && !scopeHas(scopeValue, outcome.operation, outcome.path),
+  );
+  if (hasBlocked || !changed) {
+    return Object.freeze({
+      outcomes: Object.freeze(outcomes),
+      nextRevision: current.revision,
+      idempotent: !hasBlocked,
+      executionScope,
+    });
+  }
+
+  const nextRevision = current.revision + 1;
+  if (!Number.isSafeInteger(nextRevision)) throw new Error("working-set revision exhausted");
+  const reason = entries
+    .map((entry) => entry.reason)
+    .join("; ")
+    .slice(0, MAX_TEXT);
+  const evidence = entries
+    .map((entry) => entry.evidence)
+    .filter((value): value is string => value !== undefined)
+    .join("; ")
+    .slice(0, MAX_TEXT);
+  const historyEntry: WorkingSetExpansionHistoryEntry = Object.freeze({
+    revision: nextRevision,
+    paths: Object.freeze([...new Set(entries.map((entry) => entry.path))].sort(compareStrings)),
+    operations: Object.freeze(
+      [...new Set(entries.map((entry) => entry.operation))].sort(compareStrings) as WorkingSetExpansionOperation[],
+    ),
+    reason,
+    ...(evidence.length === 0 ? {} : { evidence }),
+    requestDigest: artifactDigest(entries),
+  });
+  const history = [...(current.history ?? []), historyEntry].slice(-32);
+  const nextWorkingSet: EffectiveWorkingSet = Object.freeze({
+    ...current,
+    revision: nextRevision,
+    scope: Object.freeze({
+      readOnly: Object.freeze([...additions.get("READONLY")!].sort(compareStrings)),
+      write: Object.freeze([...additions.get("WRITE")!].sort(compareStrings)),
+      create: Object.freeze([...additions.get("CREATE")!].sort(compareStrings)),
+      delete: Object.freeze([...additions.get("DELETE")!].sort(compareStrings)),
+      deny: current.scope.deny,
+    }),
+    history: Object.freeze(history),
+  });
+  return Object.freeze({
+    outcomes: Object.freeze(outcomes),
+    nextWorkingSet,
+    nextRevision,
+    idempotent: false,
+    executionScope,
+  });
 }
 
 /** Throwing convenience for callers that require a usable governed set. */
