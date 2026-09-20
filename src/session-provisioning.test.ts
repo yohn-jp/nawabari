@@ -630,6 +630,65 @@ test("simultaneous provisioning serializes ownership and creates distinct worktr
   }
 });
 
+test(
+  "simultaneous bootstrap provisions serialize conflicting initial claims to one winner",
+  { timeout: 30_000 },
+  async () => {
+    const fixture = createRepositoryFixture();
+    const attempts = [
+      {
+        worktreePath: path.join(path.dirname(fixture.repositoryPath), "nawabari-bootstrap-conflict-one"),
+        branchName: "feature/bootstrap-conflict-one",
+      },
+      {
+        worktreePath: path.join(path.dirname(fixture.repositoryPath), "nawabari-bootstrap-conflict-two"),
+        branchName: "feature/bootstrap-conflict-two",
+      },
+    ];
+    try {
+      const workerModule = new URL("./session-registry.ts", import.meta.url).href;
+      const results = await Promise.all(
+        attempts.map(({ worktreePath, branchName }) =>
+          runClaimedProvisionWorker(workerModule, fixture.repositoryPath, worktreePath, branchName),
+        ),
+      );
+      const successes = results.filter((result): result is { ok: true; sessionId: string } => result.ok);
+      const conflicts = results.filter(
+        (result): result is { ok: false; code: SessionRegistryError["code"] } => !result.ok,
+      );
+
+      assert.equal(successes.length, 1);
+      assert.equal(conflicts.length, 1);
+      assert.equal(conflicts[0]?.code, "RESOURCE_CLAIM_CONFLICT");
+
+      const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+      const records = registry.list();
+      assert.equal(records.length, 1);
+      assert.equal(records[0]?.sessionId, successes[0]?.sessionId);
+      assert.deepEqual(
+        registry
+          .listClaims()
+          .map((claim) => ({ sessionId: claim.sessionId, resource: claim.resource, mode: claim.mode })),
+        [{ sessionId: successes[0]?.sessionId, resource: "README.md", mode: "write" }],
+      );
+
+      const loser = attempts.find((attempt) => !results[attempts.indexOf(attempt)]?.ok);
+      assert.ok(loser !== undefined);
+      assert.equal(fs.existsSync(loser.worktreePath), false);
+      assert.equal(
+        runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${loser.branchName}`], fixture.repositoryPath),
+        false,
+      );
+    } finally {
+      for (const { worktreePath, branchName } of attempts) {
+        removeWorktree(fixture.repositoryPath, worktreePath);
+        runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+      }
+      fixture.cleanup();
+    }
+  },
+);
+
 interface RepositoryFixture {
   readonly repositoryPath: string;
   cleanup(): void;
@@ -754,6 +813,66 @@ function runProvisionWorker(
     child.once("close", (exitCode) => {
       if (exitCode === 0) resolve(stdout.trim());
       else reject(new Error(`provision worker exited with ${exitCode}: ${stderr}`));
+    });
+  });
+}
+
+type ClaimedProvisionWorkerResult =
+  | { readonly ok: true; readonly sessionId: string }
+  | { readonly ok: false; readonly code: SessionRegistryError["code"] };
+
+function runClaimedProvisionWorker(
+  workerModule: string,
+  repositoryPath: string,
+  worktreePath: string,
+  branchName: string,
+): Promise<ClaimedProvisionWorkerResult> {
+  const script = `
+    import { SessionRegistry } from ${JSON.stringify(workerModule)};
+    try {
+      const session = new SessionRegistry({ cwd: process.env.NAWABARI_REPOSITORY }).provision({
+        worktreePath: process.env.NAWABARI_WORKTREE,
+        branchName: process.env.NAWABARI_BRANCH,
+        initialClaims: [{ resource: "README.md", mode: "write" }],
+      });
+      process.stdout.write(JSON.stringify({ ok: true, sessionId: session.sessionId }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, code: error?.code ?? "UNKNOWN" }));
+    }
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx/esm", "--input-type=module", "-e", script], {
+      cwd: path.dirname(fileURLToPath(import.meta.url)),
+      env: {
+        ...process.env,
+        NODE_NO_WARNINGS: "1",
+        NAWABARI_REPOSITORY: repositoryPath,
+        NAWABARI_WORKTREE: worktreePath,
+        NAWABARI_BRANCH: branchName,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (exitCode) => {
+      if (exitCode !== 0) {
+        reject(new Error(`claimed provision worker exited with ${exitCode}: ${stderr}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout.trim()) as ClaimedProvisionWorkerResult);
+      } catch (error: unknown) {
+        reject(new Error(`claimed provision worker returned invalid JSON: ${stdout}`, { cause: error }));
+      }
     });
   });
 }
