@@ -340,6 +340,25 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
         unsupported_platform: "LOCK_STALE; deliberate operator remediation required",
       },
     },
+    initial_claims: {
+      command: "session create",
+      input: "--resource <path-or-glob> --mode <read|write|exclusive-write> (repeatable)",
+      pairing: "adjacent-resource-mode",
+      atomic: true,
+      zero_or_more: true,
+      retry: {
+        uncertain_code: "REGISTRY_DURABILITY_UNCERTAIN",
+        conflict_codes: [
+          "RESOURCE_CLAIM_CONFLICT",
+          "WORKTREE_ALREADY_EXISTS",
+          "BRANCH_ALREADY_EXISTS",
+          "WORKTREE_OWNED_BY_OTHER_SESSION",
+          "BRANCH_OWNED_BY_OTHER_SESSION",
+        ],
+        exact_owner_adoption: false,
+        fail_closed: true,
+      },
+    },
   },
   {
     id: "session-discard",
@@ -816,7 +835,10 @@ export function machineContract(packageVersion: string): JsonObject {
           }
         : {}),
       ...(capability.id === "session-lifecycle"
-        ? { registry_lock_recovery: jsonClone(capability.registry_lock_recovery) }
+        ? {
+            registry_lock_recovery: jsonClone(capability.registry_lock_recovery),
+            initial_claims: jsonClone(capability.initial_claims),
+          }
         : {}),
       ...(capability.id === "session-diagnostics" ? { lifecycle: jsonClone(capability.lifecycle) } : {}),
       ...(capability.id === "protected-execution"

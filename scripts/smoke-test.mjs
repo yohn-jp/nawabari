@@ -793,7 +793,8 @@ async function main() {
       createHelp.ok !== true ||
       createHelp.help_for !== "session create" ||
       createHelp.required_options?.length !== 0 ||
-      createHelp.optional_options?.join(",") !== "--branch,--worktree,--worktree-root,--base,--label" ||
+      createHelp.optional_options?.join(",") !==
+        "--branch,--worktree,--worktree-root,--base,--label,--resource,--mode" ||
       createHelp.defaults?.["--base"] !== "HEAD"
     ) {
       fail("installed session create help did not expose the optional/defaulted contract");

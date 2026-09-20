@@ -210,6 +210,15 @@ test("session lifecycle capability truthfully publishes Linux-only stale-lock re
   assert.equal(staleRecovery.live_owner, "never-reclaim-by-age");
   assert.equal(staleRecovery.unknown_or_remote_owner, "fail-closed");
   assert.equal(staleRecovery.pid_only_identity, "not-sufficient");
+  const initialClaims = lifecycle?.initial_claims as JsonRecord;
+  assert.equal(initialClaims.command, "session create");
+  assert.equal(initialClaims.atomic, true);
+  assert.equal(initialClaims.zero_or_more, true);
+  assert.equal(initialClaims.pairing, "adjacent-resource-mode");
+  const retry = initialClaims.retry as JsonRecord;
+  assert.equal(retry.uncertain_code, "REGISTRY_DURABILITY_UNCERTAIN");
+  assert.equal(retry.exact_owner_adoption, false);
+  assert.equal(retry.fail_closed, true);
 });
 
 test("session-diagnostics lifecycle projection is the live XState-derived table, including both branches of a guarded transition observed at the same state", () => {
