@@ -197,6 +197,15 @@ export class LocalSessionBackend implements SessionBackend {
         ...(options.auxiliary_state === null || options.auxiliary_state === undefined
           ? {}
           : { auxiliaryState: options.auxiliary_state }),
+        ...(options.execution_scope === null || options.execution_scope === undefined
+          ? {}
+          : { executionScope: options.execution_scope }),
+        ...(options.candidate_working_set === null || options.candidate_working_set === undefined
+          ? {}
+          : { candidateWorkingSet: options.candidate_working_set }),
+        ...(options.working_set_repository === null || options.working_set_repository === undefined
+          ? {}
+          : { workingSetRepository: options.working_set_repository }),
       });
       return success(toDomainRecord(record));
     } catch (error: unknown) {
@@ -606,6 +615,9 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
     ...(record.label === undefined ? {} : { label: record.label }),
     ...(record.terminalOperation === undefined ? {} : { terminal_operation: record.terminalOperation }),
     ...(record.discardedHead === undefined ? {} : { discarded_head: record.discardedHead }),
+    ...(record.workingSet === undefined
+      ? {}
+      : { working_set: record.workingSet as unknown as import("./errors.js").JsonObject }),
   };
 }
 

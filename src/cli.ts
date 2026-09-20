@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { createRequire } from "node:module";
 import { runDoctor, summarizeDoctorReport } from "./domain/doctor.js";
 import {
@@ -132,6 +133,8 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
     "--resource",
     "--mode",
     "--auxiliary-state",
+    "--execution-scope-file",
+    "--candidate-working-set-file",
   ],
   "session id": [],
   "session show": ["--session"],
@@ -712,6 +715,8 @@ type ClaimReplacementPairs = {
   base: string | null;
   label: string | null;
   auxiliary_states: unknown[];
+  execution_scope_file: string | null;
+  candidate_working_set_file: string | null;
 };
 
 type ClaimDeltaMutation = {
@@ -1127,6 +1132,8 @@ function parseClaimReplacementPairs(
   let base: string | null = null;
   let label: string | null = null;
   const auxiliaryStates: unknown[] = [];
+  let executionScopeFile: string | null = null;
+  let candidateWorkingSetFile: string | null = null;
   let pendingResource: string | null = null;
   let concurrencyState: ClaimConcurrencyState = {
     expected_claim_set_generation: null,
@@ -1190,7 +1197,9 @@ function parseClaimReplacementPairs(
           }),
         );
       }
-    } else if (name === "--resource") pendingResource = value;
+    } else if (name === "--execution-scope-file") executionScopeFile = value;
+    else if (name === "--candidate-working-set-file") candidateWorkingSetFile = value;
+    else if (name === "--resource") pendingResource = value;
     else {
       if (pendingResource === null) {
         return failure(
@@ -1236,8 +1245,35 @@ function parseClaimReplacementPairs(
       base,
       label,
       auxiliary_states: auxiliaryStates,
+      execution_scope_file: executionScopeFile,
+      candidate_working_set_file: candidateWorkingSetFile,
     },
   };
+}
+
+const MAX_WORKING_SET_ARTIFACT_BYTES = 1_048_576;
+
+function readWorkingSetArtifactFile(file: string, option: string): DomainResult<unknown> {
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size > MAX_WORKING_SET_ARTIFACT_BYTES) {
+      return failure(
+        usageError("INVALID_ARGUMENT", `${option} must name a regular JSON file no larger than 1 MiB.`, {
+          option,
+          path: file,
+        }),
+      );
+    }
+    return { ok: true, value: JSON.parse(fs.readFileSync(file, "utf8")) as unknown };
+  } catch (error: unknown) {
+    return failure(
+      usageError("INVALID_ARGUMENT", `${option} could not be read as bounded JSON.`, {
+        option,
+        path: file,
+        reason: error instanceof Error ? error.message : "invalid JSON",
+      }),
+    );
+  }
 }
 
 type SingleClaimPair = {
@@ -1548,6 +1584,27 @@ async function executeCommand(
       if (parsed.value.worktree !== null && parsed.value.worktree_root !== null) {
         return failure(usageError("INVALID_ARGUMENT", "--worktree and --worktree-root cannot be used together."));
       }
+      if ((parsed.value.execution_scope_file === null) !== (parsed.value.candidate_working_set_file === null)) {
+        return failure(
+          usageError(
+            "INVALID_ARGUMENT",
+            "--execution-scope-file and --candidate-working-set-file must be supplied together.",
+          ),
+        );
+      }
+      let executionScope: unknown | undefined;
+      let candidateWorkingSet: unknown | undefined;
+      if (parsed.value.execution_scope_file !== null && parsed.value.candidate_working_set_file !== null) {
+        const execution = readWorkingSetArtifactFile(parsed.value.execution_scope_file, "--execution-scope-file");
+        if (!execution.ok) return execution;
+        const candidate = readWorkingSetArtifactFile(
+          parsed.value.candidate_working_set_file,
+          "--candidate-working-set-file",
+        );
+        if (!candidate.ok) return candidate;
+        executionScope = execution.value;
+        candidateWorkingSet = candidate.value;
+      }
       const options: SessionCreateOptions = {
         branch: parsed.value.branch,
         worktree: parsed.value.worktree,
@@ -1565,6 +1622,8 @@ async function executeCommand(
         ...(parsed.value.auxiliary_states.length === 0
           ? {}
           : { auxiliary_state: parsed.value.auxiliary_states as SessionCreateOptions["auxiliary_state"] }),
+        ...(executionScope === undefined ? {} : { execution_scope: executionScope }),
+        ...(candidateWorkingSet === undefined ? {} : { candidate_working_set: candidateWorkingSet }),
       };
       const result = await dependencies.backend.createSession(context, options);
       return result.ok ? { ok: true, value: result.value } : result;

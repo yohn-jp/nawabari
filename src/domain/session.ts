@@ -4,6 +4,7 @@ import type {
   SessionLifecycleState,
   SessionLifecycleTransition,
 } from "../session-lifecycle-classification.js";
+import type { RepositoryIdentity } from "../working-set.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -24,6 +25,8 @@ export type SessionRecord = {
   label?: string;
   terminal_operation?: "discard";
   discarded_head?: string;
+  /** Established bounded execution visibility for governed sessions. */
+  working_set?: JsonObject;
 };
 
 export type SessionContext = {
@@ -40,6 +43,12 @@ export type SessionCreateOptions = {
   claims?: ResourceClaimInput[] | null;
   /** Repository-local auxiliary-state declarations materialized before bootstrap succeeds. */
   auxiliary_state?: readonly unknown[] | null;
+  /** Bounded external execution-scope artifact for governed bootstrap. */
+  execution_scope?: unknown | null;
+  /** Bounded external candidate-working-set artifact for governed bootstrap. */
+  candidate_working_set?: unknown | null;
+  /** Optional repository identity used by the transport-neutral working-set contract. */
+  working_set_repository?: RepositoryIdentity | null;
 };
 
 export type ResourceClaimMode = "read" | "write" | "exclusive-write";

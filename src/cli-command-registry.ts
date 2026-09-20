@@ -78,6 +78,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     usage:
       `${CLI_NAME} session create [--branch <name>] [--worktree <path>|--worktree-root <path>] ` +
       `[--base <ref>] [--label <text>] ` +
+      `[--execution-scope-file <path> --candidate-working-set-file <path>] ` +
       `[--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
     options: [
       option("--branch", "Branch to create; omitted uses the generated session branch", {
@@ -113,11 +114,20 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         "JSON repository-local auxiliary-state declaration to materialize in the managed worktree; repeatable",
         { value: "<json>", repeatable: true },
       ),
+      option("--execution-scope-file", "Bounded JSON execution-scope artifact file for governed bootstrap", {
+        value: "<path>",
+      }),
+      option(
+        "--candidate-working-set-file",
+        "Bounded JSON candidate-working-set artifact file for governed bootstrap",
+        { value: "<path>" },
+      ),
     ],
     notes: [
       "All create options are optional. Use status --json to discover managed_worktree_root.",
       "--worktree and --worktree-root cannot be combined.",
       "Initial claims are provisioned atomically with the session; each --resource must be immediately followed by its own --mode, and zero pairs remains backward compatible.",
+      "Providing one bounded working-set artifact requires the other; both are validated before worktree ownership is established.",
       "A claim conflict returns blocking-owner evidence. A durability-uncertain result is retry-safe only after re-reading the reported registry state; an existing owner is never silently adopted.",
       "Without an override, Nawabari creates the safe managed root <repository-parent>/.nawabari/worktrees on first use. Existing absolute worktree paths directly under the repository parent remain accepted for compatibility.",
     ],

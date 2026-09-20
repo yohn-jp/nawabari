@@ -649,6 +649,8 @@ test("command-specific help is projected from one spec and marks session create 
     "--resource",
     "--mode",
     "--auxiliary-state",
+    "--execution-scope-file",
+    "--candidate-working-set-file",
   ]);
   assert.deepEqual(response.defaults, {
     "--branch": "nawabari/session/<session_id>",
@@ -1041,6 +1043,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--resource",
       "--mode",
       "--auxiliary-state",
+      "--execution-scope-file",
+      "--candidate-working-set-file",
       "--session",
       "--integrated-revision",
       "--schema-version",
@@ -1972,6 +1976,43 @@ test("session create forwards repeatable auxiliary-state JSON declarations witho
 
   assert.equal(exitCode, 0);
   assert.deepEqual((observedOptions as unknown as SessionCreateOptions).auxiliary_state, [declaration]);
+});
+
+test("session create forwards bounded working-set artifact files as one bootstrap request", async () => {
+  let observedOptions: SessionCreateOptions | null = null;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, options: SessionCreateOptions) => {
+      observedOptions = options;
+      return success(sampleSession);
+    },
+  });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-cli-working-set-"));
+  const executionScope = { kind: "implementation-execution-scope", version: 1 };
+  const candidateWorkingSet = { kind: "candidate-working-set", schemaVersion: 1 };
+  const executionPath = path.join(root, "execution.json");
+  const candidatePath = path.join(root, "candidate.json");
+  fs.writeFileSync(executionPath, JSON.stringify(executionScope));
+  fs.writeFileSync(candidatePath, JSON.stringify(candidateWorkingSet));
+  try {
+    const exitCode = await runCli(
+      [
+        "--json",
+        "session",
+        "create",
+        "--execution-scope-file",
+        executionPath,
+        "--candidate-working-set-file",
+        candidatePath,
+      ],
+      { backend, io: capture().io },
+    );
+
+    assert.equal(exitCode, 0);
+    assert.deepEqual((observedOptions as unknown as SessionCreateOptions).execution_scope, executionScope);
+    assert.deepEqual((observedOptions as unknown as SessionCreateOptions).candidate_working_set, candidateWorkingSet);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("session create accepts adjacent claims with an interleaved auxiliary declaration", async () => {

@@ -34,6 +34,7 @@ import {
   materializeAuxiliaryStateProjection,
   resolveAuxiliaryStateTrackedPathEvidence,
 } from "./domain/auxiliary-state-projection.js";
+import { composeEffectiveWorkingSet, type EffectiveWorkingSet, type RepositoryIdentity } from "./working-set.js";
 import { generateSessionId, isSessionId } from "./session-id.js";
 import { isPostRenameFailure, writeJsonAtomicallySync } from "./registry/atomic.js";
 import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
@@ -209,6 +210,8 @@ export interface SessionRecord {
   readonly discardedHead?: string;
   /** HEAD captured before a normal close began; binds partial-close retries. */
   readonly cleanupHead?: string;
+  /** Established bounded execution visibility, when this is a governed session. */
+  readonly workingSet?: EffectiveWorkingSet;
 }
 
 export interface CreateSessionOptions {
@@ -227,6 +230,12 @@ export interface ProvisionSessionOptions {
   readonly initialClaims?: readonly ResourceClaimInput[];
   /** Repository-local auxiliary-state declarations materialized in the owned worktree. */
   readonly auxiliaryState?: readonly unknown[];
+  /** Bounded external execution-scope artifact supplied by the governed caller. */
+  readonly executionScope?: unknown;
+  /** Bounded external candidate-working-set artifact supplied by the governed caller. */
+  readonly candidateWorkingSet?: unknown;
+  /** Optional repository identity for the transport-neutral working-set contract. */
+  readonly workingSetRepository?: RepositoryIdentity;
   readonly defaultBranchName?: string;
   readonly protectedBranchNames?: readonly string[];
   readonly protectedWorktreePaths?: readonly string[];
@@ -886,6 +895,7 @@ export interface PersistedSessionRecord {
   readonly terminal_operation?: "discard";
   readonly discarded_head?: string;
   readonly cleanup_head?: string;
+  readonly working_set?: EffectiveWorkingSet;
 }
 
 export interface PersistedResourceClaim {
@@ -1430,6 +1440,7 @@ export class SessionRegistry {
       const state = this.readStateUnsafe();
       const sessionId = generateUniqueSessionId(state.sessions, this.idGenerator);
       const resources = this.resolveProvisioningResources(options, sessionId);
+      const workingSet = this.composeProvisionedWorkingSet(options, resources);
       const timestamp = toTimestamp(this.clock());
       const record = freezeSessionRecord({
         schemaVersion: REGISTRY_SCHEMA_VERSION,
@@ -1444,9 +1455,10 @@ export class SessionRegistry {
         updatedAt: timestamp,
         baseRevision: resources.baseRevision,
         ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
+        ...(workingSet === undefined ? {} : { workingSet }),
       });
 
-      const retryEvidence = this.provisioningRetryEvidence(state, resources, options);
+      const retryEvidence = this.provisioningRetryEvidence(state, resources, options, workingSet);
       try {
         assertNoOwnershipConflict(state.sessions, record);
       } catch (error: unknown) {
@@ -1553,6 +1565,56 @@ export class SessionRegistry {
   }
 
   /**
+   * Establish the bounded execution visibility before Git ownership is
+   * provisioned. Legacy creates deliberately remain artifact-free.
+   */
+  private composeProvisionedWorkingSet(
+    options: ProvisionSessionOptions,
+    resources: ProvisioningResources,
+  ): EffectiveWorkingSet | undefined {
+    const hasExecutionScope = options.executionScope !== undefined;
+    const hasCandidateWorkingSet = options.candidateWorkingSet !== undefined;
+    if (!hasExecutionScope && !hasCandidateWorkingSet) return undefined;
+    if (!hasExecutionScope || !hasCandidateWorkingSet) {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "Bounded working-set bootstrap requires both execution-scope and candidate-working-set artifacts",
+        { working_set_code: "INVALID_ARTIFACT", working_set_path: "$" },
+      );
+    }
+
+    const repository = options.workingSetRepository ?? repositoryIdentityFromArtifact(options.executionScope);
+    const branch = resources.baseRef === "HEAD" ? this.currentBranchName() : resources.baseRef;
+    const result = composeEffectiveWorkingSet({
+      executionScope: options.executionScope,
+      candidateWorkingSet: options.candidateWorkingSet,
+      repository,
+      base: { branch, revision: resources.baseRevision },
+    });
+    if (result.status === "unsatisfiable") {
+      const diagnostic = result.diagnostics[0];
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        `Working-set bootstrap is unsatisfiable: ${result.code}${diagnostic === undefined ? "" : ` (${diagnostic.message})`}`,
+        {
+          working_set_code: result.code,
+          working_set_path: diagnostic?.path ?? "$",
+          working_set_diagnostic: diagnostic?.message ?? "working set is unsatisfiable",
+        },
+      );
+    }
+    return result.workingSet;
+  }
+
+  private currentBranchName(): string {
+    const branch = this.git.run(["symbolic-ref", "--short", "HEAD"], this.repository.worktreePath);
+    if (branch.length === 0) {
+      throw new SessionRegistryError("DETACHED_HEAD", "The repository base is detached and has no branch identity");
+    }
+    return branch;
+  }
+
+  /**
    * Classify a physical collision using only positively observed registry
    * ownership and the complete original bootstrap declaration. An exact
    * match is surfaced as a safe inspection action; every other collision is
@@ -1562,6 +1624,7 @@ export class SessionRegistry {
     state: RegistryState,
     resources: ProvisioningResources,
     options: ProvisionSessionOptions,
+    workingSet: EffectiveWorkingSet | undefined,
   ): RegistryErrorDetails {
     const owner = state.sessions.find(
       (candidate) =>
@@ -1589,6 +1652,8 @@ export class SessionRegistry {
         );
         declarationMatches =
           owner.label === (options.label === undefined ? undefined : options.label) &&
+          (owner.workingSet?.id ?? null) === (workingSet?.id ?? null) &&
+          (owner.workingSet?.revision ?? null) === (workingSet?.revision ?? null) &&
           requested.length === established.length &&
           requested.every(
             (claim, index) =>
@@ -7678,6 +7743,7 @@ export function toPersistedSessionRecord(
     ...(validated.terminalOperation === undefined ? {} : { terminal_operation: validated.terminalOperation }),
     ...(validated.discardedHead === undefined ? {} : { discarded_head: validated.discardedHead }),
     ...(validated.cleanupHead === undefined ? {} : { cleanup_head: validated.cleanupHead }),
+    ...(validated.workingSet === undefined ? {} : { working_set: validated.workingSet }),
   };
 }
 
@@ -8019,7 +8085,7 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
       "created_at",
       "updated_at",
     ],
-    ["base_revision", "label", "terminal_operation", "discarded_head", "cleanup_head"],
+    ["base_revision", "label", "terminal_operation", "discarded_head", "cleanup_head", "working_set"],
     index,
   );
 
@@ -8061,6 +8127,7 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
     ...(value.cleanup_head === undefined
       ? {}
       : { cleanupHead: requireRevision(value.cleanup_head, index, "cleanup_head") }),
+    ...(value.working_set === undefined ? {} : { workingSet: validatePersistedWorkingSet(value.working_set, index) }),
   };
 
   return validateSessionRecord(record, expectedRepositoryId, index);
@@ -8128,6 +8195,7 @@ function validateSessionRecord(record: SessionRecord, expectedRepositoryId: stri
   if (record.terminalOperation === undefined && record.discardedHead !== undefined) {
     throw invalidRecord(index, "discarded_head requires terminal_operation=discard");
   }
+  if (record.workingSet !== undefined) validatePersistedWorkingSet(record.workingSet, index);
   if (record.state !== "closed" && record.state !== "closing" && record.terminalOperation !== undefined) {
     throw invalidRecord(index, "terminal_operation is only valid for a closing or closed session");
   }
@@ -8258,6 +8326,40 @@ function requireRevision(value: unknown, index: number, field: string): string {
     throw invalidRecord(index, `${field} must be a full hexadecimal Git revision`);
   }
   return revision;
+}
+
+function validatePersistedWorkingSet(value: unknown, index?: number): EffectiveWorkingSet {
+  if (!isRecord(value)) throw invalidRecord(index, "working_set must be an object");
+  if (value.kind !== "effective-working-set" || value.version !== 1 || value.revision !== 1) {
+    throw invalidRecord(index, "working_set has an unsupported version or kind");
+  }
+  if (typeof value.id !== "string" || value.id.length === 0) {
+    throw invalidRecord(index, "working_set.id must be a non-empty string");
+  }
+  return value as unknown as EffectiveWorkingSet;
+}
+
+function repositoryIdentityFromArtifact(input: unknown): RepositoryIdentity {
+  if (!isRecord(input) || !isRecord(input.repository)) {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "Bounded execution-scope artifact does not declare a repository identity",
+      { working_set_code: "INVALID_ARTIFACT", working_set_path: "executionScope.repository" },
+    );
+  }
+  const repository = input.repository;
+  if (typeof repository.repositoryHost !== "string" || typeof repository.repositoryId !== "string") {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "Bounded execution-scope artifact has an invalid repository identity",
+      { working_set_code: "INVALID_ARTIFACT", working_set_path: "executionScope.repository" },
+    );
+  }
+  return {
+    repositoryHost: repository.repositoryHost,
+    repositoryId: repository.repositoryId,
+    ...(typeof repository.repository === "string" ? { repository: repository.repository } : {}),
+  };
 }
 
 function isRevision(value: string): boolean {
