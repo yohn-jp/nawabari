@@ -86,6 +86,7 @@ test("provision materializes only declared repository-local auxiliary state and 
     const session = registry.provision({
       worktreePath,
       branchName: "feature/provisioned-auxiliary-state",
+      initialClaims: [{ resource: "README.md", mode: "write" }],
       auxiliaryState: [
         {
           source: { kind: "repository-local", path: ".codegraph/ignored" },
@@ -100,6 +101,10 @@ test("provision materializes only declared repository-local auxiliary state and 
     assert.equal(fs.existsSync(path.join(worktreePath, ".codegraph", ".gitignore")), true);
     assert.equal(fs.existsSync(path.join(worktreePath, ".codegraph", "ignored", "daemon.pid")), true);
     assert.equal(runGit(["status", "--porcelain"], worktreePath), "");
+    assert.deepEqual(
+      registry.listClaims(session.sessionId).map((claim) => [claim.resource, claim.mode]),
+      [["README.md", "write"]],
+    );
 
     registry.close(session.sessionId);
     assert.equal(fs.existsSync(worktreePath), false);
@@ -553,6 +558,73 @@ test("a durability-uncertain registry write after provisioning does not roll bac
       reread.listClaims(records[0].sessionId).map((claim) => [claim.resource, claim.mode]),
       [["README.md", "write"]],
     );
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
+test("an uncertain bootstrap retry distinguishes the proven declaration from an owner conflict", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-bootstrap-retry");
+  const branchName = "feature/bootstrap-retry";
+  const declaration = {
+    worktreePath,
+    branchName,
+    label: "bootstrap-retry",
+    initialClaims: [{ resource: "README.md", mode: "write" as const }],
+  };
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+
+    assert.throws(
+      () => withDirectoryFsyncFailure(registry.paths.directory, "EIO", () => registry.provision(declaration)),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_DURABILITY_UNCERTAIN",
+    );
+    const established = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const owner = established.list()[0];
+    assert.ok(owner);
+    assert.deepEqual(
+      established.listClaims(owner.sessionId).map((claim) => [claim.resource, claim.mode]),
+      [["README.md", "write"]],
+    );
+
+    assert.throws(
+      () => established.provision(declaration),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "DUPLICATE_WORKTREE_OWNERSHIP");
+        assert.deepEqual(error.details.bootstrap_retry, {
+          classification: "already-established",
+          exact_identity_proven: true,
+          session_id: owner.sessionId,
+          next_action: "inspect-established-session",
+        });
+        assert.equal(error.details.owner_session_id, owner.sessionId);
+        return true;
+      },
+    );
+
+    assert.throws(
+      () =>
+        established.provision({
+          ...declaration,
+          initialClaims: [{ resource: "README.md", mode: "read" }],
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "DUPLICATE_WORKTREE_OWNERSHIP");
+        assert.deepEqual(error.details.bootstrap_retry, {
+          classification: "owner-conflict",
+          exact_identity_proven: false,
+          next_action: "inspect-blocking-session",
+        });
+        assert.equal(error.details.owner_session_id, owner.sessionId);
+        return true;
+      },
+    );
+    assert.equal(established.list().length, 1);
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
     runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);

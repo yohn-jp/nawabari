@@ -322,6 +322,37 @@ test("diagnose surfaces stale/missing worktree physical state as an immediate cl
   }
 });
 
+test("diagnose projects stale missing physical state into reconciliation without close or GC", () => {
+  const fixture = createFixture("stale-reconciliation");
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repository });
+    const session = registry.provision({ worktreePath: fixture.worktree, branchName: "feature/stale-reconciliation" });
+    registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "**", mode: "exclusive-write" }],
+    });
+
+    // Remove the Git worktree entry as well as its path, producing the
+    // observed unregistered-missing state from the issue reproduction.
+    runGit(["worktree", "remove", "--force", fixture.worktree], fixture.repository);
+
+    const diagnostic = registry.diagnose(session.sessionId);
+    assert.equal(diagnostic.physicalState, "unregistered-missing");
+    assert.equal(diagnostic.lifecycle?.state, "stale-inconsistent");
+    assert.equal(
+      diagnostic.lifecycle?.transitions.find((transition) => transition.operation === "close")?.reason,
+      "physical-reconciliation-required",
+    );
+    assert.equal(diagnostic.nextAction?.actionId, "reconcile-physical-state");
+    assert.ok(diagnostic.safeActions.includes("reconcile-physical-state"));
+    assert.equal(diagnostic.safeActions.includes("close-session"), false);
+    assert.equal(diagnostic.safeActions.includes("run-garbage-collect"), false);
+    assert.deepEqual(diagnostic.blockers, []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("diagnose reports an ambiguous result state, fail-closed, when Git worktree observation fails", () => {
   const fixture = createFixture("ambiguous");
   try {

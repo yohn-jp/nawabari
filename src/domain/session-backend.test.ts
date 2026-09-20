@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 import { runCli } from "../cli.js";
 import { SessionRegistry } from "../session-registry.js";
+import { withDirectoryFsyncFailure } from "../testing/fs-fault-injection.js";
 import { LocalSessionBackend } from "./session-backend.js";
 
 test("local session backend provisions through the domain contract", async () => {
@@ -55,6 +56,64 @@ test("local session backend provisions initial claims in the same registry mutat
       ["write"],
     );
     assert.equal(registry.listClaims(result.value.session_id)[0]?.resource, "README.md");
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("local session backend exposes deterministic bootstrap retry evidence without adopting an owner", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-domain-bootstrap-retry`;
+  const options = {
+    branch: "feature/domain-bootstrap-retry",
+    worktree: worktreePath,
+    label: "bootstrap-retry",
+    base: null,
+    claims: [{ resource: "README.md", mode: "write" as const }],
+  };
+  try {
+    const backend = new LocalSessionBackend();
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    assert.throws(
+      () =>
+        withDirectoryFsyncFailure(registry.paths.directory, "EIO", () =>
+          registry.provision({
+            branchName: options.branch,
+            worktreePath: options.worktree,
+            label: options.label,
+            initialClaims: options.claims,
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.name === "SessionRegistryError" &&
+        (error as { code?: string }).code === "REGISTRY_DURABILITY_UNCERTAIN",
+    );
+
+    const retry = await backend.createSession({ cwd: repositoryPath }, options);
+    assert.equal(retry.ok, false);
+    if (retry.ok) return;
+    assert.equal(retry.error.code, "WORKTREE_OWNED_BY_OTHER_SESSION");
+    const retryEvidence = retry.error.details?.bootstrap_retry as Record<string, unknown>;
+    assert.equal(retryEvidence.classification, "already-established");
+    assert.equal(retryEvidence.exact_identity_proven, true);
+    assert.equal(typeof retryEvidence.session_id, "string");
+    assert.equal(retryEvidence.next_action, "inspect-established-session");
+
+    const unrelated = await backend.createSession(
+      { cwd: repositoryPath },
+      { ...options, claims: [{ resource: "README.md", mode: "read" as const }] },
+    );
+    assert.equal(unrelated.ok, false);
+    if (unrelated.ok) return;
+    assert.equal(unrelated.error.code, "WORKTREE_OWNED_BY_OTHER_SESSION");
+    const unrelatedEvidence = unrelated.error.details?.bootstrap_retry as Record<string, unknown>;
+    assert.deepEqual(unrelatedEvidence, {
+      classification: "owner-conflict",
+      exact_identity_proven: false,
+      next_action: "inspect-blocking-session",
+    });
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });

@@ -91,6 +91,7 @@ import {
 import type { SandboxGitIdentity } from "./domain/sandbox.js";
 import {
   classifySessionLifecycle,
+  lifecycleTransition,
   type SessionLifecycleClassification,
   type SessionLifecyclePhase,
 } from "./session-lifecycle-classification.js";
@@ -1445,8 +1446,19 @@ export class SessionRegistry {
         ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
       });
 
-      assertNoOwnershipConflict(state.sessions, record);
-      assertGitResourcesAvailable(this.git, this.repository.worktreePath, resources);
+      const retryEvidence = this.provisioningRetryEvidence(state, resources, options);
+      try {
+        assertNoOwnershipConflict(state.sessions, record);
+      } catch (error: unknown) {
+        if (
+          error instanceof SessionRegistryError &&
+          (error.code === "DUPLICATE_WORKTREE_OWNERSHIP" || error.code === "DUPLICATE_BRANCH_OWNERSHIP")
+        ) {
+          throw new SessionRegistryError(error.code, error.message, { ...error.details, ...retryEvidence }, error);
+        }
+        throw error;
+      }
+      assertGitResourcesAvailable(this.git, this.repository.worktreePath, resources, retryEvidence);
 
       let gitProvisioned = false;
       try {
@@ -1538,6 +1550,73 @@ export class SessionRegistry {
 
   createProvisionedSession(options: ProvisionSessionOptions = {}): SessionRecord {
     return this.provision(options);
+  }
+
+  /**
+   * Classify a physical collision using only positively observed registry
+   * ownership and the complete original bootstrap declaration. An exact
+   * match is surfaced as a safe inspection action; every other collision is
+   * fail-closed and never adopted.
+   */
+  private provisioningRetryEvidence(
+    state: RegistryState,
+    resources: ProvisioningResources,
+    options: ProvisionSessionOptions,
+  ): RegistryErrorDetails {
+    const owner = state.sessions.find(
+      (candidate) =>
+        samePath(candidate.worktreePath, resources.worktreePath) || candidate.branchName === resources.branchName,
+    );
+    if (owner === undefined) {
+      return {
+        bootstrap_retry: {
+          classification: "unrelated-resource-conflict",
+          exact_identity_proven: false,
+          next_action: "choose-different-worktree-or-branch",
+        },
+      };
+    }
+
+    const samePhysicalIdentity =
+      samePath(owner.worktreePath, resources.worktreePath) && owner.branchName === resources.branchName;
+    let declarationMatches = false;
+    if (samePhysicalIdentity && owner.baseRevision === resources.baseRevision) {
+      try {
+        const ownerContext: ClaimOwner = { ...owner, record: owner };
+        const requested = this.canonicalClaimInputs(options.initialClaims ?? [], ownerContext, true);
+        const established = sortResourceClaims(state.claims.filter((claim) => claim.sessionId === owner.sessionId)).map(
+          (claim) => ({ resource: claim.resource, mode: claim.mode }),
+        );
+        declarationMatches =
+          owner.label === (options.label === undefined ? undefined : options.label) &&
+          requested.length === established.length &&
+          requested.every(
+            (claim, index) =>
+              claim.resource === established[index]?.resource && claim.mode === established[index]?.mode,
+          );
+      } catch {
+        declarationMatches = false;
+      }
+    }
+
+    return {
+      owner_session_id: owner.sessionId,
+      owner_worktree: owner.worktreePath,
+      owner_branch: owner.branchName,
+      owner_state: owner.state,
+      bootstrap_retry: declarationMatches
+        ? {
+            classification: "already-established",
+            exact_identity_proven: true,
+            session_id: owner.sessionId,
+            next_action: "inspect-established-session",
+          }
+        : {
+            classification: "owner-conflict",
+            exact_identity_proven: false,
+            next_action: "inspect-blocking-session",
+          },
+    };
   }
 
   register(record: SessionRecord): SessionRecord {
@@ -1963,15 +2042,19 @@ export class SessionRegistry {
               resourceClaimConflictsWithAccess(claim, resource, requiredAccess),
           );
           if (conflictingClaim !== undefined) {
-            const conflictDetails = resourceClaimConflictDetails(
+            const conflictDetails = this.resourceClaimConflictDetails(
               { resource, mode: requiredAccess },
               conflictingClaim,
-              state.sessions,
+              state,
             );
             return deniedOperation("RESOURCE_CLAIM_CONFLICT", verified, {
               ...conflictDetails,
-              safeActions: [...safeActionsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails)],
-              recoveryHints: recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
+              safeActions: Array.isArray(conflictDetails.safeActions)
+                ? [...conflictDetails.safeActions]
+                : [...safeActionsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails)],
+              recoveryHints: Array.isArray(conflictDetails.recoveryHints)
+                ? [...conflictDetails.recoveryHints]
+                : recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
             });
           }
           if (ownClaims.length > 0) {
@@ -3800,6 +3883,58 @@ export class SessionRegistry {
     this.validateRequestedClaims(candidates, owner, externalClaims, sessions);
   }
 
+  /**
+   * Add lifecycle evidence to claim conflicts only when the blocking owner is
+   * positively classified as stale/inconsistent. Healthy owners retain the
+   * ordinary wait/coordinate guidance, while ambiguous observations remain
+   * fail-closed and never become a stale-owner recovery hint.
+   */
+  private resourceClaimConflictDetails(
+    requested: { resource: string; mode: ResourceClaimMode },
+    owner: { claimId: string; sessionId: string; resource: string; mode: ResourceClaimMode },
+    state: Pick<RegistryState, "sessions" | "claims">,
+  ): RegistryErrorDetails {
+    const details = resourceClaimConflictDetails(requested, owner, state.sessions);
+    const ownerSession = state.sessions.find((record) => record.sessionId === owner.sessionId);
+    if (ownerSession === undefined) return details;
+
+    const diagnostic = this.diagnoseUnsafe(ownerSession, {
+      sessions: state.sessions,
+      claims: state.claims,
+      claimSetGeneration: 0,
+      legacyClaimsAbsent: false,
+    });
+    const lifecycle = diagnostic.lifecycle;
+    const nextAction = diagnostic.nextActions[0];
+    // A missing/prunable/invalid physical observation is concrete evidence of
+    // drift. `unavailable` is unresolved evidence and must keep ordinary
+    // fail-closed owner guidance instead of being promoted to stale recovery.
+    const physicallyInconsistent =
+      diagnostic.physicalState !== "healthy" &&
+      diagnostic.physicalState !== "closed" &&
+      diagnostic.physicalState !== "unavailable";
+    if (
+      !physicallyInconsistent ||
+      lifecycle?.state !== "stale-inconsistent" ||
+      nextAction?.actionId !== "reconcile-physical-state"
+    ) {
+      return details;
+    }
+
+    return {
+      ...details,
+      ownerPhysicalState: diagnostic.physicalState,
+      ownerLifecycleState: lifecycle.state,
+      nextAction: nextAction as unknown as RegistryErrorDetailValue,
+      nextActions: diagnostic.nextActions as unknown as RegistryErrorDetailValue,
+      safeActions: ["inspect-blocking-session", "reconcile-physical-state", "retain-session"],
+      recoveryHints: [
+        "Inspect the blocking session and run its canonical physical reconciliation before coordinating claim release.",
+        "Do not force-release another session's claim; reconciliation must prove ownership before release.",
+      ],
+    };
+  }
+
   /** Single same-session overlap authority shared by additive and delta paths. */
   private assertNoOverlappingClaims(claims: readonly ResourceClaim[], context: "request" | "result" = "result"): void {
     for (let index = 0; index < claims.length; index += 1) {
@@ -3946,12 +4081,19 @@ export class SessionRegistry {
           });
         }
         if (claimsConflict(candidate, current)) {
-          const conflictDetails = resourceClaimConflictDetails(candidate, current, sessions);
+          const conflictDetails = this.resourceClaimConflictDetails(candidate, current, {
+            sessions,
+            claims: existing,
+          });
           throw claimError("RESOURCE_CLAIM_CONFLICT", "Resource claim conflicts with an active session claim", {
             claimId: candidate.claimId,
             ...conflictDetails,
-            safeActions: [...safeActionsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails)],
-            recoveryHints: recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
+            safeActions: Array.isArray(conflictDetails.safeActions)
+              ? [...conflictDetails.safeActions]
+              : [...safeActionsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails)],
+            recoveryHints: Array.isArray(conflictDetails.recoveryHints)
+              ? [...conflictDetails.recoveryHints]
+              : recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
           });
         }
       }
@@ -4437,21 +4579,25 @@ export class SessionRegistry {
       blockers: blockers.map((blocker) => ({ code: blocker.code })),
       terminalOperation: record.terminalOperation,
       ageSuspicious: Date.parse(now) - Date.parse(record.updatedAt) >= this.staleAfterMs,
+      gcAuthorized: garbageCollection.destructiveEligibility === "eligible",
       phase: "termination",
     });
-    const safeActions =
-      blockers.length > 0
-        ? sortStrings(Array.from(new Set(blockers.flatMap((blocker) => blocker.safeActions))))
-        : closeReadiness === "ready"
-          ? cleanupReadiness === "ready"
-            ? ["close-session", "run-garbage-collect"]
-            : ["close-session"]
-          : [];
     const nextActions = projectSessionLifecycleActions({
       classification: lifecycle,
       sessionId: record.sessionId,
       blockers: blockers.map((blocker) => ({ code: blocker.code, details: blocker.details })),
     });
+    const projectedBlockers = blockers.map((blocker) =>
+      Object.freeze({
+        ...blocker,
+        safeActions: Object.freeze(projectLegacySafeActions(lifecycle, nextActions, blocker.safeActions)),
+      }),
+    );
+    const safeActions = Object.freeze(
+      blockers.length === 0
+        ? projectLegacySafeActions(lifecycle, nextActions, [])
+        : sortStrings(Array.from(new Set(projectedBlockers.flatMap((blocker) => blocker.safeActions)))),
+    );
 
     return Object.freeze({
       schemaVersion: SESSION_DIAGNOSTIC_SCHEMA_VERSION,
@@ -4466,8 +4612,8 @@ export class SessionRegistry {
       cleanupReadiness,
       resultState,
       idempotent: false,
-      blockers: Object.freeze(blockers),
-      safeActions: Object.freeze(safeActions),
+      blockers: Object.freeze(projectedBlockers),
+      safeActions,
       ...(nextActions.length === 0 ? {} : { nextAction: nextActions[0] }),
       nextActions,
       integrationEvidence: Object.freeze({
@@ -5639,6 +5785,32 @@ function toDiagnosticBlocker(error: unknown): SessionDiagnosticBlocker {
     ...blocker,
     safeActions: Object.freeze(safeActionsForCode(blocker.code, blocker.details)),
   });
+}
+
+/**
+ * Compatibility projection for the legacy string action surface. Operation
+ * authority comes from the lifecycle transition and typed action projection;
+ * older blocker-specific hints are retained only when they do not advertise a
+ * denied close/GC mutation.
+ */
+function projectLegacySafeActions(
+  lifecycle: SessionLifecycleClassification,
+  nextActions: readonly SessionLifecycleAction[],
+  compatibilityActions: readonly string[],
+): readonly string[] {
+  const close = lifecycleTransition(lifecycle, "close");
+  const gc = lifecycleTransition(lifecycle, "gc");
+  const actions = new Set(
+    compatibilityActions.filter(
+      (candidate) =>
+        (candidate !== "close-session" || close.allowed) && (candidate !== "run-garbage-collect" || gc.allowed),
+    ),
+  );
+
+  for (const nextAction of nextActions) actions.add(nextAction.actionId);
+  if (close.allowed) actions.add("close-session");
+  if (gc.allowed) actions.add("run-garbage-collect");
+  return sortStrings(actions);
 }
 
 /**
@@ -7280,7 +7452,12 @@ function localBranchCollision(git: GitCommandRunner, cwd: string, branchId: stri
     );
 }
 
-function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resources: ProvisioningResources): void {
+function assertGitResourcesAvailable(
+  git: GitCommandRunner,
+  cwd: string,
+  resources: ProvisioningResources,
+  retryEvidence: RegistryErrorDetails,
+): void {
   assertNoSymlinkPath(resources.worktreePath);
   const parent = path.dirname(resources.worktreePath);
   try {
@@ -7303,6 +7480,7 @@ function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resourc
       `Worktree path already exists: ${resources.worktreePath}`,
       {
         worktree: resources.worktreePath,
+        ...retryEvidence,
       },
     );
   }
@@ -7313,6 +7491,7 @@ function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resourc
       `Worktree path is a symbolic link: ${resources.worktreePath}`,
       {
         worktree: resources.worktreePath,
+        ...retryEvidence,
       },
     );
   }
@@ -7328,6 +7507,7 @@ function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resourc
   if (localBranchCollision(git, cwd, resources.branchId)) {
     throw new SessionRegistryError("BRANCH_ALREADY_EXISTS", `Local branch already exists: ${resources.branchName}`, {
       branch: resources.branchName,
+      ...retryEvidence,
     });
   }
 }

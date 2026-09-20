@@ -75,7 +75,10 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
   {
     name: "session create",
     summary: "Request a new Nawabari session",
-    usage: `${CLI_NAME} session create [options]`,
+    usage:
+      `${CLI_NAME} session create [--branch <name>] [--worktree <path>|--worktree-root <path>] ` +
+      `[--base <ref>] [--label <text>] ` +
+      `[--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
     options: [
       option("--branch", "Branch to create; omitted uses the generated session branch", {
         value: "<name>",
@@ -97,6 +100,15 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
       option("--base", "Commit-resolving base ref for the new worktree", { value: "<ref>", default: "HEAD" }),
       option("--label", "Optional display label; never used as an identity", { value: "<text>", default: "omitted" }),
       option(
+        "--resource",
+        "Initial repository-relative resource claim; repeatable, each paired with the --mode immediately after it",
+        { value: "<path-or-glob>", repeatable: true },
+      ),
+      option("--mode", "Mode for the --resource immediately before it; repeatable", {
+        value: "<read|write|exclusive-write>",
+        repeatable: true,
+      }),
+      option(
         "--auxiliary-state",
         "JSON repository-local auxiliary-state declaration to materialize in the managed worktree; repeatable",
         { value: "<json>", repeatable: true },
@@ -105,6 +117,8 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     notes: [
       "All create options are optional. Use status --json to discover managed_worktree_root.",
       "--worktree and --worktree-root cannot be combined.",
+      "Initial claims are provisioned atomically with the session; each --resource must be immediately followed by its own --mode, and zero pairs remains backward compatible.",
+      "A claim conflict returns blocking-owner evidence. A durability-uncertain result is retry-safe only after re-reading the reported registry state; an existing owner is never silently adopted.",
       "Without an override, Nawabari creates the safe managed root <repository-parent>/.nawabari/worktrees on first use. Existing absolute worktree paths directly under the repository parent remain accepted for compatibility.",
     ],
   },

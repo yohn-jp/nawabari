@@ -123,7 +123,16 @@ export const DISPATCHER_COMMAND_INVENTORY = [
 
 /** Dispatcher option inventory, keyed by canonical registry command identity. */
 export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly string[]>> = {
-  "session create": ["--branch", "--worktree", "--worktree-root", "--base", "--label", "--auxiliary-state"],
+  "session create": [
+    "--branch",
+    "--worktree",
+    "--worktree-root",
+    "--base",
+    "--label",
+    "--resource",
+    "--mode",
+    "--auxiliary-state",
+  ],
   "session id": [],
   "session show": ["--session"],
   "session inspect": ["--session", "--integrated-revision", "--schema-version"],
@@ -697,6 +706,12 @@ type ClaimReplacementPairs = {
   pairs: Array<{ resource: string; mode: string }>;
   expected_claim_set_generation: number | null;
   force: boolean;
+  branch: string | null;
+  worktree: string | null;
+  worktree_root: string | null;
+  base: string | null;
+  label: string | null;
+  auxiliary_states: unknown[];
 };
 
 type ClaimDeltaMutation = {
@@ -1096,12 +1111,22 @@ function parseClaimReplacementPairs(
   arguments_: string[],
   requireConcurrencyIntent = true,
   command = "session update",
+  requirePairs = true,
 ): DomainResult<ClaimReplacementPairs> {
   const positional = splitPositionalSessionTarget(arguments_);
   if (!positional.ok) return positional;
+  if (command === "session create" && positional.value.sessionId !== null) {
+    return failure(usageError("INVALID_ARGUMENT", "session create does not accept a positional session target."));
+  }
   let sessionId: string | null = null;
   let repository: string | null = null;
   const pairs: Array<{ resource: string; mode: string }> = [];
+  let branch: string | null = null;
+  let worktree: string | null = null;
+  let worktreeRoot: string | null = null;
+  let base: string | null = null;
+  let label: string | null = null;
+  const auxiliaryStates: unknown[] = [];
   let pendingResource: string | null = null;
   let concurrencyState: ClaimConcurrencyState = {
     expected_claim_set_generation: null,
@@ -1117,7 +1142,7 @@ function parseClaimReplacementPairs(
     if (!recognized.has(name) || (!requireConcurrencyIntent && isConcurrencyOption)) {
       return failure(usageError("INVALID_ARGUMENT", `Unknown option: ${name}.`, { option: name }));
     }
-    if (pendingResource !== null && name !== "--mode") {
+    if (pendingResource !== null && name !== "--mode" && name !== "--auxiliary-state") {
       return failure(
         usageError(
           "INVALID_ARGUMENT",
@@ -1149,12 +1174,36 @@ function parseClaimReplacementPairs(
       }
       sessionId = value;
     } else if (name === "--repository") repository = value;
-    else if (name === "--resource") pendingResource = value;
+    else if (name === "--branch") branch = value;
+    else if (name === "--worktree") worktree = value;
+    else if (name === "--worktree-root") worktreeRoot = value;
+    else if (name === "--base") base = value;
+    else if (name === "--label") label = value;
+    else if (name === "--auxiliary-state") {
+      try {
+        auxiliaryStates.push(JSON.parse(value) as unknown);
+      } catch (error: unknown) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--auxiliary-state requires one valid JSON declaration.", {
+            option: name,
+            reason: error instanceof Error ? error.message : "invalid JSON",
+          }),
+        );
+      }
+    } else if (name === "--resource") pendingResource = value;
     else {
       if (pendingResource === null) {
         return failure(
           usageError("INVALID_ARGUMENT", "--mode must be immediately preceded by its own --resource.", {
             option: "--mode",
+          }),
+        );
+      }
+      if (!isResourceClaimMode(value)) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--mode requires read, write, or exclusive-write.", {
+            option: "--mode",
+            value,
           }),
         );
       }
@@ -1168,7 +1217,7 @@ function parseClaimReplacementPairs(
       usageError("MISSING_ARGUMENT", "--resource must be immediately followed by --mode.", { option: "--mode" }),
     );
   }
-  if (pairs.length === 0) {
+  if (requirePairs && pairs.length === 0) {
     return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
   }
   const concurrency = finalizeClaimConcurrency(concurrencyState, requireConcurrencyIntent);
@@ -1181,6 +1230,12 @@ function parseClaimReplacementPairs(
       pairs,
       expected_claim_set_generation: concurrency.value.expected_claim_set_generation,
       force: concurrency.value.force,
+      branch,
+      worktree,
+      worktree_root: worktreeRoot,
+      base,
+      label,
+      auxiliary_states: auxiliaryStates,
     },
   };
 }
@@ -1488,7 +1543,7 @@ async function executeCommand(
       return executeRelease(rest, dependencies.backend, context, "session release");
     }
     if (subcommand === "create") {
-      const parsed = parseOptions(rest, dispatcherAllowedOptions("session create"));
+      const parsed = parseClaimReplacementPairs(rest, false, "session create", false);
       if (!parsed.ok) return parsed;
       if (parsed.value.worktree !== null && parsed.value.worktree_root !== null) {
         return failure(usageError("INVALID_ARGUMENT", "--worktree and --worktree-root cannot be used together."));
@@ -1499,6 +1554,14 @@ async function executeCommand(
         worktree_root: parsed.value.worktree_root,
         base: parsed.value.base,
         label: parsed.value.label,
+        ...(parsed.value.pairs.length === 0
+          ? {}
+          : {
+              claims: parsed.value.pairs.map((pair) => ({
+                resource: pair.resource,
+                mode: pair.mode as "read" | "write" | "exclusive-write",
+              })),
+            }),
         ...(parsed.value.auxiliary_states.length === 0
           ? {}
           : { auxiliary_state: parsed.value.auxiliary_states as SessionCreateOptions["auxiliary_state"] }),

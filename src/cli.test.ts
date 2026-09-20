@@ -646,6 +646,8 @@ test("command-specific help is projected from one spec and marks session create 
     "--worktree-root",
     "--base",
     "--label",
+    "--resource",
+    "--mode",
     "--auxiliary-state",
   ]);
   assert.deepEqual(response.defaults, {
@@ -1036,6 +1038,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--worktree-root",
       "--base",
       "--label",
+      "--resource",
+      "--mode",
       "--auxiliary-state",
       "--session",
       "--integrated-revision",
@@ -1044,8 +1048,6 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--runtime-policy",
       "--limit",
       "--offset",
-      "--resource",
-      "--mode",
       "--repository",
       "--if-generation",
       "--force",
@@ -1905,6 +1907,49 @@ test("session create forwards --worktree-root to the backend as the caller-selec
   });
 });
 
+test("session create forwards repeated initial claims in one atomic backend request", async () => {
+  let observedOptions: SessionCreateOptions | null = null;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, options: SessionCreateOptions) => {
+      observedOptions = options;
+      return success(sampleSession);
+    },
+  });
+
+  const output = capture();
+  const exitCode = await runCli(
+    [
+      "--json",
+      "session",
+      "create",
+      "--branch",
+      "feature/initial-claims",
+      "--resource",
+      "src/a.ts",
+      "--mode",
+      "write",
+      "--resource",
+      "src/b.ts",
+      "--mode",
+      "exclusive-write",
+    ],
+    { backend, io: output.io },
+  );
+
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.deepEqual(observedOptions, {
+    branch: "feature/initial-claims",
+    worktree: null,
+    worktree_root: null,
+    base: null,
+    label: null,
+    claims: [
+      { resource: "src/a.ts", mode: "write" },
+      { resource: "src/b.ts", mode: "exclusive-write" },
+    ],
+  });
+});
+
 test("session create forwards repeatable auxiliary-state JSON declarations without a second parser", async () => {
   let observedOptions: SessionCreateOptions | null = null;
   const backend = backendForTests({
@@ -1929,6 +1974,43 @@ test("session create forwards repeatable auxiliary-state JSON declarations witho
   assert.deepEqual((observedOptions as unknown as SessionCreateOptions).auxiliary_state, [declaration]);
 });
 
+test("session create accepts adjacent claims with an interleaved auxiliary declaration", async () => {
+  let observedOptions: SessionCreateOptions | null = null;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, options: SessionCreateOptions) => {
+      observedOptions = options;
+      return success(sampleSession);
+    },
+  });
+  const declaration = {
+    source: { kind: "repository-local", path: ".codegraph/ignored" },
+    target: { kind: "managed-worktree", path: ".codegraph/ignored" },
+    mode: "copy",
+    durability: "durable",
+  };
+
+  const exitCode = await runCli(
+    [
+      "--json",
+      "session",
+      "create",
+      "--resource",
+      "src/a.ts",
+      "--auxiliary-state",
+      JSON.stringify(declaration),
+      "--mode",
+      "write",
+    ],
+    { backend, io: capture().io },
+  );
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual((observedOptions as unknown as SessionCreateOptions).claims, [
+    { resource: "src/a.ts", mode: "write" },
+  ]);
+  assert.deepEqual((observedOptions as unknown as SessionCreateOptions).auxiliary_state, [declaration]);
+});
+
 test("session create rejects malformed auxiliary-state JSON before invoking the backend", async () => {
   let backendCalled = false;
   const backend = backendForTests({
@@ -1947,6 +2029,28 @@ test("session create rejects malformed auxiliary-state JSON before invoking the 
   assert.equal(exitCode, 2);
   assert.equal(JSON.parse(output.stdout[0]).code, "INVALID_ARGUMENT");
   assert.equal(backendCalled, false);
+});
+
+test("session create rejects malformed initial claim pairs before provisioning", async () => {
+  let backendCalls = 0;
+  const backend = backendForTests({
+    createSession: async () => {
+      backendCalls += 1;
+      return success(sampleSession);
+    },
+  });
+
+  for (const arguments_ of [
+    ["--resource", "src/a.ts", "--resource", "src/b.ts", "--mode", "write"],
+    ["--mode", "write", "--resource", "src/a.ts"],
+    ["--resource", "src/a.ts", "--mode", "invalid"],
+  ]) {
+    const output = capture();
+    const exitCode = await runCli(["--json", "session", "create", ...arguments_], { backend, io: output.io });
+    assert.equal(exitCode, 2);
+    assert.equal(JSON.parse(output.stdout[0] ?? "").code, "INVALID_ARGUMENT");
+  }
+  assert.equal(backendCalls, 0);
 });
 
 function sampleClaim(resource: string, mode: "read" | "write" | "exclusive-write"): ResourceClaim {

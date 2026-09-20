@@ -674,8 +674,12 @@ async function main() {
           "feature/installed-auxiliary",
           "--worktree",
           auxiliaryWorktree,
+          "--resource",
+          "README.md",
           "--auxiliary-state",
           auxiliaryDeclaration,
+          "--mode",
+          "write",
           "--json",
         ],
         lifecycleRepository,
@@ -689,6 +693,18 @@ async function main() {
       run("git", ["status", "--porcelain"], { cwd: auxiliaryWorktree, env: gitEnvironment }).stdout.trim() !== ""
     ) {
       fail("packed session create did not establish only the declared auxiliary state with clean Git status");
+    }
+    const auxiliaryClaims = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", auxiliaryCreated.session_id, "--json"], lifecycleRepository),
+      "packed auxiliary-state session claims",
+    );
+    if (
+      auxiliaryClaims.ok !== true ||
+      auxiliaryClaims.claims?.length !== 1 ||
+      auxiliaryClaims.claims[0]?.resource !== "README.md" ||
+      auxiliaryClaims.claims[0]?.mode !== "write"
+    ) {
+      fail("packed session create did not atomically establish the initial claim with auxiliary state");
     }
     const auxiliaryClosed = parseInstalledJson(
       invokeInstalled(["session", "close", "--session", auxiliaryCreated.session_id, "--json"], lifecycleRepository),
@@ -845,7 +861,7 @@ async function main() {
       createHelp.help_for !== "session create" ||
       createHelp.required_options?.length !== 0 ||
       createHelp.optional_options?.join(",") !==
-        "--branch,--worktree,--worktree-root,--base,--label,--auxiliary-state" ||
+        "--branch,--worktree,--worktree-root,--base,--label,--resource,--mode,--auxiliary-state" ||
       createHelp.defaults?.["--base"] !== "HEAD"
     ) {
       fail("installed session create help did not expose the optional/defaulted contract");
