@@ -24,6 +24,8 @@ const validBody = [
   "## Review focus",
   "",
   "None.",
+  "",
+  '<!-- inari:template {"version":"1","kind":"pull_request","path":".github/PULL_REQUEST_TEMPLATE/default.md"} -->',
 ].join("\n");
 
 test("accepts a title and valid repository-native PR body", async () => {
