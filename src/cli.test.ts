@@ -640,7 +640,14 @@ test("command-specific help is projected from one spec and marks session create 
   assert.equal(response.command, "help");
   assert.equal(response.help_for, "session create");
   assert.deepEqual(response.required_options, []);
-  assert.deepEqual(response.optional_options, ["--branch", "--worktree", "--worktree-root", "--base", "--label"]);
+  assert.deepEqual(response.optional_options, [
+    "--branch",
+    "--worktree",
+    "--worktree-root",
+    "--base",
+    "--label",
+    "--auxiliary-state",
+  ]);
   assert.deepEqual(response.defaults, {
     "--branch": "nawabari/session/<session_id>",
     "--worktree": "<managed_worktree_root>/<repository>-<session_id>",
@@ -1029,6 +1036,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--worktree-root",
       "--base",
       "--label",
+      "--auxiliary-state",
       "--session",
       "--integrated-revision",
       "--schema-version",
@@ -1895,6 +1903,50 @@ test("session create forwards --worktree-root to the backend as the caller-selec
     base: null,
     label: null,
   });
+});
+
+test("session create forwards repeatable auxiliary-state JSON declarations without a second parser", async () => {
+  let observedOptions: SessionCreateOptions | null = null;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, options: SessionCreateOptions) => {
+      observedOptions = options;
+      return success(sampleSession);
+    },
+  });
+  const declaration = {
+    source: { kind: "repository-local", path: ".codegraph/ignored" },
+    target: { kind: "managed-worktree", path: ".codegraph/ignored" },
+    mode: "copy",
+    durability: "durable",
+  };
+
+  const exitCode = await runCli(["--json", "session", "create", "--auxiliary-state", JSON.stringify(declaration)], {
+    backend,
+    io: capture().io,
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual((observedOptions as unknown as SessionCreateOptions).auxiliary_state, [declaration]);
+});
+
+test("session create rejects malformed auxiliary-state JSON before invoking the backend", async () => {
+  let backendCalled = false;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, _options: SessionCreateOptions) => {
+      backendCalled = true;
+      return success(sampleSession);
+    },
+  });
+
+  const output = capture();
+  const exitCode = await runCli(["--json", "session", "create", "--auxiliary-state", "{"], {
+    backend,
+    io: output.io,
+  });
+
+  assert.equal(exitCode, 2);
+  assert.equal(JSON.parse(output.stdout[0]).code, "INVALID_ARGUMENT");
+  assert.equal(backendCalled, false);
 });
 
 function sampleClaim(resource: string, mode: "read" | "write" | "exclusive-write"): ResourceClaim {

@@ -96,6 +96,11 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
       ),
       option("--base", "Commit-resolving base ref for the new worktree", { value: "<ref>", default: "HEAD" }),
       option("--label", "Optional display label; never used as an identity", { value: "<text>", default: "omitted" }),
+      option(
+        "--auxiliary-state",
+        "JSON repository-local auxiliary-state declaration to materialize in the managed worktree; repeatable",
+        { value: "<json>", repeatable: true },
+      ),
     ],
     notes: [
       "All create options are optional. Use status --json to discover managed_worktree_root.",

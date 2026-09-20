@@ -126,6 +126,9 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   REGISTRY_LOCK_TIMEOUT: "LOCK_CONTENTION",
   REGISTRY_IO_FAILURE: "REGISTRY_UNREADABLE",
   REGISTRY_DURABILITY_UNCERTAIN: "REGISTRY_DURABILITY_UNCERTAIN",
+  AUXILIARY_STATE_INVALID: "AUXILIARY_STATE_INVALID",
+  AUXILIARY_STATE_AMBIGUOUS: "AUXILIARY_STATE_AMBIGUOUS",
+  AUXILIARY_STATE_MATERIALIZATION_FAILED: "AUXILIARY_STATE_MATERIALIZATION_FAILED",
   INVALID_CLAIM: "INVALID_CLAIM",
   INVALID_OPERATION: "INVALID_OPERATION",
   OPERATION_REJECTED: "OPERATION_REJECTED",
@@ -191,6 +194,9 @@ export class LocalSessionBackend implements SessionBackend {
         ...(options.claims === null || options.claims === undefined
           ? {}
           : { initialClaims: options.claims.map(toRegistryClaimInput) }),
+        ...(options.auxiliary_state === null || options.auxiliary_state === undefined
+          ? {}
+          : { auxiliaryState: options.auxiliary_state }),
       });
       return success(toDomainRecord(record));
     } catch (error: unknown) {

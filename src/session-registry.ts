@@ -30,6 +30,10 @@ import {
   type RegistryErrorDetailValue,
   type RegistryErrorDetails,
 } from "./errors.js";
+import {
+  materializeAuxiliaryStateProjection,
+  resolveAuxiliaryStateTrackedPathEvidence,
+} from "./domain/auxiliary-state-projection.js";
 import { generateSessionId, isSessionId } from "./session-id.js";
 import { isPostRenameFailure, writeJsonAtomicallySync } from "./registry/atomic.js";
 import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
@@ -220,6 +224,8 @@ export interface ProvisionSessionOptions {
   readonly label?: string;
   /** Complete initial claim declaration committed with the new session. */
   readonly initialClaims?: readonly ResourceClaimInput[];
+  /** Repository-local auxiliary-state declarations materialized in the owned worktree. */
+  readonly auxiliaryState?: readonly unknown[];
   readonly defaultBranchName?: string;
   readonly protectedBranchNames?: readonly string[];
   readonly protectedWorktreePaths?: readonly string[];
@@ -1455,6 +1461,30 @@ export class SessionRegistry {
           branchName: resources.branchName,
           git: this.git,
         });
+        if (options.auxiliaryState !== undefined && options.auxiliaryState.length > 0) {
+          const trackedPathEvidence = resolveAuxiliaryStateTrackedPathEvidence(this.repository.worktreePath);
+          if (!trackedPathEvidence.ok) {
+            throw new SessionRegistryError(
+              trackedPathEvidence.error.code as RegistryErrorCode,
+              trackedPathEvidence.error.message,
+              trackedPathEvidence.error.details as unknown as RegistryErrorDetails,
+            );
+          }
+          for (const declaration of options.auxiliaryState) {
+            const materialized = materializeAuxiliaryStateProjection(declaration, {
+              repository_root: this.repository.worktreePath,
+              worktree_root: resources.worktreePath,
+              tracked_path_evidence: trackedPathEvidence.value,
+            });
+            if (!materialized.ok) {
+              throw new SessionRegistryError(
+                materialized.error.code as RegistryErrorCode,
+                materialized.error.message,
+                materialized.error.details as unknown as RegistryErrorDetails,
+              );
+            }
+          }
+        }
         const owner: ClaimOwner = { ...record, record };
         const initialClaims =
           options.initialClaims === undefined

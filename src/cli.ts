@@ -123,7 +123,7 @@ export const DISPATCHER_COMMAND_INVENTORY = [
 
 /** Dispatcher option inventory, keyed by canonical registry command identity. */
 export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly string[]>> = {
-  "session create": ["--branch", "--worktree", "--worktree-root", "--base", "--label"],
+  "session create": ["--branch", "--worktree", "--worktree-root", "--base", "--label", "--auxiliary-state"],
   "session id": [],
   "session show": ["--session"],
   "session inspect": ["--session", "--integrated-revision", "--schema-version"],
@@ -396,6 +396,7 @@ type ParsedOptions = {
   worktree_root: string | null;
   base: string | null;
   label: string | null;
+  auxiliary_states: unknown[];
   resource: string | null;
   resources: string[];
   operation: string | null;
@@ -499,6 +500,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     worktree_root: null,
     base: null,
     label: null,
+    auxiliary_states: [],
     resource: null,
     resources: [],
     operation: null,
@@ -593,7 +595,18 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--worktree-root") options.worktree_root = value;
     else if (name === "--base") options.base = value;
     else if (name === "--label") options.label = value;
-    else if (name === "--resource") {
+    else if (name === "--auxiliary-state") {
+      try {
+        options.auxiliary_states.push(JSON.parse(value) as unknown);
+      } catch (error: unknown) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--auxiliary-state requires one valid JSON declaration.", {
+            option: name,
+            reason: error instanceof Error ? error.message : "invalid JSON",
+          }),
+        );
+      }
+    } else if (name === "--resource") {
       options.resource = value;
       options.resources.push(value);
     } else if (name === "--operation") options.operation = value;
@@ -1486,6 +1499,9 @@ async function executeCommand(
         worktree_root: parsed.value.worktree_root,
         base: parsed.value.base,
         label: parsed.value.label,
+        ...(parsed.value.auxiliary_states.length === 0
+          ? {}
+          : { auxiliary_state: parsed.value.auxiliary_states as SessionCreateOptions["auxiliary_state"] }),
       };
       const result = await dependencies.backend.createSession(context, options);
       return result.ok ? { ok: true, value: result.value } : result;
