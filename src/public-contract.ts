@@ -27,6 +27,11 @@ import {
   RESOURCE_CLAIM_TRANSITION_MATRIX_ID,
 } from "./contract.js";
 
+/** Stable identity of Nawabari's bounded Effective Working Set capability. */
+export const EFFECTIVE_WORKING_SET_CONTRACT_ID = "effective-working-set" as const;
+export const EFFECTIVE_WORKING_SET_CONTRACT_VERSION = 1 as const;
+export const EFFECTIVE_WORKING_SET_RESULT_SCHEMA = "effective-working-set.v1" as const;
+
 export {
   machineContract,
   MACHINE_CONTRACT_ID,
@@ -54,4 +59,21 @@ const installedPackageMetadata = createRequire(import.meta.url)("../package.json
  */
 export function nawabariMachineContract(packageVersion: string = installedPackageMetadata.version): JsonObject {
   return machineContract(packageVersion);
+}
+
+/**
+ * Public, product-neutral discovery for the additive working-set contract.
+ * The executable machine contract remains owned by `contract.ts`; this
+ * descriptor only advertises the consumer boundary and its artifact kinds.
+ */
+export function nawabariWorkingSetContract(): JsonObject {
+  return {
+    contract_id: EFFECTIVE_WORKING_SET_CONTRACT_ID,
+    contract_version: EFFECTIVE_WORKING_SET_CONTRACT_VERSION,
+    result_schema: EFFECTIVE_WORKING_SET_RESULT_SCHEMA,
+    artifact_kinds: ["implementation-execution-scope", "candidate-working-set", "effective-working-set"],
+    operations: ["READONLY", "WRITE", "CREATE", "DELETE", "DENY"],
+    fail_closed: true,
+    resource_claims_separate: true,
+  };
 }

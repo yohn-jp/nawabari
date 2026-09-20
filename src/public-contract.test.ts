@@ -4,7 +4,12 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { machineContract, MACHINE_CONTRACT_ID, nawabariMachineContract } from "./public-contract.js";
+import {
+  machineContract,
+  MACHINE_CONTRACT_ID,
+  nawabariMachineContract,
+  nawabariWorkingSetContract,
+} from "./public-contract.js";
 
 const packageJson = JSON.parse(
   fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../package.json"), "utf8"),
@@ -30,4 +35,16 @@ test("nawabariMachineContract() defaults to the installed package's own version"
 test("nawabariMachineContract(version) still describes an explicit generation", () => {
   const contract = nawabariMachineContract("explicit-test-version");
   assert.equal(contract.package_version, "explicit-test-version");
+});
+
+test("public contract exposes the product-neutral working-set capability", () => {
+  const contract = nawabariWorkingSetContract();
+  assert.equal(contract.contract_id, "effective-working-set");
+  assert.equal(contract.contract_version, 1);
+  assert.deepEqual(contract.artifact_kinds, [
+    "implementation-execution-scope",
+    "candidate-working-set",
+    "effective-working-set",
+  ]);
+  assert.equal(contract.resource_claims_separate, true);
 });
