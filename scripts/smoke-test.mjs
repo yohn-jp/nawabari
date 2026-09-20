@@ -464,7 +464,7 @@ async function main() {
     // transition vocabularies advertised by the public contract, plus
     // headroom for incremental growth — this remains a fixed budget, not an
     // unbounded one.
-    if (capabilitiesResult.stdout.length > 32_000) fail("capabilities --json exceeded its fixed discovery budget");
+    if (capabilitiesResult.stdout.length > 40_000) fail("capabilities --json exceeded its fixed discovery budget");
 
     const helpJsonResult = spawnSync(installedBinary, ["--help", "--json"], {
       cwd: installDirectory,

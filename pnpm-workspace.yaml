@@ -4,3 +4,5 @@
 allowBuilds:
   esbuild: true
 enableGlobalVirtualStore: true
+minimumReleaseAgeExclude:
+  - gh-inari@0.13.2
