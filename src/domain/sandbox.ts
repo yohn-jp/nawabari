@@ -7,6 +7,7 @@ import process from "node:process";
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import { LANDLOCK_ABI_MINIMUM, type LandlockCapability, type LandlockEffectiveState } from "./landlock.js";
 import type { SessionBackend, SessionContext } from "./session.js";
+import type { EffectiveWorkingSet } from "../working-set.js";
 import {
   SANDBOX_CAPABILITY_BASELINE_ID,
   SANDBOX_CAPABILITY_BASELINE_VERSION,
@@ -27,6 +28,10 @@ import {
   type RuntimePolicy,
   type SessionRuntimeProjection,
 } from "./runtime-projection.js";
+import {
+  compileWorkingSetRuntimeProjection,
+  type WorkingSetRuntimeProjection,
+} from "./working-set-runtime-projection.js";
 import { fhsDevelopmentRuntimeReadiness, readFhsDevelopmentExecutableCandidates } from "./fhs-development-runtime.js";
 import type { FhsRuntimeExecutableDeclaration } from "./fhs-runtime.js";
 import {
@@ -761,6 +766,43 @@ function resolveIdentity(probe: SandboxProbe): SandboxIdentity {
   };
 }
 
+function matchesWorkingSetBoundary(
+  provided: WorkingSetRuntimeProjection,
+  persisted: WorkingSetRuntimeProjection,
+): boolean {
+  return (
+    provided.working_set_id === persisted.working_set_id &&
+    provided.revision === persisted.revision &&
+    JSON.stringify(provided.repository) === JSON.stringify(persisted.repository) &&
+    JSON.stringify(provided.base) === JSON.stringify(persisted.base) &&
+    JSON.stringify(provided.scope) === JSON.stringify(persisted.scope)
+  );
+}
+
+function composePersistedWorkingSet(
+  projection: SessionRuntimeProjection,
+  persisted: WorkingSetRuntimeProjection | undefined,
+  sessionId: string,
+): DomainResult<SessionRuntimeProjection> {
+  if (persisted === undefined) return success(projection);
+  if (projection.working_set !== undefined && !matchesWorkingSetBoundary(projection.working_set, persisted)) {
+    return failure(
+      new DomainError(
+        "RUNTIME_PROJECTION_INVALID",
+        "The caller-provided working-set projection does not match the persisted session working set.",
+        {
+          session_id: sessionId,
+          expected_working_set_id: persisted.working_set_id,
+          expected_revision: persisted.revision,
+          provided_working_set_id: projection.working_set.working_set_id,
+          provided_revision: projection.working_set.revision,
+        },
+      ),
+    );
+  }
+  return success(Object.freeze({ ...projection, working_set: persisted }));
+}
+
 /**
  * Resolve one typed sandbox execution request for a single, already
  * authoritative Nawabari session. Repository/worktree/branch/session
@@ -791,6 +833,22 @@ export async function resolveSandboxExecutionRequest(
         guard: decision as unknown as JsonObject,
       }),
     );
+  }
+
+  let persistedWorkingSet: WorkingSetRuntimeProjection | undefined;
+  // The production backend always exposes getSession. Keep the advisory
+  // compatibility seam for older test-only backends that only implement the
+  // guard contract; such a backend cannot describe a bounded session.
+  if (options.enforce && typeof backend.getSession === "function") {
+    const sessionResult = await backend.getSession(context, decision.session_id);
+    if (!sessionResult.ok) return failure(sessionResult.error);
+    if (sessionResult.value.working_set !== undefined) {
+      const compiled = compileWorkingSetRuntimeProjection(
+        sessionResult.value.working_set as unknown as EffectiveWorkingSet,
+      );
+      if (!compiled.ok) return failure(compiled.error);
+      persistedWorkingSet = compiled.value;
+    }
   }
 
   const doctor = sandboxDoctorReport(probe, runtimeLayout);
@@ -873,7 +931,9 @@ export async function resolveSandboxExecutionRequest(
         ),
       );
     }
-    runtimeProjection = provided.value;
+    const composed = composePersistedWorkingSet(provided.value, persistedWorkingSet, decision.session_id);
+    if (!composed.ok) return failure(composed.error);
+    runtimeProjection = composed.value;
     runtimeResolution = Object.freeze({
       policy: provided.value.policy,
       profile: provided.value.profile,
@@ -890,7 +950,9 @@ export async function resolveSandboxExecutionRequest(
       fhs: options.runtime_fhs_options,
     });
     if (!resolved.ok) return failure(resolved.error);
-    runtimeProjection = resolved.value.projection;
+    const composed = composePersistedWorkingSet(resolved.value.projection, persistedWorkingSet, decision.session_id);
+    if (!composed.ok) return failure(composed.error);
+    runtimeProjection = composed.value;
     runtimeResolution = Object.freeze({
       policy: resolved.value.policy,
       profile: resolved.value.profile,
