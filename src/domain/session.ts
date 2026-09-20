@@ -5,6 +5,7 @@ import type {
   SessionLifecycleTransition,
 } from "../session-lifecycle-classification.js";
 import type { RepositoryIdentity } from "../working-set.js";
+import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -49,6 +50,28 @@ export type SessionCreateOptions = {
   candidate_working_set?: unknown | null;
   /** Optional repository identity used by the transport-neutral working-set contract. */
   working_set_repository?: RepositoryIdentity | null;
+};
+
+export type WorkingSetExpansionOptions = {
+  session_id: string | null;
+  repository: RepositoryIdentity;
+  current_revision: number | null;
+  execution_scope?: unknown;
+  entries: readonly WorkingSetExpansionRequestEntry[];
+};
+
+export type WorkingSetExpansionResult = {
+  schema_version: 1;
+  operation: "working-set-expand";
+  repository: RepositoryIdentity;
+  session_id: string;
+  previous_revision: number;
+  revision: number;
+  idempotent: boolean;
+  status: "granted" | "denied" | "unresolved";
+  outcomes: WorkingSetExpansionOutcome[];
+  session: SessionRecord;
+  working_set: JsonObject;
 };
 
 export type ResourceClaimMode = "read" | "write" | "exclusive-write";
@@ -823,6 +846,10 @@ export interface SessionBackend {
   createSession(context: SessionContext, options: SessionCreateOptions): Promise<DomainResult<SessionRecord>>;
   resolveCurrentSession(context: SessionContext): Promise<DomainResult<SessionRecord>>;
   getSession(context: SessionContext, sessionId: string): Promise<DomainResult<SessionRecord>>;
+  expandWorkingSet?(
+    context: SessionContext,
+    options: WorkingSetExpansionOptions,
+  ): Promise<DomainResult<WorkingSetExpansionResult>>;
   guard(context: SessionContext, options: GuardOptions): Promise<DomainResult<GuardDecision>>;
   authorizeOperation?(
     context: SessionContext,

@@ -35,6 +35,8 @@ import type {
   SessionDiscardPreview,
   SessionRecord,
   UpdateClaimsOptions,
+  WorkingSetExpansionOptions,
+  WorkingSetExpansionResult,
 } from "./domain/session.js";
 import { unavailableCapabilities } from "./domain/session.js";
 import {
@@ -709,6 +711,7 @@ test("canonical command registry resolves aliases without duplicating option def
     "session id",
     "session show",
     "session inspect",
+    "session scope expand",
     "session reconcile",
     "session run",
     "session exec",
@@ -1000,6 +1003,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session id",
       "session show",
       "session inspect",
+      "session scope expand",
       "session reconcile",
       "session run",
       "session exec",
@@ -1048,11 +1052,18 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--session",
       "--integrated-revision",
       "--schema-version",
+      "--repository",
+      "--repository-host",
+      "--revision",
+      "--path",
+      "--operation",
+      "--reason",
+      "--evidence",
+      "--unresolved",
       "--apply",
       "--runtime-policy",
       "--limit",
       "--offset",
-      "--repository",
       "--if-generation",
       "--force",
       "--upsert-resource",
@@ -1079,7 +1090,19 @@ test("JSON help separates global, session, and garbage-collection options", asyn
     session_targeting: {
       canonical: "--session <id>",
       positional_alias: "<session-id> as the first argument after a session-scoped subcommand",
-      commands: ["show", "inspect", "claim", "update", "mutate", "transition", "claims", "release", "close", "discard"],
+      commands: [
+        "show",
+        "inspect",
+        "scope expand",
+        "claim",
+        "update",
+        "mutate",
+        "transition",
+        "claims",
+        "release",
+        "close",
+        "discard",
+      ],
       ambiguity: "supplying both positional and --session is rejected",
       discard_requires_explicit_target: true,
     },
@@ -1863,6 +1886,68 @@ test("human session create, show, and close output avoids inline structured JSON
     assert.match(text, /session_id: 0190f1e0-0000-7000-8000-000000000001/u);
     assert.doesNotMatch(text, /\{"schema_version"/u);
     assert.doesNotMatch(text, /\[object Object\]/u);
+  }
+});
+
+test("session scope expand forwards an explicit revisioned path request", async () => {
+  const artifact = path.join(os.tmpdir(), `nawabari-expansion-${process.pid}.json`);
+  fs.writeFileSync(artifact, "{}\n");
+  let received: WorkingSetExpansionOptions | null = null;
+  const output = capture();
+  const result: WorkingSetExpansionResult = {
+    schema_version: 1,
+    operation: "working-set-expand",
+    repository: { repositoryHost: "github.com", repositoryId: "1329799765" },
+    session_id: sampleSession.session_id,
+    previous_revision: 1,
+    revision: 2,
+    idempotent: false,
+    status: "granted",
+    outcomes: [{ path: "src/new.ts", operation: "READONLY", status: "granted", reason: "context" }],
+    session: sampleSession,
+    working_set: {},
+  };
+  try {
+    const exitCode = await runCli(
+      [
+        "--json",
+        "session",
+        "scope",
+        "expand",
+        sampleSession.session_id,
+        "--repository",
+        "1329799765",
+        "--repository-host",
+        "github.com",
+        "--revision",
+        "1",
+        "--execution-scope-file",
+        artifact,
+        "--path",
+        "src/new.ts",
+        "--operation",
+        "READONLY",
+        "--reason",
+        "context",
+      ],
+      {
+        backend: backendForTests({
+          expandWorkingSet: async (_context, options) => {
+            received = options;
+            return success(result);
+          },
+        }),
+        io: output.io,
+      },
+    );
+    assert.equal(exitCode, 0);
+    const observed = received as unknown as WorkingSetExpansionOptions;
+    assert.equal(observed.session_id, sampleSession.session_id);
+    assert.equal(observed.current_revision, 1);
+    assert.deepEqual(observed.entries, [{ path: "src/new.ts", operation: "READONLY", reason: "context" }]);
+    assert.equal(JSON.parse(output.stdout[0] ?? "").status, "granted");
+  } finally {
+    fs.rmSync(artifact, { force: true });
   }
 });
 

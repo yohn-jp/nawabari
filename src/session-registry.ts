@@ -34,7 +34,14 @@ import {
   materializeAuxiliaryStateProjection,
   resolveAuxiliaryStateTrackedPathEvidence,
 } from "./domain/auxiliary-state-projection.js";
-import { composeEffectiveWorkingSet, type EffectiveWorkingSet, type RepositoryIdentity } from "./working-set.js";
+import {
+  composeEffectiveWorkingSet,
+  evaluateWorkingSetExpansion,
+  type EffectiveWorkingSet,
+  type RepositoryIdentity,
+  type WorkingSetExpansionOutcome,
+  type WorkingSetExpansionRequestEntry,
+} from "./working-set.js";
 import { generateSessionId, isSessionId } from "./session-id.js";
 import { isPostRenameFailure, writeJsonAtomicallySync } from "./registry/atomic.js";
 import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
@@ -239,6 +246,35 @@ export interface ProvisionSessionOptions {
   readonly defaultBranchName?: string;
   readonly protectedBranchNames?: readonly string[];
   readonly protectedWorktreePaths?: readonly string[];
+}
+
+export interface WorkingSetExpansionOptions {
+  /** Explicit session identity; expansion never infers the current owner. */
+  readonly sessionId?: string | null;
+  readonly session_id?: string | null;
+  /** Exact transport-neutral repository identity bound to the working set. */
+  readonly repository: RepositoryIdentity;
+  /** Mandatory optimistic-concurrency token for the effective working set. */
+  readonly currentRevision?: number;
+  readonly current_revision?: number;
+  /** The same bounded Inari artifact used to establish the session set. */
+  readonly executionScope?: unknown;
+  readonly execution_scope?: unknown;
+  readonly entries: readonly WorkingSetExpansionRequestEntry[];
+}
+
+export interface WorkingSetExpansionResult {
+  readonly schemaVersion: 1;
+  readonly operation: "working-set-expand";
+  readonly repository: RepositoryIdentity;
+  readonly sessionId: string;
+  readonly previousRevision: number;
+  readonly revision: number;
+  readonly idempotent: boolean;
+  readonly status: "granted" | "denied" | "unresolved";
+  readonly outcomes: readonly WorkingSetExpansionOutcome[];
+  readonly session: SessionRecord;
+  readonly workingSet: EffectiveWorkingSet;
 }
 
 export interface CloseSessionResult {
@@ -1058,6 +1094,183 @@ export class SessionRegistry {
       claims: state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim),
       claimSetGeneration: state.claimSetGeneration,
     };
+  }
+
+  /**
+   * Atomically evaluate an explicit bounded working-set expansion. The
+   * repository lock covers the revision CAS, claim re-check, and persisted
+   * session update; denied or unresolved entries never produce a partial set.
+   */
+  expandWorkingSet(options: WorkingSetExpansionOptions): WorkingSetExpansionResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const requestedSessionId = options.sessionId ?? options.session_id;
+      if (requestedSessionId === undefined || requestedSessionId === null) {
+        throw new SessionRegistryError("INVALID_SESSION_ID", "Working-set expansion requires an explicit session ID");
+      }
+      assertSessionId(requestedSessionId);
+      const owner = state.sessions.find((record) => record.sessionId === requestedSessionId);
+      if (owner === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${requestedSessionId}`, {
+          sessionId: requestedSessionId,
+        });
+      }
+      if (owner.state !== "active") {
+        throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Session cannot expand scope while ${owner.state}`, {
+          sessionId: requestedSessionId,
+          state: owner.state,
+        });
+      }
+      if (owner.workingSet === undefined) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Working-set expansion is available only for bounded governed sessions",
+          { sessionId: requestedSessionId },
+        );
+      }
+      const repository = options.repository;
+      if (
+        repository === null ||
+        typeof repository !== "object" ||
+        repository.repositoryHost !== owner.workingSet.repository.repositoryHost ||
+        repository.repositoryId !== owner.workingSet.repository.repositoryId ||
+        repository.repositoryId !== this.repository.repositoryId
+      ) {
+        throw new SessionRegistryError(
+          "REPOSITORY_MISMATCH",
+          "Expansion repository identity does not match the session",
+          {
+            sessionId: requestedSessionId,
+            expectedRepositoryId: owner.workingSet.repository.repositoryId,
+            actualRepositoryId:
+              repository !== null && typeof repository === "object" && "repositoryId" in repository
+                ? String(repository.repositoryId)
+                : "<invalid>",
+          },
+        );
+      }
+      const suppliedRevision = options.currentRevision ?? options.current_revision;
+      if (typeof suppliedRevision !== "number" || !Number.isSafeInteger(suppliedRevision) || suppliedRevision < 1) {
+        throw new SessionRegistryError("INVALID_OPERATION", "A positive current working-set revision is required");
+      }
+      const currentRevision = suppliedRevision as number;
+      if (currentRevision !== owner.workingSet.revision) {
+        throw new SessionRegistryError(
+          "STALE_REGISTRY",
+          "Working-set revision does not match the current session state",
+          {
+            sessionId: requestedSessionId,
+            expectedWorkingSetRevision: currentRevision,
+            actualWorkingSetRevision: owner.workingSet.revision,
+          },
+        );
+      }
+      const executionScope = options.executionScope ?? options.execution_scope;
+      if (executionScope === undefined || executionScope === null) {
+        throw new SessionRegistryError("INVALID_OPERATION", "The bounded execution-scope artifact is required");
+      }
+      let evaluation;
+      try {
+        evaluation = evaluateWorkingSetExpansion(owner.workingSet, {
+          currentRevision,
+          entries: options.entries,
+          executionScope,
+        });
+      } catch (error: unknown) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          error instanceof Error ? error.message : "Working-set expansion artifact is invalid",
+          { sessionId: requestedSessionId, workingSetCode: "INVALID_ARTIFACT" },
+          error,
+        );
+      }
+      const outcomes = evaluation.outcomes.map((outcome) => ({ ...outcome }));
+      let blocked = outcomes.some((outcome) => outcome.status !== "granted");
+      for (const [index, outcome] of outcomes.entries()) {
+        if (outcome.status !== "granted" || outcome.operation === "READONLY") continue;
+        const activeClaims = state.claims.filter((claim) =>
+          state.sessions.some((record) => record.sessionId === claim.sessionId && record.state === "active"),
+        );
+        const ownClaims = activeClaims.filter(
+          (claim) => claim.sessionId === requestedSessionId && resourceMatchesClaim(claim, outcome.path),
+        );
+        const grantingClaim = ownClaims.find((claim) => claimModeGrantsAccess(claim.mode, "write"));
+        const conflictingClaim = activeClaims.find(
+          (claim) =>
+            claim.sessionId !== requestedSessionId && resourceClaimConflictsWithAccess(claim, outcome.path, "write"),
+        );
+        if (grantingClaim === undefined || conflictingClaim !== undefined) {
+          outcomes[index] = Object.freeze({
+            ...outcome,
+            status: "denied",
+            reason:
+              conflictingClaim === undefined
+                ? "existing session claim authority does not grant WRITE"
+                : "existing claim authority reports a conflicting owner",
+          });
+          blocked = true;
+        }
+      }
+      const resultStatus: WorkingSetExpansionResult["status"] = outcomes.some((outcome) => outcome.status === "denied")
+        ? "denied"
+        : outcomes.some((outcome) => outcome.status === "unresolved")
+          ? "unresolved"
+          : "granted";
+      if (blocked) {
+        return {
+          schemaVersion: 1,
+          operation: "working-set-expand",
+          repository: owner.workingSet.repository,
+          sessionId: requestedSessionId,
+          previousRevision: owner.workingSet.revision,
+          revision: owner.workingSet.revision,
+          idempotent: false,
+          status: resultStatus,
+          outcomes: Object.freeze(outcomes),
+          session: cloneSessionRecord(owner),
+          workingSet: owner.workingSet,
+        };
+      }
+
+      // A second pure reduction includes the claim-confirmed operation set;
+      // no write occurs until every requested entry has passed both authorities.
+      const nextWorkingSet = evaluation.nextWorkingSet ?? owner.workingSet;
+      if (nextWorkingSet === owner.workingSet) {
+        return {
+          schemaVersion: 1,
+          operation: "working-set-expand",
+          repository: owner.workingSet.repository,
+          sessionId: requestedSessionId,
+          previousRevision: owner.workingSet.revision,
+          revision: owner.workingSet.revision,
+          idempotent: evaluation.idempotent,
+          status: resultStatus,
+          outcomes: Object.freeze(outcomes),
+          session: cloneSessionRecord(owner),
+          workingSet: owner.workingSet,
+        };
+      }
+      const timestamp = toTimestamp(this.clock());
+      const nextRecord = freezeSessionRecord({ ...owner, updatedAt: timestamp, workingSet: nextWorkingSet });
+      const nextRecords = state.sessions.map((record) =>
+        record.sessionId === requestedSessionId ? nextRecord : record,
+      );
+      validateRecords(nextRecords, this.repository.repositoryId);
+      this.writeUnsafe(nextRecords, state.claims, state.claimSetGeneration);
+      return {
+        schemaVersion: 1,
+        operation: "working-set-expand",
+        repository: owner.workingSet.repository,
+        sessionId: requestedSessionId,
+        previousRevision: owner.workingSet.revision,
+        revision: nextWorkingSet.revision,
+        idempotent: false,
+        status: resultStatus,
+        outcomes: Object.freeze(outcomes),
+        session: cloneSessionRecord(nextRecord),
+        workingSet: nextWorkingSet,
+      };
+    });
   }
 
   getClaimSetGeneration(): number {
@@ -8330,7 +8543,13 @@ function requireRevision(value: unknown, index: number, field: string): string {
 
 function validatePersistedWorkingSet(value: unknown, index?: number): EffectiveWorkingSet {
   if (!isRecord(value)) throw invalidRecord(index, "working_set must be an object");
-  if (value.kind !== "effective-working-set" || value.version !== 1 || value.revision !== 1) {
+  if (
+    value.kind !== "effective-working-set" ||
+    value.version !== 1 ||
+    typeof value.revision !== "number" ||
+    !Number.isSafeInteger(value.revision) ||
+    value.revision < 1
+  ) {
     throw invalidRecord(index, "working_set has an unsupported version or kind");
   }
   if (typeof value.id !== "string" || value.id.length === 0) {

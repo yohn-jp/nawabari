@@ -19,6 +19,7 @@ import {
   type SessionCloseOptions,
   type SessionContext,
   type SessionCreateOptions,
+  type WorkingSetExpansionOptions,
   type SessionDiagnosticOptions,
   type SessionDiagnosticSchemaVersion,
   type SessionListOptions,
@@ -88,6 +89,7 @@ export const DISPATCHER_COMMAND_INVENTORY = [
   "session id",
   "session show",
   "session inspect",
+  "session scope expand",
   "session reconcile",
   "session run",
   "session exec",
@@ -139,6 +141,18 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session id": [],
   "session show": ["--session"],
   "session inspect": ["--session", "--integrated-revision", "--schema-version"],
+  "session scope expand": [
+    "--session",
+    "--repository",
+    "--repository-host",
+    "--revision",
+    "--execution-scope-file",
+    "--path",
+    "--operation",
+    "--reason",
+    "--evidence",
+    "--unresolved",
+  ],
   "session reconcile": ["--session", "--apply"],
   "session run": ["--session", "--runtime-policy"],
   "session shell": ["--session", "--runtime-policy"],
@@ -419,6 +433,11 @@ type ParsedOptions = {
   mode: string | null;
   claim_id: string | null;
   repository: string | null;
+  repository_host: string | null;
+  revision: string | null;
+  reason: string | null;
+  evidence: string | null;
+  execution_scope_file: string | null;
   apply: boolean;
   force: boolean;
   create_upstream: boolean;
@@ -440,6 +459,7 @@ type ParsedOptions = {
   runtime_policy: RuntimePolicyMode | null;
   schema_version: SessionDiagnosticSchemaVersion | null;
   summary: boolean;
+  unresolved: boolean;
 };
 
 function usageError(
@@ -523,6 +543,11 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     mode: null,
     claim_id: null,
     repository: null,
+    repository_host: null,
+    revision: null,
+    reason: null,
+    evidence: null,
+    execution_scope_file: null,
     apply: false,
     force: false,
     create_upstream: false,
@@ -544,6 +569,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     runtime_policy: null,
     schema_version: null,
     summary: false,
+    unresolved: false,
   };
   let dryRun = false;
 
@@ -563,7 +589,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       name === "--history" ||
       name === "--patch" ||
       name === "--preview" ||
-      name === "--summary"
+      name === "--summary" ||
+      name === "--unresolved"
     ) {
       if (inlineValue !== null) {
         return failure(usageError("INVALID_ARGUMENT", `${name} does not accept a value.`, { option: name }));
@@ -577,7 +604,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       else if (name === "--history") options.history = true;
       else if (name === "--patch") options.patch = true;
       else if (name === "--preview") options.preview = true;
-      else options.summary = true;
+      else if (name === "--summary") options.summary = true;
+      else options.unresolved = true;
       continue;
     }
 
@@ -629,6 +657,11 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--mode") options.mode = value;
     else if (name === "--claim-id") options.claim_id = value;
     else if (name === "--repository") options.repository = value;
+    else if (name === "--repository-host") options.repository_host = value;
+    else if (name === "--revision") options.revision = value;
+    else if (name === "--reason") options.reason = value;
+    else if (name === "--evidence") options.evidence = value;
+    else if (name === "--execution-scope-file") options.execution_scope_file = value;
     else if (name === "--limit") options.limit = value;
     else if (name === "--offset") options.offset = value;
     else if (name === "--path") options.paths.push(value);
@@ -1577,6 +1610,56 @@ async function executeCommand(
     }
     if (subcommand === "release") {
       return executeRelease(rest, dependencies.backend, context, "session release");
+    }
+    if (subcommand === "scope") {
+      if (rest[0] !== "expand") {
+        return failure(
+          new DomainError("UNKNOWN_COMMAND", `Unknown session scope subcommand: ${rest[0] ?? "<missing>"}.`),
+        );
+      }
+      const parsed = parseTargetedOptions(rest.slice(1), dispatcherAllowedOptions("session scope expand"), true);
+      if (!parsed.ok) return parsed;
+      if (dependencies.backend.expandWorkingSet === undefined) {
+        return failure(new DomainError("BACKEND_UNAVAILABLE", "Working-set expansion is not available."));
+      }
+      if (parsed.value.repository === null || parsed.value.repository_host === null) {
+        return failure(
+          usageError("MISSING_ARGUMENT", "Working-set expansion requires --repository and --repository-host."),
+        );
+      }
+      if (parsed.value.revision === null || !/^\d+$/u.test(parsed.value.revision)) {
+        return failure(usageError("INVALID_ARGUMENT", "--revision requires a positive safe integer."));
+      }
+      const revision = Number(parsed.value.revision);
+      if (!Number.isSafeInteger(revision) || revision < 1) {
+        return failure(usageError("INVALID_ARGUMENT", "--revision requires a positive safe integer."));
+      }
+      if (parsed.value.paths.length === 0 || parsed.value.operation === null) {
+        return failure(usageError("MISSING_ARGUMENT", "Working-set expansion requires --path and --operation."));
+      }
+      if (parsed.value.execution_scope_file === undefined || parsed.value.execution_scope_file === null) {
+        return failure(usageError("MISSING_ARGUMENT", "Working-set expansion requires --execution-scope-file."));
+      }
+      const execution = readWorkingSetArtifactFile(parsed.value.execution_scope_file, "--execution-scope-file");
+      if (!execution.ok) return execution;
+      if (!["READONLY", "WRITE", "CREATE", "DELETE"].includes(parsed.value.operation)) {
+        return failure(usageError("INVALID_ARGUMENT", "--operation requires READONLY, WRITE, CREATE, or DELETE."));
+      }
+      const options: WorkingSetExpansionOptions = {
+        session_id: parsed.value.session_id,
+        repository: { repositoryHost: parsed.value.repository_host, repositoryId: parsed.value.repository },
+        current_revision: revision,
+        execution_scope: execution.value,
+        entries: parsed.value.paths.map((path) => ({
+          path,
+          operation: parsed.value.operation as "READONLY" | "WRITE" | "CREATE" | "DELETE",
+          reason: parsed.value.reason ?? "explicit-working-set-expansion",
+          ...(parsed.value.evidence === null ? {} : { evidence: parsed.value.evidence }),
+          ...(parsed.value.unresolved ? { resolution: "unresolved" as const } : {}),
+        })),
+      };
+      const result = await dependencies.backend.expandWorkingSet(context, options);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "create") {
       const parsed = parseClaimReplacementPairs(rest, false, "session create", false);

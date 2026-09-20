@@ -43,6 +43,8 @@ import {
   type CleanupReconciliation,
   type SessionContext,
   type SessionCreateOptions,
+  type WorkingSetExpansionOptions,
+  type WorkingSetExpansionResult,
   type SessionDiagnostic,
   type SessionDiagnosticOptions,
   type SessionDiagnosticSchemaVersion,
@@ -230,6 +232,36 @@ export class LocalSessionBackend implements SessionBackend {
         );
       }
       return success(toDomainRecord(record));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async expandWorkingSet(
+    context: SessionContext,
+    options: WorkingSetExpansionOptions,
+  ): Promise<DomainResult<WorkingSetExpansionResult>> {
+    try {
+      const result = this.registryFor(context).expandWorkingSet({
+        sessionId: options.session_id,
+        repository: options.repository,
+        ...(options.current_revision === null ? {} : { currentRevision: options.current_revision }),
+        executionScope: options.execution_scope,
+        entries: options.entries,
+      });
+      return success({
+        schema_version: result.schemaVersion,
+        operation: result.operation,
+        repository: result.repository,
+        session_id: result.sessionId,
+        previous_revision: result.previousRevision,
+        revision: result.revision,
+        idempotent: result.idempotent,
+        status: result.status,
+        outcomes: result.outcomes.map((outcome) => ({ ...outcome })),
+        session: toDomainRecord(result.session),
+        working_set: result.workingSet as unknown as JsonObject,
+      });
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
