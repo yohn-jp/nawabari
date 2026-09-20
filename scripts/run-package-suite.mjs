@@ -115,6 +115,9 @@ function writeEvidence(outputPath, artifact) {
     public_surface: {
       installed_bin: "nawabari",
       protected_route: "session run",
+      verification_route: "versioned fixed-argv executor",
+      verification_read_visibility: ["declared", "repository"],
+      verification_write_policy: "deny",
       lifecycle: ["session create", "session id", "session claim", "checkpoint", "commit", "push", "session close"],
       discovery: ["capabilities --json", "doctor --json"],
     },
