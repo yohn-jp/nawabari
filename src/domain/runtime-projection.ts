@@ -1,6 +1,10 @@
 import { posix } from "node:path";
 
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
+import {
+  validateWorkingSetRuntimeProjection,
+  type WorkingSetRuntimeProjection,
+} from "./working-set-runtime-projection.js";
 
 /** Versioned identity for the Session Runtime Projection domain contract. */
 export const SESSION_RUNTIME_PROJECTION_CONTRACT_ID = "nawabari.session-runtime-projection.v1" as const;
@@ -99,6 +103,8 @@ export type RuntimeProjectionInput = Readonly<{
   requirements: readonly RuntimeRequirement[];
   filesystem: readonly RuntimeFilesystemProjection[];
   executables: readonly ProjectedExecutableEntrypoint[];
+  /** Optional strict agent visibility constraint; absent preserves legacy sessions. */
+  readonly working_set?: WorkingSetRuntimeProjection;
 }>;
 
 export type SessionRuntimeProjection = RuntimeProjectionInput &
@@ -364,6 +370,13 @@ export function validateSessionRuntimeProjection(input: unknown): DomainResult<S
   if (!Array.isArray(input.filesystem)) return invalidProjection("filesystem", "expected an array");
   if (!Array.isArray(input.executables)) return invalidProjection("executables", "expected an array");
 
+  let workingSet: WorkingSetRuntimeProjection | undefined;
+  if (input.working_set !== undefined) {
+    const result = validateWorkingSetRuntimeProjection(input.working_set);
+    if (!result.ok) return failure(result.error);
+    workingSet = result.value;
+  }
+
   const requirements: RuntimeRequirement[] = [];
   for (const [index, value] of input.requirements.entries()) {
     const result = validateRequirement(value, index);
@@ -411,6 +424,7 @@ export function validateSessionRuntimeProjection(input: unknown): DomainResult<S
           compareText(`${left.name}:${left.target}`, `${right.name}:${right.target}`),
         ),
       ),
+      ...(workingSet === undefined ? {} : { working_set: workingSet }),
     }),
   );
 }
@@ -468,7 +482,7 @@ export const SESSION_RUNTIME_PROJECTION_DESCRIPTOR: JsonObject = Object.freeze({
     compatibility: "explicit-only",
     unrestricted_host_fallback: "never-implicit",
   },
-  fields: ["policy", "profile", "requirements", "filesystem", "executables"],
+  fields: ["policy", "profile", "requirements", "filesystem", "executables", "working_set"],
   ownership: {
     resolves_before: "nawabari.sandbox-execution.v1",
     isolation_backend: "SandboxExecutionRequest",

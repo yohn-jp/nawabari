@@ -24,6 +24,7 @@ import {
   type RuntimePolicy,
   validateSessionRuntimeProjection,
 } from "./runtime-projection.js";
+import { compileWorkingSetRuntimeProjection } from "./working-set-runtime-projection.js";
 
 test("the seccomp baseline is versioned, deterministic, and uses bounded EPERM denials", () => {
   const first = compileSandboxSeccompProfile("x64");
@@ -599,6 +600,51 @@ test("explicit compatibility projection is the only enforced legacy visibility a
     const omitted = compileSandboxInvocation({ ...request, runtime_projection: undefined }, { command: "true" });
     assert.equal(omitted.ok, false);
     if (!omitted.ok) assert.equal(omitted.error.code, "RUNTIME_PROJECTION_INVALID");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("bounded working-set execution fails closed when Landlock cannot establish the additional boundary", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const workingSet = compileWorkingSetRuntimeProjection({
+      version: 1,
+      kind: "effective-working-set",
+      revision: 1,
+      id: "ews-launcher-test",
+      repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+      base: { branch: "main", revision: "a".repeat(40) },
+      scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+      provenance: {
+        executionScope: {
+          kind: "implementation-execution-scope",
+          version: 1,
+          digest: "a".repeat(64),
+          identity: "body",
+        },
+        candidateWorkingSet: {
+          kind: "candidate-working-set",
+          version: 1,
+          digest: "b".repeat(64),
+          identity: "candidate",
+        },
+        repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+        base: { branch: "main", revision: "a".repeat(40) },
+      },
+    });
+    assert.equal(workingSet.ok, true, workingSet.ok ? "" : workingSet.error.message);
+    if (!workingSet.ok) return;
+    const strict = validatedProjection([], STRICT_RUNTIME_POLICY);
+    const bounded = { ...strict, working_set: workingSet.value };
+    const compiled = compileSandboxInvocation({ ...request, runtime_projection: bounded }, { command: "true" });
+    assert.equal(compiled.ok, false);
+    if (!compiled.ok) assert.equal(compiled.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
