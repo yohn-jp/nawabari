@@ -10,6 +10,11 @@ import { RESOURCE_CLAIM_FAILURE_CODES } from "./domain/errors.js";
  * reachable public failure an intentional compatibility decision.
  */
 export const IMPLEMENTATION_FAILURE_CODE_VOCABULARY = Object.freeze({
+  "auxiliary-state-projection": Object.freeze([
+    "AUXILIARY_STATE_INVALID",
+    "AUXILIARY_STATE_AMBIGUOUS",
+    "AUXILIARY_STATE_MATERIALIZATION_FAILED",
+  ]),
   "protected-execution": Object.freeze([
     "SANDBOX_UNSUPPORTED_PLATFORM",
     "SANDBOX_CAPABILITY_UNAVAILABLE",

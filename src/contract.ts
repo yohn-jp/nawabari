@@ -26,6 +26,15 @@ import {
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
 import { DISCARD_PREVIEW_SCHEMA_VERSION } from "./session-registry.js";
 import { SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION, SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION } from "./domain/session.js";
+import {
+  AUXILIARY_STATE_DURABILITY_CLASSES,
+  AUXILIARY_STATE_MODES,
+  AUXILIARY_STATE_PROJECTION_CONTRACT_ID,
+  AUXILIARY_STATE_PROJECTION_DESCRIPTOR,
+  AUXILIARY_STATE_PROJECTION_SCHEMA_VERSION,
+  AUXILIARY_STATE_SOURCE_KINDS,
+  AUXILIARY_STATE_TARGET_KINDS,
+} from "./domain/auxiliary-state-projection.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -272,6 +281,27 @@ function registryAliasReferences(
 }
 
 const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
+  {
+    id: "auxiliary-state-projection",
+    contract_id: AUXILIARY_STATE_PROJECTION_CONTRACT_ID,
+    schema_version: AUXILIARY_STATE_PROJECTION_SCHEMA_VERSION,
+    commands: ["capabilities"],
+    result_schema: "repository-auxiliary-state-projection.v1",
+    result_schema_version: AUXILIARY_STATE_PROJECTION_SCHEMA_VERSION,
+    result_schemas: [{ schema: "repository-auxiliary-state-projection.v1", version: 1, commands: ["capabilities"] }],
+    identities: ["source", "target", "mode", "durability"],
+    source_kinds: [...AUXILIARY_STATE_SOURCE_KINDS],
+    target_kinds: [...AUXILIARY_STATE_TARGET_KINDS],
+    modes: [...AUXILIARY_STATE_MODES],
+    durability_classes: [...AUXILIARY_STATE_DURABILITY_CLASSES],
+    descriptor: AUXILIARY_STATE_PROJECTION_DESCRIPTOR,
+    failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["auxiliary-state-projection"],
+    failure_code_policy: {
+      source: "implementation-owned auxiliary-state-projection vocabulary",
+      missing_or_extra: "deterministic conformance failure",
+      internal_exceptions: [],
+    },
+  },
   PROTECTED_EXECUTION_CAPABILITY,
   {
     id: "session-lifecycle",
@@ -747,6 +777,17 @@ export function machineContract(packageVersion: string): JsonObject {
             ambient_fallback: capability.ambient_fallback,
             readiness: jsonClone(capability.readiness),
             runtime: jsonClone(capability.runtime),
+          }
+        : {}),
+      ...(capability.id === "auxiliary-state-projection"
+        ? {
+            contract_id: capability.contract_id,
+            schema_version: capability.schema_version,
+            source_kinds: [...capability.source_kinds],
+            target_kinds: [...capability.target_kinds],
+            modes: [...capability.modes],
+            durability_classes: [...capability.durability_classes],
+            descriptor: jsonClone(capability.descriptor),
           }
         : {}),
     })),
