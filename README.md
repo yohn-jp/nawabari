@@ -1,3 +1,14 @@
+<p align="center">
+  <img src="./docs/assets/readme/nawabari-hero.webp" alt="Nawabari — Git Worktree Isolation." width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/yohn-jp/nawabari/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yohn-jp/nawabari/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://www.npmjs.com/package/nawabari"><img alt="npm" src="https://img.shields.io/npm/v/nawabari"></a>
+  <a href="https://www.npmjs.com/package/nawabari"><img alt="Node" src="https://img.shields.io/node/v/nawabari"></a>
+  <a href="./LICENSE"><img alt="License" src="https://img.shields.io/npm/l/nawabari"></a>
+</p>
+
 # Nawabari
 
 Nawabari is a local governance layer for parallel coding agents. It gives each agent session an owned Git worktree and branch, records which repository resources that session may use, and checks those boundaries before governed mutations.
