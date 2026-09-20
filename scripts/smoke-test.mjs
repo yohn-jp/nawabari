@@ -645,35 +645,21 @@ async function main() {
     }
     fs.rmSync(existingWorktree, { recursive: true, force: true });
 
-    const created = parseInstalledJson(
-      invokeInstalled(
-        ["session", "create", "--branch", "feature/installed-smoke", "--worktree", lifecycleWorktree, "--json"],
-        lifecycleRepository,
-      ),
-      "session create",
-    );
-    if (created.ok !== true || typeof created.session_id !== "string")
-      fail("session create did not return a session ID");
-    if (created.state !== "active" || created.branch !== "feature/installed-smoke") {
-      fail("session create returned incomplete ownership metadata");
-    }
-
-    const auxiliaryWorktree = path.join(installDirectory, "packed-auxiliary-worktree");
     const auxiliaryDeclaration = JSON.stringify({
       source: { kind: "repository-local", path: ".codegraph/ignored" },
       target: { kind: "managed-worktree", path: ".codegraph/ignored" },
       mode: "copy",
       durability: "durable",
     });
-    const auxiliaryCreated = parseInstalledJson(
+    const created = parseInstalledJson(
       invokeInstalled(
         [
           "session",
           "create",
           "--branch",
-          "feature/installed-auxiliary",
+          "feature/installed-smoke",
           "--worktree",
-          auxiliaryWorktree,
+          lifecycleWorktree,
           "--resource",
           "README.md",
           "--auxiliary-state",
@@ -684,39 +670,49 @@ async function main() {
         ],
         lifecycleRepository,
       ),
-      "packed auxiliary-state session create",
+      "routine-use session create",
     );
-    if (
-      auxiliaryCreated.ok !== true ||
-      !fs.existsSync(path.join(auxiliaryWorktree, ".codegraph", "ignored", "index.json")) ||
-      fs.existsSync(path.join(auxiliaryWorktree, ".codegraph", "daemon.pid")) ||
-      run("git", ["status", "--porcelain"], { cwd: auxiliaryWorktree, env: gitEnvironment }).stdout.trim() !== ""
-    ) {
-      fail("packed session create did not establish only the declared auxiliary state with clean Git status");
+    if (created.ok !== true || typeof created.session_id !== "string")
+      fail("session create did not return a session ID");
+    if (created.state !== "active" || created.branch !== "feature/installed-smoke") {
+      fail("session create returned incomplete ownership metadata");
     }
-    const auxiliaryClaims = parseInstalledJson(
-      invokeInstalled(["session", "claims", "--session", auxiliaryCreated.session_id, "--json"], lifecycleRepository),
-      "packed auxiliary-state session claims",
+
+    // #358 composed routine-use proof: atomic initial ownership and declared
+    // auxiliary projection are exercised on the same session that continues
+    // through mutation, recovery, and terminal cleanup.
+    const initialClaims = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", created.session_id, "--json"], lifecycleRepository),
+      "routine-use initial claims",
     );
     if (
-      auxiliaryClaims.ok !== true ||
-      auxiliaryClaims.claims?.length !== 1 ||
-      auxiliaryClaims.claims[0]?.resource !== "README.md" ||
-      auxiliaryClaims.claims[0]?.mode !== "write"
+      initialClaims.ok !== true ||
+      initialClaims.claims?.length !== 1 ||
+      initialClaims.claims[0]?.resource !== "README.md" ||
+      initialClaims.claims[0]?.mode !== "write" ||
+      !fs.existsSync(path.join(lifecycleWorktree, ".codegraph", "ignored", "index.json")) ||
+      fs.existsSync(path.join(lifecycleWorktree, ".codegraph", "daemon.pid")) ||
+      run("git", ["status", "--porcelain"], { cwd: lifecycleWorktree, env: gitEnvironment }).stdout.trim() !== ""
     ) {
-      fail("packed session create did not atomically establish the initial claim with auxiliary state");
+      fail("routine-use session create did not atomically establish initial claims and clean auxiliary projection");
     }
-    const auxiliaryClosed = parseInstalledJson(
-      invokeInstalled(["session", "close", "--session", auxiliaryCreated.session_id, "--json"], lifecycleRepository),
-      "packed auxiliary-state session close",
+
+    // The broad stale-owner fixture must be created after the initial claim is
+    // released; the release itself is public setup for the competing-claim
+    // portion of this composed workflow.
+    const initialClaimRelease = parseInstalledJson(
+      invokeInstalled(
+        ["session", "release", "--session", created.session_id, "--resource", "README.md", "--force", "--json"],
+        lifecycleWorktree,
+      ),
+      "routine-use initial claim release",
     );
     if (
-      auxiliaryClosed.ok !== true ||
-      auxiliaryClosed.worktree_removed !== true ||
-      fs.existsSync(auxiliaryWorktree) ||
-      !fs.existsSync(path.join(lifecycleRepository, ".codegraph", "ignored", "index.json"))
+      initialClaimRelease.ok !== true ||
+      initialClaimRelease.released?.length !== 1 ||
+      initialClaimRelease.released[0]?.resource !== "README.md"
     ) {
-      fail("packed auxiliary-state cleanup did not remove only session-owned artifacts");
+      fail("routine-use initial claim could not be released through the public path");
     }
 
     // #353 packed/public regression: a missing physical owner must not leave
@@ -758,26 +754,6 @@ async function main() {
       fail("packed stale-owner fixture did not establish the broad exclusive claim");
     }
 
-    const staleClaimantWorktree = path.join(installDirectory, "packed-stale-claimant-worktree");
-    const staleClaimant = parseInstalledJson(
-      invokeInstalled(
-        [
-          "session",
-          "create",
-          "--branch",
-          "feature/packed-stale-claimant",
-          "--worktree",
-          staleClaimantWorktree,
-          "--json",
-        ],
-        lifecycleRepository,
-      ),
-      "packed stale-claimant session create",
-    );
-    if (staleClaimant.ok !== true || typeof staleClaimant.session_id !== "string") {
-      fail("packed stale-claim fixture did not establish the second managed session");
-    }
-
     fs.rmSync(staleOwnerWorktree, { recursive: true, force: true });
 
     const staleOwnerResource = "packed-stale-owner-concrete.txt";
@@ -786,14 +762,14 @@ async function main() {
         "session",
         "claim",
         "--session",
-        staleClaimant.session_id,
+        created.session_id,
         "--resource",
         staleOwnerResource,
         "--mode",
         "exclusive-write",
         "--json",
       ],
-      staleClaimantWorktree,
+      lifecycleWorktree,
     );
     const staleOwnerConflict = parseInstalledJson(staleOwnerConflictResult, "packed stale-owner claim conflict");
     if (
@@ -863,14 +839,14 @@ async function main() {
         "session",
         "claim",
         "--session",
-        staleClaimant.session_id,
+        created.session_id,
         "--resource",
         staleOwnerResource,
         "--mode",
         "exclusive-write",
         "--json",
       ],
-      staleClaimantWorktree,
+      lifecycleWorktree,
     );
     const staleOwnerRetryJson = parseInstalledJson(staleOwnerRetry, "packed stale-owner claim retry");
     if (
@@ -882,14 +858,6 @@ async function main() {
     ) {
       fail("packed concrete claim did not succeed after public stale-owner reconciliation");
     }
-    const staleClaimantClose = parseInstalledJson(
-      invokeInstalled(["session", "close", "--session", staleClaimant.session_id, "--json"], lifecycleRepository),
-      "packed stale-claimant session close",
-    );
-    if (staleClaimantClose.ok !== true || staleClaimantClose.session?.state !== "closed") {
-      fail("packed stale-claimant cleanup did not use the existing close authority");
-    }
-
     const resolvedId = parseInstalledJson(
       invokeInstalled(["session", "id", "--json"], lifecycleWorktree),
       "session id",
