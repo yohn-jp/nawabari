@@ -5,10 +5,12 @@ import path from "node:path";
 import test from "node:test";
 
 import { machineContract } from "../contract.js";
+import { defaultGit } from "../git.js";
 import {
   AUXILIARY_STATE_PROJECTION_CONTRACT_ID,
   AUXILIARY_STATE_PROJECTION_SCHEMA_VERSION,
   materializeAuxiliaryStateProjection,
+  resolveAuxiliaryStateTrackedPathEvidence,
   serializeAuxiliaryStateDeclaration,
   validateAuxiliaryStateDeclaration,
 } from "./auxiliary-state-projection.js";
@@ -35,6 +37,17 @@ function declaration(overrides: Record<string, unknown> = {}): Record<string, un
     durability: "durable",
     ...overrides,
   };
+}
+
+function initializeRepository(repository: string): void {
+  fs.mkdirSync(repository, { recursive: true });
+  defaultGit.run(["init", "-q"], repository);
+}
+
+function resolverEvidence(repository: string) {
+  const result = resolveAuxiliaryStateTrackedPathEvidence(repository);
+  if (!result.ok) throw result.error;
+  return result.value;
 }
 
 test("the declaration is typed, versioned, bounded, and deterministic", () => {
@@ -70,7 +83,7 @@ test("materialization copies only declared state and leaves undeclared ignored s
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-auxiliary-state-"));
   const repository = path.join(root, "repository");
   const worktree = path.join(root, "worktree");
-  fs.mkdirSync(repository);
+  initializeRepository(repository);
   fs.mkdirSync(worktree);
   fs.mkdirSync(path.join(repository, ".codegraph"));
   fs.writeFileSync(path.join(repository, ".codegraph", "index.json"), "declared\n");
@@ -79,34 +92,78 @@ test("materialization copies only declared state and leaves undeclared ignored s
   const result = materializeAuxiliaryStateProjection(declaration(), {
     repository_root: repository,
     worktree_root: worktree,
-    tracked_paths: [],
+    tracked_path_evidence: resolverEvidence(repository),
   });
   assert.equal(result.ok, true, result.ok ? "" : result.error.message);
   assert.equal(fs.readFileSync(path.join(worktree, ".codegraph", "index.json"), "utf8"), "declared\n");
   assert.equal(fs.existsSync(path.join(worktree, ".ignored-state")), false);
 });
 
-test("materialization rejects tracked anchors, target escapes, and symlink ambiguity", () => {
+test("materialization rejects omitted or caller-supplied tracked-path arrays", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-auxiliary-state-"));
   const repository = path.join(root, "repository");
   const worktree = path.join(root, "worktree");
-  fs.mkdirSync(path.join(repository, ".codegraph"), { recursive: true });
-  fs.mkdirSync(worktree);
+  initializeRepository(repository);
+  fs.mkdirSync(path.join(repository, ".codegraph"));
   fs.writeFileSync(path.join(repository, ".codegraph", "index"), "state\n");
+  fs.mkdirSync(worktree);
+
+  const result = materializeAuxiliaryStateProjection(declaration(), {
+    repository_root: repository,
+    worktree_root: worktree,
+    tracked_paths: [],
+  } as never);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "AUXILIARY_STATE_MATERIALIZATION_FAILED");
+});
+
+test("tracked anchors reject whole-directory projection while an ignored bounded child remains projectable", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-auxiliary-state-"));
+  const repository = path.join(root, "repository");
+  const worktree = path.join(root, "worktree");
+  initializeRepository(repository);
+  fs.mkdirSync(path.join(repository, ".codegraph"), { recursive: true });
+  fs.mkdirSync(path.join(repository, ".codegraph", "ignored"));
+  fs.writeFileSync(path.join(repository, ".codegraph", ".gitignore"), "ignored/\n");
+  fs.writeFileSync(path.join(repository, ".codegraph", "ignored", "child"), "ignored child\n");
+  defaultGit.run(["add", "--", ".codegraph/.gitignore"], repository);
+  fs.mkdirSync(worktree);
+  const evidence = resolverEvidence(repository);
 
   const tracked = materializeAuxiliaryStateProjection(declaration(), {
     repository_root: repository,
     worktree_root: worktree,
-    tracked_paths: [".codegraph/README.md"],
+    tracked_path_evidence: evidence,
   });
   assert.equal(tracked.ok, false);
   if (!tracked.ok) assert.equal(tracked.error.code, "AUXILIARY_STATE_AMBIGUOUS");
 
-  const escaped = materializeAuxiliaryStateProjection(
-    declaration({ target: { kind: "managed-worktree", path: "nested/target" } }),
-    { repository_root: repository, worktree_root: worktree, tracked_paths: [] },
+  const bounded = materializeAuxiliaryStateProjection(
+    declaration({
+      source: { kind: "repository-local", path: ".codegraph/ignored" },
+      target: { kind: "managed-worktree", path: ".codegraph/ignored" },
+    }),
+    { repository_root: repository, worktree_root: worktree, tracked_path_evidence: evidence },
   );
-  assert.equal(escaped.ok, true);
+  assert.equal(bounded.ok, true, bounded.ok ? "" : bounded.error.message);
+  assert.equal(fs.readFileSync(path.join(worktree, ".codegraph", "ignored", "child"), "utf8"), "ignored child\n");
+  assert.equal(fs.existsSync(path.join(worktree, ".codegraph", ".gitignore")), false);
+});
+
+test("materialization rejects target escapes and symlink ambiguity", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-auxiliary-state-"));
+  const repository = path.join(root, "repository");
+  const worktree = path.join(root, "worktree");
+  initializeRepository(repository);
+  fs.mkdirSync(path.join(repository, ".codegraph"), { recursive: true });
+  fs.writeFileSync(path.join(repository, ".codegraph", "index"), "state\n");
+  fs.mkdirSync(worktree);
+  const evidence = resolverEvidence(repository);
+
+  const escaped = validateAuxiliaryStateDeclaration(
+    declaration({ target: { kind: "managed-worktree", path: "../outside" } }),
+  );
+  assert.equal(escaped.ok, false);
 
   const outside = path.join(root, "outside");
   fs.mkdirSync(outside);
@@ -115,7 +172,7 @@ test("materialization rejects tracked anchors, target escapes, and symlink ambig
   const symlink = materializeAuxiliaryStateProjection(declaration(), {
     repository_root: repository,
     worktree_root: symlinkedWorktree,
-    tracked_paths: [],
+    tracked_path_evidence: evidence,
   });
   assert.equal(symlink.ok, false);
   if (!symlink.ok) assert.equal(symlink.error.code, "AUXILIARY_STATE_MATERIALIZATION_FAILED");

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
+import { defaultGit, type GitCommandRunner } from "../git.js";
 
 /** Versioned identity for repository-local auxiliary state. */
 export const AUXILIARY_STATE_PROJECTION_CONTRACT_ID = "nawabari.repository-auxiliary-state-projection.v1" as const;
@@ -41,8 +42,8 @@ export type AuxiliaryStateMaterializationContext = Readonly<{
   readonly repository_root: string;
   /** Canonical owned managed worktree receiving the declared target. */
   readonly worktree_root: string;
-  /** Explicit Git evidence. No ignored/untracked discovery is performed here. */
-  readonly tracked_paths: readonly string[];
+  /** Evidence issued by the authoritative Git resolver for repository_root. */
+  readonly tracked_path_evidence: AuxiliaryStateTrackedPathEvidence;
 }>;
 
 export type AuxiliaryStateMaterialization = Readonly<{
@@ -104,6 +105,46 @@ function relativePath(value: unknown, field: string): DomainResult<string> {
   return success(value);
 }
 
+/**
+ * Git-authoritative tracked-path evidence. The module-private constructor token
+ * and private brand prevent ordinary callers from manufacturing the evidence
+ * consumed by materialization; use the Git resolver instead.
+ */
+const trackedPathEvidenceToken = Symbol("auxiliary-state-tracked-path-evidence");
+
+export class AuxiliaryStateTrackedPathEvidence {
+  readonly #authority = true;
+
+  public constructor(
+    token: typeof trackedPathEvidenceToken,
+    private readonly repository_root: string,
+    private readonly tracked_paths: readonly string[],
+  ) {
+    if (token !== trackedPathEvidenceToken) throw new Error("tracked-path evidence must come from the Git resolver");
+  }
+
+  public repositoryRoot(): string {
+    void this.#authority;
+    return this.repository_root;
+  }
+
+  public paths(): readonly string[] {
+    void this.#authority;
+    return this.tracked_paths;
+  }
+}
+
+function issueTrackedPathEvidence(
+  repositoryRoot: string,
+  trackedPaths: readonly string[],
+): AuxiliaryStateTrackedPathEvidence {
+  return new AuxiliaryStateTrackedPathEvidence(
+    trackedPathEvidenceToken,
+    repositoryRoot,
+    Object.freeze([...trackedPaths]),
+  );
+}
+
 /** Validate and canonicalize a declaration without touching the filesystem. */
 export function validateAuxiliaryStateDeclaration(input: unknown): DomainResult<AuxiliaryStateDeclaration> {
   if (!isRecord(input)) return invalid("declaration", "expected an object");
@@ -157,6 +198,42 @@ function canonicalRoot(value: string, field: string): string {
   return resolved;
 }
 
+/**
+ * Resolve tracked paths from Git's index. Ignored and untracked content is
+ * intentionally absent from this evidence; callers cannot substitute an
+ * arbitrary array for the resolver-issued authority token.
+ */
+export function resolveAuxiliaryStateTrackedPathEvidence(
+  repositoryRoot: string,
+  options: Readonly<{ readonly git?: GitCommandRunner }> = {},
+): DomainResult<AuxiliaryStateTrackedPathEvidence> {
+  try {
+    const canonicalRepositoryRoot = canonicalRoot(repositoryRoot, "repository_root");
+    const git = options.git ?? defaultGit;
+    const output = git.runRaw
+      ? git.runRaw(["ls-files", "--cached", "--full-name", "-z", "--"], canonicalRepositoryRoot)
+      : git.run(["ls-files", "--cached", "--full-name", "-z", "--"], canonicalRepositoryRoot);
+    const trackedPaths: string[] = [];
+    for (const [index, value] of output.split("\u0000").entries()) {
+      if (value.length === 0) continue;
+      const tracked = relativePath(value, `tracked_paths[${index}]`);
+      if (!tracked.ok) return failure(tracked.error);
+      trackedPaths.push(tracked.value);
+    }
+    return success(issueTrackedPathEvidence(canonicalRepositoryRoot, trackedPaths));
+  } catch (error: unknown) {
+    return failure(
+      new DomainError(
+        "AUXILIARY_STATE_MATERIALIZATION_FAILED",
+        `Auxiliary state materialization 'tracked_paths' failed: ${
+          error instanceof Error ? error.message : "Git authority was unavailable"
+        }.`,
+        { field: "tracked_paths" },
+      ),
+    );
+  }
+}
+
 function within(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
@@ -196,18 +273,19 @@ export function materializeAuxiliaryStateProjection(
   const declaration = validateAuxiliaryStateDeclaration(input);
   if (!declaration.ok) return declaration;
   if (!isRecord(context)) return materializationFailure("context", "expected an explicit materialization context");
-  if (!Array.isArray(context.tracked_paths)) {
-    return materializationFailure("tracked_paths", "expected explicit Git tracked-path evidence");
-  }
-  for (const [index, tracked] of context.tracked_paths.entries()) {
-    const validated = relativePath(tracked, `tracked_paths[${index}]`);
-    if (!validated.ok) return failure(validated.error);
+  if (!(context.tracked_path_evidence instanceof AuxiliaryStateTrackedPathEvidence)) {
+    return materializationFailure("tracked_paths", "expected resolver-issued Git tracked-path evidence");
   }
   try {
     const repositoryRoot = canonicalRoot(context.repository_root, "repository_root");
     const worktreeRoot = canonicalRoot(context.worktree_root, "worktree_root");
     if (repositoryRoot === worktreeRoot)
       return materializationFailure("worktree_root", "must differ from repository_root");
+    const evidenceRepositoryRoot = context.tracked_path_evidence.repositoryRoot();
+    if (evidenceRepositoryRoot !== repositoryRoot) {
+      return materializationFailure("tracked_paths", "evidence belongs to a different repository");
+    }
+    const trackedPaths = context.tracked_path_evidence.paths();
 
     const sourcePath = path.resolve(repositoryRoot, declaration.value.source.path);
     const targetPath = path.resolve(worktreeRoot, declaration.value.target.path);
@@ -218,7 +296,7 @@ export function materializeAuxiliaryStateProjection(
       return materializationFailure("source.path", "declared source is absent", sourcePath);
     assertNoSymlinksRecursively(sourcePath);
     const targetRelative = path.relative(worktreeRoot, targetPath).split(path.sep).join("/");
-    const overlap = trackedOverlap(targetRelative, context.tracked_paths);
+    const overlap = trackedOverlap(targetRelative, trackedPaths);
     if (overlap !== undefined)
       return ambiguous("target.path", "target overlaps a Git-tracked path or directory anchor", overlap);
 
