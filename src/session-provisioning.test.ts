@@ -70,6 +70,92 @@ test("provision commits the complete initial claim set with the session", () => 
   }
 });
 
+test("provision materializes only declared repository-local auxiliary state and cleanup preserves its source", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-auxiliary-state");
+  const source = path.join(fixture.repositoryPath, ".codegraph");
+  try {
+    fs.mkdirSync(path.join(source, "ignored"), { recursive: true });
+    fs.writeFileSync(path.join(source, ".gitignore"), "ignored/\n");
+    fs.writeFileSync(path.join(source, "ignored", "index.json"), "declared\n");
+    fs.writeFileSync(path.join(source, "ignored", "daemon.pid"), "123\n");
+    runGit(["add", ".codegraph/.gitignore"], fixture.repositoryPath);
+    runGit(["commit", "-m", "add codegraph anchor"], fixture.repositoryPath);
+
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({
+      worktreePath,
+      branchName: "feature/provisioned-auxiliary-state",
+      initialClaims: [{ resource: "README.md", mode: "write" }],
+      auxiliaryState: [
+        {
+          source: { kind: "repository-local", path: ".codegraph/ignored" },
+          target: { kind: "managed-worktree", path: ".codegraph/ignored" },
+          mode: "copy",
+          durability: "durable",
+        },
+      ],
+    });
+
+    assert.equal(fs.readFileSync(path.join(worktreePath, ".codegraph", "ignored", "index.json"), "utf8"), "declared\n");
+    assert.equal(fs.existsSync(path.join(worktreePath, ".codegraph", ".gitignore")), true);
+    assert.equal(fs.existsSync(path.join(worktreePath, ".codegraph", "ignored", "daemon.pid")), true);
+    assert.equal(runGit(["status", "--porcelain"], worktreePath), "");
+    assert.deepEqual(
+      registry.listClaims(session.sessionId).map((claim) => [claim.resource, claim.mode]),
+      [["README.md", "write"]],
+    );
+
+    registry.close(session.sessionId);
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(fs.readFileSync(path.join(source, ".gitignore"), "utf8"), "ignored/\n");
+    assert.equal(fs.readFileSync(path.join(source, "ignored", "index.json"), "utf8"), "declared\n");
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("auxiliary-state setup failure rolls back the newly provisioned worktree and branch", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-invalid-auxiliary-state");
+  const branchName = "feature/provisioned-invalid-auxiliary-state";
+  try {
+    fs.mkdirSync(path.join(fixture.repositoryPath, ".codegraph"), { recursive: true });
+    fs.writeFileSync(path.join(fixture.repositoryPath, ".codegraph", ".gitignore"), "ignored/\n");
+    runGit(["add", ".codegraph/.gitignore"], fixture.repositoryPath);
+    runGit(["commit", "-m", "add codegraph anchor"], fixture.repositoryPath);
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+
+    assertRegistryError(
+      () =>
+        registry.provision({
+          worktreePath,
+          branchName,
+          auxiliaryState: [
+            {
+              source: { kind: "repository-local", path: ".codegraph" },
+              target: { kind: "managed-worktree", path: ".codegraph" },
+              mode: "copy",
+              durability: "durable",
+            },
+          ],
+        }),
+      "AUXILIARY_STATE_AMBIGUOUS",
+    );
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], fixture.repositoryPath),
+      false,
+    );
+    assert.deepEqual(registry.list(), []);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
 test("invalid initial claims roll back newly provisioned Git resources", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-invalid-claim");

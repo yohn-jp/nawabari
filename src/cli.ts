@@ -123,7 +123,16 @@ export const DISPATCHER_COMMAND_INVENTORY = [
 
 /** Dispatcher option inventory, keyed by canonical registry command identity. */
 export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly string[]>> = {
-  "session create": ["--branch", "--worktree", "--worktree-root", "--base", "--label", "--resource", "--mode"],
+  "session create": [
+    "--branch",
+    "--worktree",
+    "--worktree-root",
+    "--base",
+    "--label",
+    "--resource",
+    "--mode",
+    "--auxiliary-state",
+  ],
   "session id": [],
   "session show": ["--session"],
   "session inspect": ["--session", "--integrated-revision", "--schema-version"],
@@ -396,6 +405,7 @@ type ParsedOptions = {
   worktree_root: string | null;
   base: string | null;
   label: string | null;
+  auxiliary_states: unknown[];
   resource: string | null;
   resources: string[];
   operation: string | null;
@@ -499,6 +509,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     worktree_root: null,
     base: null,
     label: null,
+    auxiliary_states: [],
     resource: null,
     resources: [],
     operation: null,
@@ -593,7 +604,18 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--worktree-root") options.worktree_root = value;
     else if (name === "--base") options.base = value;
     else if (name === "--label") options.label = value;
-    else if (name === "--resource") {
+    else if (name === "--auxiliary-state") {
+      try {
+        options.auxiliary_states.push(JSON.parse(value) as unknown);
+      } catch (error: unknown) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--auxiliary-state requires one valid JSON declaration.", {
+            option: name,
+            reason: error instanceof Error ? error.message : "invalid JSON",
+          }),
+        );
+      }
+    } else if (name === "--resource") {
       options.resource = value;
       options.resources.push(value);
     } else if (name === "--operation") options.operation = value;
@@ -689,6 +711,7 @@ type ClaimReplacementPairs = {
   worktree_root: string | null;
   base: string | null;
   label: string | null;
+  auxiliary_states: unknown[];
 };
 
 type ClaimDeltaMutation = {
@@ -1103,6 +1126,7 @@ function parseClaimReplacementPairs(
   let worktreeRoot: string | null = null;
   let base: string | null = null;
   let label: string | null = null;
+  const auxiliaryStates: unknown[] = [];
   let pendingResource: string | null = null;
   let concurrencyState: ClaimConcurrencyState = {
     expected_claim_set_generation: null,
@@ -1118,7 +1142,7 @@ function parseClaimReplacementPairs(
     if (!recognized.has(name) || (!requireConcurrencyIntent && isConcurrencyOption)) {
       return failure(usageError("INVALID_ARGUMENT", `Unknown option: ${name}.`, { option: name }));
     }
-    if (pendingResource !== null && name !== "--mode") {
+    if (pendingResource !== null && name !== "--mode" && name !== "--auxiliary-state") {
       return failure(
         usageError(
           "INVALID_ARGUMENT",
@@ -1155,7 +1179,18 @@ function parseClaimReplacementPairs(
     else if (name === "--worktree-root") worktreeRoot = value;
     else if (name === "--base") base = value;
     else if (name === "--label") label = value;
-    else if (name === "--resource") pendingResource = value;
+    else if (name === "--auxiliary-state") {
+      try {
+        auxiliaryStates.push(JSON.parse(value) as unknown);
+      } catch (error: unknown) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--auxiliary-state requires one valid JSON declaration.", {
+            option: name,
+            reason: error instanceof Error ? error.message : "invalid JSON",
+          }),
+        );
+      }
+    } else if (name === "--resource") pendingResource = value;
     else {
       if (pendingResource === null) {
         return failure(
@@ -1200,6 +1235,7 @@ function parseClaimReplacementPairs(
       worktree_root: worktreeRoot,
       base,
       label,
+      auxiliary_states: auxiliaryStates,
     },
   };
 }
@@ -1526,6 +1562,9 @@ async function executeCommand(
                 mode: pair.mode as "read" | "write" | "exclusive-write",
               })),
             }),
+        ...(parsed.value.auxiliary_states.length === 0
+          ? {}
+          : { auxiliary_state: parsed.value.auxiliary_states as SessionCreateOptions["auxiliary_state"] }),
       };
       const result = await dependencies.backend.createSession(context, options);
       return result.ok ? { ok: true, value: result.value } : result;

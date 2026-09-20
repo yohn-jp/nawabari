@@ -38,6 +38,8 @@ export type SessionCreateOptions = {
   base?: string | null;
   /** Explicit initial claims to commit with the provisioned session. */
   claims?: ResourceClaimInput[] | null;
+  /** Repository-local auxiliary-state declarations materialized before bootstrap succeeds. */
+  auxiliary_state?: readonly unknown[] | null;
 };
 
 export type ResourceClaimMode = "read" | "write" | "exclusive-write";

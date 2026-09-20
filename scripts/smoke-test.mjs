@@ -531,6 +531,12 @@ async function main() {
     fs.writeFileSync(path.join(lifecycleRepository, "README.md"), "smoke fixture\n");
     run("git", ["add", "README.md"], { cwd: lifecycleRepository, env: gitEnvironment });
     run("git", ["commit", "-m", "initial"], { cwd: lifecycleRepository, env: gitEnvironment });
+    fs.mkdirSync(path.join(lifecycleRepository, ".codegraph", "ignored"), { recursive: true });
+    fs.writeFileSync(path.join(lifecycleRepository, ".codegraph", ".gitignore"), "ignored/\n*.pid\n");
+    fs.writeFileSync(path.join(lifecycleRepository, ".codegraph", "ignored", "index.json"), "packed declared state\n");
+    fs.writeFileSync(path.join(lifecycleRepository, ".codegraph", "daemon.pid"), "must not be projected\n");
+    run("git", ["add", ".codegraph/.gitignore"], { cwd: lifecycleRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "add codegraph anchor"], { cwd: lifecycleRepository, env: gitEnvironment });
     const remoteRepository = path.join(installDirectory, "lifecycle-remote.git");
     run("git", ["init", "--bare", remoteRepository], { env: gitEnvironment });
     run("git", ["remote", "add", "origin", remoteRepository], { cwd: lifecycleRepository, env: gitEnvironment });
@@ -650,6 +656,67 @@ async function main() {
       fail("session create did not return a session ID");
     if (created.state !== "active" || created.branch !== "feature/installed-smoke") {
       fail("session create returned incomplete ownership metadata");
+    }
+
+    const auxiliaryWorktree = path.join(installDirectory, "packed-auxiliary-worktree");
+    const auxiliaryDeclaration = JSON.stringify({
+      source: { kind: "repository-local", path: ".codegraph/ignored" },
+      target: { kind: "managed-worktree", path: ".codegraph/ignored" },
+      mode: "copy",
+      durability: "durable",
+    });
+    const auxiliaryCreated = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "create",
+          "--branch",
+          "feature/installed-auxiliary",
+          "--worktree",
+          auxiliaryWorktree,
+          "--resource",
+          "README.md",
+          "--auxiliary-state",
+          auxiliaryDeclaration,
+          "--mode",
+          "write",
+          "--json",
+        ],
+        lifecycleRepository,
+      ),
+      "packed auxiliary-state session create",
+    );
+    if (
+      auxiliaryCreated.ok !== true ||
+      !fs.existsSync(path.join(auxiliaryWorktree, ".codegraph", "ignored", "index.json")) ||
+      fs.existsSync(path.join(auxiliaryWorktree, ".codegraph", "daemon.pid")) ||
+      run("git", ["status", "--porcelain"], { cwd: auxiliaryWorktree, env: gitEnvironment }).stdout.trim() !== ""
+    ) {
+      fail("packed session create did not establish only the declared auxiliary state with clean Git status");
+    }
+    const auxiliaryClaims = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", auxiliaryCreated.session_id, "--json"], lifecycleRepository),
+      "packed auxiliary-state session claims",
+    );
+    if (
+      auxiliaryClaims.ok !== true ||
+      auxiliaryClaims.claims?.length !== 1 ||
+      auxiliaryClaims.claims[0]?.resource !== "README.md" ||
+      auxiliaryClaims.claims[0]?.mode !== "write"
+    ) {
+      fail("packed session create did not atomically establish the initial claim with auxiliary state");
+    }
+    const auxiliaryClosed = parseInstalledJson(
+      invokeInstalled(["session", "close", "--session", auxiliaryCreated.session_id, "--json"], lifecycleRepository),
+      "packed auxiliary-state session close",
+    );
+    if (
+      auxiliaryClosed.ok !== true ||
+      auxiliaryClosed.worktree_removed !== true ||
+      fs.existsSync(auxiliaryWorktree) ||
+      !fs.existsSync(path.join(lifecycleRepository, ".codegraph", "ignored", "index.json"))
+    ) {
+      fail("packed auxiliary-state cleanup did not remove only session-owned artifacts");
     }
 
     const resolvedId = parseInstalledJson(
@@ -794,7 +861,7 @@ async function main() {
       createHelp.help_for !== "session create" ||
       createHelp.required_options?.length !== 0 ||
       createHelp.optional_options?.join(",") !==
-        "--branch,--worktree,--worktree-root,--base,--label,--resource,--mode" ||
+        "--branch,--worktree,--worktree-root,--base,--label,--resource,--mode,--auxiliary-state" ||
       createHelp.defaults?.["--base"] !== "HEAD"
     ) {
       fail("installed session create help did not expose the optional/defaulted contract");

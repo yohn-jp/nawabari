@@ -108,6 +108,11 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         value: "<read|write|exclusive-write>",
         repeatable: true,
       }),
+      option(
+        "--auxiliary-state",
+        "JSON repository-local auxiliary-state declaration to materialize in the managed worktree; repeatable",
+        { value: "<json>", repeatable: true },
+      ),
     ],
     notes: [
       "All create options are optional. Use status --json to discover managed_worktree_root.",
