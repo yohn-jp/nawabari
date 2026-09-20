@@ -23,27 +23,29 @@ test("accepts immutable external actions and repository-local actions", () => {
   assert.equal(result.references.filter((reference) => reference.local).length, 1);
 });
 
-test("accepts immutable canonical reusable governance workflows", () => {
+test("accepts canonical organization reusable workflows at main", () => {
   const result = validateActionText(
     [
-      "    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@" + sha,
-      "    uses: yohn-jp/.github/.github/workflows/issue-governance.yml@" + sha,
+      "    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@main",
+      "    uses: yohn-jp/.github/.github/workflows/issue-governance.yml@main",
+      "    uses: yohn-jp/.github/.github/workflows/typescript-cli-ci.yml@main",
+      "    uses: yohn-jp/.github/.github/workflows/codeql.yml@main",
     ].join("\n"),
     ".github/workflows/example.yml",
   );
 
   assert.deepEqual(result.errors, []);
-  assert.equal(result.references.filter((reference) => reference.trustedReusableWorkflow).length, 2);
+  assert.equal(result.references.filter((reference) => reference.trustedReusableWorkflow).length, 4);
 });
 
-test("rejects mutable canonical reusable governance workflows", () => {
+test("rejects pinned canonical organization reusable workflows", () => {
   const result = validateActionText(
-    "    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@main",
+    "    uses: yohn-jp/.github/.github/workflows/pr-governance.yml@" + sha,
     ".github/workflows/example.yml",
   );
 
   assert.equal(result.errors.length, 1);
-  assert.match(result.errors[0], /full 40-character commit SHA/u);
+  assert.match(result.errors[0], /organization reusable workflow must use @main/u);
 });
 
 test("rejects mutable untrusted reusable workflow references", () => {
@@ -67,7 +69,7 @@ test("rejects mutable, incomplete, and missing external action refs", () => {
   assert.match(result.errors[2], /same line/u);
 });
 
-test("all repository-owned workflow and composite-action refs are pinned", () => {
+test("all repository workflow and composite-action refs satisfy reference policy", () => {
   const result = validateRepositoryActions(repositoryRoot);
 
   assert.deepEqual(result.errors, []);

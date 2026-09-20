@@ -14,9 +14,9 @@ permissions:
 
 jobs:
   validate-issue:
-    # The provider revision is immutable; validation still executes against
-    # this repository's checked-in .github/inari snapshot.
-    uses: yohn-jp/.github/.github/workflows/issue-governance.yml@1231c1ba59f5eb2ab053f39327b0d6cf64fee809
+    # Organization reusable workflows track the canonical main branch while
+    # validation still executes against this repository's .github/inari snapshot.
+    uses: yohn-jp/.github/.github/workflows/issue-governance.yml@main
     permissions:
       contents: read
       issues: write
