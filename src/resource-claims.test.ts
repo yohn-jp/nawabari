@@ -1390,6 +1390,58 @@ test("RESOURCE_CLAIM_CONFLICT exposes the blocking session identity, claim, and 
   }
 });
 
+test("RESOURCE_CLAIM_CONFLICT directs callers to reconciliation for a stale blocking owner", () => {
+  const fixture = createRepositoryFixture(true);
+  try {
+    const firstRegistry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const first = firstRegistry.provision({
+      worktreePath: `${fixture.repositoryPath}-stale-owner`,
+      branchName: "feature/stale-owner",
+      label: "stale-owner",
+    });
+    const secondRegistry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const second = secondRegistry.create();
+
+    firstRegistry.claimResources({
+      sessionId: first.sessionId,
+      claims: [{ resource: "**", mode: "exclusive-write" }],
+    });
+    runGit(["worktree", "remove", "--force", first.worktreePath], fixture.repositoryPath);
+
+    assert.throws(
+      () =>
+        secondRegistry.claimResources({
+          sessionId: second.sessionId,
+          claims: [{ resource: "src/file.ts", mode: "write" }],
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "RESOURCE_CLAIM_CONFLICT");
+        assert.equal(error.details.ownerSessionId, first.sessionId);
+        assert.equal(error.details.ownerPhysicalState, "unregistered-missing");
+        assert.equal(error.details.ownerLifecycleState, "stale-inconsistent");
+        assert.equal((error.details.nextAction as { actionId: string }).actionId, "reconcile-physical-state");
+        assert.deepEqual(
+          (error.details.nextActions as unknown as { actionId: string }[]).map((action) => action.actionId),
+          ["reconcile-physical-state"],
+        );
+        assert.deepEqual(error.details.safeActions, [
+          "inspect-blocking-session",
+          "reconcile-physical-state",
+          "retain-session",
+        ]);
+        assert.equal(
+          (error.details.recoveryHints as string[])[0],
+          "Inspect the blocking session and run its canonical physical reconciliation before coordinating claim release.",
+        );
+        return true;
+      },
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 interface RepositoryFixture {
   readonly repositoryPath: string;
   readonly linkedWorktreePath: string;
