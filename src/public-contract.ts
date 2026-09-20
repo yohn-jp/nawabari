@@ -115,6 +115,8 @@ export function nawabariVerificationContract(): JsonObject {
     read_visibility: ["declared", "repository"],
     write_policy: "deny",
     execution: "fixed-argv-no-shell",
+    filesystem_boundary: "invocation-local-read-only-working-set",
+    enforcement: "strict-protected-execution-landlock",
     bounded_diagnostics: true,
     mutates_working_set: false,
     mutates_session_registry: false,

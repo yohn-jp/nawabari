@@ -11,6 +11,38 @@ import { success, type DomainResult } from "./domain/errors.js";
 import type { SandboxExecutionRequest } from "./domain/sandbox.js";
 import type { SandboxExecutionResult } from "./domain/sandbox-launcher.js";
 
+const agentWorkingSet = {
+  contract_id: "nawabari.working-set-runtime-projection.v1" as const,
+  schema_version: 1 as const,
+  working_set_id: "agent-ews",
+  revision: 7,
+  repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+  base: { branch: "main", revision: "a".repeat(40) },
+  scope: {
+    readOnly: ["src/**"],
+    write: ["src/allowed.ts"],
+    create: ["src/generated.ts"],
+    delete: ["src/removed.ts"],
+    deny: ["src/secret.ts"],
+  },
+};
+
+const runtimeProjection = {
+  contract_id: "nawabari.session-runtime-projection.v1" as const,
+  schema_version: 1 as const,
+  policy: {
+    mode: "strict" as const,
+    host_visibility: "default-deny" as const,
+    compatibility: "disabled" as const,
+    unrestricted_host_fallback: "forbidden" as const,
+  },
+  profile: { id: "node-runtime", version: "1" },
+  requirements: [],
+  filesystem: [],
+  executables: [],
+  working_set: agentWorkingSet,
+};
+
 const profile = {
   contract_id: VERIFICATION_PROFILE_CONTRACT_ID,
   schema_version: VERIFICATION_PROFILE_SCHEMA_VERSION,
@@ -28,6 +60,7 @@ const profile = {
 const request = {
   enforce: true,
   worktree: "/repo/worktree",
+  runtime_projection: runtimeProjection,
 } as unknown as SandboxExecutionRequest;
 
 test("verification profile is versioned, fixed-argv, and default-deny", () => {
@@ -44,7 +77,7 @@ test("verification profile is versioned, fixed-argv, and default-deny", () => {
   assert.equal(unsupported.ok, false);
 });
 
-test("verification normalizes bounded diagnostics and never mutates the request", async () => {
+test("verification derives a repository read-only projection without mutating agent EWS", async () => {
   const source = "secret-source-content-".repeat(100);
   let receivedRequest: SandboxExecutionRequest | null = null;
   const execute = async (sandboxRequest: SandboxExecutionRequest): Promise<DomainResult<SandboxExecutionResult>> => {
@@ -65,7 +98,42 @@ test("verification normalizes bounded diagnostics and never mutates the request"
   assert.equal(result.value.working_set_mutated, false);
   assert.notEqual(result.value.stdout.text, source);
   assert.ok(result.value.stdout.text.length <= 4_096);
-  assert.equal(receivedRequest, request);
+  assert.notEqual(receivedRequest, request);
+  assert.deepEqual(request.runtime_projection?.working_set, agentWorkingSet);
+  const projectedRequest = receivedRequest as unknown as SandboxExecutionRequest;
+  assert.deepEqual(projectedRequest.runtime_projection?.working_set?.scope, {
+    readOnly: ["**"],
+    write: [],
+    create: [],
+    delete: [],
+    deny: [],
+  });
+  assert.equal(projectedRequest.runtime_projection?.working_set?.working_set_id, agentWorkingSet.working_set_id);
+  assert.equal(projectedRequest.runtime_projection?.working_set?.revision, agentWorkingSet.revision);
+});
+
+test("declared verification visibility is the only read grant and keeps writes denied", async () => {
+  let receivedRequest: SandboxExecutionRequest | null = null;
+  const execute = async (sandboxRequest: SandboxExecutionRequest): Promise<DomainResult<SandboxExecutionResult>> => {
+    receivedRequest = sandboxRequest;
+    return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+  };
+
+  const result = await executeVerification(
+    { ...profile, read_visibility: "declared", declared_read: ["src/allowed.ts"] },
+    request,
+    { execute },
+  );
+  assert.equal(result.ok, true);
+  const projectedRequest = receivedRequest as unknown as SandboxExecutionRequest;
+  assert.deepEqual(projectedRequest.runtime_projection?.working_set?.scope, {
+    readOnly: ["src/allowed.ts"],
+    write: [],
+    create: [],
+    delete: [],
+    deny: [],
+  });
+  assert.deepEqual(request.runtime_projection?.working_set, agentWorkingSet);
 });
 
 test("verification requires protected execution and rejects worktree escape", async () => {
