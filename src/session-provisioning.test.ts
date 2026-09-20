@@ -11,6 +11,122 @@ import { defaultGit, type GitCommandRunner, resolveRepositoryContext } from "./g
 import { SessionRegistry } from "./session-registry.js";
 import { errnoError, withDirectoryFsyncFailure } from "./testing/fs-fault-injection.js";
 
+test("bounded provision establishes and persists the effective working set before ownership commit", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-working-set");
+  try {
+    const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
+    const revision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+    const identity = { repositoryHost: "local", repositoryId: repository.repositoryId };
+    const base = { branch: "main", revision };
+    const executionScope = {
+      version: 1,
+      kind: "implementation-execution-scope",
+      authorization: {
+        version: 1,
+        kind: "implementation-authorization",
+        contractVersion: 1,
+        implementation: { ...identity, number: 374 },
+        governedBodyDigest: "b".repeat(64),
+      },
+      repository: identity,
+      base,
+      scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+    };
+    const candidateWorkingSet = {
+      kind: "candidate-working-set",
+      schemaVersion: 1,
+      workingSetId: "candidate-374",
+      repository: { ...identity, repository: "local/nawabari" },
+      revision,
+      entries: [
+        {
+          state: "required",
+          target: { kind: "file", locator: "README.md" },
+          reason: { id: "test:bootstrap", summary: "bounded fixture" },
+          evidence: [{ artifact: "test", reference: "README.md" }],
+        },
+      ],
+    };
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({
+      worktreePath,
+      branchName: "feature/provisioned-working-set",
+      executionScope,
+      candidateWorkingSet,
+    });
+
+    assert.equal(session.workingSet?.revision, 1);
+    assert.equal(session.workingSet?.repository.repositoryId, repository.repositoryId);
+    const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
+      sessions: Array<{ working_set?: { id?: string; revision?: number } }>;
+    };
+    assert.equal(typeof persisted.sessions[0]?.working_set?.id, "string");
+    assert.equal(persisted.sessions[0]?.working_set?.revision, 1);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("unsatisfiable bounded working-set bootstrap creates no ownership", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-invalid-working-set");
+  const branchName = "feature/provisioned-invalid-working-set";
+  try {
+    const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
+    const revision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+    const identity = { repositoryHost: "local", repositoryId: repository.repositoryId };
+    assertRegistryError(
+      () =>
+        new SessionRegistry({ cwd: fixture.repositoryPath }).provision({
+          worktreePath,
+          branchName,
+          executionScope: {
+            version: 1,
+            kind: "implementation-execution-scope",
+            authorization: {
+              version: 1,
+              kind: "implementation-authorization",
+              contractVersion: 1,
+              implementation: { ...identity, number: 374 },
+              governedBodyDigest: "b".repeat(64),
+            },
+            repository: identity,
+            base: { branch: "main", revision },
+            scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+          },
+          candidateWorkingSet: {
+            kind: "candidate-working-set",
+            schemaVersion: 1,
+            workingSetId: "candidate-374-invalid",
+            repository: { ...identity, repository: "local/nawabari" },
+            revision,
+            entries: [
+              {
+                state: "required",
+                target: { kind: "file", locator: "src/secret.ts" },
+                reason: { id: "test:bootstrap", summary: "outside scope" },
+                evidence: [],
+              },
+            ],
+          },
+        }),
+      "OPERATION_REJECTED",
+    );
+    assert.equal(fs.existsSync(worktreePath), false);
+    assert.equal(
+      runGitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], fixture.repositoryPath),
+      false,
+    );
+    assert.deepEqual(new SessionRegistry({ cwd: fixture.repositoryPath }).list(), []);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    runGitQuiet(["branch", "-D", "--", branchName], fixture.repositoryPath);
+    fixture.cleanup();
+  }
+});
+
 test("provision creates one dedicated worktree and one mutable branch", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-provisioned-one");
