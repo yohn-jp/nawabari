@@ -186,6 +186,9 @@ export class LocalSessionBackend implements SessionBackend {
         worktreeRoot: options.worktree_root ?? undefined,
         label: options.label ?? undefined,
         baseRef: options.base ?? undefined,
+        ...(options.claims === null || options.claims === undefined
+          ? {}
+          : { initialClaims: options.claims.map(toRegistryClaimInput) }),
       });
       return success(toDomainRecord(record));
     } catch (error: unknown) {
