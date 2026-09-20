@@ -30,6 +30,7 @@ import type {
   SessionCreateOptions,
   SessionDiagnostic,
   SessionDiagnosticOptions,
+  ReconciliationApplyResult,
   SessionDiscardResult,
   SessionDiscardPreview,
   SessionRecord,
@@ -697,6 +698,7 @@ test("canonical command registry resolves aliases without duplicating option def
     "session id",
     "session show",
     "session inspect",
+    "session reconcile",
     "session run",
     "session exec",
     "session shell",
@@ -987,6 +989,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session id",
       "session show",
       "session inspect",
+      "session reconcile",
       "session run",
       "session exec",
       "session shell",
@@ -1029,6 +1032,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--session",
       "--integrated-revision",
       "--schema-version",
+      "--apply",
       "--runtime-policy",
       "--limit",
       "--offset",
@@ -1329,6 +1333,62 @@ test("session inspect forwards --session and --integrated-revision to the diagno
     ok: true,
     command: "session inspect",
     ...diagnosticResult,
+  });
+});
+
+test("session reconcile requires an explicit target and apply flag, then delegates the bounded result", async () => {
+  const seen: string[] = [];
+  const output = capture();
+  const result = {
+    schema_version: 1,
+    operation: "reconcile-apply",
+    outcome: "completed",
+    repository: sampleSession.repository,
+    session_id: sampleSession.session_id,
+    action: {
+      schema_version: 2,
+      action_id: "reconcile-physical-state-apply",
+      kind: "reconcile-apply",
+      command: "session reconcile",
+      session_id: sampleSession.session_id,
+      required_args: ["--session", sampleSession.session_id, "--apply"],
+      requires_explicit_intent: true,
+      mutates: true,
+    },
+    session: { ...sampleSession, state: "closed" },
+    lifecycle: {} as ReconciliationApplyResult["lifecycle"],
+    physical_state: "prunable-missing",
+    claims: [],
+    released_claims: [],
+    released_claim_count: 0,
+    worktree_removed: true,
+    branch_removed: true,
+    claim_set_generation: 1,
+  } satisfies ReconciliationApplyResult;
+  const backend = backendForTests({
+    reconcileApply: async (_context: SessionContext, sessionId: string) => {
+      seen.push(sessionId);
+      return success(result);
+    },
+  });
+
+  assert.equal(
+    await runCli(["session", "reconcile", "--session", sampleSession.session_id, "--json"], { backend, io: output.io }),
+    2,
+  );
+  assert.deepEqual(seen, []);
+  assert.equal(
+    await runCli(["session", "reconcile", "--session", sampleSession.session_id, "--apply", "--json"], {
+      backend,
+      io: output.io,
+    }),
+    0,
+  );
+  assert.deepEqual(seen, [sampleSession.session_id]);
+  assert.deepEqual(JSON.parse(output.stdout.at(-1) ?? ""), {
+    ok: true,
+    command: "session reconcile",
+    ...result,
   });
 });
 

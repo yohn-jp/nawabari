@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { availableLifecycleOperations, classifySessionLifecycle } from "./session-lifecycle-classification.js";
-import { primarySessionLifecycleAction, projectSessionLifecycleActions } from "./session-lifecycle-actions.js";
+import {
+  primarySessionLifecycleAction,
+  projectSessionLifecycleActions,
+  reconciliationApplyAction,
+} from "./session-lifecycle-actions.js";
 
 test("projects recoverable commits into retain plus explicit discard without executing either", () => {
   const classification = classifySessionLifecycle({
@@ -114,6 +118,38 @@ test("ambiguous and terminal states never advertise destructive recovery", () =>
     phase: "termination",
   });
   assert.equal(primarySessionLifecycleAction({ classification: ready, sessionId: "session-6" }), undefined);
+});
+
+test("v1 physical reconciliation remains diagnostic-only while apply uses an explicit v2 action", () => {
+  const classification = classifySessionLifecycle({
+    sessionState: "active",
+    physicalState: "unavailable",
+    closeReadiness: "ambiguous",
+    blockers: [{ code: "GIT_COMMAND_FAILED" }],
+    phase: "termination",
+  });
+  const diagnosticAction = primarySessionLifecycleAction({
+    classification,
+    sessionId: "session-apply",
+  });
+  assert.deepEqual(diagnosticAction, {
+    schemaVersion: 1,
+    actionId: "reconcile-physical-state",
+    kind: "reconcile",
+    command: "doctor",
+    sessionId: "session-apply",
+    mutates: false,
+  });
+  assert.deepEqual(reconciliationApplyAction("session-apply"), {
+    schemaVersion: 2,
+    actionId: "reconcile-physical-state-apply",
+    kind: "reconcile-apply",
+    command: "session reconcile",
+    sessionId: "session-apply",
+    requiredArgs: ["--session", "session-apply", "--apply"],
+    requiresExplicitIntent: true,
+    mutates: true,
+  });
 });
 
 test("next-actions and operation availability follow the XState transition projection for every public state", () => {

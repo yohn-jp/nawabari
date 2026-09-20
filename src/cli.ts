@@ -87,6 +87,7 @@ export const DISPATCHER_COMMAND_INVENTORY = [
   "session id",
   "session show",
   "session inspect",
+  "session reconcile",
   "session run",
   "session exec",
   "session shell",
@@ -126,6 +127,7 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session id": [],
   "session show": ["--session"],
   "session inspect": ["--session", "--integrated-revision", "--schema-version"],
+  "session reconcile": ["--session", "--apply"],
   "session run": ["--session", "--runtime-policy"],
   "session shell": ["--session", "--runtime-policy"],
   "session list": ["--all", "--history", "--limit", "--offset"],
@@ -1498,6 +1500,18 @@ async function executeCommand(
         ...(parsed.value.schema_version === null ? {} : { schema_version: parsed.value.schema_version }),
       };
       const result = await dependencies.backend.sessionDiagnostic(context, options);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (subcommand === "reconcile") {
+      const parsed = parseTargetedOptions(rest, dispatcherAllowedOptions("session reconcile"), true);
+      if (!parsed.ok) return parsed;
+      if (!parsed.value.apply) {
+        return failure(usageError("MISSING_ARGUMENT", "session reconcile requires --apply.", { option: "--apply" }));
+      }
+      if (dependencies.backend.reconcileApply === undefined) {
+        return failure(new DomainError("BACKEND_UNAVAILABLE", "Session reconciliation is not available."));
+      }
+      const result = await dependencies.backend.reconcileApply(context, parsed.value.session_id as string);
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "discard") {

@@ -144,6 +144,25 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     ],
   },
   {
+    name: "session reconcile",
+    summary: "Apply bounded lifecycle reconciliation for one selected session",
+    usage: `${CLI_NAME} session reconcile --session <id> --apply`,
+    options: [
+      option("--session", "Explicit session identity; never inferred from the current worktree", {
+        value: "<id>",
+        required: true,
+      }),
+      option("--apply", "Apply only cleanup already authorized by lifecycle and physical-state evidence", {
+        required: true,
+      }),
+    ],
+    notes: [
+      "Destructive mutation requires both an explicit session target and --apply.",
+      "Elapsed age, missing paths alone, ambiguous ownership, recoverable work, and unresolved physical evidence never authorize mutation.",
+      "Repeating a converged request returns an explicit already-terminal result.",
+    ],
+  },
+  {
     name: "session run",
     aliases: ["session exec"],
     summary: "Run one command inside the protected session sandbox",

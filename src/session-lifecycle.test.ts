@@ -805,6 +805,76 @@ test("gc recovers an externally removed prunable worktree and permits branch reu
   }
 });
 
+test("reconcile apply uses bounded cleanup authority, is idempotent, and rejects missing-only evidence", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-reconcile-apply`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/reconcile-apply" });
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+
+    const applied = registry.reconcileApply(session.sessionId);
+    assert.equal(applied.operation, "reconcile-apply");
+    assert.equal(applied.outcome, "completed");
+    assert.equal(applied.physicalState, "prunable-missing");
+    assert.equal(applied.session.state, "closed");
+    assert.equal(applied.releasedClaimCount, 0);
+    assert.equal(hasLocalBranch(fixture.repositoryPath, session.branchName), false);
+
+    const repeated = registry.reconcileApply(session.sessionId);
+    assert.equal(repeated.outcome, "already-terminal");
+    assert.equal(repeated.session.state, "closed");
+
+    const missingOnlyPath = `${fixture.repositoryPath}-reconcile-missing-only`;
+    const missingOnly = registry.provision({
+      worktreePath: missingOnlyPath,
+      branchName: "feature/reconcile-missing-only",
+    });
+    fs.rmSync(missingOnlyPath, { recursive: true, force: true });
+    runGit(["worktree", "prune"], fixture.repositoryPath);
+    runGit(["branch", "-D", missingOnly.branchName], fixture.repositoryPath);
+
+    assert.throws(
+      () => registry.reconcileApply(missingOnly.sessionId),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "GIT_STATE_AMBIGUOUS",
+    );
+    assert.equal(registry.get(missingOnly.sessionId)?.state, "active");
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("reconcile apply rejects age-only and recoverable work before mutation", () => {
+  const fixture = createRepositoryFixture();
+  const agePath = `${fixture.repositoryPath}-reconcile-age`;
+  const dirtyPath = `${fixture.repositoryPath}-reconcile-dirty`;
+  let now = new Date("2026-01-01T00:00:00.000Z");
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, clock: () => now, staleAfterMs: 1_000 });
+    const ageOnly = registry.provision({ worktreePath: agePath, branchName: "feature/reconcile-age" });
+    now = new Date("2026-01-01T00:00:02.000Z");
+    assert.throws(
+      () => registry.reconcileApply(ageOnly.sessionId),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "OPERATION_REJECTED",
+    );
+    assert.equal(registry.get(ageOnly.sessionId)?.state, "active");
+
+    const dirty = registry.provision({ worktreePath: dirtyPath, branchName: "feature/reconcile-dirty" });
+    fs.writeFileSync(path.join(dirtyPath, "recoverable.txt"), "retain me\n");
+    setPersistedSessionState(registry, dirty.sessionId, "stale");
+    assert.throws(
+      () => registry.reconcileApply(dirty.sessionId),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "DIRTY_WORKTREE",
+    );
+    assert.equal(registry.get(dirty.sessionId)?.state, "stale");
+  } finally {
+    removeWorktree(fixture.repositoryPath, agePath);
+    removeWorktree(fixture.repositoryPath, dirtyPath);
+    fixture.cleanup();
+  }
+});
+
 test("close succeeds when multiple prunable worktree entries exist alongside the session worktree", () => {
   const fixture = createRepositoryFixture();
   const sessionWorktreePath = `${fixture.repositoryPath}-session-prunable`;
