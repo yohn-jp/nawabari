@@ -12,6 +12,7 @@ permissions: {}
 
 jobs:
   analyze:
+    name: CodeQL
     uses: yohn-jp/.github/.github/workflows/codeql.yml@1231c1ba59f5eb2ab053f39327b0d6cf64fee809
     with:
       languages: javascript-typescript,actions
