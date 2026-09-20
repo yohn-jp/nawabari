@@ -67,9 +67,11 @@ jobs:
             fi
           fi
 
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "expected_commit=${release_commit,,}" >> "$GITHUB_OUTPUT"
-          echo "expected_package_version=$package_version" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_tag=$release_tag"
+            echo "expected_commit=${release_commit,,}"
+            echo "expected_package_version=$package_version"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout selected release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -112,10 +114,12 @@ jobs:
             exit 1
           fi
 
-          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "release_commit=$tag_commit" >> "$GITHUB_OUTPUT"
-          echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
-          echo "tarball_name=nawabari-${package_version}.tgz" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_tag=$RELEASE_TAG"
+            echo "release_commit=$tag_commit"
+            echo "package_version=$package_version"
+            echo "tarball_name=nawabari-${package_version}.tgz"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare

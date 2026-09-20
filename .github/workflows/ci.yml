@@ -16,7 +16,7 @@ jobs:
   typescript:
     needs: changes
     name: shared TypeScript CI
-    uses: yohn-jp/.github/.github/workflows/typescript-cli-ci.yml@1231c1ba59f5eb2ab053f39327b0d6cf64fee809
+    uses: yohn-jp/.github/.github/workflows/typescript-cli-ci.yml@main
     with:
       node-version: "24"
       release-docs-fast-path: ${{ needs.changes.outputs.release_docs_only == 'true' }}
