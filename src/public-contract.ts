@@ -26,6 +26,30 @@ import {
   RESOURCE_CLAIM_RESULT_SCHEMA,
   RESOURCE_CLAIM_TRANSITION_MATRIX_ID,
 } from "./contract.js";
+import {
+  VERIFICATION_PROFILE_CONTRACT_ID,
+  VERIFICATION_PROFILE_SCHEMA_VERSION,
+  VERIFICATION_RESULT_SCHEMA_VERSION,
+  VERIFICATION_RESULT_SCHEMA,
+} from "./verification-executor.js";
+
+export {
+  executeVerification,
+  runVerification,
+  validateVerificationProfile,
+  VERIFICATION_PROFILE_CONTRACT_ID,
+  VERIFICATION_PROFILE_SCHEMA_VERSION,
+  VERIFICATION_RESULT_SCHEMA,
+  VERIFICATION_RESULT_SCHEMA_VERSION,
+} from "./verification-executor.js";
+export type {
+  VerificationDiagnosticStream,
+  VerificationExecutorDependencies,
+  VerificationProfile,
+  VerificationProfileInput,
+  VerificationReadVisibility,
+  VerificationResult,
+} from "./verification-executor.js";
 
 /** Stable identity of Nawabari's bounded Effective Working Set capability. */
 export const EFFECTIVE_WORKING_SET_CONTRACT_ID = "effective-working-set" as const;
@@ -75,5 +99,24 @@ export function nawabariWorkingSetContract(): JsonObject {
     operations: ["READONLY", "WRITE", "CREATE", "DELETE", "DENY"],
     fail_closed: true,
     resource_claims_separate: true,
+  };
+}
+
+/**
+ * Public discovery for the isolated verification authority. The executor is
+ * transport-neutral; interactive session execution and working-set state
+ * remain separate authorities.
+ */
+export function nawabariVerificationContract(): JsonObject {
+  return {
+    contract_id: VERIFICATION_PROFILE_CONTRACT_ID,
+    contract_version: VERIFICATION_PROFILE_SCHEMA_VERSION,
+    result_schema: VERIFICATION_RESULT_SCHEMA,
+    read_visibility: ["declared", "repository"],
+    write_policy: "deny",
+    execution: "fixed-argv-no-shell",
+    bounded_diagnostics: true,
+    mutates_working_set: false,
+    mutates_session_registry: false,
   };
 }

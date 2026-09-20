@@ -8,6 +8,7 @@ import {
   machineContract,
   MACHINE_CONTRACT_ID,
   nawabariMachineContract,
+  nawabariVerificationContract,
   nawabariWorkingSetContract,
 } from "./public-contract.js";
 
@@ -47,4 +48,14 @@ test("public contract exposes the product-neutral working-set capability", () =>
     "effective-working-set",
   ]);
   assert.equal(contract.resource_claims_separate, true);
+});
+
+test("public contract exposes isolated verification authority", () => {
+  const contract = nawabariVerificationContract();
+  assert.equal(contract.contract_id, "nawabari.verification-profile.v1");
+  assert.equal(contract.contract_version, 1);
+  assert.deepEqual(contract.read_visibility, ["declared", "repository"]);
+  assert.equal(contract.write_policy, "deny");
+  assert.equal(contract.execution, "fixed-argv-no-shell");
+  assert.equal(contract.mutates_working_set, false);
 });
