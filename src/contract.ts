@@ -348,7 +348,13 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       zero_or_more: true,
       retry: {
         uncertain_code: "REGISTRY_DURABILITY_UNCERTAIN",
-        conflict_codes: ["RESOURCE_CLAIM_CONFLICT", "WORKTREE_ALREADY_EXISTS", "BRANCH_ALREADY_EXISTS"],
+        conflict_codes: [
+          "RESOURCE_CLAIM_CONFLICT",
+          "WORKTREE_ALREADY_EXISTS",
+          "BRANCH_ALREADY_EXISTS",
+          "WORKTREE_OWNED_BY_OTHER_SESSION",
+          "BRANCH_OWNED_BY_OTHER_SESSION",
+        ],
         exact_owner_adoption: false,
         fail_closed: true,
       },

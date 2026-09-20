@@ -1440,8 +1440,19 @@ export class SessionRegistry {
         ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
       });
 
-      assertNoOwnershipConflict(state.sessions, record);
-      assertGitResourcesAvailable(this.git, this.repository.worktreePath, resources);
+      const retryEvidence = this.provisioningRetryEvidence(state, resources, options);
+      try {
+        assertNoOwnershipConflict(state.sessions, record);
+      } catch (error: unknown) {
+        if (
+          error instanceof SessionRegistryError &&
+          (error.code === "DUPLICATE_WORKTREE_OWNERSHIP" || error.code === "DUPLICATE_BRANCH_OWNERSHIP")
+        ) {
+          throw new SessionRegistryError(error.code, error.message, { ...error.details, ...retryEvidence }, error);
+        }
+        throw error;
+      }
+      assertGitResourcesAvailable(this.git, this.repository.worktreePath, resources, retryEvidence);
 
       let gitProvisioned = false;
       try {
@@ -1509,6 +1520,73 @@ export class SessionRegistry {
 
   createProvisionedSession(options: ProvisionSessionOptions = {}): SessionRecord {
     return this.provision(options);
+  }
+
+  /**
+   * Classify a physical collision using only positively observed registry
+   * ownership and the complete original bootstrap declaration. An exact
+   * match is surfaced as a safe inspection action; every other collision is
+   * fail-closed and never adopted.
+   */
+  private provisioningRetryEvidence(
+    state: RegistryState,
+    resources: ProvisioningResources,
+    options: ProvisionSessionOptions,
+  ): RegistryErrorDetails {
+    const owner = state.sessions.find(
+      (candidate) =>
+        samePath(candidate.worktreePath, resources.worktreePath) || candidate.branchName === resources.branchName,
+    );
+    if (owner === undefined) {
+      return {
+        bootstrap_retry: {
+          classification: "unrelated-resource-conflict",
+          exact_identity_proven: false,
+          next_action: "choose-different-worktree-or-branch",
+        },
+      };
+    }
+
+    const samePhysicalIdentity =
+      samePath(owner.worktreePath, resources.worktreePath) && owner.branchName === resources.branchName;
+    let declarationMatches = false;
+    if (samePhysicalIdentity && owner.baseRevision === resources.baseRevision) {
+      try {
+        const ownerContext: ClaimOwner = { ...owner, record: owner };
+        const requested = this.canonicalClaimInputs(options.initialClaims ?? [], ownerContext, true);
+        const established = sortResourceClaims(state.claims.filter((claim) => claim.sessionId === owner.sessionId)).map(
+          (claim) => ({ resource: claim.resource, mode: claim.mode }),
+        );
+        declarationMatches =
+          owner.label === (options.label === undefined ? undefined : options.label) &&
+          requested.length === established.length &&
+          requested.every(
+            (claim, index) =>
+              claim.resource === established[index]?.resource && claim.mode === established[index]?.mode,
+          );
+      } catch {
+        declarationMatches = false;
+      }
+    }
+
+    return {
+      owner_session_id: owner.sessionId,
+      owner_worktree: owner.worktreePath,
+      owner_branch: owner.branchName,
+      owner_state: owner.state,
+      bootstrap_retry: declarationMatches
+        ? {
+            classification: "already-established",
+            exact_identity_proven: true,
+            session_id: owner.sessionId,
+            next_action: "inspect-established-session",
+          }
+        : {
+            classification: "owner-conflict",
+            exact_identity_proven: false,
+            next_action: "inspect-blocking-session",
+          },
+    };
   }
 
   register(record: SessionRecord): SessionRecord {
@@ -7344,7 +7422,12 @@ function localBranchCollision(git: GitCommandRunner, cwd: string, branchId: stri
     );
 }
 
-function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resources: ProvisioningResources): void {
+function assertGitResourcesAvailable(
+  git: GitCommandRunner,
+  cwd: string,
+  resources: ProvisioningResources,
+  retryEvidence: RegistryErrorDetails,
+): void {
   assertNoSymlinkPath(resources.worktreePath);
   const parent = path.dirname(resources.worktreePath);
   try {
@@ -7367,6 +7450,7 @@ function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resourc
       `Worktree path already exists: ${resources.worktreePath}`,
       {
         worktree: resources.worktreePath,
+        ...retryEvidence,
       },
     );
   }
@@ -7377,6 +7461,7 @@ function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resourc
       `Worktree path is a symbolic link: ${resources.worktreePath}`,
       {
         worktree: resources.worktreePath,
+        ...retryEvidence,
       },
     );
   }
@@ -7392,6 +7477,7 @@ function assertGitResourcesAvailable(git: GitCommandRunner, cwd: string, resourc
   if (localBranchCollision(git, cwd, resources.branchId)) {
     throw new SessionRegistryError("BRANCH_ALREADY_EXISTS", `Local branch already exists: ${resources.branchName}`, {
       branch: resources.branchName,
+      ...retryEvidence,
     });
   }
 }
