@@ -6,12 +6,17 @@ It is for teams and tools that need several agents to work in one repository wit
 
 This README describes the current 0.10.x product model. It is an overview and navigation surface, not a copy of generated contracts or implementation history.
 
-The product model is intentionally small:
+The canonical routine-use workflow is one machine-authority path for both people
+and agents:
 
-1. Create a session. Nawabari provisions a dedicated worktree and branch.
-2. Claim the resources the session is allowed to use.
-3. Route governed work through claims, evidence, and mutation authorization.
-4. Inspect the result, then close the session only when integration is proven.
+1. Create a managed session with explicit initial claims.
+2. Declare any required auxiliary repository-local state explicitly.
+3. Inspect the session and its claims.
+4. Run governed work and mutations through the claim and evidence surfaces.
+5. Handle claim conflicts from machine-readable evidence and typed lifecycle actions.
+6. Reconcile stale or inconsistent physical state through the canonical operation.
+7. Close or discard according to the lifecycle authority.
+8. Confirm convergence with `doctor` and garbage-collection observation.
 
 Nawabari governs operations routed through Nawabari. A normal governed session is an ownership and authorization boundary, not an operating-system or filesystem sandbox. A process with ambient filesystem permissions can still edit another worktree directly.
 
@@ -27,29 +32,50 @@ git nawabari --help
 
 The package installs both `nawabari` and `git-nawabari`; `git nawabari ...` works as Git's external subcommand.
 
-## First session
+## Canonical routine-use workflow
 
-Run from the repository's integration worktree. `src/example.ts` below is a placeholder path; substitute a real file that exists in your repository.
+Run from the repository's integration worktree. The following bootstrap uses the
+same public option shape as the packed routine-use certification. Omit the
+auxiliary declaration when the session needs no declared repository-local state;
+do not replace it with an arbitrary host path.
 
 ```bash
 nawabari capabilities --json
+nawabari doctor --json
 
-created=$(git nawabari session create --branch feature/example --json)
+auxiliary_state='{"source":{"kind":"repository-local","path":".codegraph/ignored"},"target":{"kind":"managed-worktree","path":".codegraph/ignored"},"mode":"copy","durability":"durable"}'
+created=$(git nawabari session create \
+  --branch feature/example \
+  --resource README.md --mode write \
+  --auxiliary-state "$auxiliary_state" \
+  --json)
 session_id=$(printf '%s' "$created" | jq -r .session_id)
 worktree=$(printf '%s' "$created" | jq -r .worktree)
 
-(cd "$worktree" && git nawabari session claim --session "$session_id" --resource src/example.ts --mode exclusive-write --json)
-(cd "$worktree" && git nawabari guard --session "$session_id" --operation source-write --resource src/example.ts --json)
-(cd "$worktree" && "$EDITOR" src/example.ts)
+(cd "$worktree" && git nawabari session show --session "$session_id" --json)
+(cd "$worktree" && git nawabari session claims --session "$session_id" --json)
+(cd "$worktree" && git nawabari session inspect --session "$session_id" --schema-version 2 --json)
+
+(cd "$worktree" && git nawabari session claim --session "$session_id" --resource contract-lifecycle.txt --mode exclusive-write --json)
+(cd "$worktree" && git nawabari authorize --session "$session_id" --operation source-write --resource contract-lifecycle.txt --json)
+(cd "$worktree" && "$EDITOR" contract-lifecycle.txt)
+(cd "$worktree" && git nawabari evidence snapshot --session "$session_id" --json)
 (cd "$worktree" && git nawabari checkpoint --session "$session_id" --json)
-(cd "$worktree" && git nawabari commit --session "$session_id" --all-claimed --message "Update example" --json)
+(cd "$worktree" && git nawabari commit --session "$session_id" --message "Exercise governed lifecycle" --resource contract-lifecycle.txt --json)
+(cd "$worktree" && git nawabari push --session "$session_id" --remote origin --branch feature/example --resource contract-lifecycle.txt --create-upstream --json)
 ```
 
 `session create` provisions the new worktree under `<repository-parent>/.nawabari/worktrees` by default (discoverable via `status --json` as `managed_worktree_root`). Nawabari creates that managed subdirectory on first default placement. New exact `--worktree` paths must be under the reported root; an absolute path directly under the repository parent remains accepted for compatibility with older callers and persisted sessions.
 
+The initial-claim grammar is `--resource <path-or-glob> --mode <read|write|exclusive-write>` and the pair may be repeated. Each resource is paired with its own mode. The parser also permits zero pairs for backward compatibility, but the canonical routine path declares at least one initial claim. Initial claims are committed atomically with the new session, worktree, and branch. A conflict returns a machine-readable failure such as `RESOURCE_CLAIM_CONFLICT` and does not leave a partially established session or claim set.
+
+The packed auxiliary-state declaration above is the bounded `copy` form: a `repository-local` source is copied to a `managed-worktree` target with `durability: durable`. It is an explicit, repeatable, allowlisted capability. It does not discover ignored state, project process-local sockets/PID files/logs, shadow Git-tracked paths, or expose arbitrary host filesystem paths. Auxiliary-state projection is separate from `SessionRuntimeProjection`: the former copies declared repository-local durable state for a managed worktree; the latter describes explicit runtime material and filesystem visibility for protected execution. Auxiliary state does not change the runtime projection.
+
+The create operation is atomic, but a caller must treat an uncertain result carefully. If JSON reports `REGISTRY_DURABILITY_UNCERTAIN`, re-read the reported session and claims before retrying. If the exact original declaration is already present, follow `bootstrap_retry.next_action: inspect-established-session` and inspect that `session_id`; if another declaration owns the worktree or branch, follow `bootstrap_retry.next_action: inspect-blocking-session`. Nawabari never silently adopts an existing owner. A retry is appropriate only after the authoritative state proves that the requested bootstrap was not established.
+
 `--all-claimed` is an explicit resource selector. It resolves safely observed Git-changed paths covered by qualifying claims; it does not bypass claim authorization. Use repeated `--resource <path>` when an explicit path list is preferable.
 
-After reviewing and integrating the session branch:
+After reviewing and integrating the session branch through the caller's normal local Git/provider process:
 
 ```bash
 git nawabari session inspect --session "$session_id" --json
@@ -58,34 +84,68 @@ git nawabari session close --session "$session_id" --json
 
 Close is conservative. Unintegrated commits, dirty worktrees, ambiguous Git state, and ownership mismatches remain blocked. For a squash or rebase merge, pass an exact local `--integrated-revision <rev>` so Nawabari can independently re-verify the content.
 
+If the lifecycle result exposes a recoverable blocker, follow its typed `next_action`/`next_actions` entry. `reconcile-physical-state` is the non-mutating observation action (its command is `doctor`). Its explicit apply action is `reconcile-physical-state-apply`, and its exact command is:
+
+```bash
+git nawabari session reconcile --session "$owner_session_id" --apply --json
+```
+
+The session ID must be the blocking owner reported by the machine result. A successful apply returns `operation: "reconcile-apply"`, `action.action_id: "reconcile-physical-state-apply"`, and a completed outcome; the owner is terminalized and its claims are released only when the existing lifecycle and physical-state evidence authorizes that transition. Retry the blocked claim only after this result succeeds.
+
+After every session reaches its terminal lifecycle result, confirm convergence from
+the repository integration worktree:
+
+```bash
+git nawabari gc --dry-run --json
+git nawabari doctor --json
+```
+
 ## Authority model
 
 Each boundary has one job and one local authority. README summarizes the product contract; executable code and machine-readable projections remain authoritative for exact schemas, transitions, and failure vocabularies.
 
-| Boundary               | What it answers                                                                      | Typical commands                                                       |
-| ---------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
-| Session lifecycle      | Which session owns a worktree/branch and whether it can safely progress or terminate | `session create`, `session inspect`, `session close`                   |
-| Resource Claims        | Which session may access a canonical repository resource and at what mode            | `session claim`, `session claims`, `session update`, `session release` |
-| Mutation authorization | Whether a concrete operation has sufficient claims and no conflicting owner          | `guard`, `authorize`, `commit`, `push`                                 |
-| Repository evidence    | What Git can observe about revisions, paths, changes, ancestry, and bounded diffs    | `checkpoint`, `evidence snapshot`, `diff`                              |
-| Protected execution    | Whether a command runs inside the opt-in Linux process/filesystem boundary           | `session run`, `session exec`, `session shell`, `doctor`               |
+| Boundary               | What it answers                                                                                    | Typical commands                                                       |
+| ---------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Session lifecycle      | Which session owns a worktree/branch and whether it can safely progress or terminate               | `session create`, `session inspect`, `session close`                   |
+| Resource Claims        | Which session may access a canonical repository resource and at what mode                          | `session claim`, `session claims`, `session update`, `session release` |
+| Mutation authorization | Whether a concrete operation has sufficient claims and no conflicting owner                        | `guard`, `authorize`, `commit`, `push`                                 |
+| Repository evidence    | What Git can observe about revisions, paths, changes, ancestry, and bounded diffs                  | `checkpoint`, `evidence snapshot`, `diff`                              |
+| Auxiliary state        | Whether explicitly declared durable repository-local state may be copied into the managed worktree | `session create --auxiliary-state`, `capabilities`                     |
+| Reconciliation/cleanup | Whether observed physical state permits a lifecycle recovery or cleanup action                     | `session inspect`, `session reconcile`, `doctor`, `gc`                 |
+| Protected execution    | Whether a command runs inside the opt-in Linux process/filesystem boundary                         | `session run`, `session exec`, `session shell`, `doctor`               |
 
 Claims are not task labels and do not encode GitHub or agent semantics. `write` permits ordinary path changes; `exclusive-write` is required for finalizing operations such as commit and push. Conflicting or ambiguous claims fail closed.
 
 The default governance path does not install hooks and does not prevent direct filesystem writes outside Nawabari. Its guarantee is that Nawabari-routed operations consult authoritative session, Git, and claim state before mutation.
+
+Nawabari's authority ends at local session ownership, claims, Git evidence, and the lifecycle of the managed worktree and branch. Task meaning, Issue/PR state, review decisions, and provider/GitHub state remain outside that authority.
+
+### Claim conflict and physical recovery
+
+`RESOURCE_CLAIM_CONFLICT` does not always mean stale state. A healthy owner is reported with `ownerState: "active"`; the certified contention path exposes `inspect-blocking-session` and `wait-for-conflicting-claim-release` safe actions without a reconciliation `nextAction`. Inspect the owner and wait for the legitimate claim release; do not remove another session's claim.
+
+For a stale or inconsistent owner, the machine result instead carries physical and lifecycle evidence such as `ownerPhysicalState: "prunable-missing"`, `ownerLifecycleState: "stale-inconsistent"`, and the typed `nextAction.actionId: "reconcile-physical-state"`. Inspect it first:
+
+```bash
+git nawabari session inspect --session "$owner_session_id" --schema-version 2 --json
+```
+
+Then use the explicit apply operation shown above and retry the original claim after it completes. Age or a missing path alone is not destructive authority. The packed test removes a worktree only as external fault injection; supported recovery does not involve editing the session registry manually or deleting a raw Git worktree.
 
 ## Session and resource lifecycle
 
 The normal path is:
 
 ```text
-session create
+session create (explicit initial claims)
       ↓
-active session → claim resources → guard/checkpoint → commit or push
+inspect session/claims → claim/authorize → checkpoint → commit or push
       ↓                                              ↓
   inspect readiness                         integrate the branch
       ↓                                              ↓
-session close  ←────────────────────────────────────┘
+session close or discard  ←─────────────────────────┘
+       ↓
+doctor + gc --dry-run convergence check
 ```
 
 If work is not integrated, `session inspect` reports bounded blockers and safe next actions. Discard is never an implicit fallback for close or garbage collection.
@@ -94,7 +154,7 @@ The Session lifecycle is backed by the executable XState authority in 0.10.x and
 
 ### Claims
 
-Claims are canonical repository-relative resource records attached to a session. Supported modes are `read`, `write`, and `exclusive-write`.
+Claims are canonical repository-relative resource records attached to a session. Supported modes are `read`, `write`, and `exclusive-write`. The canonical routine path establishes its first claim during `session create`; later additions, transitions, and releases use the existing claim surfaces.
 
 ```bash
 git nawabari session claim --session "$session_id" --resource src/example.ts --mode exclusive-write --json
@@ -115,7 +175,7 @@ The policy requires `exclusive-write` for operations that finalize or remove sha
 
 ### Inspect, close, discard, and garbage collection
 
-`session inspect` is read-only and uses the same close/cleanup evidence as `session close`.
+`session inspect` is read-only and uses the same close/cleanup evidence as `session close`. Use `--schema-version 2` when consuming the single-authority lifecycle and action projection.
 
 ```bash
 git nawabari session inspect --session "$session_id" --json
@@ -124,7 +184,11 @@ git nawabari session discard --session "$session_id" --preview --json
 
 `session discard` requires an explicit session ID and may destroy unintegrated commits and uncommitted work in that session's worktree. Preview reports bounded destructive scope without mutation. Actual discard revalidates repository, worktree, branch, `HEAD`, and registry ownership before destructive steps.
 
-`gc --dry-run` reports stale candidates and blockers. `gc --apply` only cleans candidates passing the same safety checks; elapsed age alone is not destructive authority. `doctor` reports prerequisite and reconciliation state without silently repairing ownership.
+When the caller intentionally abandons the session, apply that explicit
+decision with `git nawabari session discard --session "$session_id" --json`.
+Discard is not an automatic fallback for a blocked close.
+
+`gc --dry-run` reports stale candidates and blockers. `gc --apply` only cleans candidates passing the same safety checks; elapsed age alone is diagnostic suspicion, not destructive authority. `doctor` reports prerequisite and reconciliation state without silently repairing ownership. Use the typed lifecycle action and explicit `session reconcile` operation for supported stale/inconsistent-owner recovery; `doctor` does not silently repair it.
 
 ## Governed Git work
 
@@ -172,14 +236,16 @@ The installed CLI is the primary integration surface. Discover its contract rath
 nawabari capabilities --json
 nawabari --version --json
 nawabari session create --help --json
+nawabari session inspect --help --json
+nawabari session reconcile --help --json
 nawabari commit --help --json
 ```
 
-`capabilities --json` works without a Git repository. The top-level contract is `nawabari.standalone-execution.v1`, schema version `1`; Resource Claim meaning is separately versioned as `nawabari.resource-claims.v2`. Package version alone is not a compatibility decision.
+`capabilities --json` works without a Git repository. The top-level contract is `nawabari.standalone-execution.v1`, schema version `1`; Resource Claim meaning is separately versioned as `nawabari.resource-claims.v2`. Package version alone is not a compatibility decision. The capability projection publishes the initial-claim grammar and retry vocabulary, auxiliary-state contract, lifecycle action IDs, and the `session reconcile --session <id> --apply` apply arguments used above.
 
 JSON mode emits one bounded document on stdout. Consumers should use machine-readable fields and stable codes rather than parse human-oriented text.
 
-The command surface includes Session lifecycle, Resource Claims, authorization/evidence, governed Git commit/push, reconciliation/discovery, and protected execution. Use `--help --json` and `capabilities --json` for the authoritative inventory.
+The command surface includes Session lifecycle, Resource Claims, authorization/evidence, governed Git commit/push, reconciliation/discovery, and protected execution. Use `--help --json` and `capabilities --json` for the authoritative inventory. Human-readable guidance and agent integrations use these same command and action identifiers; there is no separate human or agent workflow.
 
 ## Stable package exports
 

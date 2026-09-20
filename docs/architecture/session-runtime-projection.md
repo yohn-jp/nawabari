@@ -33,6 +33,16 @@ profile does not implicitly expose every executable in its material, and an
 executable provider is not a package-discovery mechanism. Concrete providers
 and third-party tools remain outside this stable domain vocabulary.
 
+This runtime projection is not the repository-local auxiliary-state projection
+used by `session create --auxiliary-state <json>`. Auxiliary state is a separate
+`nawabari.repository-auxiliary-state-projection.v1` capability: it accepts only
+an explicit repository-local source, an owned managed-worktree target, durable
+`copy` materialization, and the allowlisted declaration vocabulary. It does not
+discover arbitrary host paths, project process-local state, or alter
+`SessionRuntimeProjection`. Runtime projection describes protected execution
+material and visibility; auxiliary-state projection copies declared durable
+repository-local state into the managed worktree.
+
 Strict policy is the default and encodes `host_visibility: "default-deny"`
 with `unrestricted_host_fallback: "forbidden"`. Compatibility projections
 must carry compatibility provenance and use
