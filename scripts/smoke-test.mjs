@@ -719,6 +719,177 @@ async function main() {
       fail("packed auxiliary-state cleanup did not remove only session-owned artifacts");
     }
 
+    // #353 packed/public regression: a missing physical owner must not leave
+    // a broad claim deadlocked. The filesystem removal is the external fault
+    // injection; all lifecycle and claim recovery below stays on the public
+    // Nawabari surface.
+    const staleOwnerWorktree = path.join(installDirectory, "packed-stale-claim-owner-worktree");
+    const staleOwner = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "create",
+          "--branch",
+          "feature/packed-stale-claim-owner",
+          "--worktree",
+          staleOwnerWorktree,
+          "--resource",
+          "**",
+          "--mode",
+          "exclusive-write",
+          "--json",
+        ],
+        lifecycleRepository,
+      ),
+      "packed stale-owner session create",
+    );
+    const staleOwnerClaims = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", staleOwner.session_id, "--json"], lifecycleRepository),
+      "packed stale-owner claims",
+    );
+    if (
+      staleOwner.ok !== true ||
+      typeof staleOwner.session_id !== "string" ||
+      staleOwnerClaims.ok !== true ||
+      staleOwnerClaims.claims?.length !== 1 ||
+      staleOwnerClaims.claims[0]?.resource !== "**" ||
+      staleOwnerClaims.claims[0]?.mode !== "exclusive-write"
+    ) {
+      fail("packed stale-owner fixture did not establish the broad exclusive claim");
+    }
+
+    const staleClaimantWorktree = path.join(installDirectory, "packed-stale-claimant-worktree");
+    const staleClaimant = parseInstalledJson(
+      invokeInstalled(
+        [
+          "session",
+          "create",
+          "--branch",
+          "feature/packed-stale-claimant",
+          "--worktree",
+          staleClaimantWorktree,
+          "--json",
+        ],
+        lifecycleRepository,
+      ),
+      "packed stale-claimant session create",
+    );
+    if (staleClaimant.ok !== true || typeof staleClaimant.session_id !== "string") {
+      fail("packed stale-claim fixture did not establish the second managed session");
+    }
+
+    fs.rmSync(staleOwnerWorktree, { recursive: true, force: true });
+
+    const staleOwnerResource = "packed-stale-owner-concrete.txt";
+    const staleOwnerConflictResult = invokeInstalled(
+      [
+        "session",
+        "claim",
+        "--session",
+        staleClaimant.session_id,
+        "--resource",
+        staleOwnerResource,
+        "--mode",
+        "exclusive-write",
+        "--json",
+      ],
+      staleClaimantWorktree,
+    );
+    const staleOwnerConflict = parseInstalledJson(staleOwnerConflictResult, "packed stale-owner claim conflict");
+    if (
+      staleOwnerConflictResult.status !== 3 ||
+      staleOwnerConflict.ok !== false ||
+      staleOwnerConflict.code !== "RESOURCE_CLAIM_CONFLICT" ||
+      staleOwnerConflict.details?.ownerSessionId !== staleOwner.session_id ||
+      staleOwnerConflict.details?.ownerResource !== "**" ||
+      staleOwnerConflict.details?.ownerMode !== "exclusive-write" ||
+      staleOwnerConflict.details?.ownerPhysicalState !== "prunable-missing" ||
+      staleOwnerConflict.details?.ownerLifecycleState !== "stale-inconsistent" ||
+      staleOwnerConflict.details?.nextAction?.actionId !== "reconcile-physical-state" ||
+      staleOwnerConflict.details?.nextAction?.command !== "doctor" ||
+      !staleOwnerConflict.details?.safeActions?.includes("reconcile-physical-state")
+    ) {
+      fail("packed stale-owner conflict did not project the blocking owner and canonical reconciliation action");
+    }
+
+    const staleOwnerInspect = parseInstalledJson(
+      invokeInstalled(
+        ["session", "inspect", "--session", staleOwner.session_id, "--schema-version", "2", "--json"],
+        lifecycleRepository,
+      ),
+      "packed stale-owner inspect",
+    );
+    if (
+      staleOwnerInspect.lifecycle_state !== "stale-inconsistent" ||
+      staleOwnerInspect.physical_state !== "prunable-missing" ||
+      staleOwnerInspect.next_action?.action_id !== "reconcile-physical-state" ||
+      staleOwnerInspect.next_action?.command !== "doctor" ||
+      !staleOwnerInspect.next_actions?.some((action) => action.action_id === "reconcile-physical-state")
+    ) {
+      fail("packed stale-owner inspect did not preserve the canonical lifecycle/action projection");
+    }
+
+    const staleOwnerReconcileResult = invokeInstalled(
+      ["session", "reconcile", "--session", staleOwner.session_id, "--apply", "--json"],
+      lifecycleRepository,
+    );
+    const staleOwnerReconcile = parseInstalledJson(staleOwnerReconcileResult, "packed stale-owner reconcile apply");
+    if (
+      staleOwnerReconcileResult.status !== 0 ||
+      staleOwnerReconcile.ok !== true ||
+      staleOwnerReconcile.operation !== "reconcile-apply" ||
+      staleOwnerReconcile.outcome !== "completed" ||
+      staleOwnerReconcile.action?.action_id !== "reconcile-physical-state-apply" ||
+      staleOwnerReconcile.action?.command !== "session reconcile" ||
+      staleOwnerReconcile.session?.state !== "closed" ||
+      staleOwnerReconcile.physical_state !== "prunable-missing" ||
+      staleOwnerReconcile.released_claim_count !== 1 ||
+      staleOwnerReconcile.released_claims?.[0]?.session_id !== staleOwner.session_id ||
+      staleOwnerReconcile.released_claims?.[0]?.resource !== "**" ||
+      staleOwnerReconcile.branch_removed !== true
+    ) {
+      fail("packed stale-owner reconciliation did not terminalize the owner and release its claim");
+    }
+    const staleOwnerClaimsAfter = parseInstalledJson(
+      invokeInstalled(["session", "claims", "--session", staleOwner.session_id, "--json"], lifecycleRepository),
+      "packed stale-owner claims after reconcile",
+    );
+    if (staleOwnerClaimsAfter.ok !== true || staleOwnerClaimsAfter.claims?.length !== 0) {
+      fail("packed stale-owner reconciliation left residual claims");
+    }
+
+    const staleOwnerRetry = invokeInstalled(
+      [
+        "session",
+        "claim",
+        "--session",
+        staleClaimant.session_id,
+        "--resource",
+        staleOwnerResource,
+        "--mode",
+        "exclusive-write",
+        "--json",
+      ],
+      staleClaimantWorktree,
+    );
+    const staleOwnerRetryJson = parseInstalledJson(staleOwnerRetry, "packed stale-owner claim retry");
+    if (
+      staleOwnerRetry.status !== 0 ||
+      staleOwnerRetryJson.ok !== true ||
+      !staleOwnerRetryJson.claims?.some(
+        (claimEntry) => claimEntry.resource === staleOwnerResource && claimEntry.mode === "exclusive-write",
+      )
+    ) {
+      fail("packed concrete claim did not succeed after public stale-owner reconciliation");
+    }
+    const staleClaimantClose = parseInstalledJson(
+      invokeInstalled(["session", "close", "--session", staleClaimant.session_id, "--json"], lifecycleRepository),
+      "packed stale-claimant session close",
+    );
+    if (staleClaimantClose.ok !== true || staleClaimantClose.session?.state !== "closed") {
+      fail("packed stale-claimant cleanup did not use the existing close authority");
+    }
+
     const resolvedId = parseInstalledJson(
       invokeInstalled(["session", "id", "--json"], lifecycleWorktree),
       "session id",
@@ -1780,6 +1951,18 @@ async function main() {
       fail("concurrent installed claims did not expose RESOURCE_CLAIM_CONFLICT");
     }
     const winnerIndex = claimRaceJson.findIndex((result) => result.ok === true);
+    const healthyOwner = claimRaceSpecs[winnerIndex]?.session;
+    if (
+      healthyOwner === undefined ||
+      deniedClaim.details?.ownerSessionId !== healthyOwner.session_id ||
+      deniedClaim.details?.ownerState !== "active" ||
+      deniedClaim.details?.nextAction !== undefined ||
+      deniedClaim.details?.ownerLifecycleState !== undefined ||
+      !deniedClaim.details?.safeActions?.includes("inspect-blocking-session") ||
+      !deniedClaim.details?.safeActions?.includes("wait-for-conflicting-claim-release")
+    ) {
+      fail("packed healthy-owner conflict did not retain ordinary wait/inspect guidance");
+    }
     const retryClaim = parseInstalledJson(
       invokeInstalled(
         [
