@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
-import { defaultGit, type GitCommandRunner } from "../git.js";
+import { defaultGit } from "../git.js";
 
 /** Versioned identity for repository-local auxiliary state. */
 export const AUXILIARY_STATE_PROJECTION_CONTRACT_ID = "nawabari.repository-auxiliary-state-projection.v1" as const;
@@ -205,14 +205,12 @@ function canonicalRoot(value: string, field: string): string {
  */
 export function resolveAuxiliaryStateTrackedPathEvidence(
   repositoryRoot: string,
-  options: Readonly<{ readonly git?: GitCommandRunner }> = {},
 ): DomainResult<AuxiliaryStateTrackedPathEvidence> {
   try {
     const canonicalRepositoryRoot = canonicalRoot(repositoryRoot, "repository_root");
-    const git = options.git ?? defaultGit;
-    const output = git.runRaw
-      ? git.runRaw(["ls-files", "--cached", "--full-name", "-z", "--"], canonicalRepositoryRoot)
-      : git.run(["ls-files", "--cached", "--full-name", "-z", "--"], canonicalRepositoryRoot);
+    const output = defaultGit.runRaw
+      ? defaultGit.runRaw(["ls-files", "--cached", "--full-name", "-z", "--"], canonicalRepositoryRoot)
+      : defaultGit.run(["ls-files", "--cached", "--full-name", "-z", "--"], canonicalRepositoryRoot);
     const trackedPaths: string[] = [];
     for (const [index, value] of output.split("\u0000").entries()) {
       if (value.length === 0) continue;
