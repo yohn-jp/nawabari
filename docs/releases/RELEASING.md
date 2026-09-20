@@ -17,6 +17,30 @@ release created (tag vX.Y.Z, target = commit on main)
 
 Any job failure stops the pipeline before `npm publish` runs. **No partial or unformatted release is ever published to the registry** — a failure here means try again, not that npm needs cleanup.
 
+## Organization workflow comparison (#99)
+
+Nawabari retains its repository-local publish workflow. The candidate shared
+workflow was compared at the immutable provider revision
+`yohn-jp/.github@1231c1ba59f5eb2ab053f39327b0d6cf64fee809`, file
+`.github/workflows/npm-publish.yml`.
+
+| Contract surface              | Nawabari local workflow                                                                                                                                        | Shared workflow at the compared revision                                                                                                                                     | Decision                                                                    |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Trigger                       | `release.published`, plus `workflow_dispatch` with an explicit tag, 40-character release commit, and package version for recovery                              | `workflow_call`; a caller supplies the release trigger, with no equivalent immutable recovery inputs                                                                         | Local recovery is required                                                  |
+| Version and release identity  | Requires a `v`-prefixed semantic tag, verifies the tag's resolved commit, and carries that commit and `package.json` version through build, smoke, and publish | Reads `github.event.release.tag_name`, accepts an optional `v`, and publishes after checking the tarball while the publish checkout does not pin the verified release commit | Local identity binding is stronger                                          |
+| Exact tarball and smoke       | `pnpm run build` plus `run-package-suite.mjs`, `validate-release-tarball.mjs`, the product smoke suite, and a pre-publish npm dry-run                          | Packs exactly one tarball, records and checks its SHA-256 across jobs, and runs the consumer-provided smoke script                                                           | Shared bytes are protected, but the Nawabari package gate is not equivalent |
+| Provenance and authentication | npm Trusted Publishing through `id-token: write`, npm registry configuration, and no npm token secret                                                          | npm Trusted Publishing through `id-token: write`, an npm OIDC-capable CLI, and no npm token secret                                                                           | Equivalent on this surface                                                  |
+| Permissions                   | Workflow `contents: read`; only `publish` receives `id-token: write`                                                                                           | Workflow `contents: read`; publish receives `contents: read` and `id-token: write` (the shared build also uses `actions: read`)                                              | No local privilege expansion is needed                                      |
+
+The shared workflow is therefore materially incompatible with Nawabari's
+release/version identity and product-specific package gates. This is a
+deliberate retained-local exception, not a failed migration: `.github/workflows/publish.yml`
+remains the only enabled publish path, and no partial `workflow_call` publish
+job or consumer-specific workaround is added. The local workflow continues to
+provide OIDC/Trusted Publishing, least-privilege permissions, exact tarball
+validation, and packed-package smoke verification. Reconsider adoption only
+after a new provider revision supplies the missing equivalent semantics.
+
 ## Steps
 
 1. **Prepare the release commit on `main`.**
