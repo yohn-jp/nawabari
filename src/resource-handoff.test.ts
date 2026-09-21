@@ -9,6 +9,7 @@ import {
   handoffResources,
   type HandoffResourcesOptions,
   type ResourceHandoffAuthority,
+  type ResourceHandoffCommitResult,
   type ResourceHandoffCommitInput,
   type ResourceHandoffFence,
   type ResourceHandoffFenceController,
@@ -122,6 +123,22 @@ test("rejects stale generation, inactive sessions, mismatched identities, and mi
   );
 });
 
+test("rejects duplicate sessions and invalid persisted claim schema, mode, and timestamps", () => {
+  const assertRegistryCorrupt = (candidate: ResourceHandoffSnapshot) => {
+    assert.throws(
+      () => validateResourceHandoff(candidate, options()),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+    );
+  };
+
+  assertRegistryCorrupt(snapshot({ sessions: [session("source"), session("source")] }));
+  assertRegistryCorrupt(snapshot({ claims: [{ ...claim("source", "src/owned.ts"), schemaVersion: 2 as 3 }] }));
+  assertRegistryCorrupt(
+    snapshot({ claims: [{ ...claim("source", "src/owned.ts"), mode: "invalid" as ResourceClaim["mode"] }] }),
+  );
+  assertRegistryCorrupt(snapshot({ claims: [{ ...claim("source", "src/owned.ts"), createdAt: "not-a-timestamp" }] }));
+});
+
 test("retains unrelated destination claims as an integration invariant and rejects overlap", () => {
   const result = validateResourceHandoff(
     snapshot({ claims: [claim("source", "src/owned.ts"), claim("destination", "src/other.ts")] }),
@@ -187,6 +204,7 @@ class FakeAuthority implements ResourceHandoffAuthority {
   constructor(
     snapshots: ResourceHandoffSnapshot[],
     private readonly durabilityError = false,
+    private readonly commitEvidence: unknown = undefined,
   ) {
     this.snapshots = snapshots;
   }
@@ -207,6 +225,7 @@ class FakeAuthority implements ResourceHandoffAuthority {
         "Registry rename may have committed but durability was not proven",
       );
     }
+    if (this.commitEvidence !== undefined) return this.commitEvidence as ResourceHandoffCommitResult;
     return {
       status: "transferred" as const,
       operationId: input.normalized.operationId,
@@ -216,6 +235,30 @@ class FakeAuthority implements ResourceHandoffAuthority {
     };
   }
 }
+
+test("malformed fences are typed unresolved outcomes and retain the source claim", async () => {
+  for (const malformed of [null, {}, { sessionId: "source", operationId: "operation-1", epoch: Number.NaN }]) {
+    const authority = new FakeAuthority([snapshot()]);
+    const execution: ResourceHandoffFenceController = {
+      fence: () => malformed as ResourceHandoffFence,
+      awaitQuiescence: () => quiescence(),
+    };
+    const result = await handoffResources(authority, execution, options());
+    assert.equal(result.status, "unresolved");
+    assert.equal(result.code, "PHYSICAL_OBSERVATION_UNAVAILABLE");
+    assert.equal(result.sourceClaim?.sessionId, "source");
+    assert.deepEqual(authority.calls, ["read"]);
+  }
+});
+
+test("malformed commit evidence is a controlled corruption outcome retaining the source claim", async () => {
+  const authority = new FakeAuthority([snapshot(), snapshot()], false, null);
+  const result = await handoffResources(authority, new FakeExecution(), options());
+  assert.equal(result.status, "unresolved");
+  assert.equal(result.code, "REGISTRY_CORRUPT");
+  assert.equal(result.sourceClaim?.sessionId, "source");
+  assert.deepEqual(authority.calls, ["read", "read", "commit"]);
+});
 
 test("fences, drains, revalidates, and commits through one atomic authority boundary", async () => {
   const authority = new FakeAuthority([snapshot(), snapshot()]);
@@ -296,4 +339,10 @@ test("malformed required generation fails closed before any authority read", asy
     () => handoffResources(new FakeAuthority([snapshot()]), new FakeExecution(), options({ ifGeneration: null })),
     (error: unknown) => error instanceof SessionRegistryError && error.code === "INVALID_OPERATION",
   );
+});
+
+test("canonical operation IDs remain unambiguous for colon-containing fields", () => {
+  const first = canonicalResourceHandoffOperationId("a:b", "c", "d", "write");
+  const second = canonicalResourceHandoffOperationId("a", "b:c", "d", "write");
+  assert.notEqual(first, second);
 });

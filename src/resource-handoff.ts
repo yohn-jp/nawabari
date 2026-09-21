@@ -1,7 +1,11 @@
+import { createHash } from "node:crypto";
+
 import {
   assertCanonicalClaimResource,
   claimsOverlap,
+  isResourceClaimMode,
   resourceMatchesClaim,
+  RESOURCE_CLAIM_SCHEMA_VERSION,
   type ResourceClaim,
   type ResourceClaimMode,
 } from "./resource-claims.js";
@@ -28,6 +32,7 @@ export type ResourceHandoffCode =
   | "STALE_CLAIM_SET"
   | "MISSING_RESOURCE_CLAIM"
   | "RESOURCE_CLAIM_CONFLICT"
+  | "REGISTRY_CORRUPT"
   | "CLAIM_SESSION_MISMATCH"
   | "INSUFFICIENT_CLAIM_MODE"
   | "PHYSICAL_OBSERVATION_UNAVAILABLE"
@@ -203,6 +208,7 @@ export interface NormalizedHandoffOptions {
 const MAX_OPERATION_ID_LENGTH = 128;
 const MAX_SESSION_ID_LENGTH = 256;
 const MAX_RESOURCE_LENGTH = 4_096;
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 /**
  * Validate one immutable registry snapshot. This function has no mutation or
@@ -413,10 +419,22 @@ export async function handoffResources(
 
   let fence: ResourceHandoffFence;
   try {
-    fence = await execution.fence({
+    const candidateFence: unknown = await execution.fence({
       sessionId: normalized.fromSessionId,
       operationId: normalized.operationId,
     });
+    if (!isFenceFor(candidateFence, normalized)) {
+      return unresolvedResult(
+        normalized,
+        initial.registry.claimSetGeneration,
+        "PHYSICAL_OBSERVATION_UNAVAILABLE",
+        "Execution fence evidence is missing or inconsistent",
+        undefined,
+        [],
+        initialValidation.sourceClaim,
+      );
+    }
+    fence = candidateFence;
   } catch (error: unknown) {
     return unresolvedResult(
       normalized,
@@ -424,22 +442,8 @@ export async function handoffResources(
       "PHYSICAL_OBSERVATION_UNAVAILABLE",
       "Source execution fence could not be established",
       undefined,
-    );
-  }
-  if (
-    fence.sessionId !== normalized.fromSessionId ||
-    fence.operationId !== normalized.operationId ||
-    !Number.isSafeInteger(fence.epoch) ||
-    fence.epoch < 0 ||
-    fence.accepting !== false ||
-    fence.status !== "fenced"
-  ) {
-    return unresolvedResult(
-      normalized,
-      initial.registry.claimSetGeneration,
-      "PHYSICAL_OBSERVATION_UNAVAILABLE",
-      "Execution fence evidence is missing or inconsistent",
-      typeof fence?.epoch === "number" ? fence.epoch : undefined,
+      [],
+      initialValidation.sourceClaim,
     );
   }
 
@@ -453,6 +457,8 @@ export async function handoffResources(
       "PHYSICAL_OBSERVATION_UNAVAILABLE",
       "Managed execution drain evidence is unavailable",
       fence.epoch,
+      [],
+      initialValidation.sourceClaim,
     );
   }
   if (!isQuiescenceFor(fence, quiescence)) {
@@ -462,6 +468,8 @@ export async function handoffResources(
       "PHYSICAL_OBSERVATION_UNAVAILABLE",
       "Managed execution drain evidence does not match the fence epoch",
       fence.epoch,
+      [],
+      initialValidation.sourceClaim,
     );
   }
   if (quiescence.status === "active") {
@@ -472,6 +480,7 @@ export async function handoffResources(
       "Managed execution is still active; source claim is retained",
       fence.epoch,
       quiescence.activeExecutionIds,
+      initialValidation.sourceClaim,
     );
   }
   if (
@@ -486,6 +495,7 @@ export async function handoffResources(
       "Unknown or unproven managed execution remains",
       fence.epoch,
       quiescence.unknownExecutionIds,
+      initialValidation.sourceClaim,
     );
   }
 
@@ -498,6 +508,8 @@ export async function handoffResources(
       "STALE_CLAIM_SET",
       "Claim-set generation changed while the source was draining",
       fence.epoch,
+      [],
+      currentValidation.sourceClaim,
     );
   }
   if (currentValidation.status === "idempotent") {
@@ -533,6 +545,8 @@ export async function handoffResources(
           code,
           registryError?.message ?? "Atomic handoff commit was rejected",
           fence.epoch,
+          [],
+          currentValidation.sourceClaim,
         )
       : unresolvedResult(
           normalized,
@@ -540,9 +554,23 @@ export async function handoffResources(
           code,
           registryError?.message ?? "Atomic handoff durability could not be proven",
           fence.epoch,
+          [],
+          currentValidation.sourceClaim,
         );
   }
-  assertCommitResult(committed, normalized, initial.registry.claimSetGeneration);
+  try {
+    assertCommitResult(committed, normalized, initial.registry.claimSetGeneration);
+  } catch (error: unknown) {
+    return unresolvedResult(
+      normalized,
+      current.registry.claimSetGeneration,
+      "REGISTRY_CORRUPT",
+      error instanceof Error ? error.message : "Atomic handoff authority returned invalid commit evidence",
+      fence.epoch,
+      [],
+      currentValidation.sourceClaim,
+    );
+  }
   return {
     schemaVersion: RESOURCE_HANDOFF_SCHEMA_VERSION,
     operation: RESOURCE_HANDOFF_OPERATION,
@@ -572,7 +600,8 @@ export function canonicalResourceHandoffOperationId(
   resource: string,
   mode: ResourceClaimMode,
 ): string {
-  return `handoff:${fromSessionId}:${toSessionId}:${resource}:${mode}`;
+  const fields = [fromSessionId, toSessionId, resource, mode].map((field) => `${field.length}:${field}`).join("");
+  return `handoff-${createHash("sha256").update(fields).digest("hex")}`;
 }
 
 function normalizeHandoffOptions(options: HandoffResourcesOptions): NormalizedHandoffOptions {
@@ -651,6 +680,7 @@ function assertSnapshot(snapshot: ResourceHandoffSnapshot): void {
   ) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff snapshot registry evidence is invalid");
   }
+  const sessionIds = new Set<string>();
   for (const session of registry.sessions) {
     if (
       !isRecord(session) ||
@@ -661,15 +691,25 @@ function assertSnapshot(snapshot: ResourceHandoffSnapshot): void {
     ) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff snapshot contains an invalid session");
     }
+    if (sessionIds.has(session.sessionId)) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff snapshot contains duplicate session IDs", {
+        sessionId: session.sessionId,
+      });
+    }
+    sessionIds.add(session.sessionId);
   }
   for (const claim of registry.claims) {
     if (
       !isRecord(claim) ||
+      claim.schemaVersion !== RESOURCE_CLAIM_SCHEMA_VERSION ||
       !boundedText(claim.claimId, MAX_OPERATION_ID_LENGTH) ||
       !boundedText(claim.sessionId, MAX_SESSION_ID_LENGTH) ||
       !boundedText(claim.repositoryId, MAX_SESSION_ID_LENGTH) ||
       !boundedText(claim.worktreePath, MAX_RESOURCE_LENGTH) ||
-      !boundedText(claim.resource, MAX_RESOURCE_LENGTH)
+      !boundedText(claim.resource, MAX_RESOURCE_LENGTH) ||
+      !isResourceClaimMode(claim.mode) ||
+      !canonicalTimestamp(claim.createdAt) ||
+      !canonicalTimestamp(claim.updatedAt)
     ) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff snapshot contains an invalid claim");
     }
@@ -829,6 +869,8 @@ function blockedResult(
   reason: string,
   fenceEpoch?: number,
   executionIds: readonly string[] = [],
+  sourceClaim: ResourceClaim | null = null,
+  destinationClaim: ResourceClaim | null = null,
 ): ResourceHandoffResult {
   const details: RegistryErrorDetails = executionIds.length === 0 ? {} : { executionIds: [...executionIds] };
   return {
@@ -844,8 +886,8 @@ function blockedResult(
     mode: normalized.mode,
     previousClaimSetGeneration: generation,
     claimSetGeneration: generation,
-    sourceClaim: null,
-    destinationClaim: null,
+    sourceClaim,
+    destinationClaim,
     blockers: [
       {
         code,
@@ -867,9 +909,33 @@ function unresolvedResult(
   reason: string,
   fenceEpoch?: number,
   executionIds: readonly string[] = [],
+  sourceClaim: ResourceClaim | null = null,
+  destinationClaim: ResourceClaim | null = null,
 ): ResourceHandoffResult {
-  const result = blockedResult(normalized, generation, code, reason, fenceEpoch, executionIds);
+  const result = blockedResult(
+    normalized,
+    generation,
+    code,
+    reason,
+    fenceEpoch,
+    executionIds,
+    sourceClaim,
+    destinationClaim,
+  );
   return { ...result, status: "unresolved", safeActions: ["retain-source-claim", "refresh-execution-evidence"] };
+}
+
+function isFenceFor(value: unknown, normalized: NormalizedHandoffOptions): value is ResourceHandoffFence {
+  return (
+    isRecord(value) &&
+    value.schemaVersion === RESOURCE_HANDOFF_SCHEMA_VERSION &&
+    value.sessionId === normalized.fromSessionId &&
+    value.operationId === normalized.operationId &&
+    Number.isSafeInteger(value.epoch) &&
+    (value.epoch as number) >= 0 &&
+    value.accepting === false &&
+    value.status === "fenced"
+  );
 }
 
 function isQuiescenceFor(fence: ResourceHandoffFence, value: ResourceHandoffQuiescence): boolean {
@@ -890,14 +956,15 @@ function assertCommitResult(
   normalized: NormalizedHandoffOptions,
   initialGeneration: number,
 ): void {
+  if (!isRecord(result)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Atomic handoff authority returned invalid commit evidence");
+  }
   const destinationMatches =
-    result.destinationClaim !== null &&
+    isRecord(result.destinationClaim) &&
     result.destinationClaim.sessionId === normalized.toSessionId &&
     result.destinationClaim.resource === normalized.resource &&
     result.destinationClaim.mode === normalized.mode;
   if (
-    result === null ||
-    typeof result !== "object" ||
     !["transferred", "idempotent"].includes(result.status) ||
     result.operationId !== normalized.operationId ||
     !Number.isSafeInteger(result.claimSetGeneration) ||
@@ -935,6 +1002,10 @@ function boundedText(value: unknown, maxLength: number): value is string {
   return (
     typeof value === "string" && value.length > 0 && value.length <= maxLength && !/[\u0000-\u001f\u007f]/u.test(value)
   );
+}
+
+function canonicalTimestamp(value: unknown): value is string {
+  return typeof value === "string" && ISO_TIMESTAMP_PATTERN.test(value) && !Number.isNaN(Date.parse(value));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
