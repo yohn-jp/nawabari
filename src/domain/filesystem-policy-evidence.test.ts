@@ -142,6 +142,24 @@ test("incomplete observation is unresolved instead of being reported clean", () 
   ]);
 });
 
+test("an unproven claim classification keeps the evidence incomplete", () => {
+  const unresolvedClaim = projectFilesystemPolicyEvidence(
+    {
+      ...checkpoint,
+      inClaim: ["src/generated/new.ts"],
+      outOfClaim: ["docs/readme.md", "src/secret.ts"],
+    },
+    policy,
+  );
+  assert.equal(unresolvedClaim.ok, true);
+  if (!unresolvedClaim.ok) return;
+  assert.equal(
+    unresolvedClaim.value.entries.find((entry) => entry.path === "src/updated.ts")?.claim_status,
+    "unresolved",
+  );
+  assert.equal(unresolvedClaim.value.complete, false);
+});
+
 test("serialization preserves observed paths and does not synthesize a read set", () => {
   const result = projectFilesystemPolicyEvidence(checkpoint, policy);
   assert.equal(result.ok, true);
