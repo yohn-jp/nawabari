@@ -327,8 +327,10 @@ test("requires explicit migration before interpreting v1 claim semantics", () =>
     registry.claimResources({ sessionId: session.sessionId, claims: [{ resource: "README.md", mode: "read" }] });
     const legacy = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
       claims_schema_version: number;
-      claims: Array<{ schema_version: number }>;
+      claims: Array<{ schema_version: number; claim_id: string }>;
     };
+    const legacyClaimId = legacy.claims[0]?.claim_id;
+    assert.equal(typeof legacyClaimId, "string");
     legacy.claims_schema_version = 2;
     for (const claim of legacy.claims) claim.schema_version = 2;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
@@ -342,10 +344,11 @@ test("requires explicit migration before interpreting v1 claim semantics", () =>
     assert.equal(registry.listClaims()[0]?.mode, "read");
     const migrated = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
       claims_schema_version: number;
-      claims: Array<{ schema_version: number }>;
+      claims: Array<{ schema_version: number; claim_id: string }>;
     };
     assert.equal(migrated.claims_schema_version, 3);
     assert.equal(migrated.claims[0]?.schema_version, 3);
+    assert.equal(migrated.claims[0]?.claim_id, legacyClaimId);
   } finally {
     fixture.cleanup();
   }
