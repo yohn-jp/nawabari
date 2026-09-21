@@ -263,7 +263,8 @@ export function previewCoordination(
     git,
     includePatch && readAuthorized,
   );
-  const base = mergeBlobSide(baseEvidence, null);
+  const baseContent = includePatch && readAuthorized ? (baseEvidence?.content ?? null) : null;
+  const base = mergeBlobSide(baseEvidence, baseContent);
   const leftState = mergePathState(leftPath, includePatch && readAuthorized ? leftPath.blob.worktree.content : null);
   const rightState = mergePathState(rightPath, includePatch && readAuthorized ? rightPath.blob.worktree.content : null);
   let decision = classifyThreeWayPath(base, leftState, rightState);
@@ -275,7 +276,6 @@ export function previewCoordination(
     if (!includePatch || !readAuthorized) {
       unknownReason = "read-authority-required";
     } else {
-      const baseContent = readBaseContent(left, observedPath, bounds.maxContentBytes, git);
       const textInput = mergeBytes(baseContent, leftPath.blob.worktree.content, rightPath.blob.worktree.content);
       if (textInput === null || options.git_executable === undefined) {
         unknownReason =
@@ -537,21 +537,6 @@ function decodeContent(content: { readonly bytes: string; readonly byteLength: n
   if (content === null) return null;
   const bytes = Buffer.from(content.bytes, "base64");
   return bytes.byteLength === content.byteLength ? bytes : null;
-}
-
-function readBaseContent(
-  session: CoordinationSessionObservation,
-  resource: string,
-  maxContentBytes: number,
-  git: GitCommandRunner | undefined,
-): { readonly bytes: string; readonly byteLength: number } | null {
-  if (git === undefined || session.baseRevision === null) return null;
-  const blob = readCoordinationBlobState(git, session.worktreePath, session.baseRevision, resource, {
-    maxContentBytes,
-    includeContent: true,
-    operatorAuthorized: true,
-  });
-  return blob.revisionBlob.content;
 }
 
 function mergeBytes(

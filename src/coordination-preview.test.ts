@@ -129,6 +129,54 @@ test("classifies a one-sided deletion as clean instead of delete/modify", () => 
   }
 });
 
+test("patch preview keeps a one-sided modification clean", () => {
+  const fixture = createFixture();
+  try {
+    claimBoth(fixture);
+    fs.writeFileSync(path.join(fixture.root, "tracked.txt"), "left-only\n");
+
+    const result = previewCoordination(fixture.registry, {
+      left: fixture.left.sessionId,
+      right: fixture.right.sessionId,
+      path: "tracked.txt",
+      include_patch: true,
+      operator_authorized: true,
+      git_executable: findGit(),
+    });
+
+    assert.equal(result.outcome, "clean");
+    assert.equal(result.decision?.kind, "left-only");
+    assert.equal(result.unknown, false);
+    assert.equal(result.patch, null);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("patch preview keeps a one-sided deletion clean", () => {
+  const fixture = createFixture();
+  try {
+    claimBoth(fixture);
+    fs.rmSync(path.join(fixture.root, "tracked.txt"));
+
+    const result = previewCoordination(fixture.registry, {
+      left: fixture.left.sessionId,
+      right: fixture.right.sessionId,
+      path: "tracked.txt",
+      include_patch: true,
+      operator_authorized: true,
+      git_executable: findGit(),
+    });
+
+    assert.equal(result.outcome, "clean");
+    assert.equal(result.decision?.kind, "left-only");
+    assert.equal(result.unknown, false);
+    assert.equal(result.patch, null);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("explicit read authority exposes only the bounded merge preview", () => {
   const fixture = createFixture();
   try {
