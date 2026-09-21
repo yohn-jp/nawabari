@@ -64,6 +64,32 @@ function strictLandlockProjection(source: string): SessionRuntimeProjection {
     schema_version: SESSION_RUNTIME_PROJECTION_SCHEMA_VERSION,
     policy: STRICT_RUNTIME_POLICY,
     profile: { id: "development", version: "1" },
+    requirements: [{ id: "landlock-helper", kind: "runtime", name: "python3", version: ">=3" }],
+    filesystem: [
+      {
+        source,
+        target: source,
+        access_mode: "read-only",
+        provenance: "runtime-profile",
+      },
+    ],
+    executables: [
+      {
+        name: "python3",
+        target: source,
+        provider: { id: "fhs-landlock-helper-provider", requirement_id: "landlock-helper" },
+        provenance: "runtime-profile",
+      },
+    ],
+  };
+}
+
+function forgedFilesystemOnlyProjection(source: string): SessionRuntimeProjection {
+  return {
+    contract_id: SESSION_RUNTIME_PROJECTION_CONTRACT_ID,
+    schema_version: SESSION_RUNTIME_PROJECTION_SCHEMA_VERSION,
+    policy: STRICT_RUNTIME_POLICY,
+    profile: { id: "development", version: "1" },
     requirements: [],
     filesystem: [
       {
@@ -194,6 +220,30 @@ test("execution rejects a canonical python3 path outside the selected strict mat
     if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
     assert.equal(helperInvoked, false);
     assert.equal(fs.existsSync(path.join(root, "docs", "arbitrary-helper.txt")), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("execution rejects a forged strict filesystem projection without a resolved helper provider", () => {
+  const root = fixture();
+  try {
+    const prepared = prepareWorktreeFileOperation(request(root, "CREATE", "docs/forged-helper.txt", null));
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    let helperInvoked = false;
+    const result = executeWorktreeFileOperation(prepared.value, {
+      landlock_helper: helperMaterialization(TEST_LANDLOCK_HELPER),
+      runtime_projection: forgedFilesystemOnlyProjection(TEST_LANDLOCK_HELPER),
+      run_helper: () => {
+        helperInvoked = true;
+        return JSON.stringify({ ok: true });
+      },
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+    assert.equal(helperInvoked, false);
+    assert.equal(fs.existsSync(path.join(root, "docs", "forged-helper.txt")), false);
   } finally {
     cleanup(root);
   }

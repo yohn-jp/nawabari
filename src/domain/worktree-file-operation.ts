@@ -4,7 +4,11 @@ import path from "node:path";
 
 import { FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS, FHS_LANDLOCK_HELPER_REQUIREMENT_ID } from "./fhs-development-runtime.js";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
-import type { RuntimeExecutableProviderMaterialization } from "./runtime-executable-projection.js";
+import {
+  compileRuntimeExecutableProjection,
+  runtimeExecutableProviderKey,
+  type RuntimeExecutableProviderMaterialization,
+} from "./runtime-executable-projection.js";
 import {
   STRICT_RUNTIME_POLICY,
   validateSessionRuntimeProjection,
@@ -541,6 +545,34 @@ function validateLandlockHelper(
         new DomainError(
           "SANDBOX_CAPABILITY_UNAVAILABLE",
           "The Landlock Python executable is not backed by the strict runtime projection.",
+        ),
+      );
+    }
+    const executableSurface = compileRuntimeExecutableProjection(
+      validatedProjection.value,
+      new Map([[runtimeExecutableProviderKey(value.provider), value]]),
+    );
+    if (!executableSurface.ok) {
+      return failure(
+        new DomainError(
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "The Landlock Python executable provider is not declared by the strict executable projection.",
+        ),
+      );
+    }
+    const resolvedProvider = executableSurface.value.find(
+      (entry) =>
+        entry.provider.id === value.provider.id &&
+        entry.provider.requirement_id === value.provider.requirement_id &&
+        entry.source === canonical &&
+        entry.provenance === "runtime-profile" &&
+        entry.source_kind === "file",
+    );
+    if (resolvedProvider === undefined) {
+      return failure(
+        new DomainError(
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "The Landlock Python executable provider did not resolve to canonical strict evidence.",
         ),
       );
     }
