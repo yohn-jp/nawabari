@@ -431,6 +431,51 @@ test("retries an equivalent transaction idempotently without a second write", ()
   }
 });
 
+test("preserves exact claims and generation on no-op replace and delta", () => {
+  const value = fixture();
+  try {
+    const existing = [
+      claim(value.left, "read", "docs/existing.md"),
+      claim(value.left, "write", "src/existing.ts", "group"),
+    ];
+    const before = snapshot(value, existing, 7);
+    const replacement = planCoordinationTransaction(before, {
+      kind: "replace",
+      sessionId: value.left.sessionId,
+      claims: [
+        { resource: "docs/existing.md", mode: "read" },
+        { resource: "src/existing.ts", mode: "write", sharing: { kind: "isolated-worktree", groupId: "group" } },
+      ],
+      expectedClaimSetGeneration: 7,
+      timestamp: "2026-02-02T00:00:00.000Z",
+    });
+    assert.equal(replacement.idempotent, true);
+    assert.equal(replacement.claimSetGeneration, before.claimSetGeneration);
+    assert.equal(JSON.stringify(replacement.claims), JSON.stringify(before.claims));
+    assert.equal(JSON.stringify(replacement.sessionClaims), JSON.stringify(before.claims));
+
+    const delta = planCoordinationTransaction(snapshot(value, replacement.claims, replacement.claimSetGeneration), {
+      kind: "delta",
+      sessionId: value.left.sessionId,
+      deltas: [
+        {
+          kind: "upsert",
+          resource: "src/existing.ts",
+          mode: "write",
+          sharing: { kind: "isolated-worktree", groupId: "group" },
+        },
+      ],
+      expectedClaimSetGeneration: replacement.claimSetGeneration,
+      timestamp: "2026-03-03T00:00:00.000Z",
+    });
+    assert.equal(delta.idempotent, true);
+    assert.equal(delta.claimSetGeneration, before.claimSetGeneration);
+    assert.equal(JSON.stringify(delta.sessionClaims), JSON.stringify(replacement.claims));
+  } finally {
+    value.cleanup();
+  }
+});
+
 test("keeps serialization identity and rejects sharing on read or exclusive claims", () => {
   const value = fixture();
   try {
@@ -483,6 +528,32 @@ test("binds one explicit sharing group to all write declarations and rejects acq
           sessionId: value.left.sessionId,
           claims: [{ resource: "src/one.ts", mode: "write", sharing: { kind: "isolated-worktree", groupId: "other" } }],
           timestamp: TIMESTAMP,
+        }),
+      "CONTRADICTORY_CLAIM",
+    );
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("rejects delta sharing that conflicts with its top-level binding", () => {
+  const value = fixture();
+  try {
+    errorCode(
+      () =>
+        planCoordinationTransaction(snapshot(value), {
+          kind: "delta",
+          sessionId: value.left.sessionId,
+          sharing: { kind: "isolated-worktree", groupId: "top-level" },
+          force: true,
+          deltas: [
+            {
+              kind: "upsert",
+              resource: "src/conflicting-sharing.ts",
+              mode: "write",
+              sharing: { kind: "isolated-worktree", groupId: "per-delta" },
+            },
+          ],
         }),
       "CONTRADICTORY_CLAIM",
     );

@@ -422,6 +422,15 @@ function normalizeRequest(owner: SessionRecord, request: CoordinationTransaction
   }
   const deltas = request.deltas ?? [];
   if (deltas.length === 0) throw transactionError("INVALID_CLAIM", "At least one claim delta is required");
+  const requestSharing = request.sharing;
+  if (
+    requestSharing !== undefined &&
+    deltas.some(
+      (delta) => delta.kind === "upsert" && delta.sharing !== undefined && !sameSharing(delta.sharing, requestSharing),
+    )
+  ) {
+    throw transactionError("CONTRADICTORY_CLAIM", "Request contains conflicting sharing bindings");
+  }
   const seen = new Set<string>();
   const normalized = deltas.map((delta): NormalizedDelta => {
     if (delta.kind !== "upsert" && delta.kind !== "release") {
@@ -433,7 +442,7 @@ function normalizeRequest(owner: SessionRecord, request: CoordinationTransaction
     seen.add(resource);
     if (delta.kind === "release") return { kind: "release", resource };
     const input = canonicalizeClaimInput(
-      { resource: delta.resource, mode: delta.mode, sharing: delta.sharing ?? request.sharing },
+      { resource: delta.resource, mode: delta.mode, sharing: delta.sharing ?? requestSharing },
       ownerContext(owner),
     );
     return { kind: "upsert", resource: input.resource, mode: input.mode, sharing: input.sharing };
@@ -504,12 +513,19 @@ function materializeNextClaims(
   owner: SessionRecord,
 ): Map<string, ResourceClaim> {
   const next = new Map(current.map((claim) => [claim.resource, claim]));
+  const existingByResource = new Map(next);
   const ownerContextValue = ownerContext(owner);
   if (kind === "replace") {
     next.clear();
     for (const input of request.claims) {
       const claim = input as CanonicalClaim;
-      next.set(claim.resource, createResourceClaim(claim, ownerContextValue, timestamp));
+      const existing = existingByResource.get(claim.resource);
+      next.set(
+        claim.resource,
+        existing !== undefined && claimEquivalentInput(existing, claim)
+          ? existing
+          : createResourceClaim(claim, ownerContextValue, timestamp),
+      );
     }
     return next;
   }
@@ -539,7 +555,10 @@ function materializeNextClaims(
     if (delta.kind === "release") {
       next.delete(delta.resource);
     } else {
-      next.set(delta.resource, createResourceClaim(delta, ownerContextValue, timestamp));
+      const existing = next.get(delta.resource);
+      if (existing === undefined || !claimEquivalentInput(existing, delta)) {
+        next.set(delta.resource, createResourceClaim(delta, ownerContextValue, timestamp));
+      }
     }
   }
   return next;
