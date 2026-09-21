@@ -209,6 +209,7 @@ export class LocalSessionBackend implements SessionBackend {
         ...(options.working_set_repository === null || options.working_set_repository === undefined
           ? {}
           : { workingSetRepository: options.working_set_repository }),
+        ...(options.profile === null || options.profile === undefined ? {} : { profile: options.profile }),
       });
       return success(toDomainRecord(record));
     } catch (error: unknown) {

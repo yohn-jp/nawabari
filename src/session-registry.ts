@@ -34,6 +34,7 @@ import {
   materializeAuxiliaryStateProjection,
   resolveAuxiliaryStateTrackedPathEvidence,
 } from "./domain/auxiliary-state-projection.js";
+import type { JsonObject } from "./domain/errors.js";
 import {
   composeEffectiveWorkingSet,
   evaluateWorkingSetExpansion,
@@ -56,6 +57,12 @@ import {
   type RuntimeRecord,
   type RuntimeRecords,
 } from "./registry/runtime-records.js";
+import {
+  loadWorktreeProfileCatalog,
+  resolveWorktreeProfile,
+  substituteProfileParameters,
+} from "./domain/worktree-profile-catalog.js";
+import { pinWorktreeProfile, type PinnedWorktreeProfile } from "./domain/worktree-profile-pinning.js";
 import {
   assertCanonicalClaimResource,
   canonicalClaimId,
@@ -262,6 +269,11 @@ export interface ProvisionSessionOptions {
   readonly defaultBranchName?: string;
   readonly protectedBranchNames?: readonly string[];
   readonly protectedWorktreePaths?: readonly string[];
+  readonly profile?: {
+    readonly selection: { readonly profile: string };
+    readonly parameters?: JsonObject;
+    readonly provenance?: { readonly catalog?: { readonly path?: string; readonly blob_oid?: string } };
+  };
 }
 
 export interface WorkingSetExpansionOptions {
@@ -1742,6 +1754,7 @@ export class SessionRegistry {
       const state = this.readStateUnsafe();
       const sessionId = generateUniqueSessionId(state.sessions, this.idGenerator);
       const resources = this.resolveProvisioningResources(options, sessionId);
+      const pinnedProfile = this.resolvePinnedProfile(options.profile, resources.baseRevision);
       const workingSet = this.composeProvisionedWorkingSet(options, resources);
       const timestamp = toTimestamp(this.clock());
       const record = freezeSessionRecord({
@@ -1820,13 +1833,28 @@ export class SessionRegistry {
               );
         this.assertCompleteClaimSet(initialClaims, owner, state.claims, [...state.sessions, record]);
         const nextClaims = sortResourceClaims([...state.claims, ...initialClaims]);
+        const runtimeRecords =
+          pinnedProfile === undefined
+            ? state.runtimeRecords
+            : {
+                requiredFeatures: Object.freeze([
+                  ...new Set<RegistryFeature>([...state.runtimeRecords.requiredFeatures, "pinned-profiles.v1"]),
+                ]),
+                records: Object.freeze({
+                  ...state.runtimeRecords.records,
+                  pinned_profiles: Object.freeze([
+                    ...(state.runtimeRecords.records.pinned_profiles ?? []),
+                    pinnedProfile as unknown as RuntimeRecord,
+                  ]),
+                }),
+              };
         this.writeUnsafe(
           [...state.sessions, record],
           nextClaims,
           nextClaimSetGeneration(state, nextClaims),
           nextRegistryRevision(state),
           nextRuntimeEpoch(state),
-          state.runtimeRecords,
+          runtimeRecords,
         );
         return cloneSessionRecord(record);
       } catch (error: unknown) {
@@ -1835,6 +1863,43 @@ export class SessionRegistry {
         }
         throw classifyProvisioningFailure(error, this.git, this.repository.worktreePath, resources);
       }
+    });
+  }
+
+  private resolvePinnedProfile(
+    request: ProvisionSessionOptions["profile"],
+    baseRevision: string,
+  ): PinnedWorktreeProfile | undefined {
+    if (request === undefined) return undefined;
+    const catalogPath = request.provenance?.catalog?.path ?? "nawabari.profiles.json";
+    if (catalogPath !== "nawabari.profiles.json")
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Profile catalog path is not authoritative");
+    const catalog = loadWorktreeProfileCatalog(this.repository, baseRevision, "nawabari.profiles.json", this.git);
+    if (!catalog.ok) throw catalog.error;
+    const resolved = resolveWorktreeProfile(request.selection, catalog.value);
+    if (!resolved.ok) throw resolved.error;
+    const parameterized =
+      request.parameters === undefined ? resolved : substituteProfileParameters(resolved.value, request.parameters);
+    if (!parameterized.ok) throw parameterized.error;
+    let blobOid: string;
+    try {
+      blobOid = this.git.run(["rev-parse", `${baseRevision}:${catalogPath}`], this.repository.worktreePath);
+    } catch (error: unknown) {
+      throw new SessionRegistryError(
+        "REGISTRY_CORRUPT",
+        "The selected profile catalog authority could not be proven",
+        {},
+        error,
+      );
+    }
+    const requestedBlob = request.provenance?.catalog?.blob_oid;
+    if (requestedBlob !== undefined && requestedBlob !== blobOid)
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Profile catalog provenance does not match the pinned base");
+    return pinWorktreeProfile(parameterized.value, {
+      repository: { id: this.repository.repositoryId, revision: baseRevision },
+      base: { revision: baseRevision },
+      catalog: { path: catalogPath, blob_oid: blobOid },
+      selection: { profile: request.selection.profile, parameters: request.parameters ?? {} },
     });
   }
 
