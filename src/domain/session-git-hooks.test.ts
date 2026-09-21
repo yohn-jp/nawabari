@@ -212,6 +212,45 @@ test("protected execution environment keys cannot be overridden by hook context"
   }
 });
 
+test("authority-changing environment classes are denied case-insensitively, including reserved prefixes", () => {
+  const fixture = executableFixture();
+  try {
+    const resolved = resolveSessionHookSet(profile(), providerMaterial(fixture));
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    const deniedKeys = [
+      "NODE_OPTIONS",
+      "node_options",
+      "BASH_ENV",
+      "env",
+      "GIT_DIR",
+      "gIt_DiR",
+      "GIT_CONFIG_COUNT",
+      "git_config_key_0",
+      "LD_PRELOAD",
+      "lD_library_path",
+      "DYLD_INSERT_LIBRARIES",
+      "HOME",
+      "xDg_CONFIG_HOME",
+    ];
+    for (const key of deniedKeys) {
+      const result = runGovernedHook("pre-commit", {
+        hook_set: resolved.value,
+        session_id: "session-1",
+        cwd: "/tmp",
+        environment: { [key]: "/tmp/authority-changing-value" },
+        runner: () => {
+          throw new Error("must not run");
+        },
+      });
+      assert.equal(result.ok, false, key);
+      if (!result.ok) assert.equal(result.error.code, "RUNTIME_PROFILE_INVALID", key);
+    }
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("execution rejects forged hook commands and argv even when the outer set looks canonical", () => {
   const fixture = executableFixture();
   try {

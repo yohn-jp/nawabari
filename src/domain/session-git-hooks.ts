@@ -172,6 +172,42 @@ const PROTECTED_ENVIRONMENT_KEYS = new Set([
   "NAWABARI_HOOK_DEPTH",
   "NAWABARI_SESSION_ID",
 ]);
+const BENIGN_ENVIRONMENT_KEYS = new Set(["GIT_TERMINAL_PROMPT"]);
+const DENIED_ENVIRONMENT_KEYS = new Set([
+  "ENV",
+  "IFS",
+  "CDPATH",
+  "SHELLOPTS",
+  "BASHOPTS",
+  "ZDOTDIR",
+  "COMSPEC",
+  "PATHEXT",
+  "KRB5_CONFIG",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+]);
+const DENIED_ENVIRONMENT_PREFIXES = Object.freeze([
+  "NODE_",
+  "BASH_",
+  "LD_",
+  "DYLD_",
+  "PYTHON",
+  "PERL",
+  "RUBY",
+  "JAVA",
+  "NPM_CONFIG_",
+  "PNPM_",
+  "COREPACK_",
+  "GIT_",
+  "HOME",
+  "XDG_",
+  "TMP",
+  "TEMP",
+  "SSH_",
+  "AWS_",
+  "GOOGLE_",
+  "AZURE_",
+]);
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -207,6 +243,13 @@ function assertKeys(value: UnknownRecord, allowed: readonly string[], field: str
     if (!keys.has(key)) return invalid(`${field}.${key}`, "unknown fields are not supported");
   }
   return success(null);
+}
+
+function isDeniedEnvironmentKey(key: string): boolean {
+  const normalized = key.toUpperCase();
+  if (BENIGN_ENVIRONMENT_KEYS.has(normalized)) return key !== normalized;
+  if (PROTECTED_ENVIRONMENT_KEYS.has(normalized) || DENIED_ENVIRONMENT_KEYS.has(normalized)) return true;
+  return DENIED_ENVIRONMENT_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
 function boundedText(value: unknown, field: string, maxLength = MAX_IDENTITY_LENGTH): DomainResult<string> {
@@ -638,8 +681,8 @@ function validateHookContext(input: GovernedHookContext): DomainResult<GovernedH
     for (const [key, value] of Object.entries(input.environment)) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key))
         return invalid("context.environment", "environment key is invalid", key);
-      if (PROTECTED_ENVIRONMENT_KEYS.has(key)) {
-        return invalid("context.environment", "protected environment keys cannot be overridden", key);
+      if (isDeniedEnvironmentKey(key)) {
+        return invalid("context.environment", "authority-changing environment keys cannot be injected", key);
       }
       const parsed = validHookArgument(value, `context.environment.${key}`);
       if (!parsed.ok) return parsed;
