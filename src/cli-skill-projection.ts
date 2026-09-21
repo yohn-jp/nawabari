@@ -1,4 +1,4 @@
-import { CLI_COMMAND_REGISTRY, type CliCommandDefinition } from "./cli-command-registry.js";
+import { CLI_COMMAND_REGISTRY, type CliCommandDefinition, type CommandId } from "./cli-command-registry.js";
 
 /** Stable identity for the generated skill/playbook artifact. */
 export const CLI_SKILL_PROJECTION_ID = "nawabari.cli-skill-projection.v1" as const;
@@ -10,7 +10,13 @@ name: nawabari
 description: Operate the Nawabari session/worktree harness through its canonical CLI. Use this skill whenever creating, inspecting, claiming resources for, running commands in, or closing a Nawabari-managed session.
 ---`;
 
-const CANONICAL_ROUTINE: readonly { readonly command: string; readonly purpose: string }[] = [
+/**
+ * `command` is typed `CommandId` (derived from `CLI_COMMAND_REGISTRY` in
+ * cli-command-registry.ts), not `string`: a typo or a renamed/removed
+ * command is a compile-time error here, not a runtime throw discovered only
+ * when the playbook is generated.
+ */
+const CANONICAL_ROUTINE: readonly { readonly command: CommandId; readonly purpose: string }[] = [
   { command: "capabilities", purpose: "discover the installed machine contract before relying on any behavior" },
   { command: "session create", purpose: "request a new session and its managed worktree" },
   { command: "session claim", purpose: "add a resource claim before touching a path" },
@@ -52,13 +58,9 @@ function commandSection(definition: CliCommandDefinition): string {
  * table.
  */
 export function renderCliSkillPlaybook(): string {
-  const registeredNames = new Set(CLI_COMMAND_REGISTRY.map((definition) => definition.name));
-  const routine = CANONICAL_ROUTINE.map(({ command, purpose }, index) => {
-    if (!registeredNames.has(command)) {
-      throw new Error(`Skill playbook canonical routine references an unregistered command: ${command}`);
-    }
-    return `${index + 1}. \`${CLI_NAME} ${command}\` — ${purpose}.`;
-  }).join("\n");
+  const routine = CANONICAL_ROUTINE.map(
+    ({ command, purpose }, index) => `${index + 1}. \`${CLI_NAME} ${command}\` — ${purpose}.`,
+  ).join("\n");
   const commandIndex = CLI_COMMAND_REGISTRY.map(commandSection).join("\n\n");
 
   return `${SKILL_FRONTMATTER}

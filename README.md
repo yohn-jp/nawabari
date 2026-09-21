@@ -260,6 +260,8 @@ JSON mode emits one bounded document on stdout. Consumers should use machine-rea
 
 The command surface includes Session lifecycle, Resource Claims, authorization/evidence, governed Git commit/push, reconciliation/discovery, and protected execution. Use `--help --json` and `capabilities --json` for the authoritative inventory. Human-readable guidance and agent integrations use these same command and action identifiers; there is no separate human or agent workflow.
 
+`src/cli-command-registry.ts` is the single canonical authority for that surface: every command/option name is a `CommandId`/`OptionId` literal type derived directly from the registry data (not hand-typed), and `--help`, `capabilities`, the executable dispatcher's own accepted-flag parsing, and the generated skill playbook at `.claude/skills/nawabari/SKILL.md` all read that same data. There is no second command or option table to keep in sync.
+
 An agent-facing playbook at [`.claude/skills/nawabari/SKILL.md`](.claude/skills/nawabari/SKILL.md) is generated from the same `CLI_COMMAND_REGISTRY` authority (`pnpm run skill:generate`; `pnpm run skill:check` fails CI on drift). It orients an operating agent toward the canonical routine and each command's live `--help --json` projection; it does not restate an independent flag or syntax table.
 
 ## Stable package exports
