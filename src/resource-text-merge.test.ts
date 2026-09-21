@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { test } from "node:test";
+import path from "node:path";
 
 import { classifyMergeExit, analyzeTextMerge } from "./resource-text-merge.js";
 
-const GIT = "/run/current-system/sw/bin/git";
+const GIT = resolveGitExecutable();
 
 test("classifies only zero as clean and 1..127 as conflict counts", () => {
   assert.deepEqual(classifyMergeExit(0), { outcome: "clean", conflictCount: 0 });
@@ -76,3 +78,23 @@ test("output bounds and process failures remain unknown rather than clean", () =
   assert.equal(missing.outcome, "unknown");
   assert.equal(missing.reason, "executable-unavailable");
 });
+
+function resolveGitExecutable(): string {
+  const explicit = process.env.NAWABARI_GIT_EXECUTABLE;
+  const pathEntries = (process.env.PATH ?? "")
+    .split(path.delimiter)
+    .filter((entry) => entry.length > 0)
+    .flatMap((entry) => ["git", "git.exe", "git.cmd"].map((name) => path.resolve(entry, name)));
+  const candidates = explicit === undefined ? pathEntries : [explicit, ...pathEntries];
+  for (const candidate of [...new Set(candidates)]) {
+    if (!path.isAbsolute(candidate)) continue;
+    try {
+      if (!fs.statSync(candidate).isFile()) continue;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.realpathSync.native(candidate);
+    } catch {
+      // Continue through PATH candidates until an executable Git is found.
+    }
+  }
+  throw new Error("The #460 focused tests require an available absolute Git executable");
+}
