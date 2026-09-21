@@ -9,6 +9,7 @@ import {
   FILE_OPERATION_STATE_UNCERTAIN,
   WORKTREE_FILE_OPERATION_CONTRACT_ID,
   WORKTREE_FILE_OPERATION_HELPER,
+  WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES,
   deserializeWorktreeFileOperation,
   mutateWorktreeFile,
   prepareWorktreeFileOperation,
@@ -124,6 +125,47 @@ test("DELETE requires expected identity and refuses a second deletion", () => {
   }
 });
 
+test("DELETE and RENAME reject files with unknown hardlink identity", () => {
+  const root = fixture();
+  try {
+    const content = "hardlink-me";
+    const source = path.join(root, "docs", "hardlinked.txt");
+    const alias = path.join(root, "docs", "hardlinked-alias.txt");
+    fs.writeFileSync(source, content);
+    fs.linkSync(source, alias);
+    const stat = fs.statSync(source);
+    const expected = {
+      dev: String(stat.dev),
+      ino: String(stat.ino),
+      size: Buffer.byteLength(content),
+      digest: digest(content),
+    } satisfies WorktreeFileIdentity;
+
+    const deletion = mutateWorktreeFile(
+      request(root, "DELETE", "docs/hardlinked.txt", expected.digest, { expected_identity: expected }),
+    );
+    assert.equal(deletion.ok, false);
+    if (!deletion.ok) {
+      assert.equal(deletion.error.details?.operation_code, "TARGET_IDENTITY_UNAVAILABLE");
+      assert.equal(deletion.error.details?.state_uncertain, false);
+    }
+    assert.equal(fs.readFileSync(source, "utf8"), content);
+    assert.equal(fs.readFileSync(alias, "utf8"), content);
+
+    const rename = mutateWorktreeFile(
+      request(root, "RENAME", "docs/hardlinked.txt", expected.digest, {
+        to_path: "renamed/hardlinked.txt",
+        expected_identity: expected,
+      }),
+    );
+    assert.equal(rename.ok, false);
+    if (!rename.ok) assert.equal(rename.error.details?.operation_code, "SOURCE_IDENTITY_UNAVAILABLE");
+    assert.equal(fs.existsSync(path.join(root, "renamed", "hardlinked.txt")), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("RENAME checks source identity and destination CREATE authority without replacement", () => {
   const root = fixture();
   try {
@@ -207,6 +249,33 @@ test("helper protocol failures are reported as uncertain evidence", () => {
       assert.equal(result.error.details?.operation_code, FILE_OPERATION_STATE_UNCERTAIN);
       assert.equal(result.error.details?.state_uncertain, true);
     }
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("oversized payloads are rejected before helper spawn", () => {
+  const root = fixture();
+  try {
+    let helperInvoked = false;
+    const result = mutateWorktreeFile(
+      request(root, "CREATE", "docs/oversized.txt", null, {
+        payload_ref: {
+          encoding: "base64",
+          data: Buffer.alloc(WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES + 1).toString("base64"),
+        },
+      }),
+      {
+        run_helper: () => {
+          helperInvoked = true;
+          return JSON.stringify({ ok: false, code: "unexpected", message: "helper must not run" });
+        },
+      },
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "INVALID_ARGUMENT");
+    assert.equal(helperInvoked, false);
+    assert.equal(fs.existsSync(path.join(root, "docs", "oversized.txt")), false);
   } finally {
     cleanup(root);
   }

@@ -13,7 +13,7 @@ export const WORKTREE_FILE_OPERATION_CONTRACT_ID = "nawabari.worktree-file-opera
 export const FILE_OPERATION_STATE_UNCERTAIN = "FILE_OPERATION_STATE_UNCERTAIN" as const;
 export const WORKTREE_FILE_OPERATION_MAX_PATH_LENGTH = 4_096 as const;
 export const WORKTREE_FILE_OPERATION_MAX_SELECTOR_COUNT = 2_048 as const;
-export const WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024;
+export const WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES = 1_048_576 as const;
 
 export const WORKTREE_FILE_OPERATIONS = ["CREATE", "DELETE", "RENAME"] as const;
 export type WorktreeFileOperationName = (typeof WORKTREE_FILE_OPERATIONS)[number];
