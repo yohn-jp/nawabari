@@ -16,7 +16,7 @@ test("projects explicitly selected Bash with hermetic startup arguments", () => 
     executables: [{
       name: "bash",
       target: "/nawabari/bin/bash",
-      provider: { id: "fhs-bash-provider", requirement_id: "bash-runtime" },
+      provider: { id: "fhs-bash-runtime-provider", requirement_id: "bash-runtime" },
       provenance: "runtime-profile",
     }],
   });
@@ -29,5 +29,17 @@ test("projects explicitly selected Bash with hermetic startup arguments", () => 
 
 test("unselected Bash is not supplied by the shell resolver", () => {
   const result = resolveProfileShell({ ...profile, requirements: [] }, { executables: [] });
+  assert.equal(result.ok, false);
+});
+
+test("rejects Bash material from a non-canonical provider", () => {
+  const result = resolveProfileShell(profile, {
+    executables: [{
+      name: "bash",
+      target: "/nawabari/bin/bash",
+      provider: { id: "fhs-bash-provider", requirement_id: "bash-runtime" },
+      provenance: "runtime-profile",
+    }],
+  });
   assert.equal(result.ok, false);
 });

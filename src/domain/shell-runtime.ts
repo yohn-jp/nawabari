@@ -1,4 +1,5 @@
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
+import { FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS } from "./fhs-development-runtime.js";
 import type { ResolvedRuntimeProfile } from "./runtime-profile.js";
 import type { ProjectedExecutableEntrypoint, SessionRuntimeProjection } from "./runtime-projection.js";
 
@@ -36,7 +37,9 @@ export function resolveProfileShell(
     return missing("the Bash requirement is inconsistent");
   }
   const entrypoint = materialized.executables.find(
-    (candidate) => candidate.name === BASH_REQUIREMENT.name && candidate.provider.requirement_id === BASH_REQUIREMENT.id,
+    (candidate) => candidate.name === BASH_REQUIREMENT.name
+      && candidate.provider.id === FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS[BASH_REQUIREMENT.id]
+      && candidate.provider.requirement_id === BASH_REQUIREMENT.id,
   );
   if (entrypoint === undefined) return missing("selected Bash material was not projected");
   return success(Object.freeze({
