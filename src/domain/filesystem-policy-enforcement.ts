@@ -102,6 +102,68 @@ function sameIdentity(left: { readonly device: string; readonly inode: string },
   return left.device === right.dev.toString() && left.inode === right.ino.toString();
 }
 
+function identityFromEvidence(
+  input: PolicyInput,
+  source: string,
+): { readonly device: string; readonly inode: string } | null {
+  const parents = input.resolution.resolved
+    .filter((entry) => entry.parent.path === source)
+    .map((entry) => entry.parent.identity);
+  if (parents.length === 0) return null;
+  const first = parents[0] as (typeof parents)[number];
+  return parents.every((candidate) => candidate.device === first.device && candidate.inode === first.inode)
+    ? first
+    : null;
+}
+
+function literalPrefix(selector: string): string {
+  const wildcard = selector.search(/[?*]/u);
+  if (wildcard === -1) return selector;
+  const prefix = selector.slice(0, wildcard);
+  const slash = prefix.lastIndexOf("/");
+  return slash === -1 ? "" : prefix.slice(0, slash);
+}
+
+/**
+ * A native namespace bind is one broad grant.  If a deny selector could match
+ * anything below that grant, the bind would expose a hole that Landlock cannot
+ * express by pathname.  Reject the whole native bind instead of weakening
+ * deny precedence or silently switching to a copied worktree.
+ */
+function denyMayIntersectNamespace(selector: string, root: string): boolean {
+  if (root.length === 0) return true;
+  const prefix = literalPrefix(selector);
+  if (prefix.length === 0) return true;
+  return prefix === root || prefix.startsWith(`${root}/`) || root.startsWith(`${prefix}/`);
+}
+
+function revalidateNamespaceSource(input: PolicyInput, rule: FilesystemPolicyRule, source: string): DomainResult<null> {
+  const evidence = identityFromEvidence(input, source);
+  if (evidence === null) {
+    return enforcementError("Filesystem namespace rule has no physical identity evidence for its root.", {
+      relative_path: rule.relativePath,
+    });
+  }
+  try {
+    const observed = fs.lstatSync(source, { bigint: true });
+    if (observed.isSymbolicLink() || !observed.isDirectory() || !sameIdentity(evidence, observed)) {
+      return enforcementError("Filesystem namespace source changed after materialization.", {
+        relative_path: rule.relativePath,
+      });
+    }
+    if (fs.realpathSync.native(source) !== source) {
+      return enforcementError("Filesystem namespace source resolves through a symlink.", {
+        relative_path: rule.relativePath,
+      });
+    }
+  } catch {
+    return enforcementError("Filesystem namespace source cannot be physically observed.", {
+      relative_path: rule.relativePath,
+    });
+  }
+  return success(null);
+}
+
 function resolvedKind(input: PolicyInput, rule: FilesystemPolicyRule): "file" | "directory" | null {
   if (rule.kind === "native-namespace") return "directory";
   const evidence = input.resolution.resolved.find((entry) => entry.relativePath === rule.relativePath);
@@ -147,6 +209,15 @@ function compileMountsInternal(input: PolicyInput): DomainResult<readonly Filesy
       return enforcementError("Filesystem policy rule has no physical kind evidence.", {
         relative_path: rule.relativePath,
       });
+    }
+    if (rule.kind === "native-namespace") {
+      if (input.working_set.scope.deny.some((deny) => denyMayIntersectNamespace(deny, rule.relativePath))) {
+        return enforcementError("A DENY selector intersects a native namespace bind.", {
+          relative_path: rule.relativePath,
+        });
+      }
+      const namespaceSource = revalidateNamespaceSource(input, rule, source);
+      if (!namespaceSource.ok) return namespaceSource;
     }
     if (rule.kind === "native-path-rule") {
       const evidence = input.resolution.resolved.find((entry) => entry.relativePath === rule.relativePath);
