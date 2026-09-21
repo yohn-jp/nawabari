@@ -93,10 +93,7 @@ test("discard advances registry_revision once for each sequential persisted muta
 
 test("multi-candidate garbage collection never reuses or regresses registry_revision", () => {
   const fixture = createRepositoryFixture();
-  const worktreePaths = [
-    `${fixture.repositoryPath}-gc-revision-1`,
-    `${fixture.repositoryPath}-gc-revision-2`,
-  ];
+  const worktreePaths = [`${fixture.repositoryPath}-gc-revision-1`, `${fixture.repositoryPath}-gc-revision-2`];
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const sessions = [
@@ -659,7 +656,8 @@ function writeRegistry(registry: SessionRegistry, value: PersistedRegistry): voi
 }
 
 function persistedRegistryRevision(registry: SessionRegistry): number {
-  return (readJson(registry.paths.registry) as PersistedRegistry).registry_revision ?? 0;
+  const persisted = readJson(registry.paths.registry) as PersistedRegistry;
+  return "registry_revision" in persisted ? persisted.registry_revision : 0;
 }
 
 function removeWorktree(repositoryPath: string, worktreePath: string): void {
