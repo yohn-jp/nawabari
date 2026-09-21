@@ -95,9 +95,27 @@ test("projects exclusive writer versus reader as a typed wait reason", () => {
     resource: "src/a.ts",
     requestedMode: "read",
     currentMode: "exclusive-write",
-    releaseCondition: "owner-releases-claim",
+    releaseCondition: "owner-changes-claim",
   });
   assert.equal(record?.nextActions[0]?.actionId, "wait-for-owner-release");
+});
+
+test("an exclusive request against a reader requires release, not a mode change", () => {
+  const snapshot = projectResourceCoordinationSnapshot(
+    input({
+      registry: {
+        ...input().registry,
+        claims: [claim("reader", "src/a.ts", "read")],
+      },
+      contract: {
+        complete: true,
+        resourceIntents: [{ sessionId: "writer", resource: "src/a.ts", mode: "exclusive-write" }],
+      },
+    }),
+  );
+
+  assert.equal(snapshot.resources[0]?.blockers[0]?.kind, "claim-conflict");
+  assert.equal(snapshot.resources[0]?.blockers[0]?.releaseCondition, "owner-releases-claim");
 });
 
 test("incomplete evidence remains unresolved instead of claiming no conflict", () => {
@@ -132,4 +150,26 @@ test("claims, intents, and changes are deterministically ordered and bounded", (
   );
   assert.equal(snapshot.complete, false);
   assert.match(serializeResourceCoordinationSnapshot(snapshot), /"contract"/u);
+});
+
+test("participant and blocker bounds are visible as incomplete truncation", () => {
+  const snapshot = projectResourceCoordinationSnapshot(
+    input({
+      registry: {
+        ...input().registry,
+        claims: [claim("writer-a", "src/a.ts", "exclusive-write"), claim("writer-b", "src/a.ts", "exclusive-write")],
+      },
+      contract: {
+        complete: true,
+        resourceIntents: [{ sessionId: "reader", resource: "src/a.ts", mode: "read" }],
+      },
+      bounds: { maxParticipantsPerResource: 1, maxBlockersPerResource: 1 },
+    }),
+  );
+
+  assert.equal(snapshot.truncated, true);
+  assert.equal(snapshot.complete, false);
+  assert.deepEqual(snapshot.incompleteReasons, ["BLOCKER_BOUND_EXCEEDED", "PARTICIPANT_BOUND_EXCEEDED"]);
+  assert.equal(snapshot.resources[0]?.blockers.length, 1);
+  assert.equal(snapshot.resources[0]?.participants.length, 1);
 });

@@ -178,6 +178,17 @@ interface ResourceFacts {
   readonly mergeability: CoordinationMergeabilityEvidence[];
 }
 
+interface ResourceProjection {
+  readonly record: ResourceCoordinationRecord;
+  readonly truncated: boolean;
+  readonly truncationReasons: readonly string[];
+}
+
+interface ParticipantProjection {
+  readonly participants: readonly ResourceCoordinationParticipant[];
+  readonly truncated: boolean;
+}
+
 const DEFAULT_MAX_RESOURCES = 1_000;
 const DEFAULT_MAX_PARTICIPANTS = 1_000;
 const DEFAULT_MAX_BLOCKERS = 1_000;
@@ -196,14 +207,22 @@ export function projectResourceCoordinationSnapshot(
   const evidence = input.contract;
   const facts = collectResourceFacts(input.registry, evidence);
   const orderedResources = [...facts.keys()].sort(compareStrings);
-  const truncated = orderedResources.length > bounds.maxResources;
-  const resources = orderedResources
+  const resourceTruncated = orderedResources.length > bounds.maxResources;
+  const projections = orderedResources
     .slice(0, bounds.maxResources)
     .map((resource) => projectResource(facts.get(resource) as ResourceFacts, input.registry, evidence, bounds));
+  const resources = projections.map((projection) => projection.record);
+  const truncated = resourceTruncated || projections.some((projection) => projection.truncated);
 
   const incompleteReasons = new Set<string>(evidence.incompleteReasons ?? []);
   if (evidence.complete !== true) incompleteReasons.add("INCOMPLETE_AUTHORITY_EVIDENCE");
-  if (truncated) incompleteReasons.add("RESOURCE_BOUND_EXCEEDED");
+  if (resourceTruncated) incompleteReasons.add("RESOURCE_BOUND_EXCEEDED");
+  if (projections.some((projection) => projection.truncationReasons.includes("BLOCKER_BOUND_EXCEEDED"))) {
+    incompleteReasons.add("BLOCKER_BOUND_EXCEEDED");
+  }
+  if (projections.some((projection) => projection.truncationReasons.includes("PARTICIPANT_BOUND_EXCEEDED"))) {
+    incompleteReasons.add("PARTICIPANT_BOUND_EXCEEDED");
+  }
   const complete = evidence.complete === true && !truncated && incompleteReasons.size === 0;
 
   return freezeSnapshot({
@@ -238,7 +257,7 @@ function projectResource(
   registry: CoordinationRegistryInput,
   evidence: CoordinationContractInput,
   bounds: Required<ResourceCoordinationSnapshotBounds>,
-): ResourceCoordinationRecord {
+): ResourceProjection {
   const intents = [...facts.intents].sort(compareIntent);
   const claims = [...facts.claims].sort(compareClaim);
   const changes = [...facts.changes].sort(compareChange);
@@ -258,13 +277,15 @@ function projectResource(
       releaseCondition: "refresh-authoritative-evidence",
     });
   }
+  const blockerTruncated = blockers.length > bounds.maxBlockersPerResource;
   const boundedBlockers = blockers.slice(0, bounds.maxBlockersPerResource);
   const conflict: CoordinationConflict = claimBlockers.length > 0 ? "conflict" : authorityComplete ? "none" : "unknown";
   const permission: CoordinationPermission =
     claimBlockers.length > 0 ? "denied" : authorityComplete ? "allowed" : "unknown";
   const physicalModification = projectPhysicalModification(changes);
   const projectedMergeability = projectMergeability(mergeability);
-  const participants = projectParticipants(facts, registry.sessions, bounds.maxParticipantsPerResource);
+  const participantProjection = projectParticipants(facts, registry.sessions, bounds.maxParticipantsPerResource);
+  const participants = participantProjection.participants;
   const classification: CoordinationClassification =
     conflict === "conflict" || permission === "denied"
       ? "blocked"
@@ -283,16 +304,23 @@ function projectResource(
   );
 
   return Object.freeze({
-    resource: facts.resource,
-    participants,
-    requestedModes,
-    permission,
-    conflict,
-    physicalModification,
-    mergeability: projectedMergeability,
-    classification,
-    blockers: Object.freeze(boundedBlockers),
-    nextActions: Object.freeze(nextActions),
+    record: Object.freeze({
+      resource: facts.resource,
+      participants,
+      requestedModes,
+      permission,
+      conflict,
+      physicalModification,
+      mergeability: projectedMergeability,
+      classification,
+      blockers: Object.freeze(boundedBlockers),
+      nextActions: Object.freeze(nextActions),
+    }),
+    truncated: blockerTruncated || participantProjection.truncated,
+    truncationReasons: Object.freeze([
+      ...(blockerTruncated ? ["BLOCKER_BOUND_EXCEEDED"] : []),
+      ...(participantProjection.truncated ? ["PARTICIPANT_BOUND_EXCEEDED"] : []),
+    ]),
   });
 }
 
@@ -351,7 +379,7 @@ function findClaimBlockers(
         resource,
         requestedMode: intent.mode,
         currentMode: claim.mode,
-        releaseCondition: claim.mode === "exclusive-write" ? "owner-releases-claim" : "owner-changes-claim",
+        releaseCondition: releaseConditionFor(claim.mode, intent.mode),
       });
     }
   }
@@ -369,7 +397,7 @@ function findClaimBlockers(
         resource,
         requestedMode: second.mode,
         currentMode: first.mode,
-        releaseCondition: first.mode === "exclusive-write" ? "owner-releases-claim" : "owner-changes-claim",
+        releaseCondition: releaseConditionFor(first.mode, second.mode),
       });
     }
   }
@@ -394,7 +422,7 @@ function projectParticipants(
   facts: ResourceFacts,
   sessions: readonly CoordinationSession[],
   maxParticipants: number,
-): readonly ResourceCoordinationParticipant[] {
+): ParticipantProjection {
   const sessionById = new Map(sessions.map((session) => [session.sessionId, session]));
   const rows: ResourceCoordinationParticipant[] = [];
   const keys = new Set<string>();
@@ -446,17 +474,23 @@ function projectParticipants(
       integrated: change.integrated,
     });
   }
-  return Object.freeze(
-    rows
-      .sort((left, right) =>
-        compareStrings(
-          `${left.sessionId}\u0000${left.claimId ?? ""}`,
-          `${right.sessionId}\u0000${right.claimId ?? ""}`,
-        ),
-      )
-      .slice(0, maxParticipants)
-      .map((row) => Object.freeze(row)),
+  rows.sort((left, right) =>
+    compareStrings(`${left.sessionId}\u0000${left.claimId ?? ""}`, `${right.sessionId}\u0000${right.claimId ?? ""}`),
   );
+  return Object.freeze({
+    participants: Object.freeze(rows.slice(0, maxParticipants).map((row) => Object.freeze(row))),
+    truncated: rows.length > maxParticipants,
+  });
+}
+
+function releaseConditionFor(
+  currentMode: ResourceClaimMode,
+  requestedMode: ResourceClaimMode,
+): "owner-releases-claim" | "owner-changes-claim" {
+  // A read or write owner can only unblock an exclusive request by releasing.
+  if (requestedMode === "exclusive-write") return "owner-releases-claim";
+  if (currentMode === "exclusive-write") return "owner-changes-claim";
+  return "owner-changes-claim";
 }
 
 function projectPhysicalModification(changes: readonly CoordinationObservedChange[]): CoordinationPhysicalModification {
