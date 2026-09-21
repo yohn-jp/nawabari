@@ -300,6 +300,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     options: [
       option("--resource", "Repository-relative resource", { value: "<path-or-glob>", required: true }),
       option("--mode", "Granted claim mode", { value: "<read|write|exclusive-write>", required: true }),
+      option("--sharing-group", "Explicit coordinated-write group; only valid with ordinary write", { value: "<id>" }),
       option("--session", "Target active session; omitted resolves the current owner", { value: "<id>" }),
       option("--repository", "Expected repository identity", { value: "<id>" }),
     ],
@@ -329,6 +330,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         required: true,
         repeatable: true,
       }),
+      option("--sharing-group", "Explicit coordinated-write group applied to every write pair", { value: "<id>" }),
       option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
         value: "<non-negative-integer>",
       }),
@@ -365,6 +367,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         value: "<read|write|exclusive-write>",
         repeatable: true,
       }),
+      option("--sharing-group", "Explicit coordinated-write group applied to every write upsert", { value: "<id>" }),
       option("--release-resource", "Exact repository-relative resource to release; repeatable", {
         value: "<path-or-glob>",
         repeatable: true,
@@ -399,6 +402,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         value: "<read|write|exclusive-write>",
         required: true,
       }),
+      option("--sharing-group", "Explicit coordinated-write group for an ordinary write target", { value: "<id>" }),
       option("--if-generation", "Expected claim-set generation for CAS; mutually exclusive with --force", {
         value: "<non-negative-safe-int>",
       }),
@@ -410,6 +414,43 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
       "Exactly one resource/mode pair is projected as one atomic upsert delta; same mode is an idempotent no-op.",
       "Use exactly one concurrency intent: --if-generation <non-negative-safe-int> or explicit --force.",
       "The target grammar accepts an optional first positional <session> or --session <id>, but not both.",
+    ],
+  },
+  {
+    name: "session coordination preview",
+    summary: "Preview bounded coordination evidence between two sessions",
+    usage: `${CLI_NAME} session coordination preview --left <session-id> --right <session-id> --path <path> [--patch --read-authorized]`,
+    options: [
+      option("--left", "Explicit left session", { value: "<id>", required: true }),
+      option("--right", "Explicit right session", { value: "<id>", required: true }),
+      option("--path", "Concrete repository-relative resource", { value: "<path>", required: true }),
+      option("--patch", "Include bounded patch/merge preview; requires explicit read authority"),
+      option("--read-authorized", "Assert explicit read authority for patch output"),
+      option("--operator-authorized", "Assert operator authority for bounded content output"),
+      option("--allowed-read-path", "Explicitly approved read path; repeatable", { value: "<path>", repeatable: true }),
+      option("--max-bytes", "Maximum bounded content/patch bytes", { value: "<n>" }),
+      option("--max-hunks", "Maximum bounded diff hunks", { value: "<n>" }),
+    ],
+    notes: [
+      "Metadata-only is the default. Preview never merges, checks out, stages, commits, or mutates registry state.",
+      "Patch output requires --patch together with --read-authorized, --operator-authorized, or --allowed-read-path.",
+    ],
+  },
+  {
+    name: "session handoff",
+    summary: "Transfer one resource claim between active sessions",
+    usage: `${CLI_NAME} session handoff --from <session-id> --to <session-id> --resource <path> --mode <read|write|exclusive-write> --if-generation <n>`,
+    options: [
+      option("--from", "Source session retaining ownership until atomic commit", { value: "<id>", required: true }),
+      option("--to", "Destination active session", { value: "<id>", required: true }),
+      option("--resource", "One concrete canonical resource", { value: "<path>", required: true }),
+      option("--mode", "Destination claim mode", { value: "<read|write|exclusive-write>", required: true }),
+      option("--if-generation", "Required claim-set generation CAS token", { value: "<n>", required: true }),
+      option("--operation-id", "Stable retry identity", { value: "<id>" }),
+    ],
+    notes: [
+      "Handoff fences source execution, waits for quiescence, and commits source release plus destination claim atomically.",
+      "Content copying, branch merging, and scheduler behavior are outside this command.",
     ],
   },
   {

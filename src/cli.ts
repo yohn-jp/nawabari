@@ -32,6 +32,8 @@ import {
 import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS, EVIDENCE_MAX_DIFF_PATHS } from "./repository-evidence.js";
 import { isResourceClaimMode } from "./resource-claims.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
+import type { CoordinationPreviewOptions } from "./coordination-preview.js";
+import type { HandoffResourcesOptions } from "./resource-handoff.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
@@ -94,6 +96,8 @@ export const DISPATCHER_COMMAND_INVENTORY = [
   "session run",
   "session exec",
   "session shell",
+  "session coordination preview",
+  "session handoff",
   "session list",
   "session claim",
   "resource claim",
@@ -157,18 +161,47 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session run": ["--session", "--runtime-policy"],
   "session shell": ["--session", "--runtime-policy"],
   "session list": ["--all", "--history", "--limit", "--offset"],
-  "session claim": ["--resource", "--mode", "--session", "--repository"],
-  "session update": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
+  "session claim": ["--resource", "--mode", "--sharing-group", "--session", "--repository"],
+  "session update": [
+    "--resource",
+    "--mode",
+    "--sharing-group",
+    "--if-generation",
+    "--force",
+    "--session",
+    "--repository",
+  ],
   "session mutate": [
     "--upsert-resource",
     "--mode",
+    "--sharing-group",
     "--release-resource",
     "--if-generation",
     "--force",
     "--session",
     "--repository",
   ],
-  "session transition": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
+  "session transition": [
+    "--resource",
+    "--mode",
+    "--sharing-group",
+    "--if-generation",
+    "--force",
+    "--session",
+    "--repository",
+  ],
+  "session coordination preview": [
+    "--left",
+    "--right",
+    "--path",
+    "--patch",
+    "--read-authorized",
+    "--operator-authorized",
+    "--allowed-read-path",
+    "--max-bytes",
+    "--max-hunks",
+  ],
+  "session handoff": ["--from", "--to", "--resource", "--mode", "--if-generation", "--operation-id"],
   "session claims": ["--session"],
   "session release": ["--session", "--resource", "--claim-id", "--all", "--if-generation", "--force"],
   "session close": ["--session", "--integrated-revision", "--fetch-remote", "--fetch-branch"],
@@ -265,9 +298,11 @@ validateCliRegistryParity();
 function helpSpecFor(commandArguments: readonly string[]): CliCommandDefinition {
   if (commandArguments.length === 0) return ROOT_HELP_SPEC;
   const key =
-    commandArguments[0] === "resource"
-      ? `resource ${commandArguments[1] ?? "list"}`
-      : commandArguments.slice(0, 2).join(" ");
+    commandArguments[0] === "session" && commandArguments[1] === "coordination"
+      ? commandArguments.slice(0, 3).join(" ")
+      : commandArguments[0] === "resource"
+        ? `resource ${commandArguments[1] ?? "list"}`
+        : commandArguments.slice(0, 2).join(" ");
   return resolveCliCommandDefinition(key) ?? resolveCliCommandDefinition(commandArguments[0]) ?? ROOT_HELP_SPEC;
 }
 
@@ -431,10 +466,12 @@ type ParsedOptions = {
   remote: string | null;
   remote_branch: string | null;
   mode: string | null;
+  sharing_group: string | null;
   claim_id: string | null;
   repository: string | null;
   repository_host: string | null;
   revision: string | null;
+  if_generation: string | null;
   reason: string | null;
   evidence: string | null;
   execution_scope_file: string | null;
@@ -447,9 +484,17 @@ type ParsedOptions = {
   limit: string | null;
   offset: string | null;
   paths: string[];
+  allowed_read_paths: string[];
+  left: string | null;
+  right: string | null;
+  from_session: string | null;
+  to_session: string | null;
+  operation_id: string | null;
   from_revision: string | null;
   to_revision: string | null;
   patch: boolean;
+  read_authorized: boolean;
+  operator_authorized: boolean;
   max_bytes: string | null;
   max_hunks: string | null;
   integrated_revision: string | null;
@@ -541,10 +586,12 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     remote: null,
     remote_branch: null,
     mode: null,
+    sharing_group: null,
     claim_id: null,
     repository: null,
     repository_host: null,
     revision: null,
+    if_generation: null,
     reason: null,
     evidence: null,
     execution_scope_file: null,
@@ -557,9 +604,17 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     limit: null,
     offset: null,
     paths: [],
+    allowed_read_paths: [],
+    left: null,
+    right: null,
+    from_session: null,
+    to_session: null,
+    operation_id: null,
     from_revision: null,
     to_revision: null,
     patch: false,
+    read_authorized: false,
+    operator_authorized: false,
     max_bytes: null,
     max_hunks: null,
     integrated_revision: null,
@@ -588,6 +643,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       name === "--all" ||
       name === "--history" ||
       name === "--patch" ||
+      name === "--read-authorized" ||
+      name === "--operator-authorized" ||
       name === "--preview" ||
       name === "--summary" ||
       name === "--unresolved"
@@ -603,6 +660,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       else if (name === "--all") options.all = true;
       else if (name === "--history") options.history = true;
       else if (name === "--patch") options.patch = true;
+      else if (name === "--read-authorized") options.read_authorized = true;
+      else if (name === "--operator-authorized") options.operator_authorized = true;
       else if (name === "--preview") options.preview = true;
       else if (name === "--summary") options.summary = true;
       else options.unresolved = true;
@@ -655,18 +714,28 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--remote") options.remote = value;
     else if (name === "--remote-branch") options.remote_branch = value;
     else if (name === "--mode") options.mode = value;
+    else if (name === "--sharing-group") options.sharing_group = value;
     else if (name === "--claim-id") options.claim_id = value;
     else if (name === "--repository") options.repository = value;
     else if (name === "--repository-host") options.repository_host = value;
     else if (name === "--revision") options.revision = value;
+    else if (name === "--if-generation") options.if_generation = value;
     else if (name === "--reason") options.reason = value;
     else if (name === "--evidence") options.evidence = value;
     else if (name === "--execution-scope-file") options.execution_scope_file = value;
     else if (name === "--limit") options.limit = value;
     else if (name === "--offset") options.offset = value;
     else if (name === "--path") options.paths.push(value);
-    else if (name === "--from") options.from_revision = value;
-    else if (name === "--to") options.to_revision = value;
+    else if (name === "--allowed-read-path") options.allowed_read_paths.push(value);
+    else if (name === "--left") options.left = value;
+    else if (name === "--right") options.right = value;
+    else if (name === "--from") {
+      options.from_session = value;
+      options.from_revision = value;
+    } else if (name === "--to") {
+      options.to_session = value;
+      options.to_revision = value;
+    } else if (name === "--operation-id") options.operation_id = value;
     else if (name === "--max-bytes") options.max_bytes = value;
     else if (name === "--max-hunks") options.max_hunks = value;
     else if (name === "--integrated-revision") options.integrated_revision = value;
@@ -740,6 +809,7 @@ type ClaimReplacementPairs = {
   session_id: string | null;
   repository: string | null;
   pairs: Array<{ resource: string; mode: string }>;
+  sharing_group: string | null;
   expected_claim_set_generation: number | null;
   force: boolean;
   branch: string | null;
@@ -756,6 +826,7 @@ type ClaimDeltaMutation = {
   session_id: string | null;
   repository: string | null;
   deltas: ResourceClaimDelta[];
+  sharing_group: string | null;
   expected_claim_set_generation: number | null;
   force: boolean;
 };
@@ -765,6 +836,7 @@ type ClaimTransition = {
   repository: string | null;
   resource: string;
   mode: "read" | "write" | "exclusive-write";
+  sharing_group: string | null;
   expected_claim_set_generation: number | null;
   force: boolean;
 };
@@ -994,6 +1066,7 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
   let repository: string | null = null;
   const deltas: ResourceClaimDelta[] = [];
   let pendingUpsertResource: string | null = null;
+  let sharingGroup: string | null = null;
   let concurrencyState: ClaimConcurrencyState = {
     expected_claim_set_generation: null,
     force: false,
@@ -1043,6 +1116,8 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
       sessionId = value;
     } else if (name === "--repository") {
       repository = value;
+    } else if (name === "--sharing-group") {
+      sharingGroup = value;
     } else if (name === "--upsert-resource") {
       pendingUpsertResource = value;
     } else if (name === "--release-resource") {
@@ -1067,6 +1142,7 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
         kind: "upsert",
         resource: pendingUpsertResource,
         mode: value,
+        ...(sharingGroup === null ? {} : { sharing: { kind: "isolated-worktree" as const, groupId: sharingGroup } }),
       });
       pendingUpsertResource = null;
     }
@@ -1094,6 +1170,7 @@ function parseClaimDeltaMutation(arguments_: string[]): DomainResult<ClaimDeltaM
       session_id: sessionId,
       repository,
       deltas,
+      sharing_group: sharingGroup,
       expected_claim_set_generation: concurrency.value.expected_claim_set_generation,
       force: concurrency.value.force,
     },
@@ -1131,6 +1208,7 @@ function parseClaimTransition(arguments_: string[]): DomainResult<ClaimTransitio
       repository: parsed.value.repository,
       resource: pair.resource,
       mode: pair.mode,
+      sharing_group: parsed.value.sharing_group,
       expected_claim_set_generation: parsed.value.expected_claim_set_generation,
       force: parsed.value.force,
     },
@@ -1168,6 +1246,7 @@ function parseClaimReplacementPairs(
   let executionScopeFile: string | null = null;
   let candidateWorkingSetFile: string | null = null;
   let pendingResource: string | null = null;
+  let sharingGroup: string | null = null;
   let concurrencyState: ClaimConcurrencyState = {
     expected_claim_set_generation: null,
     force: false,
@@ -1214,6 +1293,7 @@ function parseClaimReplacementPairs(
       }
       sessionId = value;
     } else if (name === "--repository") repository = value;
+    else if (name === "--sharing-group") sharingGroup = value;
     else if (name === "--branch") branch = value;
     else if (name === "--worktree") worktree = value;
     else if (name === "--worktree-root") worktreeRoot = value;
@@ -1270,6 +1350,7 @@ function parseClaimReplacementPairs(
       session_id: sessionId,
       repository,
       pairs,
+      sharing_group: sharingGroup,
       expected_claim_set_generation: concurrency.value.expected_claim_set_generation,
       force: concurrency.value.force,
       branch,
@@ -1314,6 +1395,7 @@ type SingleClaimPair = {
   repository: string | null;
   resource: string;
   mode: string;
+  sharing_group: string | null;
 };
 
 /**
@@ -1340,6 +1422,7 @@ function parseSingleClaimPair(arguments_: string[]): DomainResult<SingleClaimPai
       repository: parsed.value.repository,
       resource: pair.resource,
       mode: pair.mode,
+      sharing_group: parsed.value.sharing_group,
     },
   };
 }
@@ -1443,7 +1526,16 @@ async function executeClaimTransition(
   const result = await backend.applyClaimDeltas(context, {
     session_id: parsed.value.session_id,
     repository: parsed.value.repository,
-    deltas: [{ kind: "upsert", resource: parsed.value.resource, mode: parsed.value.mode }],
+    deltas: [
+      {
+        kind: "upsert",
+        resource: parsed.value.resource,
+        mode: parsed.value.mode,
+        ...(parsed.value.sharing_group === null
+          ? {}
+          : { sharing: { kind: "isolated-worktree" as const, groupId: parsed.value.sharing_group } }),
+      },
+    ],
     ...concurrency,
   });
   return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
@@ -1566,6 +1658,69 @@ async function executeCommand(
     if (canonicalCommandForName(`session ${subcommand}`)?.name === "session run") {
       return executeProtectedSessionCommand(rest, dependencies, context);
     }
+    if (subcommand === "coordination" && rest[0] === "preview") {
+      const parsed = parseOptions(rest.slice(1), dispatcherAllowedOptions("session coordination preview"));
+      if (!parsed.ok) return parsed;
+      if (parsed.value.left === null || parsed.value.right === null || parsed.value.paths.length !== 1) {
+        return failure(
+          usageError("MISSING_ARGUMENT", "session coordination preview requires --left, --right, and --path."),
+        );
+      }
+      if (dependencies.backend.coordinationPreview === undefined) {
+        return failure(new DomainError("BACKEND_UNAVAILABLE", "Coordination preview is not available."));
+      }
+      const options: CoordinationPreviewOptions = {
+        left: parsed.value.left,
+        right: parsed.value.right,
+        path: parsed.value.paths[0] as string,
+        include_patch: parsed.value.patch,
+        read_authorized: parsed.value.read_authorized,
+        operator_authorized: parsed.value.operator_authorized,
+        allowed_read_paths: parsed.value.allowed_read_paths,
+        ...(parsed.value.max_bytes === null ? {} : { max_content_bytes: Number(parsed.value.max_bytes) }),
+        ...(parsed.value.max_hunks === null ? {} : { max_diff_hunks: Number(parsed.value.max_hunks) }),
+      };
+      const result = await dependencies.backend.coordinationPreview(context, options);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (subcommand === "handoff") {
+      const parsed = parseOptions(rest, dispatcherAllowedOptions("session handoff"));
+      if (!parsed.ok) return parsed;
+      if (
+        parsed.value.from_session === null ||
+        parsed.value.to_session === null ||
+        parsed.value.resource === null ||
+        parsed.value.mode === null ||
+        parsed.value.if_generation === null
+      ) {
+        return failure(
+          usageError(
+            "MISSING_ARGUMENT",
+            "session handoff requires --from, --to, --resource, --mode, and --if-generation.",
+          ),
+        );
+      }
+      if (!isResourceClaimMode(parsed.value.mode) || !/^\d+$/u.test(parsed.value.if_generation)) {
+        return failure(usageError("INVALID_ARGUMENT", "session handoff mode or generation is invalid."));
+      }
+      const generation = Number(parsed.value.if_generation);
+      if (!Number.isSafeInteger(generation)) {
+        return failure(usageError("INVALID_ARGUMENT", "--if-generation is outside the safe integer range."));
+      }
+      if (dependencies.backend.handoffResources === undefined) {
+        return failure(new DomainError("BACKEND_UNAVAILABLE", "Resource handoff is not available."));
+      }
+      const options: HandoffResourcesOptions = {
+        fromSessionId: parsed.value.from_session,
+        toSessionId: parsed.value.to_session,
+        resource: parsed.value.resource,
+        mode: parsed.value.mode,
+        ifGeneration: generation,
+        ...(parsed.value.operation_id === null ? {} : { operationId: parsed.value.operation_id }),
+      };
+      const result = await dependencies.backend.handoffResources(context, options);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
     if (subcommand === "claim") {
       const parsed = parseSingleClaimPair(rest);
       if (!parsed.ok) return parsed;
@@ -1573,7 +1728,15 @@ async function executeCommand(
       const result = await dependencies.backend.claimResources(context, {
         session_id: parsed.value.session_id,
         repository: parsed.value.repository,
-        claims: [{ resource: parsed.value.resource, mode: parsed.value.mode as "read" | "write" | "exclusive-write" }],
+        claims: [
+          {
+            resource: parsed.value.resource,
+            mode: parsed.value.mode as "read" | "write" | "exclusive-write",
+            ...(parsed.value.sharing_group === null
+              ? {}
+              : { sharing: { kind: "isolated-worktree" as const, groupId: parsed.value.sharing_group } }),
+          },
+        ],
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
@@ -1590,6 +1753,9 @@ async function executeCommand(
         claims: parsed.value.pairs.map((pair) => ({
           resource: pair.resource,
           mode: pair.mode as "read" | "write" | "exclusive-write",
+          ...(parsed.value.sharing_group === null
+            ? {}
+            : { sharing: { kind: "isolated-worktree" as const, groupId: parsed.value.sharing_group } }),
         })),
         ...concurrency,
       });
@@ -1811,7 +1977,15 @@ async function executeCommand(
       const result = await dependencies.backend.claimResources(context, {
         session_id: parsed.value.session_id,
         repository: parsed.value.repository,
-        claims: [{ resource: parsed.value.resource, mode: parsed.value.mode as "read" | "write" | "exclusive-write" }],
+        claims: [
+          {
+            resource: parsed.value.resource,
+            mode: parsed.value.mode as "read" | "write" | "exclusive-write",
+            ...(parsed.value.sharing_group === null
+              ? {}
+              : { sharing: { kind: "isolated-worktree" as const, groupId: parsed.value.sharing_group } }),
+          },
+        ],
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
@@ -1828,6 +2002,9 @@ async function executeCommand(
         claims: parsed.value.pairs.map((pair) => ({
           resource: pair.resource,
           mode: pair.mode as "read" | "write" | "exclusive-write",
+          ...(parsed.value.sharing_group === null
+            ? {}
+            : { sharing: { kind: "isolated-worktree" as const, groupId: parsed.value.sharing_group } }),
         })),
         ...concurrency,
       });
@@ -2117,6 +2294,9 @@ async function executeCommand(
 }
 
 function commandName(commandArguments: string[]): string {
+  if (commandArguments[0] === "session" && commandArguments[1] === "coordination") {
+    return commandArguments.slice(0, 3).join(" ");
+  }
   if (commandArguments[0] === "session") return commandArguments.slice(0, 2).join(" ");
   if (commandArguments[0] === "resource") {
     return commandArguments[1] === undefined ? "resource list" : commandArguments.slice(0, 2).join(" ");

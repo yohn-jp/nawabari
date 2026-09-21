@@ -45,6 +45,20 @@ import {
   AUXILIARY_STATE_SOURCE_KINDS,
   AUXILIARY_STATE_TARGET_KINDS,
 } from "./domain/auxiliary-state-projection.js";
+import {
+  RESOURCE_COORDINATION_SCHEMA_VERSION,
+  RESOURCE_COORDINATION_SERIALIZATION_KEY,
+} from "./resource-coordination.js";
+import { COORDINATION_PREVIEW_OPERATION, COORDINATION_PREVIEW_SCHEMA_VERSION } from "./coordination-preview.js";
+import {
+  RESOURCE_HANDOFF_CONTRACT_ID,
+  RESOURCE_HANDOFF_OPERATION,
+  RESOURCE_HANDOFF_SCHEMA_VERSION,
+} from "./resource-handoff.js";
+import {
+  RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
+  RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
+} from "./resource-coordination-snapshot.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -645,6 +659,32 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
         selected_preserves_unrelated: true,
         absent_exact_resource: "idempotent",
       },
+      coordination: {
+        commands: ["session coordination preview", "session handoff"],
+        serialization_keys: [RESOURCE_COORDINATION_SERIALIZATION_KEY, "merge-preview", "git-evidence"],
+        preview: {
+          operation: COORDINATION_PREVIEW_OPERATION,
+          schema_version: COORDINATION_PREVIEW_SCHEMA_VERSION,
+          metadata_only_default: true,
+          patch_requires_explicit_read_authority: true,
+          mutates: false,
+        },
+        handoff: {
+          contract_id: RESOURCE_HANDOFF_CONTRACT_ID,
+          operation: RESOURCE_HANDOFF_OPERATION,
+          schema_version: RESOURCE_HANDOFF_SCHEMA_VERSION,
+          atomic_source_release_and_destination_acquire: true,
+          quiescence_required: true,
+          stale_generation_fails_closed: true,
+        },
+        snapshot: {
+          contract_id: RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
+          schema_version: RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
+          persisted: false,
+          mutation: false,
+          file_contents: false,
+        },
+      },
     },
     recovery: {
       schema: RESOURCE_CLAIM_RECOVERY_SCHEMA,
@@ -823,6 +863,7 @@ export function machineContract(packageVersion: string): JsonObject {
             compatibility: jsonClone(capability.compatibility),
             mutation: jsonClone(capability.mutation),
             semantics: jsonClone(capability.semantics),
+            coordination: jsonClone(capability.semantics.coordination),
             recovery: jsonClone(capability.recovery),
             operation_required_claim_modes: capability.operation_required_claim_modes,
             help_dispatcher: {

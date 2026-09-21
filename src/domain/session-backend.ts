@@ -66,7 +66,15 @@ import {
   type RegistryMigrationResult,
   type StatusResult,
   type UpdateClaimsOptions,
+  type CoordinationPreview,
+  type ResourceCoordinationSnapshotOptions,
+  type ResourceHandoff,
+  type CoordinationTransaction,
 } from "./session.js";
+import type { CoordinationPreviewOptions } from "../coordination-preview.js";
+import type { HandoffResourcesOptions } from "../resource-handoff.js";
+import type { ResourceCoordinationSnapshot } from "../resource-coordination-snapshot.js";
+import type { CoordinationTransactionRequest } from "../coordination-transactions.js";
 import type { SandboxGitIdentity } from "./sandbox.js";
 
 export interface LocalSessionBackendOptions {
@@ -560,6 +568,50 @@ export class LocalSessionBackend implements SessionBackend {
         force: options.force === true,
       });
       return success(toDomainClaimDeltasResult(result));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async coordinationPreview(
+    context: SessionContext,
+    options: CoordinationPreviewOptions,
+  ): Promise<DomainResult<CoordinationPreview>> {
+    try {
+      return success(this.registryFor(context).coordinationPreview(options));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async resourceCoordinationSnapshot(
+    context: SessionContext,
+    options: ResourceCoordinationSnapshotOptions,
+  ): Promise<DomainResult<ResourceCoordinationSnapshot>> {
+    try {
+      return success(this.registryFor(context).resourceCoordinationSnapshot(options.contract, options.bounds));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async handoffResources(
+    context: SessionContext,
+    options: HandoffResourcesOptions,
+  ): Promise<DomainResult<ResourceHandoff>> {
+    try {
+      return success(await this.registryFor(context).handoffResources(options));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async applyCoordinationTransaction(
+    context: SessionContext,
+    request: CoordinationTransactionRequest,
+  ): Promise<DomainResult<CoordinationTransaction>> {
+    try {
+      return success(this.registryFor(context).applyCoordinationTransaction(request));
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -1234,6 +1286,7 @@ function toRegistryClaimInput(
   return {
     resource: input.resource,
     mode: input.mode,
+    ...(input.sharing === undefined ? {} : { sharing: input.sharing }),
     ...(input.repository === null || input.repository === undefined ? {} : { repositoryId: input.repository }),
     ...(input.session_id === null || input.session_id === undefined ? {} : { sessionId: input.session_id }),
     ...(input.worktree === null || input.worktree === undefined ? {} : { worktreePath: input.worktree }),
@@ -1284,6 +1337,7 @@ function toDomainClaim(claim: RegistryResourceClaim): ResourceClaim {
     worktree: claim.worktreePath,
     resource: claim.resource,
     mode: claim.mode,
+    ...(claim.sharing === undefined ? {} : { sharing: claim.sharing }),
     created_at: claim.createdAt,
     updated_at: claim.updatedAt,
   };

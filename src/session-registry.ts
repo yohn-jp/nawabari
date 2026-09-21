@@ -83,8 +83,48 @@ import {
   type ResourceClaimRecoveryAction,
   type ResourceClaimInput,
   type ResourceClaimMode,
+  type SharedWriteBinding,
   RESOURCE_CLAIM_RECOVERY_ACTION_ID,
 } from "./resource-claims.js";
+import {
+  buildResourceOverlapGraph,
+  type ResourceIntent,
+  type ResourceOverlapBounds,
+  type ResourceOverlapGraph,
+} from "./resource-coordination.js";
+import {
+  applyCoordinationTransaction,
+  planCoordinationTransaction,
+  type CoordinationTransactionPlan,
+  type CoordinationTransactionRequest,
+  type CoordinationTransactionResult,
+} from "./coordination-transactions.js";
+import {
+  previewCoordination,
+  type CoordinationPreviewOptions,
+  type CoordinationPreviewResult,
+} from "./coordination-preview.js";
+import {
+  projectResourceCoordinationSnapshot,
+  type CoordinationContractInput,
+  type ResourceCoordinationSnapshot,
+  type ResourceCoordinationSnapshotBounds,
+} from "./resource-coordination-snapshot.js";
+import {
+  handoffResources as executeResourceHandoff,
+  RESOURCE_HANDOFF_OPERATION,
+  RESOURCE_HANDOFF_SCHEMA_VERSION,
+  type HandoffResourcesOptions,
+  type ResourceHandoffCommitInput,
+  type ResourceHandoffCommitResult,
+  type ResourceHandoffFence,
+  type ResourceHandoffFenceController,
+  type ResourceHandoffQuiescence,
+  type ResourceHandoffResult,
+  type ResourceHandoffOperationRecord,
+  type ResourceHandoffSession,
+  type ResourceHandoffSnapshot,
+} from "./resource-handoff.js";
 import {
   CHECKPOINT_EVIDENCE_SCHEMA_VERSION,
   CHECKPOINT_MAX_PATHS,
@@ -132,6 +172,37 @@ import {
 } from "./session-lifecycle-actions.js";
 
 export type { ResourceClaim, ResourceClaimRecoveryAction } from "./resource-claims.js";
+export {
+  buildResourceOverlapGraph,
+  classifyResourceOverlap,
+  createResourceIntent,
+  serializeResourceOverlapGraph,
+} from "./resource-coordination.js";
+export type {
+  ResourceIntent,
+  ResourceIntentInput,
+  ResourceOverlapBounds,
+  ResourceOverlapGraph,
+} from "./resource-coordination.js";
+export { previewCoordination, serializeCoordinationPreview } from "./coordination-preview.js";
+export type { CoordinationPreviewOptions, CoordinationPreviewResult } from "./coordination-preview.js";
+export {
+  projectResourceCoordinationSnapshot,
+  serializeResourceCoordinationSnapshot,
+} from "./resource-coordination-snapshot.js";
+export type {
+  CoordinationContractInput,
+  ResourceCoordinationSnapshot,
+  ResourceCoordinationSnapshotBounds,
+} from "./resource-coordination-snapshot.js";
+export { validateResourceHandoff } from "./resource-handoff.js";
+export type { HandoffResourcesOptions, ResourceHandoffResult } from "./resource-handoff.js";
+export { applyCoordinationTransaction, planCoordinationTransaction } from "./coordination-transactions.js";
+export type {
+  CoordinationTransactionPlan,
+  CoordinationTransactionRequest,
+  CoordinationTransactionResult,
+} from "./coordination-transactions.js";
 export {
   primarySessionLifecycleAction,
   primarySessionLifecycleNextAction,
@@ -688,7 +759,12 @@ export interface UpdateClaimsOptions extends ClaimResourcesOptions {
 
 /** One exact-resource mutation in an atomic claim delta batch. */
 export type ResourceClaimDelta =
-  | { readonly kind: "upsert"; readonly resource: string; readonly mode: ResourceClaimMode }
+  | {
+      readonly kind: "upsert";
+      readonly resource: string;
+      readonly mode: ResourceClaimMode;
+      readonly sharing?: SharedWriteBinding;
+    }
   | { readonly kind: "release"; readonly resource: string };
 
 /** An exact-resource delta batch. The whole batch is validated before one write. */
@@ -1045,6 +1121,8 @@ export class SessionRegistry {
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
   private readonly lock: RepositoryLock;
+  /** Operation identities are retained for retry-safe handoff within this registry authority. */
+  private readonly resourceHandoffOperations = new Map<string, ResourceHandoffOperationRecord>();
 
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
@@ -1138,6 +1216,117 @@ export class SessionRegistry {
       claims: state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim),
       claimSetGeneration: state.claimSetGeneration,
     };
+  }
+
+  /** Build the bounded cross-session overlap projection from authoritative claims and explicit intents. */
+  resourceCoordinationGraph(
+    intents: readonly ResourceIntent[],
+    bounds: ResourceOverlapBounds = {},
+  ): ResourceOverlapGraph {
+    const state = this.readStateUnsafe();
+    return buildResourceOverlapGraph(state.claims, intents, bounds);
+  }
+
+  /** Plan one generation-safe coordinated claim transition against current authority. */
+  planCoordinationTransaction(request: CoordinationTransactionRequest): CoordinationTransactionPlan {
+    const state = this.readStateUnsafe();
+    return planCoordinationTransaction(
+      {
+        repositoryId: this.repository.repositoryId,
+        claimSetGeneration: state.claimSetGeneration,
+        sessions: state.sessions,
+        claims: state.claims,
+      },
+      request,
+      {
+        coordinationFacts: (left, right) =>
+          this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+      },
+    );
+  }
+
+  /** Apply one complete coordinated claim transition with one registry write. */
+  applyCoordinationTransaction(request: CoordinationTransactionRequest): CoordinationTransactionResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      return applyCoordinationTransaction(
+        {
+          repositoryId: this.repository.repositoryId,
+          claimSetGeneration: state.claimSetGeneration,
+          sessions: state.sessions,
+          claims: state.claims,
+        },
+        request,
+        {
+          coordinationFacts: (left, right) =>
+            this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+          commit: (commit) =>
+            this.writeUnsafe(
+              state.sessions,
+              commit.claims,
+              commit.claimSetGeneration,
+              nextRegistryRevision(state),
+              state.runtimeEpoch,
+              state.runtimeRecords,
+            ),
+        },
+      );
+    });
+  }
+
+  /** Produce the non-mutating three-way coordination preview against this registry authority. */
+  coordinationPreview(options: CoordinationPreviewOptions): CoordinationPreviewResult {
+    return previewCoordination(this, { ...options, git: options.git ?? this.git });
+  }
+
+  /** Compose the bounded read-only per-resource coordination snapshot from current registry facts. */
+  resourceCoordinationSnapshot(
+    contract: CoordinationContractInput,
+    bounds: ResourceCoordinationSnapshotBounds = {},
+  ): ResourceCoordinationSnapshot {
+    const state = this.readStateUnsafe();
+    return projectResourceCoordinationSnapshot({
+      registry: {
+        repositoryId: this.repository.repositoryId,
+        claimSetGeneration: state.claimSetGeneration,
+        registryRevision: state.registryRevision,
+        sessions: state.sessions.map((session) => ({
+          sessionId: session.sessionId,
+          worktreePath: session.worktreePath,
+          state: session.state,
+          branchName: session.branchName,
+          repositoryId: session.repositoryId,
+        })),
+        claims: state.claims,
+      },
+      contract,
+      bounds,
+    });
+  }
+
+  /** Execute one quiescence-checked atomic resource handoff through registry persistence. */
+  async handoffResources(
+    options: HandoffResourcesOptions,
+    execution: ResourceHandoffFenceController = this.defaultResourceHandoffExecution(),
+  ): Promise<ResourceHandoffResult> {
+    const authority = {
+      readResourceHandoffSnapshot: (): ResourceHandoffSnapshot => this.readResourceHandoffSnapshot(),
+      commitResourceHandoff: (input: ResourceHandoffCommitInput): ResourceHandoffCommitResult =>
+        this.commitResourceHandoff(input),
+    };
+    const result = await executeResourceHandoff(authority, execution, options);
+    if (result.status === "transferred" || result.status === "idempotent") {
+      const record: ResourceHandoffOperationRecord = {
+        operationId: result.operationId,
+        fromSessionId: result.fromSessionId,
+        toSessionId: result.toSessionId,
+        resource: result.resource,
+        mode: result.mode,
+        claimSetGeneration: result.claimSetGeneration,
+      };
+      this.resourceHandoffOperations.set(result.operationId, Object.freeze(record));
+    }
+    return result;
   }
 
   /**
@@ -1520,7 +1709,11 @@ export class SessionRegistry {
           continue;
         }
 
-        const after = createResourceClaim({ resource: delta.resource, mode: delta.mode }, owner, timestamp);
+        const after = createResourceClaim(
+          { resource: delta.resource, mode: delta.mode, sharing: delta.sharing },
+          owner,
+          timestamp,
+        );
         nextByResource.set(delta.resource, after);
         if (transition === "change") {
           if (before === undefined) {
@@ -4245,7 +4438,10 @@ export class SessionRegistry {
       }
       const normalized: ResourceClaimDelta =
         delta.kind === "upsert"
-          ? { kind: "upsert", ...canonicalizeClaimInput({ resource: delta.resource, mode: delta.mode }, owner) }
+          ? {
+              kind: "upsert",
+              ...canonicalizeClaimInput({ resource: delta.resource, mode: delta.mode, sharing: delta.sharing }, owner),
+            }
           : { kind: "release", resource: canonicalizeClaimResource(delta.resource, owner.worktreePath) };
       const prior = seen.get(normalized.resource);
       if (prior !== undefined) {
@@ -4271,8 +4467,8 @@ export class SessionRegistry {
     }
     return canonical.sort((left, right) =>
       compareCodePointStrings(
-        `${left.resource}\u0000${left.kind}\u0000${left.kind === "upsert" ? left.mode : ""}`,
-        `${right.resource}\u0000${right.kind}\u0000${right.kind === "upsert" ? right.mode : ""}`,
+        `${left.resource}\u0000${left.kind}\u0000${left.kind === "upsert" ? left.mode : ""}\u0000${left.kind === "upsert" ? (left.sharing?.groupId ?? "") : ""}`,
+        `${right.resource}\u0000${right.kind}\u0000${right.kind === "upsert" ? right.mode : ""}\u0000${right.kind === "upsert" ? (right.sharing?.groupId ?? "") : ""}`,
       ),
     );
   }
@@ -4446,7 +4642,9 @@ export class SessionRegistry {
           exact.repositoryId !== owner.repositoryId ||
           exact.worktreePath !== owner.worktreePath ||
           exact.resource !== candidate.resource ||
-          exact.mode !== candidate.mode
+          exact.mode !== candidate.mode ||
+          exact.sharing?.kind !== candidate.sharing?.kind ||
+          exact.sharing?.groupId !== candidate.sharing?.groupId
         ) {
           throw claimError("CONTRADICTORY_CLAIM", "Claim identity is already bound to different canonical data", {
             claimId: candidate.claimId,
@@ -5625,6 +5823,146 @@ export class SessionRegistry {
       allowLegacyClaimSchema,
       (left, right, generation, records) => this.coordinationFacts(left, right, generation, records),
     );
+  }
+
+  private readResourceHandoffSnapshot(): ResourceHandoffSnapshot {
+    const state = this.readStateUnsafe();
+    const sessions: ResourceHandoffSession[] = state.sessions.map((session) => ({
+      sessionId: session.sessionId,
+      repositoryId: session.repositoryId,
+      worktreePath: session.worktreePath,
+      state: session.state,
+      ...(session.workingSet === undefined ? {} : { maxScope: session.workingSet.scope }),
+    }));
+    return {
+      schemaVersion: RESOURCE_HANDOFF_SCHEMA_VERSION,
+      operation: RESOURCE_HANDOFF_OPERATION,
+      registry: {
+        repositoryId: this.repository.repositoryId,
+        claimSetGeneration: state.claimSetGeneration,
+        sessions,
+        claims: state.claims,
+        completedOperations: [...this.resourceHandoffOperations.values()],
+      },
+    };
+  }
+
+  private defaultResourceHandoffExecution(): ResourceHandoffFenceController {
+    return {
+      fence: ({ sessionId, operationId }): ResourceHandoffFence => {
+        const record = this.get(sessionId);
+        if (record === undefined) {
+          throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+        }
+        if (record.state !== "active") {
+          throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Session is not active: ${sessionId}`, {
+            sessionId,
+            state: record.state,
+          });
+        }
+        return Object.freeze({
+          schemaVersion: RESOURCE_HANDOFF_SCHEMA_VERSION,
+          sessionId,
+          operationId,
+          epoch: this.getClaimSetGeneration(),
+          accepting: false,
+          status: "fenced",
+        });
+      },
+      awaitQuiescence: (fence): ResourceHandoffQuiescence => {
+        const state = this.readStateUnsafe();
+        if (state.runtimeRecords.records.executions !== undefined) {
+          return Object.freeze({
+            sessionId: fence.sessionId,
+            operationId: fence.operationId,
+            epoch: fence.epoch,
+            status: "unknown",
+            activeExecutionIds: [],
+            unknownExecutionIds: state.runtimeRecords.records.executions
+              .filter((execution) => execution.session_id === fence.sessionId)
+              .map((execution) => String(execution.execution_id ?? "unknown")),
+          });
+        }
+        return Object.freeze({
+          sessionId: fence.sessionId,
+          operationId: fence.operationId,
+          epoch: fence.epoch,
+          status: "quiescent",
+          activeExecutionIds: [],
+          unknownExecutionIds: [],
+        });
+      },
+    };
+  }
+
+  private commitResourceHandoff(input: ResourceHandoffCommitInput): ResourceHandoffCommitResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      if (state.claimSetGeneration !== input.normalized.claimSetGeneration) {
+        throw new SessionRegistryError(
+          "STALE_CLAIM_SET",
+          "Claim-set generation changed before resource handoff commit",
+          {
+            expectedClaimSetGeneration: input.normalized.claimSetGeneration,
+            actualClaimSetGeneration: state.claimSetGeneration,
+          },
+        );
+      }
+      const sourceClaim = state.claims.find(
+        (claim) => claim.sessionId === input.normalized.fromSessionId && claim.resource === input.normalized.resource,
+      );
+      if (sourceClaim === undefined) {
+        throw new SessionRegistryError("MISSING_RESOURCE_CLAIM", "Source does not own the exact resource claim", {
+          resource: input.normalized.resource,
+          sessionId: input.normalized.fromSessionId,
+        });
+      }
+      const destinationRecord = state.sessions.find((session) => session.sessionId === input.normalized.toSessionId);
+      if (destinationRecord === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", "Destination session was not found", {
+          sessionId: input.normalized.toSessionId,
+        });
+      }
+      const destinationOwner = this.claimOwner(
+        state.sessions,
+        destinationRecord.sessionId,
+        this.repository.repositoryId,
+      );
+      const destinationClaim = createResourceClaim(
+        {
+          resource: input.normalized.resource,
+          mode: input.normalized.mode,
+        },
+        destinationOwner,
+        toTimestamp(this.clock()),
+      );
+      const remaining = state.claims.filter((claim) => claim.claimId !== sourceClaim.claimId);
+      this.validateRequestedClaims(
+        [destinationClaim],
+        destinationOwner,
+        remaining,
+        state.sessions,
+        state.claimSetGeneration,
+        (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+      );
+      const nextClaims = sortResourceClaims([...remaining, destinationClaim]);
+      const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+      this.writeUnsafe(
+        state.sessions,
+        nextClaims,
+        claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        state.runtimeRecords,
+      );
+      return Object.freeze({
+        status: "transferred" as const,
+        operationId: input.normalized.operationId,
+        claimSetGeneration,
+        sourceClaim: cloneResourceClaim(sourceClaim),
+        destinationClaim: cloneResourceClaim(destinationClaim),
+      });
+    });
   }
 
   private readUnsafe(): readonly SessionRecord[] {

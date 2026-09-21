@@ -6,6 +6,15 @@ import type {
 } from "../session-lifecycle-classification.js";
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
+import type { SharedWriteBinding } from "../resource-claims.js";
+import type { CoordinationPreviewOptions, CoordinationPreviewResult } from "../coordination-preview.js";
+import type {
+  CoordinationContractInput,
+  ResourceCoordinationSnapshot,
+  ResourceCoordinationSnapshotBounds,
+} from "../resource-coordination-snapshot.js";
+import type { HandoffResourcesOptions, ResourceHandoffResult } from "../resource-handoff.js";
+import type { CoordinationTransactionRequest, CoordinationTransactionResult } from "../coordination-transactions.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -84,6 +93,7 @@ export type ResourceClaim = {
   worktree: string;
   resource: string;
   mode: ResourceClaimMode;
+  sharing?: SharedWriteBinding;
   created_at: string;
   updated_at: string;
 };
@@ -94,6 +104,7 @@ export type ResourceClaimInput = {
   repository?: string | null;
   session_id?: string | null;
   worktree?: string | null;
+  sharing?: SharedWriteBinding;
 };
 
 export type ClaimResourcesOptions = {
@@ -108,7 +119,8 @@ export type UpdateClaimsOptions = ClaimResourcesOptions & {
 };
 
 export type ResourceClaimDelta =
-  { kind: "upsert"; resource: string; mode: ResourceClaimMode } | { kind: "release"; resource: string };
+  | { kind: "upsert"; resource: string; mode: ResourceClaimMode; sharing?: SharedWriteBinding }
+  | { kind: "release"; resource: string };
 
 export type ClaimDeltasOptions = {
   session_id: string | null;
@@ -166,6 +178,16 @@ export type ClaimDeltasResult = {
   unchanged: UnchangedClaimDelta[];
   idempotent: boolean;
 };
+
+export type CoordinationPreview = CoordinationPreviewResult;
+export type ResourceHandoff = ResourceHandoffResult;
+
+export type ResourceCoordinationSnapshotOptions = {
+  contract: CoordinationContractInput;
+  bounds?: ResourceCoordinationSnapshotBounds;
+};
+
+export type CoordinationTransaction = CoordinationTransactionResult;
 
 export type SessionCloseOptions = {
   session_id: string | null;
@@ -880,6 +902,19 @@ export interface SessionBackend {
   claimResources?(context: SessionContext, options: ClaimResourcesOptions): Promise<DomainResult<ClaimResourcesResult>>;
   updateClaims?(context: SessionContext, options: UpdateClaimsOptions): Promise<DomainResult<ClaimResourcesResult>>;
   applyClaimDeltas?(context: SessionContext, options: ClaimDeltasOptions): Promise<DomainResult<ClaimDeltasResult>>;
+  coordinationPreview?(
+    context: SessionContext,
+    options: CoordinationPreviewOptions,
+  ): Promise<DomainResult<CoordinationPreview>>;
+  resourceCoordinationSnapshot?(
+    context: SessionContext,
+    options: ResourceCoordinationSnapshotOptions,
+  ): Promise<DomainResult<ResourceCoordinationSnapshot>>;
+  handoffResources?(context: SessionContext, options: HandoffResourcesOptions): Promise<DomainResult<ResourceHandoff>>;
+  applyCoordinationTransaction?(
+    context: SessionContext,
+    request: CoordinationTransactionRequest,
+  ): Promise<DomainResult<CoordinationTransaction>>;
   releaseClaims?(context: SessionContext, options: ReleaseClaimsOptions): Promise<DomainResult<ReleaseClaimsResult>>;
   listClaims?(
     context: SessionContext,

@@ -768,6 +768,8 @@ test("canonical command registry resolves aliases without duplicating option def
     "resource mutate",
     "session transition",
     "resource transition",
+    "session coordination preview",
+    "session handoff",
     "session claims",
     "resource list",
     "resource claims",
@@ -794,7 +796,7 @@ test("dispatcher command and option inventory is structurally bound to the canon
   assert.doesNotThrow(() => validateCliRegistryParity());
   assert.deepEqual(
     [...dispatcherAllowedOptions("resource update")],
-    ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
+    ["--resource", "--mode", "--sharing-group", "--if-generation", "--force", "--session", "--repository"],
   );
   assert.deepEqual([...dispatcherAllowedOptions("session exec")], ["--session", "--runtime-policy"]);
 });
@@ -847,7 +849,7 @@ test("resource claim discovery projects the required canonical options through i
   assert.equal(alias.help_for, "resource claim");
   assert.equal(alias.canonical_command, "session claim");
   assert.deepEqual(canonical.required_options, ["--resource", "--mode"]);
-  assert.deepEqual(canonical.optional_options, ["--session", "--repository"]);
+  assert.deepEqual(canonical.optional_options, ["--sharing-group", "--session", "--repository"]);
   assert.deepEqual(
     alias.options.map((option) => option.name),
     canonical.options.map((option) => option.name),
@@ -1060,6 +1062,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "resource mutate",
       "session transition",
       "resource transition",
+      "session coordination preview",
+      "session handoff",
       "session claims",
       "resource list",
       "resource claims",
@@ -1107,10 +1111,22 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--runtime-policy",
       "--limit",
       "--offset",
+      "--sharing-group",
       "--if-generation",
       "--force",
       "--upsert-resource",
       "--release-resource",
+      "--left",
+      "--right",
+      "--patch",
+      "--read-authorized",
+      "--operator-authorized",
+      "--allowed-read-path",
+      "--max-bytes",
+      "--max-hunks",
+      "--from",
+      "--to",
+      "--operation-id",
       "--claim-id",
       "--fetch-remote",
       "--fetch-branch",
@@ -1141,6 +1157,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
         "update",
         "mutate",
         "transition",
+        "coordination preview",
+        "handoff",
         "claims",
         "release",
         "close",
