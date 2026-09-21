@@ -39,11 +39,11 @@ export type CliCommandDefinition = {
   readonly notes?: readonly string[];
 };
 
-export const GLOBAL_HELP_OPTIONS: readonly CliHelpOptionSpec[] = [
+export const GLOBAL_HELP_OPTIONS = [
   { name: "--json", description: "Emit one stable JSON document on stdout" },
   { name: "--help", aliases: ["-h"], description: "Show command-specific help" },
   { name: "--version", description: "Print the installed version" },
-];
+] as const satisfies readonly CliHelpOptionSpec[];
 
 /**
  * `const` type parameters keep every literal passed at each call site (the
@@ -712,6 +712,7 @@ const REGISTRY_DATA = [
 export type CommandId = (typeof REGISTRY_DATA)[number]["name"];
 
 type RegistryOption = (typeof REGISTRY_DATA)[number]["options"][number];
+type GlobalRegistryOption = (typeof GLOBAL_HELP_OPTIONS)[number];
 
 /** Extracts an option's declared `aliases` literals, or `never` when absent. */
 type OptionAliasIds<Option> = Option extends { readonly aliases: infer Aliases }
@@ -724,7 +725,11 @@ type OptionAliasIds<Option> = Option extends { readonly aliases: infer Aliases }
  * Stable canonical option identity across every command, derived from the
  * registry itself: every option's own flag plus every declared alias.
  */
-export type OptionId = RegistryOption["name"] | OptionAliasIds<RegistryOption>;
+export type OptionId =
+  | RegistryOption["name"]
+  | OptionAliasIds<RegistryOption>
+  | GlobalRegistryOption["name"]
+  | OptionAliasIds<GlobalRegistryOption>;
 
 export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = REGISTRY_DATA;
 
