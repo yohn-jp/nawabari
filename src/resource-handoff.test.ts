@@ -133,6 +133,12 @@ test("rejects duplicate sessions and invalid persisted claim schema, mode, and t
   };
 
   assertRegistryCorrupt(snapshot({ sessions: [session("source"), session("source")] }));
+  for (const worktreePath of ["worktrees/source", "/worktrees/./source", "/worktrees/source/../source"]) {
+    assertRegistryCorrupt(
+      // The malformed identity must be rejected before ownership can be reported as allowed.
+      snapshot({ sessions: [{ ...session("source"), worktreePath }, session("destination")] }),
+    );
+  }
   assertRegistryCorrupt(snapshot({ claims: [{ ...claim("source", "src/owned.ts"), schemaVersion: 2 as 3 }] }));
   assertRegistryCorrupt(
     snapshot({ claims: [{ ...claim("source", "src/owned.ts"), mode: "invalid" as ResourceClaim["mode"] }] }),
@@ -157,6 +163,34 @@ test("rejects duplicate sessions and invalid persisted claim schema, mode, and t
       claims: [
         claim("source", "src/owned.ts"),
         { ...claim("destination", "src/other.ts"), claimId: claim("source", "src/owned.ts").claimId },
+      ],
+    }),
+  );
+  assertRegistryCorrupt(
+    snapshot({
+      completedOperations: [
+        {
+          operationId: "operation-1",
+          fromSessionId: "source",
+          toSessionId: "destination",
+          resource: "src/owned.ts",
+          mode: "invalid" as ResourceClaim["mode"],
+          claimSetGeneration: 5,
+        },
+      ],
+    }),
+  );
+  assertRegistryCorrupt(
+    snapshot({
+      completedOperations: [
+        {
+          operationId: "operation-1",
+          fromSessionId: "source",
+          toSessionId: "destination",
+          resource: "src/owned.ts",
+          mode: "write",
+          claimSetGeneration: -1,
+        },
       ],
     }),
   );

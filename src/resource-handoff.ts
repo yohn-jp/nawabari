@@ -691,7 +691,7 @@ function assertSnapshot(snapshot: ResourceHandoffSnapshot): void {
       !isRecord(session) ||
       !boundedText(session.sessionId, MAX_SESSION_ID_LENGTH) ||
       !boundedText(session.repositoryId, MAX_SESSION_ID_LENGTH) ||
-      !boundedText(session.worktreePath, MAX_RESOURCE_LENGTH) ||
+      !canonicalAbsolutePath(session.worktreePath) ||
       !boundedText(session.state, MAX_SESSION_ID_LENGTH)
     ) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff snapshot contains an invalid session");
@@ -728,6 +728,8 @@ function assertSnapshot(snapshot: ResourceHandoffSnapshot): void {
         !boundedText(operation.fromSessionId, MAX_SESSION_ID_LENGTH) ||
         !boundedText(operation.toSessionId, MAX_SESSION_ID_LENGTH) ||
         !boundedText(operation.resource, MAX_RESOURCE_LENGTH) ||
+        !isResourceClaimMode(operation.mode) ||
+        !isNonnegativeSafeInteger(operation.claimSetGeneration) ||
         operationIds.has(operation.operationId)
       ) {
         throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff operation history is invalid");
@@ -1069,6 +1071,10 @@ function boundedText(value: unknown, maxLength: number): value is string {
   return (
     typeof value === "string" && value.length > 0 && value.length <= maxLength && !/[\u0000-\u001f\u007f]/u.test(value)
   );
+}
+
+function isNonnegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function canonicalTimestamp(value: unknown): value is string {
