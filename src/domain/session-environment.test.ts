@@ -17,6 +17,7 @@ import {
   compileSessionEnvironment,
   materializeSessionRuntimeDirectories,
   serializeSessionRuntimeDirectoryManifest,
+  validateSessionRuntimeDirectoryManifest,
 } from "./session-environment.js";
 
 function profileInput(cache: "session" | "shared-read-only" = "session"): Record<string, unknown> {
@@ -124,6 +125,52 @@ test("requires an explicit shared cache and marks it read-only", () => {
     fs.mkdirSync(path.join(root, "shared-cache"), { mode: 0o700 });
     const materialized = materializeSessionRuntimeDirectories(result.value.manifest);
     assert.equal(materialized.ok, true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects ancestor and descendant overlap between lifecycle roots", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-session-environment-"));
+  try {
+    const executionInsideSession = identity(root);
+    executionInsideSession.execution_root = path.join(root, "session", "execution");
+    const nestedExecution = compileSessionEnvironment(profileInput(), executionInsideSession);
+    assert.equal(nestedExecution.ok, false);
+
+    const sessionInsideExecution = identity(root);
+    sessionInsideExecution.session_root = path.join(root, "execution", "session");
+    const nestedSession = compileSessionEnvironment(profileInput(), sessionInsideExecution);
+    assert.equal(nestedSession.ok, false);
+
+    const sharedCacheInsideSession = identity(root, true);
+    sharedCacheInsideSession.shared_cache_root = path.join(root, "session", "shared-cache");
+    const nestedCache = compileSessionEnvironment(profileInput("shared-read-only"), sharedCacheInsideSession);
+    assert.equal(nestedCache.ok, false);
+
+    const compiled = compileSessionEnvironment(profileInput(), identity(root));
+    assert.equal(compiled.ok, true);
+    if (!compiled.ok) return;
+    const forged = structuredClone(compiled.value.manifest) as Record<string, unknown>;
+    const execution = forged.execution as Record<string, unknown>;
+    const executionRoot = execution.root as Record<string, unknown>;
+    const executionTmp = execution.tmp as Record<string, unknown>;
+    const nestedPath = path.join(compiled.value.manifest.session.home.path, "execution");
+    executionRoot.path = nestedPath;
+    executionTmp.path = nestedPath;
+    const rejectedManifest = validateSessionRuntimeDirectoryManifest(forged);
+    assert.equal(rejectedManifest.ok, false);
+
+    const sharedCompiled = compileSessionEnvironment(profileInput("shared-read-only"), identity(root, true));
+    assert.equal(sharedCompiled.ok, true);
+    if (!sharedCompiled.ok) return;
+    const forgedShared = structuredClone(sharedCompiled.value.manifest) as Record<string, unknown>;
+    const session = forgedShared.session as Record<string, unknown>;
+    const xdg = session.xdg as Record<string, unknown>;
+    const cache = xdg.cache as Record<string, unknown>;
+    cache.path = path.join(sharedCompiled.value.manifest.session.home.path, "shared-cache");
+    const rejectedSharedManifest = validateSessionRuntimeDirectoryManifest(forgedShared);
+    assert.equal(rejectedSharedManifest.ok, false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

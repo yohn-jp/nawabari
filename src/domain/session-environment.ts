@@ -206,6 +206,10 @@ function isBelow(parent: string, candidate: string): boolean {
   return relative.length > 0 && relative !== ".." && !relative.startsWith("../") && !path.posix.isAbsolute(relative);
 }
 
+function pathsOverlap(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
 function directory(
   value: unknown,
   field: string,
@@ -321,9 +325,9 @@ function validateManifest(input: unknown): DomainResult<SessionRuntimeDirectoryM
   const tmp = directory(input.execution.tmp, "execution.tmp", "execution", "ephemeral", "read-write");
   if (!tmp.ok) return tmp;
   if (tmp.value.path !== executionRoot.value.path) return ambiguous("execution.tmp", "must be the execution root");
-  if (executionRoot.value.path === sessionRoot.value.path) {
-    return ambiguous("execution.root", "must not be the durable session root");
-  }
+  const sharedCachePath = cache.value.scope === "shared-read-only" ? cache.value.path : undefined;
+  const roots = assertDistinctRoots(sessionRoot.value.path, executionRoot.value.path, sharedCachePath);
+  if (!roots.ok) return roots;
 
   const all = [home.value, config.value, cache.value, data.value, state.value, tmp.value];
   const paths = new Set<string>();
@@ -355,10 +359,14 @@ function assertDistinctRoots(
   sharedCacheRoot: string | undefined,
 ): DomainResult<null> {
   const roots = [sessionRoot, executionRoot, ...(sharedCacheRoot === undefined ? [] : [sharedCacheRoot])];
-  const seen = new Set<string>();
-  for (const root of roots) {
-    if (seen.has(root)) return ambiguous("identity", "directory roots must be distinct", root);
-    seen.add(root);
+  for (let index = 0; index < roots.length; index += 1) {
+    const root = roots[index] as string;
+    for (let otherIndex = index + 1; otherIndex < roots.length; otherIndex += 1) {
+      const other = roots[otherIndex] as string;
+      if (pathsOverlap(root, other)) {
+        return ambiguous("identity", "directory roots must not overlap", `${root}:${other}`);
+      }
+    }
   }
   return success(null);
 }
