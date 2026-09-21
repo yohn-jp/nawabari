@@ -439,6 +439,9 @@ function validateSharing(
   mode: ResourceClaimMode,
 ): SharedWriteBinding | undefined {
   if (sharing === undefined) return undefined;
+  if (!isRecord(sharing)) {
+    throw claimError("INVALID_CLAIM", "Coordinated write binding is invalid");
+  }
   if (
     mode !== "write" ||
     sharing.kind !== RESOURCE_CLAIM_SHARING_KIND ||

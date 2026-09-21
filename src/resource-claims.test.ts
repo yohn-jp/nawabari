@@ -13,6 +13,7 @@ import {
   canonicalizeClaimResource,
   canonicalizeConcretePath,
   canonicalClaimId,
+  canonicalizeClaimInput,
   classifyResourceClaimTransition,
   claimsConflict,
   createResourceClaim,
@@ -40,6 +41,22 @@ test("canonical claim ids preserve the no-sharing digest input and delimit shari
     canonicalClaimId(sessionId, resource, mode, { kind: "isolated-worktree", groupId: "group" }),
     `claim-${digest(`${sessionId}\u0000${mode}\u0000${resource}\u0000isolated-worktree\u0000group`)}`,
   );
+});
+
+test("rejects malformed coordinated write bindings as invalid claims", () => {
+  const owner = {
+    sessionId: "session",
+    repositoryId: "/repo/.git",
+    worktreePath: "/repo",
+    state: "active",
+  };
+
+  for (const sharing of [null, "invalid"]) {
+    assertRegistryError(
+      () => canonicalizeClaimInput({ resource: "README.md", mode: "write", sharing } as never, owner),
+      "INVALID_CLAIM",
+    );
+  }
 });
 
 test("defines every overlapping mode combination in the compatibility matrix", () => {
