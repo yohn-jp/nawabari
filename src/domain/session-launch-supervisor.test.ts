@@ -97,7 +97,16 @@ function packet(overrides: Partial<SessionLaunchSupervisorPacket> = {}): Session
         assert.equal(pid, 4242);
         return success(null);
       },
-      cleanup_scope: () => success({ removed: true }),
+      cleanup_scope: () =>
+        success({
+          removed: true,
+          after_population: {
+            state: "empty",
+            populated: false,
+            processes: [],
+            events: { populated: 0 },
+          },
+        }),
     },
     ...overrides,
   };
