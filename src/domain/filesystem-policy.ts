@@ -96,11 +96,14 @@ export type EffectiveFilesystemPolicyInputs = Readonly<{
   /** Runtime epoch is intentionally explicit; host observation is not performed here. */
   readonly runtime_epoch?: number | string | null;
   readonly runtimeEpoch?: number | string | null;
+  readonly runtime_status?: FilesystemPolicyBoundaryStatus;
   readonly runtime?: { readonly epoch?: number | string | null; readonly status?: FilesystemPolicyBoundaryStatus };
   /** Backend CREATE/DELETE/rename requirements are a separate authority. */
   readonly backend_requirements?: readonly FilesystemBackendRequirement[] | unknown;
   readonly backendRequirements?: readonly FilesystemBackendRequirement[] | unknown;
   readonly repository?: RepositoryIdentity;
+  readonly worktree_path?: string;
+  readonly worktreePath?: string;
 }>;
 
 type CompiledBoundary = Readonly<{
@@ -231,6 +234,7 @@ function normalizePath(value: unknown, field: string, selectedDomain: EffectiveF
   if (!parsed.ok) return parsed;
   const normalized = parsed.value.replaceAll("\\", "/");
   const absolute = normalized.startsWith("/");
+  if (/^[A-Za-z]:/u.test(normalized)) return invalid(field, "drive-qualified paths are not canonical namespace paths");
   if (selectedDomain === "repository") {
     const relative = normalized.replace(/^\.\//u, "");
     if (
@@ -243,7 +247,8 @@ function normalizePath(value: unknown, field: string, selectedDomain: EffectiveF
     }
     return success(relative);
   }
-  if (!absolute || normalized.includes("//") || normalized.split("/").some((part) => part === "..")) {
+  const segments = normalized.split("/").slice(1);
+  if (!absolute || normalized.includes("//") || segments.some((part) => part === "" || part === "." || part === "..")) {
     return invalid(field, "expected a normalized absolute projection path");
   }
   return success(normalized);
@@ -493,6 +498,8 @@ function workingSetBoundary(value: unknown): DomainResult<CompiledBoundary> {
     return invalid("working_set", "applied working set requires the canonical contract identity");
   if (typeof value.id !== "string" || value.id.length === 0)
     return invalid("working_set.id", "applied working set requires an identity");
+  const repository = repositoryIdentity(value.repository, "working_set.repository");
+  if (!repository.ok) return repository;
   const scopeValue = value.scope ?? value;
   const scope = scopeFromValue(scopeValue, "working_set.scope");
   if (!scope.ok) return scope;
@@ -609,17 +616,81 @@ function backendBoundary(value: unknown): DomainResult<CompiledBackendAuthority>
   );
 }
 
-function readInputValue(inputs: UnknownRecord, ...keys: string[]): unknown {
-  for (const key of keys) if (inputs[key] !== undefined) return inputs[key];
-  return undefined;
+function readAliasedValue(inputs: UnknownRecord, field: string, keys: readonly string[]): DomainResult<unknown> {
+  const supplied = keys
+    .filter((key) => Object.prototype.hasOwnProperty.call(inputs, key) && inputs[key] !== undefined)
+    .map((key) => ({ key, value: inputs[key] }));
+  if (supplied.length === 0) return success(undefined);
+  const canonical = stableJson(supplied[0]?.value);
+  if (supplied.some((entry) => stableJson(entry.value) !== canonical)) {
+    return invalid(field, `conflicting aliases '${supplied.map((entry) => entry.key).join("', '")}'`);
+  }
+  return success(supplied[0]?.value);
 }
 
 function runtimeEpoch(inputs: UnknownRecord): DomainResult<number | string | null> {
+  if (inputs.runtime !== undefined && !isRecord(inputs.runtime))
+    return invalid("runtime", "expected a runtime authority object");
   const runtime = isRecord(inputs.runtime) ? inputs.runtime : undefined;
-  const value = readInputValue(inputs, "runtime_epoch", "runtimeEpoch") ?? runtime?.epoch;
+  const topLevel = readAliasedValue(inputs, "runtime_epoch", ["runtime_epoch", "runtimeEpoch"]);
+  if (!topLevel.ok) return topLevel;
+  const values = [topLevel.value, runtime?.epoch].filter((value): value is unknown => value !== undefined);
+  if (values.length > 1 && values.some((value) => stableJson(value) !== stableJson(values[0]))) {
+    return invalid("runtime_epoch", "conflicting runtime epoch authorities");
+  }
+  const value = values[0] ?? null;
   if (value === undefined || value === null) return success(null);
   if (typeof value === "number") return positiveInteger(value, "runtime_epoch");
   return text(value, "runtime_epoch");
+}
+
+function runtimeStatus(inputs: UnknownRecord): DomainResult<FilesystemPolicyBoundaryStatus> {
+  if (inputs.runtime !== undefined && !isRecord(inputs.runtime))
+    return invalid("runtime", "expected a runtime authority object");
+  const runtime = isRecord(inputs.runtime) ? inputs.runtime : undefined;
+  const values = [inputs.runtime_status, runtime?.status].filter((value): value is unknown => value !== undefined);
+  if (values.length > 1 && values.some((value) => stableJson(value) !== stableJson(values[0]))) {
+    return invalid("runtime_status", "conflicting runtime status authorities");
+  }
+  return boundaryStatus(values[0], "runtime_status", "applied");
+}
+
+type FilesystemRepositoryIdentity = Readonly<{
+  readonly repositoryHost: string;
+  readonly repositoryId: string;
+}>;
+
+function repositoryIdentity(value: unknown, field: string): DomainResult<FilesystemRepositoryIdentity> {
+  if (!isRecord(value)) return invalid(field, "expected a repository identity object");
+  const host = text(value.repositoryHost, `${field}.repositoryHost`);
+  if (!host.ok) return host;
+  const id = text(value.repositoryId, `${field}.repositoryId`);
+  if (!id.ok) return id;
+  return success(Object.freeze({ repositoryHost: host.value, repositoryId: id.value }));
+}
+
+function currentRepository(inputs: UnknownRecord): DomainResult<FilesystemRepositoryIdentity | null> {
+  if (inputs.repository === undefined) return success(null);
+  return repositoryIdentity(inputs.repository, "repository");
+}
+
+function currentWorktree(inputs: UnknownRecord): DomainResult<string | null> {
+  const selected = readAliasedValue(inputs, "worktree_path", ["worktree_path", "worktreePath"]);
+  if (!selected.ok) return selected;
+  if (selected.value === undefined) return success(null);
+  if (
+    typeof selected.value !== "string" ||
+    !path.isAbsolute(selected.value) ||
+    path.normalize(selected.value) !== selected.value ||
+    selected.value.includes("\u0000")
+  ) {
+    return invalid("worktree_path", "expected an absolute normalized worktree identity");
+  }
+  return success(selected.value);
+}
+
+function sameRepository(left: FilesystemRepositoryIdentity, right: FilesystemRepositoryIdentity): boolean {
+  return left.repositoryHost === right.repositoryHost && left.repositoryId === right.repositoryId;
 }
 
 function selectorMatches(
@@ -687,11 +758,39 @@ function policyDigest(policy: Omit<EffectiveFilesystemPolicy, "digest">): string
 
 function compileInputs(input: unknown): DomainResult<EffectiveFilesystemPolicy> {
   if (!isRecord(input)) return invalid("inputs", "expected an object");
-  const profile = compileBoundary(readInputValue(input, "profile", "worktree_profile", "worktreeProfile"), "profile");
+  const currentRepo = currentRepository(input);
+  if (!currentRepo.ok) return currentRepo;
+  const currentWt = currentWorktree(input);
+  if (!currentWt.ok) return currentWt;
+  const profileInput = readAliasedValue(input, "profile", ["profile", "worktree_profile", "worktreeProfile"]);
+  if (!profileInput.ok) return profileInput;
+  const profile = compileBoundary(profileInput.value, "profile");
   if (!profile.ok) return profile;
-  const workingSet = workingSetBoundary(readInputValue(input, "working_set", "workingSet"));
+  const workingSetInput = readAliasedValue(input, "working_set", ["working_set", "workingSet"]);
+  if (!workingSetInput.ok) return workingSetInput;
+  const workingSet = workingSetBoundary(workingSetInput.value);
   if (!workingSet.ok) return workingSet;
-  const claimSource = readInputValue(input, "claims", "resource_claims");
+  if (workingSet.value.status === "applied") {
+    if (currentRepo.value === null)
+      return invalid("repository", "applied working set requires the current repository identity");
+    if (currentWt.value === null)
+      return invalid("worktree_path", "applied working set requires the current worktree identity");
+    if (!isRecord(workingSetInput.value)) return invalid("working_set", "applied working set identity is missing");
+    const workingSetRepo = repositoryIdentity(workingSetInput.value.repository, "working_set.repository");
+    if (!workingSetRepo.ok) return workingSetRepo;
+    if (!sameRepository(currentRepo.value, workingSetRepo.value))
+      return invalid("working_set.repository", "working set belongs to a different repository");
+    const workingSetWorktree = readAliasedValue(workingSetInput.value, "working_set.worktree_path", [
+      "worktree_path",
+      "worktreePath",
+    ]);
+    if (!workingSetWorktree.ok) return workingSetWorktree;
+    if (workingSetWorktree.value !== undefined && workingSetWorktree.value !== currentWt.value)
+      return invalid("working_set.worktree_path", "working set belongs to a different worktree");
+  }
+  const claimSourceInput = readAliasedValue(input, "claims", ["claims", "resource_claims"]);
+  if (!claimSourceInput.ok) return claimSourceInput;
+  const claimSource = claimSourceInput.value;
   const claimRecord = isRecord(claimSource) ? claimSource : undefined;
   const claimValue = claimRecord === undefined ? claimSource : (claimRecord.claims ?? claimRecord.items);
   const claims = claimsArray(claimValue, "claims");
@@ -702,30 +801,50 @@ function compileInputs(input: unknown): DomainResult<EffectiveFilesystemPolicy> 
     claimSource === undefined ? "unapplied-legacy" : "applied",
   );
   if (!claimStatusResult.ok) return claimStatusResult;
-  const generation = claimGeneration(
-    readInputValue(input, "claim_set_generation", "claimSetGeneration") ?? claimRecord?.generation,
+  const generationInput = readAliasedValue(input, "claim_set_generation", [
     "claim_set_generation",
-  );
+    "claimSetGeneration",
+  ]);
+  if (!generationInput.ok) return generationInput;
+  const generation = claimGeneration(generationInput.value ?? claimRecord?.generation, "claim_set_generation");
   if (!generation.ok) return generation;
   const runtime = runtimeEpoch(input);
   if (!runtime.ok) return runtime;
-  const runtimeStatus = isRecord(input.runtime) ? input.runtime.status : undefined;
+  const runtimeStatusResult = runtimeStatus(input);
+  if (!runtimeStatusResult.ok) return runtimeStatusResult;
+  const runtimeStatusValue = runtimeStatusResult.value;
   const claimStatus = claimStatusResult.value;
   if (claimStatus === "applied" && generation.value === null)
     return invalid("claim_set_generation", "applied claims require a generation");
+  if (claimStatus === "applied") {
+    if (currentRepo.value === null)
+      return invalid("repository", "applied claims require the current repository identity");
+    if (currentWt.value === null)
+      return invalid("worktree_path", "applied claims require the current worktree identity");
+    for (const [index, claim] of claims.value.entries()) {
+      if (claim.repositoryId !== currentRepo.value.repositoryId)
+        return invalid(`claims[${index}].repositoryId`, "claim belongs to a different repository");
+      if (claim.worktreePath !== currentWt.value)
+        return invalid(`claims[${index}].worktreePath`, "claim belongs to a different worktree");
+    }
+  }
   const claimAuthority: CompiledClaimAuthority = Object.freeze({
     status: claimStatus,
     generation: generation.value,
     claims: claims.value,
   });
-  const auxiliary = auxiliaryBoundary(readInputValue(input, "auxiliary_state", "auxiliaryState"));
+  const auxiliaryInput = readAliasedValue(input, "auxiliary_state", ["auxiliary_state", "auxiliaryState"]);
+  if (!auxiliaryInput.ok) return auxiliaryInput;
+  const auxiliary = auxiliaryBoundary(auxiliaryInput.value);
   if (!auxiliary.ok) return auxiliary;
-  const backend = backendBoundary(readInputValue(input, "backend_requirements", "backendRequirements"));
+  const backendInput = readAliasedValue(input, "backend_requirements", ["backend_requirements", "backendRequirements"]);
+  if (!backendInput.ok) return backendInput;
+  const backend = backendBoundary(backendInput.value);
   if (!backend.ok) return backend;
   const runtimeBoundary: CompiledBoundary = Object.freeze({
     ...profile.value,
-    status: runtimeStatus === "unknown" ? "unknown" : profile.value.status,
-    scope: runtimeStatus === "unknown" ? emptyScope() : profile.value.scope,
+    status: runtimeStatusValue === "unknown" ? "unknown" : profile.value.status,
+    scope: runtimeStatusValue === "unknown" ? emptyScope() : profile.value.scope,
     epoch: runtime.value,
   });
   const provenance = Object.freeze({
