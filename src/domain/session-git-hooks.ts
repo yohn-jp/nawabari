@@ -162,6 +162,16 @@ const MAX_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_HOOK_TIMEOUT_MS = 30_000;
 const MAX_HOOK_TIMEOUT_MS = 120_000;
 const MAX_ARGUMENTS = 128;
+const PROTECTED_ENVIRONMENT_KEYS = new Set([
+  "PATH",
+  "GIT_CONFIG_NOSYSTEM",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "NAWABARI_GOVERNED_HOOK",
+  "NAWABARI_HOOK_EVENT",
+  "NAWABARI_HOOK_DEPTH",
+  "NAWABARI_SESSION_ID",
+]);
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -487,8 +497,10 @@ export function resolveSessionHookSet(profileInput: unknown, materialInput: unkn
   );
 }
 
-function validateHookSet(input: SessionHookSet): DomainResult<SessionHookSet> {
+function validateHookSet(input: unknown): DomainResult<SessionHookSet> {
   if (!isRecord(input)) return invalid("hook_set", "expected a canonical hook set");
+  const keys = assertKeys(input, ["contract_id", "schema_version", "mode", "hooks_path", "hooks"], "hook_set");
+  if (!keys.ok) return keys;
   if (input.contract_id !== SESSION_HOOK_SET_CONTRACT_ID || input.schema_version !== SESSION_HOOK_SET_SCHEMA_VERSION) {
     return invalid("hook_set", "contract identity is not canonical");
   }
@@ -500,21 +512,66 @@ function validateHookSet(input: SessionHookSet): DomainResult<SessionHookSet> {
     if (input.hooks.length !== 0 || input.hooks_path !== SESSION_GIT_DISABLED_HOOKS_PATH) {
       return ambiguous("hook_set", "disabled sets cannot carry executable hooks");
     }
-    return success(input);
+    return success(
+      Object.freeze({
+        contract_id: SESSION_HOOK_SET_CONTRACT_ID,
+        schema_version: SESSION_HOOK_SET_SCHEMA_VERSION,
+        mode: "disabled",
+        hooks_path: SESSION_GIT_DISABLED_HOOKS_PATH,
+        hooks: Object.freeze([]),
+      }),
+    );
   }
   if (input.hooks_path !== SESSION_GIT_HOOKS_PATH || input.hooks.length === 0) {
     return invalid("hook_set", "governed sets require the Nawabari hooks path and at least one hook");
   }
   const events = new Set<GovernedHookEvent>();
+  const hooks: SessionHook[] = [];
   for (const hook of input.hooks) {
     if (!isRecord(hook) || !GOVERNED_HOOK_EVENTS.includes(hook.event as GovernedHookEvent)) {
       return invalid("hook_set.hooks", "expected supported hook entries");
     }
+    const hookKeys = assertKeys(hook, ["event", "command", "argv", "material"], "hook_set.hooks");
+    if (!hookKeys.ok) return hookKeys;
     const event = hook.event as GovernedHookEvent;
     if (events.has(event)) return ambiguous("hook_set.hooks", "duplicate hook event", event);
+    const command = canonicalTarget(hook.command, "hook_set.hooks.command");
+    if (!command.ok) return command;
+    if (!Array.isArray(hook.argv) || hook.argv.length !== 1 || hook.argv[0] !== event) {
+      return invalid("hook_set.hooks.argv", "must contain exactly the fixed event argument", event);
+    }
+    const material = validateHookMaterial(hook.material);
+    if (!material.ok) return material;
+    if (material.value.target !== command.value) {
+      return ambiguous("hook_set.hooks.command", "command does not match the approved material target", command.value);
+    }
     events.add(event);
+    hooks.push(
+      Object.freeze({
+        event,
+        command: command.value,
+        argv: Object.freeze([event]) as readonly [GovernedHookEvent],
+        material: Object.freeze({
+          kind: material.value.kind,
+          source: material.value.source,
+          target: material.value.target,
+          digest: material.value.digest,
+          ...(material.value.kind === "provider"
+            ? { provider: material.value.provider }
+            : { path: material.value.path }),
+        }),
+      }),
+    );
   }
-  return success(input);
+  return success(
+    Object.freeze({
+      contract_id: SESSION_HOOK_SET_CONTRACT_ID,
+      schema_version: SESSION_HOOK_SET_SCHEMA_VERSION,
+      mode: "governed",
+      hooks_path: SESSION_GIT_HOOKS_PATH,
+      hooks: Object.freeze(hooks),
+    }),
+  );
 }
 
 function safeOutput(value: string | Buffer | null | undefined): string {
@@ -581,6 +638,9 @@ function validateHookContext(input: GovernedHookContext): DomainResult<GovernedH
     for (const [key, value] of Object.entries(input.environment)) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key))
         return invalid("context.environment", "environment key is invalid", key);
+      if (PROTECTED_ENVIRONMENT_KEYS.has(key)) {
+        return invalid("context.environment", "protected environment keys cannot be overridden", key);
+      }
       const parsed = validHookArgument(value, `context.environment.${key}`);
       if (!parsed.ok) return parsed;
     }
@@ -647,6 +707,7 @@ export function runGovernedHook(
   if (!material.ok) return material;
   const suppliedArguments = context.value.argv ?? [];
   const env: NodeJS.ProcessEnv = {
+    ...(context.value.environment ?? {}),
     PATH: "/nawabari/bin",
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
@@ -655,7 +716,6 @@ export function runGovernedHook(
     NAWABARI_HOOK_EVENT: event,
     NAWABARI_HOOK_DEPTH: "1",
     NAWABARI_SESSION_ID: context.value.session_id,
-    ...(context.value.environment ?? {}),
   };
   const timeout = Math.min(context.value.timeout_ms ?? DEFAULT_HOOK_TIMEOUT_MS, MAX_HOOK_TIMEOUT_MS);
   let result: SpawnSyncReturns<string>;
@@ -709,16 +769,87 @@ export function runGovernedHook(
   return success(response);
 }
 
-/** Serialize the canonical session-private Git projection under `sandbox`. */
-export function serializeSessionGitConfig(input: unknown): DomainResult<string> {
+function validateSessionGitConfig(input: unknown): DomainResult<SessionGitConfig> {
   if (!isRecord(input)) return invalid("config", "expected a materialized session Git config");
+  const keys = assertKeys(
+    input,
+    [
+      "contract_id",
+      "schema_version",
+      "config",
+      "global_config",
+      "system_config",
+      "credential_helpers",
+      "identity_source",
+    ],
+    "config",
+  );
+  if (!keys.ok) return keys;
   if (
     input.contract_id !== SESSION_GIT_CONFIG_CONTRACT_ID ||
     input.schema_version !== SESSION_GIT_CONFIG_SCHEMA_VERSION
   ) {
     return invalid("config", "contract identity is not canonical");
   }
-  return success(JSON.stringify({ [SANDBOX_SERIALIZATION_KEY]: input }));
+  if (input.global_config !== "excluded" || input.system_config !== "excluded") {
+    return invalid("config", "host and system Git configuration must remain excluded");
+  }
+  if (input.credential_helpers !== "disabled") {
+    return invalid("config", "credential helpers must remain disabled");
+  }
+  if (!isRecord(input.config)) return invalid("config.config", "expected an explicit Git key allowlist");
+  const configKeys = assertKeys(input.config, ["core.hooksPath", "user.name", "user.email"], "config.config");
+  if (!configKeys.ok) return configKeys;
+  if (
+    input.config["core.hooksPath"] !== SESSION_GIT_HOOKS_PATH &&
+    input.config["core.hooksPath"] !== SESSION_GIT_DISABLED_HOOKS_PATH
+  ) {
+    return invalid("config.config.core.hooksPath", "expected the canonical session or disabled hooks path");
+  }
+  const name =
+    input.config["user.name"] === undefined
+      ? success<string | undefined>(undefined)
+      : boundedText(input.config["user.name"], "config.config.user.name");
+  if (!name.ok) return name;
+  const email =
+    input.config["user.email"] === undefined
+      ? success<string | undefined>(undefined)
+      : boundedText(input.config["user.email"], "config.config.user.email");
+  if (!email.ok) return email;
+  if (!isRecord(input.identity_source))
+    return invalid("config.identity_source", "expected per-key identity provenance");
+  const identityKeys = assertKeys(input.identity_source, ["name", "email"], "config.identity_source");
+  if (!identityKeys.ok) return identityKeys;
+  const identitySources = ["repository-local", "host-global", "unset"] as const;
+  if (!identitySources.includes(input.identity_source.name as (typeof identitySources)[number])) {
+    return invalid("config.identity_source.name", "expected a canonical identity source");
+  }
+  if (!identitySources.includes(input.identity_source.email as (typeof identitySources)[number])) {
+    return invalid("config.identity_source.email", "expected a canonical identity source");
+  }
+  const canonicalConfig: Record<string, string> = { "core.hooksPath": input.config["core.hooksPath"] as string };
+  if (name.value !== undefined) canonicalConfig["user.name"] = name.value;
+  if (email.value !== undefined) canonicalConfig["user.email"] = email.value;
+  return success(
+    Object.freeze({
+      contract_id: SESSION_GIT_CONFIG_CONTRACT_ID,
+      schema_version: SESSION_GIT_CONFIG_SCHEMA_VERSION,
+      config: Object.freeze(canonicalConfig) as SessionGitConfigValues,
+      global_config: "excluded",
+      system_config: "excluded",
+      credential_helpers: "disabled",
+      identity_source: Object.freeze({
+        name: input.identity_source.name as "repository-local" | "host-global" | "unset",
+        email: input.identity_source.email as "repository-local" | "host-global" | "unset",
+      }),
+    }),
+  );
+}
+
+/** Serialize the canonical session-private Git projection under `sandbox`. */
+export function serializeSessionGitConfig(input: unknown): DomainResult<string> {
+  const config = validateSessionGitConfig(input);
+  return config.ok ? success(JSON.stringify({ [SANDBOX_SERIALIZATION_KEY]: config.value })) : config;
 }
 
 /** JSON-safe contract descriptor for architecture and public-state consumers. */

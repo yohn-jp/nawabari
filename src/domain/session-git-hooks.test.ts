@@ -15,6 +15,7 @@ import {
   runGovernedHook,
   serializeSessionGitConfig,
   type GovernedHookRunner,
+  type SessionHookSet,
 } from "./session-git-hooks.js";
 import { STRICT_RUNTIME_POLICY } from "./runtime-projection.js";
 
@@ -186,6 +187,76 @@ test("governed execution is direct, deterministic, and passes stdin without shel
   }
 });
 
+test("protected execution environment keys cannot be overridden by hook context", () => {
+  const fixture = executableFixture();
+  try {
+    const resolved = resolveSessionHookSet(profile(), providerMaterial(fixture));
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    let spawned = false;
+    const result = runGovernedHook("pre-commit", {
+      hook_set: resolved.value,
+      session_id: "session-1",
+      cwd: "/tmp",
+      environment: { PATH: "/tmp/ambient", GIT_CONFIG_GLOBAL: "/tmp/global" },
+      runner: () => {
+        spawned = true;
+        throw new Error("must not run");
+      },
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "RUNTIME_PROFILE_INVALID");
+    assert.equal(spawned, false);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("execution rejects forged hook commands and argv even when the outer set looks canonical", () => {
+  const fixture = executableFixture();
+  try {
+    const resolved = resolveSessionHookSet(profile(), providerMaterial(fixture));
+    assert.equal(resolved.ok, true);
+    if (!resolved.ok) return;
+    let spawned = false;
+    const runner: GovernedHookRunner = () => {
+      spawned = true;
+      throw new Error("must not run");
+    };
+    const forgedCommand = {
+      ...resolved.value,
+      hooks: resolved.value.hooks.map((hook, index) =>
+        index === 0 ? { ...hook, command: "/nawabari/bin/forged" } : hook,
+      ),
+    };
+    const commandResult = runGovernedHook("pre-commit", {
+      hook_set: forgedCommand as unknown as SessionHookSet,
+      session_id: "session-1",
+      cwd: "/tmp",
+      runner,
+    });
+    assert.equal(commandResult.ok, false);
+    if (!commandResult.ok) assert.equal(commandResult.error.code, "RUNTIME_PROFILE_AMBIGUOUS");
+    const forgedArgv = {
+      ...resolved.value,
+      hooks: resolved.value.hooks.map((hook, index) =>
+        index === 0 ? { ...hook, argv: [hook.event, "--forged"] } : hook,
+      ),
+    };
+    const argvResult = runGovernedHook("pre-commit", {
+      hook_set: forgedArgv as unknown as SessionHookSet,
+      session_id: "session-1",
+      cwd: "/tmp",
+      runner,
+    });
+    assert.equal(argvResult.ok, false);
+    if (!argvResult.ok) assert.equal(argvResult.error.code, "RUNTIME_PROFILE_INVALID");
+    assert.equal(spawned, false);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("a held registry lock or nested hook rejects before spawning", () => {
   const fixture = executableFixture();
   try {
@@ -284,4 +355,17 @@ test("session Git config serializes under the sandbox document key", () => {
   const document = JSON.parse(serialized.value) as Record<string, unknown>;
   assert.deepEqual(Object.keys(document), [SANDBOX_SERIALIZATION_KEY]);
   assert.equal((document[SANDBOX_SERIALIZATION_KEY] as Record<string, unknown>).contract_id, result.value.contract_id);
+});
+
+test("session Git config serialization rejects arbitrary keys and top-level fields", () => {
+  const result = materializeSessionGitConfig(profile(), {});
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  const forbiddenKey = {
+    ...result.value,
+    config: { ...result.value.config, "credential.helper": "!ambient-helper" },
+  };
+  assert.equal(serializeSessionGitConfig(forbiddenKey).ok, false);
+  const extraField = { ...result.value, arbitrary: "not part of the contract" };
+  assert.equal(serializeSessionGitConfig(extraField).ok, false);
 });
