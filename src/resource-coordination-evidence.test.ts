@@ -67,6 +67,21 @@ test("reports one-sided changes from the worktree checkpoint, not only HEAD diff
   }
 });
 
+test("keeps a successful empty diff complete and classified as no change", () => {
+  const fixture = createFixture();
+  try {
+    const token = observe(fixture.registry, fixture.first.sessionId, ["tracked.txt"]);
+    const evidence = sessionPath(token, fixture.first.sessionId, "tracked.txt");
+
+    assert.equal(evidence.diff?.statsAvailable, false);
+    assert.equal(evidence.complete, true);
+    assert.equal(token.complete, true);
+    assert.equal(token.paths[0]?.status, "no-change");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("redacts content and patch for paths outside the selected read authority", () => {
   const fixture = createFixture();
   try {
@@ -156,6 +171,29 @@ test("marks the observation incomplete when bounded diff evidence is unavailable
     assert.equal(evidence.complete, false);
     assert.equal(token.complete, false);
     assert.equal(token.paths[0]?.status, "unavailable");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("contains ls-tree failures as unavailable bounded evidence", () => {
+  const fixture = createFixture();
+  try {
+    const git: GitCommandRunner = {
+      ...defaultGit,
+      runRaw(args, cwd) {
+        if (args[0] === "ls-tree") throw new Error("tree unavailable");
+        return (defaultGit.runRaw ?? defaultGit.run)(args, cwd);
+      },
+    };
+    const token = observeCoordinationInputs(fixture.registry, [fixture.first.sessionId], ["tracked.txt"], { git });
+    const evidence = sessionPath(token, fixture.first.sessionId, "tracked.txt");
+
+    assert.equal(token.status, "unavailable");
+    assert.equal(token.complete, false);
+    assert.equal(token.paths[0]?.status, "unavailable");
+    assert.equal(evidence.unavailable, true);
+    assert.equal(evidence.blob.complete, false);
   } finally {
     fixture.cleanup();
   }

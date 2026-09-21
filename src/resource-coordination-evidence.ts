@@ -122,7 +122,7 @@ export interface CoordinationSessionObservation {
   readonly worktreePath: string;
   readonly branchId: string;
   readonly branchName: string;
-  readonly headId: string;
+  readonly headId: string | null;
   readonly baseRevision: string | null;
   readonly claimSetGeneration: number;
   readonly checkpoint: GitCheckpointPaths;
@@ -152,6 +152,7 @@ export interface CoordinationPathEvidence {
   readonly contentHash: string | null;
   readonly mode: string | null;
   readonly diff: CoordinationDiffEvidence | null;
+  readonly unavailable: boolean;
   readonly complete: boolean;
 }
 
@@ -300,8 +301,25 @@ export function readCoordinationBlobState(
   const maxContentBytes = options.maxContentBytes ?? COORDINATION_DEFAULT_MAX_CONTENT_BYTES;
   assertBound(maxContentBytes, "maxContentBytes");
   const canonicalPath = canonicalizeConcretePath(resource, worktree);
-  const tree = readTreePathStates(git, worktree, revision, [canonicalPath]);
-  const revisionEntry = tree.get(canonicalPath);
+  let revisionEntry: GitTreeEntry | undefined;
+  try {
+    revisionEntry = readTreePathStates(git, worktree, revision, [canonicalPath]).get(canonicalPath);
+  } catch {
+    const unavailable = Object.freeze({
+      schemaVersion: COORDINATION_BLOB_SCHEMA_VERSION,
+      source: COORDINATION_EVIDENCE_SOURCE,
+      path: canonicalPath,
+      revision,
+      revisionBlob: emptySide("revision-blob", "unavailable"),
+      worktree: readWorktreeSide(worktree, canonicalPath, maxContentBytes),
+      equal: false,
+      complete: false,
+    });
+    const contentAuthorized =
+      options.includeContent === true &&
+      (options.operatorAuthorized === true || (options.allowedReadPaths ?? []).includes(canonicalPath));
+    return contentAuthorized ? unavailable : redactBlob(unavailable);
+  }
   const revisionBlob = readRevisionSide(git, worktree, revision, canonicalPath, revisionEntry, maxContentBytes);
   const worktreeSide = readWorktreeSide(worktree, canonicalPath, maxContentBytes);
   const equal =
@@ -340,23 +358,43 @@ function observeAttempt(
 ): ObservationAttempt {
   const selectedIds = new Set(records.map((record) => record.sessionId));
   const initialClaims = initialRegistry.claims.filter((claim) => selectedIds.has(claim.sessionId));
-  const physical = readPhysicalObservations(repository, git, records, initialClaims);
+  let physical: readonly PhysicalObservation[];
+  try {
+    physical = readPhysicalObservations(repository, git, records, initialClaims);
+  } catch {
+    return unavailableAttemptToken(repository, records, initialClaims, initialRegistry, explicitPaths, bounds, attempt);
+  }
   const selectedPaths = limitPaths(
     explicitPaths.length > 0 ? explicitPaths : deriveOverlapPaths(physical, initialClaims),
     bounds.maxPaths,
   );
-  const sessionObservations = physical.map((entry) =>
-    buildSessionObservation(
-      entry,
-      selectedPaths,
-      initialClaims,
-      records.length,
-      initialRegistry.claimSetGeneration,
-      git,
-      bounds,
-      limits,
-    ),
-  );
+  let observationUnavailable = false;
+  const sessionObservations = physical.map((entry) => {
+    try {
+      const session = buildSessionObservation(
+        entry,
+        selectedPaths,
+        initialClaims,
+        records.length,
+        initialRegistry.claimSetGeneration,
+        git,
+        bounds,
+        limits,
+      );
+      if (session.paths.some((pathEvidence) => pathEvidence.unavailable)) observationUnavailable = true;
+      return session;
+    } catch {
+      observationUnavailable = true;
+      return unavailableSessionObservation(
+        entry.record,
+        entry.headId,
+        entry.checkpoint,
+        entry.claims,
+        selectedPaths,
+        initialRegistry.claimSetGeneration,
+      );
+    }
+  });
   const baseRevisions = sessionObservations.map((session) => session.baseRevision);
   const baseCompatible =
     baseRevisions.length === 1
@@ -366,7 +404,12 @@ function observeAttempt(
         baseRevisions.every((revision) => revision !== null && revision === baseRevisions[0]);
   const pathComparisons = selectedPaths.map((resource) => comparePath(resource, sessionObservations, baseCompatible));
 
-  const finalPhysical = readPhysicalObservations(repository, git, records, initialClaims);
+  let finalPhysical: readonly PhysicalObservation[];
+  try {
+    finalPhysical = readPhysicalObservations(repository, git, records, initialClaims);
+  } catch {
+    return unavailableAttemptToken(repository, records, initialClaims, initialRegistry, selectedPaths, bounds, attempt);
+  }
   const finalRegistry = readRegistrySnapshot(registry);
   const unchanged =
     sameRegistrySnapshot(initialRegistry, finalRegistry, selectedIds) &&
@@ -374,7 +417,11 @@ function observeAttempt(
     sessionObservations.every((session, index) =>
       samePathIdentity(session, finalPhysical[index], selectedPaths, bounds, limits),
     );
-  const status: CoordinationObservationStatus = unchanged ? "stable" : "stale";
+  const status: CoordinationObservationStatus = !unchanged
+    ? "stale"
+    : observationUnavailable
+      ? "unavailable"
+      : "stable";
   const complete =
     unchanged && sessionObservations.every((session) => session.complete) && pathComparisons.every((p) => p.complete);
   const withoutHash = {
@@ -393,7 +440,7 @@ function observeAttempt(
     bounds,
   };
   return {
-    stable: unchanged,
+    stable: unchanged || observationUnavailable,
     token: Object.freeze({ ...withoutHash, evidenceHash: evidenceHash(withoutHash) }),
   };
 }
@@ -439,6 +486,112 @@ function readPhysicalObservations(
   });
 }
 
+function unavailableAttemptToken(
+  repository: RepositoryContext,
+  records: readonly SessionRecord[],
+  claims: readonly ResourceClaim[],
+  registry: RegistrySnapshot,
+  paths: readonly string[],
+  bounds: CoordinationObservationBounds,
+  attempt: number,
+): ObservationAttempt {
+  const selectedPaths = limitPaths(paths, bounds.maxPaths);
+  const sessions = records.map((record) =>
+    unavailableSessionObservation(
+      record,
+      null,
+      emptyCheckpoint(),
+      claims.filter((claim) => claim.sessionId === record.sessionId),
+      selectedPaths,
+      registry.claimSetGeneration,
+    ),
+  );
+  const comparisons = selectedPaths.map((resource) => comparePath(resource, sessions, true));
+  const withoutHash = {
+    schemaVersion: COORDINATION_EVIDENCE_SCHEMA_VERSION,
+    source: COORDINATION_EVIDENCE_SOURCE,
+    operation: "coordination-observation" as const,
+    status: "unavailable" as const,
+    stale: false,
+    attempts: attempt,
+    repositoryId: repository.repositoryId,
+    registryRevision: registry.registryRevision,
+    claimSetGeneration: registry.claimSetGeneration,
+    sessions: Object.freeze(sessions),
+    paths: Object.freeze(comparisons),
+    complete: false,
+    bounds,
+  };
+  return {
+    stable: true,
+    token: Object.freeze({ ...withoutHash, evidenceHash: evidenceHash(withoutHash) }),
+  };
+}
+
+function unavailableSessionObservation(
+  record: SessionRecord,
+  headId: string | null,
+  checkpoint: GitCheckpointPaths,
+  claims: readonly ResourceClaim[],
+  paths: readonly string[],
+  claimSetGeneration: number,
+): CoordinationSessionObservation {
+  return Object.freeze({
+    sessionId: record.sessionId,
+    repositoryId: record.repositoryId,
+    worktreeId: record.worktreeId,
+    worktreePath: record.worktreePath,
+    branchId: record.branchId,
+    branchName: record.branchName,
+    headId,
+    baseRevision: record.baseRevision ?? null,
+    claimSetGeneration,
+    checkpoint,
+    claims: Object.freeze(
+      claims.map(({ claimId, sessionId, resource, mode }) => ({ claimId, sessionId, resource, mode })),
+    ),
+    paths: Object.freeze(
+      paths.map((resource) =>
+        Object.freeze({
+          path: resource,
+          base: null,
+          head: null,
+          blob: unavailableBlobState(resource, headId ?? "unavailable"),
+          changedFromBase: null,
+          changedInWorktree: null,
+          indexChanged: false,
+          worktreeChanged: false,
+          untracked: false,
+          missing: false,
+          contentHash: null,
+          mode: null,
+          diff: null,
+          unavailable: true,
+          complete: false,
+        }),
+      ),
+    ),
+    complete: false,
+  });
+}
+
+function unavailableBlobState(resource: string, revision: string): CoordinationBlobState {
+  return Object.freeze({
+    schemaVersion: COORDINATION_BLOB_SCHEMA_VERSION,
+    source: COORDINATION_EVIDENCE_SOURCE,
+    path: resource,
+    revision,
+    revisionBlob: emptySide("revision-blob", "unavailable"),
+    worktree: emptySide("worktree-file", "unavailable"),
+    equal: false,
+    complete: false,
+  });
+}
+
+function emptyCheckpoint(): GitCheckpointPaths {
+  return Object.freeze({ changed: [], staged: [], unstaged: [], untracked: [] });
+}
+
 function buildSessionObservation(
   physical: PhysicalObservation,
   selectedPaths: readonly string[],
@@ -481,6 +634,7 @@ function buildSessionObservation(
     }
     const redactedBlob = limits.includeContent === true && authorized ? blob : redactBlob(blob);
     const diff = readDiffEvidence(git, record.worktreePath, physical.headId, resource, authorized, bounds, limits);
+    const diffComplete = diff !== null && (diff.statsAvailable || changedInWorktree === false);
     return Object.freeze({
       path: resource,
       base,
@@ -495,7 +649,8 @@ function buildSessionObservation(
       contentHash: redactedBlob.worktree.contentHash,
       mode: redactedBlob.worktree.mode,
       diff,
-      complete: redactedBlob.complete && diff !== null && (diff.statsAvailable || !authorized),
+      unavailable: !redactedBlob.complete || diff === null,
+      complete: redactedBlob.complete && diffComplete,
     });
   });
   return Object.freeze({
@@ -558,11 +713,12 @@ function comparePath(
   const selected = sessions.map((session) => session.paths.find((entry) => entry.path === pathName));
   const complete = selected.every((entry) => entry !== undefined && entry.complete);
   if (!baseCompatible || !complete || selected.some((entry) => entry?.changedFromBase === null)) {
+    const ambiguousBase =
+      !baseCompatible || selected.some((entry) => entry?.changedFromBase === null && entry?.blob.complete !== false);
     return Object.freeze({
       path: pathName,
       sessionIds: Object.freeze(sessions.map((session) => session.sessionId)),
-      status:
-        !baseCompatible || selected.some((entry) => entry?.changedFromBase === null) ? "ambiguous-base" : "unavailable",
+      status: ambiguousBase ? "ambiguous-base" : "unavailable",
       complete: false,
     });
   }
@@ -585,11 +741,13 @@ function samePathIdentity(
   bounds: CoordinationObservationBounds,
   limits: CoordinationObservationLimits,
 ): boolean {
-  if (finalPhysical === undefined || finalPhysical.headId !== initial.headId) return false;
+  if (initial.headId === null || finalPhysical === undefined || finalPhysical.headId !== initial.headId) return false;
   if (!sameCheckpoint(initial.checkpoint, finalPhysical.checkpoint)) return false;
+  if (initial.paths.some((pathEvidence) => pathEvidence.unavailable)) return true;
   const finalGit = defaultGitOr(limits);
+  const headId = initial.headId;
   return selectedPaths.every((resource) => {
-    const current = readCoordinationBlobState(finalGit, initial.worktreePath, initial.headId, resource, {
+    const current = readCoordinationBlobState(finalGit, initial.worktreePath, headId, resource, {
       maxContentBytes: bounds.maxContentBytes,
       includeContent: false,
     });
