@@ -1,5 +1,6 @@
 import type { JsonObject, JsonValue } from "../domain/errors.js";
 import { SessionRegistryError } from "../errors.js";
+import { parsePinnedProfileRecord } from "../domain/worktree-profile-pinning.js";
 
 /**
  * Optional registry areas are deliberately a closed, versioned vocabulary.
@@ -18,7 +19,7 @@ export const REGISTRY_FEATURES = Object.freeze([
 export type RegistryFeature = (typeof REGISTRY_FEATURES)[number];
 
 /** No optional record authority is implemented by the registry migration. */
-export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([] as const);
+export const SUPPORTED_REGISTRY_FEATURES = Object.freeze(["pinned-profiles.v1"] as const);
 
 export const MAX_RUNTIME_RECORDS = 256 as const;
 export const MAX_RUNTIME_RECORD_KEYS = 32 as const;
@@ -96,7 +97,19 @@ export function parseRuntimeRecords(
       );
     }
     if (!present) continue;
-    records[definition.field] = parseRecordList(input[definition.field], definition.field);
+    records[definition.field] = parseRecordList(input[definition.field], definition.field).map((record) => {
+      if (definition.feature === "pinned-profiles.v1") {
+        try {
+          return parsePinnedProfileRecord(record) as unknown as RuntimeRecord;
+        } catch (error) {
+          throw new SessionRegistryError(
+            "REGISTRY_CORRUPT",
+            error instanceof Error ? error.message : "Invalid pinned profile",
+          );
+        }
+      }
+      return record;
+    });
   }
 
   return Object.freeze({
