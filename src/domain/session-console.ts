@@ -235,6 +235,7 @@ function selectedShell(
     requirement === undefined ||
     requirement.kind !== "runtime" ||
     requirement.name !== CANONICAL_SHELL ||
+    requirement.version !== BASH_REQUIREMENT.version ||
     executable === undefined
   ) {
     return failure(
@@ -458,7 +459,7 @@ export async function listSessionProcesses(
     });
     if (!observation.ok) return observation;
     let cgroups: OwnedExecutionObservation | null = null;
-    if (record.value.state === "attached" || record.value.state === "running") {
+    if (record.value.state === "attached" || record.value.state === "running" || record.value.state === "unresolved") {
       const observe = options.observe_owned_execution ?? observeOwnedExecution;
       const cgroupRecord = cgroupObservationRecord(record.value);
       const cgroupObservation = observe(cgroupRecord, {

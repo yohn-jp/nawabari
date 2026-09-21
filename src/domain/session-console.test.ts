@@ -45,7 +45,7 @@ function backend(): SessionBackend {
   } as unknown as SessionBackend;
 }
 
-function projection(): SessionRuntimeProjection {
+function projection(options: { readonly bashVersion?: string } = {}): SessionRuntimeProjection {
   return {
     contract_id: "nawabari.session-runtime-projection.v1",
     schema_version: 1,
@@ -56,7 +56,7 @@ function projection(): SessionRuntimeProjection {
       unrestricted_host_fallback: "forbidden",
     },
     profile: { id: "console-profile", version: "7" },
-    requirements: [{ id: "bash-runtime", kind: "runtime", name: "bash", version: ">=5" }],
+    requirements: [{ id: "bash-runtime", kind: "runtime", name: "bash", version: options.bashVersion ?? ">=5" }],
     filesystem: [
       {
         source: "/nix/store/pinned-bash",
@@ -90,7 +90,7 @@ function readyProbe() {
   };
 }
 
-function executionRecord(state: "starting" | "attached" = "starting"): SessionExecutionRecord {
+function executionRecord(state: "starting" | "attached" | "unresolved" = "starting"): SessionExecutionRecord {
   const reserved = reserveExecution({
     session_id: session.session_id,
     execution_id: "execution-console-1",
@@ -108,6 +108,14 @@ function executionRecord(state: "starting" | "attached" = "starting"): SessionEx
     now: "2026-09-21T00:00:01.000Z",
   });
   if (!attached.ok) throw attached.error;
+  if (state === "unresolved") {
+    const unresolved = recordExecutionState(attached.value, {
+      state: "unresolved",
+      now: "2026-09-21T00:00:02.000Z",
+    });
+    if (!unresolved.ok) throw unresolved.error;
+    return unresolved.value;
+  }
   return attached.value;
 }
 
@@ -178,6 +186,23 @@ test("entry fails closed before launch when the execution writer is absent", asy
   assert.equal(launches, 0);
 });
 
+test("entry rejects a non-canonical Bash requirement version before launch", async () => {
+  let launches = 0;
+  const result = await enterSessionConsole(context, backend(), {
+    session_id: session.session_id,
+    runtime_projection: projection({ bashVersion: "4" }),
+    sandbox_probe: readyProbe(),
+    sandbox_runner: async () => {
+      launches += 1;
+      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+    },
+    persist_execution: async () => undefined,
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+  assert.equal(launches, 0);
+});
+
 test("process inspection proves boot, PID generation, and cgroup identity", async () => {
   const record = executionRecord("attached");
   const result = await listSessionProcesses(context, backend(), {
@@ -223,4 +248,36 @@ test("process inspection proves boot, PID generation, and cgroup identity", asyn
   });
   assert.equal(matched.ok, true);
   if (matched.ok) assert.equal(matched.value.processes[0]?.observation.matches, true);
+});
+
+test("process inspection retains cgroup observation for unresolved executions", async () => {
+  const record = executionRecord("unresolved");
+  const observedRecords: Parameters<
+    NonNullable<Parameters<typeof listSessionProcesses>[2]["observe_owned_execution"]>
+  >[0][] = [];
+  const result = await listSessionProcesses(context, backend(), {
+    session_id: session.session_id,
+    read_executions: () => [record],
+    identity_reader: {
+      read_boot_id: () => record.boot_id,
+      read_process_starttime: () => record.supervisor_starttime ?? "0",
+      read_process_cgroup: () => `/nawabari/${deriveCgroupScopeName(record.cgroup_identity)}`,
+    },
+    observe_owned_execution: (ownedRecord) => {
+      observedRecords.push(ownedRecord);
+      return success({
+        contract_id: "nawabari.session-process-observation.v1" as const,
+        session_id: record.session_id,
+        execution_id: record.execution_id,
+        boot_id: record.boot_id,
+        state: "empty" as const,
+        cgroups: null,
+      });
+    },
+  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(observedRecords.length, 1);
+  assert.equal(observedRecords[0]?.cgroups?.identity.execution_id, record.execution_id);
+  assert.equal(result.value.processes[0]?.cgroups?.state, "empty");
 });
