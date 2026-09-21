@@ -392,6 +392,22 @@ test("uncertain park does not succeed from a matching state without matching ope
   assert.match(retentionResult.reason ?? "", /retention record is absent/u);
 });
 
+test("uncertain park rejects a reported parked state over an active snapshot", () => {
+  const authority = new FakeRetentionAuthority();
+  authority.uncertainPark = true;
+  authority.reobserve = (input) => ({
+    status: "resolved",
+    operationId: input.operationId,
+    state: "parked",
+    snapshot: { ...authority.current, session: { ...authority.current.session, state: "active" } },
+  });
+  const result = park(authority);
+
+  assert.equal(result.status, "uncertain");
+  assert.equal(result.reconciliation?.status, "unknown");
+  assert.match(result.reason ?? "", /snapshot session state does not match/u);
+});
+
 test("uncertain resume requires its operation/session identity and removal of the retention record", () => {
   const sessionAuthority = new FakeRetentionAuthority();
   park(sessionAuthority);

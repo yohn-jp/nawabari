@@ -454,13 +454,20 @@ function resolveUncertain(
     const observedSessionMatches = reconciliation.snapshot.session.sessionId === sessionId;
     const observedOperationMatches = reconciliation.operationId === operationIdValue;
     const observedStateMatches = reconciliation.state === expectedState;
+    const observedSnapshotStateMatches = reconciliation.snapshot.session.state === expectedState;
     const postconditionMatches =
       operation === "park"
         ? reconciliation.snapshot.retention?.state === "parked" &&
           reconciliation.snapshot.retention.operationId === operationIdValue &&
           reconciliation.snapshot.retention.sessionId === sessionId
         : reconciliation.snapshot.retention === undefined;
-    if (observedSessionMatches && observedOperationMatches && observedStateMatches && postconditionMatches) {
+    if (
+      observedSessionMatches &&
+      observedOperationMatches &&
+      observedStateMatches &&
+      observedSnapshotStateMatches &&
+      postconditionMatches
+    ) {
       return operationResult(
         operation,
         operationIdValue,
@@ -474,6 +481,7 @@ function resolveUncertain(
       ...(observedSessionMatches ? [] : ["session identity mismatch"]),
       ...(observedOperationMatches ? [] : ["operation identity mismatch"]),
       ...(observedStateMatches ? [] : [`state ${reconciliation.state} does not match ${expectedState}`]),
+      ...(observedSnapshotStateMatches ? [] : ["snapshot session state does not match the reported state"]),
       ...(postconditionMatches
         ? []
         : [operation === "park" ? "park retention record is absent or mismatched" : "resume retention record remains"]),
