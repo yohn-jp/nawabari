@@ -99,7 +99,7 @@ test("catalog drift is informational and never replaces the pinned profile", () 
 });
 
 test("unavailable catalog is unknown and unavailable runtime does not masquerade as declared capability", () => {
-  const current: WorktreeProfileCatalogObservation = { status: "unknown", reason: "catalog could not be read" };
+  const current: WorktreeProfileCatalogObservation = { status: "unknown" };
   const result = inspectWorktreeProfile(
     pinned,
     current,
@@ -112,6 +112,17 @@ test("unavailable catalog is unknown and unavailable runtime does not masquerade
   assert.equal(result.current.drift, "unknown");
   assert.ok(result.runtime.tools.every((tool) => tool.availability === "unknown"));
   assert.equal(result.pinned.profile.tools.length, 2);
+});
+
+test("unknown catalog diagnostics are omitted from the public projection", () => {
+  const current = {
+    status: "unknown",
+    reason: "/secret/host/path".repeat(10_000),
+  } as unknown as WorktreeProfileCatalogObservation;
+  const result = inspectWorktreeProfile(pinned, current, runtime("unknown", []));
+
+  assert.deepEqual(result.current.catalog, { status: "unknown" });
+  assert.doesNotMatch(serializeWorktreeProfileInspection(result), /secret\/host\/path/u);
 });
 
 test("inspection serialization uses one stable public document key and is observational", () => {

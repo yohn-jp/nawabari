@@ -2,6 +2,7 @@ import type { JsonObject } from "./errors.js";
 import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
 import type { WorktreeProfileCatalog } from "./worktree-profile-catalog.js";
 import type { RuntimeExecutableProvider } from "./runtime-projection.js";
+import type { RuntimeMaterializer } from "./runtime-resolution.js";
 import type { WorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 
 /** The schema version of the read-only worktree profile inspection projection. */
@@ -22,13 +23,11 @@ export type WorktreeProfileCatalogObservation =
     }>
   | Readonly<{
       readonly status: "unknown";
-      /** A bounded diagnostic; it must not contain host configuration or secrets. */
-      readonly reason: string;
     }>;
 
 export type WorktreeProfileRuntimeObservation = Readonly<{
   readonly status: "available" | "missing" | "unknown";
-  readonly materializer: "nix" | "fhs" | "compatibility" | "provided" | null;
+  readonly materializer: RuntimeMaterializer | null;
   /** Provider identities, not executable paths or host-backed material. */
   readonly providers: readonly RuntimeExecutableProvider[];
 }>;
@@ -65,7 +64,7 @@ export type WorktreeProfileInspection = Readonly<{
     readonly materializer: WorktreeProfileRuntimeObservation["materializer"];
     readonly tools: readonly Readonly<{
       readonly entrypoint: string;
-      readonly provider: Readonly<{ readonly id: string; readonly requirement_id: string }>;
+      readonly provider: RuntimeExecutableProvider;
       readonly availability: WorktreeProfileToolAvailability;
     }>[];
   }>;
@@ -94,6 +93,12 @@ function compareText(left: string, right: string): number {
 function driftFor(pinned: PinnedWorktreeProfile, current: WorktreeProfileCatalogObservation): WorktreeProfileDrift {
   if (current.status === "unknown") return "unknown";
   return current.digest === pinned.provenance.catalog.blob_oid ? "same" : "changed";
+}
+
+function currentCatalogProjection(observation: WorktreeProfileCatalogObservation): WorktreeProfileCatalogObservation {
+  // Unknown diagnostics are intentionally omitted from the public projection:
+  // provider/backend error text may contain unbounded host paths or secrets.
+  return observation.status === "unknown" ? { status: "unknown" } : clone(observation);
 }
 
 function toolAvailability(
@@ -146,7 +151,7 @@ export function inspectWorktreeProfile(
       digest: pinned.digest,
     },
     current: {
-      catalog: clone(currentCatalogObservation),
+      catalog: currentCatalogProjection(currentCatalogObservation),
       drift: driftFor(pinned, currentCatalogObservation),
     },
     runtime: {
