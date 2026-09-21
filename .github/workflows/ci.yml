@@ -112,6 +112,9 @@ jobs:
       - name: Verify generated Product State Manifest diagram
         run: pnpm run manifest:check
 
+      - name: Verify generated CLI skill playbook
+        run: pnpm run skill:check
+
       - name: Verify GitHub Actions are pinned by SHA
         run: pnpm run governance:actions
 
