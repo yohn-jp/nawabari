@@ -336,7 +336,7 @@ test("migrates a v0.1.0 registry to the canonical claim section", () => {
   }
 });
 
-test("requires explicit migration before interpreting v1 claim semantics", () => {
+test("reads and migrates schema2 claims while preserving legacy identity", () => {
   const fixture = createRepositoryFixture();
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
@@ -352,7 +352,9 @@ test("requires explicit migration before interpreting v1 claim semantics", () =>
     for (const claim of legacy.claims) claim.schema_version = 2;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
-    assertRegistryError(() => registry.listClaims(), "UNSUPPORTED_CLAIM_SCHEMA_VERSION");
+    const readable = registry.listClaims();
+    assert.equal(readable[0]?.mode, "read");
+    assert.equal(readable[0]?.claimId, legacyClaimId);
     assert.deepEqual(registry.migrate(), {
       migrated: true,
       registrySchemaVersion: 1,
