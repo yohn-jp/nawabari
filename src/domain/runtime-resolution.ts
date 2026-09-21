@@ -23,6 +23,7 @@ import {
   runtimeMaterializationMissingError,
   STRICT_RUNTIME_POLICY,
   validateRuntimePolicy,
+  validateSessionRuntimeProjection,
   type RuntimeFilesystemProjection,
   type RuntimePolicy,
   type RuntimeProfileIdentity,
@@ -78,6 +79,9 @@ export type RuntimeDoctorReport = Readonly<
     readonly compatibility_policy: RuntimePolicy;
   }
 >;
+
+/** Governed document key for a serialized runtime-resolution result. */
+export const RUNTIME_RESOLUTION_SERIALIZATION_KEY = "runtime-resolution" as const;
 
 /** The ordinary pass-through commands owned by the canonical development profile. */
 const DEVELOPMENT_EXECUTABLE_RELATIVE_PATHS: Readonly<Record<string, string>> = Object.freeze({
@@ -385,3 +389,51 @@ export function resolveRuntimeProjection(options: RuntimeResolutionOptions): Dom
 
 export const resolveRuntimeResolution = resolveRuntimeProjection;
 export const resolveSessionRuntimeProjection = resolveRuntimeProjection;
+
+function validateRuntimeResolution(value: unknown): DomainResult<RuntimeResolution> {
+  if (!isRecord(value)) {
+    return failure(new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution must be an object."));
+  }
+  if (
+    value.materializer !== "nix" &&
+    value.materializer !== "fhs" &&
+    value.materializer !== "compatibility" &&
+    value.materializer !== "provided"
+  ) {
+    return failure(new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution materializer is invalid."));
+  }
+  const projection = validateSessionRuntimeProjection(value.projection);
+  if (!projection.ok) return failure(projection.error);
+  if (
+    !isRecord(value.profile) ||
+    value.profile.id !== projection.value.profile.id ||
+    value.profile.version !== projection.value.profile.version
+  ) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution profile evidence is inconsistent."),
+    );
+  }
+  const policy = validateRuntimePolicy(value.policy);
+  if (!policy.ok) return failure(policy.error);
+  if (policy.value.mode !== projection.value.policy.mode) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution policy evidence is inconsistent."),
+    );
+  }
+  return success(
+    Object.freeze({
+      policy: projection.value.policy,
+      profile: projection.value.profile,
+      materializer: value.materializer,
+      projection: projection.value,
+    }),
+  );
+}
+
+/** Serialize only a validated runtime resolution under its governed key. */
+export function serializeRuntimeResolution(input: unknown): DomainResult<string> {
+  const checked = validateRuntimeResolution(input);
+  return checked.ok
+    ? success(JSON.stringify({ [RUNTIME_RESOLUTION_SERIALIZATION_KEY]: checked.value }))
+    : failure(checked.error);
+}
