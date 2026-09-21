@@ -7,6 +7,7 @@ import {
   type SessionDrainFence,
   type SessionDrainFinalization,
   type SessionDrainIntent,
+  type SessionDrainAdmissionAuthority,
   type SessionDrainNextAction,
   type SessionDrainObservation,
   type SessionDrainOperation,
@@ -31,6 +32,8 @@ export type SessionRuntimeLifecycleMutation = Readonly<{
 export type SessionRuntimeLifecycleAdapter<T> = Readonly<{
   /** Read authoritative state without retaining the registry lock. */
   readonly observe: (sessionId: string) => SessionRuntimeLifecycleSnapshot | Promise<SessionRuntimeLifecycleSnapshot>;
+  /** Atomically closes launch admission and advances runtime_epoch. */
+  readonly close_admission: SessionDrainAdmissionAuthority;
   /** Canonical SessionRegistry.close/discard/releaseClaims mutation. */
   readonly mutate: (mutation: SessionRuntimeLifecycleMutation) => T | Promise<T>;
   /** Explicit owned-process termination, if the caller selected terminate. */
@@ -70,14 +73,60 @@ function snapshotToObservation(snapshot: SessionRuntimeLifecycleSnapshot): Sessi
   };
 }
 
+function isEpoch(value: unknown): value is RuntimeEpoch {
+  return (
+    (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) ||
+    (typeof value === "string" && value.length > 0 && value.length <= 256 && !value.includes("\0"))
+  );
+}
+
+function isOperation(value: unknown): value is SessionDrainOperation {
+  return value === "close" || value === "discard" || value === "release-claims";
+}
+
+function isPolicy(value: unknown): value is SessionDrainPolicy {
+  return value === "wait" || value === "terminate";
+}
+
+function validateOptions(options: SessionRuntimeLifecycleOptions): DomainResult<SessionRuntimeLifecycleOptions> {
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    return rejected("Runtime lifecycle options are invalid.");
+  }
+  if (!isEpoch(options.expected_epoch) || !isOperation(options.operation) || !isPolicy(options.policy)) {
+    return rejected("Runtime lifecycle options contain an invalid epoch, operation, or policy.");
+  }
+  if (
+    options.idempotency_key !== undefined &&
+    (typeof options.idempotency_key !== "string" ||
+      options.idempotency_key.length === 0 ||
+      options.idempotency_key.length > 512 ||
+      options.idempotency_key.includes("\0"))
+  ) {
+    return rejected("Runtime lifecycle idempotency_key is invalid.");
+  }
+  return success(options);
+}
+
 function validateSnapshot(
   snapshot: SessionRuntimeLifecycleSnapshot,
   sessionId: string,
 ): DomainResult<SessionRuntimeLifecycleSnapshot> {
+  if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) {
+    return rejected("The runtime snapshot is invalid.", { session_id: sessionId });
+  }
   if (snapshot.session_id !== sessionId) {
     return rejected("The runtime snapshot belongs to a different session.", {
       session_id: sessionId,
       observed_session_id: snapshot.session_id,
+    });
+  }
+  if (
+    !isEpoch(snapshot.runtime_epoch) ||
+    !Array.isArray(snapshot.executions) ||
+    typeof snapshot.kernel_empty !== "boolean"
+  ) {
+    return rejected("The runtime snapshot contains invalid epoch, execution, or kernel occupancy evidence.", {
+      session_id: sessionId,
     });
   }
   return success(snapshot);
@@ -91,17 +140,25 @@ async function runMutation<T>(
   const initial = await adapter.observe(sessionId);
   const checkedInitial = validateSnapshot(initial, sessionId);
   if (!checkedInitial.ok) return checkedInitial;
-  const firstFence = beginExecutionDrain(sessionId, options.expected_epoch, {
-    operation: options.operation,
-    policy: options.policy,
-    observed_epoch: checkedInitial.value.runtime_epoch,
-    executions: checkedInitial.value.executions,
-    kernel_empty: checkedInitial.value.kernel_empty,
-    ...(options.idempotency_key === undefined ? {} : { idempotency_key: options.idempotency_key }),
-  } satisfies SessionDrainIntent);
+  const firstFence = beginExecutionDrain(
+    sessionId,
+    options.expected_epoch,
+    {
+      operation: options.operation,
+      policy: options.policy,
+      observed_epoch: checkedInitial.value.runtime_epoch,
+      executions: checkedInitial.value.executions,
+      kernel_empty: checkedInitial.value.kernel_empty,
+      ...(options.idempotency_key === undefined ? {} : { idempotency_key: options.idempotency_key }),
+    } satisfies SessionDrainIntent,
+    adapter.close_admission,
+  );
   if (!firstFence.ok) return firstFence;
 
-  let completion = observeDrainCompletion(firstFence.value, snapshotToObservation(checkedInitial.value));
+  const afterAdmission = await adapter.observe(sessionId);
+  const checkedAfterAdmission = validateSnapshot(afterAdmission, sessionId);
+  if (!checkedAfterAdmission.ok) return checkedAfterAdmission;
+  let completion = observeDrainCompletion(firstFence.value, snapshotToObservation(checkedAfterAdmission.value));
   if (!completion.ok) return completion;
   let fence = completion.value.fence;
 
@@ -160,8 +217,13 @@ export async function runSessionRuntimeLifecycle<T>(
   sessionId: string,
   options: SessionRuntimeLifecycleOptions,
 ): Promise<DomainResult<SessionRuntimeLifecycleResult<T>>> {
+  if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > 256 || sessionId.includes("\0")) {
+    return rejected("Runtime lifecycle session_id is invalid.");
+  }
+  const checkedOptions = validateOptions(options);
+  if (!checkedOptions.ok) return checkedOptions;
   try {
-    return await runMutation(adapter, sessionId, options);
+    return await runMutation(adapter, sessionId, checkedOptions.value);
   } catch (error: unknown) {
     return failure(
       new DomainError("OPERATION_REJECTED", "The runtime lifecycle mutation could not complete safely.", {
