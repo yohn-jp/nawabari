@@ -58,6 +58,8 @@ import {
   serializeWorktreeFileOperationCliOutcome,
   type WorktreeFileOperationCliAuthority,
 } from "./worktree-file-operation-cli.js";
+import { FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS, FHS_LANDLOCK_HELPER_REQUIREMENT_ID } from "./domain/fhs-development-runtime.js";
+import type { WorktreeFileOperationExecutionOptions } from "./domain/worktree-file-operation.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -447,6 +449,8 @@ export type CliDependencies = {
   sandboxRuntimeLayout?: SandboxRuntimeLayout;
   /** Validated runtime projection forwarded to sandbox resolution; test/integration seam. */
   sandboxRuntimeProjection?: import("./domain/sandbox.js").SandboxExecutionOptions["runtime_projection"];
+  /** Strict helper materialization seam for the governed file-operation route. */
+  fileOperationExecution?: WorktreeFileOperationExecutionOptions;
 };
 
 type GlobalArguments = {
@@ -1586,9 +1590,67 @@ async function executeProtectedSessionCommand(
   };
 }
 
+async function fileOperationExecution(
+  dependencies: Pick<
+    CliDependencies,
+    "fileOperationExecution" | "sandboxProbe" | "sandboxRuntimeLayout" | "sandboxRuntimeProjection"
+  >,
+  backend: SessionBackend,
+  context: SessionContext,
+  sessionId: string,
+): Promise<DomainResult<WorktreeFileOperationExecutionOptions>> {
+  if (dependencies.fileOperationExecution !== undefined) return { ok: true, value: dependencies.fileOperationExecution };
+  const runtimeLayout = dependencies.sandboxRuntimeLayout ?? discoverSandboxRuntimeLayout();
+  const runtime = await resolveSandboxExecutionRequest(
+    backend,
+    context,
+    {
+      session_id: sessionId,
+      enforce: true,
+      landlock: "required",
+      runtime_policy: STRICT_RUNTIME_POLICY,
+      ...(dependencies.sandboxRuntimeProjection === undefined
+        ? {}
+        : { runtime_projection: dependencies.sandboxRuntimeProjection }),
+    },
+    dependencies.sandboxProbe,
+    runtimeLayout,
+  );
+  if (!runtime.ok) return runtime;
+  if (runtime.value.landlock_executable === null || runtime.value.runtime_projection === undefined) {
+    return failure(
+      new DomainError(
+        "SANDBOX_CAPABILITY_UNAVAILABLE",
+        "The strict file-operation helper materialization is unavailable.",
+        { session_id: sessionId },
+      ),
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      landlock_helper: {
+        provider: {
+          id: FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS[FHS_LANDLOCK_HELPER_REQUIREMENT_ID],
+          requirement_id: FHS_LANDLOCK_HELPER_REQUIREMENT_ID,
+        },
+        source: runtime.value.landlock_executable,
+      },
+      runtime_projection: runtime.value.runtime_projection,
+    },
+  };
+}
+
 async function executeSessionFileOperation(
   arguments_: string[],
-  backend: SessionBackend,
+  dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
+    Pick<
+      CliDependencies,
+      | "fileOperationExecution"
+      | "sandboxProbe"
+      | "sandboxRuntimeLayout"
+      | "sandboxRuntimeProjection"
+    >,
   context: SessionContext,
 ): Promise<DomainResult<JsonObject>> {
   const parsed = parseWorktreeFileOperationCli(["session", "file", ...arguments_]);
@@ -1617,7 +1679,16 @@ async function executeSessionFileOperation(
   };
   const operation = materializeWorktreeFileOperationCliRequest(parsed.value, authority);
   if (!operation.ok) return operation;
-  const result = await backend.fileOperation(context, { operation: operation.value });
+  const execution = await fileOperationExecution(dependencies, backend, context, operation.value.session_id);
+  if (!execution.ok) {
+    const outcome = projectWorktreeFileOperationCliOutcome(
+      execution,
+      operation.value.operation_id,
+      operation.value.operation,
+    );
+    return { ok: true, value: serializeWorktreeFileOperationCliOutcome(outcome) as unknown as JsonObject };
+  }
+  const result = await backend.fileOperation(context, { operation: operation.value, execution: execution.value });
   const outcome = projectWorktreeFileOperationCliOutcome(
     result.ok ? { ok: true, value: result.value.operation } : result,
     operation.value.operation_id,
@@ -1629,7 +1700,14 @@ async function executeSessionFileOperation(
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
-    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout" | "sandboxRuntimeProjection">,
+    Pick<
+      CliDependencies,
+      | "sandboxRunner"
+      | "sandboxProbe"
+      | "sandboxRuntimeLayout"
+      | "sandboxRuntimeProjection"
+      | "fileOperationExecution"
+    >,
 ): Promise<DomainResult<JsonObject>> {
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
@@ -1654,7 +1732,7 @@ async function executeCommand(
           new DomainError("UNKNOWN_COMMAND", `Unknown session file operation: ${operation ?? "<missing>"}.`),
         );
       }
-      return executeSessionFileOperation(rest, dependencies.backend, context);
+      return executeSessionFileOperation(rest, dependencies, context);
     }
     if (subcommand === "claim") {
       const parsed = parseSingleClaimPair(rest);
@@ -2529,6 +2607,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       sandboxProbe: dependencies.sandboxProbe,
       sandboxRuntimeLayout: runtimeLayout,
       sandboxRuntimeProjection: dependencies.sandboxRuntimeProjection,
+      fileOperationExecution: dependencies.fileOperationExecution,
     });
     if (!result.ok) {
       const enriched = await enrichInvalidSessionIdError(result.error, backend, sessionContext(cwd));

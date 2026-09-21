@@ -61,6 +61,8 @@ import {
 import {
   mutateWorktreeFile,
   prepareWorktreeFileOperation,
+  WORKTREE_FILE_OPERATION_CONTRACT_ID,
+  WORKTREE_FILE_OPERATION_SCHEMA_VERSION,
   type WorktreeFileOperation,
   type WorktreeFileOperationExecutionOptions,
   type WorktreeFileOperationResult,
@@ -1003,6 +1005,12 @@ export interface PersistedRegistry {
   /** Durable bounded receipts for exact file operations. */
   readonly required_features?: readonly string[];
   readonly file_operations?: readonly import("./registry/file-operation-record.js").PersistedFileOperationRecord[];
+  readonly file_operation_results?: readonly PersistedFileOperationResult[];
+}
+
+interface PersistedFileOperationResult {
+  readonly operation_id: string;
+  readonly result: WorktreeFileOperationResult;
 }
 
 interface RegistryState {
@@ -1012,6 +1020,7 @@ interface RegistryState {
   readonly legacyClaimsAbsent: boolean;
   readonly legacyClaimsSchemaVersion?: typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
   readonly fileOperations: readonly FileOperationRecord[];
+  readonly fileOperationResults: ReadonlyMap<string, WorktreeFileOperationResult>;
 }
 
 interface ClaimOwner extends ClaimOwnerContext {
@@ -1408,91 +1417,165 @@ export class SessionRegistry {
    * receipt outcome and is never silently retried.
    */
   mutateWorktreeFile(options: FileOperationExecutionOptions): FileOperationExecutionResult {
-    const operation = options.operation;
-    const session = this.get(operation.session_id);
-    if (session === undefined)
-      throw new SessionRegistryError("SESSION_NOT_FOUND", "Session was not found", { sessionId: operation.session_id });
-    if (session.state !== "active") {
-      throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Session cannot mutate files while ${session.state}`, {
-        sessionId: session.sessionId,
-        state: session.state,
-      });
-    }
-    if (session.worktreePath !== operation.worktree_root) {
-      throw new SessionRegistryError("WORKTREE_MISMATCH", "File operation worktree does not match the owned session", {
-        sessionId: operation.session_id,
-      });
-    }
-    if (options.expectedPolicyToken !== undefined && options.expectedPolicyToken !== null) {
-      if (
-        options.policyToken === undefined ||
-        options.policyToken === null ||
-        !isFilesystemPolicyTokenCurrent(options.policyToken, options.expectedPolicyToken)
-      ) {
-        throw new SessionRegistryError("STALE_REGISTRY", "Filesystem policy execution fence is stale", {
+    return this.withLock(() => {
+      const operation = options.operation;
+      const state = this.readStateUnsafe();
+      const session = state.sessions.find((candidate) => candidate.sessionId === operation.session_id);
+      if (session === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", "Session was not found", {
           sessionId: operation.session_id,
         });
       }
-    }
+      if (session.state !== "active") {
+        throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Session cannot mutate files while ${session.state}`, {
+          sessionId: session.sessionId,
+          state: session.state,
+        });
+      }
+      if (session.worktreePath !== operation.worktree_root) {
+        throw new SessionRegistryError("WORKTREE_MISMATCH", "File operation worktree does not match the owned session", {
+          sessionId: operation.session_id,
+        });
+      }
+      const workingSetRevision = session.workingSet?.revision;
+      if (workingSetRevision === undefined || operation.requested_generation !== workingSetRevision) {
+        throw new SessionRegistryError("STALE_REGISTRY", "File operation working-set generation is stale", {
+          sessionId: operation.session_id,
+          expectedGeneration: workingSetRevision ?? null,
+          requestedGeneration: operation.requested_generation,
+        });
+      }
+      if (!fileOperationScopeMatches(operation, session.workingSet?.scope)) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "File operation scope is not the live effective scope", {
+          sessionId: operation.session_id,
+          operationId: operation.operation_id,
+        });
+      }
+      if (!fileOperationClaimsMatch(operation, state.claims)) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "File operation claims are not the live session claims", {
+          sessionId: operation.session_id,
+          operationId: operation.operation_id,
+        });
+      }
+      if (options.expectedPolicyToken !== undefined && options.expectedPolicyToken !== null) {
+        const expectedPolicyToken = options.expectedPolicyToken;
+        if (
+          options.policyToken === undefined ||
+          options.policyToken === null ||
+          !isFilesystemPolicyTokenCurrent(options.policyToken, expectedPolicyToken) ||
+          expectedPolicyToken.session_id !== operation.session_id ||
+          expectedPolicyToken.claim_set_generation !== state.claimSetGeneration ||
+          expectedPolicyToken.working_set_revision !== workingSetRevision
+        ) {
+          throw new SessionRegistryError("STALE_REGISTRY", "Filesystem policy execution fence is stale", {
+            sessionId: operation.session_id,
+            expectedClaimSetGeneration: state.claimSetGeneration,
+            expectedWorkingSetRevision: workingSetRevision,
+          });
+        }
+      }
 
-    // Validate the frozen producer request before recording an apply attempt;
-    // malformed or unauthorized input must not consume a physical-apply slot.
-    const prepared = prepareWorktreeFileOperation(operation);
-    if (!prepared.ok) {
-      throw new SessionRegistryError("OPERATION_REJECTED", prepared.error.message, {
-        operationId: operation.operation_id,
-        operationCode:
-          typeof prepared.error.details?.operation_code === "string"
-            ? prepared.error.details.operation_code
-            : prepared.error.code,
-        stateUncertain: prepared.error.details?.state_uncertain === true,
-      });
-    }
+      // Validate the frozen producer request before recording an apply attempt;
+      // malformed or unauthorized input must not consume a physical-apply slot.
+      const prepared = prepareWorktreeFileOperation(operation);
+      if (!prepared.ok) {
+        throw new SessionRegistryError("OPERATION_REJECTED", prepared.error.message, {
+          operationId: operation.operation_id,
+          operationCode:
+            typeof prepared.error.details?.operation_code === "string"
+              ? prepared.error.details.operation_code
+              : prepared.error.code,
+          stateUncertain: prepared.error.details?.state_uncertain === true,
+        });
+      }
 
-    const receiptRequest = fileOperationRequestFromWorktreeOperation(operation);
-    const reserved = this.reserveFileOperation(receiptRequest);
-    if (reserved.record.stage === "completed") {
-      return {
-        operation: typedResultFromReceipt(operation, reserved.record),
-        receipt: reserved.record,
+      const receiptRequest = fileOperationRequestFromWorktreeOperation(operation);
+      const receipts: FileOperationRegistryState = {
+        schemaVersion: 1,
+        fileOperations: [...state.fileOperations],
       };
-    }
-    if (reserved.record.stage === "unresolved" || reserved.record.stage === "apply-recorded") {
-      throw new SessionRegistryError("OPERATION_REJECTED", "File-operation receipt is not safely retryable", {
-        operationId: operation.operation_id,
-        operationCode: "FILE_OPERATION_STATE_UNCERTAIN",
-        stateUncertain: true,
-      });
-    }
-
-    this.recordFileOperationApplyAttempt(operation.operation_id, receiptRequest.authorityToken);
-    const applied = mutateWorktreeFile(operation, options.execution);
-    if (!applied.ok) {
-      throw new SessionRegistryError("OPERATION_REJECTED", applied.error.message, {
-        operationId: operation.operation_id,
-        operationCode:
-          typeof applied.error.details?.operation_code === "string"
-            ? applied.error.details.operation_code
-            : "OPERATION_REJECTED",
-        stateUncertain: applied.error.details?.state_uncertain === true,
-      });
-    }
-    const reconciliation = this.reconcileFileOperationReceipt(
-      operation.operation_id,
-      observationFromTypedResult(operation, applied.value),
-    );
-    if (reconciliation.disposition !== "completed") {
-      throw new SessionRegistryError(
-        "OPERATION_REJECTED",
-        "File-operation effect was observed but completion was not proven",
-        {
+      const existing = state.fileOperations.find((record) => record.operationId === operation.operation_id);
+      const reserved = reserveFileOperation(receipts, receiptRequest, toTimestamp(this.clock()));
+      if (existing === undefined) {
+        this.writeUnsafe(
+          state.sessions,
+          state.claims,
+          state.claimSetGeneration,
+          receipts.fileOperations,
+          state.fileOperationResults,
+        );
+      }
+      if (reserved.stage === "completed") {
+        return {
+          operation: typedResultFromReceipt(
+            operation,
+            reserved,
+            state.fileOperationResults.get(operation.operation_id),
+          ),
+          receipt: reserved,
+        };
+      }
+      if (reserved.stage === "unresolved" || reserved.stage === "apply-recorded") {
+        throw new SessionRegistryError("OPERATION_REJECTED", "File-operation receipt is not safely retryable", {
           operationId: operation.operation_id,
           operationCode: "FILE_OPERATION_STATE_UNCERTAIN",
           stateUncertain: true,
-        },
+        });
+      }
+
+      const applyRecord = recordFileOperationApplyAttempt(
+        receipts,
+        operation.operation_id,
+        receiptRequest.authorityToken,
+        toTimestamp(this.clock()),
       );
-    }
-    return { operation: applied.value, receipt: reconciliation.record };
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        receipts.fileOperations,
+        state.fileOperationResults,
+      );
+      const applied = mutateWorktreeFile(operation, options.execution);
+      if (!applied.ok) {
+        throw new SessionRegistryError("OPERATION_REJECTED", applied.error.message, {
+          operationId: operation.operation_id,
+          operationCode:
+            typeof applied.error.details?.operation_code === "string"
+              ? applied.error.details.operation_code
+              : "OPERATION_REJECTED",
+          stateUncertain: applied.error.details?.state_uncertain === true,
+        });
+      }
+      const reconciliation = reconcileFileOperationReceipt(
+        applyRecord,
+        observationFromTypedResult(operation, applied.value),
+        toTimestamp(this.clock()),
+      );
+      const nextResults = new Map(state.fileOperationResults);
+      if (reconciliation.disposition === "completed") nextResults.set(operation.operation_id, applied.value);
+      const index = receipts.fileOperations.findIndex((record) => record.operationId === operation.operation_id);
+      receipts.fileOperations[index] = reconciliation.record;
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        receipts.fileOperations,
+        nextResults,
+      );
+      if (reconciliation.disposition !== "completed") {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "File-operation effect was observed but completion was not proven",
+          {
+            operationId: operation.operation_id,
+            operationCode: "FILE_OPERATION_STATE_UNCERTAIN",
+            stateUncertain: true,
+          },
+        );
+      }
+      return { operation: applied.value, receipt: reconciliation.record };
+    });
   }
 
   getClaim(claimId: string): ResourceClaim | undefined {
@@ -5594,7 +5677,14 @@ export class SessionRegistry {
       contents = fs.readFileSync(this.paths.registry, "utf8");
     } catch (error: unknown) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        return { sessions: [], claims: [], claimSetGeneration: 0, legacyClaimsAbsent: false, fileOperations: [] };
+        return {
+          sessions: [],
+          claims: [],
+          claimSetGeneration: 0,
+          legacyClaimsAbsent: false,
+          fileOperations: [],
+          fileOperationResults: new Map(),
+        };
       }
       throw new SessionRegistryError(
         "REGISTRY_IO_FAILURE",
@@ -5641,7 +5731,9 @@ export class SessionRegistry {
     claims: readonly ResourceClaim[],
     claimSetGeneration: number,
     fileOperations: readonly FileOperationRecord[] = [],
+    fileOperationResults?: ReadonlyMap<string, WorktreeFileOperationResult>,
   ): void {
+    const persistedResults = fileOperationResults ?? this.readStateUnsafe().fileOperationResults;
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
       repository_id: this.repository.repositoryId,
@@ -5652,6 +5744,13 @@ export class SessionRegistry {
       required_features: [...REGISTRY_FEATURES],
       file_operations: serializeFileOperationRegistry({ schemaVersion: 1, fileOperations: [...fileOperations] })
         .file_operations,
+      ...(persistedResults.size === 0
+        ? {}
+        : {
+            file_operation_results: [...persistedResults.entries()]
+              .sort(([left], [right]) => left.localeCompare(right))
+              .map(([operationId, result]) => ({ operation_id: operationId, result })),
+          }),
     };
 
     try {
@@ -8195,6 +8294,37 @@ export function toPersistedResourceClaim(
   };
 }
 
+type FileOperationLiveScope = Readonly<{
+  readonly create: readonly string[];
+  readonly delete: readonly string[];
+  readonly deny: readonly string[];
+}>;
+
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function fileOperationScopeMatches(
+  operation: WorktreeFileOperation,
+  liveScope: FileOperationLiveScope | undefined,
+): boolean {
+  const expected = liveScope ?? { create: [], delete: [], deny: [] };
+  return (
+    sameStringList(operation.scope.create, expected.create) &&
+    sameStringList(operation.scope.delete, expected.delete) &&
+    sameStringList(operation.scope.deny, expected.deny)
+  );
+}
+
+function fileOperationClaimsMatch(operation: WorktreeFileOperation, claims: readonly ResourceClaim[]): boolean {
+  const live = claims
+    .filter((claim) => claim.sessionId === operation.session_id && claim.mode !== "read")
+    .map((claim) => `${claim.resource}\u0000${claim.mode}`)
+    .sort();
+  const provided = operation.claims.map((claim) => `${claim.resource}\u0000${claim.mode}`).sort();
+  return sameStringList(provided, live);
+}
+
 function fileOperationRequestFromWorktreeOperation(operation: WorktreeFileOperation): FileOperationRequest {
   const source = operation.operation === "CREATE" ? null : operation.path;
   const destination =
@@ -8212,7 +8342,9 @@ function fileOperationRequestFromWorktreeOperation(operation: WorktreeFileOperat
     operation: operation.operation,
     source,
     destination,
-    expectedIdentity: operation.expected_identity ?? null,
+    expectedIdentity:
+      operation.expected_identity ??
+      (operation.expected_digest === null ? null : { digest: operation.expected_digest }),
     payloadDigest:
       operation.payload_ref === undefined
         ? null
@@ -8226,10 +8358,15 @@ function observationFromTypedResult(
   operation: WorktreeFileOperation,
   result: WorktreeFileOperationResult,
 ): FileOperationObservation {
-  const expected = operation.expected_identity ?? null;
+  const expected =
+    operation.expected_identity ??
+    (operation.expected_digest === null ? null : { digest: operation.expected_digest });
+  const observedIdentity = operation.expected_identity === undefined && operation.expected_digest !== null
+    ? expected
+    : result.identity;
   const after = {
     present: true,
-    identity: result.identity,
+    identity: observedIdentity,
     ...(operation.operation === "CREATE" ? { payloadDigest: result.identity.digest } : {}),
   };
   if (operation.operation === "CREATE") {
@@ -8268,7 +8405,20 @@ function observationFromTypedResult(
 function typedResultFromReceipt(
   operation: WorktreeFileOperation,
   receipt: FileOperationRecord,
+  persistedResult?: WorktreeFileOperationResult,
 ): WorktreeFileOperationResult {
+  if (persistedResult !== undefined) {
+    if (
+      persistedResult.operation_id !== operation.operation_id ||
+      persistedResult.operation !== operation.operation ||
+      persistedResult.previous_generation !== operation.requested_generation
+    ) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Persisted file-operation result does not match its request", {
+        operationId: operation.operation_id,
+      });
+    }
+    return persistedResult;
+  }
   const candidate = receipt.expectedIdentity;
   const identity =
     candidate !== null && typeof candidate === "object" && !Array.isArray(candidate)
@@ -8306,6 +8456,118 @@ function typedResultFromReceipt(
   };
 }
 
+function parseFileOperationResults(
+  value: unknown,
+  receipts: readonly FileOperationRecord[],
+): ReadonlyMap<string, WorktreeFileOperationResult> {
+  if (value === undefined) return new Map();
+  if (!Array.isArray(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "file_operation_results must be an array");
+  }
+  const results = new Map<string, WorktreeFileOperationResult>();
+  for (const [index, candidate] of value.entries()) {
+    if (!isRecord(candidate) || Object.keys(candidate).sort().join("\u0000") !== "operation_id\u0000result") {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid file-operation result at index ${index}`);
+    }
+    const operationId = candidate.operation_id;
+    if (typeof operationId !== "string" || operationId.length === 0 || results.has(operationId)) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid file-operation result operation_id at index ${index}`);
+    }
+    const receipt = receipts.find((record) => record.operationId === operationId);
+    if (receipt === undefined || receipt.stage !== "completed") {
+      throw new SessionRegistryError(
+        "REGISTRY_CORRUPT",
+        `File-operation result does not reference a completed receipt at index ${index}`,
+      );
+    }
+    const result = parseCompletedWorktreeFileOperationResult(candidate.result, receipt, index);
+    results.set(operationId, result);
+  }
+  return results;
+}
+
+function parseCompletedWorktreeFileOperationResult(
+  value: unknown,
+  receipt: FileOperationRecord,
+  index: number,
+): WorktreeFileOperationResult {
+  if (!isRecord(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid completed file-operation result at index ${index}`);
+  }
+  const expectedKeys = [
+    "contract_id",
+    "schema_version",
+    "operation_id",
+    "operation",
+    "state",
+    "previous_generation",
+    "next_generation",
+    "identity",
+    "postcondition",
+  ];
+  if (
+    Object.keys(value).length !== expectedKeys.length ||
+    expectedKeys.some((key) => !Object.hasOwn(value, key))
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid completed file-operation result fields at index ${index}`);
+  }
+  if (
+    value.contract_id !== WORKTREE_FILE_OPERATION_CONTRACT_ID ||
+    value.schema_version !== WORKTREE_FILE_OPERATION_SCHEMA_VERSION ||
+    value.operation_id !== receipt.operationId ||
+    value.operation !== receipt.operation.toUpperCase() ||
+    value.state !== "applied" ||
+    value.previous_generation !== receipt.fenceEpoch ||
+    !Number.isSafeInteger(value.next_generation) ||
+    value.next_generation !== receipt.fenceEpoch + 1
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Completed file-operation result identity mismatch at index ${index}`);
+  }
+  const identity = value.identity;
+  if (
+    !isRecord(identity) ||
+    Object.keys(identity).length !== 4 ||
+    typeof identity.dev !== "string" ||
+    typeof identity.ino !== "string" ||
+    !Number.isSafeInteger(identity.size) ||
+    (identity.size as number) < 0 ||
+    typeof identity.digest !== "string" ||
+    !/^[0-9a-f]{64}$/iu.test(identity.digest)
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid completed file-operation identity at index ${index}`);
+  }
+  const postcondition = value.postcondition;
+  if (
+    !isRecord(postcondition) ||
+    Object.keys(postcondition).length !== 3 ||
+    postcondition.kind !== "rebuild-execution-view" ||
+    postcondition.reason !== "physical-operation-applied" ||
+    postcondition.generation !== value.next_generation
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid completed file-operation postcondition at index ${index}`);
+  }
+  return Object.freeze({
+    contract_id: value.contract_id,
+    schema_version: value.schema_version,
+    operation_id: value.operation_id,
+    operation: value.operation,
+    state: value.state,
+    previous_generation: value.previous_generation,
+    next_generation: value.next_generation,
+    identity: Object.freeze({
+      dev: identity.dev,
+      ino: identity.ino,
+      size: identity.size,
+      digest: identity.digest,
+    }),
+    postcondition: Object.freeze({
+      kind: postcondition.kind,
+      reason: postcondition.reason,
+      generation: postcondition.generation,
+    }),
+  }) as WorktreeFileOperationResult;
+}
+
 function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacyClaimSchema = false): RegistryState {
   if (!isRecord(value)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry root must be an object");
@@ -8325,7 +8587,14 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
   assertExactKeys(
     value,
     ["schema_version", "repository_id", "sessions"],
-    ["claims_schema_version", "claims", "claim_set_generation", "required_features", "file_operations"],
+    [
+      "claims_schema_version",
+      "claims",
+      "claim_set_generation",
+      "required_features",
+      "file_operations",
+      "file_operation_results",
+    ],
   );
 
   if (typeof value.repository_id !== "string" || value.repository_id !== expectedRepositoryId) {
@@ -8343,10 +8612,17 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
 
   const hasFileOperations = Object.hasOwn(value, "file_operations");
   const hasRequiredFeatures = Object.hasOwn(value, "required_features");
+  const hasFileOperationResults = Object.hasOwn(value, "file_operation_results");
   if (hasFileOperations !== hasRequiredFeatures) {
     throw new SessionRegistryError(
       "REGISTRY_CORRUPT",
       "Registry file-operation feature metadata and file_operations must be persisted together",
+    );
+  }
+  if (hasFileOperationResults && !hasFileOperations) {
+    throw new SessionRegistryError(
+      "REGISTRY_CORRUPT",
+      "Registry file-operation results require the file_operations feature",
     );
   }
   let fileOperations: readonly FileOperationRecord[] = [];
@@ -8379,6 +8655,10 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
 
   const records = value.sessions.map((candidate, index) => parseSessionRecord(candidate, index, expectedRepositoryId));
   validateRecords(records, expectedRepositoryId);
+  const fileOperationResults = parseFileOperationResults(
+    hasFileOperationResults ? value.file_operation_results : undefined,
+    fileOperations,
+  );
   const hasClaimsSchema = Object.hasOwn(value, "claims_schema_version");
   const hasClaims = Object.hasOwn(value, "claims");
   if (hasClaimsSchema !== hasClaims) {
@@ -8390,7 +8670,14 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
   if (!hasClaimsSchema) {
     // v0.1.0 had no claim section. It is a deterministic empty claim set,
     // materialized on the next locked mutation or via migrate().
-    return { sessions: records, claims: [], claimSetGeneration, legacyClaimsAbsent: true, fileOperations };
+    return {
+      sessions: records,
+      claims: [],
+      claimSetGeneration,
+      legacyClaimsAbsent: true,
+      fileOperations,
+      fileOperationResults,
+    };
   }
   const claimSchemaVersion = value.claims_schema_version;
   const isLegacyClaimSchema = claimSchemaVersion === LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
@@ -8430,6 +8717,7 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
     claimSetGeneration,
     legacyClaimsAbsent: false,
     fileOperations,
+    fileOperationResults,
     ...(isLegacyClaimSchema ? { legacyClaimsSchemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION } : {}),
   };
 }
