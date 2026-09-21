@@ -1344,11 +1344,7 @@ export class SessionRegistry {
     return claim === undefined ? undefined : cloneResourceClaim(claim);
   }
 
-  /**
-   * Explicitly materialize a claim section or upgrade its semantics. A v2
-   * claim registry is intentionally unreadable through ordinary operations;
-   * only this locked, explicit migration rewrites legacy claims as v3.
-   */
+  /** Explicitly materialize a claim section or upgrade legacy claims as v3. */
   migrate(): RegistryMigrationResult {
     return this.withLock(() => {
       let state: RegistryState;
@@ -8321,17 +8317,8 @@ function parseRegistry(
       { schemaVersion: claimSchemaVersion as number },
     );
   }
-  if (isLegacyClaimSchema && !allowLegacyClaimSchema) {
-    throw new SessionRegistryError(
-      "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
-      "Resource claim schema v1 requires explicit migration before use",
-      {
-        schemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
-        migrationRequired: true,
-        recoveryHints: [...MIGRATION_RECOVERY_HINTS],
-      },
-    );
-  }
+  // Schema 2 is readable for ordinary operations, but retains its legacy
+  // no-sharing semantics and canonical IDs until explicit migration.
   if (!Array.isArray(value.claims)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry claims must be an array");
   }
