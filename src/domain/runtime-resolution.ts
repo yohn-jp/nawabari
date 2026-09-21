@@ -420,11 +420,101 @@ function validateRuntimeResolution(value: unknown): DomainResult<RuntimeResoluti
       new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution policy evidence is inconsistent."),
     );
   }
+  const materializer = value.materializer as RuntimeMaterializer;
+  if (materializer === "compatibility") {
+    if (projection.value.policy.mode !== "compatibility") {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "Compatibility materialization requires the explicit compatibility policy.",
+          { field: "materializer", materializer, policy: projection.value.policy.mode },
+        ),
+      );
+    }
+    if (projection.value.executables.length !== 0) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "Compatibility materialization cannot declare executable providers.",
+          { field: "projection.executables", materializer },
+        ),
+      );
+    }
+    if (projection.value.filesystem.some((entry) => entry.provenance !== "compatibility")) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "Compatibility materialization requires compatibility filesystem provenance.",
+          { field: "projection.filesystem.provenance", materializer },
+        ),
+      );
+    }
+  } else if (materializer === "nix" || materializer === "fhs") {
+    if (projection.value.policy.mode !== "strict") {
+      return failure(
+        new DomainError("RUNTIME_PROJECTION_INVALID", "Strict materialization requires the strict runtime policy.", {
+          field: "materializer",
+          materializer,
+          policy: projection.value.policy.mode,
+        }),
+      );
+    }
+    if (
+      projection.value.filesystem.some(
+        (entry) => entry.provenance !== "runtime-profile" && entry.provenance !== "package",
+      )
+    ) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "Strict materialization requires runtime or package filesystem provenance.",
+          { field: "projection.filesystem.provenance", materializer },
+        ),
+      );
+    }
+    const requirements = new Map(projection.value.requirements.map((requirement) => [requirement.id, requirement]));
+    for (const entrypoint of projection.value.executables) {
+      const requirement = requirements.get(entrypoint.provider.requirement_id);
+      if (requirement === undefined) continue;
+      const expectedProvider = `${materializer}-${requirement.id}-provider`;
+      if (entrypoint.provider.id !== expectedProvider) {
+        return failure(
+          new DomainError(
+            "RUNTIME_PROJECTION_INVALID",
+            "Strict materialization provider identity does not match its materializer.",
+            {
+              field: "projection.executables.provider.id",
+              materializer,
+              requirement_id: requirement.id,
+              expected_provider: expectedProvider,
+              provider: entrypoint.provider.id,
+            },
+          ),
+        );
+      }
+      const expectedProvenance = requirement.kind === "runtime" ? "runtime-profile" : "package";
+      if (entrypoint.provenance !== expectedProvenance) {
+        return failure(
+          new DomainError(
+            "RUNTIME_PROJECTION_INVALID",
+            "Strict materialization executable provenance does not match its requirement.",
+            {
+              field: "projection.executables.provenance",
+              materializer,
+              requirement_id: requirement.id,
+              expected_provenance: expectedProvenance,
+              provenance: entrypoint.provenance,
+            },
+          ),
+        );
+      }
+    }
+  }
   return success(
     Object.freeze({
       policy: projection.value.policy,
       profile: projection.value.profile,
-      materializer: value.materializer,
+      materializer,
       projection: projection.value,
     }),
   );

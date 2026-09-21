@@ -240,3 +240,47 @@ test("entrypoint selection matches exact provider identity and serialization use
     fixture.cleanup();
   }
 });
+
+test("runtime-resolution serialization rejects contradictory materializer evidence", () => {
+  const fixture = candidateFixture();
+  try {
+    const resolved = resolveWorktreeProfileRuntime(profile(), fixture.layout, {
+      platform: "linux",
+      nix: { store_root: fixture.store, command_runner: fixture.runner },
+    });
+    assert.equal(resolved.ok, true, resolved.ok ? "" : JSON.stringify(resolved.error));
+    if (!resolved.ok) return;
+
+    const compatibilityLabel = serializeRuntimeResolution({
+      ...resolved.value,
+      materializer: "compatibility",
+    });
+    assert.equal(compatibilityLabel.ok, false);
+
+    const fhsProvider = serializeRuntimeResolution({
+      ...resolved.value,
+      projection: {
+        ...resolved.value.projection,
+        executables: resolved.value.projection.executables.map((entrypoint) => ({
+          ...entrypoint,
+          provider: { ...entrypoint.provider, id: `fhs-${entrypoint.provider.requirement_id}-provider` },
+        })),
+      },
+    });
+    assert.equal(fhsProvider.ok, false);
+
+    const sessionFilesystem = serializeRuntimeResolution({
+      ...resolved.value,
+      projection: {
+        ...resolved.value.projection,
+        filesystem: resolved.value.projection.filesystem.map((entry) => ({
+          ...entry,
+          provenance: "session" as const,
+        })),
+      },
+    });
+    assert.equal(sessionFilesystem.ok, false);
+  } finally {
+    fixture.cleanup();
+  }
+});
