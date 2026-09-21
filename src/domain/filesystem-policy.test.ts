@@ -8,8 +8,37 @@ import {
   serializeEffectiveFilesystemPolicy,
   validateEffectiveFilesystemPolicy,
 } from "./filesystem-policy.js";
+import { canonicalClaimId } from "../resource-claims.js";
 
 const PROFILE_DIGEST = "a".repeat(64);
+const SESSION_ID = "0190f1e0-0000-7000-8000-000000000001";
+const WORKTREE_PATH = "/tmp/nawabari-policy-worktree";
+
+function claim(resource: string, mode: "read" | "write" | "exclusive-write") {
+  return {
+    schemaVersion: 2,
+    claimId: canonicalClaimId(SESSION_ID, resource, mode),
+    sessionId: SESSION_ID,
+    repositoryId: "1329799765",
+    worktreePath: WORKTREE_PATH,
+    resource,
+    mode,
+    createdAt: "2026-09-21T00:00:00.000Z",
+    updatedAt: "2026-09-21T00:00:00.000Z",
+  };
+}
+
+function workingSet(scope: Record<string, unknown>, revision = 4) {
+  return {
+    version: 1,
+    kind: "effective-working-set",
+    revision,
+    id: "ews-policy-test",
+    repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+    base: { branch: "main", revision: "a".repeat(40) },
+    scope,
+  };
+}
 
 function policyInput(overrides: Record<string, unknown> = {}) {
   return {
@@ -25,24 +54,21 @@ function policyInput(overrides: Record<string, unknown> = {}) {
         deny: ["src/private.ts"],
       },
     },
-    working_set: {
-      revision: 4,
-      scope: {
-        readOnly: ["src/**"],
-        write: ["src/write.ts"],
-        create: ["src/new.ts"],
-        delete: ["src/delete.ts"],
-        rename: ["src/**"],
-        deny: [],
-      },
-    },
+    working_set: workingSet({
+      readOnly: ["src/**"],
+      write: ["src/write.ts"],
+      create: ["src/new.ts"],
+      delete: ["src/delete.ts"],
+      rename: ["src/**"],
+      deny: [],
+    }),
     claims: [
-      { claimId: "read", resource: "src/**", mode: "read" },
-      { claimId: "write", resource: "src/write.ts", mode: "write" },
-      { claimId: "create", resource: "src/new.ts", mode: "write" },
-      { claimId: "delete", resource: "src/delete.ts", mode: "write" },
-      { claimId: "rename", resource: "src/old.ts", mode: "write" },
-      { claimId: "rename-destination", resource: "src/new-name.ts", mode: "write" },
+      claim("src/**", "read"),
+      claim("src/write.ts", "write"),
+      claim("src/new.ts", "write"),
+      claim("src/delete.ts", "write"),
+      claim("src/old.ts", "write"),
+      claim("src/new-name.ts", "write"),
     ],
     claim_set_generation: 8,
     runtime_epoch: 12,
@@ -79,11 +105,11 @@ test("evaluates READ independently and never derives it from WRITE", () => {
       digest: PROFILE_DIGEST,
       filesystem: { readOnly: [], write: ["src/write.ts"], create: [], delete: [], deny: [] },
     },
-    working_set: {
-      revision: 1,
-      scope: { readOnly: ["src/write.ts"], write: ["src/write.ts"], create: [], delete: [], deny: [] },
-    },
-    claims: [{ claimId: "write", resource: "src/write.ts", mode: "write" }],
+    working_set: workingSet(
+      { readOnly: ["src/write.ts"], write: ["src/write.ts"], create: [], delete: [], deny: [] },
+      1,
+    ),
+    claims: [claim("src/write.ts", "write")],
     claim_set_generation: 1,
     backend_requirements: undefined,
   });
@@ -133,8 +159,8 @@ test("runtime/package/infrastructure selectors do not authorize repository conte
       digest: PROFILE_DIGEST,
       filesystem: { readOnly: [{ domain: "runtime", path: "/nix/store/**" }] },
     },
-    working_set: { revision: 1, scope: { readOnly: [], write: [], create: [], delete: [], deny: [] } },
-    claims: [{ claimId: "runtime", resource: "src/**", mode: "read" }],
+    working_set: workingSet({ readOnly: [], write: [], create: [], delete: [], deny: [] }, 1),
+    claims: [claim("src/**", "read")],
     claim_set_generation: 1,
     backend_requirements: undefined,
   });
@@ -143,6 +169,64 @@ test("runtime/package/infrastructure selectors do not authorize repository conte
     decideEffectivePathAccess({ policy, operation: "READONLY", path: "/nix/store/node", domain: "runtime" }).allowed,
     true,
   );
+});
+
+test("immutable profile areas override broader mutation scopes", () => {
+  const policy = compile({
+    profile: {
+      status: "applied",
+      digest: PROFILE_DIGEST,
+      filesystem: {
+        readOnly: ["src/**"],
+        write: ["src/**"],
+        immutable: ["src/frozen.ts"],
+      },
+    },
+    working_set: workingSet({ readOnly: ["src/**"], write: ["src/**"], create: [], delete: [], deny: [] }),
+    claims: [claim("src/frozen.ts", "write")],
+    claim_set_generation: 1,
+    backend_requirements: undefined,
+  });
+  assert.equal(decideEffectivePathAccess({ policy, operation: "WRITE", path: "src/frozen.ts" }).allowed, false);
+  assert.equal(decideEffectivePathAccess({ policy, operation: "READONLY", path: "src/frozen.ts" }).allowed, true);
+});
+
+test("partial claims fail closed and compiled claims are detached immutable authority", () => {
+  const partial = compileEffectiveFilesystemPolicy(
+    policyInput({ claims: [{ resource: "src/**", mode: "read" }], claim_set_generation: 1 }),
+  );
+  assert.equal(partial.ok, false);
+
+  const mutableClaim = claim("src/mutable.ts", "write");
+  const policy = compile({
+    claims: [mutableClaim],
+    claim_set_generation: 1,
+    profile: {
+      status: "applied",
+      digest: PROFILE_DIGEST,
+      filesystem: { write: ["src/mutable.ts"], readOnly: ["src/mutable.ts"] },
+    },
+    working_set: workingSet({ write: ["src/mutable.ts"], readOnly: ["src/mutable.ts"], create: [], delete: [] }, 1),
+    backend_requirements: undefined,
+  });
+  mutableClaim.resource = "src/changed.ts";
+  assert.equal(policy.claims.claims[0]?.resource, "src/mutable.ts");
+  assert.equal(Object.isFrozen(policy.claims.claims[0]), true);
+});
+
+test("partial working-set facts are not treated as an applied authority", () => {
+  const result = compileEffectiveFilesystemPolicy(
+    policyInput({ working_set: { scope: { readOnly: ["src/**"], write: [], create: [], delete: [] } } }),
+  );
+  assert.equal(result.ok, false);
+});
+
+test("rename and unknown operations fail closed before scope matching", () => {
+  const policy = compile();
+  assert.equal(decideEffectivePathAccess({ policy, operation: "RENAME", path: "src/old.ts" }).allowed, false);
+  const unknown = decideEffectivePathAccess({ policy, operation: "REPLACE" as never, path: "src/old.ts" });
+  assert.equal(unknown.allowed, false);
+  assert.equal(unknown.status, "deny");
 });
 
 test("serialization is canonical and rejects a changed policy identity", () => {
