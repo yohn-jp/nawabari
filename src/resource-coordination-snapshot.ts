@@ -263,7 +263,7 @@ function projectResource(
   const changes = [...facts.changes].sort(compareChange);
   const mergeability = [...facts.mergeability].sort(compareMergeability);
   const requestedModes = uniqueModes(intents.map((intent) => intent.mode));
-  const authorityComplete = evidence.complete === true;
+  const authorityComplete = evidence.complete === true && (evidence.incompleteReasons?.length ?? 0) === 0;
   const claimBlockers = findClaimBlockers(claims, intents, facts.resource);
   const blockers = [...claimBlockers];
   if (!authorityComplete && claimBlockers.length === 0) {
@@ -292,7 +292,9 @@ function projectResource(
       : conflict === "unknown" ||
           permission === "unknown" ||
           physicalModification === "unknown" ||
-          projectedMergeability === "unknown"
+          projectedMergeability === "unknown" ||
+          blockerTruncated ||
+          participantProjection.truncated
         ? "unresolved"
         : "available";
   const nextActions = projectNextActions(
@@ -300,7 +302,7 @@ function projectResource(
     boundedBlockers,
     participants,
     classification,
-    authorityComplete,
+    authorityComplete && !blockerTruncated && !participantProjection.truncated,
   );
 
   return Object.freeze({

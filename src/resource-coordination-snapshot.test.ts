@@ -132,6 +132,27 @@ test("incomplete evidence remains unresolved instead of claiming no conflict", (
   assert.deepEqual(snapshot.incompleteReasons, ["INCOMPLETE_AUTHORITY_EVIDENCE", "MERGEABILITY_UNAVAILABLE"]);
 });
 
+test("declared incomplete reasons fail closed even when the axes have positive evidence", () => {
+  const snapshot = projectResourceCoordinationSnapshot(
+    input({
+      contract: {
+        complete: true,
+        incompleteReasons: ["STALE_MERGEABILITY"],
+        resourceIntents: [{ sessionId: "reader", resource: "src/a.ts", mode: "read" }],
+        mergeability: [{ sessionId: "reader", resource: "src/a.ts", state: "mergeable" }],
+      },
+    }),
+  );
+  const record = snapshot.resources[0];
+  assert.equal(record?.permission, "unknown");
+  assert.equal(record?.conflict, "unknown");
+  assert.equal(record?.classification, "unresolved");
+  assert.deepEqual(
+    record?.nextActions.map((action) => action.actionId),
+    ["refresh-coordination-evidence"],
+  );
+});
+
 test("claims, intents, and changes are deterministically ordered and bounded", () => {
   const snapshot = projectResourceCoordinationSnapshot(
     input({
@@ -172,4 +193,29 @@ test("participant and blocker bounds are visible as incomplete truncation", () =
   assert.deepEqual(snapshot.incompleteReasons, ["BLOCKER_BOUND_EXCEEDED", "PARTICIPANT_BOUND_EXCEEDED"]);
   assert.equal(snapshot.resources[0]?.blockers.length, 1);
   assert.equal(snapshot.resources[0]?.participants.length, 1);
+});
+
+test("participant truncation cannot produce proceed when an omitted participant is modified", () => {
+  const snapshot = projectResourceCoordinationSnapshot(
+    input({
+      registry: {
+        ...input().registry,
+        claims: [claim("aaa", "src/a.ts", "read")],
+      },
+      contract: {
+        complete: true,
+        observedChanges: [{ sessionId: "zzz", resource: "src/a.ts", state: "modified", integrated: false }],
+        mergeability: [{ sessionId: "zzz", resource: "src/a.ts", state: "mergeable" }],
+      },
+      bounds: { maxParticipantsPerResource: 1 },
+    }),
+  );
+  const record = snapshot.resources[0];
+  assert.equal(snapshot.truncated, true);
+  assert.equal(record?.physicalModification, "modified");
+  assert.equal(record?.classification, "unresolved");
+  assert.deepEqual(
+    record?.nextActions.map((action) => action.actionId),
+    ["refresh-coordination-evidence"],
+  );
 });
