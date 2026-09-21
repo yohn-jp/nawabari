@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import { WORKTREE_FILE_OPERATION_HELPER } from "./worktree-file-operation-helper.js";
+import type { ResourceClaimMode } from "../resource-claims.js";
 
 export { WORKTREE_FILE_OPERATION_HELPER } from "./worktree-file-operation-helper.js";
 
@@ -16,7 +17,6 @@ export const WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024;
 
 export const WORKTREE_FILE_OPERATIONS = ["CREATE", "DELETE", "RENAME"] as const;
 export type WorktreeFileOperationName = (typeof WORKTREE_FILE_OPERATIONS)[number];
-export type WorktreeFileOperationClaimMode = "write" | "exclusive-write";
 
 export type WorktreeFileIdentity = Readonly<{
   readonly dev: string;
@@ -33,7 +33,7 @@ export type WorktreeFileOperationScope = Readonly<{
 
 export type WorktreeFileOperationClaim = Readonly<{
   readonly resource: string;
-  readonly mode: WorktreeFileOperationClaimMode;
+  readonly mode: ResourceClaimMode;
 }>;
 
 export type WorktreeFileOperationPayload = Readonly<{
