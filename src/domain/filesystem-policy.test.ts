@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  AUXILIARY_STATE_PROJECTION_CONTRACT_ID,
+  AUXILIARY_STATE_PROJECTION_SCHEMA_VERSION,
+} from "./auxiliary-state-projection.js";
+import {
   EFFECTIVE_FILESYSTEM_POLICY_CONTRACT_ID,
   compileEffectiveFilesystemPolicy,
   decideEffectivePathAccess,
@@ -43,6 +47,7 @@ function workingSet(scope: Record<string, unknown>, revision = 4) {
 function policyInput(overrides: Record<string, unknown> = {}) {
   return {
     repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+    base: { branch: "main", revision: "a".repeat(40) },
     worktreePath: WORKTREE_PATH,
     profile: {
       status: "applied",
@@ -245,6 +250,17 @@ test("effective working sets and claims are bound to the current repository and 
   assert.equal(compileEffectiveFilesystemPolicy(policyInput({ claims: [foreignWorktreeClaim] })).ok, false);
 });
 
+test("effective working sets are bound to the current base branch and revision", () => {
+  const foreignBranch = workingSet({ readOnly: ["src/**"], write: [], create: [], delete: [] });
+  foreignBranch.base = { branch: "feature/foreign", revision: "a".repeat(40) };
+  assert.equal(compileEffectiveFilesystemPolicy(policyInput({ working_set: foreignBranch })).ok, false);
+
+  const foreignRevision = workingSet({ readOnly: ["src/**"], write: [], create: [], delete: [] });
+  foreignRevision.base = { branch: "main", revision: "b".repeat(40) };
+  assert.equal(compileEffectiveFilesystemPolicy(policyInput({ working_set: foreignRevision })).ok, false);
+  assert.equal(compileEffectiveFilesystemPolicy(policyInput({ base: undefined })).ok, false);
+});
+
 test("runtime status is closed and all producer aliases reject conflicts", () => {
   assert.equal(compileEffectiveFilesystemPolicy(policyInput({ runtime: { status: "not-a-status" } })).ok, false);
   assert.equal(compileEffectiveFilesystemPolicy(policyInput({ runtime: "not-an-authority" })).ok, false);
@@ -259,11 +275,64 @@ test("runtime status is closed and all producer aliases reject conflicts", () =>
   );
   assert.equal(
     compileEffectiveFilesystemPolicy(
-      policyInput({ claims: policyInput().claims, resource_claims: [claim("src/other.ts", "read")] }),
+      policyInput({
+        profile: {
+          status: "applied",
+          digest: PROFILE_DIGEST,
+          profile_digest: "b".repeat(64),
+          filesystem: { readOnly: ["src/**"] },
+        },
+      }),
+    ).ok,
+    false,
+  );
+  assert.equal(
+    compileEffectiveFilesystemPolicy(
+      policyInput({
+        profile: {
+          status: "applied",
+          digest: PROFILE_DIGEST,
+          scope: { readOnly: ["src/**"] },
+          filesystem: { readOnly: ["src/other.ts"] },
+        },
+      }),
+    ).ok,
+    false,
+  );
+  assert.equal(
+    compileEffectiveFilesystemPolicy(
+      policyInput({
+        claims: { status: "applied", claims: [claim("src/write.ts", "write")], items: [claim("src/other.ts", "read")] },
+        claim_set_generation: 8,
+      }),
     ).ok,
     false,
   );
   assert.equal(compileEffectiveFilesystemPolicy(policyInput({ runtime_epoch: 12, runtimeEpoch: 13 })).ok, false);
+});
+
+test("auxiliary boundaries preserve status and require canonical declarations", () => {
+  const declaration = {
+    contract_id: AUXILIARY_STATE_PROJECTION_CONTRACT_ID,
+    schema_version: AUXILIARY_STATE_PROJECTION_SCHEMA_VERSION,
+    source: { kind: "repository-local", path: ".codegraph" },
+    target: { kind: "managed-worktree", path: ".codegraph" },
+    mode: "copy",
+    durability: "durable",
+  };
+  const legacy = compileEffectiveFilesystemPolicy(
+    policyInput({ auxiliary_state: { status: "unapplied-legacy", declarations: [declaration] } }),
+  );
+  assert.equal(legacy.ok, true);
+  if (legacy.ok) assert.equal(legacy.value.auxiliary.status, "unapplied-legacy");
+
+  for (const malformed of [
+    { ...declaration, source: { kind: "host", path: ".codegraph" } },
+    { ...declaration, mode: "link" },
+    { ...declaration, durability: "process-local" },
+  ]) {
+    assert.equal(compileEffectiveFilesystemPolicy(policyInput({ auxiliary_state: [malformed] })).ok, false);
+  }
 });
 
 test("namespace selectors reject absolute dot segments and traversal aliases", () => {

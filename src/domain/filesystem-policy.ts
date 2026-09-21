@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
-import type { AuxiliaryStateDeclaration } from "./auxiliary-state-projection.js";
+import { validateAuxiliaryStateDeclaration, type AuxiliaryStateDeclaration } from "./auxiliary-state-projection.js";
 import {
   assertCanonicalClaimResource,
   canonicalClaimId,
@@ -102,6 +102,7 @@ export type EffectiveFilesystemPolicyInputs = Readonly<{
   readonly backend_requirements?: readonly FilesystemBackendRequirement[] | unknown;
   readonly backendRequirements?: readonly FilesystemBackendRequirement[] | unknown;
   readonly repository?: RepositoryIdentity;
+  readonly base?: unknown;
   readonly worktree_path?: string;
   readonly worktreePath?: string;
 }>;
@@ -310,8 +311,9 @@ function scopeFromValue(
 function scopeFromBoundary(value: unknown, field: string): DomainResult<EffectiveFilesystemScope> {
   if (value === undefined) return success(emptyScope());
   if (!isRecord(value)) return invalid(field, "expected a boundary object");
-  const nested = value.scope ?? value.filesystem ?? value.paths ?? value;
-  return scopeFromValue(nested, `${field}.scope`, "repository");
+  const nested = readAliasedValue(value, `${field}.scope`, ["scope", "filesystem", "paths"]);
+  if (!nested.ok) return nested;
+  return scopeFromValue(nested.value === undefined ? value : nested.value, `${field}.scope`, "repository");
 }
 
 function boundaryStatus(
@@ -349,8 +351,10 @@ function compileBoundary(
   const identityValue =
     value.identity === undefined ? success<string | null>(null) : identityKey(value.identity, `${field}.identity`);
   if (!identityValue.ok) return identityValue;
-  const digestValue = value.digest === undefined ? value.profile_digest : value.digest;
-  const digest = digestValue === undefined ? success<string | null>(null) : identityKey(digestValue, `${field}.digest`);
+  const digestValue = readAliasedValue(value, `${field}.digest`, ["digest", "profile_digest", "profileDigest"]);
+  if (!digestValue.ok) return digestValue;
+  const digest =
+    digestValue.value === undefined ? success<string | null>(null) : identityKey(digestValue.value, `${field}.digest`);
   if (!digest.ok) return digest;
   let revisionValue: number | string | null = null;
   if (value.revision !== undefined && value.revision !== null) {
@@ -500,6 +504,8 @@ function workingSetBoundary(value: unknown): DomainResult<CompiledBoundary> {
     return invalid("working_set.id", "applied working set requires an identity");
   const repository = repositoryIdentity(value.repository, "working_set.repository");
   if (!repository.ok) return repository;
+  const base = baseIdentity(value.base, "working_set.base");
+  if (!base.ok) return base;
   const scopeValue = value.scope ?? value;
   const scope = scopeFromValue(scopeValue, "working_set.scope");
   if (!scope.ok) return scope;
@@ -525,13 +531,41 @@ function workingSetBoundary(value: unknown): DomainResult<CompiledBoundary> {
 
 function auxiliaryBoundary(value: unknown): DomainResult<CompiledBoundary> {
   if (value === undefined || value === null) return compileBoundary(undefined, "auxiliary");
-  const source = isRecord(value) ? (value.declarations ?? value.items) : value;
+  const sourceValue = isRecord(value)
+    ? readAliasedValue(value, "auxiliary_state.declarations", ["declarations", "items"])
+    : success(value);
+  if (!sourceValue.ok) return sourceValue;
+  const source = sourceValue.value;
   const parsedStatus = boundaryStatus(isRecord(value) ? value.status : undefined, "auxiliary_state.status", "applied");
   if (!parsedStatus.ok) return parsedStatus;
-  if (parsedStatus.value === "unknown")
+  if (source === undefined || source === null) {
+    if (parsedStatus.value === "unknown" || parsedStatus.value === "unapplied-legacy")
+      return success(
+        Object.freeze({
+          status: parsedStatus.value,
+          identity: null,
+          digest: null,
+          revision: null,
+          epoch: null,
+          scope: emptyScope(),
+        }),
+      );
+    return invalid("auxiliary_state", "applied auxiliary state requires declarations");
+  }
+  if (!Array.isArray(source) || source.length > MAX_SELECTORS)
+    return invalid("auxiliary_state", "expected a bounded declaration array");
+  const readOnly: FilesystemPolicySelector[] = [];
+  for (const [index, item] of source.entries()) {
+    const declaration = validateAuxiliaryStateDeclaration(item);
+    if (!declaration.ok) return invalid(`auxiliary_state[${index}]`, declaration.error.message);
+    const target = selector(declaration.value.target.path, `auxiliary_state[${index}].target.path`, "repository");
+    if (!target.ok) return target;
+    readOnly.push(target.value);
+  }
+  if (parsedStatus.value !== "applied")
     return success(
       Object.freeze({
-        status: "unknown",
+        status: parsedStatus.value,
         identity: null,
         digest: null,
         revision: null,
@@ -539,19 +573,9 @@ function auxiliaryBoundary(value: unknown): DomainResult<CompiledBoundary> {
         scope: emptyScope(),
       }),
     );
-  if (!Array.isArray(source) || source.length > MAX_SELECTORS)
-    return invalid("auxiliary_state", "expected a bounded declaration array");
-  const readOnly: FilesystemPolicySelector[] = [];
-  for (const [index, item] of source.entries()) {
-    if (!isRecord(item) || !isRecord(item.target))
-      return invalid(`auxiliary_state[${index}]`, "expected an auxiliary declaration");
-    const target = selector(item.target.path, `auxiliary_state[${index}].target.path`, "repository");
-    if (!target.ok) return target;
-    readOnly.push(target.value);
-  }
   return success(
     Object.freeze({
-      status: "applied",
+      status: parsedStatus.value,
       identity: null,
       digest: null,
       revision: null,
@@ -674,6 +698,35 @@ function currentRepository(inputs: UnknownRecord): DomainResult<FilesystemReposi
   return repositoryIdentity(inputs.repository, "repository");
 }
 
+type FilesystemBaseIdentity = Readonly<{
+  readonly branch: string;
+  readonly revision: string;
+  readonly freshness?: string;
+}>;
+
+function baseIdentity(value: unknown, field: string): DomainResult<FilesystemBaseIdentity> {
+  if (!isRecord(value)) return invalid(field, "expected a base identity object");
+  const branch = text(value.branch, `${field}.branch`);
+  if (!branch.ok) return branch;
+  const revision = text(value.revision, `${field}.revision`);
+  if (!revision.ok) return revision;
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(revision.value))
+    return invalid(`${field}.revision`, "expected an immutable hexadecimal revision");
+  if (value.freshness !== undefined) {
+    const freshness = text(value.freshness, `${field}.freshness`);
+    if (!freshness.ok) return freshness;
+    return success(
+      Object.freeze({ branch: branch.value, revision: revision.value.toLowerCase(), freshness: freshness.value }),
+    );
+  }
+  return success(Object.freeze({ branch: branch.value, revision: revision.value.toLowerCase() }));
+}
+
+function currentBase(inputs: UnknownRecord): DomainResult<FilesystemBaseIdentity | null> {
+  if (inputs.base === undefined) return success(null);
+  return baseIdentity(inputs.base, "base");
+}
+
 function currentWorktree(inputs: UnknownRecord): DomainResult<string | null> {
   const selected = readAliasedValue(inputs, "worktree_path", ["worktree_path", "worktreePath"]);
   if (!selected.ok) return selected;
@@ -760,6 +813,8 @@ function compileInputs(input: unknown): DomainResult<EffectiveFilesystemPolicy> 
   if (!isRecord(input)) return invalid("inputs", "expected an object");
   const currentRepo = currentRepository(input);
   if (!currentRepo.ok) return currentRepo;
+  const currentBaseValue = currentBase(input);
+  if (!currentBaseValue.ok) return currentBaseValue;
   const currentWt = currentWorktree(input);
   if (!currentWt.ok) return currentWt;
   const profileInput = readAliasedValue(input, "profile", ["profile", "worktree_profile", "worktreeProfile"]);
@@ -780,6 +835,15 @@ function compileInputs(input: unknown): DomainResult<EffectiveFilesystemPolicy> 
     if (!workingSetRepo.ok) return workingSetRepo;
     if (!sameRepository(currentRepo.value, workingSetRepo.value))
       return invalid("working_set.repository", "working set belongs to a different repository");
+    if (currentBaseValue.value === null)
+      return invalid("base", "applied working set requires the current base identity");
+    const workingSetBase = baseIdentity(workingSetInput.value.base, "working_set.base");
+    if (!workingSetBase.ok) return workingSetBase;
+    if (
+      workingSetBase.value.branch !== currentBaseValue.value.branch ||
+      workingSetBase.value.revision !== currentBaseValue.value.revision
+    )
+      return invalid("working_set.base", "working set belongs to a different base branch or revision");
     const workingSetWorktree = readAliasedValue(workingSetInput.value, "working_set.worktree_path", [
       "worktree_path",
       "worktreePath",
@@ -792,7 +856,10 @@ function compileInputs(input: unknown): DomainResult<EffectiveFilesystemPolicy> 
   if (!claimSourceInput.ok) return claimSourceInput;
   const claimSource = claimSourceInput.value;
   const claimRecord = isRecord(claimSource) ? claimSource : undefined;
-  const claimValue = claimRecord === undefined ? claimSource : (claimRecord.claims ?? claimRecord.items);
+  const claimValueInput =
+    claimRecord === undefined ? success(claimSource) : readAliasedValue(claimRecord, "claims", ["claims", "items"]);
+  if (!claimValueInput.ok) return claimValueInput;
+  const claimValue = claimValueInput.value;
   const claims = claimsArray(claimValue, "claims");
   if (!claims.ok) return claims;
   const claimStatusResult = boundaryStatus(
