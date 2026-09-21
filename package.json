@@ -42,6 +42,8 @@
     "smoke-test": "node scripts/smoke-test.mjs",
     "manifest:generate": "node --import tsx scripts/generate-state-diagram.mjs",
     "manifest:check": "node --import tsx scripts/generate-state-diagram.mjs --check",
+    "skill:generate": "node --import tsx scripts/generate-cli-skill.mjs",
+    "skill:check": "node --import tsx scripts/generate-cli-skill.mjs --check",
     "test:package": "pnpm run build && node scripts/run-package-suite.mjs",
     "test:package:protected": "pnpm run build && node scripts/run-package-suite.mjs --require-protected-execution",
     "test:package:mottainai": "pnpm run build && node scripts/run-mottainai-uid-handoff-gate.mjs",
