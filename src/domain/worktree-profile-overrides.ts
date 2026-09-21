@@ -421,7 +421,11 @@ function selectorWithin(candidate: string, ceiling: string): boolean {
   let candidateIndex = 0;
   for (let ceilingIndex = 0; ceilingIndex < ceilingParts.length; ceilingIndex += 1) {
     const ceilingPart = ceilingParts[ceilingIndex];
-    if (ceilingPart === "**") return true;
+    // A non-terminal globstar can skip arbitrary path segments.  Proving
+    // containment there requires a full glob-language subset check; treating
+    // it as a prefix would allow a broad request such as `src/**` through a
+    // ceiling of `src/**/private`.  Fail closed for that ambiguous relation.
+    if (ceilingPart === "**") return ceilingIndex === ceilingParts.length - 1;
     const candidatePart = candidateParts[candidateIndex];
     if (candidatePart === undefined || candidatePart === "**") return false;
     if (!globSegmentMatches(ceilingPart, candidatePart)) return false;

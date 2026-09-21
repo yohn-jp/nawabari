@@ -43,13 +43,17 @@ function profile() {
   } as const;
 }
 
-function pinned() {
-  return pinWorktreeProfile(profile(), {
+function pinnedFrom(input: unknown) {
+  return pinWorktreeProfile(input, {
     repository: { id: "repo", revision },
     base: { revision },
     catalog: { path: "nawabari.profiles.json", blob_oid: blob },
     selection: { profile: "standard", parameters: {} },
   });
+}
+
+function pinned() {
+  return pinnedFrom(profile());
 }
 
 function auth(filesystem: Record<string, readonly string[]> = {}, baselineRequirements: readonly string[] = []) {
@@ -121,6 +125,26 @@ test("keeps operation-specific ceilings independent and rejects host paths or ex
     auth({ readOnly: ["/tmp/**"] }),
   );
   assert.equal(hostPath.ok, false);
+});
+
+test("fails closed for non-terminal globstar ceilings in both profile and external authority", () => {
+  const nonterminalCeiling = pinnedFrom({
+    ...profile(),
+    filesystem: { ...profile().filesystem, readOnly: ["src/**/private"] },
+  });
+  const profileBroadening = applyWorktreeProfileOverrides(
+    nonterminalCeiling,
+    { restrictions: { filesystem: { readOnly: ["src/**"] } } },
+    auth({ readOnly: ["src/**/private"] }),
+  );
+  assert.equal(profileBroadening.ok, false);
+
+  const externalBroadening = applyWorktreeProfileOverrides(
+    pinned(),
+    { restrictions: { filesystem: { readOnly: ["src/**"] } } },
+    auth({ readOnly: ["src/**/private"] }),
+  );
+  assert.equal(externalBroadening.ok, false);
 });
 
 test("DENY and immutable selectors cannot be removed, and strict policy cannot be weakened", () => {
