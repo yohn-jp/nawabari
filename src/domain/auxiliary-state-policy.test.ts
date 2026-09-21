@@ -88,6 +88,43 @@ test("requires explicit declaration and refuses an index that contains out-of-sc
   if (!missingDeclaration.ok) assert.equal(missingDeclaration.error.code, "AUXILIARY_STATE_INVALID");
 });
 
+test("proves covered selector containment instead of treating a narrower glob as a prefix match", () => {
+  const leaked = validateAuxiliaryStatePolicy(
+    declaration(),
+    profile({
+      scope: { readOnly: ["src/*"], write: [], create: [], delete: [], deny: [] },
+    }),
+    evidence({ covered_scope: ["src/**"], content_paths: ["src/index.ts"] }),
+  );
+  assert.equal(leaked.ok, false);
+  if (!leaked.ok) assert.equal(leaked.error.code, "AUXILIARY_STATE_AMBIGUOUS");
+
+  const nested = validateAuxiliaryStatePolicy(
+    declaration(),
+    profile(),
+    evidence({ covered_scope: ["src/domain/**"], content_paths: ["src/domain/auxiliary-state-projection.ts"] }),
+  );
+  assert.equal(nested.ok, true, nested.ok ? "" : nested.error.message);
+});
+
+test("index and Git evidence paths are concrete and cannot smuggle wildcard selectors", () => {
+  const wildcardContent = validateAuxiliaryStatePolicy(
+    declaration(),
+    profile(),
+    evidence({ content_paths: ["src/**"] }),
+  );
+  assert.equal(wildcardContent.ok, false);
+  if (!wildcardContent.ok) assert.equal(wildcardContent.error.code, "AUXILIARY_STATE_INVALID");
+
+  const wildcardTracked = validateAuxiliaryStatePolicy(
+    declaration(),
+    profile(),
+    evidence({ tracked_paths: [".codegraph/**"] }),
+  );
+  assert.equal(wildcardTracked.ok, false);
+  if (!wildcardTracked.ok) assert.equal(wildcardTracked.error.code, "AUXILIARY_STATE_INVALID");
+});
+
 test("stale root/revision evidence closes as unsupported and never grants a read scope", () => {
   const noRoot = validateAuxiliaryStatePolicy(
     declaration(),
@@ -142,4 +179,15 @@ test("serialization accepts only the canonical closed projection", () => {
   });
   assert.equal(weakened.ok, false);
   if (!weakened.ok) assert.equal(weakened.error.code, "AUXILIARY_STATE_INVALID");
+
+  const missingProvenance = serializeAuxiliaryStatePolicy({ ...result.value, provenance: null });
+  assert.equal(missingProvenance.ok, false);
+  if (!missingProvenance.ok) assert.equal(missingProvenance.error.code, "AUXILIARY_STATE_INVALID");
+
+  const malformedProvenance = serializeAuxiliaryStatePolicy({
+    ...result.value,
+    provenance: { repository: {}, base: {}, covered_scope: [], root: ROOT, revision: REVISION },
+  });
+  assert.equal(malformedProvenance.ok, false);
+  if (!malformedProvenance.ok) assert.equal(malformedProvenance.error.code, "AUXILIARY_STATE_INVALID");
 });

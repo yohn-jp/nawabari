@@ -239,6 +239,21 @@ function selectors(value: unknown, field: string, allowEmpty = true): DomainResu
   return success(Object.freeze(parsed));
 }
 
+function concretePaths(value: unknown, field: string, allowEmpty = true): DomainResult<readonly string[]> {
+  if (!Array.isArray(value) || (!allowEmpty && value.length === 0) || value.length > 2_048) {
+    return invalid(field, "expected a bounded array of concrete paths");
+  }
+  const parsed: string[] = [];
+  for (const [index, item] of value.entries()) {
+    const result = selector(item, `${field}[${index}]`, false);
+    if (!result.ok) return result;
+    parsed.push(result.value);
+  }
+  if (new Set(parsed).size !== parsed.length) return invalid(field, "contains duplicate paths");
+  parsed.sort(compareText);
+  return success(Object.freeze(parsed));
+}
+
 function scope(value: unknown, field: string): DomainResult<AuxiliaryStatePolicyScope> {
   if (!isRecord(value)) return invalid(field, "expected a path-scope object");
   const readOnly = selectors(value.readOnly, `${field}.readOnly`);
@@ -297,7 +312,7 @@ function parseEvidence(value: unknown): DomainResult<AuxiliaryStatePolicyEvidenc
   if (!baseValue.ok) return baseValue;
   const covered = selectors(value.covered_scope, "evidence.covered_scope", false);
   if (!covered.ok) return covered;
-  const content = selectors(value.content_paths, "evidence.content_paths");
+  const content = concretePaths(value.content_paths, "evidence.content_paths");
   if (!content.ok) return content;
   if (value.root === undefined && value.revision !== undefined) {
     return invalid("evidence.root", "a producer revision requires its actual root");
@@ -313,7 +328,7 @@ function parseEvidence(value: unknown): DomainResult<AuxiliaryStatePolicyEvidenc
     evidenceRevision = parsedRevision.value;
   }
   if (value.tracked_paths !== undefined) {
-    const tracked = selectors(value.tracked_paths, "evidence.tracked_paths", true);
+    const tracked = concretePaths(value.tracked_paths, "evidence.tracked_paths", true);
     if (!tracked.ok) return tracked;
     return success(
       Object.freeze({
@@ -381,7 +396,10 @@ function conservativeScopeSubset(covered: string, allowed: readonly string[]): b
   if (!covered.includes("*") && !covered.includes("?")) return allowed.some((pattern) => matches(pattern, covered));
   if (covered.endsWith("/**")) {
     const prefix = covered.slice(0, -3);
-    return allowed.some((pattern) => pattern === covered || pattern === "**" || pattern.startsWith(prefix));
+    return allowed.some(
+      (pattern) =>
+        pattern === covered || pattern === "**" || (pattern.endsWith("/**") && prefix.startsWith(pattern.slice(0, -3))),
+    );
   }
   return false;
 }
@@ -516,6 +534,33 @@ export function validateAuxiliaryStatePolicy(
 export const compileAuxiliaryStatePolicy = validateAuxiliaryStatePolicy;
 export const projectAuxiliaryStateVisibility = validateAuxiliaryStatePolicy;
 
+function parseProvenance(value: unknown): DomainResult<AuxiliaryStatePolicyProvenance> {
+  if (!isRecord(value)) return invalid("visibility.provenance", "expected a provenance object");
+  const repository = identity(value.repository, "visibility.provenance.repository");
+  if (!repository.ok) return repository;
+  const baseValue = base(value.base, "visibility.provenance.base");
+  if (!baseValue.ok) return baseValue;
+  const covered = selectors(value.covered_scope, "visibility.provenance.covered_scope", false);
+  if (!covered.ok) return covered;
+  const root = absolutePath(value.root, "visibility.provenance.root");
+  if (!root.ok) return root;
+  const provenanceRevision = revision(value.revision, "visibility.provenance.revision");
+  if (!provenanceRevision.ok) return provenanceRevision;
+  if (typeof value.evidence_digest !== "string" || !/^[0-9a-f]{64}$/u.test(value.evidence_digest)) {
+    return invalid("visibility.provenance.evidence_digest", "expected a SHA-256 hexadecimal digest");
+  }
+  return success(
+    Object.freeze({
+      repository: repository.value,
+      base: baseValue.value,
+      covered_scope: covered.value,
+      root: root.value,
+      revision: provenanceRevision.value,
+      evidence_digest: value.evidence_digest,
+    }),
+  );
+}
+
 function validateVisibility(input: unknown): DomainResult<AuxiliaryStateVisibility> {
   if (!isRecord(input)) return invalid("visibility", "expected an object");
   if (input.contract_id !== AUXILIARY_STATE_POLICY_CONTRACT_ID)
@@ -545,8 +590,16 @@ function validateVisibility(input: unknown): DomainResult<AuxiliaryStateVisibili
   if (input.visibility === "unsupported" && !equalJson(deny.value, ["**"])) {
     return invalid("visibility.auxiliary.deny", "unsupported visibility must deny all paths");
   }
-  if (input.provenance !== null && !isRecord(input.provenance)) {
-    return invalid("visibility.provenance", "expected provenance or null");
+  if (input.visibility === "bounded" && input.provenance === null) {
+    return invalid("visibility.provenance", "bounded visibility requires complete provenance");
+  }
+  if (input.visibility === "unsupported" && input.provenance !== null) {
+    return invalid("visibility.provenance", "unsupported visibility cannot carry provenance");
+  }
+  const provenance = input.provenance === null ? null : parseProvenance(input.provenance);
+  if (provenance !== null && !provenance.ok) return provenance;
+  if (provenance !== null && !equalJson(visibleScope.value, provenance.value.covered_scope)) {
+    return invalid("visibility.provenance.covered_scope", "does not match the visible auxiliary scope");
   }
   return success(
     Object.freeze({
@@ -563,7 +616,7 @@ function validateVisibility(input: unknown): DomainResult<AuxiliaryStateVisibili
         scope: visibleScope.value,
         deny: deny.value,
       }),
-      provenance: input.provenance as AuxiliaryStatePolicyProvenance | null,
+      provenance: provenance === null ? null : provenance.value,
     }),
   );
 }
