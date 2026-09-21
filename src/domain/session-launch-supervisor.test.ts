@@ -135,7 +135,7 @@ test("attaches the supervisor, durably revalidates, and sends one GO before wait
   if (!result.ok) return;
   assert.equal(result.value.status, "completed");
   assert.equal(result.value.started, true);
-  assert.deepEqual(events, ["attached", "epoch", "release-attempt", "go", "wait"]);
+  assert.deepEqual(events, ["attached", "epoch", "release-attempt", "epoch", "go", "wait"]);
 });
 
 test("parent death before GO never starts the user payload", async () => {
@@ -171,6 +171,32 @@ test("a stale epoch terminates the attached supervisor without sending GO", asyn
     assert.equal(result.value.started, false);
   }
   assert.deepEqual(events, ["terminate"]);
+});
+
+test("an epoch advanced by the durable release record cannot reach GO", async () => {
+  const events: string[] = [];
+  let observations = 0;
+  const result = await runSessionLaunchSupervisor({
+    ...packet(),
+    process_factory: async () => fakeProcess(events),
+    durability: {
+      revalidate_epoch: () => {
+        observations += 1;
+        events.push("epoch");
+        return observations === 1 ? 19 : 20;
+      },
+      record_release_attempt: () => {
+        events.push("release-attempt");
+      },
+    },
+  });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.value.status, "not-started");
+    assert.equal(result.value.reason, "stale-epoch");
+    assert.equal(result.value.started, false);
+  }
+  assert.deepEqual(events, ["epoch", "release-attempt", "epoch", "terminate"]);
 });
 
 test("parent death after GO is explicit unresolved and never retryable", async () => {

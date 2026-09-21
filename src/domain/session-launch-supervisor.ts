@@ -589,6 +589,14 @@ export async function runSessionLaunchSupervisor(
       }),
     );
   }
+  // The durable record can advance the lifecycle epoch. Revalidate again
+  // immediately before the final parent check and one-shot GO so a stale
+  // supervisor can never release a payload after that record.
+  if (!(await epochIsCurrent(reservation, durability))) {
+    supervisor.terminate();
+    cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    return success(notStarted(reservation, "stale-epoch", supervisor.pid, scope?.name ?? null));
+  }
   if (!parent.is_connected()) {
     supervisor.terminate();
     cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
