@@ -70,6 +70,22 @@ test("preview parser is metadata-only unless bounded read authority is explicit"
   assert.equal(authorized.ok, true);
 });
 
+test("preview parser accepts zero observation retries", () => {
+  const parsed = parseCoordinationPreviewArguments([
+    "--left",
+    "left-session",
+    "--right",
+    "right-session",
+    "--path",
+    "README.md",
+    "--max-retries",
+    "0",
+  ]);
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.max_retries, 0);
+});
+
 test("sharing-group parser emits the canonical producer binding", () => {
   assert.deepEqual(parseCoordinatedSharingGroup(["--mode", "write", "--sharing-group", "group-1"]), {
     ok: true,

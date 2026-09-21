@@ -52,7 +52,7 @@ export function parseCoordinationPreviewArguments(argv: readonly string[]): Doma
     else if (name === "--path") path = value;
     else if (name === "--allow-read-path") allowedReadPaths.push(value);
     else {
-      const parsed = positiveInteger(name, value);
+      const parsed = name === "--max-retries" ? nonNegativeInteger(name, value) : positiveInteger(name, value);
       if (!parsed.ok) return parsed;
       if (name === "--max-content-bytes") maxContentBytes = parsed.value;
       else if (name === "--max-diff-bytes") maxDiffBytes = parsed.value;

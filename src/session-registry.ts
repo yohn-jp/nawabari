@@ -5879,6 +5879,14 @@ export class SessionRegistry {
         ...state.claims.filter((claim) => claim.claimId !== validation.sourceClaim?.claimId),
         destinationClaim,
       ]);
+      validateRegistryClaims(
+        state.sessions,
+        nextClaims,
+        this.repository.repositoryId,
+        false,
+        (left, right, generation, records) => this.coordinationFacts(left, right, generation, records),
+        state.claimSetGeneration,
+      );
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
       if (claimSetGeneration === state.claimSetGeneration) {
         throw new SessionRegistryError("OPERATION_REJECTED", "Resource handoff did not change the claim set");

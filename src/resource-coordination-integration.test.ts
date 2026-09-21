@@ -186,6 +186,111 @@ test("resource handoff persists one atomic retry receipt and retries idempotentl
   }
 });
 
+test("resource handoff rejects a destination conflict without changing claims or persistence", async () => {
+  const repositoryPath = createRepository();
+  try {
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const revision = runGit(["rev-parse", "HEAD"], repositoryPath);
+    const identity = { repositoryHost: "local", repositoryId: registry.repository.repositoryId };
+    const executionScope = {
+      version: 1,
+      kind: "implementation-execution-scope",
+      authorization: {
+        version: 1,
+        kind: "implementation-authorization",
+        contractVersion: 1,
+        implementation: { ...identity, number: 500 },
+        governedBodyDigest: "b".repeat(64),
+      },
+      repository: identity,
+      base: { branch: "main", revision },
+      scope: { readOnly: ["README.md"], write: ["README.md"], create: [], delete: [], deny: [] },
+    };
+    const candidateWorkingSet = {
+      kind: "candidate-working-set",
+      schemaVersion: 1,
+      workingSetId: "candidate-500-conflict",
+      repository: { ...identity, repository: "local/nawabari" },
+      revision,
+      entries: [
+        {
+          state: "required",
+          target: { kind: "file", locator: "README.md" },
+          reason: { id: "test:handoff-conflict", summary: "bounded handoff conflict" },
+          evidence: [],
+        },
+      ],
+    };
+    const source = registry.provision({
+      worktreePath: `${repositoryPath}-handoff-conflict-source`,
+      branchName: "feature/handoff-conflict-source",
+      executionScope,
+      candidateWorkingSet,
+      initialClaims: [
+        { resource: "README.md", mode: "write", sharing: { kind: "isolated-worktree", groupId: "group-500" } },
+      ],
+    });
+    const retained = registry.provision({
+      worktreePath: `${repositoryPath}-handoff-conflict-retained`,
+      branchName: "feature/handoff-conflict-retained",
+      executionScope,
+      candidateWorkingSet,
+      initialClaims: [
+        { resource: "README.md", mode: "write", sharing: { kind: "isolated-worktree", groupId: "group-500" } },
+      ],
+    });
+    const destination = registry.provision({
+      worktreePath: `${repositoryPath}-handoff-conflict-destination`,
+      branchName: "feature/handoff-conflict-destination",
+      executionScope,
+      candidateWorkingSet,
+    });
+    const beforeRegistry = fs.readFileSync(registry.paths.registry, "utf8");
+    const beforeGeneration = registry.listClaimsSnapshot().claimSetGeneration;
+    const execution = {
+      fence: ({ sessionId, operationId }: { sessionId: string; operationId: string }) => ({
+        schemaVersion: 1 as const,
+        sessionId,
+        operationId,
+        epoch: 1,
+        accepting: false as const,
+        status: "fenced" as const,
+      }),
+      awaitQuiescence: (fence: { sessionId: string; operationId: string; epoch: number }) => ({
+        sessionId: fence.sessionId,
+        operationId: fence.operationId,
+        epoch: fence.epoch,
+        status: "quiescent" as const,
+        activeExecutionIds: [],
+        unknownExecutionIds: [],
+      }),
+    };
+
+    const result = await registry.handoffResources(
+      {
+        from_session_id: source.sessionId,
+        to_session_id: destination.sessionId,
+        resource: "README.md",
+        mode: "exclusive-write",
+        if_generation: beforeGeneration,
+        operation_id: "handoff-500-conflict",
+      },
+      execution,
+    );
+
+    assert.equal(result.status, "blocked");
+    assert.equal(result.code, "RESOURCE_CLAIM_CONFLICT");
+    assert.equal(result.sourceRetained, true);
+    assert.equal(registry.listClaims(source.sessionId).length, 1);
+    assert.equal(registry.listClaims(retained.sessionId).length, 1);
+    assert.equal(registry.listClaims(destination.sessionId).length, 0);
+    assert.equal(registry.listClaimsSnapshot().claimSetGeneration, beforeGeneration);
+    assert.equal(fs.readFileSync(registry.paths.registry, "utf8"), beforeRegistry);
+  } finally {
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 function createRepository(): string {
   const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-coordination-"));
   runGit(["init", "-b", "main"], repositoryPath);
