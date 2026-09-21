@@ -323,19 +323,20 @@ export function createResourceClaim(
       mode: stringifyDetail(input.mode),
     });
   }
+  const sharing = validateSharing(input.sharing, input.mode);
   assertCanonicalClaimResource(input.resource);
   if (!isTimestamp(timestamp)) {
     throw claimError("INVALID_CLAIM", "Claim timestamp is not canonical", { timestamp });
   }
   return Object.freeze({
     schemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
-    claimId: canonicalClaimId(owner.sessionId, input.resource, input.mode, input.sharing),
+    claimId: canonicalClaimId(owner.sessionId, input.resource, input.mode, sharing),
     sessionId: owner.sessionId,
     repositoryId: owner.repositoryId,
     worktreePath: owner.worktreePath,
     resource: input.resource,
     mode: input.mode,
-    ...(input.sharing === undefined ? {} : { sharing: Object.freeze({ ...input.sharing }) }),
+    ...(sharing === undefined ? {} : { sharing }),
     createdAt: timestamp,
     updatedAt: timestamp,
   });

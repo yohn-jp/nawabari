@@ -342,6 +342,49 @@ test("persists and round-trips schema-3 sharing claims", () => {
   }
 });
 
+test("admits coordinated claims only for distinct managed worktrees and reloads them", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const clock = () => new Date("2026-01-02T03:04:05.006Z");
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, clock });
+    const linkedRegistry = new SessionRegistry({ cwd: fixture.linkedWorktreePath, clock });
+    const first = registry.create();
+    assertRegistryError(() => registry.create(), "DUPLICATE_WORKTREE_OWNERSHIP");
+    const second = linkedRegistry.create();
+    const sharing = { kind: "isolated-worktree" as const, groupId: "shared-group" };
+
+    registry.claimResources({
+      sessionId: first.sessionId,
+      claims: [{ resource: "README.md", mode: "write", sharing }],
+    });
+    const admitted = linkedRegistry.claimResources({
+      sessionId: second.sessionId,
+      claims: [{ resource: "README.md", mode: "write", sharing }],
+    });
+    assert.equal(admitted.claims[0]?.sharing?.groupId, "shared-group");
+    assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath, clock }).listClaims().length, 2);
+
+    assertRegistryError(
+      () =>
+        registry.claimResources({
+          sessionId: first.sessionId,
+          claims: [{ resource: "src/file.ts", mode: "read", sharing }],
+        }),
+      "INVALID_CLAIM",
+    );
+    assertRegistryError(
+      () =>
+        linkedRegistry.claimResources({
+          sessionId: second.sessionId,
+          claims: [{ resource: "README.md", mode: "exclusive-write" }],
+        }),
+      "RESOURCE_CLAIM_CONFLICT",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("does not rewrite a registry containing an unsupported feature", () => {
   const fixture = createRepositoryFixture();
   try {

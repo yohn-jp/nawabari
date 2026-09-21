@@ -1443,7 +1443,7 @@ export class SessionRegistry {
         state.claims.filter((claim) => claim.sessionId !== sessionId),
         state.sessions,
         undefined,
-        (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration),
+        (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
       );
       const nextIds = new Set(next.map((claim) => claim.claimId));
       const released = current.filter((claim) => !nextIds.has(claim.claimId));
@@ -1544,7 +1544,14 @@ export class SessionRegistry {
       const externalClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
       // Validate the resulting complete set, including pairwise ownership
       // invariants, before exposing any persistence side effect.
-      this.assertCompleteClaimSet(nextSessionClaims, owner, externalClaims, state.sessions);
+      this.assertCompleteClaimSet(
+        nextSessionClaims,
+        owner,
+        externalClaims,
+        state.sessions,
+        state.claimSetGeneration,
+        (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+      );
       const nextClaims = sortResourceClaims([...externalClaims, ...nextSessionClaims]);
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
       if (claimSetGeneration !== state.claimSetGeneration) {
@@ -1824,7 +1831,14 @@ export class SessionRegistry {
             : this.canonicalClaimInputs(options.initialClaims, owner, true).map((input) =>
                 createResourceClaim(input, owner, toTimestamp(this.clock())),
               );
-        this.assertCompleteClaimSet(initialClaims, owner, state.claims, [...state.sessions, record]);
+        this.assertCompleteClaimSet(
+          initialClaims,
+          owner,
+          state.claims,
+          [...state.sessions, record],
+          state.claimSetGeneration,
+          (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, [...state.sessions, record]),
+        );
         const nextClaims = sortResourceClaims([...state.claims, ...initialClaims]);
         this.writeUnsafe(
           [...state.sessions, record],
@@ -4272,9 +4286,11 @@ export class SessionRegistry {
     owner: ClaimOwner,
     externalClaims: readonly ResourceClaim[],
     sessions: readonly SessionRecord[],
+    claimSetGeneration: number,
+    coordinationFacts: (left: ResourceClaim, right: ResourceClaim) => CoordinationFacts | undefined,
   ): void {
     this.assertNoOverlappingClaims(candidates);
-    this.validateRequestedClaims(candidates, owner, externalClaims, sessions);
+    this.validateRequestedClaims(candidates, owner, externalClaims, sessions, claimSetGeneration, coordinationFacts);
   }
 
   /**
@@ -4404,7 +4420,7 @@ export class SessionRegistry {
       [...existing, ...current],
       state.sessions,
       state.claimSetGeneration,
-      (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration),
+      (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
     );
     const nextClaims = sortResourceClaims([
       ...state.claims,
