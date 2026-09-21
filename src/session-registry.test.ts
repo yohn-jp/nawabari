@@ -42,11 +42,76 @@ test("round-trips session metadata through common Git state", () => {
     assert.equal(mainRegistry.get(mainSession.sessionId)?.label, "same human label");
 
     const persisted = readJson(mainRegistry.paths.registry) as PersistedRegistry;
-    assert.equal(persisted.schema_version, 1);
+    assert.equal(persisted.schema_version, 2);
+    assert.equal(persisted.registry_revision, 2);
+    assert.equal(persisted.runtime_epoch, 2);
+    assert.deepEqual(persisted.required_features, []);
     assert.equal(persisted.repository_id, mainRegistry.repository.repositoryId);
     assert.equal(persisted.sessions.length, 2);
     assert.equal(persisted.sessions[0].session_id, mainSession.sessionId);
   } finally {
+    fixture.cleanup();
+  }
+});
+
+test("close advances registry_revision once for each sequential persisted mutation", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-close-revision`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/close-revision" });
+    const before = persistedRegistryRevision(registry);
+
+    const result = registry.close(session.sessionId);
+
+    assert.equal(result.session.state, "closed");
+    assert.equal(persistedRegistryRevision(registry), before + 2);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("discard advances registry_revision once for each sequential persisted mutation", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-revision`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-revision" });
+    const before = persistedRegistryRevision(registry);
+
+    const result = registry.discard(session.sessionId);
+
+    assert.equal(result.session.state, "closed");
+    assert.equal(result.session.terminalOperation, "discard");
+    assert.equal(persistedRegistryRevision(registry), before + 2);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("multi-candidate garbage collection never reuses or regresses registry_revision", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePaths = [`${fixture.repositoryPath}-gc-revision-1`, `${fixture.repositoryPath}-gc-revision-2`];
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const sessions = [
+      registry.provision({ worktreePath: worktreePaths[0], branchName: "feature/gc-revision-1" }),
+      registry.provision({ worktreePath: worktreePaths[1], branchName: "feature/gc-revision-2" }),
+    ];
+    const before = persistedRegistryRevision(registry);
+    for (const worktreePath of worktreePaths) fs.rmSync(worktreePath, { recursive: true, force: true });
+
+    const result = registry.garbageCollect({ apply: true });
+
+    assert.deepEqual(
+      result.cleaned.map((session) => session.sessionId),
+      sessions.map((session) => session.sessionId),
+    );
+    assert.equal(persistedRegistryRevision(registry), before + 6);
+  } finally {
+    for (const worktreePath of worktreePaths) removeWorktree(fixture.repositoryPath, worktreePath);
     fixture.cleanup();
   }
 });
@@ -273,6 +338,55 @@ test("fails closed when persisted records contain duplicate ownership", () => {
   }
 });
 
+test("migrates a legacy registry without changing session ownership or claim mode", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    const claim = registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "README.md", mode: "write" }],
+    }).claims[0];
+    assert.ok(claim);
+
+    const legacy = readJson(registry.paths.registry) as Record<string, unknown>;
+    legacy.schema_version = 1;
+    delete legacy.registry_revision;
+    delete legacy.runtime_epoch;
+    delete legacy.required_features;
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
+
+    const result = registry.migrate();
+    assert.equal(result.migrated, true);
+    const migrated = readJson(registry.paths.registry) as PersistedRegistry;
+    assert.equal(migrated.schema_version, 2);
+    assert.equal(migrated.claims_schema_version, 2);
+    assert.equal(migrated.sessions[0]?.session_id, session.sessionId);
+    assert.equal((migrated.claims?.[0] as { mode?: string } | undefined)?.mode, "write");
+    assert.equal(registry.listClaims()[0]?.sessionId, session.sessionId);
+    assert.equal(registry.listClaims()[0]?.mode, "write");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("does not rewrite a registry containing an unsupported feature", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    registry.create();
+    const unsupported = readJson(registry.paths.registry) as Record<string, unknown>;
+    unsupported.required_features = ["future.v1"];
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(unsupported)}\n`);
+    const before = fs.readFileSync(registry.paths.registry, "utf8");
+
+    assertRegistryError(() => registry.create(), "REGISTRY_FEATURE_UNSUPPORTED");
+    assert.equal(fs.readFileSync(registry.paths.registry, "utf8"), before);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("toPersistedSessionRecord validates against the caller's expected repository", () => {
   const fixture = createRepositoryFixture();
   try {
@@ -441,6 +555,7 @@ test("an unexpected post-rename directory-sync failure is reported durability-un
     // The rename already committed the document; the failure only means
     // directory durability could not be proven, not that nothing happened.
     assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).list().length, 1);
+    assert.equal(fs.existsSync(registry.paths.registry), true);
   } finally {
     fixture.cleanup();
   }
@@ -472,6 +587,7 @@ test("an unexpected pre-rename write failure never produces a successful mutatio
       "REGISTRY_IO_FAILURE",
     );
     assert.deepEqual(registry.list(), []);
+    assert.equal(fs.existsSync(registry.paths.registry), false);
   } finally {
     fixture.cleanup();
   }
@@ -537,6 +653,20 @@ function readJson(filePath: string): unknown {
 function writeRegistry(registry: SessionRegistry, value: PersistedRegistry): void {
   fs.mkdirSync(registry.paths.directory, { recursive: true });
   fs.writeFileSync(registry.paths.registry, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function persistedRegistryRevision(registry: SessionRegistry): number {
+  const persisted = readJson(registry.paths.registry) as PersistedRegistry;
+  return "registry_revision" in persisted ? persisted.registry_revision : 0;
+}
+
+function removeWorktree(repositoryPath: string, worktreePath: string): void {
+  try {
+    runGit(["worktree", "remove", "--force", worktreePath], repositoryPath);
+  } catch {
+    // The directory cleanup remains safe when Git metadata was already removed.
+  }
+  fs.rmSync(worktreePath, { recursive: true, force: true });
 }
 
 function assertRegistryError(operation: () => unknown, code: SessionRegistryError["code"]): void {
