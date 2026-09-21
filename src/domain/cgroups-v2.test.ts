@@ -10,6 +10,7 @@ import {
   createCgroupScope,
   deriveCgroupScopeName,
   readCgroupAccounting,
+  readCgroupPopulation,
   type CgroupFileSystem,
 } from "./cgroups-v2.js";
 
@@ -24,8 +25,10 @@ function fixture(): { readonly root: string; readonly filesystem: CgroupFileSyst
     readFileSync: (file) => fs.readFileSync(file, "utf8"),
     writeFileSync: (file, value) => {
       fs.writeFileSync(file, value, "utf8");
-      if (path.basename(file) === "cgroup.kill")
+      if (path.basename(file) === "cgroup.kill") {
         fs.writeFileSync(path.join(path.dirname(file), "cgroup.procs"), "", "utf8");
+        fs.writeFileSync(path.join(path.dirname(file), "cgroup.events"), "populated 0\n", "utf8");
+      }
     },
     mkdirSync: (file, options) => {
       fs.mkdirSync(file, options);
@@ -36,6 +39,7 @@ function fixture(): { readonly root: string; readonly filesystem: CgroupFileSyst
         initializedScopes.add(file);
         for (const [name, value] of [
           ["cgroup.procs", ""],
+          ["cgroup.events", "populated 0\n"],
           [
             "cpu.stat",
             reused
@@ -108,6 +112,53 @@ test("occupied deterministic scopes are not adopted on restart", () => {
     const retry = createCgroupScope(identity, { root: testFixture.root, filesystem: testFixture.filesystem });
     assert.equal(retry.ok, false);
     if (!retry.ok) assert.equal(retry.error.code, "SANDBOX_CGROUP_SCOPE_CONFLICT");
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("cgroup.events proves descendant occupancy and process-read failure is unknown", () => {
+  const testFixture = fixture();
+  try {
+    const created = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-population" },
+      { root: testFixture.root, filesystem: testFixture.filesystem },
+    );
+    assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+    if (!created.ok) return;
+
+    fs.writeFileSync(path.join(created.value.path, "cgroup.events"), "populated 1\n", "utf8");
+    fs.writeFileSync(path.join(created.value.path, "cgroup.procs"), "", "utf8");
+    assert.deepEqual(readCgroupPopulation(created.value), {
+      state: "populated",
+      populated: true,
+      processes: [],
+      events: { populated: 1 },
+    });
+
+    fs.rmSync(path.join(created.value.path, "cgroup.procs"));
+    const unknown = readCgroupPopulation(created.value);
+    assert.equal(unknown.state, "unknown");
+    assert.equal(unknown.processes, null);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("cleanup refuses to remove a scope when occupancy evidence is unavailable", () => {
+  const testFixture = fixture();
+  try {
+    const created = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-unknown" },
+      { root: testFixture.root, filesystem: testFixture.filesystem },
+    );
+    assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+    if (!created.ok) return;
+    fs.rmSync(path.join(created.value.path, "cgroup.events"));
+    const cleaned = cleanupCgroupScope(created.value);
+    assert.equal(cleaned.ok, false);
+    if (!cleaned.ok) assert.equal(cleaned.error.code, "SANDBOX_CGROUP_CLEANUP_FAILED");
+    assert.equal(fs.existsSync(created.value.path), true);
   } finally {
     testFixture.cleanup();
   }
