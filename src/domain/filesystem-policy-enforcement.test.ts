@@ -79,6 +79,54 @@ test("does not turn a DENY-hole policy into a broad namespace bind", () => {
   }
 });
 
+test("revalidates a native namespace identity before binding a replacement directory", () => {
+  const value = fixture();
+  try {
+    const policy = materialize(value.root, { readOnly: ["src/**"] });
+    const original = path.join(value.root, "src-original");
+    const replacement = path.join(value.root, "src-replacement");
+    fs.renameSync(path.join(value.root, "src"), original);
+    fs.mkdirSync(replacement);
+    fs.writeFileSync(path.join(replacement, "allowed.ts"), "replacement");
+    fs.renameSync(replacement, path.join(value.root, "src"));
+
+    const result = compileFilesystemMounts(policy);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "SANDBOX_TOPOLOGY_INVALID");
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("rejects a native namespace replaced by a symlink escape", () => {
+  const value = fixture();
+  try {
+    const policy = materialize(value.root, { readOnly: ["src/**"] });
+    const original = path.join(value.root, "src-original");
+    fs.renameSync(path.join(value.root, "src"), original);
+    fs.symlinkSync(original, path.join(value.root, "src"), "dir");
+
+    const result = compileFilesystemMounts(policy);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "SANDBOX_TOPOLOGY_INVALID");
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("rejects a broad namespace bind when a deny glob can match a descendant", () => {
+  const value = fixture();
+  try {
+    fs.writeFileSync(path.join(value.root, "src", "secret.tmp"), "secret");
+    const policy = materialize(value.root, { readOnly: ["src/**"], deny: ["**/*.tmp"] });
+    const result = compileFilesystemMounts(policy);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "SANDBOX_TOPOLOGY_INVALID");
+  } finally {
+    value.cleanup();
+  }
+});
+
 test("keeps exact CREATE as a registry operation and emits no parent-directory grant", () => {
   const value = fixture();
   try {
