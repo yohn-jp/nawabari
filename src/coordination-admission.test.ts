@@ -12,4 +12,5 @@ test("admits only two verified distinct worktrees in one write group", () => {
   assert.equal(permitsCoordinatedWrite(facts), "allowed");
   assert.equal(permitsCoordinatedWrite({ ...facts, rightIdentity: { ...facts.rightIdentity, status: "ambiguous" } }), "denied");
   assert.equal(permitsCoordinatedWrite({ ...facts, observedClaimSetGeneration: 3 }), "denied");
+  assert.equal(permitsCoordinatedWrite({ ...facts, leftIdentity: { ...facts.leftIdentity, worktreePath: "/repo/other" } }), "denied");
 });

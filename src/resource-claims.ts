@@ -413,6 +413,7 @@ export function permitsCoordinatedWrite(facts: CoordinationFacts): CoordinationD
   if (leftIdentity.status !== "verified" || rightIdentity.status !== "verified") return "denied";
   if (leftIdentity.repositoryId !== rightIdentity.repositoryId || leftIdentity.repositoryId !== left.repositoryId) return "denied";
   if (left.sessionId === right.sessionId || leftIdentity.sessionId !== left.sessionId || rightIdentity.sessionId !== right.sessionId) return "denied";
+  if (leftIdentity.worktreePath !== left.worktreePath || rightIdentity.worktreePath !== right.worktreePath) return "denied";
   if (!leftIdentity.worktreeId || !rightIdentity.worktreeId || leftIdentity.worktreeId === rightIdentity.worktreeId) return "denied";
   if (!leftIdentity.worktreePath || !rightIdentity.worktreePath || leftIdentity.worktreePath === rightIdentity.worktreePath) return "denied";
   return "allowed";
