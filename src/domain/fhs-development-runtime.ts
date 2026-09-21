@@ -76,6 +76,7 @@ export const FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS: Readonly<Record<string, strin
   "git-package": "fhs-git-package-provider",
   "ls-runtime": "fhs-ls-runtime-provider",
   "pnpm-package": "fhs-pnpm-package-provider",
+  "bash-runtime": "fhs-bash-runtime-provider",
   [FHS_LANDLOCK_HELPER_REQUIREMENT_ID]: "fhs-landlock-helper-provider",
 });
 
@@ -116,7 +117,8 @@ export type FhsDevelopmentRuntimeReadiness = Readonly<{
  * expects a `landlock-helper` requirement.
  */
 const FHS_DISCOVERABLE_REQUIREMENT_IDS = Object.freeze([
-  ...FHS_DEVELOPMENT_SUPPORTED_REQUIREMENT_IDS,
+  ...FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS,
+  "pnpm-package",
   FHS_LANDLOCK_HELPER_REQUIREMENT_ID,
 ] as const);
 
