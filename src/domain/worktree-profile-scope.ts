@@ -367,7 +367,9 @@ export function resolveProfileRuntimeScope(
       operation: request.operation,
       profile,
       ...(workingSet === undefined ? {} : { workingSet }),
-      ...(claims === undefined ? {} : { claims, claimsRequired: session.claimsRequired === true }),
+      ...(claims === undefined && session.claimsRequired !== true
+        ? {}
+        : { claims, claimsRequired: session.claimsRequired === true }),
       ...(repositoryId === undefined ? {} : { repositoryId }),
     });
     decisions.push(evaluated);

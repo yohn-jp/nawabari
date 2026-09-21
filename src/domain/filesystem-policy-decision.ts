@@ -228,6 +228,9 @@ export function decideEffectivePathAccess(facts: FilesystemPolicyFacts): Filesys
     }
     authorities.working_set = "allow";
   }
+  if (facts.claims === undefined && facts.claimsRequired === true) {
+    return decision(path, facts.operation, "unsupported", "required ResourceClaim evidence is missing", authorities);
+  }
   if (facts.claims !== undefined) {
     if (facts.repositoryId === undefined) {
       return decision(

@@ -103,6 +103,19 @@ test("CREATE, DELETE, non-concrete paths, and missing required claims are unsupp
   assert.equal(noClaim.status, "denied");
 });
 
+test("missing claim evidence is unsupported when claims are required", () => {
+  const result = decideEffectivePathAccess({
+    path: "src/index.ts",
+    operation: "WRITE",
+    profile: ceiling,
+    claimsRequired: true,
+    repositoryId: "repo",
+  });
+  assert.equal(result.status, "unsupported");
+  assert.match(result.reason, /required ResourceClaim evidence/u);
+  assert.equal(result.authorities.claim, "not_provided");
+});
+
 test("claim matching and access strength remain delegated to the existing claim authority", () => {
   const current = claim("src/*.ts", "write");
   assert.equal(resourceMatchesClaim(current, "src/index.ts"), true);

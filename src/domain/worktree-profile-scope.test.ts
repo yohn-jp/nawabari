@@ -85,6 +85,14 @@ test("does not convert an absent external artifact into a ready result", () => {
   assert.match(result.value.diagnostics[0]?.reason ?? "", /Effective Working Set/u);
 });
 
+test("does not compile a ready scope when required claim evidence is omitted", () => {
+  const result = resolveProfileRuntimeScope(profile, { repositoryId: "repo", claimsRequired: true }, pathEvidence());
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.value.status, "unsupported");
+  assert.match(result.value.diagnostics[0]?.reason ?? "", /required ResourceClaim evidence/u);
+});
+
 test("fails closed for broad grants, unsupported operations, and denied intersections", () => {
   const broad = resolveProfileRuntimeScope(
     { ...profile, filesystem: { ...profile.filesystem, readOnly: ["src/**"] } },
