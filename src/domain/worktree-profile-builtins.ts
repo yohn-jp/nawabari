@@ -1,6 +1,7 @@
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import { FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS } from "./fhs-development-runtime.js";
 import { STRICT_RUNTIME_POLICY } from "./runtime-projection.js";
+import { resolveRuntimeProfile } from "./runtime-profile.js";
 import {
   resolveWorktreeProfile,
   substituteProfileParameters,
@@ -188,6 +189,13 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function validateCanonicalMaterialSelection(
+  profile: ResolvedWorktreeRuntimeProfile,
+): DomainResult<ResolvedWorktreeRuntimeProfile> {
+  const material = resolveRuntimeProfile(profile.materialSelection);
+  return material.ok ? success(profile) : failure(material.error);
+}
+
 /** Return one built-in declaration without resolving its material requirements. */
 export function getBuiltinWorktreeProfile(id: string): DomainResult<CatalogWorktreeProfile> {
   if (!BUILTIN_WORKTREE_PROFILE_IDS.includes(id as BuiltinWorktreeProfileId)) return missingProfile(id);
@@ -213,10 +221,14 @@ export function resolveBuiltinWorktreeProfile(
   if (!selected.ok) return selected;
   const resolved = resolveWorktreeProfile(selection, BUILTIN_WORKTREE_PROFILE_CATALOG);
   if (!resolved.ok) return resolved;
-  if (parameters === undefined) return resolved;
-  if (!record(parameters))
-    return invalidSelection("Profile parameters must be a JSON object.", { field: "parameters" });
-  return substituteProfileParameters(resolved.value, parameters);
+  const parameterized = (() => {
+    if (parameters === undefined) return resolved;
+    if (!record(parameters))
+      return invalidSelection("Profile parameters must be a JSON object.", { field: "parameters" });
+    return substituteProfileParameters(resolved.value, parameters);
+  })();
+  if (!parameterized.ok) return parameterized;
+  return validateCanonicalMaterialSelection(parameterized.value);
 }
 
 /** Serialize a validated built-in catalog under the canonical profile key. */

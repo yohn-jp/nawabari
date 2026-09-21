@@ -118,6 +118,16 @@ test("unknown profile and parameter failures use the same backend resolver", () 
   );
   assert.equal(parameter.ok, false);
   if (!parameter.ok) assert.equal(parameter.error.code, "RUNTIME_PROFILE_INVALID");
+  const unknownMaterial = resolveWorktreeProfileSessionCreate(
+    {
+      command: "session create",
+      profile: "builtin:minimal",
+      parameters: { "materialSelection.profiles": ["missing-runtime-profile"] },
+    },
+    {},
+  );
+  assert.equal(unknownMaterial.ok, false);
+  if (!unknownMaterial.ok) assert.equal(unknownMaterial.error.code, "RUNTIME_PROFILE_MISSING");
   const shared = resolveWorktreeProfileCliRequest(
     { command: "session create", profile: "builtin:minimal", parameters: { "not-allowed": true } },
     {},
