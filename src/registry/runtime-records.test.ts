@@ -18,7 +18,7 @@ test("registry optional areas are a finite feature-gated contract", () => {
     "recent-events.v1",
     "file-operations.v1",
   ]);
-  assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, []);
+  assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, ["recent-events.v1"]);
   assert.deepEqual(parseRuntimeRecords({}), { requiredFeatures: [], records: {} });
 });
 
@@ -52,6 +52,61 @@ test("supported feature records require matching presence and round-trip as boun
 test("feature presence without a matching gate fails closed", () => {
   assert.throws(
     () => parseRuntimeRecords({ executions: [] }, ["executions.v1"]),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+});
+
+test("recent-event records accept only the frozen resource-handoff shape", () => {
+  const parsed = parseRuntimeRecords(
+    {
+      required_features: ["recent-events.v1"],
+      recent_events: [
+        {
+          kind: "resource-handoff",
+          schema_version: 1,
+          operation_id: "handoff-1",
+          from_session_id: "session-a",
+          to_session_id: "session-b",
+          resource: "README.md",
+          mode: "write",
+          claim_set_generation: 2,
+        },
+      ],
+    },
+    SUPPORTED_REGISTRY_FEATURES,
+  );
+  assert.equal(parsed.records.recent_events?.[0]?.kind, "resource-handoff");
+  assert.throws(
+    () =>
+      parseRuntimeRecords(
+        {
+          required_features: ["recent-events.v1"],
+          recent_events: [{ kind: "unknown", schema_version: 1 }],
+        },
+        SUPPORTED_REGISTRY_FEATURES,
+      ),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+  assert.throws(
+    () =>
+      parseRuntimeRecords(
+        {
+          required_features: ["recent-events.v1"],
+          recent_events: [
+            {
+              kind: "resource-handoff",
+              schema_version: 2,
+              operation_id: "handoff-1",
+              from_session_id: "session-a",
+              to_session_id: "session-b",
+              resource: "README.md",
+              mode: "write",
+              claim_set_generation: 2,
+            },
+          ],
+        },
+        SUPPORTED_REGISTRY_FEATURES,
+      ),
     (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
   );
 });

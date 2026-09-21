@@ -48,6 +48,7 @@ import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
 import {
   REGISTRY_FEATURES,
   SUPPORTED_REGISTRY_FEATURES,
+  MAX_RUNTIME_RECORDS,
   emptyRuntimeRecords,
   parseRuntimeRecords,
   toPersistedRuntimeRecords,
@@ -55,7 +56,47 @@ import {
   type RegistryFeature,
   type RuntimeRecord,
   type RuntimeRecords,
+  type ResourceHandoffRecentEvent,
 } from "./registry/runtime-records.js";
+import {
+  buildResourceOverlapGraph,
+  createResourceIntent,
+  type ResourceIntentInput,
+  type ResourceOverlapBounds,
+  type ResourceOverlapGraph,
+} from "./resource-coordination.js";
+import {
+  applyCoordinationTransaction,
+  planCoordinationTransaction,
+  type CoordinationTransactionRequest,
+  type CoordinationTransactionResult,
+  type CoordinationTransactionPlan,
+  type CoordinationTransactionSnapshot,
+} from "./coordination-transactions.js";
+import {
+  previewCoordination,
+  type CoordinationPreviewOptions,
+  type CoordinationPreviewRegistry,
+  type CoordinationPreviewResult,
+} from "./coordination-preview.js";
+import {
+  projectResourceCoordinationSnapshot,
+  type CoordinationContractInput,
+  type ResourceCoordinationSnapshot,
+  type ResourceCoordinationSnapshotBounds,
+  type ResourceCoordinationSnapshotInput,
+} from "./resource-coordination-snapshot.js";
+import {
+  handoffResources,
+  validateResourceHandoff,
+  type HandoffResourcesOptions,
+  type ResourceHandoffAuthority,
+  type ResourceHandoffCommitInput,
+  type ResourceHandoffCommitResult,
+  type ResourceHandoffFenceController,
+  type ResourceHandoffResult,
+  type ResourceHandoffSnapshot,
+} from "./resource-handoff.js";
 import {
   assertCanonicalClaimResource,
   canonicalClaimId,
@@ -1138,6 +1179,108 @@ export class SessionRegistry {
       claims: state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim),
       claimSetGeneration: state.claimSetGeneration,
     };
+  }
+
+  /** Project the authoritative claims and explicit intents into the coordination graph. */
+  resourceCoordinationGraph(
+    intents: readonly ResourceIntentInput[] = [],
+    bounds: ResourceOverlapBounds = {},
+  ): ResourceOverlapGraph {
+    const state = this.readStateUnsafe();
+    const canonicalIntents = intents.map((intent) =>
+      createResourceIntent({
+        ...intent,
+        repositoryId: intent.repositoryId ?? this.repository.repositoryId,
+      }),
+    );
+    return buildResourceOverlapGraph(state.claims, canonicalIntents, bounds);
+  }
+
+  /** Plan one coordination transaction against the current registry snapshot. */
+  planCoordinationTransaction(request: CoordinationTransactionRequest): CoordinationTransactionPlan {
+    const state = this.readStateUnsafe();
+    return planCoordinationTransaction(this.coordinationTransactionSnapshot(state), request, {
+      coordinationFacts: (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+    });
+  }
+
+  /** Apply one coordination transaction through the single registry writer. */
+  applyCoordinationTransaction(request: CoordinationTransactionRequest): CoordinationTransactionResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const snapshot = this.coordinationTransactionSnapshot(state);
+      return applyCoordinationTransaction(snapshot, request, {
+        coordinationFacts: (left, right) =>
+          this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+        commit: (commit) => {
+          validateRecords(state.sessions, this.repository.repositoryId);
+          this.writeUnsafe(
+            state.sessions,
+            commit.claims,
+            commit.claimSetGeneration,
+            nextRegistryRevision(state),
+            state.runtimeEpoch,
+            state.runtimeRecords,
+          );
+        },
+      });
+    });
+  }
+
+  /** Produce a read-only bounded three-way coordination preview. */
+  coordinationPreview(options: CoordinationPreviewOptions): CoordinationPreviewResult {
+    const state = this.readStateUnsafe();
+    const registry: CoordinationPreviewRegistry = {
+      repository: this.repository,
+      paths: this.paths,
+      registryRevision: state.registryRevision,
+      sessions: state.sessions,
+      claims: state.claims,
+      listClaimsSnapshot: () => ({
+        claims: state.claims,
+        claimSetGeneration: state.claimSetGeneration,
+      }),
+    };
+    return previewCoordination(registry, { ...options, git: options.git ?? this.git });
+  }
+
+  /** Compose the non-persisted coordination snapshot from current authorities. */
+  resourceCoordinationSnapshot(
+    contract: CoordinationContractInput,
+    bounds?: ResourceCoordinationSnapshotBounds,
+  ): ResourceCoordinationSnapshot {
+    const state = this.readStateUnsafe();
+    const input: ResourceCoordinationSnapshotInput = {
+      registry: {
+        repositoryId: this.repository.repositoryId,
+        claimSetGeneration: state.claimSetGeneration,
+        registryRevision: state.registryRevision,
+        sessions: state.sessions.map((session) => ({
+          sessionId: session.sessionId,
+          worktreePath: session.worktreePath,
+          state: session.state,
+          branchName: session.branchName,
+          repositoryId: session.repositoryId,
+        })),
+        claims: state.claims,
+      },
+      contract,
+      ...(bounds === undefined ? {} : { bounds }),
+    };
+    return projectResourceCoordinationSnapshot(input);
+  }
+
+  /** Execute a fenced, quiescence-verified atomic resource handoff. */
+  handoffResources(
+    options: HandoffResourcesOptions,
+    executionController: ResourceHandoffFenceController,
+  ): Promise<ResourceHandoffResult> {
+    const authority: ResourceHandoffAuthority = {
+      readResourceHandoffSnapshot: () =>
+        this.withLock(() => this.resourceHandoffSnapshotUnsafe(this.readStateUnsafe())),
+      commitResourceHandoff: (input) => this.commitResourceHandoff(input),
+    };
+    return handoffResources(authority, executionController, options);
   }
 
   /**
@@ -5629,6 +5772,159 @@ export class SessionRegistry {
 
   private readUnsafe(): readonly SessionRecord[] {
     return this.readStateUnsafe().sessions;
+  }
+
+  private coordinationTransactionSnapshot(state: RegistryState): CoordinationTransactionSnapshot {
+    return {
+      repositoryId: this.repository.repositoryId,
+      claimSetGeneration: state.claimSetGeneration,
+      sessions: state.sessions,
+      claims: state.claims,
+    };
+  }
+
+  private resourceHandoffSnapshotUnsafe(state: RegistryState): ResourceHandoffSnapshot {
+    const completedOperations = (state.runtimeRecords.records.recent_events ?? []).map((record) => {
+      const event = record as unknown as ResourceHandoffRecentEvent;
+      return {
+        operationId: event.operation_id,
+        fromSessionId: event.from_session_id,
+        toSessionId: event.to_session_id,
+        resource: event.resource,
+        mode: event.mode,
+        claimSetGeneration: event.claim_set_generation,
+      };
+    });
+    return {
+      schemaVersion: 1,
+      operation: "resource-handoff",
+      registry: {
+        repositoryId: this.repository.repositoryId,
+        claimSetGeneration: state.claimSetGeneration,
+        sessions: state.sessions.map((session) => ({
+          sessionId: session.sessionId,
+          repositoryId: session.repositoryId,
+          worktreePath: session.worktreePath,
+          state: session.state,
+          maxScope: session.workingSet?.scope ?? null,
+        })),
+        claims: state.claims.map(cloneResourceClaim),
+        ...(completedOperations.length === 0 ? {} : { completedOperations }),
+      },
+    };
+  }
+
+  private commitResourceHandoff(input: ResourceHandoffCommitInput): ResourceHandoffCommitResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const current = this.resourceHandoffSnapshotUnsafe(state);
+      if (current.registry.claimSetGeneration !== input.snapshot.registry.claimSetGeneration) {
+        throw new SessionRegistryError("STALE_CLAIM_SET", "Claim-set generation changed before the handoff commit", {
+          expectedClaimSetGeneration: input.snapshot.registry.claimSetGeneration,
+          actualClaimSetGeneration: current.registry.claimSetGeneration,
+        });
+      }
+
+      const validation = validateResourceHandoff(current, input.options);
+      if (validation.status === "idempotent") {
+        return {
+          status: "idempotent",
+          operationId: input.normalized.operationId,
+          claimSetGeneration: current.registry.claimSetGeneration,
+          sourceClaim: validation.sourceClaim,
+          destinationClaim: validation.destinationClaim,
+        };
+      }
+      if (validation.status !== "allowed" || validation.sourceClaim === null) {
+        throw new SessionRegistryError(validation.code as RegistryErrorCode, "Resource handoff commit was rejected", {
+          blockers: validation.blockers as unknown as RegistryErrorDetailValue,
+          sourceRetained: true,
+        });
+      }
+
+      const sourceSession = state.sessions.find((session) => session.sessionId === input.normalized.fromSessionId);
+      const destinationSession = state.sessions.find((session) => session.sessionId === input.normalized.toSessionId);
+      if (sourceSession === undefined || destinationSession === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", "Resource handoff session identity changed before commit");
+      }
+      const expectedSource = input.snapshot.registry.sessions.find(
+        (session) => session.sessionId === input.normalized.fromSessionId,
+      );
+      const expectedDestination = input.snapshot.registry.sessions.find(
+        (session) => session.sessionId === input.normalized.toSessionId,
+      );
+      if (
+        expectedSource === undefined ||
+        expectedDestination === undefined ||
+        expectedSource.repositoryId !== sourceSession.repositoryId ||
+        expectedSource.worktreePath !== sourceSession.worktreePath ||
+        expectedSource.state !== sourceSession.state ||
+        expectedDestination.repositoryId !== destinationSession.repositoryId ||
+        expectedDestination.worktreePath !== destinationSession.worktreePath ||
+        expectedDestination.state !== destinationSession.state
+      ) {
+        throw new SessionRegistryError("WORKTREE_MISMATCH", "Handoff session identity changed before commit", {
+          fromSessionId: input.normalized.fromSessionId,
+          toSessionId: input.normalized.toSessionId,
+        });
+      }
+
+      const destinationOwner: ClaimOwner = { ...destinationSession, record: destinationSession };
+      const destinationClaim = createResourceClaim(
+        { resource: input.normalized.resource, mode: input.normalized.mode },
+        destinationOwner,
+        toTimestamp(this.clock()),
+      );
+      const nextClaims = sortResourceClaims([
+        ...state.claims.filter((claim) => claim.claimId !== validation.sourceClaim?.claimId),
+        destinationClaim,
+      ]);
+      const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+      if (claimSetGeneration === state.claimSetGeneration) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Resource handoff did not change the claim set");
+      }
+
+      const recentEvents = [...(state.runtimeRecords.records.recent_events ?? [])];
+      if (recentEvents.length >= MAX_RUNTIME_RECORDS) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Resource handoff retry evidence capacity is exhausted", {
+          maximum: MAX_RUNTIME_RECORDS,
+        });
+      }
+      const event: ResourceHandoffRecentEvent = Object.freeze({
+        kind: "resource-handoff",
+        schema_version: 1,
+        operation_id: input.normalized.operationId,
+        from_session_id: input.normalized.fromSessionId,
+        to_session_id: input.normalized.toSessionId,
+        resource: input.normalized.resource,
+        mode: input.normalized.mode,
+        claim_set_generation: claimSetGeneration,
+      });
+      const requiredFeatures: RegistryFeature[] = [...state.runtimeRecords.requiredFeatures];
+      if (!requiredFeatures.includes("recent-events.v1")) requiredFeatures.push("recent-events.v1");
+      const runtimeRecords: ParsedRuntimeRecords = Object.freeze({
+        requiredFeatures: Object.freeze(requiredFeatures),
+        records: Object.freeze({
+          ...state.runtimeRecords.records,
+          recent_events: Object.freeze([...recentEvents, event]),
+        }),
+      });
+      this.writeUnsafe(
+        state.sessions,
+        nextClaims,
+        claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        runtimeRecords,
+      );
+      return {
+        status: "transferred",
+        operationId: input.normalized.operationId,
+        claimSetGeneration,
+        sourceClaim: null,
+        destinationClaim: cloneResourceClaim(destinationClaim),
+      };
+    });
   }
 
   /**

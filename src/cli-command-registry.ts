@@ -270,6 +270,55 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     ],
   },
   {
+    name: "session coordination preview",
+    summary: "Preview bounded coordination between two sessions",
+    usage:
+      `${CLI_NAME} session coordination preview --left <session-id> --right <session-id> --path <resource> ` +
+      `[--patch --allow-read-path <resource>] [--max-content-bytes <n>] [--max-diff-bytes <n>] [--max-diff-hunks <n>] [--max-retries <n>]`,
+    options: [
+      option("--left", "Left session identity", { value: "<session-id>", required: true }),
+      option("--right", "Right session identity", { value: "<session-id>", required: true }),
+      option("--path", "One concrete repository-relative resource", { value: "<resource>", required: true }),
+      option("--patch", "Request bounded patch output; requires explicit --allow-read-path authority"),
+      option("--allow-read-path", "Explicit bounded read authority for patch output", {
+        value: "<resource>",
+        repeatable: true,
+      }),
+      option("--max-content-bytes", "Maximum observed content bytes", { value: "<n>" }),
+      option("--max-diff-bytes", "Maximum bounded diff bytes", { value: "<n>" }),
+      option("--max-diff-hunks", "Maximum bounded diff hunks", { value: "<n>" }),
+      option("--max-retries", "Maximum bounded observation retries", { value: "<n>" }),
+    ],
+    notes: [
+      "Preview is read-only and metadata-only by default.",
+      "--patch requires explicit bounded read authority for the requested path.",
+      "Session identities are passed to the producer as session IDs; they are never Git revisions.",
+    ],
+  },
+  {
+    name: "session handoff",
+    summary: "Transfer one resource claim between active sessions",
+    usage:
+      `${CLI_NAME} session handoff --from <session-id> --to <session-id> --resource <exact-resource> ` +
+      `--mode <read|write|exclusive-write> --if-generation <claim-set-generation> [--operation-id <id>]`,
+    options: [
+      option("--from", "Source session identity", { value: "<session-id>", required: true }),
+      option("--to", "Destination session identity", { value: "<session-id>", required: true }),
+      option("--resource", "Exact canonical resource", { value: "<exact-resource>", required: true }),
+      option("--mode", "Destination claim mode", {
+        value: "<read|write|exclusive-write>",
+        required: true,
+        values: ["read", "write", "exclusive-write"],
+      }),
+      option("--if-generation", "Required claim-set generation", { value: "<claim-set-generation>", required: true }),
+      option("--operation-id", "Optional stable retry identity", { value: "<id>" }),
+    ],
+    notes: [
+      "--from and --to are session identities and are never interpreted as Git revisions.",
+      "A configured execution-control fence is required; absence fails closed before claim mutation.",
+    ],
+  },
+  {
     name: "session list",
     summary: "List bounded repository session records",
     usage: `${CLI_NAME} session list [--all|--history] [--limit <n>] [--offset <n>]`,

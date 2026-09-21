@@ -66,14 +66,25 @@ import {
   type RegistryMigrationResult,
   type StatusResult,
   type UpdateClaimsOptions,
+  type CoordinationPreviewOptions,
+  type CoordinationPreviewResult,
+  type ResourceCoordinationSnapshotContract,
+  type ResourceCoordinationSnapshotOptions,
+  type ResourceCoordinationSnapshotResult,
+  type ResourceHandoffOptions,
+  type ResourceHandoffResult,
+  type CoordinationTransactionRequest,
+  type CoordinationTransactionResult,
 } from "./session.js";
 import type { SandboxGitIdentity } from "./sandbox.js";
+import type { ResourceHandoffFenceController } from "../resource-handoff.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
   /** Minimal host Git identity projected into governed commit operations. */
   readonly gitIdentity?: SandboxGitIdentity;
   readonly registry?: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
+  readonly resourceHandoffExecution?: ResourceHandoffFenceController;
 }
 
 export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
@@ -175,11 +186,13 @@ export class LocalSessionBackend implements SessionBackend {
   private readonly git: SessionRegistryOptions["git"];
   private readonly gitIdentity: SandboxGitIdentity | undefined;
   private readonly registryOptions: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
+  private readonly resourceHandoffExecution: ResourceHandoffFenceController | undefined;
 
   public constructor(options: LocalSessionBackendOptions = {}) {
     this.git = options.git;
     this.gitIdentity = options.gitIdentity;
     this.registryOptions = options.registry ?? {};
+    this.resourceHandoffExecution = options.resourceHandoffExecution;
   }
 
   public async createSession(
@@ -600,6 +613,58 @@ export class LocalSessionBackend implements SessionBackend {
         claims: snapshot.claims.map(toDomainClaim),
         claim_set_generation: snapshot.claimSetGeneration,
       });
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async coordinationPreview(
+    context: SessionContext,
+    options: CoordinationPreviewOptions,
+  ): Promise<DomainResult<CoordinationPreviewResult>> {
+    try {
+      return success(this.registryFor(context).coordinationPreview(options));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async resourceCoordinationSnapshot(
+    context: SessionContext,
+    contract: ResourceCoordinationSnapshotContract,
+    bounds?: ResourceCoordinationSnapshotOptions,
+  ): Promise<DomainResult<ResourceCoordinationSnapshotResult>> {
+    try {
+      return success(this.registryFor(context).resourceCoordinationSnapshot(contract, bounds));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async handoffResources(
+    context: SessionContext,
+    options: ResourceHandoffOptions,
+  ): Promise<DomainResult<ResourceHandoffResult>> {
+    if (this.resourceHandoffExecution === undefined) {
+      return failure(
+        new DomainError("OPERATION_REJECTED", "Resource handoff requires configured execution-control evidence.", {
+          operation_code: "PHYSICAL_OBSERVATION_UNAVAILABLE",
+        }),
+      );
+    }
+    try {
+      return success(await this.registryFor(context).handoffResources(options, this.resourceHandoffExecution));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async applyCoordinationTransaction(
+    context: SessionContext,
+    request: CoordinationTransactionRequest,
+  ): Promise<DomainResult<CoordinationTransactionResult>> {
+    try {
+      return success(this.registryFor(context).applyCoordinationTransaction(request));
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
