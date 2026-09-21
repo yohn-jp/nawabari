@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
 import type { AuxiliaryStateDeclaration } from "./auxiliary-state-projection.js";
 import {
+  assertCanonicalClaimResource,
+  canonicalClaimId,
   claimModeGrantsAccess,
+  RESOURCE_CLAIM_SCHEMA_VERSION,
   resourceMatchesClaim,
   type ResourceClaim,
   type ResourceClaimMode,
 } from "../resource-claims.js";
-import type { RepositoryIdentity } from "../working-set.js";
+import { isSessionId } from "../session-id.js";
+import { EFFECTIVE_WORKING_SET_KIND, EFFECTIVE_WORKING_SET_VERSION, type RepositoryIdentity } from "../working-set.js";
 
 /** Stable identity for the operation-level filesystem policy contract. */
 export const EFFECTIVE_FILESYSTEM_POLICY_CONTRACT_ID = "nawabari.effective-filesystem-policy.v1" as const;
@@ -27,7 +32,11 @@ export type EffectiveFilesystemDomain = "repository" | "runtime" | "package" | "
 export type FilesystemPolicyBoundaryStatus = "applied" | "unapplied-legacy" | "unknown";
 export type FilesystemDecisionStatus = "allow" | "deny" | "unresolved";
 
-const SCOPE_KEYS = ["readOnly", "write", "create", "delete", "rename", "deny"] as const;
+export function isEffectiveFilesystemOperation(value: unknown): value is EffectiveFilesystemOperation {
+  return typeof value === "string" && EFFECTIVE_FILESYSTEM_OPERATIONS.includes(value as EffectiveFilesystemOperation);
+}
+
+const SCOPE_KEYS = ["readOnly", "write", "create", "delete", "rename", "deny", "immutable"] as const;
 type ScopeKey = (typeof SCOPE_KEYS)[number];
 const MAX_SELECTORS = 4_096;
 const MAX_CLAIMS = 4_096;
@@ -47,6 +56,7 @@ export type EffectiveFilesystemScope = Readonly<{
   readonly delete: readonly FilesystemPolicySelector[];
   readonly rename: readonly FilesystemPolicySelector[];
   readonly deny: readonly FilesystemPolicySelector[];
+  readonly immutable: readonly FilesystemPolicySelector[];
 }>;
 
 /** A bounded factual input for a single producer authority. */
@@ -265,6 +275,7 @@ function emptyScope(): EffectiveFilesystemScope {
     delete: Object.freeze([]),
     rename: Object.freeze([]),
     deny: Object.freeze([]),
+    immutable: Object.freeze([]),
   });
 }
 
@@ -380,11 +391,52 @@ function claimsArray(value: unknown, field: string): DomainResult<readonly Resou
   const result: ResourceClaim[] = [];
   for (const [index, claim] of value.entries()) {
     if (!isRecord(claim)) return invalid(`${field}[${index}]`, "expected a claim object");
-    if (typeof claim.resource !== "string" || typeof claim.mode !== "string")
-      return invalid(`${field}[${index}]`, "claim resource and mode are required");
+    if (claim.schemaVersion !== RESOURCE_CLAIM_SCHEMA_VERSION)
+      return invalid(`${field}[${index}].schemaVersion`, "unsupported claim schema");
+    if (
+      typeof claim.claimId !== "string" ||
+      typeof claim.sessionId !== "string" ||
+      typeof claim.repositoryId !== "string" ||
+      typeof claim.worktreePath !== "string" ||
+      typeof claim.resource !== "string" ||
+      typeof claim.mode !== "string"
+    )
+      return invalid(`${field}[${index}]`, "canonical claim identity fields are required");
     if (claim.mode !== "read" && claim.mode !== "write" && claim.mode !== "exclusive-write")
       return invalid(`${field}[${index}].mode`, "unsupported claim mode");
-    result.push(claim as unknown as ResourceClaim);
+    if (!isSessionId(claim.sessionId)) return invalid(`${field}[${index}].sessionId`, "invalid session identity");
+    const repositoryId = text(claim.repositoryId, `${field}[${index}].repositoryId`);
+    if (!repositoryId.ok) return repositoryId;
+    if (
+      !path.isAbsolute(claim.worktreePath) ||
+      path.normalize(claim.worktreePath) !== claim.worktreePath ||
+      claim.worktreePath.includes("\u0000")
+    )
+      return invalid(`${field}[${index}].worktreePath`, "expected an absolute normalized worktree identity");
+    try {
+      assertCanonicalClaimResource(claim.resource);
+    } catch {
+      return invalid(`${field}[${index}].resource`, "claim resource is not canonical");
+    }
+    if (canonicalClaimId(claim.sessionId, claim.resource, claim.mode) !== claim.claimId)
+      return invalid(`${field}[${index}].claimId`, "claim id does not match canonical identity");
+    const createdAt = canonicalClaimTimestamp(claim.createdAt, `${field}[${index}].createdAt`);
+    if (!createdAt.ok) return createdAt;
+    const updatedAt = canonicalClaimTimestamp(claim.updatedAt, `${field}[${index}].updatedAt`);
+    if (!updatedAt.ok) return updatedAt;
+    result.push(
+      Object.freeze({
+        schemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
+        claimId: claim.claimId,
+        sessionId: claim.sessionId,
+        repositoryId: repositoryId.value,
+        worktreePath: claim.worktreePath,
+        resource: claim.resource,
+        mode: claim.mode,
+        createdAt: createdAt.value,
+        updatedAt: updatedAt.value,
+      }),
+    );
   }
   result.sort((left, right) =>
     compare(`${left.resource}:${left.mode}:${left.claimId}`, `${right.resource}:${right.mode}:${right.claimId}`),
@@ -397,9 +449,50 @@ function claimGeneration(value: unknown, field: string): DomainResult<number | n
   return positiveInteger(value, field);
 }
 
+function canonicalClaimTimestamp(value: unknown, field: string): DomainResult<string> {
+  const parsed = text(value, field);
+  if (!parsed.ok) return parsed;
+  if (
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(parsed.value) ||
+    Number.isNaN(Date.parse(parsed.value)) ||
+    new Date(parsed.value).toISOString() !== parsed.value
+  ) {
+    return invalid(field, "expected a canonical UTC timestamp");
+  }
+  return parsed;
+}
+
 function workingSetBoundary(value: unknown): DomainResult<CompiledBoundary> {
   if (value === undefined || value === null) return compileBoundary(undefined, "working_set");
   if (!isRecord(value)) return invalid("working_set", "expected an Effective Working Set or scope object");
+  const parsedStatus = boundaryStatus(value.status, "working_set.status", "applied");
+  if (!parsedStatus.ok) return parsedStatus;
+  if (parsedStatus.value === "unknown")
+    return success(
+      Object.freeze({
+        status: "unknown",
+        identity: typeof value.id === "string" ? value.id : null,
+        digest: null,
+        revision: null,
+        epoch: null,
+        scope: emptyScope(),
+      }),
+    );
+  if (parsedStatus.value === "unapplied-legacy")
+    return success(
+      Object.freeze({
+        status: "unapplied-legacy",
+        identity: null,
+        digest: null,
+        revision: null,
+        epoch: null,
+        scope: emptyScope(),
+      }),
+    );
+  if (value.version !== EFFECTIVE_WORKING_SET_VERSION || value.kind !== EFFECTIVE_WORKING_SET_KIND)
+    return invalid("working_set", "applied working set requires the canonical contract identity");
+  if (typeof value.id !== "string" || value.id.length === 0)
+    return invalid("working_set.id", "applied working set requires an identity");
   const scopeValue = value.scope ?? value;
   const scope = scopeFromValue(scopeValue, "working_set.scope");
   if (!scope.ok) return scope;
@@ -410,19 +503,15 @@ function workingSetBoundary(value: unknown): DomainResult<CompiledBoundary> {
       revision = value.revision as number;
     else return invalid("working_set.revision", "expected a positive revision");
   }
-  const status = value.status === undefined ? "applied" : value.status;
-  const parsedStatus = boundaryStatus(status, "working_set.status", "applied");
-  if (!parsedStatus.ok) return parsedStatus;
-  const identityValue = value.id === undefined ? null : value.id;
-  if (identityValue !== null && typeof identityValue !== "string") return invalid("working_set.id", "expected text");
+  if (revision === null) return invalid("working_set.revision", "applied working set requires a revision");
   return success(
     Object.freeze({
       status: parsedStatus.value,
-      identity: identityValue,
+      identity: value.id,
       digest: null,
       revision,
       epoch: null,
-      scope: parsedStatus.value === "unknown" ? emptyScope() : scope.value,
+      scope: scope.value,
     }),
   );
 }
@@ -580,6 +669,14 @@ function scopeDenies(
   return scope.deny.some((item) => selectorMatches(item, pathValue, selectedDomain));
 }
 
+function scopeIsImmutable(
+  scope: EffectiveFilesystemScope,
+  pathValue: string,
+  selectedDomain: EffectiveFilesystemDomain,
+): boolean {
+  return scope.immutable.some((item) => selectorMatches(item, pathValue, selectedDomain));
+}
+
 function operationClaimMode(operation: EffectiveFilesystemOperation): ResourceClaimMode {
   return operation === "READONLY" ? "read" : "write";
 }
@@ -704,6 +801,8 @@ function authorityDecision(
     return Object.freeze({ authority, status: "legacy", reason: "legacy boundary was not applied" });
   if (scopeDenies(boundary.scope, pathValue, selectedDomain))
     return Object.freeze({ authority, status: "denied", reason: "explicit deny matches" });
+  if (operation !== "READONLY" && scopeIsImmutable(boundary.scope, pathValue, selectedDomain))
+    return Object.freeze({ authority, status: "denied", reason: "immutable area rejects mutation" });
   if (!scopeAllows(boundary.scope, operation, pathValue, selectedDomain))
     return Object.freeze({ authority, status: "denied", reason: "path is outside the operation scope" });
   return Object.freeze({ authority, status: "allowed", reason: "operation scope matches" });
@@ -711,7 +810,23 @@ function authorityDecision(
 
 /** Decide one operation independently; WRITE never implies READONLY. */
 export function decideEffectivePathAccess(facts: EffectivePathAccessFacts): EffectivePathAccessDecision {
+  if (!isEffectiveFilesystemOperation(facts.operation))
+    return decision(
+      facts,
+      "deny",
+      "unsupported filesystem operation",
+      [{ authority: "input", status: "denied", reason: "unsupported filesystem operation" }],
+      facts.domain ?? "repository",
+    );
   const selectedDomain = facts.domain ?? "repository";
+  if (facts.operation === "RENAME" && facts.destination === undefined)
+    return decision(
+      facts,
+      "deny",
+      "rename requires a destination",
+      [{ authority: "input", status: "denied", reason: "rename requires a destination" }],
+      selectedDomain,
+    );
   const normalized = pathValue(facts.path, "path", selectedDomain);
   if (!normalized.ok)
     return decision(
