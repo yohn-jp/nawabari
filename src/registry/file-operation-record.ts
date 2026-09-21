@@ -567,7 +567,16 @@ export function recordFileOperationApplyAttempt(
       operationId: normalizedOperationId,
     });
   }
-  if (authorityToken !== undefined && authorityToken !== record.authorityToken) {
+  if (typeof authorityToken !== "string" || authorityToken.length === 0) {
+    throw new FileOperationError(
+      "FILE_OPERATION_AUTHORITY_DENIED",
+      "Apply attempt requires the receipt authority token",
+      {
+        operationId: normalizedOperationId,
+      },
+    );
+  }
+  if (authorityToken !== record.authorityToken) {
     throw new FileOperationError(
       "FILE_OPERATION_AUTHORITY_DENIED",
       "Apply attempt authority token does not match receipt",

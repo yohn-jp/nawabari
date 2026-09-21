@@ -167,6 +167,20 @@ test("authority and fence mismatches cannot rewrite a receipt", () => {
       "code" in error &&
       error.code === "FILE_OPERATION_AUTHORITY_DENIED",
   );
+
+  const unrecordedState = createFileOperationRegistryState();
+  const reserved = reserveFileOperation(unrecordedState, request({ operationId: "missing-authority" }), now(1));
+  const beforeMissingToken = JSON.stringify(unrecordedState);
+  assert.throws(
+    () => recordFileOperationApplyAttempt(unrecordedState, reserved.operationId),
+    (error: unknown) =>
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "FILE_OPERATION_AUTHORITY_DENIED",
+  );
+  assert.equal(JSON.stringify(unrecordedState), beforeMissingToken);
+
   assert.throws(
     () => reconcileFileOperationReceipt(recorded, createObservation(recorded, { fenceEpoch: FENCE + 1 }), now(3)),
     (error: unknown) =>
