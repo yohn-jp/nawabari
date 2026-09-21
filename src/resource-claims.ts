@@ -7,9 +7,10 @@ import { SessionRegistryError, type RegistryErrorDetails } from "./errors.js";
 /**
  * Claim schema version 2 records the distinct overlap semantics below. A
  * persisted v1 claim must be explicitly migrated before it is interpreted by
- * the v2 authority.
+ * the v2 authority. Coordinated-write admission is additive and does not
+ * advance the existing claim schema.
  */
-export const RESOURCE_CLAIM_SCHEMA_VERSION = 3 as const;
+export const RESOURCE_CLAIM_SCHEMA_VERSION = 2 as const;
 export const LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION = 1 as const;
 
 export const RESOURCE_CLAIM_MODES = ["read", "write", "exclusive-write"] as const;
