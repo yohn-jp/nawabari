@@ -110,6 +110,8 @@ export type SerializedWorktreeFileOperation = Readonly<{
 }>;
 
 export type WorktreeFileOperationExecutionOptions = Readonly<{
+  /** Canonical executable selected by the strict Landlock runtime materialization. */
+  readonly landlock_helper: string | null;
   /** Test seam for the fixed helper protocol; production uses the fixed spawn below. */
   readonly run_helper?: (packet: string) => string;
   readonly timeout_ms?: number;
@@ -475,9 +477,40 @@ function helperResponse(value: unknown): DomainResult<HelperResponse> {
   );
 }
 
-function spawnFixedHelper(packet: string, timeout: number): string {
-  const result: SpawnSyncReturns<string> = spawnSync("python3", ["-I", "-c", WORKTREE_FILE_OPERATION_HELPER], {
-    cwd: process.cwd(),
+function validateLandlockHelper(value: string | null): DomainResult<string> {
+  if (process.platform !== "linux" || value === null || !path.isAbsolute(value) || value.includes("\0")) {
+    return failure(
+      new DomainError(
+        "SANDBOX_CAPABILITY_UNAVAILABLE",
+        "The strictly materialized Landlock Python executable is unavailable.",
+      ),
+    );
+  }
+  try {
+    const canonical = fs.realpathSync.native(value);
+    const stat = fs.statSync(canonical);
+    if (!stat.isFile() || (stat.mode & 0o111) === 0 || !/^python3(?:\.[0-9]+)*$/u.test(path.basename(canonical))) {
+      return failure(
+        new DomainError(
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "The Landlock Python executable is not a canonical materialized runtime executable.",
+        ),
+      );
+    }
+    return success(canonical);
+  } catch {
+    return failure(
+      new DomainError(
+        "SANDBOX_CAPABILITY_UNAVAILABLE",
+        "The strictly materialized Landlock Python executable is unavailable.",
+      ),
+    );
+  }
+}
+
+function spawnFixedHelper(executable: string, packet: string, timeout: number, cwd: string): string {
+  const result: SpawnSyncReturns<string> = spawnSync(executable, ["-I", "-c", WORKTREE_FILE_OPERATION_HELPER], {
+    cwd,
     env: {},
     input: packet,
     encoding: "utf8",
@@ -493,8 +526,10 @@ function spawnFixedHelper(packet: string, timeout: number): string {
 /** Execute exactly one prepared operation through the fixed Linux helper. */
 export function executeWorktreeFileOperation(
   preparedOperation: PreparedWorktreeFileOperation,
-  options: WorktreeFileOperationExecutionOptions = {},
+  options: WorktreeFileOperationExecutionOptions = { landlock_helper: null },
 ): DomainResult<WorktreeFileOperationResult> {
+  const helper = validateLandlockHelper(options.landlock_helper);
+  if (!helper.ok) return helper;
   const timeout = options.timeout_ms ?? 10_000;
   if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 60_000)
     return invalid("timeout_ms", "expected a bounded positive timeout");
@@ -502,7 +537,12 @@ export function executeWorktreeFileOperation(
   try {
     serialized =
       options.run_helper === undefined
-        ? spawnFixedHelper(JSON.stringify(preparedOperation.helper_packet), timeout)
+        ? spawnFixedHelper(
+            helper.value,
+            JSON.stringify(preparedOperation.helper_packet),
+            timeout,
+            preparedOperation.request.worktree_root,
+          )
         : options.run_helper(JSON.stringify(preparedOperation.helper_packet));
   } catch (error: unknown) {
     return failure(
@@ -579,7 +619,7 @@ export function executeWorktreeFileOperation(
 /** Complete the bounded producer operation without exposing shell execution. */
 export function mutateWorktreeFile(
   input: unknown,
-  options: WorktreeFileOperationExecutionOptions = {},
+  options: WorktreeFileOperationExecutionOptions = { landlock_helper: null },
 ): DomainResult<WorktreeFileOperationResult> {
   const prepared = prepareWorktreeFileOperation(input);
   if (!prepared.ok) return prepared;
