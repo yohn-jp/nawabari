@@ -209,6 +209,42 @@ export function getBuiltinWorktreeProfileStatus(id: string): DomainResult<Builti
   return success(BUILTIN_WORKTREE_PROFILE_AVAILABILITY[id as BuiltinWorktreeProfileId]);
 }
 
+/**
+ * Project readiness from the selected canonical material and the profile's
+ * declared executable surface. A declaration is not ready when its selected
+ * material omits a requirement needed by one of its tools.
+ */
+export function getBuiltinWorktreeProfileStatusForResolution(
+  id: string,
+  profile: ResolvedWorktreeRuntimeProfile,
+): DomainResult<BuiltinWorktreeProfileStatus> {
+  const status = getBuiltinWorktreeProfileStatus(id);
+  if (!status.ok) return status;
+  const material = resolveRuntimeProfile(profile.materialSelection);
+  if (!material.ok) return failure(material.error);
+
+  const availableRequirements = new Set(material.value.requirements.map((requirement) => requirement.id));
+  const missing = [
+    ...new Set(
+      profile.tools
+        .map((tool) => tool.provider.requirement_id)
+        .filter((requirementId) => !availableRequirements.has(requirementId)),
+    ),
+  ];
+  if (missing.length === 0) return status;
+
+  const allMissing = [...new Set([...status.value.missing, ...missing])];
+  return success(
+    Object.freeze({
+      ...status.value,
+      availability: "missing" as const,
+      ready: false,
+      missing: Object.freeze(allMissing),
+      reason: `Selected material is missing builtin executable requirements: ${allMissing.join(", ")}.`,
+    }),
+  );
+}
+
 /** Resolve a built-in through the canonical worktree-profile resolver. */
 export function resolveBuiltinWorktreeProfile(
   selection: unknown,

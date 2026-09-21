@@ -142,6 +142,27 @@ test("unknown profile and parameter failures use the same backend resolver", () 
   }
 });
 
+test("builtin readiness fails closed when selected material omits a declared executable", () => {
+  const resolution = resolveWorktreeProfileSessionCreate(
+    {
+      command: "session create",
+      profile: "builtin:minimal",
+      parameters: { "materialSelection.profiles": ["base"] },
+    },
+    {},
+  );
+  assert.equal(resolution.ok, true);
+  if (!resolution.ok) return;
+  assert.notEqual(resolution.value.profile, null);
+  if (resolution.value.profile === null) return;
+  assert.equal(resolution.value.profile.availability, "missing");
+  assert.equal(resolution.value.profile.ready, false);
+  assert.deepEqual(resolution.value.profile.missing, ["git-package", "ls-runtime"]);
+  const readiness = requireWorktreeProfileReady(resolution.value);
+  assert.equal(readiness.ok, false);
+  if (!readiness.ok) assert.equal(readiness.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+});
+
 test("CLI and profile contract serializers use separate stable keys", () => {
   const response = listWorktreeProfiles();
   assert.equal(response.ok, true);

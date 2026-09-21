@@ -4,6 +4,7 @@ import {
   BUILTIN_WORKTREE_PROFILE_CATALOG,
   BUILTIN_WORKTREE_PROFILE_NAMESPACE,
   getBuiltinWorktreeProfile,
+  getBuiltinWorktreeProfileStatusForResolution,
   resolveBuiltinWorktreeProfile,
   type BuiltinWorktreeProfileAvailability,
   type BuiltinWorktreeProfileStatus,
@@ -325,13 +326,14 @@ function resolveSelectedProfile(
     if (!builtin.ok) return builtin;
     const resolved = resolveBuiltinWorktreeProfile({ profile: id }, parameters);
     if (!resolved.ok) return resolved;
-    const status = builtinStatus(id);
+    const status = getBuiltinWorktreeProfileStatusForResolution(id, resolved.value);
+    if (!status.ok) return status;
     return success({
       source: sourceFor(selectedNamespace, id, builtin.value.version),
       profile: resolved.value,
-      availability: status.availability,
-      ready: status.ready,
-      missing: status.missing,
+      availability: status.value.availability,
+      ready: status.value.ready,
+      missing: status.value.missing,
       collision,
     });
   }
