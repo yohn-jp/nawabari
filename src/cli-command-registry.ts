@@ -45,24 +45,35 @@ export const GLOBAL_HELP_OPTIONS: readonly CliHelpOptionSpec[] = [
   { name: "--version", description: "Print the installed version" },
 ];
 
-const option = (
-  name: string,
+/**
+ * `const` type parameters keep every literal passed at each call site (the
+ * option's own name, and any nested `aliases`/`values` literals) instead of
+ * widening to `string`/`string[]`. This is what lets `OptionId` below be a
+ * real compile-time union derived from the registry, not a hand-typed list.
+ */
+const option = <
+  const Name extends string,
+  const Extra extends Partial<
+    Pick<
+      CliHelpOptionSpec,
+      | "aliases"
+      | "alias_of"
+      | "value"
+      | "required"
+      | "default"
+      | "minimum"
+      | "maximum"
+      | "repeatable"
+      | "values"
+      | "required_unless"
+      | "mutually_exclusive_with"
+    >
+  > = Record<never, never>,
+>(
+  name: Name,
   description: string,
-  options: Pick<
-    CliHelpOptionSpec,
-    | "aliases"
-    | "alias_of"
-    | "value"
-    | "required"
-    | "default"
-    | "minimum"
-    | "maximum"
-    | "repeatable"
-    | "values"
-    | "required_unless"
-    | "mutually_exclusive_with"
-  > = {},
-): CliHelpOptionSpec => ({ name, description, ...options });
+  extra: Extra = {} as Extra,
+) => ({ name, description, ...extra }) satisfies CliHelpOptionSpec;
 
 /**
  * Canonical public command/discovery registry.
@@ -70,8 +81,16 @@ const option = (
  * Dispatcher implementation deliberately remains below in this module.  This
  * registry only describes the public discovery surface; aliases point at the
  * canonical command so option metadata cannot drift between projections.
+ *
+ * `as const satisfies` on the underlying data (rather than a
+ * `: readonly CliCommandDefinition[]` annotation) keeps every command/option
+ * name as its own literal type so `CommandId`/`OptionId` below can be
+ * derived from this data instead of hand-typed as a second identity list.
+ * `CLI_COMMAND_REGISTRY` itself keeps the wider `CliCommandDefinition[]`
+ * view every existing consumer already expects; it is the same array, not a
+ * second copy.
  */
-export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
+const REGISTRY_DATA = [
   {
     name: "session create",
     summary: "Request a new Nawabari session",
@@ -682,7 +701,27 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     usage: `${CLI_NAME} capabilities`,
     options: [],
   },
-];
+] as const satisfies readonly CliCommandDefinition[];
+
+/** Stable canonical command identity, derived from the registry itself. */
+export type CommandId = (typeof REGISTRY_DATA)[number]["name"];
+
+type RegistryOption = (typeof REGISTRY_DATA)[number]["options"][number];
+
+/** Extracts an option's declared `aliases` literals, or `never` when absent. */
+type OptionAliasIds<Option> = Option extends { readonly aliases: infer Aliases }
+  ? Aliases extends readonly string[]
+    ? Aliases[number]
+    : never
+  : never;
+
+/**
+ * Stable canonical option identity across every command, derived from the
+ * registry itself: every option's own flag plus every declared alias.
+ */
+export type OptionId = RegistryOption["name"] | OptionAliasIds<RegistryOption>;
+
+export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = REGISTRY_DATA;
 
 export const ROOT_HELP_SPEC: CliCommandDefinition = {
   name: "root",
@@ -714,7 +753,7 @@ export function publicCliCommandDefinitions(): readonly CliCommandDefinition[] {
   ]);
 }
 
-/** Stable alias for consumers such as the future dispatcher parity layer. */
+/** Stable alias kept for existing external consumers of the registry. */
 export const COMMAND_REGISTRY = CLI_COMMAND_REGISTRY;
 
 /** Resolve either a canonical command or one of its public aliases. */

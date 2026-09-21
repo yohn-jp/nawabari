@@ -1234,6 +1234,30 @@ test("unknown commands expose a stable JSON error without decoration", async () 
   });
 });
 
+test("every canonical command and alias is recognized by the dispatcher", async () => {
+  // Replaces a hand-authored DISPATCHER_COMMAND_INVENTORY list: instead of a
+  // second table a human must remember to update, this drives every name
+  // the registry itself advertises straight through the real dispatcher and
+  // asserts it was recognized (never UNKNOWN_COMMAND). A command missing its
+  // dispatch branch, or removed from the registry but left in the
+  // dispatcher, fails here without any separately maintained inventory.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-dispatch-coverage-"));
+  try {
+    for (const definition of publicCliCommandDefinitions()) {
+      const output = capture();
+      await runCli([...definition.name.split(" "), "--json"], { io: output.io, cwd: directory });
+      const response = JSON.parse(output.stdout[0] ?? "{}") as { code?: string };
+      assert.notEqual(
+        response.code,
+        "UNKNOWN_COMMAND",
+        `dispatcher does not recognize registered command: ${definition.name}`,
+      );
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("state commands reject honestly when the current directory is not a Git repository", async () => {
   const output = capture();
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-not-a-repository-"));

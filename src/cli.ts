@@ -67,6 +67,8 @@ import {
   canonicalCommandForName,
   type CliCommandDefinition,
   type CliHelpOptionSpec,
+  type CommandId,
+  type OptionId,
 } from "./cli-command-registry.js";
 
 export {
@@ -77,174 +79,35 @@ export {
   resolveCliCommandDefinition,
   canonicalCommandForName,
 } from "./cli-command-registry.js";
-export type { CliCommandDefinition, CliHelpOptionSpec } from "./cli-command-registry.js";
-
-/**
- * The dispatcher deliberately keeps its command branches specialized, but
- * this inventory makes the executable surface explicit for structural parity
- * checks. Aliases are listed because they are public entry points too.
- */
-export const DISPATCHER_COMMAND_INVENTORY = [
-  "session create",
-  "session id",
-  "session show",
-  "session inspect",
-  "session scope expand",
-  "session reconcile",
-  "session run",
-  "session exec",
-  "session shell",
-  "session list",
-  "session claim",
-  "resource claim",
-  "session update",
-  "resource update",
-  "session mutate",
-  "resource mutate",
-  "session transition",
-  "resource transition",
-  "session claims",
-  "resource list",
-  "resource claims",
-  "session release",
-  "resource release",
-  "session close",
-  "session discard",
-  "authorize",
-  "checkpoint",
-  "evidence snapshot",
-  "diff",
-  "commit",
-  "push",
-  "status",
-  "guard",
-  "gc",
-  "doctor",
-  "migrate",
-  "capabilities",
-] as const;
-
-/** Dispatcher option inventory, keyed by canonical registry command identity. */
-export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly string[]>> = {
-  "session create": [
-    "--branch",
-    "--worktree",
-    "--worktree-root",
-    "--base",
-    "--label",
-    "--resource",
-    "--mode",
-    "--auxiliary-state",
-    "--execution-scope-file",
-    "--candidate-working-set-file",
-  ],
-  "session id": [],
-  "session show": ["--session"],
-  "session inspect": ["--session", "--integrated-revision", "--schema-version"],
-  "session scope expand": [
-    "--session",
-    "--repository",
-    "--repository-host",
-    "--revision",
-    "--execution-scope-file",
-    "--path",
-    "--operation",
-    "--reason",
-    "--evidence",
-    "--unresolved",
-  ],
-  "session reconcile": ["--session", "--apply"],
-  "session run": ["--session", "--runtime-policy"],
-  "session shell": ["--session", "--runtime-policy"],
-  "session list": ["--all", "--history", "--limit", "--offset"],
-  "session claim": ["--resource", "--mode", "--session", "--repository"],
-  "session update": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
-  "session mutate": [
-    "--upsert-resource",
-    "--mode",
-    "--release-resource",
-    "--if-generation",
-    "--force",
-    "--session",
-    "--repository",
-  ],
-  "session transition": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
-  "session claims": ["--session"],
-  "session release": ["--session", "--resource", "--claim-id", "--all", "--if-generation", "--force"],
-  "session close": ["--session", "--integrated-revision", "--fetch-remote", "--fetch-branch"],
-  "session discard": ["--session", "--preview"],
-  authorize: ["--session", "--operation", "--resource"],
-  checkpoint: ["--session"],
-  "evidence snapshot": ["--session"],
-  diff: ["--session", "--path", "--from", "--to", "--patch", "--max-bytes", "--max-hunks"],
-  commit: ["--session", "--message", "--resource", "--all-claimed", "--message-pattern"],
-  push: [
-    "--session",
-    "--resource",
-    "--all-claimed",
-    "--remote",
-    "--branch",
-    "--remote-branch",
-    "--force",
-    "--create-upstream",
-  ],
-  status: ["--all", "--history", "--limit", "--offset"],
-  guard: ["--session", "--operation", "--resource"],
-  gc: ["--apply", "--dry-run"],
-  doctor: ["--summary"],
-  migrate: [],
-  capabilities: [],
-};
+export type { CliCommandDefinition, CliHelpOptionSpec, CommandId, OptionId } from "./cli-command-registry.js";
 
 function optionNames(definition: CliCommandDefinition): readonly string[] {
   return definition.options.flatMap((candidate) => [candidate.name, ...(candidate.aliases ?? [])]);
 }
 
-function canonicalName(name: string): string | undefined {
-  return CLI_COMMAND_REGISTRY.find((definition) => definition.name === name || definition.aliases?.includes(name))
-    ?.name;
-}
-
-/** Return the registry-backed option set used by a specialized dispatcher parser. */
+/**
+ * The dispatcher's accepted flags for a command are exactly its canonical
+ * registry `options` (including declared aliases) — there is no second,
+ * hand-maintained option table for the parser to drift from. `--help` and
+ * the executable parser read the same registry entry. The returned set is
+ * widened to `string` (rather than `OptionId`) because callers test
+ * arbitrary argv tokens for membership; `OptionId` is for authoring and
+ * cross-checking known option identities, not for narrowing untrusted input.
+ */
 export function dispatcherAllowedOptions(command: string): ReadonlySet<string> {
-  const canonical = canonicalName(command);
+  const canonical = canonicalCommandForName(command);
   if (canonical === undefined) throw new Error(`Dispatcher command is not registered: ${command}`);
-  return new Set(DISPATCHER_OPTION_INVENTORY[canonical] ?? []);
+  return new Set(optionNames(canonical));
 }
 
 /**
- * Verify both executable command/option inventory and registry metadata. This
- * is intentionally structural: parser semantics remain in their command
- * handlers, while drift becomes a deterministic failure in tests/startup.
+ * Verify the operation vocabulary the registry advertises for
+ * `authorize`/`guard` matches the domain's authoritative
+ * `OPERATION_VOCABULARY`. Command/option identity no longer needs an
+ * equivalent check: `dispatcherAllowedOptions` reads the registry directly,
+ * so the parser and the registry cannot silently diverge on those.
  */
 export function validateCliRegistryParity(): void {
-  const publicNames = publicCliCommandNames();
-  const publicSet = new Set(publicNames);
-  const dispatcherSet = new Set<string>(DISPATCHER_COMMAND_INVENTORY);
-  const missingFromDispatcher = publicNames.filter((name) => !dispatcherSet.has(name));
-  const missingFromRegistry = DISPATCHER_COMMAND_INVENTORY.filter((name) => !publicSet.has(name));
-  if (missingFromDispatcher.length > 0 || missingFromRegistry.length > 0) {
-    throw new Error(
-      `CLI command registry parity failure: missing_from_dispatcher=${missingFromDispatcher.join(",")}; ` +
-        `missing_from_registry=${missingFromRegistry.join(",")}`,
-    );
-  }
-
-  for (const name of publicNames) {
-    const canonical = canonicalName(name);
-    if (canonical === undefined) throw new Error(`CLI command registry cannot resolve ${name}`);
-    const expected = new Set(DISPATCHER_OPTION_INVENTORY[canonical] ?? []);
-    const actual = new Set(optionNames(resolveCliCommandDefinition(name) as CliCommandDefinition));
-    const missing = [...actual].filter((option) => !expected.has(option));
-    const extra = [...expected].filter((option) => !actual.has(option));
-    if (missing.length > 0 || extra.length > 0) {
-      throw new Error(
-        `CLI option registry parity failure for ${name}: missing_from_dispatcher=${missing.join(",")}; ` +
-          `missing_from_registry=${extra.join(",")}`,
-      );
-    }
-  }
-
   for (const command of ["authorize", "guard"] as const) {
     const definition = resolveCliCommandDefinition(command);
     const operation = definition?.options.find((candidate) => candidate.name === "--operation");
