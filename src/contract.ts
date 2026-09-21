@@ -569,49 +569,6 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     },
   },
   {
-    id: "resource-coordination",
-    commands: ["session coordination preview", "session handoff"],
-    result_schema: "resource-coordination.v1",
-    result_schema_version: RESOURCE_COORDINATION_SCHEMA_VERSION,
-    result_schemas: [
-      {
-        schema: "resource-coordination.v1",
-        version: RESOURCE_COORDINATION_SCHEMA_VERSION,
-        commands: ["session coordination preview", "session handoff"],
-      },
-    ],
-    identities: ["repository", "session", "resource", "claim_set_generation", "preview_token", "operation_id"],
-    producer_contracts: {
-      resource_coordination: {
-        schema_version: RESOURCE_COORDINATION_SCHEMA_VERSION,
-        intent_schema_version: RESOURCE_INTENT_SCHEMA_VERSION,
-      },
-      coordination_preview: { schema_version: COORDINATION_PREVIEW_SCHEMA_VERSION },
-      coordination_transaction: { schema_version: COORDINATION_TRANSACTION_SCHEMA_VERSION },
-      resource_handoff: {
-        contract_id: RESOURCE_HANDOFF_CONTRACT_ID,
-        operation: RESOURCE_HANDOFF_OPERATION,
-        schema_version: RESOURCE_HANDOFF_SCHEMA_VERSION,
-      },
-      coordination_snapshot: {
-        contract_id: RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
-        contract_version: RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_VERSION,
-        schema_version: RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
-      },
-    },
-    mutation: {
-      preview: false,
-      handoff: true,
-      transaction: true,
-    },
-    failure_codes: [],
-    failure_code_policy: {
-      source: "producer-owned coordination vocabulary",
-      missing_or_extra: "producer authority",
-      internal_exceptions: [],
-    },
-  },
-  {
     id: "resource-claims",
     contract_id: RESOURCE_CLAIM_MACHINE_CONTRACT_ID,
     contract_version: RESOURCE_CLAIM_MACHINE_CONTRACT_VERSION,
@@ -648,6 +605,27 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       source: "implementation-owned resource-claim lifecycle vocabulary",
       missing_or_extra: "deterministic conformance failure",
       internal_exceptions: [],
+    },
+    coordination: {
+      commands: ["session coordination preview", "session handoff"],
+      producer_contracts: {
+        resource_coordination: {
+          schema_version: RESOURCE_COORDINATION_SCHEMA_VERSION,
+          intent_schema_version: RESOURCE_INTENT_SCHEMA_VERSION,
+        },
+        coordination_preview: { schema_version: COORDINATION_PREVIEW_SCHEMA_VERSION },
+        coordination_transaction: { schema_version: COORDINATION_TRANSACTION_SCHEMA_VERSION },
+        resource_handoff: {
+          contract_id: RESOURCE_HANDOFF_CONTRACT_ID,
+          operation: RESOURCE_HANDOFF_OPERATION,
+          schema_version: RESOURCE_HANDOFF_SCHEMA_VERSION,
+        },
+        coordination_snapshot: {
+          contract_id: RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
+          contract_version: RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_VERSION,
+          schema_version: RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
+        },
+      },
     },
     transition_matrix: {
       id: RESOURCE_CLAIM_TRANSITION_MATRIX_ID,
