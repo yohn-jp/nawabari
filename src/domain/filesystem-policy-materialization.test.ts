@@ -80,6 +80,36 @@ test("DENY holes prevent a broad subtree grant", () => {
   }
 });
 
+test("DENY overrides every exact operation capability", () => {
+  const fixtureValue = fixture();
+  try {
+    const cases = [
+      { operation: "READONLY", scope: { readOnly: ["src/allowed.ts"], deny: ["src/allowed.ts"] } },
+      { operation: "WRITE", scope: { write: ["src/allowed.ts"], deny: ["src/allowed.ts"] } },
+      { operation: "CREATE", scope: { create: ["src/new.ts"], deny: ["src/new.ts"] } },
+      { operation: "DELETE", scope: { delete: ["src/secret.ts"], deny: ["src/secret.ts"] } },
+    ] as const;
+
+    for (const entry of cases) {
+      const result = materializeFilesystemPolicy(fixtureValue.root, projection(entry.scope));
+      assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+      if (!result.ok) continue;
+      const selection = selectFilesystemEnforcement(result.value);
+      assert.equal(selection.status, "unsupported", entry.operation);
+      assert.equal(selection.nativePathRules.length, 0, entry.operation);
+      assert.equal(selection.nativeNamespace.length, 0, entry.operation);
+      assert.equal(selection.registryOperations.length, 0, entry.operation);
+      assert.equal(
+        selection.unsupported.some((capability) => capability.operation === entry.operation),
+        true,
+        entry.operation,
+      );
+    }
+  } finally {
+    fixtureValue.cleanup();
+  }
+});
+
 test("read failures and expansion limits do not produce a successful subset", () => {
   const fixtureValue = fixture();
   try {
