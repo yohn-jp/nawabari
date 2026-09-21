@@ -244,6 +244,22 @@ test("park stops before mutation when the execution fence or drain is not proven
   assert.equal(drainAuthority.parkCommits.length, 0);
 });
 
+test("park requires the canonical millisecond ISO timestamp shape", () => {
+  const authority = new FakeRetentionAuthority();
+  assert.throws(
+    () =>
+      parkSession(authority, {
+        sessionId: "session-1",
+        pinnedProfile: { profile: "strict", revision: 3 },
+        operationId: "park-op-timestamp",
+        now: "0",
+      }),
+    (error: unknown) => error instanceof SessionRetentionError && error.code === "INVALID_INPUT",
+  );
+  assert.deepEqual(authority.events, []);
+  assert.equal(authority.parkCommits.length, 0);
+});
+
 test("resume leaves parked state unchanged when the all-claims validation finds a conflict", () => {
   const authority = new FakeRetentionAuthority();
   park(authority);
@@ -346,6 +362,66 @@ test("uncertain atomic writes are resolved by operation ID and registry re-obser
     authority.current.claims.some((candidate) => candidate.sessionId === "session-1"),
     false,
   );
+});
+
+test("uncertain park does not succeed from a matching state without matching operation and retention evidence", () => {
+  const operationAuthority = new FakeRetentionAuthority();
+  operationAuthority.uncertainPark = true;
+  operationAuthority.reobserve = (input) => ({
+    status: "resolved",
+    operationId: "different-operation",
+    state: "parked",
+    snapshot: operationAuthority.current,
+  });
+  const operationResult = park(operationAuthority);
+  assert.equal(operationResult.status, "uncertain");
+  assert.equal(operationResult.reconciliation?.status, "unknown");
+  assert.match(operationResult.reason ?? "", /operation identity mismatch/u);
+
+  const retentionAuthority = new FakeRetentionAuthority();
+  retentionAuthority.uncertainPark = true;
+  retentionAuthority.reobserve = (input) => ({
+    status: "resolved",
+    operationId: input.operationId,
+    state: "parked",
+    snapshot: { ...retentionAuthority.current, retention: undefined },
+  });
+  const retentionResult = park(retentionAuthority);
+  assert.equal(retentionResult.status, "uncertain");
+  assert.equal(retentionResult.reconciliation?.status, "unknown");
+  assert.match(retentionResult.reason ?? "", /retention record is absent/u);
+});
+
+test("uncertain resume requires its operation/session identity and removal of the retention record", () => {
+  const sessionAuthority = new FakeRetentionAuthority();
+  park(sessionAuthority);
+  sessionAuthority.uncertainResume = true;
+  sessionAuthority.reobserve = (input) => ({
+    status: "resolved",
+    operationId: input.operationId,
+    state: "active",
+    snapshot: { ...sessionAuthority.current, session: { ...sessionAuthority.current.session, sessionId: "session-2" } },
+  });
+  const sessionResult = resume(sessionAuthority);
+  assert.equal(sessionResult.status, "uncertain");
+  assert.equal(sessionResult.reconciliation?.status, "unknown");
+  assert.match(sessionResult.reason ?? "", /session identity mismatch/u);
+
+  const retentionAuthority = new FakeRetentionAuthority();
+  park(retentionAuthority);
+  retentionAuthority.uncertainResume = true;
+  const retained = retentionAuthority.current.retention;
+  assert.ok(retained);
+  retentionAuthority.reobserve = (input) => ({
+    status: "resolved",
+    operationId: input.operationId,
+    state: "active",
+    snapshot: { ...retentionAuthority.current, retention: retained },
+  });
+  const retentionResult = resume(retentionAuthority);
+  assert.equal(retentionResult.status, "uncertain");
+  assert.equal(retentionResult.reconciliation?.status, "unknown");
+  assert.match(retentionResult.reason ?? "", /retention record remains/u);
 });
 
 test("unknown durability remains typed uncertainty instead of inventing success", () => {

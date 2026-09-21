@@ -4,6 +4,7 @@ import { isResourceClaimMode, type ResourceClaim, type ResourceClaimMode } from 
 
 /** Schema version for the durable park/resume retention record. */
 export const SESSION_RETENTION_SCHEMA_VERSION = 1 as const;
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 export const SESSION_RETENTION_ERROR_CODES = Object.freeze([
   "INVALID_INPUT",
@@ -279,7 +280,10 @@ function operationId(value: unknown, path: string): string {
 
 function timestamp(value: unknown, path: string): string {
   const result = nonEmptyString(value, path);
-  if (!Number.isFinite(Date.parse(result))) fail("INVALID_INPUT", `${path} must be an ISO timestamp`);
+  const parsed = Date.parse(result);
+  if (!ISO_TIMESTAMP_PATTERN.test(result) || !Number.isFinite(parsed) || new Date(parsed).toISOString() !== result) {
+    fail("INVALID_INPUT", `${path} must be a canonical ISO timestamp`);
+  }
   return result;
 }
 
@@ -446,28 +450,38 @@ function resolveUncertain(
   commit: RetentionCommitUncertain,
 ): SessionRetentionOperationResult {
   const reconciliation = authority.reobserve({ operationId: operationIdValue, sessionId, operation });
-  if (reconciliation.status === "resolved" && reconciliation.state === expectedState) {
-    return operationResult(
-      operation,
-      operationIdValue,
-      sessionId,
-      operation === "park" ? "parked" : "resumed",
-      reconciliation.snapshot,
-      { reconciliation },
-    );
-  }
   if (reconciliation.status === "resolved") {
-    return Object.freeze({
-      schemaVersion: SESSION_RETENTION_SCHEMA_VERSION,
-      operation,
-      operationId: operationIdValue,
-      sessionId,
-      status: "uncertain",
-      claimSetGeneration: reconciliation.snapshot.claimSetGeneration,
-      snapshot: reconciliation.snapshot,
-      reconciliation,
-      reason: `Re-observation found ${reconciliation.state}; expected ${expectedState}`,
-    });
+    const observedSessionMatches = reconciliation.snapshot.session.sessionId === sessionId;
+    const observedOperationMatches = reconciliation.operationId === operationIdValue;
+    const observedStateMatches = reconciliation.state === expectedState;
+    const postconditionMatches =
+      operation === "park"
+        ? reconciliation.snapshot.retention?.state === "parked" &&
+          reconciliation.snapshot.retention.operationId === operationIdValue &&
+          reconciliation.snapshot.retention.sessionId === sessionId
+        : reconciliation.snapshot.retention === undefined;
+    if (observedSessionMatches && observedOperationMatches && observedStateMatches && postconditionMatches) {
+      return operationResult(
+        operation,
+        operationIdValue,
+        sessionId,
+        operation === "park" ? "parked" : "resumed",
+        reconciliation.snapshot,
+        { reconciliation },
+      );
+    }
+    const reasons = [
+      ...(observedSessionMatches ? [] : ["session identity mismatch"]),
+      ...(observedOperationMatches ? [] : ["operation identity mismatch"]),
+      ...(observedStateMatches ? [] : [`state ${reconciliation.state} does not match ${expectedState}`]),
+      ...(postconditionMatches
+        ? []
+        : [operation === "park" ? "park retention record is absent or mismatched" : "resume retention record remains"]),
+    ];
+    return unresolvedResult(operation, operationIdValue, sessionId, reasons.join("; "));
+  }
+  if (reconciliation.operationId !== operationIdValue) {
+    return unresolvedResult(operation, operationIdValue, sessionId, "operation identity mismatch");
   }
   return Object.freeze({
     schemaVersion: SESSION_RETENTION_SCHEMA_VERSION,
@@ -479,6 +493,29 @@ function resolveUncertain(
     reconciliation,
     snapshot: undefined,
     ...(commit.reason.length === 0 ? {} : { reason: commit.reason }),
+  });
+}
+
+function unresolvedResult(
+  operation: "park" | "resume",
+  operationIdValue: string,
+  sessionId: string,
+  reason: string,
+): SessionRetentionOperationResult {
+  const reconciliation: RetentionReobservationUnknown = {
+    status: "unknown",
+    operationId: operationIdValue,
+    reason,
+  };
+  return Object.freeze({
+    schemaVersion: SESSION_RETENTION_SCHEMA_VERSION,
+    operation,
+    operationId: operationIdValue,
+    sessionId,
+    status: "uncertain",
+    claimSetGeneration: null,
+    reconciliation,
+    reason,
   });
 }
 
