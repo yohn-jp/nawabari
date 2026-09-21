@@ -19,6 +19,13 @@ import {
   type WorktreeFileIdentity,
   type WorktreeFileOperationExecutionOptions,
 } from "./worktree-file-operation.js";
+import {
+  SESSION_RUNTIME_PROJECTION_CONTRACT_ID,
+  SESSION_RUNTIME_PROJECTION_SCHEMA_VERSION,
+  STRICT_RUNTIME_POLICY,
+  type SessionRuntimeProjection,
+} from "./runtime-projection.js";
+import type { RuntimeExecutableProviderMaterialization } from "./runtime-executable-projection.js";
 
 // Test setup resolves the executable once; production execution receives this
 // value from strict Landlock materialization and never searches PATH.
@@ -39,9 +46,42 @@ function materializedPythonExecutable(): string {
 const TEST_LANDLOCK_HELPER = materializedPythonExecutable();
 
 function helperOptions(
-  overrides: Omit<WorktreeFileOperationExecutionOptions, "landlock_helper"> = {},
+  overrides: Omit<WorktreeFileOperationExecutionOptions, "landlock_helper" | "runtime_projection"> = {},
 ): WorktreeFileOperationExecutionOptions {
-  return { landlock_helper: TEST_LANDLOCK_HELPER, ...overrides };
+  return {
+    landlock_helper: {
+      provider: { id: "fhs-landlock-helper-provider", requirement_id: "landlock-helper" },
+      source: TEST_LANDLOCK_HELPER,
+    },
+    runtime_projection: strictLandlockProjection(TEST_LANDLOCK_HELPER),
+    ...overrides,
+  };
+}
+
+function strictLandlockProjection(source: string): SessionRuntimeProjection {
+  return {
+    contract_id: SESSION_RUNTIME_PROJECTION_CONTRACT_ID,
+    schema_version: SESSION_RUNTIME_PROJECTION_SCHEMA_VERSION,
+    policy: STRICT_RUNTIME_POLICY,
+    profile: { id: "development", version: "1" },
+    requirements: [],
+    filesystem: [
+      {
+        source,
+        target: source,
+        access_mode: "read-only",
+        provenance: "runtime-profile",
+      },
+    ],
+    executables: [],
+  };
+}
+
+function helperMaterialization(source: string): RuntimeExecutableProviderMaterialization {
+  return {
+    provider: { id: "fhs-landlock-helper-provider", requirement_id: "landlock-helper" },
+    source,
+  };
 }
 
 function digest(value: string): string {
@@ -117,6 +157,7 @@ test("execution fails closed without the canonical materialized Landlock helper"
     let helperInvoked = false;
     const result = executeWorktreeFileOperation(prepared.value, {
       landlock_helper: null,
+      runtime_projection: null,
       run_helper: () => {
         helperInvoked = true;
         return JSON.stringify({ ok: true });
@@ -126,6 +167,33 @@ test("execution fails closed without the canonical materialized Landlock helper"
     if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
     assert.equal(helperInvoked, false);
     assert.equal(fs.existsSync(path.join(root, "docs", "no-helper.txt")), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("execution rejects a canonical python3 path outside the selected strict materialization", () => {
+  const root = fixture();
+  const arbitrary = path.join(root, "python3");
+  try {
+    fs.copyFileSync(TEST_LANDLOCK_HELPER, arbitrary);
+    fs.chmodSync(arbitrary, 0o755);
+    const prepared = prepareWorktreeFileOperation(request(root, "CREATE", "docs/arbitrary-helper.txt", null));
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    let helperInvoked = false;
+    const result = executeWorktreeFileOperation(prepared.value, {
+      landlock_helper: helperMaterialization(arbitrary),
+      runtime_projection: strictLandlockProjection(TEST_LANDLOCK_HELPER),
+      run_helper: () => {
+        helperInvoked = true;
+        return JSON.stringify({ ok: true });
+      },
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+    assert.equal(helperInvoked, false);
+    assert.equal(fs.existsSync(path.join(root, "docs", "arbitrary-helper.txt")), false);
   } finally {
     cleanup(root);
   }
