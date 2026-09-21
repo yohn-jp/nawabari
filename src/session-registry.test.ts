@@ -308,6 +308,81 @@ test("migrates a legacy registry without changing session ownership or claim mod
   }
 });
 
+test("close advances registry revision for both lifecycle writes", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const session = registry.create();
+    const before = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+
+    const result = registry.close(session.sessionId);
+
+    assert.equal(result.session.state, "closed");
+    const after = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+    assert.equal(after, before + 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("discard advances registry revision for both lifecycle writes", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const session = registry.create();
+    const before = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+
+    const result = registry.discard(session.sessionId);
+
+    assert.equal(result.session.state, "closed");
+    const after = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+    assert.equal(after, before + 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("garbage collection does not reuse a registry revision across stale candidates", () => {
+  const fixture = createRepositoryFixture();
+  const secondWorktreePath = path.join(
+    path.dirname(fixture.repositoryPath),
+    `${path.basename(fixture.repositoryPath)}-second`,
+  );
+  try {
+    runGit(["worktree", "add", "-b", "feature/second", secondWorktreePath], fixture.repositoryPath);
+    const linkedRegistry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
+    const secondRegistry = new SessionRegistry({ cwd: secondWorktreePath });
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const linkedSession = linkedRegistry.create();
+    const secondSession = secondRegistry.create();
+    const before = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+
+    fs.rmSync(fixture.linkedWorktreePath, { recursive: true, force: true });
+    fs.rmSync(secondWorktreePath, { recursive: true, force: true });
+
+    const result = registry.garbageCollect({ apply: true, staleAfterMs: 0 });
+
+    assert.deepEqual(
+      result.cleaned.map((record) => record.sessionId).sort(),
+      [linkedSession.sessionId, secondSession.sessionId].sort(),
+    );
+    assert.deepEqual(result.blocked, []);
+    assert.equal((readJson(registry.paths.registry) as PersistedRegistry).registry_revision, before + 6);
+    assert.equal(
+      registry.list().every((record) => record.state === "closed"),
+      true,
+    );
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", secondWorktreePath], fixture.repositoryPath);
+    } catch {
+      // The fixture cleanup remains safe when GC already removed the branch.
+    }
+    fs.rmSync(secondWorktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
 test("does not rewrite a registry containing an unsupported feature", () => {
   const fixture = createRepositoryFixture();
   try {
