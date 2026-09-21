@@ -98,6 +98,17 @@ function discardPreviewFor(record: SessionRecord): SessionDiscardPreview {
   };
 }
 
+function discardPreviewForHead(record: SessionRecord, head: string): SessionDiscardPreview {
+  const preview = discardPreviewFor(record);
+  return {
+    ...preview,
+    head,
+    worktree_head: head,
+    branch_head: head,
+    expected_head: head,
+  };
+}
+
 function discardResultFor(record: SessionRecord): SessionDiscardResult {
   return {
     schema_version: 1,
@@ -121,6 +132,7 @@ function backendFor(
   records: Map<string, SessionRecord>,
   actions: Map<string, readonly SessionLifecycleAction[]>,
   calls: { close: string[]; preview: string[]; discard: string[]; diagnostic: string[] },
+  physicalEvidence: { head: string } = { head: "head" },
 ): SessionBackend {
   return {
     createSession: async () => failure(new DomainError("BACKEND_UNAVAILABLE", "unused")),
@@ -163,7 +175,7 @@ function backendFor(
       const record = records.get(sessionId);
       return record === undefined
         ? failure(new DomainError("SESSION_NOT_FOUND", "missing"))
-        : success(discardPreviewFor(record));
+        : success(discardPreviewForHead(record, physicalEvidence.head));
     },
     discardSession: async (_context, sessionId) => {
       calls.discard.push(sessionId);
@@ -279,6 +291,7 @@ test("discard requires explicit confirmation and repeated delivery does not dupl
   const confirmed = await controller.dispatchSessionAction("discard-session", identity(record), snapshot.value.token, {
     confirmed: true,
     operation_id: "discard-one",
+    preview: preview.value.preview,
   });
   assert.equal(confirmed.ok, true);
   assert.deepEqual(calls.discard, ["one"]);
@@ -286,10 +299,45 @@ test("discard requires explicit confirmation and repeated delivery does not dupl
   const repeated = await controller.dispatchSessionAction("discard-session", identity(record), snapshot.value.token, {
     confirmed: true,
     operation_id: "discard-one",
+    preview: preview.value.preview,
   });
   assert.equal(repeated.ok, true);
   assert.deepEqual(calls.discard, ["one"]);
   assert.deepEqual(calls.preview, ["one", "one"]);
+});
+
+test("discard rejects a changed physical head even when session metadata is unchanged", async () => {
+  const record = session("one");
+  const physicalEvidence = { head: "head" };
+  const calls = { close: [], preview: [], discard: [], diagnostic: [] };
+  const controller = createSessionActions(
+    backendFor(
+      new Map([[record.session_id, record]]),
+      new Map([[record.session_id, [discardAction]]]),
+      calls,
+      physicalEvidence,
+    ),
+    context,
+  );
+  const snapshot = await controller.readSessionActionSnapshot(identity(record));
+  assert.equal(snapshot.ok, true);
+  if (!snapshot.ok) return;
+
+  const preview = await controller.dispatchSessionAction("discard-session", identity(record), snapshot.value.token, {
+    confirmed: false,
+  });
+  assert.equal(preview.ok, true);
+  if (!preview.ok || preview.value.status !== "confirmation-required") return;
+
+  physicalEvidence.head = "changed-head";
+  const rejected = await controller.dispatchSessionAction("discard-session", identity(record), snapshot.value.token, {
+    confirmed: true,
+    operation_id: "discard-one-changed-head",
+    preview: preview.value.preview,
+  });
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) assert.equal(rejected.error.code, "STALE_SESSION");
+  assert.deepEqual(calls.discard, []);
 });
 
 test("unknown action IDs never become shell commands or backend mutations", async () => {

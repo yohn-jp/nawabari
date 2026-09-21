@@ -45,6 +45,8 @@ export type SessionActionConfirmation =
       readonly confirmed: true;
       /** Stable caller operation key; repeated delivery of the same request is coalesced. */
       readonly operation_id?: string;
+      /** The bounded, authoritative discard preview the caller explicitly reviewed. */
+      readonly preview?: SessionDiscardPreview;
     };
 
 export type SessionActionSnapshot = {
@@ -149,6 +151,70 @@ function confirmationRequired(preview: SessionDiscardPreview, token: SessionActi
     token,
     preview,
   };
+}
+
+/**
+ * Bind destructive confirmation to every bounded physical/claim observation
+ * that the canonical discard preview exposed. This is evidence binding, not
+ * a second cleanup authority; the registry remains the final mutation guard.
+ */
+function destructivePreviewEvidence(preview: SessionDiscardPreview): string {
+  return JSON.stringify({
+    schema_version: preview.schema_version,
+    operation: preview.operation,
+    destructive: preview.destructive,
+    session: {
+      session_id: preview.session.session_id,
+      repository: preview.session.repository,
+      worktree: preview.session.worktree,
+      branch: preview.session.branch,
+      state: preview.session.state,
+      updated_at: preview.session.updated_at,
+    },
+    session_id: preview.session_id,
+    repository: preview.repository,
+    worktree: preview.worktree,
+    branch: preview.branch,
+    current_state: preview.current_state,
+    persisted_state: preview.persisted_state,
+    physical_state: preview.physical_state,
+    worktree_present: preview.worktree_present,
+    branch_present: preview.branch_present,
+    head: preview.head,
+    worktree_head: preview.worktree_head,
+    branch_head: preview.branch_head,
+    expected_head: preview.expected_head,
+    recoverable_commits: preview.recoverable_commits,
+    uncommitted_work: preview.uncommitted_work,
+    claims: preview.claims,
+    claim_count: preview.claim_count,
+    claims_truncated: preview.claims_truncated,
+    destructive_scope: preview.destructive_scope,
+    diagnostic: preview.diagnostic,
+  });
+}
+
+function sameDestructivePreviewEvidence(left: SessionDiscardPreview, right: SessionDiscardPreview): boolean {
+  return destructivePreviewEvidence(left) === destructivePreviewEvidence(right);
+}
+
+function staleDestructivePreview(
+  identity: SessionActionIdentity,
+  expected: SessionDiscardPreview,
+  observed: SessionDiscardPreview,
+): DomainResult<never> {
+  return failure(
+    new DomainError(
+      "STALE_SESSION",
+      "The discard preview changed; refresh the session and confirm the new destructive scope.",
+      {
+        session_id: identity.session_id,
+        reason: "discard-preview-changed",
+        expected_preview: expected as unknown as JsonObject,
+        observed_preview: observed as unknown as JsonObject,
+      },
+    ),
+  );
 }
 
 function responseToken(diagnostic: SessionDiagnostic, claimSetGeneration: number): SessionActionToken {
@@ -287,6 +353,21 @@ export function createSessionActions(backend: SessionBackend, context: SessionCo
     }
     if (!request.confirmation.confirmed) {
       return success(confirmationRequired(preview.value, fresh.value.token));
+    }
+    if (request.confirmation.preview === undefined) {
+      return failure(
+        new DomainError(
+          "OPERATION_REJECTED",
+          "An authoritative discard preview is required for destructive confirmation.",
+          {
+            session_id: request.identity.session_id,
+            reason: "discard-preview-required",
+          },
+        ),
+      );
+    }
+    if (!sameDestructivePreviewEvidence(request.confirmation.preview, preview.value)) {
+      return staleDestructivePreview(request.identity, request.confirmation.preview, preview.value);
     }
 
     const result = await backend.discardSession(context, request.identity.session_id);
