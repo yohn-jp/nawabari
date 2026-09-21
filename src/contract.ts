@@ -28,7 +28,13 @@ import {
   SANDBOX_REQUIRED_CAPABILITIES,
 } from "./domain/sandbox.js";
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
-import { DISCARD_PREVIEW_SCHEMA_VERSION, RECONCILIATION_APPLY_SCHEMA_VERSION } from "./session-registry.js";
+import {
+  DISCARD_PREVIEW_SCHEMA_VERSION,
+  REGISTRY_FEATURES,
+  REGISTRY_SCHEMA_VERSION,
+  SUPPORTED_REGISTRY_FEATURES,
+  RECONCILIATION_APPLY_SCHEMA_VERSION,
+} from "./session-registry.js";
 import { SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION, SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION } from "./domain/session.js";
 import {
   AUXILIARY_STATE_DURABILITY_CLASSES,
@@ -540,6 +546,10 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     id: "resource-claims",
     contract_id: RESOURCE_CLAIM_MACHINE_CONTRACT_ID,
     contract_version: RESOURCE_CLAIM_MACHINE_CONTRACT_VERSION,
+    registry_schema_version: REGISTRY_SCHEMA_VERSION,
+    registry_feature_gate_version: 1,
+    registry_features: [...REGISTRY_FEATURES],
+    supported_registry_features: [...SUPPORTED_REGISTRY_FEATURES],
     claim_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
     commands: RESOURCE_CLAIM_COMMANDS,
     command_aliases: RESOURCE_CLAIM_COMMAND_ALIASES,
@@ -557,6 +567,9 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "updated_at",
       "claim_set_generation",
       "previous_claim_set_generation",
+      "registry_revision",
+      "runtime_epoch",
+      "required_features",
       "migrated",
       "registry_schema_version",
       "claim_schema_version",
