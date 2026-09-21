@@ -11,12 +11,38 @@ import {
   WORKTREE_FILE_OPERATION_HELPER,
   WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES,
   deserializeWorktreeFileOperation,
+  executeWorktreeFileOperation,
   mutateWorktreeFile,
   prepareWorktreeFileOperation,
   serializeWorktreeFileOperation,
   validateWorktreeFileOperation,
   type WorktreeFileIdentity,
+  type WorktreeFileOperationExecutionOptions,
 } from "./worktree-file-operation.js";
+
+// Test setup resolves the executable once; production execution receives this
+// value from strict Landlock materialization and never searches PATH.
+function materializedPythonExecutable(): string {
+  for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (directory.length === 0) continue;
+    try {
+      const canonical = fs.realpathSync.native(path.join(directory, "python3"));
+      const stat = fs.statSync(canonical);
+      if (stat.isFile() && (stat.mode & 0o111) !== 0) return canonical;
+    } catch {
+      // Try the next test-runtime candidate.
+    }
+  }
+  throw new Error("The test runtime has no materialized python3 executable.");
+}
+
+const TEST_LANDLOCK_HELPER = materializedPythonExecutable();
+
+function helperOptions(
+  overrides: Omit<WorktreeFileOperationExecutionOptions, "landlock_helper"> = {},
+): WorktreeFileOperationExecutionOptions {
+  return { landlock_helper: TEST_LANDLOCK_HELPER, ...overrides };
+}
 
 function digest(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -82,14 +108,37 @@ test("validation requires both typed authority and exact endpoint scope", () => 
   }
 });
 
+test("execution fails closed without the canonical materialized Landlock helper", () => {
+  const root = fixture();
+  try {
+    const prepared = prepareWorktreeFileOperation(request(root, "CREATE", "docs/no-helper.txt", null));
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    let helperInvoked = false;
+    const result = executeWorktreeFileOperation(prepared.value, {
+      landlock_helper: null,
+      run_helper: () => {
+        helperInvoked = true;
+        return JSON.stringify({ ok: true });
+      },
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+    assert.equal(helperInvoked, false);
+    assert.equal(fs.existsSync(path.join(root, "docs", "no-helper.txt")), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("CREATE is exclusive and a failed retry cannot overwrite content", () => {
   const root = fixture();
   try {
-    const first = mutateWorktreeFile(request(root, "CREATE", "docs/new.txt", null));
+    const first = mutateWorktreeFile(request(root, "CREATE", "docs/new.txt", null), helperOptions());
     assert.equal(first.ok, true);
     assert.equal(fs.readFileSync(path.join(root, "docs/new.txt"), "utf8"), "payload");
 
-    const retry = mutateWorktreeFile(request(root, "CREATE", "docs/new.txt", null));
+    const retry = mutateWorktreeFile(request(root, "CREATE", "docs/new.txt", null), helperOptions());
     assert.equal(retry.ok, false);
     assert.equal(fs.readFileSync(path.join(root, "docs/new.txt"), "utf8"), "payload");
   } finally {
@@ -109,6 +158,7 @@ test("DELETE requires expected identity and refuses a second deletion", () => {
     };
     const first = mutateWorktreeFile(
       request(root, "DELETE", "docs/remove.txt", expected.digest, { expected_identity: expected }),
+      helperOptions(),
     );
     assert.equal(first.ok, true);
     assert.equal(fs.existsSync(path.join(root, "docs", "remove.txt")), false);
@@ -118,6 +168,7 @@ test("DELETE requires expected identity and refuses a second deletion", () => {
         expected_identity: expected,
         operation_id: "operation-delete-retry",
       }),
+      helperOptions(),
     );
     assert.equal(retry.ok, false);
   } finally {
@@ -143,6 +194,7 @@ test("DELETE and RENAME reject files with unknown hardlink identity", () => {
 
     const deletion = mutateWorktreeFile(
       request(root, "DELETE", "docs/hardlinked.txt", expected.digest, { expected_identity: expected }),
+      helperOptions(),
     );
     assert.equal(deletion.ok, false);
     if (!deletion.ok) {
@@ -157,6 +209,7 @@ test("DELETE and RENAME reject files with unknown hardlink identity", () => {
         to_path: "renamed/hardlinked.txt",
         expected_identity: expected,
       }),
+      helperOptions(),
     );
     assert.equal(rename.ok, false);
     if (!rename.ok) assert.equal(rename.error.details?.operation_code, "SOURCE_IDENTITY_UNAVAILABLE");
@@ -183,6 +236,7 @@ test("RENAME checks source identity and destination CREATE authority without rep
         to_path: "renamed/target.txt",
         expected_identity: expected,
       }),
+      helperOptions(),
     );
     assert.equal(rename.ok, true);
     assert.equal(fs.readFileSync(path.join(root, "renamed", "target.txt"), "utf8"), "rename-me");
@@ -203,6 +257,7 @@ test("RENAME checks source identity and destination CREATE authority without rep
           digest: digest("source-again"),
         },
       }),
+      helperOptions(),
     );
     assert.equal(rejected.ok, false);
     assert.equal(fs.readFileSync(occupied, "utf8"), "keep");
@@ -235,15 +290,18 @@ test("helper protocol failures are reported as uncertain evidence", () => {
     const prepared = prepareWorktreeFileOperation(request(root, "CREATE", "docs/uncertain.txt", null));
     assert.equal(prepared.ok, true);
     if (!prepared.ok) return;
-    const result = mutateWorktreeFile(request(root, "CREATE", "docs/uncertain.txt", null), {
-      run_helper: () =>
-        JSON.stringify({
-          ok: false,
-          code: "CREATE_UNCERTAIN",
-          message: "post-rename registry evidence unavailable",
-          uncertain: true,
-        }),
-    });
+    const result = mutateWorktreeFile(
+      request(root, "CREATE", "docs/uncertain.txt", null),
+      helperOptions({
+        run_helper: () =>
+          JSON.stringify({
+            ok: false,
+            code: "CREATE_UNCERTAIN",
+            message: "post-rename registry evidence unavailable",
+            uncertain: true,
+          }),
+      }),
+    );
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.equal(result.error.details?.operation_code, FILE_OPERATION_STATE_UNCERTAIN);
@@ -266,6 +324,7 @@ test("oversized payloads are rejected before helper spawn", () => {
         },
       }),
       {
+        ...helperOptions(),
         run_helper: () => {
           helperInvoked = true;
           return JSON.stringify({ ok: false, code: "unexpected", message: "helper must not run" });

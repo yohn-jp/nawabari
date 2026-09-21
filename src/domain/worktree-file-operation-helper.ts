@@ -2,9 +2,10 @@
  * The Linux primitive used by the typed worktree-file operation authority.
  *
  * This is deliberately a complete, fixed program rather than a shell
- * fragment.  The TypeScript caller invokes it with `python3 -I -c`, an empty
- * environment, and one JSON packet on stdin.  It never receives a pathname
- * for a script, a command string, or a caller-selected interpreter.
+ * fragment.  The TypeScript caller invokes it with the selected canonical
+ * Landlock Python executable, `-I -c`, an empty environment, and one JSON
+ * packet on stdin.  It never receives a pathname for a script, a command
+ * string, or an arbitrary interpreter.
  */
 export const WORKTREE_FILE_OPERATION_HELPER = String.raw`
 import base64
