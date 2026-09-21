@@ -328,4 +328,26 @@ test("serialization rejects unknown versions and round-trips the canonical regis
       "code" in error &&
       error.code === "FILE_OPERATION_UNSUPPORTED_SCHEMA",
   );
+
+  const persistedRecord = persisted.file_operations[0];
+  assert.ok(persistedRecord);
+  const corruptedRecords = [
+    { stage: "prepared", apply_attempts: 1, effect_observed: false, execution_completed: false },
+    { stage: "apply-recorded", apply_attempts: 1, effect_observed: true, execution_completed: false },
+    { stage: "completed", apply_attempts: 1, effect_observed: false, execution_completed: true },
+    { stage: "completed", apply_attempts: 1, effect_observed: true, execution_completed: false },
+    { stage: "unresolved", apply_attempts: 1, effect_observed: false, execution_completed: true },
+    { stage: "unresolved", apply_attempts: 0, effect_observed: true, execution_completed: false },
+  ] as const;
+  for (const corruptedRecord of corruptedRecords) {
+    assert.throws(
+      () =>
+        parseFileOperationRegistry({
+          ...persisted,
+          file_operations: [{ ...persistedRecord, ...corruptedRecord }],
+        }),
+      (error: unknown) =>
+        typeof error === "object" && error !== null && "code" in error && error.code === "FILE_OPERATION_CORRUPT",
+    );
+  }
 });
