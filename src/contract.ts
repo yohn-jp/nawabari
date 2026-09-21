@@ -45,6 +45,29 @@ import {
   AUXILIARY_STATE_SOURCE_KINDS,
   AUXILIARY_STATE_TARGET_KINDS,
 } from "./domain/auxiliary-state-projection.js";
+import {
+  BUILTIN_WORKTREE_PROFILE_DESCRIPTOR,
+  BUILTIN_WORKTREE_PROFILE_IDS,
+} from "./domain/worktree-profile-builtins.js";
+import { WORKTREE_PROFILE_CLI_DESCRIPTOR } from "./worktree-profile-cli.js";
+import {
+  WORKTREE_PROFILE_RUNTIME_CONTRACT_ID,
+  WORKTREE_PROFILE_RUNTIME_DESCRIPTOR,
+  WORKTREE_PROFILE_RUNTIME_SCHEMA_VERSION,
+} from "./domain/worktree-profile-runtime.js";
+import {
+  WORKTREE_RUNTIME_PROFILE_CONTRACT_ID,
+  WORKTREE_RUNTIME_PROFILE_SCHEMA_VERSION,
+} from "./domain/worktree-runtime-profile.js";
+import {
+  DECLARED_TOOL_MATERIAL_CONTRACT_ID,
+  DECLARED_TOOL_MATERIAL_DESCRIPTOR,
+  DECLARED_TOOL_MATERIAL_SCHEMA_VERSION,
+} from "./domain/runtime-provider-declared.js";
+import {
+  WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION,
+  WORKTREE_PROFILE_INSPECTION_SERIALIZATION_KEY,
+} from "./domain/worktree-profile-inspection.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -363,6 +386,31 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
         ],
         exact_owner_adoption: false,
         fail_closed: true,
+      },
+    },
+    worktree_profile: {
+      contract_id: WORKTREE_RUNTIME_PROFILE_CONTRACT_ID,
+      schema_version: WORKTREE_RUNTIME_PROFILE_SCHEMA_VERSION,
+      commands: ["session create", "profile list", "profile show"],
+      namespaces: ["builtin", "repository"],
+      profiles: [...BUILTIN_WORKTREE_PROFILE_IDS],
+      cli: WORKTREE_PROFILE_CLI_DESCRIPTOR,
+      runtime: WORKTREE_PROFILE_RUNTIME_DESCRIPTOR,
+      builtin: BUILTIN_WORKTREE_PROFILE_DESCRIPTOR,
+      pinning: {
+        catalog_sources: ["repository", "builtin"],
+        builtin_revision: "sha256-canonical-validated-profile-bytes",
+        digest_includes: "catalog-source-discriminant-and-source",
+      },
+      inspection: {
+        schema_version: WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION,
+        serialization_key: WORKTREE_PROFILE_INSPECTION_SERIALIZATION_KEY,
+        projection: "public-state",
+      },
+      declared_tool_material: {
+        contract_id: DECLARED_TOOL_MATERIAL_CONTRACT_ID,
+        schema_version: DECLARED_TOOL_MATERIAL_SCHEMA_VERSION,
+        descriptor: DECLARED_TOOL_MATERIAL_DESCRIPTOR,
       },
     },
   },
@@ -851,6 +899,7 @@ export function machineContract(packageVersion: string): JsonObject {
         ? {
             registry_lock_recovery: jsonClone(capability.registry_lock_recovery),
             initial_claims: jsonClone(capability.initial_claims),
+            worktree_profile: jsonClone(capability.worktree_profile),
           }
         : {}),
       ...(capability.id === "session-diagnostics" ? { lifecycle: jsonClone(capability.lifecycle) } : {}),

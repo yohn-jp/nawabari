@@ -59,11 +59,21 @@ import {
   type RuntimeRecords,
 } from "./registry/runtime-records.js";
 import {
-  loadWorktreeProfileCatalog,
   resolveWorktreeProfile,
   substituteProfileParameters,
+  validateWorktreeProfileCatalog,
 } from "./domain/worktree-profile-catalog.js";
-import { pinWorktreeProfile, type PinnedWorktreeProfile } from "./domain/worktree-profile-pinning.js";
+import {
+  builtinWorktreeProfileRevision,
+  pinWorktreeProfile,
+  type PinnedWorktreeProfile,
+} from "./domain/worktree-profile-pinning.js";
+import {
+  getBuiltinWorktreeProfile,
+  getBuiltinWorktreeProfileStatusForResolution,
+  resolveBuiltinWorktreeProfile,
+  type BuiltinWorktreeProfileId,
+} from "./domain/worktree-profile-builtins.js";
 import { DomainError } from "./domain/errors.js";
 import { sandboxDoctorReport, type SandboxProbe } from "./domain/sandbox.js";
 import {
@@ -1011,6 +1021,40 @@ export interface PersistedRegistryV2 {
 
 export type PersistedRegistry = PersistedRegistryV1 | PersistedRegistryV2;
 
+function loadPinnedProfileCatalog(
+  repository: RepositoryContext,
+  revision: string,
+  git: GitCommandRunner,
+): ReturnType<typeof validateWorktreeProfileCatalog> {
+  let text: string;
+  try {
+    text = git.run(["show", `${revision}:nawabari.profiles.json`], repository.worktreePath);
+  } catch (cause: unknown) {
+    return {
+      ok: false,
+      error: new DomainError("RUNTIME_PROFILE_MISSING", "The pinned repository catalog could not be read.", {
+        path: "nawabari.profiles.json",
+        revision,
+        cause: cause instanceof Error ? cause.message : String(cause),
+      }),
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch (cause: unknown) {
+    return {
+      ok: false,
+      error: new DomainError("RUNTIME_PROFILE_INVALID", "The pinned repository catalog contains invalid JSON.", {
+        path: "nawabari.profiles.json",
+        revision,
+        cause: cause instanceof Error ? cause.message : String(cause),
+      }),
+    };
+  }
+  return validateWorktreeProfileCatalog(parsed);
+}
+
 interface RegistryState {
   readonly registrySchemaVersion: typeof LEGACY_REGISTRY_SCHEMA_VERSION | RegistrySchemaVersion;
   readonly registryRevision: number;
@@ -1895,12 +1939,53 @@ export class SessionRegistry {
     baseRevision: string,
   ): PinnedWorktreeProfile | undefined {
     if (request === undefined) return undefined;
+    const selection = request.selection.profile;
+    const builtinPrefix = "builtin:";
+    if (selection.startsWith(builtinPrefix)) {
+      const builtinId = selection.slice(builtinPrefix.length);
+      if (builtinId.length === 0 || builtinId.includes(":")) {
+        throw new DomainError("RUNTIME_PROFILE_INVALID", "Built-in profile selection is not canonical.");
+      }
+      const builtin = getBuiltinWorktreeProfile(builtinId);
+      if (!builtin.ok) throw builtin.error;
+      const builtinProfileId = builtin.value.id as BuiltinWorktreeProfileId;
+      const resolved = resolveBuiltinWorktreeProfile({ profile: builtinId }, request.parameters ?? {});
+      if (!resolved.ok) throw resolved.error;
+      const readiness = getBuiltinWorktreeProfileStatusForResolution(builtinProfileId, resolved.value);
+      if (!readiness.ok) throw readiness.error;
+      if (!readiness.value.ready) {
+        throw new DomainError("RUNTIME_MATERIALIZATION_MISSING", "The selected built-in profile is not ready.", {
+          profile_id: builtinProfileId,
+          availability: readiness.value.availability,
+          missing: [...readiness.value.missing],
+        });
+      }
+      return pinWorktreeProfile(resolved.value, {
+        repository: { id: this.repository.repositoryId, revision: baseRevision },
+        base: { revision: baseRevision },
+        catalog: {
+          kind: "builtin",
+          id: builtinProfileId,
+          revision: builtinWorktreeProfileRevision(builtinProfileId),
+        },
+        selection: { profile: builtinProfileId, parameters: request.parameters ?? {} },
+      });
+    }
+
+    const repositoryPrefix = "repository:";
+    const repositorySelection = selection.startsWith(repositoryPrefix)
+      ? selection.slice(repositoryPrefix.length)
+      : selection;
+    if (repositorySelection.length === 0 || repositorySelection.includes(":")) {
+      throw new DomainError("RUNTIME_PROFILE_INVALID", "Repository profile selection is not canonical.");
+    }
+
     const catalogPath = request.provenance?.catalog?.path ?? "nawabari.profiles.json";
     if (catalogPath !== "nawabari.profiles.json")
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Profile catalog path is not authoritative");
-    const catalog = loadWorktreeProfileCatalog(this.repository, baseRevision, "nawabari.profiles.json", this.git);
+    const catalog = loadPinnedProfileCatalog(this.repository, baseRevision, this.git);
     if (!catalog.ok) throw catalog.error;
-    const resolved = resolveWorktreeProfile(request.selection, catalog.value);
+    const resolved = resolveWorktreeProfile({ profile: repositorySelection }, catalog.value);
     if (!resolved.ok) throw resolved.error;
     const parameterized =
       request.parameters === undefined ? resolved : substituteProfileParameters(resolved.value, request.parameters);
@@ -1922,8 +2007,8 @@ export class SessionRegistry {
     return pinWorktreeProfile(parameterized.value, {
       repository: { id: this.repository.repositoryId, revision: baseRevision },
       base: { revision: baseRevision },
-      catalog: { path: catalogPath, blob_oid: blobOid },
-      selection: { profile: request.selection.profile, parameters: request.parameters ?? {} },
+      catalog: { kind: "repository", path: catalogPath, blob_oid: blobOid },
+      selection: { profile: repositorySelection, parameters: request.parameters ?? {} },
     });
   }
 

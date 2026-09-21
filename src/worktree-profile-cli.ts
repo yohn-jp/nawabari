@@ -479,7 +479,7 @@ export function resolveWorktreeProfileSessionCreate(
       profile: Object.freeze({
         namespace: resolved.value.source.namespace,
         reference: resolved.value.source.reference,
-        selection: Object.freeze({ profile: resolved.value.source.id }),
+        selection: Object.freeze({ profile: resolved.value.source.reference }),
         parameters,
         resolved: resolved.value.profile,
         availability: resolved.value.availability,
