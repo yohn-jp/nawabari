@@ -9,11 +9,36 @@ import { SessionRegistryError, type RegistryErrorDetails } from "./errors.js";
  * persisted v1 claim must be explicitly migrated before it is interpreted by
  * the v2 authority.
  */
-export const RESOURCE_CLAIM_SCHEMA_VERSION = 2 as const;
+export const RESOURCE_CLAIM_SCHEMA_VERSION = 3 as const;
 export const LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION = 1 as const;
 
 export const RESOURCE_CLAIM_MODES = ["read", "write", "exclusive-write"] as const;
 export type ResourceClaimMode = (typeof RESOURCE_CLAIM_MODES)[number];
+
+export const RESOURCE_CLAIM_SHARING_KIND = "isolated-worktree" as const;
+export interface SharedWriteBinding {
+  readonly kind: typeof RESOURCE_CLAIM_SHARING_KIND;
+  readonly groupId: string;
+}
+
+export interface WorktreeIdentityEvidence {
+  readonly status: "verified" | "missing" | "ambiguous";
+  readonly repositoryId?: string;
+  readonly sessionId?: string;
+  readonly worktreeId?: string;
+  readonly worktreePath?: string;
+}
+
+export interface CoordinationFacts {
+  readonly left: ResourceClaim;
+  readonly right: ResourceClaim;
+  readonly leftIdentity: WorktreeIdentityEvidence;
+  readonly rightIdentity: WorktreeIdentityEvidence;
+  readonly claimSetGeneration: number;
+  readonly observedClaimSetGeneration: number;
+}
+
+export type CoordinationDecision = "allowed" | "denied";
 
 /**
  * Transition-only modes. `none` represents the absence of an exact-resource
@@ -94,6 +119,7 @@ export interface ResourceClaim {
   /** Canonical repository-relative POSIX path or supported glob. */
   readonly resource: string;
   readonly mode: ResourceClaimMode;
+  readonly sharing?: SharedWriteBinding;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -107,6 +133,7 @@ export interface ResourceClaimInput {
   readonly session_id?: string;
   readonly worktreePath?: string;
   readonly worktree_path?: string;
+  readonly sharing?: SharedWriteBinding;
 }
 
 export interface ClaimOwnerContext {
@@ -119,6 +146,7 @@ export interface ClaimOwnerContext {
 export interface CanonicalResourceClaimInput {
   readonly resource: string;
   readonly mode: ResourceClaimMode;
+  readonly sharing?: SharedWriteBinding;
 }
 
 const CLAIM_ID_PREFIX = "claim-";
@@ -156,13 +184,20 @@ export function claimModeGrantsAccess(granted: ResourceClaimMode, required: Reso
   return RESOURCE_CLAIM_ACCESS_STRENGTH[granted] >= RESOURCE_CLAIM_ACCESS_STRENGTH[required];
 }
 
-export function canonicalClaimId(sessionId: string, resource: string, mode: ResourceClaimMode): string {
+export function canonicalClaimId(
+  sessionId: string,
+  resource: string,
+  mode: ResourceClaimMode,
+  sharing?: SharedWriteBinding,
+): string {
   const digest = createHash("sha256")
     .update(sessionId)
     .update("\u0000")
     .update(mode)
     .update("\u0000")
     .update(resource)
+    .update("\u0000")
+    .update(sharing === undefined ? "" : `${sharing.kind}\u0000${sharing.groupId}`)
     .digest("hex");
   return `${CLAIM_ID_PREFIX}${digest}`;
 }
@@ -208,9 +243,11 @@ export function canonicalizeClaimInput(
     });
   }
 
+  const sharing = validateSharing(input.sharing, input.mode);
   return {
     resource: canonicalizeClaimResource(input.resource, owner.worktreePath),
     mode: input.mode,
+    ...(sharing === undefined ? {} : { sharing }),
   };
 }
 
@@ -298,19 +335,20 @@ export function createResourceClaim(
   }
   return Object.freeze({
     schemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
-    claimId: canonicalClaimId(owner.sessionId, input.resource, input.mode),
+    claimId: canonicalClaimId(owner.sessionId, input.resource, input.mode, input.sharing),
     sessionId: owner.sessionId,
     repositoryId: owner.repositoryId,
     worktreePath: owner.worktreePath,
     resource: input.resource,
     mode: input.mode,
+    ...(input.sharing === undefined ? {} : { sharing: Object.freeze({ ...input.sharing }) }),
     createdAt: timestamp,
     updatedAt: timestamp,
   });
 }
 
 export function cloneResourceClaim(claim: ResourceClaim): ResourceClaim {
-  return Object.freeze({ ...claim });
+  return Object.freeze({ ...claim, ...(claim.sharing === undefined ? {} : { sharing: Object.freeze({ ...claim.sharing }) }) });
 }
 
 export function claimsOverlap(left: ResourceClaim, right: ResourceClaim): boolean {
@@ -359,8 +397,32 @@ function canonicalClaimResourceForComparison(
   }
 }
 
-export function claimsConflict(left: ResourceClaim, right: ResourceClaim): boolean {
-  return claimsOverlap(left, right) && RESOURCE_CLAIM_COMPATIBILITY_MATRIX[left.mode][right.mode] === "conflict";
+export function claimsConflict(left: ResourceClaim, right: ResourceClaim, evidence?: CoordinationFacts): boolean {
+  if (!claimsOverlap(left, right)) return false;
+  if (evidence !== undefined && permitsCoordinatedWrite(evidence) === "allowed") return false;
+  return RESOURCE_CLAIM_COMPATIBILITY_MATRIX[left.mode][right.mode] === "conflict";
+}
+
+export function permitsCoordinatedWrite(facts: CoordinationFacts): CoordinationDecision {
+  const { left, right, leftIdentity, rightIdentity } = facts;
+  if (facts.claimSetGeneration !== facts.observedClaimSetGeneration) return "denied";
+  if (left.mode !== "write" || right.mode !== "write") return "denied";
+  if (left.sharing?.kind !== RESOURCE_CLAIM_SHARING_KIND || right.sharing?.kind !== RESOURCE_CLAIM_SHARING_KIND) return "denied";
+  if (!left.sharing.groupId || left.sharing.groupId !== right.sharing.groupId) return "denied";
+  if (leftIdentity.status !== "verified" || rightIdentity.status !== "verified") return "denied";
+  if (leftIdentity.repositoryId !== rightIdentity.repositoryId || leftIdentity.repositoryId !== left.repositoryId) return "denied";
+  if (left.sessionId === right.sessionId || leftIdentity.sessionId !== left.sessionId || rightIdentity.sessionId !== right.sessionId) return "denied";
+  if (!leftIdentity.worktreeId || !rightIdentity.worktreeId || leftIdentity.worktreeId === rightIdentity.worktreeId) return "denied";
+  if (!leftIdentity.worktreePath || !rightIdentity.worktreePath || leftIdentity.worktreePath === rightIdentity.worktreePath) return "denied";
+  return "allowed";
+}
+
+function validateSharing(sharing: SharedWriteBinding | undefined, mode: ResourceClaimMode): SharedWriteBinding | undefined {
+  if (sharing === undefined) return undefined;
+  if (mode !== "write" || sharing.kind !== RESOURCE_CLAIM_SHARING_KIND || typeof sharing.groupId !== "string" || sharing.groupId.length === 0 || sharing.groupId.length > 128) {
+    throw claimError("INVALID_CLAIM", "Coordinated write binding is invalid");
+  }
+  return Object.freeze({ kind: sharing.kind, groupId: sharing.groupId });
 }
 
 export function claimSortKey(claim: Pick<ResourceClaim, "sessionId" | "resource" | "mode" | "claimId">): string {
