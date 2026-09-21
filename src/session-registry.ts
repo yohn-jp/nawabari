@@ -48,6 +48,7 @@ import { isPostRenameFailure, writeJsonAtomicallySync } from "./registry/atomic.
 import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
 import {
   REGISTRY_FEATURES,
+  MAX_RUNTIME_RECORDS,
   SUPPORTED_REGISTRY_FEATURES,
   emptyRuntimeRecords,
   parseRuntimeRecords,
@@ -1858,10 +1859,17 @@ export class SessionRegistry {
                 ]),
                 records: Object.freeze({
                   ...state.runtimeRecords.records,
-                  pinned_profiles: Object.freeze([
-                    ...(state.runtimeRecords.records.pinned_profiles ?? []),
-                    pinnedProfile as unknown as RuntimeRecord,
-                  ]),
+                  pinned_profiles: (() => {
+                    const pinnedProfiles = state.runtimeRecords.records.pinned_profiles ?? [];
+                    if (pinnedProfiles.length >= MAX_RUNTIME_RECORDS) {
+                      throw new SessionRegistryError(
+                        "REGISTRY_CORRUPT",
+                        "Registry pinned_profiles exceeds its bounded record count",
+                        { field: "pinned_profiles", maximum: MAX_RUNTIME_RECORDS },
+                      );
+                    }
+                    return Object.freeze([...pinnedProfiles, pinnedProfile as unknown as RuntimeRecord]);
+                  })(),
                 }),
               };
         this.writeUnsafe(
