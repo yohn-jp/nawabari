@@ -219,6 +219,15 @@ export interface SessionRecord {
   readonly cleanupHead?: string;
   /** Established bounded execution visibility, when this is a governed session. */
   readonly workingSet?: EffectiveWorkingSet;
+  /**
+   * Present and true only when this session explicitly opted into
+   * resource-claim enforcement at creation. Absent (the default for newly
+   * created sessions) means operation authorization does not require
+   * resource claims for otherwise session-owned operations. Worktree and
+   * branch ownership, and claim conflicts against other sessions, remain
+   * enforced regardless of this flag.
+   */
+  readonly claimEnforcement?: boolean;
 }
 
 export interface CreateSessionOptions {
@@ -235,6 +244,8 @@ export interface ProvisionSessionOptions {
   readonly label?: string;
   /** Complete initial claim declaration committed with the new session. */
   readonly initialClaims?: readonly ResourceClaimInput[];
+  /** Explicit opt-in to resource-claim enforcement for this session; omitted or false leaves enforcement disabled. */
+  readonly claimEnforcement?: boolean;
   /** Repository-local auxiliary-state declarations materialized in the owned worktree. */
   readonly auxiliaryState?: readonly unknown[];
   /** Bounded external execution-scope artifact supplied by the governed caller. */
@@ -932,6 +943,8 @@ export interface PersistedSessionRecord {
   readonly discarded_head?: string;
   readonly cleanup_head?: string;
   readonly working_set?: EffectiveWorkingSet;
+  /** Present and true only when this session opted into resource-claim enforcement; absent means disabled. */
+  readonly claim_enforcement?: boolean;
 }
 
 export interface PersistedResourceClaim {
@@ -1669,6 +1682,7 @@ export class SessionRegistry {
         baseRevision: resources.baseRevision,
         ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
         ...(workingSet === undefined ? {} : { workingSet }),
+        ...(options.claimEnforcement === true ? { claimEnforcement: true } : {}),
       });
 
       const retryEvidence = this.provisioningRetryEvidence(state, resources, options, workingSet);
@@ -2297,6 +2311,7 @@ export class SessionRegistry {
       };
 
       const resources = canonicalOperationResources(options.resources, physical.worktreePath);
+      const claimEnforcementEnabled = currentRecord.claimEnforcement === true;
       // Authorization decision is advisory only. Claims may change between this
       // read and actual commit/push execution. Stale-decision handling is deferred
       // to future commit/push execution path; this PR adds no locking, revalidation,
@@ -2334,6 +2349,10 @@ export class SessionRegistry {
                 ? [...conflictDetails.recoveryHints]
                 : recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
             });
+          }
+          if (!claimEnforcementEnabled) {
+            authorized.push({ resource, claimIds: sortStrings(ownClaims.map((claim) => claim.claimId)) });
+            continue;
           }
           if (ownClaims.length > 0) {
             return deniedOperation("INSUFFICIENT_CLAIM_MODE", verified, {
@@ -7957,6 +7976,7 @@ export function toPersistedSessionRecord(
     ...(validated.discardedHead === undefined ? {} : { discarded_head: validated.discardedHead }),
     ...(validated.cleanupHead === undefined ? {} : { cleanup_head: validated.cleanupHead }),
     ...(validated.workingSet === undefined ? {} : { working_set: validated.workingSet }),
+    ...(validated.claimEnforcement === undefined ? {} : { claim_enforcement: validated.claimEnforcement }),
   };
 }
 
@@ -8298,7 +8318,15 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
       "created_at",
       "updated_at",
     ],
-    ["base_revision", "label", "terminal_operation", "discarded_head", "cleanup_head", "working_set"],
+    [
+      "base_revision",
+      "label",
+      "terminal_operation",
+      "discarded_head",
+      "cleanup_head",
+      "working_set",
+      "claim_enforcement",
+    ],
     index,
   );
 
@@ -8341,6 +8369,9 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
       ? {}
       : { cleanupHead: requireRevision(value.cleanup_head, index, "cleanup_head") }),
     ...(value.working_set === undefined ? {} : { workingSet: validatePersistedWorkingSet(value.working_set, index) }),
+    ...(value.claim_enforcement === undefined
+      ? {}
+      : { claimEnforcement: requireBoolean(value.claim_enforcement, index, "claim_enforcement") }),
   };
 
   return validateSessionRecord(record, expectedRepositoryId, index);
@@ -8409,6 +8440,9 @@ function validateSessionRecord(record: SessionRecord, expectedRepositoryId: stri
     throw invalidRecord(index, "discarded_head requires terminal_operation=discard");
   }
   if (record.workingSet !== undefined) validatePersistedWorkingSet(record.workingSet, index);
+  if (record.claimEnforcement !== undefined && typeof record.claimEnforcement !== "boolean") {
+    throw invalidRecord(index, "claim_enforcement must be a boolean");
+  }
   if (record.state !== "closed" && record.state !== "closing" && record.terminalOperation !== undefined) {
     throw invalidRecord(index, "terminal_operation is only valid for a closing or closed session");
   }
@@ -8529,6 +8563,13 @@ function freezeSessionRecord(record: SessionRecord): SessionRecord {
 function requireString(value: unknown, index: number, field: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw invalidRecord(index, `${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requireBoolean(value: unknown, index: number, field: string): boolean {
+  if (typeof value !== "boolean") {
+    throw invalidRecord(index, `${field} must be a boolean`);
   }
   return value;
 }

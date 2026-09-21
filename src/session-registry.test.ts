@@ -162,6 +162,40 @@ test("keeps human labels separate from session identity", () => {
   }
 });
 
+test("resource-claim enforcement defaults to disabled and persists an explicit opt-in across registry instances", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const claimLessWorktree = `${fixture.repositoryPath}-claim-less`;
+    const enforcedWorktree = `${fixture.repositoryPath}-claim-enforced`;
+    try {
+      const claimLess = registry.provision({ worktreePath: claimLessWorktree, branchName: "feature/claim-less" });
+      assert.equal(claimLess.claimEnforcement, undefined);
+
+      const enforced = registry.provision({
+        worktreePath: enforcedWorktree,
+        branchName: "feature/claim-enforced",
+        claimEnforcement: true,
+      });
+      assert.equal(enforced.claimEnforcement, true);
+
+      const reopened = new SessionRegistry({ cwd: fixture.repositoryPath });
+      assert.equal(reopened.get(claimLess.sessionId)?.claimEnforcement, undefined);
+      assert.equal(reopened.get(enforced.sessionId)?.claimEnforcement, true);
+    } finally {
+      for (const worktreePath of [claimLessWorktree, enforcedWorktree]) {
+        try {
+          runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
+        } catch {
+          fs.rmSync(worktreePath, { recursive: true, force: true });
+        }
+      }
+    }
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("rejects an empty label before writing unreadable registry state", () => {
   const fixture = createRepositoryFixture();
   try {

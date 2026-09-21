@@ -137,6 +137,7 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
     "--auxiliary-state",
     "--execution-scope-file",
     "--candidate-working-set-file",
+    "--enforce-claims",
   ],
   "session id": [],
   "session show": ["--session"],
@@ -750,6 +751,7 @@ type ClaimReplacementPairs = {
   auxiliary_states: unknown[];
   execution_scope_file: string | null;
   candidate_working_set_file: string | null;
+  enforce_claims: boolean;
 };
 
 type ClaimDeltaMutation = {
@@ -1167,6 +1169,7 @@ function parseClaimReplacementPairs(
   const auxiliaryStates: unknown[] = [];
   let executionScopeFile: string | null = null;
   let candidateWorkingSetFile: string | null = null;
+  let enforceClaims = false;
   let pendingResource: string | null = null;
   let concurrencyState: ClaimConcurrencyState = {
     expected_claim_set_generation: null,
@@ -1197,6 +1200,17 @@ function parseClaimReplacementPairs(
       if (!consumed.ok) return consumed;
       concurrencyState = consumed.value.state;
       if (consumed.value.consumed_next_value) index += 1;
+      continue;
+    }
+
+    if (name === "--enforce-claims") {
+      if (inlineValue !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--enforce-claims does not accept a value.", { option: name }));
+      }
+      if (enforceClaims) {
+        return failure(usageError("INVALID_ARGUMENT", "--enforce-claims may be supplied only once.", { option: name }));
+      }
+      enforceClaims = true;
       continue;
     }
 
@@ -1280,6 +1294,7 @@ function parseClaimReplacementPairs(
       auxiliary_states: auxiliaryStates,
       execution_scope_file: executionScopeFile,
       candidate_working_set_file: candidateWorkingSetFile,
+      enforce_claims: enforceClaims,
     },
   };
 }
@@ -1707,6 +1722,7 @@ async function executeCommand(
           : { auxiliary_state: parsed.value.auxiliary_states as SessionCreateOptions["auxiliary_state"] }),
         ...(executionScope === undefined ? {} : { execution_scope: executionScope }),
         ...(candidateWorkingSet === undefined ? {} : { candidate_working_set: candidateWorkingSet }),
+        ...(parsed.value.enforce_claims ? { claim_enforcement: true } : {}),
       };
       const result = await dependencies.backend.createSession(context, options);
       return result.ok ? { ok: true, value: result.value } : result;

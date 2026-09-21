@@ -38,7 +38,7 @@ nawabari capabilities --json
 Request a new Nawabari session
 
 ```
-nawabari session create [--branch <name>] [--worktree <path>|--worktree-root <path>] [--base <ref>] [--label <text>] [--execution-scope-file <path> --candidate-working-set-file <path>] [--resource <path-or-glob> --mode <read|write|exclusive-write> ...]
+nawabari session create [--branch <name>] [--worktree <path>|--worktree-root <path>] [--base <ref>] [--label <text>] [--execution-scope-file <path> --candidate-working-set-file <path>] [--resource <path-or-glob> --mode <read|write|exclusive-write> ...] [--enforce-claims]
 ```
 
 Aliases: none.
