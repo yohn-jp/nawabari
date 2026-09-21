@@ -43,7 +43,7 @@ test("round-trips session metadata through common Git state", () => {
 
     const persisted = readJson(mainRegistry.paths.registry) as PersistedRegistry;
     assert.equal(persisted.schema_version, 2);
-    assert.equal(persisted.registry_revision, 2);
+    assert.equal(registryRevision(mainRegistry), 2);
     assert.equal(persisted.runtime_epoch, 2);
     assert.deepEqual(persisted.required_features, []);
     assert.equal(persisted.repository_id, mainRegistry.repository.repositoryId);
@@ -313,12 +313,12 @@ test("close advances registry revision for both lifecycle writes", () => {
   try {
     const registry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
     const session = registry.create();
-    const before = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+    const before = registryRevision(registry);
 
     const result = registry.close(session.sessionId);
 
     assert.equal(result.session.state, "closed");
-    const after = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+    const after = registryRevision(registry);
     assert.equal(after, before + 2);
   } finally {
     fixture.cleanup();
@@ -330,12 +330,12 @@ test("discard advances registry revision for both lifecycle writes", () => {
   try {
     const registry = new SessionRegistry({ cwd: fixture.linkedWorktreePath });
     const session = registry.create();
-    const before = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+    const before = registryRevision(registry);
 
     const result = registry.discard(session.sessionId);
 
     assert.equal(result.session.state, "closed");
-    const after = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+    const after = registryRevision(registry);
     assert.equal(after, before + 2);
   } finally {
     fixture.cleanup();
@@ -355,7 +355,7 @@ test("garbage collection does not reuse a registry revision across stale candida
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
     const linkedSession = linkedRegistry.create();
     const secondSession = secondRegistry.create();
-    const before = (readJson(registry.paths.registry) as PersistedRegistry).registry_revision;
+    const before = registryRevision(registry);
 
     fs.rmSync(fixture.linkedWorktreePath, { recursive: true, force: true });
     fs.rmSync(secondWorktreePath, { recursive: true, force: true });
@@ -367,7 +367,7 @@ test("garbage collection does not reuse a registry revision across stale candida
       [linkedSession.sessionId, secondSession.sessionId].sort(),
     );
     assert.deepEqual(result.blocked, []);
-    assert.equal((readJson(registry.paths.registry) as PersistedRegistry).registry_revision, before + 6);
+    assert.equal(registryRevision(registry), before + 6);
     assert.equal(
       registry.list().every((record) => record.state === "closed"),
       true,
@@ -661,6 +661,14 @@ function runGit(args: readonly string[], cwd: string): string {
 
 function readJson(filePath: string): unknown {
   return JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
+}
+
+function registryRevision(registry: SessionRegistry): number {
+  const persisted = readJson(registry.paths.registry) as PersistedRegistry;
+  if (!("registry_revision" in persisted) || typeof persisted.registry_revision !== "number") {
+    throw new Error("Expected a v2 registry revision");
+  }
+  return persisted.registry_revision;
 }
 
 function writeRegistry(registry: SessionRegistry, value: PersistedRegistry): void {
