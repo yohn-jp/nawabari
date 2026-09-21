@@ -174,6 +174,36 @@ test("serialization preserves observed paths and does not synthesize a read set"
   assert.equal("files_read" in parsed, false);
 });
 
+test("serialization rejects forged hashes, altered provenance, and unknown fields", () => {
+  const result = projectFilesystemPolicyEvidence(checkpoint, policy);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const forgedHash = serializeFilesystemPolicyEvidence({
+    ...result.value,
+    evidence_hash: "0".repeat(64),
+  });
+  assert.equal(forgedHash.ok, false);
+
+  const alteredProvenance = serializeFilesystemPolicyEvidence({
+    ...result.value,
+    policy: { ...result.value.policy, policy_id: "forged-policy" },
+  });
+  assert.equal(alteredProvenance.ok, false);
+
+  const unknownField = serializeFilesystemPolicyEvidence({
+    ...result.value,
+    read_set: ["src/secret.ts"],
+  });
+  assert.equal(unknownField.ok, false);
+
+  const malformedNested = serializeFilesystemPolicyEvidence({
+    ...result.value,
+    observation: { ...result.value.observation, atomic: true },
+  });
+  assert.equal(malformedNested.ok, false);
+});
+
 const runtimeProjection = {
   contract_id: "nawabari.session-runtime-projection.v1" as const,
   schema_version: 1 as const,
