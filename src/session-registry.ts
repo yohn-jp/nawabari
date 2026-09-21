@@ -112,6 +112,7 @@ import {
 } from "./resource-coordination-snapshot.js";
 import {
   handoffResources as executeResourceHandoff,
+  validateResourceHandoff,
   RESOURCE_HANDOFF_OPERATION,
   RESOURCE_HANDOFF_SCHEMA_VERSION,
   type HandoffResourcesOptions,
@@ -120,6 +121,7 @@ import {
   type ResourceHandoffFence,
   type ResourceHandoffFenceController,
   type ResourceHandoffQuiescence,
+  type ResourceHandoffCode,
   type ResourceHandoffResult,
   type ResourceHandoffOperationRecord,
   type ResourceHandoffSession,
@@ -1042,6 +1044,15 @@ export interface PersistedResourceClaim {
   readonly updated_at: string;
 }
 
+export interface PersistedResourceHandoffOperation {
+  readonly operation_id: string;
+  readonly from_session_id: string;
+  readonly to_session_id: string;
+  readonly resource: string;
+  readonly mode: ResourceClaimMode;
+  readonly claim_set_generation: number;
+}
+
 export interface PersistedRegistryV1 {
   readonly schema_version: typeof LEGACY_REGISTRY_SCHEMA_VERSION;
   readonly repository_id: string;
@@ -1052,6 +1063,8 @@ export interface PersistedRegistryV1 {
   readonly claims?: readonly PersistedResourceClaim[];
   /** Monotonic authoritative claim-set generation; absent in pre-generation registries. */
   readonly claim_set_generation?: number;
+  /** Completed resource handoffs retained for restart-safe idempotent retries. */
+  readonly resource_handoff_operations?: readonly PersistedResourceHandoffOperation[];
 }
 
 export interface PersistedRegistryV2 {
@@ -1070,6 +1083,8 @@ export interface PersistedRegistryV2 {
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
   readonly file_operations?: readonly RuntimeRecord[];
+  /** Completed resource handoffs retained for restart-safe idempotent retries. */
+  readonly resource_handoff_operations?: readonly PersistedResourceHandoffOperation[];
 }
 
 export type PersistedRegistry = PersistedRegistryV1 | PersistedRegistryV2;
@@ -1084,6 +1099,7 @@ interface RegistryState {
   readonly claimSetGeneration: number;
   readonly legacyClaimsAbsent: boolean;
   readonly legacyClaimsSchemaVersion?: typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
+  readonly resourceHandoffOperations: readonly ResourceHandoffOperationRecord[];
 }
 
 interface ClaimOwner extends ClaimOwnerContext {
@@ -1700,7 +1716,8 @@ export class SessionRegistry {
         }
 
         const transition = classifyResourceClaimTransition(before?.mode ?? "none", delta.mode);
-        if (transition === "no-op") {
+        const sharingChanged = before !== undefined && !sameClaimSharing(before.sharing, delta.sharing);
+        if (transition === "no-op" && !sharingChanged) {
           // `before` is necessarily present for an upsert no-op.
           if (before === undefined) {
             throw new SessionRegistryError("OPERATION_REJECTED", "Claim transition classification was inconsistent");
@@ -1715,7 +1732,7 @@ export class SessionRegistry {
           timestamp,
         );
         nextByResource.set(delta.resource, after);
-        if (transition === "change") {
+        if (transition === "change" || sharingChanged) {
           if (before === undefined) {
             throw new SessionRegistryError("OPERATION_REJECTED", "Claim transition classification was inconsistent");
           }
@@ -4447,7 +4464,9 @@ export class SessionRegistry {
       if (prior !== undefined) {
         const contradictory =
           prior.kind !== normalized.kind ||
-          (prior.kind === "upsert" && normalized.kind === "upsert" && prior.mode !== normalized.mode);
+          (prior.kind === "upsert" &&
+            normalized.kind === "upsert" &&
+            (prior.mode !== normalized.mode || !sameClaimSharing(prior.sharing, normalized.sharing)));
         throw claimError(
           contradictory ? "CONTRADICTORY_CLAIM" : "DUPLICATE_CLAIM",
           contradictory
@@ -5782,6 +5801,7 @@ export class SessionRegistry {
       contents = fs.readFileSync(this.paths.registry, "utf8");
     } catch (error: unknown) {
       if (isNodeError(error) && error.code === "ENOENT") {
+        this.resourceHandoffOperations.clear();
         return {
           registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
           registryRevision: 0,
@@ -5791,6 +5811,7 @@ export class SessionRegistry {
           claims: [],
           claimSetGeneration: 0,
           legacyClaimsAbsent: false,
+          resourceHandoffOperations: [],
         };
       }
       throw new SessionRegistryError(
@@ -5817,16 +5838,25 @@ export class SessionRegistry {
       );
     }
 
-    return parseRegistry(
+    const state = parseRegistry(
       parsed,
       this.repository.repositoryId,
       allowLegacyClaimSchema,
       (left, right, generation, records) => this.coordinationFacts(left, right, generation, records),
     );
+    this.resourceHandoffOperations.clear();
+    for (const operation of state.resourceHandoffOperations) {
+      this.resourceHandoffOperations.set(operation.operationId, operation);
+    }
+    return state;
   }
 
   private readResourceHandoffSnapshot(): ResourceHandoffSnapshot {
     const state = this.readStateUnsafe();
+    return this.resourceHandoffSnapshotFromState(state);
+  }
+
+  private resourceHandoffSnapshotFromState(state: RegistryState): ResourceHandoffSnapshot {
     const sessions: ResourceHandoffSession[] = state.sessions.map((session) => ({
       sessionId: session.sessionId,
       repositoryId: session.repositoryId,
@@ -5842,7 +5872,7 @@ export class SessionRegistry {
         claimSetGeneration: state.claimSetGeneration,
         sessions,
         claims: state.claims,
-        completedOperations: [...this.resourceHandoffOperations.values()],
+        completedOperations: state.resourceHandoffOperations,
       },
     };
   }
@@ -5908,6 +5938,27 @@ export class SessionRegistry {
           },
         );
       }
+      const currentSnapshot = this.resourceHandoffSnapshotFromState(state);
+      const currentValidation = validateResourceHandoff(currentSnapshot, input.options);
+      if (currentValidation.status === "idempotent") {
+        return Object.freeze({
+          status: "idempotent" as const,
+          operationId: input.normalized.operationId,
+          claimSetGeneration: state.claimSetGeneration,
+          sourceClaim: currentValidation.sourceClaim,
+          destinationClaim: currentValidation.destinationClaim,
+        });
+      }
+      if (currentValidation.status !== "allowed") {
+        throw handoffValidationError(currentValidation.code, currentValidation.blockers[0]?.reason);
+      }
+      this.assertHandoffCommitIdentity(
+        input.snapshot,
+        currentSnapshot,
+        state.sessions,
+        input.normalized.fromSessionId,
+        input.normalized.toSessionId,
+      );
       const sourceClaim = state.claims.find(
         (claim) => claim.sessionId === input.normalized.fromSessionId && claim.resource === input.normalized.resource,
       );
@@ -5947,6 +5998,18 @@ export class SessionRegistry {
       );
       const nextClaims = sortResourceClaims([...remaining, destinationClaim]);
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+      const completedOperation: ResourceHandoffOperationRecord = Object.freeze({
+        operationId: input.normalized.operationId,
+        fromSessionId: input.normalized.fromSessionId,
+        toSessionId: input.normalized.toSessionId,
+        resource: input.normalized.resource,
+        mode: input.normalized.mode,
+        claimSetGeneration,
+      });
+      const completedOperations = [
+        ...state.resourceHandoffOperations.filter((operation) => operation.operationId !== completedOperation.operationId),
+        completedOperation,
+      ];
       this.writeUnsafe(
         state.sessions,
         nextClaims,
@@ -5954,6 +6017,7 @@ export class SessionRegistry {
         nextRegistryRevision(state),
         state.runtimeEpoch,
         state.runtimeRecords,
+        completedOperations,
       );
       return Object.freeze({
         status: "transferred" as const,
@@ -5963,6 +6027,44 @@ export class SessionRegistry {
         destinationClaim: cloneResourceClaim(destinationClaim),
       });
     });
+  }
+
+  private assertHandoffCommitIdentity(
+    initial: ResourceHandoffSnapshot,
+    current: ResourceHandoffSnapshot,
+    sessions: readonly SessionRecord[],
+    fromSessionId: string,
+    toSessionId: string,
+  ): void {
+    for (const sessionId of [fromSessionId, toSessionId]) {
+      const before = initial.registry.sessions.find((session) => session.sessionId === sessionId);
+      const after = current.registry.sessions.find((session) => session.sessionId === sessionId);
+      if (
+        before === undefined ||
+        after === undefined ||
+        before.repositoryId !== after.repositoryId ||
+        before.worktreePath !== after.worktreePath
+      ) {
+        throw new SessionRegistryError("WORKTREE_MISMATCH", "Handoff session identity changed before commit", {
+          sessionId,
+        });
+      }
+      const session = sessions.find((candidate) => candidate.sessionId === sessionId);
+      if (session === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", "Handoff session disappeared before commit", { sessionId });
+      }
+      const physical = verifyPhysicalExecutionContext({
+        repository: this.repository,
+        worktreePath: session.worktreePath,
+        branchName: session.branchName,
+        git: this.git,
+      });
+      if (physical.worktreePath !== session.worktreePath || physical.branchId !== session.branchId) {
+        throw new SessionRegistryError("WORKTREE_MISMATCH", "Handoff physical identity changed before commit", {
+          sessionId,
+        });
+      }
+    }
   }
 
   private readUnsafe(): readonly SessionRecord[] {
@@ -5985,6 +6087,7 @@ export class SessionRegistry {
     registryRevision: number,
     runtimeEpoch: number,
     runtimeRecords: ParsedRuntimeRecords,
+    resourceHandoffOperations: readonly ResourceHandoffOperationRecord[] = [...this.resourceHandoffOperations.values()],
   ): void {
     if (!Number.isSafeInteger(registryRevision) || registryRevision < 0) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry revision must be a non-negative safe integer");
@@ -6003,11 +6106,23 @@ export class SessionRegistry {
       registry_revision: registryRevision,
       runtime_epoch: runtimeEpoch,
       required_features: [...runtimeRecords.requiredFeatures],
+      ...(resourceHandoffOperations.length === 0
+        ? {}
+        : {
+            resource_handoff_operations: resourceHandoffOperations
+              .slice()
+              .sort((left, right) => compareCodePointStrings(left.operationId, right.operationId))
+              .map(toPersistedResourceHandoffOperation),
+          }),
       ...optionalRecords,
     };
 
     try {
       writeJsonAtomicallySync(this.paths.registry, registry);
+      this.resourceHandoffOperations.clear();
+      for (const operation of resourceHandoffOperations) {
+        this.resourceHandoffOperations.set(operation.operationId, Object.freeze({ ...operation }));
+      }
     } catch (error: unknown) {
       if (isPostRenameFailure(error)) {
         throw new SessionRegistryError(
@@ -8603,6 +8718,7 @@ function parseRegistry(
       "retentions",
       "recent_events",
       "file_operations",
+      "resource_handoff_operations",
     ],
   );
 
@@ -8621,6 +8737,7 @@ function parseRegistry(
   const registryRevision = parseGeneration(value.registry_revision, "registry_revision");
   const runtimeEpoch = parseGeneration(value.runtime_epoch, "runtime_epoch");
   const runtimeRecords = parseRuntimeRecords(value, SUPPORTED_REGISTRY_FEATURES);
+  const resourceHandoffOperations = parsePersistedResourceHandoffOperations(value.resource_handoff_operations);
 
   const records = value.sessions.map((candidate, index) => parseSessionRecord(candidate, index, expectedRepositoryId));
   validateRecords(records, expectedRepositoryId);
@@ -8644,6 +8761,7 @@ function parseRegistry(
       claims: [],
       claimSetGeneration,
       legacyClaimsAbsent: true,
+      resourceHandoffOperations,
     };
   }
   const claimSchemaVersion = value.claims_schema_version;
@@ -8685,6 +8803,7 @@ function parseRegistry(
     claims: sortResourceClaims(claims),
     claimSetGeneration,
     legacyClaimsAbsent: false,
+    resourceHandoffOperations,
     ...(isLegacyClaimSchema ? { legacyClaimsSchemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION } : {}),
   };
 }
@@ -8710,6 +8829,102 @@ function parseGeneration(value: unknown, field: string): number {
     });
   }
   return value as number;
+}
+
+function parsePersistedResourceHandoffOperations(
+  value: unknown,
+): readonly ResourceHandoffOperationRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry resource_handoff_operations must be an array");
+  }
+  const operations = value.map((candidate, index) => {
+    if (!isRecord(candidate)) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry resource handoff operation must be an object", {
+        index,
+      });
+    }
+    assertExactKeys(
+      candidate,
+      ["operation_id", "from_session_id", "to_session_id", "resource", "mode", "claim_set_generation"],
+      [],
+      index,
+    );
+    const operationId = requireString(candidate.operation_id, index, "operation_id");
+    const fromSessionId = requireString(candidate.from_session_id, index, "from_session_id");
+    const toSessionId = requireString(candidate.to_session_id, index, "to_session_id");
+    const resource = requireString(candidate.resource, index, "resource");
+    if (!isResourceClaimMode(candidate.mode)) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry resource handoff operation mode is invalid", {
+        index,
+      });
+    }
+    if (!Number.isSafeInteger(candidate.claim_set_generation) || (candidate.claim_set_generation as number) < 0) {
+      throw new SessionRegistryError(
+        "REGISTRY_CORRUPT",
+        "Registry resource handoff operation claim_set_generation is invalid",
+        { index },
+      );
+    }
+    try {
+      assertCanonicalClaimResource(resource);
+    } catch (error: unknown) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry resource handoff operation resource is invalid", {
+        index,
+      }, error);
+    }
+    return Object.freeze({
+      operationId,
+      fromSessionId,
+      toSessionId,
+      resource,
+      mode: candidate.mode,
+      claimSetGeneration: candidate.claim_set_generation as number,
+    });
+  });
+  const ids = new Set<string>();
+  for (const operation of operations) {
+    if (ids.has(operation.operationId)) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry resource handoff operation IDs must be unique", {
+        operationId: operation.operationId,
+      });
+    }
+    ids.add(operation.operationId);
+  }
+  return Object.freeze(operations);
+}
+
+function sameClaimSharing(left: SharedWriteBinding | undefined, right: SharedWriteBinding | undefined): boolean {
+  return left?.kind === right?.kind && left?.groupId === right?.groupId;
+}
+
+function toPersistedResourceHandoffOperation(
+  operation: ResourceHandoffOperationRecord,
+): PersistedResourceHandoffOperation {
+  return {
+    operation_id: operation.operationId,
+    from_session_id: operation.fromSessionId,
+    to_session_id: operation.toSessionId,
+    resource: operation.resource,
+    mode: operation.mode,
+    claim_set_generation: operation.claimSetGeneration,
+  };
+}
+
+function handoffValidationError(code: ResourceHandoffCode, reason = "Resource handoff evidence changed before commit"): SessionRegistryError {
+  const mapped: RegistryErrorCode =
+    code === "STALE_CLAIM_SET"
+      ? "STALE_CLAIM_SET"
+      : code === "RESOURCE_CLAIM_CONFLICT"
+        ? "RESOURCE_CLAIM_CONFLICT"
+        : code === "SESSION_NOT_FOUND"
+          ? "SESSION_NOT_FOUND"
+          : code === "MISSING_RESOURCE_CLAIM"
+            ? "MISSING_RESOURCE_CLAIM"
+            : code === "INSUFFICIENT_CLAIM_MODE"
+              ? "INSUFFICIENT_CLAIM_MODE"
+              : "OPERATION_REJECTED";
+  return new SessionRegistryError(mapped, reason);
 }
 
 function nextRegistryRevision(state: RegistryState): number {
