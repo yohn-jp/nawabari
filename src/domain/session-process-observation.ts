@@ -200,6 +200,14 @@ export function terminateOwnedExecution(
   intent: TerminationIntent,
   options: SessionProcessObservationOptions = {},
 ): DomainResult<OwnedExecutionTermination> {
+  if (options.current_boot_id === undefined || options.current_boot_id !== record.boot_id) {
+    return observationError("A live boot identity is required for destructive execution termination.", {
+      session_id: record.session_id,
+      execution_id: record.execution_id,
+      expected_boot_id: record.boot_id,
+      observed_boot_id: options.current_boot_id ?? null,
+    });
+  }
   if (
     intent.kind !== "terminate" ||
     intent.session_id !== record.session_id ||

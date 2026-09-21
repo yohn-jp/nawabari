@@ -136,12 +136,28 @@ test("termination requires exact session, execution, and boot identity and uses 
     assert.equal(wrongBoot.ok, false);
     assert.equal(fs.readFileSync(path.join(created.value.path, "cgroup.procs"), "utf8"), "4242\n");
 
-    const terminated = terminateOwnedExecution(execution, {
+    const omittedLiveBoot = terminateOwnedExecution(execution, {
       kind: "terminate",
       session_id: "session-a",
       execution_id: "run-b",
       boot_id: "boot-a",
     });
+    assert.equal(omittedLiveBoot.ok, false);
+    assert.equal(fs.readFileSync(path.join(created.value.path, "cgroup.procs"), "utf8"), "4242\n");
+
+    const mismatchedLiveBoot = terminateOwnedExecution(
+      execution,
+      { kind: "terminate", session_id: "session-a", execution_id: "run-b", boot_id: "boot-a" },
+      { current_boot_id: "boot-other" },
+    );
+    assert.equal(mismatchedLiveBoot.ok, false);
+    assert.equal(fs.readFileSync(path.join(created.value.path, "cgroup.procs"), "utf8"), "4242\n");
+
+    const terminated = terminateOwnedExecution(
+      execution,
+      { kind: "terminate", session_id: "session-a", execution_id: "run-b", boot_id: "boot-a" },
+      { current_boot_id: "boot-a" },
+    );
     assert.equal(terminated.ok, true, terminated.ok ? "" : JSON.stringify(terminated.error));
     if (!terminated.ok) return;
     assert.equal(terminated.value.killed, true);
