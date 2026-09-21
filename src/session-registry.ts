@@ -76,6 +76,8 @@ import {
   RESOURCE_CLAIM_SCHEMA_VERSION,
   sortResourceClaims,
   type ClaimOwnerContext,
+  type CoordinationFacts,
+  type WorktreeIdentityEvidence,
   type CanonicalResourceClaimInput,
   type ResourceClaim,
   type ResourceClaimRecoveryAction,
@@ -1440,6 +1442,8 @@ export class SessionRegistry {
         owner,
         state.claims.filter((claim) => claim.sessionId !== sessionId),
         state.sessions,
+        undefined,
+        (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration),
       );
       const nextIds = new Set(next.map((claim) => claim.claimId));
       const released = current.filter((claim) => !nextIds.has(claim.claimId));
@@ -4400,6 +4404,7 @@ export class SessionRegistry {
       [...existing, ...current],
       state.sessions,
       state.claimSetGeneration,
+      (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration),
     );
     const nextClaims = sortResourceClaims([
       ...state.claims,
@@ -4419,6 +4424,7 @@ export class SessionRegistry {
     existing: readonly ResourceClaim[],
     sessions: readonly SessionRecord[] = [],
     additiveClaimSetGeneration?: number,
+    coordinationFacts?: (left: ResourceClaim, right: ResourceClaim) => CoordinationFacts | undefined,
   ): readonly ResourceClaim[] {
     for (const candidate of candidates) {
       const exact = existing.find((claim) => claim.claimId === candidate.claimId);
@@ -4471,7 +4477,7 @@ export class SessionRegistry {
                 }),
           });
         }
-        if (claimsConflict(candidate, current)) {
+        if (claimsConflict(candidate, current, coordinationFacts?.(candidate, current))) {
           const conflictDetails = this.resourceClaimConflictDetails(candidate, current, {
             sessions,
             claims: existing,
@@ -4490,6 +4496,46 @@ export class SessionRegistry {
       }
     }
     return candidates;
+  }
+
+  private coordinationFacts(
+    left: ResourceClaim,
+    right: ResourceClaim,
+    generation: number,
+    suppliedRecords?: readonly SessionRecord[],
+  ): CoordinationFacts | undefined {
+    const records = suppliedRecords ?? this.readUnsafe();
+    const identity = (claim: ResourceClaim): WorktreeIdentityEvidence => {
+      const record = records.find((candidate) => candidate.sessionId === claim.sessionId);
+      if (record === undefined || record.state !== "active") return { status: "missing" };
+      try {
+        const physical = verifyPhysicalExecutionContext({
+          repository: this.repository,
+          worktreePath: record.worktreePath,
+          branchName: record.branchName,
+          git: this.git,
+        });
+        if (physical.worktreeId !== record.worktreeId || physical.worktreePath !== record.worktreePath)
+          return { status: "ambiguous" };
+        return {
+          status: "verified",
+          repositoryId: physical.repositoryId,
+          sessionId: record.sessionId,
+          worktreeId: physical.worktreeId,
+          worktreePath: physical.worktreePath,
+        };
+      } catch {
+        return { status: "missing" };
+      }
+    };
+    return {
+      left,
+      right,
+      leftIdentity: identity(left),
+      rightIdentity: identity(right),
+      claimSetGeneration: generation,
+      observedClaimSetGeneration: generation,
+    };
   }
 
   private closeUnsafe(
@@ -5561,7 +5607,12 @@ export class SessionRegistry {
       );
     }
 
-    return parseRegistry(parsed, this.repository.repositoryId, allowLegacyClaimSchema);
+    return parseRegistry(
+      parsed,
+      this.repository.repositoryId,
+      allowLegacyClaimSchema,
+      (left, right, generation, records) => this.coordinationFacts(left, right, generation, records),
+    );
   }
 
   private readUnsafe(): readonly SessionRecord[] {
@@ -8159,7 +8210,17 @@ export function toPersistedResourceClaim(
   };
 }
 
-function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacyClaimSchema = false): RegistryState {
+function parseRegistry(
+  value: unknown,
+  expectedRepositoryId: string,
+  allowLegacyClaimSchema = false,
+  coordinationFacts?: (
+    left: ResourceClaim,
+    right: ResourceClaim,
+    generation: number,
+    records: readonly SessionRecord[],
+  ) => CoordinationFacts | undefined,
+): RegistryState {
   if (!isRecord(value)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry root must be an object");
   }
@@ -8266,7 +8327,14 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
       isLegacyClaimSchema ? LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION : undefined,
     ),
   );
-  validateRegistryClaims(records, claims, expectedRepositoryId, isLegacyClaimSchema);
+  validateRegistryClaims(
+    records,
+    claims,
+    expectedRepositoryId,
+    isLegacyClaimSchema,
+    coordinationFacts,
+    claimSetGeneration,
+  );
   return {
     registrySchemaVersion,
     registryRevision,
@@ -8477,6 +8545,13 @@ function validateRegistryClaims(
   claims: readonly ResourceClaim[],
   expectedRepositoryId: string,
   legacySemantics = false,
+  coordinationFacts?: (
+    left: ResourceClaim,
+    right: ResourceClaim,
+    generation: number,
+    records: readonly SessionRecord[],
+  ) => CoordinationFacts | undefined,
+  claimSetGeneration = 0,
 ): void {
   const sessions = new Map(records.map((record) => [record.sessionId, record]));
   const claimIds = new Set<string>();
@@ -8520,7 +8595,12 @@ function validateRegistryClaims(
           { claimId: current.claimId, ownerClaimId: prior.claimId },
         );
       }
-      if (!(legacySemantics ? legacyClaimsConflict(current, prior) : claimsConflict(current, prior))) continue;
+      if (
+        !(legacySemantics
+          ? legacyClaimsConflict(current, prior)
+          : claimsConflict(current, prior, coordinationFacts?.(current, prior, claimSetGeneration, records)))
+      )
+        continue;
       const conflictDetails = resourceClaimConflictDetails(current, prior, records);
       throw claimError("RESOURCE_CLAIM_CONFLICT", "Persisted claims contain an unresolved conflict", {
         claimId: current.claimId,
