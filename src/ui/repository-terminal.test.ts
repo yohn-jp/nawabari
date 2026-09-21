@@ -106,3 +106,20 @@ test("Ctrl-C exits through the same cleanup path", async () => {
   assert.equal(result.reason, "interrupt");
   assert.deepEqual(input.rawModes, [true, false]);
 });
+
+test("an already-aborted signal resolves before raw mode or listeners are installed", async () => {
+  const input = new FakeInput(true);
+  const output = new FakeOutput(true);
+  const abortController = new AbortController();
+  abortController.abort();
+  const result = await runRepositoryTerminal({
+    stdin: input as unknown as RepositoryTerminalInput,
+    stdout: output as unknown as RepositoryTerminalOutput,
+    signal: abortController.signal,
+    readSnapshot: () => sample(),
+  });
+  assert.equal(result.reason, "aborted");
+  assert.equal(result.snapshot_token, "token-1");
+  assert.deepEqual(input.rawModes, []);
+  assert.deepEqual(output.writes, []);
+});

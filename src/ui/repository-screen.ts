@@ -50,6 +50,7 @@ const MIN_WIDTH = 1;
 const MIN_HEIGHT = 1;
 const MAX_ROWS_PER_SECTION = 256;
 const MAX_JSON_BYTES = 64 * 1024;
+const MAX_FALLBACK_SCALAR_BYTES = 1024;
 const ELLIPSIS = "…";
 
 function asRecord(value: unknown): ScreenRecord | null {
@@ -201,6 +202,18 @@ function tokenOf(model: RepositoryScreenModel): string | null {
   return scalar(recordValue(model, ["snapshot_token", "token"]));
 }
 
+function boundedFallbackScalar(value: string | null): string | null {
+  if (value === null) return null;
+  if (new TextEncoder().encode(value).byteLength <= MAX_FALLBACK_SCALAR_BYTES) return value;
+  let bounded = "";
+  for (const character of value) {
+    const candidate = `${bounded}${character}${ELLIPSIS}`;
+    if (new TextEncoder().encode(candidate).byteLength > MAX_FALLBACK_SCALAR_BYTES) break;
+    bounded += character;
+  }
+  return `${bounded}${ELLIPSIS}`;
+}
+
 function rowsForView(model: RepositoryScreenModel, view: RepositoryScreenView): readonly ScreenRecord[] {
   if (view === "sessions") return sectionRows(model.sessions);
   if (view === "files") return sectionRows(model.matrix ?? model.files);
@@ -320,10 +333,10 @@ export function repositoryScreenJson(model: RepositoryScreenModel, viewport: Rep
   return JSON.stringify({
     ui: "repository",
     interactive: false,
-    snapshot_token: tokenOf(model),
+    snapshot_token: boundedFallbackScalar(tokenOf(model)),
     screen: renderRepositoryScreen(model, { width, height }),
     truncated: true,
-    next_cursor: scalar(model.next_cursor),
+    next_cursor: boundedFallbackScalar(scalar(model.next_cursor)),
   });
 }
 

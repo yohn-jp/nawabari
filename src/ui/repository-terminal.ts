@@ -165,6 +165,7 @@ export async function runRepositoryTerminal(
   }
 
   let selection = initialSelection(model);
+  if (controller.signal?.aborted) return reasonResult(true, "aborted", model, selection);
   const input = controller.stdin;
   const output = controller.stdout;
   const inputSource = input as unknown as EventSource;
@@ -257,8 +258,12 @@ export async function runRepositoryTerminal(
   inputSource.on?.("end", onEnd as (...args: unknown[]) => void);
   inputSource.on?.("error", onError as (...args: unknown[]) => void);
   outputSource.on?.("resize", onResize as (...args: unknown[]) => void);
-  controller.signal?.addEventListener("abort", onAbort, { once: true });
   process.once("SIGINT", onSigint);
+  controller.signal?.addEventListener("abort", onAbort, { once: true });
+  if (controller.signal?.aborted) {
+    onAbort();
+    return result;
+  }
   draw();
   return result;
 }

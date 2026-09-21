@@ -111,3 +111,18 @@ test("JSON fallback remains bounded when a producer supplies a large snapshot", 
   assert.ok(new TextEncoder().encode(encoded).byteLength <= 64 * 1024);
   assert.equal((JSON.parse(encoded) as Record<string, unknown>).truncated, true);
 });
+
+test("JSON fallback bounds snapshot token and cursor scalars in its summary", () => {
+  const huge = "token-" + "x".repeat(200_000);
+  const encoded = repositoryScreenJson(model({ snapshot_token: huge, next_cursor: huge, sessions: [] }), {
+    width: 80,
+    height: 20,
+  });
+  assert.ok(new TextEncoder().encode(encoded).byteLength <= 64 * 1024);
+  const value = JSON.parse(encoded) as Record<string, unknown>;
+  assert.equal(value.truncated, true);
+  assert.ok(typeof value.snapshot_token === "string");
+  assert.ok((value.snapshot_token as string).length < 2_000);
+  assert.ok(typeof value.next_cursor === "string");
+  assert.ok((value.next_cursor as string).length < 2_000);
+});
