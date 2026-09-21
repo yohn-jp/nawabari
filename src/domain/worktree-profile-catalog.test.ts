@@ -1,13 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { STRICT_RUNTIME_POLICY } from "./runtime-projection.js";
-import { resolveWorktreeProfile, validateWorktreeProfileCatalog, substituteProfileParameters } from "./worktree-profile-catalog.js";
+import {
+  resolveWorktreeProfile,
+  validateWorktreeProfileCatalog,
+  substituteProfileParameters,
+} from "./worktree-profile-catalog.js";
 
 const profile = (id: string, parents: string[] = []) => ({
-  id, version: "1", extends: parents, materialSelection: { profiles: ["base"] },
+  id,
+  version: "1",
+  extends: parents,
+  materialSelection: { profiles: ["base"] },
   filesystem: { readOnly: ["src/*"], write: [], create: [], delete: [], deny: [], immutable: [] },
-  tools: [{ entrypoint: "node", provider: { id: "node", requirement_id: "node-runtime" } }], shell: { entrypoint: "node" },
-  environment: { home: "session", xdg: { config: "session", cache: "session", data: "session", state: "session" }, tmp: "execution" },
+  tools: [{ entrypoint: "node", provider: { id: "node", requirement_id: "node-runtime" } }],
+  shell: { entrypoint: "node" },
+  environment: {
+    home: "session",
+    xdg: { config: "session", cache: "session", data: "session", state: "session" },
+    tmp: "execution",
+  },
   git: { config: "session-private", globalConfig: "excluded", credentialHelpers: "disabled", hooks: "disabled" },
   execution: { policy: STRICT_RUNTIME_POLICY, processTracking: "required" },
 });
