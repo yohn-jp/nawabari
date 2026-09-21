@@ -112,14 +112,43 @@ test("an already-aborted signal resolves before raw mode or listeners are instal
   const output = new FakeOutput(true);
   const abortController = new AbortController();
   abortController.abort();
+  let readerCalls = 0;
   const result = await runRepositoryTerminal({
     stdin: input as unknown as RepositoryTerminalInput,
     stdout: output as unknown as RepositoryTerminalOutput,
     signal: abortController.signal,
-    readSnapshot: () => sample(),
+    readSnapshot: () => {
+      readerCalls += 1;
+      return sample();
+    },
   });
   assert.equal(result.reason, "aborted");
-  assert.equal(result.snapshot_token, "token-1");
+  assert.equal(result.snapshot_token, null);
+  assert.equal(readerCalls, 0);
   assert.deepEqual(input.rawModes, []);
   assert.deepEqual(output.writes, []);
+});
+
+test("an already-aborted signal does not await a never-resolving snapshot reader", async () => {
+  const input = new FakeInput(true);
+  const output = new FakeOutput(true);
+  const abortController = new AbortController();
+  abortController.abort();
+  let readerCalls = 0;
+  const outcome = await Promise.race([
+    runRepositoryTerminal({
+      stdin: input as unknown as RepositoryTerminalInput,
+      stdout: output as unknown as RepositoryTerminalOutput,
+      signal: abortController.signal,
+      readSnapshot: () => {
+        readerCalls += 1;
+        return new Promise<RepositoryScreenModel>(() => undefined);
+      },
+    }),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 100)),
+  ]);
+  assert.ok(outcome !== null);
+  assert.equal(outcome.reason, "aborted");
+  assert.equal(readerCalls, 0);
+  assert.deepEqual(input.rawModes, []);
 });

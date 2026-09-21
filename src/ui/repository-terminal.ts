@@ -147,6 +147,7 @@ export async function runRepositoryTerminal(
   controller: RepositoryTerminalController,
 ): Promise<RepositoryTerminalResult> {
   const interactive = outputIsTTY(controller);
+  if (controller.signal?.aborted) return reasonResult(interactive, "aborted", null, null);
   const readSnapshot = readerFor(controller);
   let model: RepositoryScreenModel;
   try {
