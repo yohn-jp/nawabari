@@ -5,6 +5,7 @@ import { success } from "./errors.js";
 import { decideExecutionAdmission, type ExecutionAdmissionReservation } from "./session-admission-decision.js";
 import {
   runSessionLaunchSupervisor,
+  serializeTrustedSupervisorGoMessage,
   type SessionLaunchSupervisorPacket,
   type TrustedSupervisorProcess,
 } from "./session-launch-supervisor.js";
@@ -110,6 +111,11 @@ test("attaches the supervisor, durably revalidates, and sends one GO before wait
       assert.equal(request.payload.stdio[3], 9);
       assert.equal(request.payload.seccomp_fd, 9);
       assert.equal(request.trusted.env?.NODE_OPTIONS, "--require attacker.js");
+      const go = JSON.parse(serializeTrustedSupervisorGoMessage(request)) as {
+        payload: { stdio: unknown[]; seccomp_fd: number };
+      };
+      assert.deepEqual(go.payload.stdio, ["ignore", "pipe", "pipe", 3]);
+      assert.equal(go.payload.seccomp_fd, 3);
       return fakeProcess(events);
     },
     durability: {

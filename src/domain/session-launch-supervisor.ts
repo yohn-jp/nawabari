@@ -108,6 +108,26 @@ export type TrustedSupervisorFactory = (
   request: SupervisorStartRequest,
 ) => TrustedSupervisorProcess | Promise<TrustedSupervisorProcess>;
 
+/** Serialize the private one-shot message sent to the trusted supervisor. */
+export function serializeTrustedSupervisorGoMessage(request: SupervisorStartRequest): string {
+  return JSON.stringify({
+    type: "GO",
+    contract_id: SESSION_LAUNCH_SUPERVISOR_CONTRACT_ID,
+    admission_contract_id: SESSION_ADMISSION_CONTRACT_ID,
+    reservation: request.reservation,
+    payload: {
+      executable: request.payload.executable,
+      args: request.payload.args,
+      cwd: request.payload.cwd,
+      env: request.payload.env,
+      // The parent's descriptor may have any number, but the child receives
+      // it at fd 3 because stdio slot 3 is the inherited seccomp descriptor.
+      stdio: [request.payload.stdio[0], request.payload.stdio[1], request.payload.stdio[2], 3],
+      seccomp_fd: 3,
+    },
+  });
+}
+
 export type SessionLaunchSupervisorPacket = {
   readonly admission: ExecutionAdmissionReservation | ExecutionAdmissionFacts;
   readonly trusted: TrustedSupervisorSpec;
@@ -294,20 +314,7 @@ function defaultSupervisorFactory(request: SupervisorStartRequest): TrustedSuper
     pid: child.pid ?? -1,
     send_go: () => {
       if (child.stdin === null || child.stdin.destroyed) throw new Error("trusted supervisor stdin is unavailable");
-      const message = JSON.stringify({
-        type: "GO",
-        contract_id: SESSION_LAUNCH_SUPERVISOR_CONTRACT_ID,
-        admission_contract_id: SESSION_ADMISSION_CONTRACT_ID,
-        reservation: request.reservation,
-        payload: {
-          executable: request.payload.executable,
-          args: request.payload.args,
-          cwd: request.payload.cwd,
-          env: request.payload.env,
-          stdio: request.payload.stdio,
-          seccomp_fd: 3,
-        },
-      });
+      const message = serializeTrustedSupervisorGoMessage(request);
       child.stdin.write(`${message}\n`);
       child.stdin.end();
     },
@@ -599,18 +606,26 @@ export async function runSessionLaunchSupervisor(
   const resultPromise = Promise.resolve()
     .then(() => supervisor.wait())
     .catch((): SupervisorChildResult => ({ status: "unknown" }));
+  let timeoutHandle: NodeJS.Timeout | null = null;
   const timeoutPromise = new Promise<"timeout">((resolve) => {
-    setTimeout(() => resolve("timeout"), timeoutMs);
+    timeoutHandle = setTimeout(() => resolve("timeout"), timeoutMs);
   });
   const disconnectPromise =
     parent.wait_for_disconnect === undefined
       ? new Promise<never>(() => undefined)
-      : parent.wait_for_disconnect.then(() => "disconnected" as const);
+      : parent.wait_for_disconnect.then(
+          () => "disconnected" as const,
+          () => "disconnected" as const,
+        );
   const observed = await Promise.race([
     resultPromise.then((result) => ({ kind: "result" as const, result })),
     timeoutPromise.then((result) => ({ kind: result })),
     disconnectPromise.then((result) => ({ kind: result })),
   ]);
+  if (timeoutHandle !== null) {
+    clearTimeout(timeoutHandle);
+    timeoutHandle = null;
+  }
 
   if (observed.kind === "timeout") {
     supervisor.terminate();
