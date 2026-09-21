@@ -5,7 +5,10 @@ import path from "node:path";
 import test from "node:test";
 
 import { compileFilesystemPolicyEnforcement } from "./filesystem-policy-enforcement.js";
-import { materializeFilesystemPolicy } from "./filesystem-policy-materialization.js";
+import {
+  materializeFilesystemPolicy,
+  validateMaterializedFilesystemPolicy,
+} from "./filesystem-policy-materialization.js";
 import { validateAuxiliaryStatePolicy } from "./auxiliary-state-policy.js";
 import {
   SANDBOX_CAPABILITY_BASELINE_ID,
@@ -13,10 +16,33 @@ import {
   sandboxCapabilityBaseline,
   sandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
+import { discoverSandboxRuntimeLayout, sandboxDoctorReport } from "./sandbox.js";
 import { compileSandboxInvocation } from "./sandbox-launcher.js";
 import { STRICT_RUNTIME_POLICY, validateSessionRuntimeProjection } from "./runtime-projection.js";
 
-const RUNTIME_HELPER = fs.realpathSync.native(process.execPath);
+type RuntimeEvidence = Readonly<{
+  readonly bubblewrap: string;
+  readonly landlock_helper: string;
+  readonly landlock_abi: number;
+}>;
+
+function runtimeEvidence(): RuntimeEvidence | null {
+  const layout = discoverSandboxRuntimeLayout();
+  const doctor = sandboxDoctorReport(undefined, layout);
+  const bubblewrap = layout.bubblewrap;
+  const landlockHelper = layout.landlock_helper;
+  const landlockAbi = doctor.landlock.abi;
+  if (bubblewrap === null || typeof landlockHelper !== "string" || landlockAbi === null) return null;
+  try {
+    return Object.freeze({
+      bubblewrap: fs.realpathSync.native(bubblewrap),
+      landlock_helper: fs.realpathSync.native(landlockHelper),
+      landlock_abi: landlockAbi,
+    });
+  } catch {
+    return null;
+  }
+}
 
 function fixture(): { readonly root: string; readonly cleanup: () => void } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-filesystem-enforcement-integration-"));
@@ -29,7 +55,7 @@ function fixture(): { readonly root: string; readonly cleanup: () => void } {
   return { root, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
-function projection(root: string) {
+function projection(root: string, runtime?: RuntimeEvidence) {
   const auxiliary = validateAuxiliaryStatePolicy(
     {
       contract_id: "nawabari.repository-auxiliary-state-projection.v1",
@@ -59,14 +85,17 @@ function projection(root: string) {
     policy: STRICT_RUNTIME_POLICY,
     profile: { id: "filesystem-enforcement-integration", version: "1" },
     requirements: [],
-    filesystem: [
-      {
-        source: RUNTIME_HELPER,
-        target: RUNTIME_HELPER,
-        access_mode: "read-only",
-        provenance: "runtime-profile",
-      },
-    ],
+    filesystem:
+      runtime === undefined
+        ? []
+        : [
+            {
+              source: runtime.landlock_helper,
+              target: runtime.landlock_helper,
+              access_mode: "read-only",
+              provenance: "runtime-profile" as const,
+            },
+          ],
     executables: [],
     working_set: {
       contract_id: "nawabari.working-set-runtime-projection.v1",
@@ -87,13 +116,18 @@ function projection(root: string) {
   return { projection: enriched.value, policy: policy.value };
 }
 
-test("protected launch consumes the real materialized policy and its enforcement plan", () => {
+test("protected launch consumes the real materialized policy and its enforcement plan", (t) => {
+  const runtime = runtimeEvidence();
+  if (runtime === null) {
+    t.skip("bubblewrap, Landlock, and the canonical runtime helper are unavailable");
+    return;
+  }
   const value = fixture();
   try {
-    const { projection: runtimeProjection, policy } = projection(value.root);
+    const { projection: runtimeProjection, policy } = projection(value.root, runtime);
     const plan = compileFilesystemPolicyEnforcement(policy, {
-      landlock_abi: 3,
-      landlock_helper: RUNTIME_HELPER,
+      landlock_abi: runtime.landlock_abi,
+      landlock_helper: runtime.landlock_helper,
     });
     assert.equal(plan.ok, true, plan.ok ? "" : plan.error.message);
     if (!plan.ok) return;
@@ -107,7 +141,7 @@ test("protected launch consumes the real materialized policy and its enforcement
       worktree: value.root,
       branch: "feature/filesystem-enforcement",
       network_mode: "inherited" as const,
-      sandbox_executable: RUNTIME_HELPER,
+      sandbox_executable: runtime.bubblewrap,
       identity: { real_uid: null, real_gid: null, namespace_uid: 0, namespace_gid: 0 },
       git_identity: { host_global_name: null, host_global_email: null },
       filesystem: {
@@ -125,8 +159,8 @@ test("protected launch consumes the real materialized policy and its enforcement
       required_capabilities: [],
       seccomp_profile: sandboxSeccompProfileMetadata(),
       capability_baseline: sandboxCapabilityBaseline,
-      landlock_executable: RUNTIME_HELPER,
-      landlock_abi: 3,
+      landlock_executable: runtime.landlock_helper,
+      landlock_abi: runtime.landlock_abi,
       landlock_required: true,
       runtime_projection: runtimeProjection,
       filesystem_policy: policy,
@@ -149,6 +183,29 @@ test("protected launch consumes the real materialized policy and its enforcement
     assert.equal(plan.value.runtime_projection_serialization_key, "runtime-projection");
     assert.equal(SANDBOX_CAPABILITY_BASELINE_ID, "nawabari.capabilities.v1");
     assert.equal(SANDBOX_CAPABILITY_BASELINE_VERSION, 1);
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("runtime policy boundaries reject null, identity-only, and forged materializations", () => {
+  const value = fixture();
+  try {
+    const { projection: runtimeProjection, policy } = projection(value.root);
+    const identityOnly = {
+      contract_id: policy.contract_id,
+      schema_version: policy.schema_version,
+      serialization_key: policy.serialization_key,
+    };
+    for (const candidate of [null, identityOnly, { ...policy, digest: "0".repeat(64) }]) {
+      const validated = validateMaterializedFilesystemPolicy(candidate);
+      assert.equal(validated.ok, false);
+      if (!validated.ok) assert.equal(validated.error.code, "RUNTIME_PROJECTION_INVALID");
+      assert.doesNotThrow(() => compileFilesystemPolicyEnforcement(candidate as never));
+      const projected = validateSessionRuntimeProjection({ ...runtimeProjection, filesystem_policy: candidate });
+      assert.equal(projected.ok, false);
+      if (!projected.ok) assert.equal(projected.error.code, "RUNTIME_PROJECTION_INVALID");
+    }
   } finally {
     value.cleanup();
   }

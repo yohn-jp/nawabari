@@ -134,6 +134,198 @@ export type MaterializedFilesystemPolicy = Readonly<{
   readonly digest: string;
 }>;
 
+const MATERIALIZED_POLICY_FIELDS = Object.freeze([
+  "contract_id",
+  "schema_version",
+  "serialization_key",
+  "worktree",
+  "working_set",
+  "resolution",
+  "rules",
+  "registry_operations",
+  "unsupported",
+  "digest",
+] as const);
+const DECIMAL_TEXT = /^(?:0|[1-9][0-9]*)$/u;
+const DIGEST_TEXT = /^[0-9a-f]{64}$/u;
+
+function runtimePolicyInvalid(field: string, reason: string): DomainResult<never> {
+  return failure(
+    new DomainError("RUNTIME_PROJECTION_INVALID", `Filesystem policy field '${field}' is invalid: ${reason}.`, {}),
+  );
+}
+
+function requiredRecord(value: unknown, field: string): DomainResult<Record<string, unknown>> {
+  if (!isRecord(value)) return runtimePolicyInvalid(field, "expected an object");
+  return success(value);
+}
+
+function requiredArray(value: unknown, field: string): DomainResult<readonly unknown[]> {
+  if (!Array.isArray(value)) return runtimePolicyInvalid(field, "expected an array");
+  return success(value);
+}
+
+function requiredText(value: unknown, field: string, allowEmpty = false): DomainResult<string> {
+  if (
+    typeof value !== "string" ||
+    (!allowEmpty && value.length === 0) ||
+    value.length > 4_096 ||
+    CONTROL_CHARACTER.test(value)
+  ) {
+    return runtimePolicyInvalid(field, "expected bounded text");
+  }
+  return success(value);
+}
+
+function canonicalAbsoluteText(value: unknown, field: string): DomainResult<string> {
+  const text = requiredText(value, field);
+  if (!text.ok) return text;
+  if (!path.isAbsolute(text.value) || path.normalize(text.value) !== text.value) {
+    return runtimePolicyInvalid(field, "expected a normalized absolute path");
+  }
+  return text;
+}
+
+function canonicalRelativeText(value: unknown, field: string): DomainResult<string> {
+  const text = requiredText(value, field, true);
+  if (!text.ok) return text;
+  if (
+    path.posix.isAbsolute(text.value) ||
+    text.value === "." ||
+    path.posix.normalize(text.value) !== text.value ||
+    text.value.split("/").some((part) => part.length === 0 || part === "." || part === "..")
+  ) {
+    return runtimePolicyInvalid(field, "expected a normalized worktree-relative path");
+  }
+  return text;
+}
+
+function withinPath(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function validatePathIdentity(value: unknown, field: string): DomainResult<FilesystemPolicyPathIdentity> {
+  const record = requiredRecord(value, field);
+  if (!record.ok) return record;
+  const device = requiredText(record.value.device, `${field}.device`);
+  if (!device.ok || !DECIMAL_TEXT.test(device.value))
+    return runtimePolicyInvalid(`${field}.device`, "expected decimal text");
+  const inode = requiredText(record.value.inode, `${field}.inode`);
+  if (!inode.ok || !DECIMAL_TEXT.test(inode.value))
+    return runtimePolicyInvalid(`${field}.inode`, "expected decimal text");
+  return success(Object.freeze({ device: device.value, inode: inode.value }));
+}
+
+function validateParentEvidence(
+  value: unknown,
+  field: string,
+  worktree: string,
+): DomainResult<FilesystemPolicyParentEvidence> {
+  const record = requiredRecord(value, field);
+  if (!record.ok) return record;
+  const parent = canonicalAbsoluteText(record.value.path, `${field}.path`);
+  if (!parent.ok) return parent;
+  if (!withinPath(worktree, parent.value)) return runtimePolicyInvalid(`${field}.path`, "escaped the policy worktree");
+  const identityValue = validatePathIdentity(record.value.identity, `${field}.identity`);
+  if (!identityValue.ok) return identityValue;
+  return success(Object.freeze({ path: parent.value, identity: identityValue.value }));
+}
+
+function validateResolutionEvidence(value: unknown, worktree: string): DomainResult<WorkingSetPathResolutionEvidence> {
+  const record = requiredRecord(value, "resolution");
+  if (!record.ok) return record;
+  const resolutionWorktree = canonicalAbsoluteText(record.value.worktree, "resolution.worktree");
+  if (!resolutionWorktree.ok) return resolutionWorktree;
+  if (resolutionWorktree.value !== worktree)
+    return runtimePolicyInvalid("resolution.worktree", "does not match worktree");
+  const selectors = requiredArray(record.value.selectors, "resolution.selectors");
+  if (!selectors.ok) return selectors;
+  const resolved = requiredArray(record.value.resolved, "resolution.resolved");
+  if (!resolved.ok) return resolved;
+  const missingExact = requiredArray(record.value.missingExact, "resolution.missingExact");
+  if (!missingExact.ok) return missingExact;
+  const unsupported = requiredArray(record.value.unsupported, "resolution.unsupported");
+  if (!unsupported.ok) return unsupported;
+  const unreadable = requiredArray(record.value.unreadable, "resolution.unreadable");
+  if (!unreadable.ok) return unreadable;
+  if (typeof record.value.truncated !== "boolean" || typeof record.value.complete !== "boolean") {
+    return runtimePolicyInvalid("resolution", "truncated and complete must be booleans");
+  }
+  for (const [index, selector] of selectors.value.entries()) {
+    const checked = canonicalRelativeText(selector, `resolution.selectors[${index}]`);
+    if (!checked.ok) return checked;
+  }
+  for (const [index, selector] of missingExact.value.entries()) {
+    const checked = canonicalRelativeText(selector, `resolution.missingExact[${index}]`);
+    if (!checked.ok) return checked;
+  }
+  for (const [index, value] of resolved.value.entries()) {
+    const entry = requiredRecord(value, `resolution.resolved[${index}]`);
+    if (!entry.ok) return entry;
+    const selector = canonicalRelativeText(entry.value.selector, `resolution.resolved[${index}].selector`);
+    if (!selector.ok) return selector;
+    const relativePath = canonicalRelativeText(entry.value.relativePath, `resolution.resolved[${index}].relativePath`);
+    if (!relativePath.ok) return relativePath;
+    const absolutePath = canonicalAbsoluteText(entry.value.absolutePath, `resolution.resolved[${index}].absolutePath`);
+    if (!absolutePath.ok) return absolutePath;
+    if (
+      !withinPath(worktree, absolutePath.value) ||
+      path.resolve(worktree, relativePath.value) !== absolutePath.value
+    ) {
+      return runtimePolicyInvalid(`resolution.resolved[${index}]`, "path escaped or disagreed with the worktree");
+    }
+    if (entry.value.kind !== "file" && entry.value.kind !== "directory") {
+      return runtimePolicyInvalid(`resolution.resolved[${index}].kind`, "expected file or directory");
+    }
+    const identityValue = validatePathIdentity(entry.value.identity, `resolution.resolved[${index}].identity`);
+    if (!identityValue.ok) return identityValue;
+    const parent = validateParentEvidence(entry.value.parent, `resolution.resolved[${index}].parent`, worktree);
+    if (!parent.ok) return parent;
+  }
+  for (const [kind, values] of [
+    ["unsupported", unsupported.value],
+    ["unreadable", unreadable.value],
+  ] as const) {
+    for (const [index, value] of values.entries()) {
+      const diagnosticValue = requiredRecord(value, `resolution.${kind}[${index}]`);
+      if (!diagnosticValue.ok) return diagnosticValue;
+      const selector = canonicalRelativeText(diagnosticValue.value.selector, `resolution.${kind}[${index}].selector`);
+      if (!selector.ok) return selector;
+      if (diagnosticValue.value.path !== undefined) {
+        const diagnosticPath = canonicalAbsoluteText(diagnosticValue.value.path, `resolution.${kind}[${index}].path`);
+        if (!diagnosticPath.ok) return diagnosticPath;
+        if (!withinPath(worktree, diagnosticPath.value))
+          return runtimePolicyInvalid(`resolution.${kind}[${index}].path`, "escaped the worktree");
+      }
+      const code = requiredText(diagnosticValue.value.code, `resolution.${kind}[${index}].code`);
+      if (!code.ok) return code;
+      const message = requiredText(diagnosticValue.value.message, `resolution.${kind}[${index}].message`);
+      if (!message.ok) return message;
+    }
+  }
+  return success(record.value as unknown as WorkingSetPathResolutionEvidence);
+}
+
+function materializedPolicyDigestPayload(
+  input: Pick<
+    MaterializedFilesystemPolicy,
+    "worktree" | "working_set" | "resolution" | "rules" | "registry_operations" | "unsupported"
+  >,
+): object {
+  return {
+    contract_id: FILESYSTEM_POLICY_MATERIALIZATION_CONTRACT_ID,
+    schema_version: FILESYSTEM_POLICY_MATERIALIZATION_SCHEMA_VERSION,
+    serialization_key: FILESYSTEM_POLICY_SERIALIZATION_KEY,
+    worktree: input.worktree,
+    working_set: input.working_set,
+    resolution: input.resolution,
+    rules: input.rules,
+    registry_operations: input.registry_operations,
+    unsupported: input.unsupported,
+  };
+}
+
 type SelectorScope = Readonly<{
   readonly readOnly: readonly string[];
   readonly write: readonly string[];
@@ -686,6 +878,128 @@ function makeDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+function validatePolicyRule(value: unknown, field: string): DomainResult<FilesystemPolicyRule> {
+  const record = requiredRecord(value, field);
+  if (!record.ok) return record;
+  const selector = canonicalRelativeText(record.value.selector, `${field}.selector`);
+  if (!selector.ok) return selector;
+  const relativePath = canonicalRelativeText(record.value.relativePath, `${field}.relativePath`);
+  if (!relativePath.ok) return relativePath;
+  if (record.value.operation !== "READONLY" && record.value.operation !== "WRITE") {
+    return runtimePolicyInvalid(`${field}.operation`, "expected READONLY or WRITE");
+  }
+  if (record.value.kind !== "native-path-rule" && record.value.kind !== "native-namespace") {
+    return runtimePolicyInvalid(`${field}.kind`, "expected a native path or namespace rule");
+  }
+  return success(record.value as unknown as FilesystemPolicyRule);
+}
+
+function validateRegistryOperation(
+  value: unknown,
+  field: string,
+  worktree: string,
+): DomainResult<FilesystemPolicyRegistryOperation> {
+  const record = requiredRecord(value, field);
+  if (!record.ok) return record;
+  const selector = canonicalRelativeText(record.value.selector, `${field}.selector`);
+  if (!selector.ok) return selector;
+  const relativePath = canonicalRelativeText(record.value.relativePath, `${field}.relativePath`);
+  if (!relativePath.ok) return relativePath;
+  if (
+    record.value.operation !== "CREATE" &&
+    record.value.operation !== "DELETE" &&
+    record.value.operation !== "RENAME" &&
+    record.value.operation !== "ATOMIC_REPLACEMENT"
+  ) {
+    return runtimePolicyInvalid(`${field}.operation`, "expected a registry operation");
+  }
+  let parent: FilesystemPolicyParentEvidence | undefined;
+  if (record.value.parent !== undefined) {
+    const checked = validateParentEvidence(record.value.parent, `${field}.parent`, worktree);
+    if (!checked.ok) return checked;
+    parent = checked.value;
+  }
+  return success({
+    ...(record.value as unknown as FilesystemPolicyRegistryOperation),
+    ...(parent === undefined ? {} : { parent }),
+  });
+}
+
+function validateUnsupportedCapability(
+  value: unknown,
+  field: string,
+): DomainResult<FilesystemPolicyUnsupportedCapability> {
+  const record = requiredRecord(value, field);
+  if (!record.ok) return record;
+  const selector = canonicalRelativeText(record.value.selector, `${field}.selector`);
+  if (!selector.ok) return selector;
+  const operation = requiredText(record.value.operation, `${field}.operation`);
+  if (!operation.ok) return operation;
+  const reason = requiredText(record.value.reason, `${field}.reason`);
+  if (!reason.ok) return reason;
+  return success(record.value as unknown as FilesystemPolicyUnsupportedCapability);
+}
+
+/** Validate a materialized policy at every runtime handoff boundary. */
+export function validateMaterializedFilesystemPolicy(input: unknown): DomainResult<MaterializedFilesystemPolicy> {
+  const record = requiredRecord(input, "filesystem_policy");
+  if (!record.ok) return record;
+  for (const field of MATERIALIZED_POLICY_FIELDS) {
+    if (!(field in record.value)) return runtimePolicyInvalid(field, "required field is missing");
+  }
+  for (const field of Object.keys(record.value)) {
+    if (!MATERIALIZED_POLICY_FIELDS.includes(field as (typeof MATERIALIZED_POLICY_FIELDS)[number])) {
+      return runtimePolicyInvalid(field, "unknown field is not part of the canonical policy");
+    }
+  }
+  if (record.value.contract_id !== FILESYSTEM_POLICY_MATERIALIZATION_CONTRACT_ID) {
+    return runtimePolicyInvalid("contract_id", "unsupported contract");
+  }
+  if (record.value.schema_version !== FILESYSTEM_POLICY_MATERIALIZATION_SCHEMA_VERSION) {
+    return runtimePolicyInvalid("schema_version", "unsupported schema version");
+  }
+  if (record.value.serialization_key !== FILESYSTEM_POLICY_SERIALIZATION_KEY) {
+    return runtimePolicyInvalid("serialization_key", "unsupported serialization key");
+  }
+  const worktree = canonicalAbsoluteText(record.value.worktree, "worktree");
+  if (!worktree.ok) return worktree;
+  const workingSet = validateWorkingSetRuntimeProjection(record.value.working_set);
+  if (!workingSet.ok) return failure(workingSet.error);
+  const resolution = validateResolutionEvidence(record.value.resolution, worktree.value);
+  if (!resolution.ok) return resolution;
+  const rules = requiredArray(record.value.rules, "rules");
+  if (!rules.ok) return rules;
+  const registryOperations = requiredArray(record.value.registry_operations, "registry_operations");
+  if (!registryOperations.ok) return registryOperations;
+  const unsupported = requiredArray(record.value.unsupported, "unsupported");
+  if (!unsupported.ok) return unsupported;
+  if (
+    rules.value.length > DEFAULT_MAX_PATHS ||
+    registryOperations.value.length > DEFAULT_MAX_PATHS ||
+    unsupported.value.length > DEFAULT_MAX_DIAGNOSTICS
+  ) {
+    return runtimePolicyInvalid("filesystem_policy", "contains too many entries");
+  }
+  for (const [index, rule] of rules.value.entries()) {
+    const checked = validatePolicyRule(rule, `rules[${index}]`);
+    if (!checked.ok) return checked;
+  }
+  for (const [index, operation] of registryOperations.value.entries()) {
+    const checked = validateRegistryOperation(operation, `registry_operations[${index}]`, worktree.value);
+    if (!checked.ok) return checked;
+  }
+  for (const [index, capability] of unsupported.value.entries()) {
+    const checked = validateUnsupportedCapability(capability, `unsupported[${index}]`);
+    if (!checked.ok) return checked;
+  }
+  const digest = requiredText(record.value.digest, "digest");
+  if (!digest.ok || !DIGEST_TEXT.test(digest.value)) return runtimePolicyInvalid("digest", "expected a SHA-256 digest");
+  const candidate = record.value as unknown as MaterializedFilesystemPolicy;
+  const expectedDigest = makeDigest(materializedPolicyDigestPayload(candidate));
+  if (digest.value !== expectedDigest) return runtimePolicyInvalid("digest", "does not match canonical policy content");
+  return success(candidate);
+}
+
 function buildPlan(
   worktree: string,
   workingSet: WorkingSetRuntimeProjection,
@@ -860,17 +1174,16 @@ export function materializeFilesystemPolicy(
     rules: plan.rules,
     registry_operations: plan.registryOperations,
     unsupported: plan.unsupported,
-    digest: makeDigest({
-      contract_id: FILESYSTEM_POLICY_MATERIALIZATION_CONTRACT_ID,
-      schema_version: FILESYSTEM_POLICY_MATERIALIZATION_SCHEMA_VERSION,
-      serialization_key: FILESYSTEM_POLICY_SERIALIZATION_KEY,
-      worktree: normalizedWorktree,
-      working_set: projection.value,
-      resolution,
-      rules: plan.rules,
-      registry_operations: plan.registryOperations,
-      unsupported: plan.unsupported,
-    }),
+    digest: makeDigest(
+      materializedPolicyDigestPayload({
+        worktree: normalizedWorktree,
+        working_set: projection.value,
+        resolution,
+        rules: plan.rules,
+        registry_operations: plan.registryOperations,
+        unsupported: plan.unsupported,
+      }),
+    ),
   });
   return success(policy);
 }
@@ -901,16 +1214,8 @@ export function selectFilesystemEnforcement(
 
 /** Serialize a materialized policy without consulting ambient filesystem state. */
 export function serializeFilesystemPolicy(input: MaterializedFilesystemPolicy): DomainResult<string> {
-  if (
-    input.contract_id !== FILESYSTEM_POLICY_MATERIALIZATION_CONTRACT_ID ||
-    input.schema_version !== FILESYSTEM_POLICY_MATERIALIZATION_SCHEMA_VERSION ||
-    input.serialization_key !== FILESYSTEM_POLICY_SERIALIZATION_KEY
-  ) {
-    return failure(
-      new DomainError("RUNTIME_PROJECTION_INVALID", "Filesystem policy contract identity is unsupported.", {}),
-    );
-  }
-  return success(JSON.stringify(input));
+  const validated = validateMaterializedFilesystemPolicy(input);
+  return validated.ok ? success(JSON.stringify(validated.value)) : failure(validated.error);
 }
 
 /** Compatibility aliases for callers that use the domain's compile wording. */

@@ -5,6 +5,7 @@ import {
   FILESYSTEM_POLICY_MATERIALIZATION_CONTRACT_ID,
   FILESYSTEM_POLICY_MATERIALIZATION_SCHEMA_VERSION,
   selectFilesystemEnforcement,
+  validateMaterializedFilesystemPolicy,
   type FilesystemPolicyRegistryOperation,
   type FilesystemPolicyRule,
   type MaterializedFilesystemPolicy,
@@ -342,19 +343,21 @@ export function compileFilesystemPolicyEnforcement(
   input: PolicyInput,
   options: FilesystemPolicyEnforcementOptions = {},
 ): DomainResult<FilesystemPolicyEnforcementPlan> {
-  const mounts = compileMountsInternal(input);
+  const validated = validateMaterializedFilesystemPolicy(input);
+  if (!validated.ok) return failure(validated.error);
+  const mounts = compileMountsInternal(validated.value);
   if (!mounts.ok) return mounts;
   const plan: FilesystemPolicyEnforcementPlan = Object.freeze({
     contract_id: FILESYSTEM_POLICY_ENFORCEMENT_CONTRACT_ID,
     schema_version: FILESYSTEM_POLICY_ENFORCEMENT_SCHEMA_VERSION,
     serialization_key: SANDBOX_FILESYSTEM_POLICY_SERIALIZATION_KEY,
     runtime_projection_serialization_key: RUNTIME_PROJECTION_FILESYSTEM_POLICY_SERIALIZATION_KEY,
-    worktree: input.worktree,
-    policy_digest: policyDigest(input),
+    worktree: validated.value.worktree,
+    policy_digest: policyDigest(validated.value),
     mounts: mounts.value,
     landlock_rules: deriveFilesystemPolicyLandlockRules(mounts.value),
     landlock_required_abi: requiredAbi(mounts.value),
-    registry_operations: Object.freeze([...selectFilesystemEnforcement(input).registryOperations]),
+    registry_operations: Object.freeze([...selectFilesystemEnforcement(validated.value).registryOperations]),
   });
   const runtime = validateFilesystemPolicyEnforcementRuntime(plan, options);
   if (!runtime.ok) return runtime;
@@ -363,12 +366,15 @@ export function compileFilesystemPolicyEnforcement(
 
 /** Compile deterministic bind declarations for the existing sandbox launcher. */
 export function compileFilesystemMounts(input: PolicyInput): DomainResult<readonly FilesystemPolicyMount[]> {
-  return compileMountsInternal(input);
+  const validated = validateMaterializedFilesystemPolicy(input);
+  return validated.ok ? compileMountsInternal(validated.value) : failure(validated.error);
 }
 
 /** Compile bubblewrap argv fragments without ever copying a host worktree. */
 export function compileFilesystemMountArguments(input: PolicyInput): DomainResult<readonly string[]> {
-  const mounts = compileMountsInternal(input);
+  const validated = validateMaterializedFilesystemPolicy(input);
+  if (!validated.ok) return failure(validated.error);
+  const mounts = compileMountsInternal(validated.value);
   if (!mounts.ok) return mounts;
   const args: string[] = [];
   const directories = new Set<string>();

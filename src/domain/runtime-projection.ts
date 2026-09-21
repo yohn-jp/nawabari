@@ -6,7 +6,10 @@ import {
   type WorkingSetRuntimeProjection,
 } from "./working-set-runtime-projection.js";
 import { validateAuxiliaryStateVisibility, type AuxiliaryStateVisibility } from "./auxiliary-state-policy.js";
-import { serializeFilesystemPolicy, type MaterializedFilesystemPolicy } from "./filesystem-policy-materialization.js";
+import {
+  validateMaterializedFilesystemPolicy,
+  type MaterializedFilesystemPolicy,
+} from "./filesystem-policy-materialization.js";
 
 /** Versioned identity for the Session Runtime Projection domain contract. */
 export const SESSION_RUNTIME_PROJECTION_CONTRACT_ID = "nawabari.session-runtime-projection.v1" as const;
@@ -392,10 +395,9 @@ export function validateSessionRuntimeProjection(input: unknown): DomainResult<S
 
   let filesystemPolicy: MaterializedFilesystemPolicy | undefined;
   if (input.filesystem_policy !== undefined) {
-    const candidate = input.filesystem_policy as MaterializedFilesystemPolicy;
-    const serialized = serializeFilesystemPolicy(candidate);
-    if (!serialized.ok) return failure(serialized.error);
-    filesystemPolicy = candidate;
+    const validated = validateMaterializedFilesystemPolicy(input.filesystem_policy);
+    if (!validated.ok) return failure(validated.error);
+    filesystemPolicy = validated.value;
   }
 
   const requirements: RuntimeRequirement[] = [];
