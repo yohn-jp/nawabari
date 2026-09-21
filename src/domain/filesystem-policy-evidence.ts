@@ -364,6 +364,270 @@ function evidenceHash(value: unknown): string {
     .digest("hex");
 }
 
+function exactKeys(value: Record<string, unknown>, expected: readonly string[], field: string): DomainResult<true> {
+  const allowed = new Set(expected);
+  const unexpected = Object.keys(value).find((key) => !allowed.has(key));
+  return unexpected === undefined ? success(true) : invalid(field, `contains unsupported field '${unexpected}'`);
+}
+
+function canonicalPathList(value: unknown, field: string): DomainResult<readonly string[]> {
+  const parsed = pathList(value, field, true);
+  if (!parsed.ok) return parsed;
+  return JSON.stringify(value) === JSON.stringify(parsed.value)
+    ? parsed
+    : invalid(field, "must be sorted and canonical");
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function enumValue<T extends string>(value: unknown, allowed: readonly T[], field: string): DomainResult<T> {
+  return typeof value === "string" && allowed.includes(value as T)
+    ? success(value as T)
+    : invalid(field, "unsupported value");
+}
+
+/** Validate the complete closed evidence envelope and recompute its digest. */
+export function validateFilesystemPolicyEvidence(input: unknown): DomainResult<FilesystemPolicyEvidence> {
+  if (!isRecord(input)) return invalid("evidence", "expected an object");
+  const topKeys = exactKeys(
+    input,
+    [
+      "contract_id",
+      "schema_version",
+      "source",
+      "guarantee",
+      "observation",
+      "checkpoint",
+      "policy",
+      "paths",
+      "entries",
+      "in_claim",
+      "out_of_claim",
+      "allowed",
+      "denied",
+      "unresolved",
+      "violations",
+      "complete",
+      "evidence_hash",
+    ],
+    "evidence",
+  );
+  if (!topKeys.ok) return topKeys;
+  if (input.contract_id !== FILESYSTEM_POLICY_EVIDENCE_CONTRACT_ID)
+    return invalid("evidence.contract_id", "unsupported contract");
+  if (input.schema_version !== FILESYSTEM_POLICY_EVIDENCE_SCHEMA_VERSION)
+    return invalid("evidence.schema_version", "unsupported schema version");
+  if (input.source !== "git-checkpoint") return invalid("evidence.source", "unsupported source");
+  if (input.guarantee !== "git-observable-only") return invalid("evidence.guarantee", "unsupported guarantee");
+  if (typeof input.complete !== "boolean") return invalid("evidence.complete", "expected a boolean");
+  if (typeof input.evidence_hash !== "string" || !/^[0-9a-f]{64}$/u.test(input.evidence_hash))
+    return invalid("evidence.evidence_hash", "expected a SHA-256 digest");
+
+  if (!isRecord(input.observation)) return invalid("evidence.observation", "expected an object");
+  const observationKeys = exactKeys(
+    input.observation,
+    ["point_in_time", "atomic", "complete", "incomplete_reasons"],
+    "evidence.observation",
+  );
+  if (!observationKeys.ok) return observationKeys;
+  if (input.observation.point_in_time !== true) return invalid("evidence.observation.point_in_time", "must be true");
+  if (input.observation.atomic !== false) return invalid("evidence.observation.atomic", "must be false");
+  if (typeof input.observation.complete !== "boolean")
+    return invalid("evidence.observation.complete", "expected a boolean");
+  const incompleteReasons = canonicalPathList(
+    input.observation.incomplete_reasons,
+    "evidence.observation.incomplete_reasons",
+  );
+  if (!incompleteReasons.ok) return incompleteReasons;
+
+  if (!isRecord(input.checkpoint)) return invalid("evidence.checkpoint", "expected an object");
+  const checkpointKeys = exactKeys(
+    input.checkpoint,
+    ["repository_id", "worktree_path", "branch_name", "head_id", "session_id"],
+    "evidence.checkpoint",
+  );
+  if (!checkpointKeys.ok) return checkpointKeys;
+  const repositoryId = boundedText(input.checkpoint.repository_id, "evidence.checkpoint.repository_id");
+  if (!repositoryId.ok) return repositoryId;
+  const worktreePath = boundedText(input.checkpoint.worktree_path, "evidence.checkpoint.worktree_path");
+  if (!worktreePath.ok) return worktreePath;
+  const branchName = boundedText(input.checkpoint.branch_name, "evidence.checkpoint.branch_name");
+  if (!branchName.ok) return branchName;
+  const headId = boundedText(input.checkpoint.head_id, "evidence.checkpoint.head_id", 128);
+  if (!headId.ok) return headId;
+  if (!HEX_REVISION.test(headId.value))
+    return invalid("evidence.checkpoint.head_id", "expected an immutable Git revision");
+  const sessionId = boundedText(input.checkpoint.session_id, "evidence.checkpoint.session_id");
+  if (!sessionId.ok) return sessionId;
+
+  if (!isRecord(input.policy)) return invalid("evidence.policy", "expected an object");
+  const policyKeys = exactKeys(input.policy, ["policy_id", "revision"], "evidence.policy");
+  if (!policyKeys.ok) return policyKeys;
+  const policyId = boundedText(input.policy.policy_id, "evidence.policy.policy_id", MAX_POLICY_ID);
+  if (!policyId.ok) return policyId;
+  const policyRevision = positiveRevision(input.policy.revision, "evidence.policy.revision");
+  if (!policyRevision.ok) return policyRevision;
+
+  if (!isRecord(input.paths)) return invalid("evidence.paths", "expected an object");
+  const pathsKeys = exactKeys(input.paths, ["changed", "staged", "unstaged", "untracked"], "evidence.paths");
+  if (!pathsKeys.ok) return pathsKeys;
+  const paths = {} as Record<keyof GitCheckpointPaths, readonly string[]>;
+  for (const key of ["changed", "staged", "unstaged", "untracked"] as const) {
+    const parsed = canonicalPathList(input.paths[key], `evidence.paths.${key}`);
+    if (!parsed.ok) return parsed;
+    paths[key] = parsed.value;
+  }
+  const changed = new Set(paths.changed);
+  for (const key of ["staged", "unstaged", "untracked"] as const) {
+    if (paths[key].some((pathValue) => !changed.has(pathValue)))
+      return invalid(`evidence.paths.${key}`, "contains a path absent from changed");
+  }
+
+  const inClaim = canonicalPathList(input.in_claim, "evidence.in_claim");
+  if (!inClaim.ok) return inClaim;
+  const outOfClaim = canonicalPathList(input.out_of_claim, "evidence.out_of_claim");
+  if (!outOfClaim.ok) return outOfClaim;
+  if (inClaim.value.some((pathValue) => !changed.has(pathValue)))
+    return invalid("evidence.in_claim", "contains a path absent from changed");
+  if (outOfClaim.value.some((pathValue) => !changed.has(pathValue)))
+    return invalid("evidence.out_of_claim", "contains a path absent from changed");
+  if (inClaim.value.some((pathValue) => outOfClaim.value.includes(pathValue)))
+    return invalid("evidence.claim", "a path cannot be both in and out of claim");
+
+  if (!Array.isArray(input.entries) || input.entries.length > MAX_PATHS)
+    return invalid("evidence.entries", "expected a bounded array");
+  const entries: FilesystemPolicyPathEvidence[] = [];
+  for (const [index, value] of input.entries.entries()) {
+    if (!isRecord(value)) return invalid(`evidence.entries[${index}]`, "expected an object");
+    const entryKeys = exactKeys(
+      value,
+      ["path", "status", "claim_status", "mutation", "reason"],
+      `evidence.entries[${index}]`,
+    );
+    if (!entryKeys.ok) return entryKeys;
+    const pathValue = concretePath(value.path, `evidence.entries[${index}].path`);
+    if (!pathValue.ok) return pathValue;
+    const status = enumValue(
+      value.status,
+      ["allowed", "denied", "unresolved"] as const,
+      `evidence.entries[${index}].status`,
+    );
+    if (!status.ok) return status;
+    const claimStatus = enumValue(
+      value.claim_status,
+      ["in_claim", "out_of_claim", "unresolved"] as const,
+      `evidence.entries[${index}].claim_status`,
+    );
+    if (!claimStatus.ok) return claimStatus;
+    const mutation = enumValue(
+      value.mutation,
+      ["create", "write_or_delete", "unknown"] as const,
+      `evidence.entries[${index}].mutation`,
+    );
+    if (!mutation.ok) return mutation;
+    const reason = enumValue(
+      value.reason,
+      [
+        "allowed-create",
+        "allowed-write-or-delete",
+        "denied-by-policy",
+        "create-not-authorized",
+        "mutation-not-authorized",
+        "observation-incomplete",
+      ] as const,
+      `evidence.entries[${index}].reason`,
+    );
+    if (!reason.ok) return reason;
+    entries.push(
+      Object.freeze({
+        path: pathValue.value,
+        status: status.value,
+        claim_status: claimStatus.value,
+        mutation: mutation.value,
+        reason: reason.value,
+      }),
+    );
+  }
+  if (
+    !sameValue(
+      entries.map((entry) => entry.path),
+      paths.changed,
+    )
+  )
+    return invalid("evidence.entries", "must contain exactly the changed paths in canonical order");
+
+  const allowed = canonicalPathList(input.allowed, "evidence.allowed");
+  if (!allowed.ok) return allowed;
+  const denied = canonicalPathList(input.denied, "evidence.denied");
+  if (!denied.ok) return denied;
+  const unresolved = canonicalPathList(input.unresolved, "evidence.unresolved");
+  if (!unresolved.ok) return unresolved;
+  const expectedAllowed = entries.filter((entry) => entry.status === "allowed").map((entry) => entry.path);
+  const expectedDenied = entries.filter((entry) => entry.status === "denied").map((entry) => entry.path);
+  const expectedUnresolved = entries.filter((entry) => entry.status === "unresolved").map((entry) => entry.path);
+  if (!sameValue(allowed.value, expectedAllowed)) return invalid("evidence.allowed", "does not match entries");
+  if (!sameValue(denied.value, expectedDenied)) return invalid("evidence.denied", "does not match entries");
+  if (!sameValue(unresolved.value, expectedUnresolved)) return invalid("evidence.unresolved", "does not match entries");
+
+  if (!Array.isArray(input.violations) || input.violations.length > MAX_PATHS)
+    return invalid("evidence.violations", "expected a bounded array");
+  const violations: FilesystemPolicyViolation[] = [];
+  for (const [index, value] of input.violations.entries()) {
+    if (!isRecord(value)) return invalid(`evidence.violations[${index}]`, "expected an object");
+    const violationKeys = exactKeys(value, ["path", "code", "reason", "claim_status"], `evidence.violations[${index}]`);
+    if (!violationKeys.ok) return violationKeys;
+    const pathValue = concretePath(value.path, `evidence.violations[${index}].path`);
+    if (!pathValue.ok) return pathValue;
+    if (value.code !== "OUT_OF_POLICY") return invalid(`evidence.violations[${index}].code`, "unsupported code");
+    const reason = enumValue(
+      value.reason,
+      ["denied-by-policy", "create-not-authorized", "mutation-not-authorized", "observation-incomplete"] as const,
+      `evidence.violations[${index}].reason`,
+    );
+    if (!reason.ok) return reason;
+    const claimStatus = enumValue(
+      value.claim_status,
+      ["in_claim", "out_of_claim", "unresolved"] as const,
+      `evidence.violations[${index}].claim_status`,
+    );
+    if (!claimStatus.ok) return claimStatus;
+    violations.push(
+      Object.freeze({
+        path: pathValue.value,
+        code: "OUT_OF_POLICY",
+        reason: reason.value,
+        claim_status: claimStatus.value,
+      }),
+    );
+  }
+  const expectedViolations = entries
+    .filter((entry): entry is FilesystemPolicyPathEvidence & { readonly status: "denied" } => entry.status === "denied")
+    .map((entry) =>
+      Object.freeze({
+        path: entry.path,
+        code: "OUT_OF_POLICY" as const,
+        reason: entry.reason as FilesystemPolicyViolation["reason"],
+        claim_status: entry.claim_status,
+      }),
+    );
+  if (!sameValue(violations, expectedViolations))
+    return invalid("evidence.violations", "does not match denied entries");
+
+  const expectedComplete =
+    input.observation.complete &&
+    expectedUnresolved.length === 0 &&
+    entries.every((entry) => entry.claim_status !== "unresolved");
+  if (input.complete !== expectedComplete)
+    return invalid("evidence.complete", "does not match observation and entries");
+  const { evidence_hash: _providedHash, ...withoutHash } = input;
+  const expectedHash = evidenceHash(withoutHash);
+  if (input.evidence_hash !== expectedHash)
+    return invalid("evidence.evidence_hash", "does not match the canonical artifact");
+  return success(input as unknown as FilesystemPolicyEvidence);
+}
+
 function policyPathEvidence(
   pathValue: string,
   checkpoint: FilesystemPolicyCheckpoint,
@@ -509,15 +773,10 @@ export const assessFilesystemPolicyEvidence = projectFilesystemPolicyEvidence;
 
 /** Serialize only an already projected, deterministic evidence artifact. */
 export function serializeFilesystemPolicyEvidence(input: unknown): DomainResult<string> {
-  if (!isRecord(input)) return invalid("evidence", "expected an object");
-  if (input.contract_id !== FILESYSTEM_POLICY_EVIDENCE_CONTRACT_ID)
-    return invalid("evidence.contract_id", "unsupported contract");
-  if (input.schema_version !== FILESYSTEM_POLICY_EVIDENCE_SCHEMA_VERSION)
-    return invalid("evidence.schema_version", "unsupported schema version");
-  if (typeof input.evidence_hash !== "string" || !/^[0-9a-f]{64}$/u.test(input.evidence_hash))
-    return invalid("evidence.evidence_hash", "expected a SHA-256 digest");
+  const evidence = validateFilesystemPolicyEvidence(input);
+  if (!evidence.ok) return evidence;
   try {
-    return success(JSON.stringify(input));
+    return success(JSON.stringify(evidence.value));
   } catch {
     return invalid("evidence", "could not serialize the bounded artifact");
   }
