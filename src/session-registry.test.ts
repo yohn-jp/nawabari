@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { SessionRegistryError } from "./errors.js";
 import { resolveRepositoryContext } from "./git.js";
 import { RepositoryLock } from "./registry/lock.js";
+import { canonicalClaimId } from "./resource-claims.js";
 import { SessionRegistry, toPersistedSessionRecord, type PersistedRegistry } from "./session-registry.js";
 import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
 
@@ -303,6 +304,39 @@ test("migrates a legacy registry without changing session ownership or claim mod
     assert.equal((migrated.claims?.[0] as { mode?: string } | undefined)?.mode, "write");
     assert.equal(registry.listClaims()[0]?.sessionId, session.sessionId);
     assert.equal(registry.listClaims()[0]?.mode, "write");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("persists and round-trips schema-3 sharing claims", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const clock = () => new Date("2026-01-02T03:04:05.006Z");
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, clock });
+    const session = registry.create();
+    const sharing = { kind: "isolated-worktree" as const, groupId: "shared-group" };
+    const first = registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "README.md", mode: "write", sharing }],
+    });
+    const claim = first.claims[0];
+    assert.ok(claim);
+    assert.deepEqual(claim.sharing, sharing);
+    assert.equal(claim.claimId, canonicalClaimId(session.sessionId, "README.md", "write", sharing));
+    assert.equal(first.claimSetGeneration, 1);
+
+    const persisted = readJson(registry.paths.registry) as PersistedRegistry;
+    assert.deepEqual(persisted.claims?.[0]?.sharing, { kind: "isolated-worktree", group_id: "shared-group" });
+
+    const roundTripped = new SessionRegistry({ cwd: fixture.repositoryPath, clock });
+    assert.deepEqual(roundTripped.listClaims()[0]?.sharing, sharing);
+    const repeated = roundTripped.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "README.md", mode: "write", sharing }],
+    });
+    assert.equal(repeated.idempotent, true);
+    assert.equal(repeated.claimSetGeneration, 1);
   } finally {
     fixture.cleanup();
   }

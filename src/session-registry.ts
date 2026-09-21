@@ -76,6 +76,7 @@ import {
   RESOURCE_CLAIM_SCHEMA_VERSION,
   sortResourceClaims,
   type ClaimOwnerContext,
+  type CanonicalResourceClaimInput,
   type ResourceClaim,
   type ResourceClaimRecoveryAction,
   type ResourceClaimInput,
@@ -4366,14 +4367,17 @@ export class SessionRegistry {
     inputs: readonly ResourceClaimInput[],
     owner: ClaimOwner,
     allowEmpty = false,
-  ): readonly { resource: string; mode: ResourceClaimMode }[] {
+  ): readonly CanonicalResourceClaimInput[] {
     if (!Array.isArray(inputs) || (!allowEmpty && inputs.length === 0)) {
       throw claimError("INVALID_CLAIM", "At least one resource claim is required");
     }
     const canonical = inputs
       .map((input) => canonicalizeClaimInput(input, owner))
       .sort((left, right) =>
-        compareCodePointStrings(`${left.resource}\u0000${left.mode}`, `${right.resource}\u0000${right.mode}`),
+        compareCodePointStrings(
+          `${left.resource}\u0000${left.mode}\u0000${left.sharing?.kind ?? ""}\u0000${left.sharing?.groupId ?? ""}`,
+          `${right.resource}\u0000${right.mode}\u0000${right.sharing?.kind ?? ""}\u0000${right.sharing?.groupId ?? ""}`,
+        ),
       );
     const timestamp = toTimestamp(this.clock());
     const claims = canonical.map((input) => createResourceClaim(input, owner, timestamp));
@@ -4384,7 +4388,7 @@ export class SessionRegistry {
   private addClaimsUnsafe(
     state: RegistryState,
     owner: ClaimOwner,
-    requested: readonly { resource: string; mode: ResourceClaimMode }[],
+    requested: readonly CanonicalResourceClaimInput[],
   ): ClaimMutationResult {
     const timestamp = toTimestamp(this.clock());
     const candidates = requested.map((input) => createResourceClaim(input, owner, timestamp));
@@ -8354,6 +8358,8 @@ function sameClaimSet(left: readonly ResourceClaim[], right: readonly ResourceCl
       a.worktreePath !== b.worktreePath ||
       a.resource !== b.resource ||
       a.mode !== b.mode ||
+      a.sharing?.kind !== b.sharing?.kind ||
+      a.sharing?.groupId !== b.sharing?.groupId ||
       a.createdAt !== b.createdAt ||
       a.updatedAt !== b.updatedAt
     ) {
