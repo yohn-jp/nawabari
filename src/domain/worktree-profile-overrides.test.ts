@@ -147,6 +147,26 @@ test("fails closed for non-terminal globstar ceilings in both profile and extern
   assert.equal(externalBroadening.ok, false);
 });
 
+test("rejects wildcard candidates broader than a wildcard ceiling in both authorities", () => {
+  const wildcardCeiling = pinnedFrom({
+    ...profile(),
+    filesystem: { ...profile().filesystem, readOnly: ["src/a?"] },
+  });
+  const profileBroadening = applyWorktreeProfileOverrides(
+    wildcardCeiling,
+    { restrictions: { filesystem: { readOnly: ["src/a*"] } } },
+    auth({ readOnly: ["src/a?"] }),
+  );
+  assert.equal(profileBroadening.ok, false);
+
+  const externalBroadening = applyWorktreeProfileOverrides(
+    pinned(),
+    { restrictions: { filesystem: { readOnly: ["src/a*"] } } },
+    auth({ readOnly: ["src/a?"] }),
+  );
+  assert.equal(externalBroadening.ok, false);
+});
+
 test("DENY and immutable selectors cannot be removed, and strict policy cannot be weakened", () => {
   const base = pinned();
   const strictBase = pinWorktreeProfile(

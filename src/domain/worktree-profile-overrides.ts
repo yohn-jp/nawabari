@@ -413,25 +413,84 @@ function globSegmentMatches(pattern: string, candidate: string): boolean {
   return expression.test(candidate);
 }
 
+function globClosure(pattern: string, states: readonly number[]): Set<number> {
+  const closure = new Set(states);
+  const pending = [...states];
+  while (pending.length > 0) {
+    const state = pending.pop();
+    if (state === undefined || pattern[state] !== "*" || closure.has(state + 1)) continue;
+    closure.add(state + 1);
+    pending.push(state + 1);
+  }
+  return closure;
+}
+
+function globTransition(pattern: string, states: ReadonlySet<number>, character: string): Set<number> {
+  const next: number[] = [];
+  for (const state of globClosure(pattern, [...states])) {
+    const token = pattern[state];
+    if (token === "*") next.push(state);
+    else if (token === "?" || token === character) next.push(state + 1);
+  }
+  return globClosure(pattern, next);
+}
+
+/** Prove that a wildcard candidate language is a subset of its ceiling. */
+function globSegmentSubset(candidate: string, ceiling: string): boolean {
+  if (candidate === ceiling) return true;
+  if (!candidate.includes("*") && !candidate.includes("?")) return globSegmentMatches(ceiling, candidate);
+  if (!ceiling.includes("*") && !ceiling.includes("?")) return false;
+
+  const alphabet = new Set<string>(
+    [...candidate, ...ceiling].filter((character) => character !== "*" && character !== "?"),
+  );
+  // All non-literal characters are equivalent for these bounded glob tokens.
+  alphabet.add("\u0000");
+  const startCandidate = globClosure(candidate, [0]);
+  const startCeiling = globClosure(ceiling, [0]);
+  const queue: Array<readonly [ReadonlySet<number>, ReadonlySet<number>]> = [[startCandidate, startCeiling]];
+  const visited = new Set<string>();
+  const key = (left: ReadonlySet<number>, right: ReadonlySet<number>): string =>
+    `${[...left].sort((a, b) => a - b).join(",")}|${[...right].sort((a, b) => a - b).join(",")}`;
+  visited.add(key(startCandidate, startCeiling));
+
+  for (let index = 0; index < queue.length; index += 1) {
+    const [candidateStates, ceilingStates] = queue[index];
+    if (candidateStates.has(candidate.length) && !ceilingStates.has(ceiling.length)) return false;
+    for (const character of alphabet) {
+      const nextCandidate = globTransition(candidate, candidateStates, character);
+      if (nextCandidate.size === 0) continue;
+      const nextCeiling = globTransition(ceiling, ceilingStates, character);
+      const nextKey = key(nextCandidate, nextCeiling);
+      if (visited.has(nextKey)) continue;
+      // An unexpectedly complex relation is not evidence of authorization.
+      if (visited.size >= 4_096) return false;
+      visited.add(nextKey);
+      queue.push([nextCandidate, nextCeiling]);
+    }
+  }
+  return true;
+}
+
 /** Conservative selector containment; uncertain glob relations fail closed. */
 function selectorWithin(candidate: string, ceiling: string): boolean {
   if (candidate === ceiling) return true;
   const candidateParts = candidate.split("/");
   const ceilingParts = ceiling.split("/");
+  const terminalGlobstar = ceilingParts.at(-1) === "**";
+  if (ceilingParts.slice(0, terminalGlobstar ? -1 : undefined).includes("**")) return false;
+  const fixedCeilingParts = terminalGlobstar ? ceilingParts.slice(0, -1) : ceilingParts;
+  if (!terminalGlobstar && candidateParts.length !== ceilingParts.length) return false;
+  if (terminalGlobstar && candidateParts.length < fixedCeilingParts.length) return false;
   let candidateIndex = 0;
-  for (let ceilingIndex = 0; ceilingIndex < ceilingParts.length; ceilingIndex += 1) {
-    const ceilingPart = ceilingParts[ceilingIndex];
-    // A non-terminal globstar can skip arbitrary path segments.  Proving
-    // containment there requires a full glob-language subset check; treating
-    // it as a prefix would allow a broad request such as `src/**` through a
-    // ceiling of `src/**/private`.  Fail closed for that ambiguous relation.
-    if (ceilingPart === "**") return ceilingIndex === ceilingParts.length - 1;
+  for (let ceilingIndex = 0; ceilingIndex < fixedCeilingParts.length; ceilingIndex += 1) {
+    const ceilingPart = fixedCeilingParts[ceilingIndex];
     const candidatePart = candidateParts[candidateIndex];
     if (candidatePart === undefined || candidatePart === "**") return false;
-    if (!globSegmentMatches(ceilingPart, candidatePart)) return false;
+    if (!globSegmentSubset(candidatePart, ceilingPart)) return false;
     candidateIndex += 1;
   }
-  return candidateIndex === candidateParts.length;
+  return terminalGlobstar || candidateIndex === candidateParts.length;
 }
 
 function withinAny(candidate: string, ceilings: readonly string[]): boolean {
