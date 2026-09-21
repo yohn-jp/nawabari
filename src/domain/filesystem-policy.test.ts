@@ -311,6 +311,41 @@ test("runtime status is closed and all producer aliases reject conflicts", () =>
   assert.equal(compileEffectiveFilesystemPolicy(policyInput({ runtime_epoch: 12, runtimeEpoch: 13 })).ok, false);
 });
 
+test("backend, generation, and rename aliases reject contradictory authorities", () => {
+  assert.equal(
+    compileEffectiveFilesystemPolicy(
+      policyInput({
+        backend_requirements: {
+          requirements: [{ operation: "CREATE", path: "src/new.ts" }],
+          items: [{ operation: "DELETE", path: "src/delete.ts" }],
+        },
+      }),
+    ).ok,
+    false,
+  );
+  assert.equal(
+    compileEffectiveFilesystemPolicy(
+      policyInput({
+        profile: {
+          status: "applied",
+          digest: PROFILE_DIGEST,
+          filesystem: { readOnly: ["src/**"], rename: ["src/**"], renames: ["src/other/**"] },
+        },
+      }),
+    ).ok,
+    false,
+  );
+  assert.equal(
+    compileEffectiveFilesystemPolicy(
+      policyInput({
+        claims: { status: "applied", generation: 7, claims: policyInput().claims },
+        claim_set_generation: 8,
+      }),
+    ).ok,
+    false,
+  );
+});
+
 test("auxiliary boundaries preserve status and require canonical declarations", () => {
   const declaration = {
     contract_id: AUXILIARY_STATE_PROJECTION_CONTRACT_ID,
@@ -333,6 +368,44 @@ test("auxiliary boundaries preserve status and require canonical declarations", 
   ]) {
     assert.equal(compileEffectiveFilesystemPolicy(policyInput({ auxiliary_state: [malformed] })).ok, false);
   }
+});
+
+test("auxiliary declarations are canonicalized before policy identity", () => {
+  const declaration = {
+    contract_id: AUXILIARY_STATE_PROJECTION_CONTRACT_ID,
+    schema_version: AUXILIARY_STATE_PROJECTION_SCHEMA_VERSION,
+    source: { kind: "repository-local", path: ".codegraph" },
+    target: { kind: "managed-worktree", path: ".codegraph" },
+    mode: "copy",
+    durability: "durable",
+  };
+  const second = {
+    ...declaration,
+    source: { kind: "repository-local", path: ".nawabari" },
+    target: { kind: "managed-worktree", path: ".nawabari" },
+  };
+  const forward = compile({ auxiliary_state: [declaration, second, declaration] });
+  const reversed = compile({ auxiliary_state: [second, declaration] });
+  assert.equal(forward.digest, reversed.digest);
+  assert.deepEqual(forward.auxiliary.scope.readOnly, reversed.auxiliary.scope.readOnly);
+});
+
+test("unknown decision domains fail closed even when authorities are legacy", () => {
+  const policy = compile({
+    profile: undefined,
+    working_set: undefined,
+    claims: undefined,
+    auxiliary_state: undefined,
+    backend_requirements: undefined,
+  });
+  const result = decideEffectivePathAccess({
+    policy,
+    operation: "READONLY",
+    path: "/nix/store/node",
+    domain: "unknown" as never,
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.status, "deny");
 });
 
 test("namespace selectors reject absolute dot segments and traversal aliases", () => {

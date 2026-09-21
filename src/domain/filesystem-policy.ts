@@ -293,7 +293,9 @@ function scopeFromValue(
   if (!isRecord(value)) return invalid(field, "expected a scope object");
   const result = {} as Record<ScopeKey, readonly FilesystemPolicySelector[]>;
   for (const key of SCOPE_KEYS) {
-    const raw = value[key] ?? (key === "rename" ? value.renames : undefined) ?? [];
+    const rawInput = readAliasedValue(value, `${field}.${key}`, key === "rename" ? ["rename", "renames"] : [key]);
+    if (!rawInput.ok) return rawInput;
+    const raw = rawInput.value ?? [];
     if (!Array.isArray(raw) || raw.length > MAX_SELECTORS)
       return invalid(`${field}.${key}`, "expected a bounded array");
     const parsed: FilesystemPolicySelector[] = [];
@@ -580,7 +582,18 @@ function auxiliaryBoundary(value: unknown): DomainResult<CompiledBoundary> {
       digest: null,
       revision: null,
       epoch: null,
-      scope: Object.freeze({ ...emptyScope(), readOnly: Object.freeze(readOnly) }),
+      scope: Object.freeze({
+        ...emptyScope(),
+        readOnly: Object.freeze(
+          readOnly
+            .sort((left, right) => compare(`${left.domain}:${left.path}`, `${right.domain}:${right.path}`))
+            .filter(
+              (entry, index, entries) =>
+                index === 0 ||
+                `${entry.domain}:${entry.path}` !== `${entries[index - 1]?.domain}:${entries[index - 1]?.path}`,
+            ),
+        ),
+      }),
     }),
   );
 }
@@ -588,7 +601,11 @@ function auxiliaryBoundary(value: unknown): DomainResult<CompiledBoundary> {
 function backendBoundary(value: unknown): DomainResult<CompiledBackendAuthority> {
   if (value === undefined || value === null)
     return success(Object.freeze({ status: "unapplied-legacy", requirements: Object.freeze([]) }));
-  const source = isRecord(value) ? (value.requirements ?? value.items) : value;
+  const sourceInput = isRecord(value)
+    ? readAliasedValue(value, "backend_requirements.requirements", ["requirements", "items"])
+    : success(value);
+  if (!sourceInput.ok) return sourceInput;
+  const source = sourceInput.value;
   const parsedStatus = boundaryStatus(
     isRecord(value) ? value.status : undefined,
     "backend_requirements.status",
@@ -873,7 +890,25 @@ function compileInputs(input: unknown): DomainResult<EffectiveFilesystemPolicy> 
     "claimSetGeneration",
   ]);
   if (!generationInput.ok) return generationInput;
-  const generation = claimGeneration(generationInput.value ?? claimRecord?.generation, "claim_set_generation");
+  const wrapperGenerationInput =
+    claimRecord === undefined
+      ? success(undefined)
+      : readAliasedValue(claimRecord, "claims.generation", [
+          "generation",
+          "claim_set_generation",
+          "claimSetGeneration",
+        ]);
+  if (!wrapperGenerationInput.ok) return wrapperGenerationInput;
+  const generationValues = [generationInput.value, wrapperGenerationInput.value].filter(
+    (value): value is unknown => value !== undefined,
+  );
+  if (
+    generationValues.length > 1 &&
+    generationValues.some((value) => stableJson(value) !== stableJson(generationValues[0]))
+  ) {
+    return invalid("claim_set_generation", "conflicting claim generation authorities");
+  }
+  const generation = claimGeneration(generationValues[0], "claim_set_generation");
   if (!generation.ok) return generation;
   const runtime = runtimeEpoch(input);
   if (!runtime.ok) return runtime;
@@ -996,15 +1031,24 @@ function authorityDecision(
 
 /** Decide one operation independently; WRITE never implies READONLY. */
 export function decideEffectivePathAccess(facts: EffectivePathAccessFacts): EffectivePathAccessDecision {
+  const selectedDomainValue = domain(facts.domain, "domain");
+  if (!selectedDomainValue.ok)
+    return decision(
+      facts,
+      "deny",
+      selectedDomainValue.error.message,
+      [{ authority: "input", status: "denied", reason: selectedDomainValue.error.message }],
+      "repository",
+    );
+  const selectedDomain = selectedDomainValue.value;
   if (!isEffectiveFilesystemOperation(facts.operation))
     return decision(
       facts,
       "deny",
       "unsupported filesystem operation",
       [{ authority: "input", status: "denied", reason: "unsupported filesystem operation" }],
-      facts.domain ?? "repository",
+      selectedDomain,
     );
-  const selectedDomain = facts.domain ?? "repository";
   if (facts.operation === "RENAME" && facts.destination === undefined)
     return decision(
       facts,
