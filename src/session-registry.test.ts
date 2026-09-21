@@ -364,6 +364,12 @@ test("admits coordinated claims only for distinct managed worktrees and reloads 
     assert.equal(admitted.claims[0]?.sharing?.groupId, "shared-group");
     assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath, clock }).listClaims().length, 2);
 
+    linkedRegistry.releaseClaims({
+      sessionId: second.sessionId,
+      all: true,
+      expectedClaimSetGeneration: admitted.claimSetGeneration,
+    });
+
     assertRegistryError(
       () =>
         registry.claimResources({
@@ -374,11 +380,11 @@ test("admits coordinated claims only for distinct managed worktrees and reloads 
     );
     assertRegistryError(
       () =>
-        linkedRegistry.claimResources({
-          sessionId: second.sessionId,
+        registry.claimResources({
+          sessionId: first.sessionId,
           claims: [{ resource: "README.md", mode: "exclusive-write" }],
         }),
-      "RESOURCE_CLAIM_CONFLICT",
+      "CONTRADICTORY_CLAIM",
     );
   } finally {
     fixture.cleanup();
