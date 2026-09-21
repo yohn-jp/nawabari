@@ -17,7 +17,10 @@ test("keeps revision and dirty worktree content as separate bounded origins", ()
   const fixture = createFixture();
   try {
     fs.writeFileSync(path.join(fixture.root, "tracked.txt"), "working\n");
-    const blob = readCoordinationBlobState(defaultGit, fixture.root, fixture.head, "tracked.txt");
+    const blob = readCoordinationBlobState(defaultGit, fixture.root, fixture.head, "tracked.txt", {
+      includeContent: true,
+      operatorAuthorized: true,
+    });
 
     assert.equal(blob.revisionBlob.state, "regular");
     assert.equal(blob.worktree.state, "regular");
@@ -76,6 +79,83 @@ test("redacts content and patch for paths outside the selected read authority", 
     assert.equal(evidence.blob.worktree.redacted, true);
     assert.equal(evidence.diff?.patch, null);
     assert.equal(JSON.stringify(token).includes("private"), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("does not expose either session's content without cross-session authority", () => {
+  const fixture = createFixture(true);
+  try {
+    fixture.registry.claim({
+      sessionId: fixture.first.sessionId,
+      claims: [{ resource: "tracked.txt", mode: "read" }],
+    });
+    fixture.registry.claim({
+      sessionId: fixture.second.sessionId,
+      claims: [{ resource: "tracked.txt", mode: "read" }],
+    });
+    const token = observeCoordinationInputs(
+      fixture.registry,
+      [fixture.first.sessionId, fixture.second.sessionId],
+      ["tracked.txt"],
+      { includeContent: true, includePatch: true },
+    );
+
+    for (const session of token.sessions) {
+      const evidence = session.paths[0];
+      assert.ok(evidence);
+      assert.equal(evidence.blob.revisionBlob.content, null);
+      assert.equal(evidence.blob.worktree.content, null);
+      assert.equal(evidence.diff?.patch, null);
+    }
+    assert.equal(JSON.stringify(token).includes("YmFzZQo="), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("fails closed instead of UTF-8 decoding exact blob bytes", () => {
+  const fixture = createFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.root, "tracked.txt"), Buffer.from([0xff, 0x00, 0xfe]));
+    runGit(fixture.root, ["add", "tracked.txt"]);
+    runGit(fixture.root, ["commit", "-m", "binary"]);
+    const revision = runGit(fixture.root, ["rev-parse", "HEAD"]).trim();
+    const withoutBuffer: GitCommandRunner = {
+      run: defaultGit.run,
+      runRaw: defaultGit.runRaw,
+    };
+    const blob = readCoordinationBlobState(withoutBuffer, fixture.root, revision, "tracked.txt", {
+      includeContent: true,
+      operatorAuthorized: true,
+    });
+
+    assert.equal(blob.revisionBlob.state, "unavailable");
+    assert.equal(blob.revisionBlob.content, null);
+    assert.equal(blob.complete, false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("marks the observation incomplete when bounded diff evidence is unavailable", () => {
+  const fixture = createFixture();
+  try {
+    const git: GitCommandRunner = {
+      ...defaultGit,
+      runRaw(args, cwd) {
+        if (args[0] === "diff") throw new Error("diff unavailable");
+        return (defaultGit.runRaw ?? defaultGit.run)(args, cwd);
+      },
+    };
+    const token = observeCoordinationInputs(fixture.registry, [fixture.first.sessionId], ["tracked.txt"], { git });
+    const evidence = sessionPath(token, fixture.first.sessionId, "tracked.txt");
+
+    assert.equal(evidence.diff, null);
+    assert.equal(evidence.complete, false);
+    assert.equal(token.complete, false);
+    assert.equal(token.paths[0]?.status, "unavailable");
   } finally {
     fixture.cleanup();
   }

@@ -81,8 +81,10 @@ export interface CoordinationBlobState {
 
 export interface CoordinationBlobReadOptions {
   readonly maxContentBytes?: number;
-  /** Direct callers may request content; observation redaction is separate. */
+  /** Content is withheld unless this explicit authority is supplied. */
   readonly includeContent?: boolean;
+  readonly operatorAuthorized?: boolean;
+  readonly allowedReadPaths?: readonly string[];
 }
 
 export interface CoordinationObservationLimits {
@@ -319,7 +321,10 @@ export function readCoordinationBlobState(
     equal,
     complete,
   });
-  return options.includeContent === false ? redactBlob(result) : result;
+  const contentAuthorized =
+    options.includeContent === true &&
+    (options.operatorAuthorized === true || (options.allowedReadPaths ?? []).includes(canonicalPath));
+  return contentAuthorized ? result : redactBlob(result);
 }
 
 function observeAttempt(
@@ -345,6 +350,7 @@ function observeAttempt(
       entry,
       selectedPaths,
       initialClaims,
+      records.length,
       initialRegistry.claimSetGeneration,
       git,
       bounds,
@@ -437,6 +443,7 @@ function buildSessionObservation(
   physical: PhysicalObservation,
   selectedPaths: readonly string[],
   claims: readonly ResourceClaim[],
+  selectedSessionCount: number,
   claimSetGeneration: number,
   git: GitCommandRunner,
   bounds: CoordinationObservationBounds,
@@ -450,9 +457,12 @@ function buildSessionObservation(
       : readTreePathStates(git, record.worktreePath, baseRevision, selectedPaths);
   const headTree = readTreePathStates(git, record.worktreePath, physical.headId, selectedPaths);
   const pathEvidence = selectedPaths.map((resource) => {
+    const authorized = contentAuthorized(record.sessionId, resource, claims, selectedSessionCount, limits);
     let blob = readCoordinationBlobState(git, record.worktreePath, physical.headId, resource, {
       maxContentBytes: bounds.maxContentBytes,
-      includeContent: true,
+      includeContent: limits.includeContent === true && authorized,
+      operatorAuthorized: authorized,
+      allowedReadPaths: limits.allowedReadPaths,
     });
     const base = baseTree.get(resource) ?? null;
     const head = headTree.get(resource) ?? null;
@@ -463,7 +473,6 @@ function buildSessionObservation(
     const missing = blob.worktree.state === "missing";
     const changedInWorktree = indexChanged || worktreeChanged || untracked || missing || !blob.equal;
     const changedFromBase = baseRevision === null ? null : !treeEntriesEqualSafe(base, head) || changedInWorktree;
-    const authorized = contentAuthorized(record.sessionId, resource, claims, limits);
     if (untracked && blob.worktree.state === "regular") {
       blob = Object.freeze({
         ...blob,
@@ -486,7 +495,7 @@ function buildSessionObservation(
       contentHash: redactedBlob.worktree.contentHash,
       mode: redactedBlob.worktree.mode,
       diff,
-      complete: redactedBlob.complete && (diff === null || diff.statsAvailable || !authorized),
+      complete: redactedBlob.complete && diff !== null && (diff.statsAvailable || !authorized),
     });
   });
   return Object.freeze({
@@ -729,11 +738,13 @@ function contentAuthorized(
   sessionId: string,
   resource: string,
   claims: readonly ResourceClaim[],
+  selectedSessionCount: number,
   limits: CoordinationObservationLimits,
 ): boolean {
   if (limits.operatorAuthorized === true) return true;
   const allowed = limits.allowedReadPaths ?? [];
   if (allowed.some((candidate) => candidate === resource)) return true;
+  if (selectedSessionCount > 1) return false;
   return claims.some((claim) => claim.sessionId === sessionId && resourceMatchesClaim(claim, resource));
 }
 
@@ -874,8 +885,10 @@ function resolveRepositoryForRecord(record: SessionRecord, git: GitCommandRunner
 
 function readGitBuffer(git: GitCommandRunner, args: readonly string[], cwd: string): Buffer {
   if (git.runBuffer !== undefined) return git.runBuffer(args, cwd);
-  const run = git.runRaw ?? git.run;
-  return Buffer.from(run(args, cwd), "utf8");
+  throw new SessionRegistryError("PHYSICAL_OBSERVATION_UNAVAILABLE", "Exact Git blob bytes are unavailable", {
+    cwd,
+    command: args[0] ?? "git",
+  });
 }
 
 function treeEntriesEqualSafe(left: GitTreeEntry | null, right: GitTreeEntry | null): boolean {
