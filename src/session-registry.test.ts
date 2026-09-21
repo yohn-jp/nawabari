@@ -320,7 +320,7 @@ test("close increments registry revision for both lifecycle writes", () => {
     const after = readJson(registry.paths.registry) as PersistedRegistry;
 
     assert.equal(result.session.state, "closed");
-    assert.equal(after.registry_revision, before.registry_revision + 2);
+    assert.equal(registryRevision(after), registryRevision(before) + 2);
     assert.equal(registry.get(session.sessionId)?.state, "closed");
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
@@ -340,7 +340,7 @@ test("discard increments registry revision for both lifecycle writes", () => {
     const after = readJson(registry.paths.registry) as PersistedRegistry;
 
     assert.equal(result.session.state, "closed");
-    assert.equal(after.registry_revision, before.registry_revision + 2);
+    assert.equal(registryRevision(after), registryRevision(before) + 2);
     assert.equal(registry.get(session.sessionId)?.state, "closed");
   } finally {
     removeWorktree(fixture.repositoryPath, worktreePath);
@@ -372,7 +372,7 @@ test("gc assigns distinct monotonic revisions across multiple prunable candidate
       new Set([first.sessionId, second.sessionId]),
     );
     assert.deepEqual(result.blocked, []);
-    assert.equal(after.registry_revision, before.registry_revision + 6);
+    assert.equal(registryRevision(after), registryRevision(before) + 6);
     assert.equal(registry.get(first.sessionId)?.state, "closed");
     assert.equal(registry.get(second.sessionId)?.state, "closed");
   } finally {
@@ -665,6 +665,11 @@ function readJson(filePath: string): unknown {
 function writeRegistry(registry: SessionRegistry, value: PersistedRegistry): void {
   fs.mkdirSync(registry.paths.directory, { recursive: true });
   fs.writeFileSync(registry.paths.registry, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function registryRevision(value: PersistedRegistry): number {
+  if (!("registry_revision" in value)) throw new Error("Expected a registry v2 document");
+  return value.registry_revision;
 }
 
 function removeWorktree(repositoryPath: string, worktreePath: string): void {
