@@ -46,4 +46,3 @@ export function resolveProfileShell(
     environment: Object.freeze({ HOME: "/nawabari/home", PATH: "/nawabari/bin" as const }),
   }));
 }
-
