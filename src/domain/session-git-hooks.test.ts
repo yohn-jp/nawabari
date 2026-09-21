@@ -223,6 +223,8 @@ test("authority-changing environment classes are denied case-insensitively, incl
       "node_options",
       "BASH_ENV",
       "env",
+      "SHELL",
+      "shell",
       "GIT_DIR",
       "gIt_DiR",
       "GIT_CONFIG_COUNT",
