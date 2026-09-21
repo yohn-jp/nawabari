@@ -56,7 +56,7 @@ function ews() {
 }
 
 test("compiles finite standalone profile requests without fabricating an EWS artifact", () => {
-  const result = resolveProfileRuntimeScope(profile, {}, pathEvidence());
+  const result = resolveProfileRuntimeScope(profile, { repositoryId: "repo" }, pathEvidence());
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.equal(result.value.status, "ready");
@@ -67,7 +67,7 @@ test("compiles finite standalone profile requests without fabricating an EWS art
 });
 
 test("narrows an external EWS while preserving its identity and revision", () => {
-  const result = resolveProfileRuntimeScope(profile, { workingSet: ews() }, pathEvidence());
+  const result = resolveProfileRuntimeScope(profile, { repositoryId: "repo", workingSet: ews() }, pathEvidence());
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.equal(result.value.status, "ready");
@@ -78,7 +78,7 @@ test("narrows an external EWS while preserving its identity and revision", () =>
 });
 
 test("does not convert an absent external artifact into a ready result", () => {
-  const result = resolveProfileRuntimeScope(profile, { externalArtifact: true }, pathEvidence());
+  const result = resolveProfileRuntimeScope(profile, { repositoryId: "repo", externalArtifact: true }, pathEvidence());
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.equal(result.value.status, "unsupported");
@@ -88,7 +88,7 @@ test("does not convert an absent external artifact into a ready result", () => {
 test("fails closed for broad grants, unsupported operations, and denied intersections", () => {
   const broad = resolveProfileRuntimeScope(
     { ...profile, filesystem: { ...profile.filesystem, readOnly: ["src/**"] } },
-    {},
+    { repositoryId: "repo" },
     { paths: ["src/index.ts"], requests: [{ path: "src/index.ts", operation: "READONLY" }] },
   );
   assert.equal(broad.ok, true);
@@ -97,7 +97,7 @@ test("fails closed for broad grants, unsupported operations, and denied intersec
 
   const unsupportedOperation = resolveProfileRuntimeScope(
     { ...profile, filesystem: { ...profile.filesystem, create: ["src/new.ts"] } },
-    {},
+    { repositoryId: "repo" },
     { paths: ["src/new.ts"], requests: [{ path: "src/new.ts", operation: "CREATE" }] },
   );
   assert.equal(unsupportedOperation.ok, true);
@@ -106,7 +106,7 @@ test("fails closed for broad grants, unsupported operations, and denied intersec
 
   const denied = resolveProfileRuntimeScope(
     { ...profile, filesystem: { ...profile.filesystem, deny: ["src/index.ts"] } },
-    {},
+    { repositoryId: "repo" },
     pathEvidence(),
   );
   assert.equal(denied.ok, true);
@@ -115,7 +115,7 @@ test("fails closed for broad grants, unsupported operations, and denied intersec
 });
 
 test("serializes the scope under the filesystem-policy key", () => {
-  const result = resolveProfileRuntimeScope(profile, {}, pathEvidence());
+  const result = resolveProfileRuntimeScope(profile, { repositoryId: "repo" }, pathEvidence());
   assert.equal(result.ok, true);
   if (!result.ok) return;
   const serialized = serializeProfileRuntimeScope(result.value);

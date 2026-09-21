@@ -312,10 +312,28 @@ export function resolveProfileRuntimeScope(
       ),
     );
   }
+  const repositoryId = session.repositoryId ?? workingSet?.repository.repositoryId;
+  if (repositoryId === undefined) {
+    return success(unsupported(profile, boundary, [], "session owner identity is not proven", "session.repositoryId"));
+  }
+  if (
+    workingSet !== undefined &&
+    session.repositoryId !== undefined &&
+    session.repositoryId !== workingSet.repository.repositoryId
+  ) {
+    return success(
+      unsupported(
+        profile,
+        boundary,
+        [],
+        "session owner identity does not match the Effective Working Set",
+        "session.repositoryId",
+      ),
+    );
+  }
   const claimsResult = validateClaims(session.claims);
   if (!claimsResult.ok) return claimsResult;
   const claims = claimsResult.value;
-  const repositoryId = session.repositoryId ?? workingSet?.repository.repositoryId;
   const defaults: ProfileRuntimeScopePathRequest[] = [
     ...readOnly.map((path) => ({ path, operation: "READONLY" as const })),
     ...write.map((path) => ({ path, operation: "WRITE" as const })),
@@ -327,6 +345,20 @@ export function resolveProfileRuntimeScope(
     return success(
       unsupported(profile, boundary, [], "profile scope requires finite explicit path evidence", "pathEvidence"),
     );
+  for (const required of defaults) {
+    if (!requests.some((request) => request.path === required.path && request.operation === required.operation)) {
+      return success(
+        unsupported(
+          profile,
+          boundary,
+          [],
+          "path evidence omitted a required profile baseline operation",
+          required.path,
+          required.operation,
+        ),
+      );
+    }
+  }
 
   const decisions: FilesystemPolicyDecision[] = [];
   for (const request of requests) {
