@@ -1,6 +1,9 @@
 import type { ErrorCode } from "./domain/errors.js";
 import { RESOURCE_CLAIM_FAILURE_CODES } from "./domain/errors.js";
 
+/** Resource operations also surface the bounded registry feature gate. */
+const RESOURCE_CLAIM_FAILURE_VOCABULARY = Object.freeze([...RESOURCE_CLAIM_FAILURE_CODES]);
+
 /**
  * Stable failures reachable through each public capability.
  *
@@ -138,7 +141,7 @@ export const IMPLEMENTATION_FAILURE_CODE_VOCABULARY = Object.freeze({
     "REGISTRY_DURABILITY_UNCERTAIN",
     "LOCK_CONTENTION",
   ]),
-  "resource-claims": RESOURCE_CLAIM_FAILURE_CODES,
+  "resource-claims": RESOURCE_CLAIM_FAILURE_VOCABULARY,
   "authorization-and-evidence": Object.freeze([
     "INVALID_OPERATION",
     "INVALID_SESSION_ID",
