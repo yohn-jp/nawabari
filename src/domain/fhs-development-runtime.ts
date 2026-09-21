@@ -37,7 +37,10 @@ export const FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS = Object.freeze([
 ] as const);
 
 /** Optional development tooling supported by explicit profile composition. */
-export const FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS = Object.freeze(["pnpm-package", "bash-runtime"] as const);
+export const FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS = Object.freeze([
+  "pnpm-package",
+  "bash-runtime",
+] as const);
 
 /**
  * The Landlock runtime adapter (a bounded Python/ctypes shim, see sandbox.ts)
