@@ -93,7 +93,9 @@ export type SupervisorStartRequest = {
 };
 
 export type SupervisorChildResult =
-  { readonly status: "completed"; readonly result?: unknown } | { readonly status: "failed"; readonly error?: string };
+  | { readonly status: "completed"; readonly result?: unknown }
+  | { readonly status: "failed"; readonly error?: string }
+  | { readonly status: "unknown" };
 
 export type TrustedSupervisorProcess = {
   readonly pid: number;
@@ -594,7 +596,9 @@ export async function runSessionLaunchSupervisor(
     return success(unresolved(reservation, "go-send-failed", supervisor.pid, scope?.name ?? null));
   }
 
-  const resultPromise = supervisor.wait();
+  const resultPromise = Promise.resolve()
+    .then(() => supervisor.wait())
+    .catch((): SupervisorChildResult => ({ status: "unknown" }));
   const timeoutPromise = new Promise<"timeout">((resolve) => {
     setTimeout(() => resolve("timeout"), timeoutMs);
   });
@@ -636,6 +640,9 @@ export async function runSessionLaunchSupervisor(
       retryable: false,
       ...(observed.result.result === undefined ? {} : { result: observed.result.result }),
     });
+  }
+  if (observed.result.status === "unknown") {
+    return success(unresolved(reservation, "result-unknown", supervisor.pid, scope?.name ?? null));
   }
   return success({
     ...outcomeBase(reservation, supervisor.pid, scope?.name ?? null),
