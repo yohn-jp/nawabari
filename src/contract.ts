@@ -45,6 +45,32 @@ import {
   AUXILIARY_STATE_SOURCE_KINDS,
   AUXILIARY_STATE_TARGET_KINDS,
 } from "./domain/auxiliary-state-projection.js";
+import { RESOURCE_COORDINATION_SCHEMA_VERSION, RESOURCE_INTENT_SCHEMA_VERSION } from "./resource-coordination.js";
+import { COORDINATION_PREVIEW_SCHEMA_VERSION } from "./coordination-preview.js";
+import { COORDINATION_TRANSACTION_SCHEMA_VERSION } from "./coordination-transactions.js";
+import {
+  RESOURCE_HANDOFF_CONTRACT_ID,
+  RESOURCE_HANDOFF_OPERATION,
+  RESOURCE_HANDOFF_SCHEMA_VERSION,
+} from "./resource-handoff.js";
+import {
+  RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
+  RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_VERSION,
+  RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
+} from "./resource-coordination-snapshot.js";
+
+export {
+  RESOURCE_COORDINATION_SCHEMA_VERSION,
+  RESOURCE_INTENT_SCHEMA_VERSION,
+  COORDINATION_PREVIEW_SCHEMA_VERSION,
+  COORDINATION_TRANSACTION_SCHEMA_VERSION,
+  RESOURCE_HANDOFF_CONTRACT_ID,
+  RESOURCE_HANDOFF_OPERATION,
+  RESOURCE_HANDOFF_SCHEMA_VERSION,
+  RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
+  RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_VERSION,
+  RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
+};
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -579,6 +605,27 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       source: "implementation-owned resource-claim lifecycle vocabulary",
       missing_or_extra: "deterministic conformance failure",
       internal_exceptions: [],
+    },
+    coordination: {
+      commands: ["session coordination preview", "session handoff"],
+      producer_contracts: {
+        resource_coordination: {
+          schema_version: RESOURCE_COORDINATION_SCHEMA_VERSION,
+          intent_schema_version: RESOURCE_INTENT_SCHEMA_VERSION,
+        },
+        coordination_preview: { schema_version: COORDINATION_PREVIEW_SCHEMA_VERSION },
+        coordination_transaction: { schema_version: COORDINATION_TRANSACTION_SCHEMA_VERSION },
+        resource_handoff: {
+          contract_id: RESOURCE_HANDOFF_CONTRACT_ID,
+          operation: RESOURCE_HANDOFF_OPERATION,
+          schema_version: RESOURCE_HANDOFF_SCHEMA_VERSION,
+        },
+        coordination_snapshot: {
+          contract_id: RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
+          contract_version: RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_VERSION,
+          schema_version: RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
+        },
+      },
     },
     transition_matrix: {
       id: RESOURCE_CLAIM_TRANSITION_MATRIX_ID,
