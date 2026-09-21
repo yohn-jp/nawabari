@@ -696,6 +696,7 @@ test("command-specific help is projected from one spec and marks session create 
     "--auxiliary-state",
     "--execution-scope-file",
     "--candidate-working-set-file",
+    "--enforce-claims",
   ]);
   assert.deepEqual(response.defaults, {
     "--branch": "nawabari/session/<session_id>",
@@ -1092,6 +1093,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--auxiliary-state",
       "--execution-scope-file",
       "--candidate-working-set-file",
+      "--enforce-claims",
       "--session",
       "--integrated-revision",
       "--schema-version",
@@ -2061,6 +2063,39 @@ test("session create forwards --worktree-root to the backend as the caller-selec
     base: null,
     label: null,
   });
+});
+
+test("session create omits claim_enforcement by default and forwards it only with --enforce-claims", async () => {
+  let observedOptions: SessionCreateOptions | null = null;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, options: SessionCreateOptions) => {
+      observedOptions = options;
+      return success(sampleSession);
+    },
+  });
+
+  const defaultExitCode = await runCli(["--json", "session", "create"], { backend, io: capture().io });
+  assert.equal(defaultExitCode, 0);
+  assert.equal((observedOptions as unknown as SessionCreateOptions).claim_enforcement, undefined);
+
+  const enforcedExitCode = await runCli(["--json", "session", "create", "--enforce-claims"], {
+    backend,
+    io: capture().io,
+  });
+  assert.equal(enforcedExitCode, 0);
+  assert.equal((observedOptions as unknown as SessionCreateOptions).claim_enforcement, true);
+});
+
+test("session create rejects a repeated --enforce-claims flag", async () => {
+  const output = capture();
+  const exitCode = await runCli(["--json", "session", "create", "--enforce-claims", "--enforce-claims"], {
+    backend: backendForTests({}),
+    io: output.io,
+  });
+  assert.equal(exitCode, 2);
+  const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string };
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "INVALID_ARGUMENT");
 });
 
 test("session create forwards repeated initial claims in one atomic backend request", async () => {

@@ -98,7 +98,7 @@ const REGISTRY_DATA = [
       `${CLI_NAME} session create [--branch <name>] [--worktree <path>|--worktree-root <path>] ` +
       `[--base <ref>] [--label <text>] ` +
       `[--execution-scope-file <path> --candidate-working-set-file <path>] ` +
-      `[--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
+      `[--resource <path-or-glob> --mode <read|write|exclusive-write> ...] [--enforce-claims]`,
     options: [
       option("--branch", "Branch to create; omitted uses the generated session branch", {
         value: "<name>",
@@ -141,11 +141,16 @@ const REGISTRY_DATA = [
         "Bounded JSON candidate-working-set artifact file for governed bootstrap",
         { value: "<path>" },
       ),
+      option(
+        "--enforce-claims",
+        "Opt this session into resource-claim enforcement; without it, operation authorization does not require resource claims for session-owned operations",
+      ),
     ],
     notes: [
       "All create options are optional. Use status --json to discover managed_worktree_root.",
       "--worktree and --worktree-root cannot be combined.",
       "Initial claims are provisioned atomically with the session; each --resource must be immediately followed by its own --mode, and zero pairs remains backward compatible.",
+      "Resource-claim enforcement is disabled by default; pass --enforce-claims to require claims for commit/push authorization on this session. Worktree and branch ownership, and claim conflicts against other sessions, remain enforced regardless.",
       "Providing one bounded working-set artifact requires the other; both are validated before worktree ownership is established.",
       "A claim conflict returns blocking-owner evidence. A durability-uncertain result is retry-safe only after re-reading the reported registry state; an existing owner is never silently adopted.",
       "Without an override, Nawabari creates the safe managed root <repository-parent>/.nawabari/worktrees on first use. Existing absolute worktree paths directly under the repository parent remain accepted for compatibility.",
