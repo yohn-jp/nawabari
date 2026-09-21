@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -45,6 +46,26 @@ import {
 import { generateSessionId, isSessionId } from "./session-id.js";
 import { isPostRenameFailure, writeJsonAtomicallySync } from "./registry/atomic.js";
 import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
+import {
+  parseFileOperationRegistry,
+  reconcileFileOperationReceipt,
+  recordFileOperationApplyAttempt,
+  reserveFileOperation,
+  serializeFileOperationRegistry,
+  FILE_OPERATION_REQUIRED_FEATURE,
+  type FileOperationObservation,
+  type FileOperationRecord,
+  type FileOperationRequest,
+  type FileOperationRegistryState,
+} from "./registry/file-operation-record.js";
+import {
+  mutateWorktreeFile,
+  prepareWorktreeFileOperation,
+  type WorktreeFileOperation,
+  type WorktreeFileOperationExecutionOptions,
+  type WorktreeFileOperationResult,
+} from "./domain/worktree-file-operation.js";
+import { isFilesystemPolicyTokenCurrent, type FilesystemPolicyToken } from "./domain/filesystem-policy-revision.js";
 import {
   assertCanonicalClaimResource,
   canonicalClaimId,
@@ -171,6 +192,9 @@ export {
 
 export const REGISTRY_SCHEMA_VERSION = 1 as const;
 export { RESOURCE_CLAIM_SCHEMA_VERSION };
+export { FILE_OPERATION_REQUIRED_FEATURE, FILE_OPERATION_SCHEMA_VERSION } from "./registry/file-operation-record.js";
+export const REGISTRY_FEATURES = Object.freeze([FILE_OPERATION_REQUIRED_FEATURE] as const);
+export const SUPPORTED_REGISTRY_FEATURES = REGISTRY_FEATURES;
 export const REGISTRY_DIRECTORY_NAME = "nawabari";
 export const REGISTRY_FILE_NAME = "session-registry.json";
 export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
@@ -750,6 +774,26 @@ export interface RegistryMigrationResult {
   readonly claimSchemaVersion: typeof RESOURCE_CLAIM_SCHEMA_VERSION;
 }
 
+export interface FileOperationExecutionOptions {
+  readonly sessionId?: string | null;
+  readonly operation: WorktreeFileOperation;
+  /** The exact fence observed by the caller before physical execution. */
+  readonly policyToken?: FilesystemPolicyToken | null;
+  /** Optional freshly observed fence; a mismatch rejects before I/O. */
+  readonly expectedPolicyToken?: FilesystemPolicyToken | null;
+  readonly execution?: WorktreeFileOperationExecutionOptions;
+}
+
+export interface FileOperationExecutionResult {
+  readonly operation: WorktreeFileOperationResult;
+  readonly receipt: FileOperationRecord;
+}
+
+export interface FileOperationReceiptResult {
+  readonly record: FileOperationRecord;
+  readonly idempotent: boolean;
+}
+
 export interface GuardOptions {
   readonly sessionId?: string | null;
 }
@@ -956,6 +1000,9 @@ export interface PersistedRegistry {
   readonly claims?: readonly PersistedResourceClaim[];
   /** Monotonic authoritative claim-set generation; absent in pre-generation registries. */
   readonly claim_set_generation?: number;
+  /** Durable bounded receipts for exact file operations. */
+  readonly required_features?: readonly string[];
+  readonly file_operations?: readonly import("./registry/file-operation-record.js").PersistedFileOperationRecord[];
 }
 
 interface RegistryState {
@@ -964,6 +1011,7 @@ interface RegistryState {
   readonly claimSetGeneration: number;
   readonly legacyClaimsAbsent: boolean;
   readonly legacyClaimsSchemaVersion?: typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
+  readonly fileOperations: readonly FileOperationRecord[];
 }
 
 interface ClaimOwner extends ClaimOwnerContext {
@@ -1256,7 +1304,7 @@ export class SessionRegistry {
         record.sessionId === requestedSessionId ? nextRecord : record,
       );
       validateRecords(nextRecords, this.repository.repositoryId);
-      this.writeUnsafe(nextRecords, state.claims, state.claimSetGeneration);
+      this.writeUnsafe(nextRecords, state.claims, state.claimSetGeneration, state.fileOperations);
       return {
         schemaVersion: 1,
         operation: "working-set-expand",
@@ -1285,6 +1333,168 @@ export class SessionRegistry {
     return this.listClaims(sessionId);
   }
 
+  /** Read the bounded durable file-operation receipts for this repository. */
+  fileOperations(sessionId?: string | null): readonly FileOperationRecord[] {
+    const records = this.readStateUnsafe().fileOperations;
+    return records
+      .filter((record) => sessionId === undefined || sessionId === null || record.sessionId === sessionId)
+      .map((record) => Object.freeze({ ...record }));
+  }
+
+  /** Reserve a receipt in the existing registry before any physical I/O. */
+  reserveFileOperation(request: FileOperationRequest): FileOperationReceiptResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const existing = state.fileOperations.find((record) => record.operationId === request.operationId);
+      const receipts: FileOperationRegistryState = {
+        schemaVersion: 1,
+        fileOperations: [...state.fileOperations],
+      };
+      const record = reserveFileOperation(receipts, request, toTimestamp(this.clock()));
+      if (existing === undefined) {
+        this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, receipts.fileOperations);
+      }
+      return { record, idempotent: existing !== undefined };
+    });
+  }
+
+  /** Persist the apply boundary; callers must do this before invoking I/O. */
+  recordFileOperationApplyAttempt(operationId: string, authorityToken: string): FileOperationRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const existing = state.fileOperations.find((record) => record.operationId === operationId);
+      if (existing === undefined) {
+        throw new SessionRegistryError("OPERATION_REJECTED", `Unknown file-operation receipt: ${operationId}`, {
+          operationId,
+        });
+      }
+      const receipts: FileOperationRegistryState = { schemaVersion: 1, fileOperations: [...state.fileOperations] };
+      const record = recordFileOperationApplyAttempt(receipts, operationId, authorityToken, toTimestamp(this.clock()));
+      if (record !== existing) {
+        this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, receipts.fileOperations);
+      }
+      return record;
+    });
+  }
+
+  /** Reconcile one apply-recorded receipt against explicit executor evidence. */
+  reconcileFileOperationReceipt(
+    operationId: string,
+    observation: FileOperationObservation,
+  ): ReturnType<typeof reconcileFileOperationReceipt> {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const existing = state.fileOperations.find((record) => record.operationId === operationId);
+      if (existing === undefined) {
+        throw new SessionRegistryError("OPERATION_REJECTED", `Unknown file-operation receipt: ${operationId}`, {
+          operationId,
+        });
+      }
+      const result = reconcileFileOperationReceipt(existing, observation, toTimestamp(this.clock()));
+      if (result.record !== existing) {
+        const receipts: FileOperationRegistryState = { schemaVersion: 1, fileOperations: [...state.fileOperations] };
+        const index = receipts.fileOperations.findIndex((record) => record.operationId === operationId);
+        receipts.fileOperations[index] = result.record;
+        this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, receipts.fileOperations);
+      }
+      return result;
+    });
+  }
+
+  /**
+   * Compose the accepted typed operation and durable receipt authorities.
+   * The receipt is reserved and marked apply-recorded before the producer is
+   * allowed to invoke its fixed helper. A failed or ambiguous apply remains a
+   * receipt outcome and is never silently retried.
+   */
+  mutateWorktreeFile(options: FileOperationExecutionOptions): FileOperationExecutionResult {
+    const operation = options.operation;
+    const session = this.get(operation.session_id);
+    if (session === undefined)
+      throw new SessionRegistryError("SESSION_NOT_FOUND", "Session was not found", { sessionId: operation.session_id });
+    if (session.state !== "active") {
+      throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Session cannot mutate files while ${session.state}`, {
+        sessionId: session.sessionId,
+        state: session.state,
+      });
+    }
+    if (session.worktreePath !== operation.worktree_root) {
+      throw new SessionRegistryError("WORKTREE_MISMATCH", "File operation worktree does not match the owned session", {
+        sessionId: operation.session_id,
+      });
+    }
+    if (options.expectedPolicyToken !== undefined && options.expectedPolicyToken !== null) {
+      if (
+        options.policyToken === undefined ||
+        options.policyToken === null ||
+        !isFilesystemPolicyTokenCurrent(options.policyToken, options.expectedPolicyToken)
+      ) {
+        throw new SessionRegistryError("STALE_REGISTRY", "Filesystem policy execution fence is stale", {
+          sessionId: operation.session_id,
+        });
+      }
+    }
+
+    // Validate the frozen producer request before recording an apply attempt;
+    // malformed or unauthorized input must not consume a physical-apply slot.
+    const prepared = prepareWorktreeFileOperation(operation);
+    if (!prepared.ok) {
+      throw new SessionRegistryError("OPERATION_REJECTED", prepared.error.message, {
+        operationId: operation.operation_id,
+        operationCode:
+          typeof prepared.error.details?.operation_code === "string"
+            ? prepared.error.details.operation_code
+            : prepared.error.code,
+        stateUncertain: prepared.error.details?.state_uncertain === true,
+      });
+    }
+
+    const receiptRequest = fileOperationRequestFromWorktreeOperation(operation);
+    const reserved = this.reserveFileOperation(receiptRequest);
+    if (reserved.record.stage === "completed") {
+      return {
+        operation: typedResultFromReceipt(operation, reserved.record),
+        receipt: reserved.record,
+      };
+    }
+    if (reserved.record.stage === "unresolved" || reserved.record.stage === "apply-recorded") {
+      throw new SessionRegistryError("OPERATION_REJECTED", "File-operation receipt is not safely retryable", {
+        operationId: operation.operation_id,
+        operationCode: "FILE_OPERATION_STATE_UNCERTAIN",
+        stateUncertain: true,
+      });
+    }
+
+    this.recordFileOperationApplyAttempt(operation.operation_id, receiptRequest.authorityToken);
+    const applied = mutateWorktreeFile(operation, options.execution);
+    if (!applied.ok) {
+      throw new SessionRegistryError("OPERATION_REJECTED", applied.error.message, {
+        operationId: operation.operation_id,
+        operationCode:
+          typeof applied.error.details?.operation_code === "string"
+            ? applied.error.details.operation_code
+            : "OPERATION_REJECTED",
+        stateUncertain: applied.error.details?.state_uncertain === true,
+      });
+    }
+    const reconciliation = this.reconcileFileOperationReceipt(
+      operation.operation_id,
+      observationFromTypedResult(operation, applied.value),
+    );
+    if (reconciliation.disposition !== "completed") {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "File-operation effect was observed but completion was not proven",
+        {
+          operationId: operation.operation_id,
+          operationCode: "FILE_OPERATION_STATE_UNCERTAIN",
+          stateUncertain: true,
+        },
+      );
+    }
+    return { operation: applied.value, receipt: reconciliation.record };
+  }
+
   getClaim(claimId: string): ResourceClaim | undefined {
     if (typeof claimId !== "string" || claimId.length === 0) {
       throw claimError("CLAIM_NOT_FOUND", "Claim ID must be a non-empty string", { claimId: stringifyDetail(claimId) });
@@ -1307,7 +1517,7 @@ export class SessionRegistry {
         throw migrationReadError(error);
       }
       const migrated = state.legacyClaimsAbsent || state.legacyClaimsSchemaVersion !== undefined;
-      if (migrated) this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration);
+      if (migrated) this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, state.fileOperations);
       return {
         migrated,
         registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
@@ -1343,7 +1553,7 @@ export class SessionRegistry {
       const requested = this.canonicalClaimInputs(options.claims, owner);
       const result = this.addClaimsUnsafe(state, owner, requested);
       const claimSetGeneration = nextClaimSetGeneration(state, result.claims);
-      this.writeUnsafe(result.sessions, result.claims, claimSetGeneration);
+      this.writeUnsafe(result.sessions, result.claims, claimSetGeneration, state.fileOperations);
       return {
         session: cloneSessionRecord(owner.record),
         claims: result.sessionClaims.map(cloneResourceClaim),
@@ -1386,7 +1596,7 @@ export class SessionRegistry {
         ...materialized,
       ]);
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
-      this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration);
+      this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration, state.fileOperations);
       return {
         session: cloneSessionRecord(owner.record),
         claims: materialized.map(cloneResourceClaim),
@@ -1467,7 +1677,7 @@ export class SessionRegistry {
       const nextClaims = sortResourceClaims([...externalClaims, ...nextSessionClaims]);
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
       if (claimSetGeneration !== state.claimSetGeneration) {
-        this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration);
+        this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration, state.fileOperations);
       }
 
       const idempotent = claimSetGeneration === state.claimSetGeneration;
@@ -1581,7 +1791,7 @@ export class SessionRegistry {
       const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId || !wanted.has(claim.claimId));
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
       if (claimSetGeneration !== state.claimSetGeneration) {
-        this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration);
+        this.writeUnsafe(state.sessions, nextClaims, claimSetGeneration, state.fileOperations);
       }
       return {
         sessionId,
@@ -1731,7 +1941,12 @@ export class SessionRegistry {
               );
         this.assertCompleteClaimSet(initialClaims, owner, state.claims, [...state.sessions, record]);
         const nextClaims = sortResourceClaims([...state.claims, ...initialClaims]);
-        this.writeUnsafe([...state.sessions, record], nextClaims, nextClaimSetGeneration(state, nextClaims));
+        this.writeUnsafe(
+          [...state.sessions, record],
+          nextClaims,
+          nextClaimSetGeneration(state, nextClaims),
+          state.fileOperations,
+        );
         return cloneSessionRecord(record);
       } catch (error: unknown) {
         if (gitProvisioned && this.absenceProvenAfterProvisioningFailure(error, sessionId)) {
@@ -2572,7 +2787,7 @@ export class SessionRegistry {
       const updated = transitionSessionState(current, current.state, this.clock);
       const records = replaceRecord(state.sessions, updated);
       validateRecords(records, this.repository.repositoryId);
-      this.writeUnsafe(records, state.claims, state.claimSetGeneration);
+      this.writeUnsafe(records, state.claims, state.claimSetGeneration, state.fileOperations);
     } catch (error: unknown) {
       if (error instanceof SessionRegistryError) {
         throw new SessionRegistryError(
@@ -3624,7 +3839,7 @@ export class SessionRegistry {
           const staleRecord = transitionSessionState(current, "stale", this.clock);
           records = replaceRecord(records, staleRecord);
           validateRecords(records, this.repository.repositoryId);
-          this.writeUnsafe(records, claims, claimSetGeneration);
+          this.writeUnsafe(records, claims, claimSetGeneration, state.fileOperations);
         }
 
         try {
@@ -4179,8 +4394,6 @@ export class SessionRegistry {
     const diagnostic = this.diagnoseUnsafe(ownerSession, {
       sessions: state.sessions,
       claims: state.claims,
-      claimSetGeneration: 0,
-      legacyClaimsAbsent: false,
     });
     const lifecycle = diagnostic.lifecycle;
     const nextAction = diagnostic.nextActions[0];
@@ -4427,7 +4640,7 @@ export class SessionRegistry {
         );
     let closingRecords = replaceRecord(records, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
-    if (!resuming) this.writeUnsafe(closingRecords, state.claims, state.claimSetGeneration);
+    if (!resuming) this.writeUnsafe(closingRecords, state.claims, state.claimSetGeneration, state.fileOperations);
 
     let worktreeRemoved = resuming && !resources.worktreePresent;
     let branchRemoved = resuming && !resources.branchPresent;
@@ -4479,7 +4692,7 @@ export class SessionRegistry {
     const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
     const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
     try {
-      this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration);
+      this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration, state.fileOperations);
     } catch (error: unknown) {
       throw this.cleanupFailure(error, closingRecord, cleanupOperation);
     }
@@ -4572,7 +4785,7 @@ export class SessionRegistry {
         );
     let closingRecords = resuming ? state.sessions : replaceRecord(state.sessions, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
-    if (!resuming) this.writeUnsafe(closingRecords, state.claims, state.claimSetGeneration);
+    if (!resuming) this.writeUnsafe(closingRecords, state.claims, state.claimSetGeneration, state.fileOperations);
 
     let worktreeRemoved = resuming && !resources.worktreePresent;
     let branchRemoved = resuming && !resources.branchPresent;
@@ -4616,7 +4829,7 @@ export class SessionRegistry {
     const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
     const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
     try {
-      this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration);
+      this.writeUnsafe(closingRecords, nextClaims, claimSetGeneration, state.fileOperations);
     } catch (error: unknown) {
       throw this.cleanupFailure(error, closingRecord, "discard");
     }
@@ -4782,7 +4995,7 @@ export class SessionRegistry {
 
   private diagnoseUnsafe(
     record: SessionRecord,
-    state: RegistryState,
+    state: Pick<RegistryState, "sessions" | "claims">,
     evidence?: IntegrationEvidenceInput,
     resourcesSink?: (resources: CleanupResources) => void,
   ): SessionDiagnostic {
@@ -5381,7 +5594,7 @@ export class SessionRegistry {
       contents = fs.readFileSync(this.paths.registry, "utf8");
     } catch (error: unknown) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        return { sessions: [], claims: [], claimSetGeneration: 0, legacyClaimsAbsent: false };
+        return { sessions: [], claims: [], claimSetGeneration: 0, legacyClaimsAbsent: false, fileOperations: [] };
       }
       throw new SessionRegistryError(
         "REGISTRY_IO_FAILURE",
@@ -5427,6 +5640,7 @@ export class SessionRegistry {
     records: readonly SessionRecord[],
     claims: readonly ResourceClaim[],
     claimSetGeneration: number,
+    fileOperations: readonly FileOperationRecord[] = [],
   ): void {
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
@@ -5435,6 +5649,9 @@ export class SessionRegistry {
       claims_schema_version: RESOURCE_CLAIM_SCHEMA_VERSION,
       claims: sortResourceClaims(claims).map((claim) => toPersistedResourceClaim(claim, this.repository.repositoryId)),
       claim_set_generation: claimSetGeneration,
+      required_features: [...REGISTRY_FEATURES],
+      file_operations: serializeFileOperationRegistry({ schemaVersion: 1, fileOperations: [...fileOperations] })
+        .file_operations,
     };
 
     try {
@@ -5470,7 +5687,7 @@ export class SessionRegistry {
       const state = this.readStateUnsafe();
       const { records: nextRecords, result } = mutation(state.sessions);
       validateRecords(nextRecords, this.repository.repositoryId);
-      this.writeUnsafe(nextRecords, state.claims, state.claimSetGeneration);
+      this.writeUnsafe(nextRecords, state.claims, state.claimSetGeneration, state.fileOperations);
       return result;
     });
   }
@@ -7978,6 +8195,117 @@ export function toPersistedResourceClaim(
   };
 }
 
+function fileOperationRequestFromWorktreeOperation(operation: WorktreeFileOperation): FileOperationRequest {
+  const source = operation.operation === "CREATE" ? null : operation.path;
+  const destination =
+    operation.operation === "DELETE"
+      ? null
+      : operation.operation === "RENAME"
+        ? (operation.to_path ?? null)
+        : operation.path;
+  if (operation.operation === "RENAME" && destination === null) {
+    throw new SessionRegistryError("OPERATION_REJECTED", "RENAME requires a destination path");
+  }
+  return {
+    operationId: operation.operation_id,
+    sessionId: operation.session_id,
+    operation: operation.operation,
+    source,
+    destination,
+    expectedIdentity: operation.expected_identity ?? null,
+    payloadDigest:
+      operation.payload_ref === undefined
+        ? null
+        : createHash("sha256").update(Buffer.from(operation.payload_ref.data, "base64")).digest("hex"),
+    authorityToken: `${operation.contract_id}:${operation.session_id}:${operation.operation_id}:${operation.requested_generation}`,
+    fenceEpoch: operation.requested_generation,
+  };
+}
+
+function observationFromTypedResult(
+  operation: WorktreeFileOperation,
+  result: WorktreeFileOperationResult,
+): FileOperationObservation {
+  const expected = operation.expected_identity ?? null;
+  const after = {
+    present: true,
+    identity: result.identity,
+    ...(operation.operation === "CREATE" ? { payloadDigest: result.identity.digest } : {}),
+  };
+  if (operation.operation === "CREATE") {
+    return {
+      operationId: operation.operation_id,
+      authorityToken: `${operation.contract_id}:${operation.session_id}:${operation.operation_id}:${operation.requested_generation}`,
+      fenceEpoch: operation.requested_generation,
+      source: null,
+      destination: after,
+      effectObserved: true,
+      executionCompleted: true,
+    };
+  }
+  if (operation.operation === "DELETE") {
+    return {
+      operationId: operation.operation_id,
+      authorityToken: `${operation.contract_id}:${operation.session_id}:${operation.operation_id}:${operation.requested_generation}`,
+      fenceEpoch: operation.requested_generation,
+      source: { present: false, before: { present: true, identity: expected } },
+      destination: null,
+      effectObserved: true,
+      executionCompleted: true,
+    };
+  }
+  return {
+    operationId: operation.operation_id,
+    authorityToken: `${operation.contract_id}:${operation.session_id}:${operation.operation_id}:${operation.requested_generation}`,
+    fenceEpoch: operation.requested_generation,
+    source: { present: false, before: { present: true, identity: expected } },
+    destination: { ...after, before: { present: false } },
+    effectObserved: true,
+    executionCompleted: true,
+  };
+}
+
+function typedResultFromReceipt(
+  operation: WorktreeFileOperation,
+  receipt: FileOperationRecord,
+): WorktreeFileOperationResult {
+  const candidate = receipt.expectedIdentity;
+  const identity =
+    candidate !== null && typeof candidate === "object" && !Array.isArray(candidate)
+      ? (candidate as Readonly<Record<string, unknown>>)
+      : null;
+  if (
+    identity === null ||
+    typeof identity.dev !== "string" ||
+    typeof identity.ino !== "string" ||
+    typeof identity.size !== "number" ||
+    typeof identity.digest !== "string"
+  ) {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "Completed file-operation receipt lacks replayable identity evidence",
+      {
+        operationId: operation.operation_id,
+      },
+    );
+  }
+  return {
+    contract_id: operation.contract_id,
+    schema_version: operation.schema_version,
+    operation_id: operation.operation_id,
+    operation: operation.operation,
+    state: "applied",
+    previous_generation: operation.requested_generation,
+    next_generation: operation.requested_generation + 1,
+    identity: identity as WorktreeFileOperationResult["identity"],
+    postcondition: {
+      kind: "rebuild-execution-view",
+      reason: "physical-operation-applied",
+      generation: operation.requested_generation + 1,
+    },
+  };
+}
+
 function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacyClaimSchema = false): RegistryState {
   if (!isRecord(value)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry root must be an object");
@@ -7997,7 +8325,7 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
   assertExactKeys(
     value,
     ["schema_version", "repository_id", "sessions"],
-    ["claims_schema_version", "claims", "claim_set_generation"],
+    ["claims_schema_version", "claims", "claim_set_generation", "required_features", "file_operations"],
   );
 
   if (typeof value.repository_id !== "string" || value.repository_id !== expectedRepositoryId) {
@@ -8013,6 +8341,42 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
 
   const claimSetGeneration = parseClaimSetGeneration(value.claim_set_generation);
 
+  const hasFileOperations = Object.hasOwn(value, "file_operations");
+  const hasRequiredFeatures = Object.hasOwn(value, "required_features");
+  if (hasFileOperations !== hasRequiredFeatures) {
+    throw new SessionRegistryError(
+      "REGISTRY_CORRUPT",
+      "Registry file-operation feature metadata and file_operations must be persisted together",
+    );
+  }
+  let fileOperations: readonly FileOperationRecord[] = [];
+  if (hasFileOperations) {
+    const requiredFeatures = value.required_features;
+    const hasUnsupportedFeature =
+      !Array.isArray(requiredFeatures) ||
+      requiredFeatures.length !== REGISTRY_FEATURES.length ||
+      requiredFeatures.some(
+        (feature) => typeof feature !== "string" || !(REGISTRY_FEATURES as readonly string[]).includes(feature),
+      );
+    if (hasUnsupportedFeature || !requiredFeatures.includes(FILE_OPERATION_REQUIRED_FEATURE)) {
+      throw new SessionRegistryError(
+        "REGISTRY_FEATURE_UNSUPPORTED",
+        "Registry declares an unsupported file-operation feature set",
+      );
+    }
+    try {
+      fileOperations = parseFileOperationRegistry({
+        schema_version: 1,
+        file_operations: value.file_operations,
+      }).fileOperations;
+    } catch (error: unknown) {
+      if (error instanceof Error && "code" in error && typeof error.code === "string") {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", error.message, { feature: FILE_OPERATION_REQUIRED_FEATURE });
+      }
+      throw error;
+    }
+  }
+
   const records = value.sessions.map((candidate, index) => parseSessionRecord(candidate, index, expectedRepositoryId));
   validateRecords(records, expectedRepositoryId);
   const hasClaimsSchema = Object.hasOwn(value, "claims_schema_version");
@@ -8026,7 +8390,7 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
   if (!hasClaimsSchema) {
     // v0.1.0 had no claim section. It is a deterministic empty claim set,
     // materialized on the next locked mutation or via migrate().
-    return { sessions: records, claims: [], claimSetGeneration, legacyClaimsAbsent: true };
+    return { sessions: records, claims: [], claimSetGeneration, legacyClaimsAbsent: true, fileOperations };
   }
   const claimSchemaVersion = value.claims_schema_version;
   const isLegacyClaimSchema = claimSchemaVersion === LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
@@ -8065,6 +8429,7 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
     claims: sortResourceClaims(claims),
     claimSetGeneration,
     legacyClaimsAbsent: false,
+    fileOperations,
     ...(isLegacyClaimSchema ? { legacyClaimsSchemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION } : {}),
   };
 }

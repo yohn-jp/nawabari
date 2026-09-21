@@ -6,6 +6,13 @@ import type {
 } from "../session-lifecycle-classification.js";
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
+import type {
+  WorktreeFileOperation,
+  WorktreeFileOperationExecutionOptions,
+  WorktreeFileOperationResult,
+} from "./worktree-file-operation.js";
+import type { FilesystemPolicyToken } from "./filesystem-policy-revision.js";
+import type { FileOperationRecord } from "../registry/file-operation-record.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -72,6 +79,23 @@ export type WorkingSetExpansionResult = {
   outcomes: WorkingSetExpansionOutcome[];
   session: SessionRecord;
   working_set: JsonObject;
+};
+
+export type FileOperationExecutionOptions = {
+  operation: WorktreeFileOperation;
+  policy_token?: FilesystemPolicyToken | null;
+  expected_policy_token?: FilesystemPolicyToken | null;
+  execution?: WorktreeFileOperationExecutionOptions;
+};
+
+export type FileOperationExecutionResult = {
+  operation: WorktreeFileOperationResult;
+  receipt: FileOperationRecord;
+};
+
+export type FileOperationReceiptResult = {
+  record: FileOperationRecord;
+  idempotent: boolean;
 };
 
 export type ResourceClaimMode = "read" | "write" | "exclusive-write";
@@ -886,6 +910,15 @@ export interface SessionBackend {
     sessionId: string | null,
   ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation: number }>>;
   migrate?(context: SessionContext): Promise<DomainResult<RegistryMigrationResult>>;
+  fileOperation?(
+    context: SessionContext,
+    options: FileOperationExecutionOptions,
+  ): Promise<DomainResult<FileOperationExecutionResult>>;
+  reserveFileOperation?(
+    context: SessionContext,
+    request: import("../registry/file-operation-record.js").FileOperationRequest,
+  ): Promise<DomainResult<FileOperationReceiptResult>>;
+  fileOperations?(context: SessionContext, sessionId?: string | null): Promise<DomainResult<FileOperationRecord[]>>;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {

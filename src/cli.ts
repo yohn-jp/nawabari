@@ -51,6 +51,13 @@ import {
   STRICT_RUNTIME_POLICY,
   type RuntimePolicyMode,
 } from "./domain/runtime-projection.js";
+import {
+  materializeWorktreeFileOperationCliRequest,
+  parseWorktreeFileOperationCli,
+  projectWorktreeFileOperationCliOutcome,
+  serializeWorktreeFileOperationCliOutcome,
+  type WorktreeFileOperationCliAuthority,
+} from "./worktree-file-operation-cli.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -94,6 +101,9 @@ export const DISPATCHER_COMMAND_INVENTORY = [
   "session run",
   "session exec",
   "session shell",
+  "session file create",
+  "session file delete",
+  "session file rename",
   "session list",
   "session claim",
   "resource claim",
@@ -156,6 +166,35 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session reconcile": ["--session", "--apply"],
   "session run": ["--session", "--runtime-policy"],
   "session shell": ["--session", "--runtime-policy"],
+  "session file create": [
+    "--session",
+    "--operation",
+    "--operation-id",
+    "--path",
+    "--if-generation",
+    "--expect-absent",
+    "--payload-file",
+    "--payload-stdin",
+  ],
+  "session file delete": [
+    "--session",
+    "--operation",
+    "--operation-id",
+    "--path",
+    "--if-generation",
+    "--expected-digest",
+    "--expected-identity",
+  ],
+  "session file rename": [
+    "--session",
+    "--operation",
+    "--operation-id",
+    "--path",
+    "--to-path",
+    "--if-generation",
+    "--expected-digest",
+    "--expected-identity",
+  ],
   "session list": ["--all", "--history", "--limit", "--offset"],
   "session claim": ["--resource", "--mode", "--session", "--repository"],
   "session update": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
@@ -267,7 +306,9 @@ function helpSpecFor(commandArguments: readonly string[]): CliCommandDefinition 
   const key =
     commandArguments[0] === "resource"
       ? `resource ${commandArguments[1] ?? "list"}`
-      : commandArguments.slice(0, 2).join(" ");
+      : commandArguments[0] === "session" && commandArguments[1] === "file"
+        ? commandArguments.slice(0, 3).join(" ")
+        : commandArguments.slice(0, 2).join(" ");
   return resolveCliCommandDefinition(key) ?? resolveCliCommandDefinition(commandArguments[0]) ?? ROOT_HELP_SPEC;
 }
 
@@ -1545,6 +1586,46 @@ async function executeProtectedSessionCommand(
   };
 }
 
+async function executeSessionFileOperation(
+  arguments_: string[],
+  backend: SessionBackend,
+  context: SessionContext,
+): Promise<DomainResult<JsonObject>> {
+  const parsed = parseWorktreeFileOperationCli(["session", "file", ...arguments_]);
+  if (!parsed.ok) return parsed;
+  const sessionResult = await backend.getSession(context, parsed.value.session_id);
+  if (!sessionResult.ok) return sessionResult;
+  if (backend.listClaims === undefined || backend.fileOperation === undefined) {
+    return failure(new DomainError("BACKEND_UNAVAILABLE", "File-operation capability is not available."));
+  }
+  const claimsResult = await backend.listClaims(context, parsed.value.session_id);
+  if (!claimsResult.ok) return claimsResult;
+  const workingSet = sessionResult.value.working_set;
+  const scopeValue = workingSet?.scope;
+  const scope =
+    scopeValue !== null && typeof scopeValue === "object" && !Array.isArray(scopeValue)
+      ? (scopeValue as Record<string, unknown>)
+      : {};
+  const authority: WorktreeFileOperationCliAuthority = {
+    worktree_root: sessionResult.value.worktree,
+    scope: {
+      create: Array.isArray(scope.create) ? (scope.create as string[]) : [],
+      delete: Array.isArray(scope.delete) ? (scope.delete as string[]) : [],
+      deny: Array.isArray(scope.deny) ? (scope.deny as string[]) : [],
+    },
+    claims: claimsResult.value.claims.map((claim) => ({ resource: claim.resource, mode: claim.mode })),
+  };
+  const operation = materializeWorktreeFileOperationCliRequest(parsed.value, authority);
+  if (!operation.ok) return operation;
+  const result = await backend.fileOperation(context, { operation: operation.value });
+  const outcome = projectWorktreeFileOperationCliOutcome(
+    result.ok ? { ok: true, value: result.value.operation } : result,
+    operation.value.operation_id,
+    operation.value.operation,
+  );
+  return { ok: true, value: serializeWorktreeFileOperationCliOutcome(outcome) as unknown as JsonObject };
+}
+
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
@@ -1565,6 +1646,15 @@ async function executeCommand(
     // of creating a second launch path.
     if (canonicalCommandForName(`session ${subcommand}`)?.name === "session run") {
       return executeProtectedSessionCommand(rest, dependencies, context);
+    }
+    if (subcommand === "file") {
+      const operation = rest[0];
+      if (operation !== "create" && operation !== "delete" && operation !== "rename") {
+        return failure(
+          new DomainError("UNKNOWN_COMMAND", `Unknown session file operation: ${operation ?? "<missing>"}.`),
+        );
+      }
+      return executeSessionFileOperation(rest, dependencies.backend, context);
     }
     if (subcommand === "claim") {
       const parsed = parseSingleClaimPair(rest);
@@ -2117,7 +2207,11 @@ async function executeCommand(
 }
 
 function commandName(commandArguments: string[]): string {
-  if (commandArguments[0] === "session") return commandArguments.slice(0, 2).join(" ");
+  if (commandArguments[0] === "session") {
+    return commandArguments[1] === "file"
+      ? commandArguments.slice(0, 3).join(" ")
+      : commandArguments.slice(0, 2).join(" ");
+  }
   if (commandArguments[0] === "resource") {
     return commandArguments[1] === undefined ? "resource list" : commandArguments.slice(0, 2).join(" ");
   }

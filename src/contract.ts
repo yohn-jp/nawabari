@@ -28,7 +28,21 @@ import {
   SANDBOX_REQUIRED_CAPABILITIES,
 } from "./domain/sandbox.js";
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
-import { DISCARD_PREVIEW_SCHEMA_VERSION, RECONCILIATION_APPLY_SCHEMA_VERSION } from "./session-registry.js";
+import {
+  DISCARD_PREVIEW_SCHEMA_VERSION,
+  RECONCILIATION_APPLY_SCHEMA_VERSION,
+  REGISTRY_FEATURES,
+  REGISTRY_SCHEMA_VERSION,
+} from "./session-registry.js";
+import {
+  WORKTREE_FILE_OPERATION_CLI_COMMANDS,
+  WORKTREE_FILE_OPERATION_CLI_CONTRACT_ID,
+  WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+} from "./worktree-file-operation-cli.js";
+import {
+  WORKTREE_FILE_OPERATION_CONTRACT_ID,
+  WORKTREE_FILE_OPERATION_SCHEMA_VERSION,
+} from "./domain/worktree-file-operation.js";
 import { SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION, SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION } from "./domain/session.js";
 import {
   AUXILIARY_STATE_DURABILITY_CLASSES,
@@ -307,6 +321,34 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     },
   },
   PROTECTED_EXECUTION_CAPABILITY,
+  {
+    id: "file-operations",
+    contract_id: WORKTREE_FILE_OPERATION_CONTRACT_ID,
+    schema_version: WORKTREE_FILE_OPERATION_SCHEMA_VERSION,
+    cli_contract_id: WORKTREE_FILE_OPERATION_CLI_CONTRACT_ID,
+    cli_schema_version: WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+    registry_schema_version: REGISTRY_SCHEMA_VERSION,
+    registry_features: [...REGISTRY_FEATURES],
+    commands: [...WORKTREE_FILE_OPERATION_CLI_COMMANDS],
+    result_schema: "worktree-file-operation-cli.v1",
+    result_schema_version: WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+    result_schemas: [
+      {
+        schema: "worktree-file-operation-cli.v1",
+        version: WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+        commands: [...WORKTREE_FILE_OPERATION_CLI_COMMANDS],
+      },
+    ],
+    identities: ["session_id", "operation_id", "operation", "state", "previous_generation", "next_generation"],
+    serialization_keys: ["registry", "domain-session", "cli", "contract", "error-vocabulary"],
+    stages: ["prepared", "apply-recorded", "completed", "unresolved"],
+    failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["file-operations"],
+    failure_code_policy: {
+      source: "accepted file-operation and CLI producer vocabularies",
+      missing_or_extra: "deterministic conformance failure",
+      internal_exceptions: [],
+    },
+  },
   {
     id: "session-lifecycle",
     commands: ["session create", "session id", "session show", "session list", "status", "session close"],
@@ -864,6 +906,18 @@ export function machineContract(packageVersion: string): JsonObject {
             modes: [...capability.modes],
             durability_classes: [...capability.durability_classes],
             descriptor: jsonClone(capability.descriptor),
+          }
+        : {}),
+      ...(capability.id === "file-operations"
+        ? {
+            contract_id: capability.contract_id,
+            schema_version: capability.schema_version,
+            cli_contract_id: capability.cli_contract_id,
+            cli_schema_version: capability.cli_schema_version,
+            registry_schema_version: capability.registry_schema_version,
+            registry_features: [...capability.registry_features],
+            serialization_keys: [...capability.serialization_keys],
+            stages: [...capability.stages],
           }
         : {}),
     })),

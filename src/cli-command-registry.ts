@@ -270,6 +270,74 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     ],
   },
   {
+    name: "session file create",
+    summary: "Create one exact file through the governed worktree operation boundary",
+    usage: `${CLI_NAME} session file create --session <id> --operation-id <id> --path <exact-path> --if-generation <n> --expect-absent (--payload-file <path>|--payload-stdin)`,
+    options: [
+      option("--session", "Explicit session identity", { value: "<id>", required: true }),
+      option("--operation-id", "Stable retry identity for the exact operation", { value: "<id>", required: true }),
+      option("--path", "Exact repository-relative destination path", { value: "<path>", required: true }),
+      option("--if-generation", "Required working-set generation CAS token", {
+        value: "<positive-integer>",
+        required: true,
+      }),
+      option("--expect-absent", "Require the destination to be absent before CREATE", { required: true }),
+      option("--payload-file", "Bounded payload input file", {
+        value: "<path>",
+        mutually_exclusive_with: ["--payload-stdin"],
+      }),
+      option("--payload-stdin", "Read the bounded payload from stdin", { mutually_exclusive_with: ["--payload-file"] }),
+      option("--operation", "Explicit operation identity; must be CREATE", { value: "<CREATE>" }),
+    ],
+  },
+  {
+    name: "session file delete",
+    summary: "Delete one exact file through the governed worktree operation boundary",
+    usage: `${CLI_NAME} session file delete --session <id> --operation-id <id> --path <exact-path> --if-generation <n> (--expected-digest <sha256>|--expected-identity <json>)`,
+    options: [
+      option("--session", "Explicit session identity", { value: "<id>", required: true }),
+      option("--operation-id", "Stable retry identity for the exact operation", { value: "<id>", required: true }),
+      option("--path", "Exact repository-relative source path", { value: "<path>", required: true }),
+      option("--if-generation", "Required working-set generation CAS token", {
+        value: "<positive-integer>",
+        required: true,
+      }),
+      option("--expected-digest", "Expected SHA-256 target identity", {
+        value: "<sha256>",
+        mutually_exclusive_with: ["--expected-identity"],
+      }),
+      option("--expected-identity", "Expected structured target identity", {
+        value: "<json>",
+        mutually_exclusive_with: ["--expected-digest"],
+      }),
+      option("--operation", "Explicit operation identity; must be DELETE", { value: "<DELETE>" }),
+    ],
+  },
+  {
+    name: "session file rename",
+    summary: "Rename one exact file through the governed worktree operation boundary",
+    usage: `${CLI_NAME} session file rename --session <id> --operation-id <id> --path <exact-path> --to-path <exact-path> --if-generation <n> (--expected-digest <sha256>|--expected-identity <json>)`,
+    options: [
+      option("--session", "Explicit session identity", { value: "<id>", required: true }),
+      option("--operation-id", "Stable retry identity for the exact operation", { value: "<id>", required: true }),
+      option("--path", "Exact repository-relative source path", { value: "<path>", required: true }),
+      option("--to-path", "Exact repository-relative destination path", { value: "<path>", required: true }),
+      option("--if-generation", "Required working-set generation CAS token", {
+        value: "<positive-integer>",
+        required: true,
+      }),
+      option("--expected-digest", "Expected SHA-256 target identity", {
+        value: "<sha256>",
+        mutually_exclusive_with: ["--expected-identity"],
+      }),
+      option("--expected-identity", "Expected structured target identity", {
+        value: "<json>",
+        mutually_exclusive_with: ["--expected-digest"],
+      }),
+      option("--operation", "Explicit operation identity; must be RENAME", { value: "<RENAME>" }),
+    ],
+  },
+  {
     name: "session list",
     summary: "List bounded repository session records",
     usage: `${CLI_NAME} session list [--all|--history] [--limit <n>] [--offset <n>]`,

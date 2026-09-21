@@ -9,6 +9,7 @@ import {
 import type { SessionLifecycleAction as RegistrySessionLifecycleAction } from "../session-lifecycle-actions.js";
 import { availableLifecycleOperations } from "../session-lifecycle-classification.js";
 import { isSessionRegistryError, type RegistryErrorCode, type SessionRegistryError } from "../errors.js";
+import { isFileOperationError } from "../registry/file-operation-record.js";
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import {
   type BackendCapabilities,
@@ -64,9 +65,13 @@ import {
   type ReleaseClaimsResult,
   type ResourceClaim,
   type RegistryMigrationResult,
+  type FileOperationExecutionOptions,
+  type FileOperationExecutionResult,
+  type FileOperationReceiptResult,
   type StatusResult,
   type UpdateClaimsOptions,
 } from "./session.js";
+import type { FileOperationRequest, FileOperationRecord } from "../registry/file-operation-record.js";
 import type { SandboxGitIdentity } from "./sandbox.js";
 
 export interface LocalSessionBackendOptions {
@@ -108,6 +113,7 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   INVALID_WORKTREE_PATH: "INVALID_WORKTREE",
   INVALID_BASE_REF: "INVALID_BASE_REF",
   REGISTRY_CORRUPT: "REGISTRY_CORRUPT",
+  REGISTRY_FEATURE_UNSUPPORTED: "REGISTRY_FEATURE_UNSUPPORTED",
   UNSUPPORTED_SCHEMA_VERSION: "REGISTRY_CORRUPT",
   REGISTRY_REPOSITORY_MISMATCH: "INVALID_REGISTRY",
   DUPLICATE_SESSION_ID: "OPERATION_REJECTED",
@@ -613,6 +619,45 @@ export class LocalSessionBackend implements SessionBackend {
         registry_schema_version: result.registrySchemaVersion,
         claim_schema_version: result.claimSchemaVersion,
       });
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async fileOperation(
+    context: SessionContext,
+    options: FileOperationExecutionOptions,
+  ): Promise<DomainResult<FileOperationExecutionResult>> {
+    try {
+      const result = this.registryFor(context).mutateWorktreeFile({
+        operation: options.operation,
+        policyToken: options.policy_token,
+        expectedPolicyToken: options.expected_policy_token,
+        execution: options.execution,
+      });
+      return success(result);
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async reserveFileOperation(
+    context: SessionContext,
+    request: FileOperationRequest,
+  ): Promise<DomainResult<FileOperationReceiptResult>> {
+    try {
+      return success(this.registryFor(context).reserveFileOperation(request));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async fileOperations(
+    context: SessionContext,
+    sessionId: string | null = null,
+  ): Promise<DomainResult<FileOperationRecord[]>> {
+    try {
+      return success([...this.registryFor(context).fileOperations(sessionId)]);
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -1289,6 +1334,10 @@ function toDomainClaim(claim: RegistryResourceClaim): ResourceClaim {
 }
 
 function toDomainError(error: unknown, fallbackCode?: ErrorCode): DomainError {
+  if (error instanceof DomainError) return error;
+  if (isFileOperationError(error)) {
+    return new DomainError(error.code as ErrorCode, error.message, error.details as JsonObject);
+  }
   if (!isSessionRegistryError(error)) {
     const cause = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     return new DomainError(
