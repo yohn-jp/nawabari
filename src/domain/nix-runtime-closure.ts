@@ -36,6 +36,7 @@ export const DEFAULT_NIX_PACKAGE_ATTRIBUTES: Readonly<Record<string, string>> = 
   git: "git",
   ls: "coreutils",
   pnpm: "pnpm",
+  bash: "bash",
 });
 
 export type NixCommandResult = Readonly<{

@@ -37,7 +37,7 @@ export const FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS = Object.freeze([
 ] as const);
 
 /** Optional development tooling supported by explicit profile composition. */
-export const FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS = Object.freeze(["pnpm-package"] as const);
+export const FHS_DEVELOPMENT_OPTIONAL_RUNTIME_REQUIREMENT_IDS = Object.freeze(["pnpm-package", "bash-runtime"] as const);
 
 /**
  * The Landlock runtime adapter (a bounded Python/ctypes shim, see sandbox.ts)
@@ -66,6 +66,7 @@ export const FHS_DEVELOPMENT_EXECUTABLE_ENVIRONMENT_KEYS = Object.freeze({
   "git-package": "NAWABARI_FHS_GIT_EXECUTABLE",
   "ls-runtime": "NAWABARI_FHS_LS_EXECUTABLE",
   "pnpm-package": "NAWABARI_FHS_PNPM_EXECUTABLE",
+  "bash-runtime": "NAWABARI_FHS_BASH_EXECUTABLE",
   [FHS_LANDLOCK_HELPER_REQUIREMENT_ID]: "NAWABARI_FHS_LANDLOCK_EXECUTABLE",
 } as const);
 
@@ -143,6 +144,7 @@ const FHS_DEVELOPMENT_EXECUTABLE_NAMES: Readonly<Record<string, string>> = Objec
   "git-package": "git",
   "ls-runtime": "ls",
   "pnpm-package": "pnpm",
+  "bash-runtime": "bash",
   [FHS_LANDLOCK_HELPER_REQUIREMENT_ID]: "python3",
 });
 
