@@ -30,6 +30,7 @@ const SAFE_TEXT = /^[^\u0000-\u001f\u007f]+$/u;
 const STABLE_IDENTIFIER = /^[a-z0-9][a-z0-9._-]*$/u;
 const ENTRYPOINT = /^[A-Za-z0-9][A-Za-z0-9+._-]*$/u;
 const SELECTOR = /^(?!\/)(?![A-Za-z]:)(?!\.\.?\/)(?!.*(?:\\|\/\/))[A-Za-z0-9_.*?/@+:-]+$/u;
+const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 /** Only these profile sections can be changed by an override. */
 export type WorktreeProfileOverrideRestrictions = Readonly<{
@@ -187,6 +188,7 @@ function jsonValue(value: unknown, field: string, depth = 0): DomainResult<unkno
   if (!isRecord(value)) return invalid(field, "expected a JSON value");
   const output: Record<string, unknown> = {};
   for (const key of Object.keys(value).sort(compareText)) {
+    if (PROTOTYPE_KEYS.has(key)) return invalid(`${field}.${key}`, "prototype-pollution keys are not supported");
     const parsedKey = boundedText(key, `${field}.<key>`);
     if (!parsedKey.ok) return parsedKey;
     const parsed = jsonValue(value[key], `${field}.${key}`, depth + 1);
@@ -311,6 +313,8 @@ export function validateWorktreeProfileOverride(input: unknown): DomainResult<Wo
     if (!isRecord(normalized.parameters)) return invalid("override.parameters", "expected a parameter object");
     const parameters: Record<string, unknown> = {};
     for (const key of Object.keys(normalized.parameters).sort(compareText)) {
+      if (PROTOTYPE_KEYS.has(key))
+        return invalid(`override.parameters.${key}`, "prototype-pollution keys are not supported");
       const parsed = jsonValue(normalized.parameters[key], `override.parameters.${key}`);
       if (!parsed.ok) return parsed;
       parameters[key] = parsed.value;

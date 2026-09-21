@@ -245,3 +245,11 @@ test("rejects generic patches, ambiguous arrays, and missing authorization", () 
   assert.equal(validateWorktreeProfileOverride({ removeTools: ["node", "node"] }).ok, false);
   assert.equal(applyWorktreeProfileOverrides(pinned(), {}, undefined).ok, false);
 });
+
+test("rejects prototype-pollution keys parsed from JSON before canonicalization", () => {
+  for (const key of ["__proto__", "constructor", "prototype"]) {
+    const input = JSON.parse(`{"parameters":{"${key}":{"shell.entrypoint":"node"}}}`) as unknown;
+    assert.equal(validateWorktreeProfileOverride(input).ok, false, key);
+    assert.equal(applyWorktreeProfileOverrides(pinned(), input, auth()).ok, false, key);
+  }
+});
