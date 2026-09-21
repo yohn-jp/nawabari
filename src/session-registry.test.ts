@@ -234,6 +234,71 @@ test("round-trips session metadata through common Git state", () => {
   }
 });
 
+test("close advances registry_revision once for each sequential persisted mutation", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-close-revision`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/close-revision" });
+    const before = persistedRegistryRevision(registry);
+
+    const result = registry.close(session.sessionId);
+
+    assert.equal(result.session.state, "closed");
+    assert.equal(persistedRegistryRevision(registry), before + 2);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("discard advances registry_revision once for each sequential persisted mutation", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-revision`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-revision" });
+    const before = persistedRegistryRevision(registry);
+
+    const result = registry.discard(session.sessionId);
+
+    assert.equal(result.session.state, "closed");
+    assert.equal(result.session.terminalOperation, "discard");
+    assert.equal(persistedRegistryRevision(registry), before + 2);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("multi-candidate garbage collection never reuses or regresses registry_revision", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePaths = [
+    `${fixture.repositoryPath}-gc-revision-1`,
+    `${fixture.repositoryPath}-gc-revision-2`,
+  ];
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const sessions = [
+      registry.provision({ worktreePath: worktreePaths[0], branchName: "feature/gc-revision-1" }),
+      registry.provision({ worktreePath: worktreePaths[1], branchName: "feature/gc-revision-2" }),
+    ];
+    const before = persistedRegistryRevision(registry);
+    for (const worktreePath of worktreePaths) fs.rmSync(worktreePath, { recursive: true, force: true });
+
+    const result = registry.garbageCollect({ apply: true });
+
+    assert.deepEqual(
+      result.cleaned.map((session) => session.sessionId),
+      sessions.map((session) => session.sessionId),
+    );
+    assert.equal(persistedRegistryRevision(registry), before + 6);
+  } finally {
+    for (const worktreePath of worktreePaths) removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 test("expands a governed working set atomically with revision CAS and claim checks", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-expansion");
@@ -1659,6 +1724,10 @@ function writeRegistry(registry: SessionRegistry, value: PersistedRegistry): voi
 function registryRevision(value: PersistedRegistry): number {
   if (!("registry_revision" in value)) throw new Error("Expected a registry v2 document");
   return value.registry_revision;
+}
+
+function persistedRegistryRevision(registry: SessionRegistry): number {
+  return (readJson(registry.paths.registry) as PersistedRegistry).registry_revision ?? 0;
 }
 
 function removeWorktree(repositoryPath: string, worktreePath: string): void {
