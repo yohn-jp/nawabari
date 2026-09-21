@@ -298,7 +298,7 @@ test("migrates a legacy registry without changing session ownership or claim mod
     assert.equal(result.migrated, true);
     const migrated = readJson(registry.paths.registry) as PersistedRegistry;
     assert.equal(migrated.schema_version, 2);
-    assert.equal(migrated.claims_schema_version, 2);
+    assert.equal(migrated.claims_schema_version, 3);
     assert.equal(migrated.sessions[0]?.session_id, session.sessionId);
     assert.equal((migrated.claims?.[0] as { mode?: string } | undefined)?.mode, "write");
     assert.equal(registry.listClaims()[0]?.sessionId, session.sessionId);

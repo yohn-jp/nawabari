@@ -5,13 +5,11 @@ import { createHash } from "node:crypto";
 import { SessionRegistryError, type RegistryErrorDetails } from "./errors.js";
 
 /**
- * Claim schema version 2 records the distinct overlap semantics below. A
- * persisted v1 claim must be explicitly migrated before it is interpreted by
- * the v2 authority. Coordinated-write admission is additive and does not
- * advance the existing claim schema.
+ * Claim schema version 3 adds coordinated-write sharing. Schema 2 remains an
+ * explicit legacy format whose claims never carry sharing semantics.
  */
-export const RESOURCE_CLAIM_SCHEMA_VERSION = 2 as const;
-export const LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION = 1 as const;
+export const RESOURCE_CLAIM_SCHEMA_VERSION = 3 as const;
+export const LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION = 2 as const;
 
 export const RESOURCE_CLAIM_MODES = ["read", "write", "exclusive-write"] as const;
 export type ResourceClaimMode = (typeof RESOURCE_CLAIM_MODES)[number];
@@ -349,7 +347,10 @@ export function createResourceClaim(
 }
 
 export function cloneResourceClaim(claim: ResourceClaim): ResourceClaim {
-  return Object.freeze({ ...claim, ...(claim.sharing === undefined ? {} : { sharing: Object.freeze({ ...claim.sharing }) }) });
+  return Object.freeze({
+    ...claim,
+    ...(claim.sharing === undefined ? {} : { sharing: Object.freeze({ ...claim.sharing }) }),
+  });
 }
 
 export function claimsOverlap(left: ResourceClaim, right: ResourceClaim): boolean {
@@ -408,20 +409,47 @@ export function permitsCoordinatedWrite(facts: CoordinationFacts): CoordinationD
   const { left, right, leftIdentity, rightIdentity } = facts;
   if (facts.claimSetGeneration !== facts.observedClaimSetGeneration) return "denied";
   if (left.mode !== "write" || right.mode !== "write") return "denied";
-  if (left.sharing?.kind !== RESOURCE_CLAIM_SHARING_KIND || right.sharing?.kind !== RESOURCE_CLAIM_SHARING_KIND) return "denied";
+  if (left.sharing?.kind !== RESOURCE_CLAIM_SHARING_KIND || right.sharing?.kind !== RESOURCE_CLAIM_SHARING_KIND)
+    return "denied";
   if (!left.sharing.groupId || left.sharing.groupId !== right.sharing.groupId) return "denied";
   if (leftIdentity.status !== "verified" || rightIdentity.status !== "verified") return "denied";
-  if (leftIdentity.repositoryId !== rightIdentity.repositoryId || leftIdentity.repositoryId !== left.repositoryId || rightIdentity.repositoryId !== right.repositoryId) return "denied";
-  if (left.sessionId === right.sessionId || leftIdentity.sessionId !== left.sessionId || rightIdentity.sessionId !== right.sessionId) return "denied";
-  if (leftIdentity.worktreePath !== left.worktreePath || rightIdentity.worktreePath !== right.worktreePath) return "denied";
-  if (!leftIdentity.worktreeId || !rightIdentity.worktreeId || leftIdentity.worktreeId === rightIdentity.worktreeId) return "denied";
-  if (!leftIdentity.worktreePath || !rightIdentity.worktreePath || leftIdentity.worktreePath === rightIdentity.worktreePath) return "denied";
+  if (
+    leftIdentity.repositoryId !== rightIdentity.repositoryId ||
+    leftIdentity.repositoryId !== left.repositoryId ||
+    rightIdentity.repositoryId !== right.repositoryId
+  )
+    return "denied";
+  if (
+    left.sessionId === right.sessionId ||
+    leftIdentity.sessionId !== left.sessionId ||
+    rightIdentity.sessionId !== right.sessionId
+  )
+    return "denied";
+  if (leftIdentity.worktreePath !== left.worktreePath || rightIdentity.worktreePath !== right.worktreePath)
+    return "denied";
+  if (!leftIdentity.worktreeId || !rightIdentity.worktreeId || leftIdentity.worktreeId === rightIdentity.worktreeId)
+    return "denied";
+  if (
+    !leftIdentity.worktreePath ||
+    !rightIdentity.worktreePath ||
+    leftIdentity.worktreePath === rightIdentity.worktreePath
+  )
+    return "denied";
   return "allowed";
 }
 
-function validateSharing(sharing: SharedWriteBinding | undefined, mode: ResourceClaimMode): SharedWriteBinding | undefined {
+function validateSharing(
+  sharing: SharedWriteBinding | undefined,
+  mode: ResourceClaimMode,
+): SharedWriteBinding | undefined {
   if (sharing === undefined) return undefined;
-  if (mode !== "write" || sharing.kind !== RESOURCE_CLAIM_SHARING_KIND || typeof sharing.groupId !== "string" || sharing.groupId.length === 0 || sharing.groupId.length > 128) {
+  if (
+    mode !== "write" ||
+    sharing.kind !== RESOURCE_CLAIM_SHARING_KIND ||
+    typeof sharing.groupId !== "string" ||
+    sharing.groupId.length === 0 ||
+    sharing.groupId.length > 128
+  ) {
     throw claimError("INVALID_CLAIM", "Coordinated write binding is invalid");
   }
   return Object.freeze({ kind: sharing.kind, groupId: sharing.groupId });

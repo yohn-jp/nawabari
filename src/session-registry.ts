@@ -958,6 +958,7 @@ export interface PersistedResourceClaim {
   readonly worktree_path: string;
   readonly resource: string;
   readonly mode: ResourceClaimMode;
+  readonly sharing?: { readonly kind: "isolated-worktree"; readonly group_id: string };
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -978,7 +979,7 @@ export interface PersistedRegistryV2 {
   readonly schema_version: RegistrySchemaVersion;
   readonly repository_id: string;
   readonly sessions: readonly PersistedSessionRecord[];
-  readonly claims_schema_version: typeof RESOURCE_CLAIM_SCHEMA_VERSION;
+  readonly claims_schema_version: typeof RESOURCE_CLAIM_SCHEMA_VERSION | typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
   readonly claims: readonly PersistedResourceClaim[];
   readonly claim_set_generation: number;
   readonly registry_revision: number;
@@ -1341,9 +1342,9 @@ export class SessionRegistry {
   }
 
   /**
-   * Explicitly materialize a claim section or upgrade its semantics. A v1
+   * Explicitly materialize a claim section or upgrade its semantics. A v2
    * claim registry is intentionally unreadable through ordinary operations;
-   * only this locked, explicit migration rewrites it as v2.
+   * only this locked, explicit migration rewrites legacy claims as v3.
    */
   migrate(): RegistryMigrationResult {
     return this.withLock(() => {
@@ -8146,6 +8147,9 @@ export function toPersistedResourceClaim(
     worktree_path: validated.worktreePath,
     resource: validated.resource,
     mode: validated.mode,
+    ...(validated.sharing === undefined
+      ? {}
+      : { sharing: { kind: validated.sharing.kind, group_id: validated.sharing.groupId } }),
     created_at: validated.createdAt,
     updated_at: validated.updatedAt,
   };
@@ -8380,7 +8384,7 @@ function parseResourceClaim(
       "created_at",
       "updated_at",
     ],
-    [],
+    expectedSchemaVersion === RESOURCE_CLAIM_SCHEMA_VERSION ? ["sharing"] : [],
     index,
   );
   if (value.schema_version !== expectedSchemaVersion) {
@@ -8390,6 +8394,7 @@ function parseResourceClaim(
       { schemaVersion: value.schema_version as number, index, expectedSchemaVersion },
     );
   }
+  const isLegacy = expectedSchemaVersion === LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
   const claim: ResourceClaim = {
     schemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
     claimId: requireString(value.claim_id, index, "claim_id"),
@@ -8398,13 +8403,22 @@ function parseResourceClaim(
     worktreePath: requireString(value.worktree_path, index, "worktree_path"),
     resource: requireString(value.resource, index, "resource"),
     mode: requireClaimMode(value.mode, index),
+    ...(isLegacy || value.sharing === undefined ? {} : { sharing: parsePersistedSharing(value.sharing, index) }),
     createdAt: requireString(value.created_at, index, "created_at"),
     updatedAt: requireString(value.updated_at, index, "updated_at"),
   };
-  return validateResourceClaim(claim, expectedRepositoryId, index);
+  if (claim.sharing !== undefined && claim.mode !== "write") {
+    throw invalidRecord(index, "claim sharing requires write mode");
+  }
+  return validateResourceClaim(claim, expectedRepositoryId, index, isLegacy);
 }
 
-function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: string, index?: number): ResourceClaim {
+function validateResourceClaim(
+  claim: ResourceClaim,
+  expectedRepositoryId: string,
+  index?: number,
+  legacySchema = false,
+): ResourceClaim {
   const position = index === undefined ? "" : ` at index ${index}`;
   if (claim.schemaVersion !== RESOURCE_CLAIM_SCHEMA_VERSION) {
     throw new SessionRegistryError("UNSUPPORTED_CLAIM_SCHEMA_VERSION", `Unsupported claim schema version${position}`, {
@@ -8425,7 +8439,9 @@ function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: strin
     throw invalidRecord(index, `claim worktree_path must be an absolute canonical path${position}`);
   }
   assertCanonicalClaimResource(claim.resource);
-  if (claim.claimId !== canonicalClaimId(claim.sessionId, claim.resource, claim.mode)) {
+  const expectedClaimId = canonicalClaimId(claim.sessionId, claim.resource, claim.mode, claim.sharing);
+  const legacyClaimId = canonicalClaimId(claim.sessionId, claim.resource, claim.mode);
+  if (claim.claimId !== (legacySchema ? legacyClaimId : expectedClaimId)) {
     throw invalidRecord(index, `claim_id is not the canonical claim identity${position}`);
   }
   if (!isTimestamp(claim.createdAt) || !isTimestamp(claim.updatedAt)) {
@@ -8435,6 +8451,19 @@ function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: strin
     throw invalidRecord(index, `claim updated_at cannot precede created_at${position}`);
   }
   return Object.freeze({ ...claim });
+}
+
+function parsePersistedSharing(value: unknown, index: number): ResourceClaim["sharing"] {
+  if (
+    !isRecord(value) ||
+    value.kind !== "isolated-worktree" ||
+    typeof value.group_id !== "string" ||
+    value.group_id.length === 0 ||
+    value.group_id.length > 128
+  ) {
+    throw invalidRecord(index, "claim sharing is invalid");
+  }
+  return { kind: "isolated-worktree", groupId: value.group_id };
 }
 
 function validateRegistryClaims(

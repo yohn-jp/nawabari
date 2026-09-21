@@ -290,10 +290,10 @@ test("migrates a v0.1.0 registry to the canonical claim section", () => {
     assert.deepEqual(migration, {
       migrated: true,
       registrySchemaVersion: 1,
-      claimSchemaVersion: 2,
+      claimSchemaVersion: 3,
     });
     const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as PersistedRegistry;
-    assert.equal(persisted.claims_schema_version, 2);
+    assert.equal(persisted.claims_schema_version, 3);
     assert.deepEqual(persisted.claims, []);
     assert.equal(registry.get(session.sessionId)?.sessionId, session.sessionId);
   } finally {
@@ -311,23 +311,23 @@ test("requires explicit migration before interpreting v1 claim semantics", () =>
       claims_schema_version: number;
       claims: Array<{ schema_version: number }>;
     };
-    legacy.claims_schema_version = 1;
-    for (const claim of legacy.claims) claim.schema_version = 1;
+    legacy.claims_schema_version = 2;
+    for (const claim of legacy.claims) claim.schema_version = 2;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     assertRegistryError(() => registry.listClaims(), "UNSUPPORTED_CLAIM_SCHEMA_VERSION");
     assert.deepEqual(registry.migrate(), {
       migrated: true,
       registrySchemaVersion: 1,
-      claimSchemaVersion: 2,
+      claimSchemaVersion: 3,
     });
     assert.equal(registry.listClaims()[0]?.mode, "read");
     const migrated = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
       claims_schema_version: number;
       claims: Array<{ schema_version: number }>;
     };
-    assert.equal(migrated.claims_schema_version, 2);
-    assert.equal(migrated.claims[0]?.schema_version, 2);
+    assert.equal(migrated.claims_schema_version, 3);
+    assert.equal(migrated.claims[0]?.schema_version, 3);
   } finally {
     fixture.cleanup();
   }
@@ -343,8 +343,8 @@ test("migration rejects ambiguous legacy claims without rewriting them", () => {
       claims_schema_version: number;
       claims: Array<Record<string, unknown>>;
     };
-    legacy.claims_schema_version = 1;
-    legacy.claims[0] = { ...legacy.claims[0], schema_version: 1, resource: "../escape" };
+    legacy.claims_schema_version = 2;
+    legacy.claims[0] = { ...legacy.claims[0], schema_version: 2, resource: "../escape" };
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     assert.throws(
@@ -362,8 +362,8 @@ test("migration rejects ambiguous legacy claims without rewriting them", () => {
       claims_schema_version: number;
       claims: Array<{ schema_version: number; resource: string }>;
     };
-    assert.equal(stillLegacy.claims_schema_version, 1);
-    assert.equal(stillLegacy.claims[0]?.schema_version, 1);
+    assert.equal(stillLegacy.claims_schema_version, 2);
+    assert.equal(stillLegacy.claims[0]?.schema_version, 2);
     assert.equal(stillLegacy.claims[0]?.resource, "../escape");
   } finally {
     fixture.cleanup();
@@ -387,15 +387,15 @@ test("migration rejects v1 overlaps that are incompatible under legacy semantics
       claims_schema_version: number;
       claims: Array<{ schema_version: number }>;
     };
-    legacy.claims_schema_version = 1;
-    for (const claim of legacy.claims) claim.schema_version = 1;
+    legacy.claims_schema_version = 2;
+    for (const claim of legacy.claims) claim.schema_version = 2;
     fs.writeFileSync(firstRegistry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     assertRegistryError(() => firstRegistry.migrate(), "RESOURCE_CLAIM_CONFLICT");
     const stillLegacy = JSON.parse(fs.readFileSync(firstRegistry.paths.registry, "utf8")) as {
       claims_schema_version: number;
     };
-    assert.equal(stillLegacy.claims_schema_version, 1);
+    assert.equal(stillLegacy.claims_schema_version, 2);
   } finally {
     fixture.cleanup();
   }
@@ -411,8 +411,8 @@ test("migration retry converges after a post-rename durability-uncertain failure
       claims_schema_version: number;
       claims: Array<{ schema_version: number }>;
     };
-    legacy.claims_schema_version = 1;
-    for (const claim of legacy.claims) claim.schema_version = 1;
+    legacy.claims_schema_version = 2;
+    for (const claim of legacy.claims) claim.schema_version = 2;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     assertRegistryError(
@@ -423,9 +423,9 @@ test("migration retry converges after a post-rename durability-uncertain failure
     assert.deepEqual(retried, {
       migrated: false,
       registrySchemaVersion: 1,
-      claimSchemaVersion: 2,
+      claimSchemaVersion: 3,
     });
-    assert.equal(registry.listClaims()[0]?.schemaVersion, 2);
+    assert.equal(registry.listClaims()[0]?.schemaVersion, 3);
   } finally {
     fixture.cleanup();
   }
