@@ -67,12 +67,13 @@ import {
   type StatusResult,
   type UpdateClaimsOptions,
 } from "./session.js";
-import type { SandboxGitIdentity } from "./sandbox.js";
+import type { SandboxGitIdentity, SandboxProbe } from "./sandbox.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
   /** Minimal host Git identity projected into governed commit operations. */
   readonly gitIdentity?: SandboxGitIdentity;
+  readonly sandboxProbe?: SandboxProbe;
   readonly registry?: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
 }
 
@@ -174,11 +175,13 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
 export class LocalSessionBackend implements SessionBackend {
   private readonly git: SessionRegistryOptions["git"];
   private readonly gitIdentity: SandboxGitIdentity | undefined;
+  private readonly sandboxProbe: SandboxProbe | undefined;
   private readonly registryOptions: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
 
   public constructor(options: LocalSessionBackendOptions = {}) {
     this.git = options.git;
     this.gitIdentity = options.gitIdentity;
+    this.sandboxProbe = options.sandboxProbe;
     this.registryOptions = options.registry ?? {};
   }
 
@@ -626,6 +629,7 @@ export class LocalSessionBackend implements SessionBackend {
       cwd: context.cwd,
       git: this.git,
       gitIdentity: this.gitIdentity,
+      sandboxProbe: this.sandboxProbe,
     });
   }
 }
@@ -1291,6 +1295,7 @@ function toDomainClaim(claim: RegistryResourceClaim): ResourceClaim {
 }
 
 function toDomainError(error: unknown, fallbackCode?: ErrorCode): DomainError {
+  if (error instanceof DomainError) return error;
   if (!isSessionRegistryError(error)) {
     const cause = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     return new DomainError(

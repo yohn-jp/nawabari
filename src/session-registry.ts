@@ -63,6 +63,8 @@ import {
   substituteProfileParameters,
 } from "./domain/worktree-profile-catalog.js";
 import { pinWorktreeProfile, type PinnedWorktreeProfile } from "./domain/worktree-profile-pinning.js";
+import { DomainError } from "./domain/errors.js";
+import { sandboxDoctorReport, type SandboxProbe } from "./domain/sandbox.js";
 import {
   assertCanonicalClaimResource,
   canonicalClaimId,
@@ -935,6 +937,8 @@ export interface SessionRegistryOptions {
   readonly protectedWorktreePaths?: readonly string[];
   readonly worktreeRoot?: string;
   readonly staleAfterMs?: number;
+  /** Capability authority used to gate profiles requiring managed execution. */
+  readonly sandboxProbe?: SandboxProbe;
 }
 
 export interface RegistryPaths {
@@ -1053,6 +1057,7 @@ export class SessionRegistry {
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
   private readonly lock: RepositoryLock;
+  private readonly sandboxProbe: SandboxProbe | undefined;
 
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
@@ -1080,6 +1085,7 @@ export class SessionRegistry {
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
     this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
+    this.sandboxProbe = options.sandboxProbe;
 
     if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0) {
       throw new RangeError("lockTimeoutMs must be a non-negative safe integer");
@@ -1755,6 +1761,16 @@ export class SessionRegistry {
       const sessionId = generateUniqueSessionId(state.sessions, this.idGenerator);
       const resources = this.resolveProvisioningResources(options, sessionId);
       const pinnedProfile = this.resolvePinnedProfile(options.profile, resources.baseRevision);
+      if (pinnedProfile?.resolved.execution.processTracking === "required") {
+        const doctor = sandboxDoctorReport(this.sandboxProbe);
+        if (!doctor.ready) {
+          throw new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "Managed execution capability is unavailable.", {
+            platform: doctor.platform,
+            platform_supported: doctor.platform_supported,
+            missing_required: doctor.missing_required,
+          });
+        }
+      }
       const workingSet = this.composeProvisionedWorkingSet(options, resources);
       const timestamp = toTimestamp(this.clock());
       const record = freezeSessionRecord({
