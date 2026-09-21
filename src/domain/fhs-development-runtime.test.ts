@@ -218,7 +218,7 @@ test("FHS candidate ordering is deterministic and selection is independent of PA
     const productionLayout = discoverSandboxRuntimeLayout(environmentWithFhsEvidence(fixture.candidates));
     assert.deepEqual(
       productionLayout.fhs_executable_candidates?.map((candidate) => candidate.requirement_id),
-      ["git-package", "landlock-helper", "ls-runtime", "node-runtime", "pnpm-package"],
+      ["bash-runtime", "git-package", "landlock-helper", "ls-runtime", "node-runtime", "pnpm-package"],
     );
     const materialized = resolveFhsDevelopmentRuntime({
       executable_candidates: productionLayout.fhs_executable_candidates,
