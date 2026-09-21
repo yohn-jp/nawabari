@@ -89,6 +89,46 @@ test("metadata preview is deterministic and carries generation, heads, and token
   }
 });
 
+test("classifies a one-sided modification as clean instead of a conflict", () => {
+  const fixture = createFixture();
+  try {
+    claimBoth(fixture);
+    fs.writeFileSync(path.join(fixture.root, "tracked.txt"), "left-only\n");
+
+    const result = previewCoordination(fixture.registry, {
+      left: fixture.left.sessionId,
+      right: fixture.right.sessionId,
+      path: "tracked.txt",
+    });
+
+    assert.equal(result.outcome, "clean");
+    assert.equal(result.decision?.kind, "left-only");
+    assert.equal(result.unknown, false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("classifies a one-sided deletion as clean instead of delete/modify", () => {
+  const fixture = createFixture();
+  try {
+    claimBoth(fixture);
+    fs.rmSync(path.join(fixture.root, "tracked.txt"));
+
+    const result = previewCoordination(fixture.registry, {
+      left: fixture.left.sessionId,
+      right: fixture.right.sessionId,
+      path: "tracked.txt",
+    });
+
+    assert.equal(result.outcome, "clean");
+    assert.equal(result.decision?.kind, "left-only");
+    assert.equal(result.unknown, false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("explicit read authority exposes only the bounded merge preview", () => {
   const fixture = createFixture();
   try {

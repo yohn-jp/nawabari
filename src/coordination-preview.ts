@@ -1,6 +1,7 @@
 import {
   observeCoordinationInputs,
   readCoordinationBlobState,
+  type CoordinationBlobSide,
   type CoordinationObservationToken,
   type CoordinationPathEvidence,
   type CoordinationSessionObservation,
@@ -255,7 +256,14 @@ export function previewCoordination(
 
   const leftPath = pathEvidence(left, observedPath);
   const rightPath = pathEvidence(right, observedPath);
-  const base = mergePathState(leftPath.base);
+  const baseEvidence = readBaseEvidence(
+    left,
+    observedPath,
+    bounds.maxContentBytes,
+    git,
+    includePatch && readAuthorized,
+  );
+  const base = mergeBlobSide(baseEvidence, null);
   const leftState = mergePathState(leftPath, includePatch && readAuthorized ? leftPath.blob.worktree.content : null);
   const rightState = mergePathState(rightPath, includePatch && readAuthorized ? rightPath.blob.worktree.content : null);
   let decision = classifyThreeWayPath(base, leftState, rightState);
@@ -478,33 +486,51 @@ function pathEvidence(session: CoordinationSessionObservation, resource: string)
 }
 
 function mergePathState(
-  value: CoordinationPathEvidence["base"] | CoordinationPathEvidence,
+  value: CoordinationPathEvidence,
   content: { readonly bytes: string; readonly byteLength: number } | null = null,
 ): MergePathInput {
-  if (value === null) return null;
-  if ("blob" in value) {
-    const side = value.blob.worktree;
-    const exists = side.state !== "missing" && side.state !== "unavailable";
-    const kind =
-      side.state === "binary"
-        ? "binary"
-        : side.state === "gitlink"
-          ? "submodule"
-          : side.state === "directory"
-            ? "directory"
-            : side.state === "regular" || side.state === "untracked"
-              ? "regular"
-              : "unknown";
-    return {
-      exists,
-      mode: side.mode,
-      type: side.type,
-      kind,
-      sha: side.contentHash,
-      content: decodeContent(content),
-    };
-  }
-  return { exists: true, mode: value.mode, type: value.type, sha: value.sha };
+  return mergeBlobSide(value.blob.worktree, content);
+}
+
+function mergeBlobSide(
+  side: CoordinationBlobSide | null,
+  content: { readonly bytes: string; readonly byteLength: number } | null,
+): MergePathInput {
+  if (side === null || side.state === "missing") return null;
+  const kind =
+    side.state === "binary"
+      ? "binary"
+      : side.state === "gitlink"
+        ? "submodule"
+        : side.state === "directory"
+          ? "directory"
+          : side.state === "regular" || side.state === "untracked"
+            ? "regular"
+            : "unknown";
+  return {
+    exists: true,
+    mode: side.mode,
+    type: side.type,
+    kind,
+    sha: side.contentHash,
+    content: decodeContent(content),
+  };
+}
+
+function readBaseEvidence(
+  session: CoordinationSessionObservation,
+  resource: string,
+  maxContentBytes: number,
+  git: GitCommandRunner,
+  includeContent: boolean,
+): CoordinationBlobSide | null {
+  if (session.baseRevision === null) return null;
+  const blob = readCoordinationBlobState(git, session.worktreePath, session.baseRevision, resource, {
+    maxContentBytes,
+    includeContent,
+    operatorAuthorized: includeContent,
+  });
+  return blob.revisionBlob;
 }
 
 function decodeContent(content: { readonly bytes: string; readonly byteLength: number } | null): Uint8Array | null {
