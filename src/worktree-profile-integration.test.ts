@@ -132,6 +132,36 @@ test("builtin list/show/create and omitted profile bootstrap use explicit namesp
   }
 });
 
+test("omitted profile create bypasses a malformed catalog and preserves backend base validation", async () => {
+  const repository = createRepository(undefined);
+  try {
+    fs.writeFileSync(path.join(repository.root, "nawabari.profiles.json"), "{invalid");
+    git(repository.root, ["add", "nawabari.profiles.json"]);
+    git(repository.root, ["commit", "-m", "malformed catalog"]);
+
+    let observed: SessionCreateOptions | null = null;
+    const backend = {
+      createSession: async (_context: unknown, options: SessionCreateOptions) => {
+        observed = options;
+        return success(session());
+      },
+    };
+    const output = capture();
+    assert.equal(
+      await runCli(["--json", "session", "create", "--base", "invalid-base"], {
+        cwd: repository.root,
+        backend: backend as unknown as SessionBackend,
+        io: output.io,
+      }),
+      0,
+    );
+    assert.equal((observed as SessionCreateOptions | null)?.base, "invalid-base");
+    assert.equal((observed as SessionCreateOptions | null)?.profile, undefined);
+  } finally {
+    repository.cleanup();
+  }
+});
+
 test("repository list/show preserves source identity and create fails closed before backend", async () => {
   const profile = repositoryProfile("repository-profile");
   const repository = createRepository({ profiles: [profile] });

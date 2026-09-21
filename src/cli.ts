@@ -1803,16 +1803,19 @@ async function executeCommand(
       ];
       const profileOptions = parseWorktreeProfileOptions(profileArgs);
       if (!profileOptions.ok) return profileOptions;
-      const sources = profileSources(dependencies.cwd, parsed.value.base);
-      if (!sources.ok) return sources;
-      const profileResolution = resolveWorktreeProfileSessionCreate(
-        {
-          command: "session create",
-          profile: profileOptions.value.profile,
-          parameters: profileOptions.value.parameters,
-        },
-        sources.value,
-      );
+      const profileRequest = {
+        command: "session create" as const,
+        profile: profileOptions.value.profile,
+        parameters: profileOptions.value.parameters,
+      };
+      let profileResolution: ReturnType<typeof resolveWorktreeProfileSessionCreate>;
+      if (profileOptions.value.profile === null) {
+        profileResolution = resolveWorktreeProfileSessionCreate(profileRequest, {});
+      } else {
+        const sources = profileSources(dependencies.cwd, parsed.value.base);
+        if (!sources.ok) return sources;
+        profileResolution = resolveWorktreeProfileSessionCreate(profileRequest, sources.value);
+      }
       if (!profileResolution.ok) return profileResolution;
       const profileReady = requireWorktreeProfileReady(profileResolution.value);
       if (!profileReady.ok) return profileReady;
