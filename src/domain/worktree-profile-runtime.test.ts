@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -236,6 +237,58 @@ test("entrypoint selection matches exact provider identity and serialization use
     assert.equal(serialized.ok, true, serialized.ok ? "" : JSON.stringify(serialized.error));
     if (!serialized.ok) return;
     assert.deepEqual(Object.keys(JSON.parse(serialized.value) as object), [RUNTIME_RESOLUTION_SERIALIZATION_KEY]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("declared material is selected by provider id and exact requirement identity", () => {
+  const fixture = candidateFixture();
+  const executable = path.join(fixture.root, "declared-node");
+  try {
+    fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const stat = fs.statSync(executable, { bigint: true });
+    const evidence = {
+      source: executable,
+      digest: createHash("sha256").update(fs.readFileSync(executable)).digest("hex"),
+      identity: { dev: stat.dev.toString(10), ino: stat.ino.toString(10) },
+    };
+    const result = resolveWorktreeProfileRuntime(
+      profile([{ entrypoint: "node", provider: { id: "declared-node", requirement_id: "node-runtime" } }]),
+      fixture.layout,
+      {
+        platform: "linux",
+        nix: { store_root: fixture.store, command_runner: fixture.runner },
+        declared_materials: [
+          {
+            id: "declared-node",
+            requirement_id: "node-runtime",
+            version: ">=24",
+            entrypoint: "node",
+            executable: evidence,
+            source_closure: [evidence],
+          },
+        ],
+      },
+    );
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (!result.ok) return;
+    assert.deepEqual(
+      result.value.projection.executables.map((entrypoint) => entrypoint.provider),
+      [{ id: "declared-node", requirement_id: "node-runtime" }],
+    );
+    assert.equal(
+      result.value.projection.filesystem.some((entry) => entry.source === executable),
+      true,
+    );
+
+    const duplicate = resolveWorktreeProfileRuntime(profile(), fixture.layout, {
+      platform: "linux",
+      nix: { store_root: fixture.store, command_runner: fixture.runner },
+      declared_materials: [{ id: "duplicate" }, { id: "duplicate" }],
+    });
+    assert.equal(duplicate.ok, false);
+    if (!duplicate.ok) assert.equal(duplicate.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
   } finally {
     fixture.cleanup();
   }

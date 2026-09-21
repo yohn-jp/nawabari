@@ -1,14 +1,39 @@
 import { createHash } from "node:crypto";
 import type { JsonObject } from "./errors.js";
+import {
+  BUILTIN_WORKTREE_PROFILE_IDS,
+  getBuiltinWorktreeProfile,
+  type BuiltinWorktreeProfileId,
+} from "./worktree-profile-builtins.js";
 import { validateWorktreeRuntimeProfile, type ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 
 export const PINNED_WORKTREE_PROFILE_SCHEMA_VERSION = 1 as const;
 export const PINNED_WORKTREE_PROFILE_SERIALIZATION_KEY = "pinned-worktree-profile" as const;
 
+export type RepositoryWorktreeProfileCatalogSource = Readonly<{
+  readonly kind: "repository";
+  readonly path: "nawabari.profiles.json";
+  readonly blob_oid: string;
+}>;
+
+export type BuiltinWorktreeProfileCatalogSource = Readonly<{
+  readonly kind: "builtin";
+  readonly id: BuiltinWorktreeProfileId;
+  readonly revision: string;
+}>;
+
+/** Schema-v1 repository provenance accepted only while parsing old pins. */
+export type LegacyRepositoryWorktreeProfileCatalogSource = Readonly<{
+  readonly path: "nawabari.profiles.json";
+  readonly blob_oid: string;
+}>;
+
+export type WorktreeProfileCatalogSource = RepositoryWorktreeProfileCatalogSource | BuiltinWorktreeProfileCatalogSource;
+
 export type PinnedWorktreeProfileProvenance = Readonly<{
   repository: Readonly<{ id: string; revision: string }>;
   base: Readonly<{ revision: string }>;
-  catalog: Readonly<{ path: string; blob_oid: string }>;
+  catalog: WorktreeProfileCatalogSource | LegacyRepositoryWorktreeProfileCatalogSource;
   selection: Readonly<{ profile: string; parameters: JsonObject }>;
 }>;
 
@@ -36,6 +61,13 @@ function stable(value: unknown): string {
       .map((key) => `${JSON.stringify(key)}:${stable(value[key])}`)
       .join(",")}}`;
   return JSON.stringify(value);
+}
+
+/** SHA-256 identity of the validated canonical built-in declaration. */
+export function builtinWorktreeProfileRevision(id: string): string {
+  const profile = getBuiltinWorktreeProfile(id);
+  if (!profile.ok) throw profile.error;
+  return createHash("sha256").update(stable(profile.value), "utf8").digest("hex");
 }
 
 function digestInput(resolved: ResolvedWorktreeRuntimeProfile, provenance: PinnedWorktreeProfileProvenance): string {
@@ -85,6 +117,28 @@ export function parsePinnedProfileRecord(input: unknown): PinnedWorktreeProfile 
 }
 
 function assertProvenance(value: PinnedWorktreeProfileProvenance): void {
+  const catalog = (value && record(value) && record(value.catalog) ? value.catalog : undefined) as
+    RecordValue | undefined;
+  const validBuiltin =
+    record(catalog) &&
+    catalog.kind === "builtin" &&
+    typeof catalog.id === "string" &&
+    BUILTIN_WORKTREE_PROFILE_IDS.includes(catalog.id as BuiltinWorktreeProfileId) &&
+    typeof catalog.revision === "string" &&
+    SHA256.test(catalog.revision) &&
+    builtinWorktreeProfileRevision(catalog.id) === catalog.revision;
+  const validRepository =
+    record(catalog) &&
+    catalog.kind === "repository" &&
+    catalog.path === "nawabari.profiles.json" &&
+    typeof catalog.blob_oid === "string" &&
+    FULL_OID.test(catalog.blob_oid);
+  const validLegacyRepository =
+    record(catalog) &&
+    catalog.kind === undefined &&
+    catalog.path === "nawabari.profiles.json" &&
+    typeof catalog.blob_oid === "string" &&
+    FULL_OID.test(catalog.blob_oid);
   if (
     !record(value) ||
     !record(value.repository) ||
@@ -92,14 +146,16 @@ function assertProvenance(value: PinnedWorktreeProfileProvenance): void {
     !FULL_OID.test(value.repository.revision) ||
     !record(value.base) ||
     !FULL_OID.test(value.base.revision) ||
-    !record(value.catalog) ||
-    value.catalog.path !== "nawabari.profiles.json" ||
-    !FULL_OID.test(value.catalog.blob_oid) ||
+    !(validBuiltin || validRepository || validLegacyRepository) ||
     !record(value.selection) ||
     typeof value.selection.profile !== "string" ||
     !record(value.selection.parameters)
   )
     throw new Error("Invalid pinned worktree profile provenance");
+
+  if (validBuiltin && value.selection.profile !== catalog.id) {
+    throw new Error("Built-in worktree profile selection does not match its provenance");
+  }
 }
 
 function clone<T>(value: T): T {

@@ -51,6 +51,16 @@ import {
   STRICT_RUNTIME_POLICY,
   type RuntimePolicyMode,
 } from "./domain/runtime-projection.js";
+import { validateWorktreeProfileCatalog, type WorktreeProfileCatalog } from "./domain/worktree-profile-catalog.js";
+import { defaultGit, resolveRepositoryContext } from "./git.js";
+import {
+  parseWorktreeProfileCliArguments,
+  parseWorktreeProfileOptions,
+  requireWorktreeProfileReady,
+  resolveWorktreeProfileCliRequest,
+  resolveWorktreeProfileSessionCreate,
+} from "./worktree-profile-cli.js";
+import type { WorktreeProfileCliSources } from "./worktree-profile-cli.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -87,6 +97,8 @@ export type { CliCommandDefinition, CliHelpOptionSpec } from "./cli-command-regi
 export const DISPATCHER_COMMAND_INVENTORY = [
   "session create",
   "session id",
+  "profile list",
+  "profile show",
   "session show",
   "session inspect",
   "session scope expand",
@@ -132,6 +144,8 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
     "--worktree-root",
     "--base",
     "--label",
+    "--profile",
+    "--profile-parameter",
     "--resource",
     "--mode",
     "--auxiliary-state",
@@ -139,6 +153,8 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
     "--candidate-working-set-file",
   ],
   "session id": [],
+  "profile list": [],
+  "profile show": ["--profile"],
   "session show": ["--session"],
   "session inspect": ["--session", "--integrated-revision", "--schema-version"],
   "session scope expand": [
@@ -422,6 +438,8 @@ type ParsedOptions = {
   worktree_root: string | null;
   base: string | null;
   label: string | null;
+  profile: string | null;
+  profile_parameter: string | null;
   auxiliary_states: unknown[];
   resource: string | null;
   resources: string[];
@@ -532,6 +550,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     worktree_root: null,
     base: null,
     label: null,
+    profile: null,
+    profile_parameter: null,
     auxiliary_states: [],
     resource: null,
     resources: [],
@@ -635,7 +655,19 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--worktree-root") options.worktree_root = value;
     else if (name === "--base") options.base = value;
     else if (name === "--label") options.label = value;
-    else if (name === "--auxiliary-state") {
+    else if (name === "--profile") {
+      if (options.profile !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--profile may be supplied only once.", { option: name }));
+      }
+      options.profile = value;
+    } else if (name === "--profile-parameter") {
+      if (options.profile_parameter !== null) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--profile-parameter may be supplied only once.", { option: name }),
+        );
+      }
+      options.profile_parameter = value;
+    } else if (name === "--auxiliary-state") {
       try {
         options.auxiliary_states.push(JSON.parse(value) as unknown);
       } catch (error: unknown) {
@@ -747,6 +779,8 @@ type ClaimReplacementPairs = {
   worktree_root: string | null;
   base: string | null;
   label: string | null;
+  profile: string | null;
+  profile_parameter: string | null;
   auxiliary_states: unknown[];
   execution_scope_file: string | null;
   candidate_working_set_file: string | null;
@@ -1164,6 +1198,8 @@ function parseClaimReplacementPairs(
   let worktreeRoot: string | null = null;
   let base: string | null = null;
   let label: string | null = null;
+  let profile: string | null = null;
+  let profileParameter: string | null = null;
   const auxiliaryStates: unknown[] = [];
   let executionScopeFile: string | null = null;
   let candidateWorkingSetFile: string | null = null;
@@ -1219,7 +1255,19 @@ function parseClaimReplacementPairs(
     else if (name === "--worktree-root") worktreeRoot = value;
     else if (name === "--base") base = value;
     else if (name === "--label") label = value;
-    else if (name === "--auxiliary-state") {
+    else if (name === "--profile") {
+      if (profile !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--profile may be supplied only once.", { option: name }));
+      }
+      profile = value;
+    } else if (name === "--profile-parameter") {
+      if (profileParameter !== null) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--profile-parameter may be supplied only once.", { option: name }),
+        );
+      }
+      profileParameter = value;
+    } else if (name === "--auxiliary-state") {
       try {
         auxiliaryStates.push(JSON.parse(value) as unknown);
       } catch (error: unknown) {
@@ -1277,6 +1325,8 @@ function parseClaimReplacementPairs(
       worktree_root: worktreeRoot,
       base,
       label,
+      profile,
+      profile_parameter: profileParameter,
       auxiliary_states: auxiliaryStates,
       execution_scope_file: executionScopeFile,
       candidate_working_set_file: candidateWorkingSetFile,
@@ -1397,6 +1447,78 @@ function boundedEvidenceInteger(
 
 function sessionContext(cwd: string): SessionContext {
   return { cwd };
+}
+
+function boundedProfileGitReason(error: unknown): string {
+  return error instanceof Error ? error.message.slice(0, 200) : "unknown";
+}
+
+function profileSources(cwd: string, base: string | null = null): DomainResult<WorktreeProfileCliSources> {
+  let repository: ReturnType<typeof resolveRepositoryContext>;
+  try {
+    repository = resolveRepositoryContext({ cwd });
+  } catch (error: unknown) {
+    return failure(
+      new DomainError("RUNTIME_PROFILE_INVALID", "The repository profile catalog context could not be resolved.", {
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
+  }
+
+  let revision: string;
+  try {
+    revision = defaultGit.run(["rev-parse", "--verify", `${base ?? "HEAD"}^{commit}`], repository.worktreePath);
+  } catch (error: unknown) {
+    return failure(
+      new DomainError("RUNTIME_PROFILE_INVALID", "The profile catalog base revision could not be resolved.", {
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
+  }
+
+  let catalogPath: string;
+  try {
+    catalogPath = defaultGit.run(
+      ["ls-tree", "--name-only", revision, "--", "nawabari.profiles.json"],
+      repository.worktreePath,
+    );
+  } catch (error: unknown) {
+    return failure(
+      new DomainError("RUNTIME_PROFILE_INVALID", "The repository profile catalog presence could not be determined.", {
+        path: "nawabari.profiles.json",
+        revision,
+        reason: boundedProfileGitReason(error),
+      }),
+    );
+  }
+  if (catalogPath.length === 0) return { ok: true, value: {} };
+
+  let text: string;
+  try {
+    text = defaultGit.run(["show", `${revision}:nawabari.profiles.json`], repository.worktreePath);
+  } catch (error: unknown) {
+    return failure(
+      new DomainError("RUNTIME_PROFILE_INVALID", "The repository profile catalog could not be read.", {
+        path: "nawabari.profiles.json",
+        revision,
+        reason: boundedProfileGitReason(error),
+      }),
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch (error: unknown) {
+    return failure(
+      new DomainError("RUNTIME_PROFILE_INVALID", "The repository profile catalog contains invalid JSON.", {
+        path: "nawabari.profiles.json",
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
+  }
+  const catalog = validateWorktreeProfileCatalog(parsed);
+  return catalog.ok ? { ok: true, value: { repository: catalog.value } } : failure(catalog.error);
 }
 
 async function resolveSelectedSession(
@@ -1553,6 +1675,17 @@ async function executeCommand(
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
 
+  if (command === "profile") {
+    const parsed = parseWorktreeProfileCliArguments(
+      [command, subcommand, ...rest].filter((value): value is string => value !== undefined),
+    );
+    if (!parsed.ok) return parsed;
+    const sources = profileSources(dependencies.cwd);
+    if (!sources.ok) return sources;
+    const resolved = resolveWorktreeProfileCliRequest(parsed.value, sources.value);
+    return resolved.ok ? { ok: true, value: resolved.value as unknown as JsonObject } : resolved;
+  }
+
   if (command === "session") {
     if (subcommand === undefined) {
       return failure(usageError("MISSING_ARGUMENT", "session requires a subcommand."));
@@ -1664,6 +1797,25 @@ async function executeCommand(
     if (subcommand === "create") {
       const parsed = parseClaimReplacementPairs(rest, false, "session create", false);
       if (!parsed.ok) return parsed;
+      const profileArgs = [
+        ...(parsed.value.profile === null ? [] : ["--profile", parsed.value.profile]),
+        ...(parsed.value.profile_parameter === null ? [] : ["--profile-parameter", parsed.value.profile_parameter]),
+      ];
+      const profileOptions = parseWorktreeProfileOptions(profileArgs);
+      if (!profileOptions.ok) return profileOptions;
+      const sources = profileSources(dependencies.cwd, parsed.value.base);
+      if (!sources.ok) return sources;
+      const profileResolution = resolveWorktreeProfileSessionCreate(
+        {
+          command: "session create",
+          profile: profileOptions.value.profile,
+          parameters: profileOptions.value.parameters,
+        },
+        sources.value,
+      );
+      if (!profileResolution.ok) return profileResolution;
+      const profileReady = requireWorktreeProfileReady(profileResolution.value);
+      if (!profileReady.ok) return profileReady;
       if (parsed.value.worktree !== null && parsed.value.worktree_root !== null) {
         return failure(usageError("INVALID_ARGUMENT", "--worktree and --worktree-root cannot be used together."));
       }
@@ -1707,6 +1859,14 @@ async function executeCommand(
           : { auxiliary_state: parsed.value.auxiliary_states as SessionCreateOptions["auxiliary_state"] }),
         ...(executionScope === undefined ? {} : { execution_scope: executionScope }),
         ...(candidateWorkingSet === undefined ? {} : { candidate_working_set: candidateWorkingSet }),
+        ...(profileResolution.value.profile === null
+          ? {}
+          : {
+              profile: {
+                selection: { profile: profileResolution.value.profile.reference },
+                parameters: profileResolution.value.profile.parameters,
+              },
+            }),
       };
       const result = await dependencies.backend.createSession(context, options);
       return result.ok ? { ok: true, value: result.value } : result;
@@ -2118,6 +2278,7 @@ async function executeCommand(
 
 function commandName(commandArguments: string[]): string {
   if (commandArguments[0] === "session") return commandArguments.slice(0, 2).join(" ");
+  if (commandArguments[0] === "profile") return commandArguments.slice(0, 2).join(" ");
   if (commandArguments[0] === "resource") {
     return commandArguments[1] === undefined ? "resource list" : commandArguments.slice(0, 2).join(" ");
   }

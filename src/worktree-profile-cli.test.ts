@@ -163,6 +163,32 @@ test("builtin readiness fails closed when selected material omits a declared exe
   if (!readiness.ok) assert.equal(readiness.error.code, "RUNTIME_MATERIALIZATION_MISSING");
 });
 
+test("repository readiness remains fail-closed while materialization is unknown", () => {
+  const resolution = resolveWorktreeProfileSessionCreate(
+    { command: "session create", profile: "repository:repository-profile", parameters: null },
+    { repository: repositoryProfile() },
+  );
+  assert.equal(resolution.ok, true);
+  if (!resolution.ok) return;
+  assert.notEqual(resolution.value.profile, null);
+  if (resolution.value.profile === null) return;
+  assert.equal(resolution.value.profile.availability, "unknown");
+  assert.equal(resolution.value.profile.ready, false);
+  const readiness = requireWorktreeProfileReady(resolution.value);
+  assert.equal(readiness.ok, false);
+  if (!readiness.ok) assert.equal(readiness.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+
+  const shown = showWorktreeProfile("repository:repository-profile", { repository: repositoryProfile() });
+  assert.equal(shown.ok, true);
+  if (shown.ok) {
+    assert.equal(shown.value.availability, "unknown");
+    assert.equal(shown.value.ready, false);
+    const showReadiness = requireWorktreeProfileReady(shown.value);
+    assert.equal(showReadiness.ok, false);
+    if (!showReadiness.ok) assert.equal(showReadiness.error.code, "RUNTIME_MATERIALIZATION_MISSING");
+  }
+});
+
 test("CLI and profile contract serializers use separate stable keys", () => {
   const response = listWorktreeProfiles();
   assert.equal(response.ok, true);
