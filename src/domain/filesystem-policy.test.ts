@@ -42,6 +42,8 @@ function workingSet(scope: Record<string, unknown>, revision = 4) {
 
 function policyInput(overrides: Record<string, unknown> = {}) {
   return {
+    repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+    worktreePath: WORKTREE_PATH,
     profile: {
       status: "applied",
       digest: PROFILE_DIGEST,
@@ -227,6 +229,64 @@ test("rename and unknown operations fail closed before scope matching", () => {
   const unknown = decideEffectivePathAccess({ policy, operation: "REPLACE" as never, path: "src/old.ts" });
   assert.equal(unknown.allowed, false);
   assert.equal(unknown.status, "deny");
+});
+
+test("effective working sets and claims are bound to the current repository and worktree", () => {
+  const foreignWorkingSet = workingSet({ readOnly: ["src/**"], write: [], create: [], delete: [] });
+  foreignWorkingSet.repository = { repositoryHost: "github.com", repositoryId: "foreign", repository: "foreign/repo" };
+  assert.equal(compileEffectiveFilesystemPolicy(policyInput({ working_set: foreignWorkingSet })).ok, false);
+
+  const foreignRepositoryClaim = claim("src/write.ts", "write");
+  foreignRepositoryClaim.repositoryId = "foreign";
+  assert.equal(compileEffectiveFilesystemPolicy(policyInput({ claims: [foreignRepositoryClaim] })).ok, false);
+
+  const foreignWorktreeClaim = claim("src/write.ts", "write");
+  foreignWorktreeClaim.worktreePath = "/tmp/foreign-worktree";
+  assert.equal(compileEffectiveFilesystemPolicy(policyInput({ claims: [foreignWorktreeClaim] })).ok, false);
+});
+
+test("runtime status is closed and all producer aliases reject conflicts", () => {
+  assert.equal(compileEffectiveFilesystemPolicy(policyInput({ runtime: { status: "not-a-status" } })).ok, false);
+  assert.equal(compileEffectiveFilesystemPolicy(policyInput({ runtime: "not-an-authority" })).ok, false);
+  assert.equal(
+    compileEffectiveFilesystemPolicy(
+      policyInput({
+        profile: { status: "applied", digest: PROFILE_DIGEST, filesystem: { readOnly: ["src/**"] } },
+        worktree_profile: { status: "applied", digest: "b".repeat(64), filesystem: { readOnly: ["src/**"] } },
+      }),
+    ).ok,
+    false,
+  );
+  assert.equal(
+    compileEffectiveFilesystemPolicy(
+      policyInput({ claims: policyInput().claims, resource_claims: [claim("src/other.ts", "read")] }),
+    ).ok,
+    false,
+  );
+  assert.equal(compileEffectiveFilesystemPolicy(policyInput({ runtime_epoch: 12, runtimeEpoch: 13 })).ok, false);
+});
+
+test("namespace selectors reject absolute dot segments and traversal aliases", () => {
+  assert.equal(
+    compileEffectiveFilesystemPolicy(
+      policyInput({
+        profile: {
+          status: "applied",
+          digest: PROFILE_DIGEST,
+          filesystem: { readOnly: [{ domain: "runtime", path: "/nix/./store/**" }] },
+        },
+      }),
+    ).ok,
+    false,
+  );
+  assert.equal(
+    compileEffectiveFilesystemPolicy(
+      policyInput({
+        backend_requirements: [{ operation: "CREATE", path: "/nix/store/../node" }],
+      }),
+    ).ok,
+    false,
+  );
 });
 
 test("serialization is canonical and rejects a changed policy identity", () => {
