@@ -105,6 +105,14 @@ test("proves covered selector containment instead of treating a narrower glob as
     evidence({ covered_scope: ["src/domain/**"], content_paths: ["src/domain/auxiliary-state-projection.ts"] }),
   );
   assert.equal(nested.ok, true, nested.ok ? "" : nested.error.message);
+
+  const segmentPrefix = validateAuxiliaryStatePolicy(
+    declaration(),
+    profile(),
+    evidence({ covered_scope: ["src-private/**"], content_paths: [] }),
+  );
+  assert.equal(segmentPrefix.ok, false);
+  if (!segmentPrefix.ok) assert.equal(segmentPrefix.error.code, "AUXILIARY_STATE_AMBIGUOUS");
 });
 
 test("index and Git evidence paths are concrete and cannot smuggle wildcard selectors", () => {
@@ -190,4 +198,25 @@ test("serialization accepts only the canonical closed projection", () => {
   });
   assert.equal(malformedProvenance.ok, false);
   if (!malformedProvenance.ok) assert.equal(malformedProvenance.error.code, "AUXILIARY_STATE_INVALID");
+
+  const processLocalDeclaration = serializeAuxiliaryStatePolicy({
+    ...result.value,
+    auxiliary: {
+      ...result.value.auxiliary,
+      declaration: {
+        ...result.value.auxiliary.declaration,
+        source: { kind: "repository-local", path: ".codegraph/logs" },
+      },
+      source_path: ".codegraph/logs",
+    },
+  });
+  assert.equal(processLocalDeclaration.ok, false);
+  if (!processLocalDeclaration.ok) assert.equal(processLocalDeclaration.error.code, "AUXILIARY_STATE_INVALID");
+
+  const mismatchedProducerRevision = serializeAuxiliaryStatePolicy({
+    ...result.value,
+    provenance: { ...result.value.provenance, revision: "b".repeat(40) },
+  });
+  assert.equal(mismatchedProducerRevision.ok, false);
+  if (!mismatchedProducerRevision.ok) assert.equal(mismatchedProducerRevision.error.code, "AUXILIARY_STATE_INVALID");
 });

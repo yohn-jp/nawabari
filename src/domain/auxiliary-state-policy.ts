@@ -398,7 +398,9 @@ function conservativeScopeSubset(covered: string, allowed: readonly string[]): b
     const prefix = covered.slice(0, -3);
     return allowed.some(
       (pattern) =>
-        pattern === covered || pattern === "**" || (pattern.endsWith("/**") && prefix.startsWith(pattern.slice(0, -3))),
+        pattern === covered ||
+        pattern === "**" ||
+        (pattern.endsWith("/**") && (prefix === pattern.slice(0, -3) || prefix.startsWith(`${pattern.slice(0, -3)}/`))),
     );
   }
   return false;
@@ -546,6 +548,9 @@ function parseProvenance(value: unknown): DomainResult<AuxiliaryStatePolicyProve
   if (!root.ok) return root;
   const provenanceRevision = revision(value.revision, "visibility.provenance.revision");
   if (!provenanceRevision.ok) return provenanceRevision;
+  if (provenanceRevision.value !== baseValue.value.revision) {
+    return invalid("visibility.provenance.revision", "does not match provenance.base.revision");
+  }
   if (typeof value.evidence_digest !== "string" || !/^[0-9a-f]{64}$/u.test(value.evidence_digest)) {
     return invalid("visibility.provenance.evidence_digest", "expected a SHA-256 hexadecimal digest");
   }
@@ -573,6 +578,9 @@ function validateVisibility(input: unknown): DomainResult<AuxiliaryStateVisibili
   if (!isRecord(input.auxiliary)) return invalid("visibility.auxiliary", "expected an auxiliary projection");
   const declaration = validateAuxiliaryStateDeclaration(input.auxiliary.declaration);
   if (!declaration.ok) return declaration;
+  if (processLocalPath(declaration.value.source.path) || processLocalPath(declaration.value.target.path)) {
+    return invalid("visibility.auxiliary.declaration", "process-local state is not durable auxiliary state");
+  }
   if (input.auxiliary.source_path !== declaration.value.source.path)
     return invalid("visibility.auxiliary.source_path", "does not match declaration");
   if (input.auxiliary.target_path !== declaration.value.target.path)
