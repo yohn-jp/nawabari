@@ -97,7 +97,16 @@ test("projects exclusive writer versus reader as a typed wait reason", () => {
     currentMode: "exclusive-write",
     releaseCondition: "owner-changes-claim",
   });
-  assert.equal(record?.nextActions[0]?.actionId, "wait-for-owner-release");
+  assert.deepEqual(record?.nextActions[0], {
+    actionId: "wait-for-owner-change",
+    kind: "wait",
+    resource: "src/a.ts",
+    ownerSessionId: "writer",
+    ownerClaimId: "writer-src/a.ts-exclusive-write",
+    requestedMode: "read",
+    currentMode: "exclusive-write",
+    releaseCondition: "owner-changes-claim",
+  });
 });
 
 test("an exclusive request against a reader requires release, not a mode change", () => {
@@ -116,6 +125,27 @@ test("an exclusive request against a reader requires release, not a mode change"
 
   assert.equal(snapshot.resources[0]?.blockers[0]?.kind, "claim-conflict");
   assert.equal(snapshot.resources[0]?.blockers[0]?.releaseCondition, "owner-releases-claim");
+  assert.equal(snapshot.resources[0]?.nextActions[0]?.actionId, "wait-for-owner-release");
+  assert.equal(snapshot.resources[0]?.nextActions[0]?.releaseCondition, "owner-releases-claim");
+});
+
+test("an exclusive request against a writer also requires release", () => {
+  const snapshot = projectResourceCoordinationSnapshot(
+    input({
+      registry: {
+        ...input().registry,
+        claims: [claim("writer", "src/a.ts", "write")],
+      },
+      contract: {
+        complete: true,
+        resourceIntents: [{ sessionId: "exclusive", resource: "src/a.ts", mode: "exclusive-write" }],
+      },
+    }),
+  );
+
+  assert.equal(snapshot.resources[0]?.blockers[0]?.releaseCondition, "owner-releases-claim");
+  assert.equal(snapshot.resources[0]?.nextActions[0]?.actionId, "wait-for-owner-release");
+  assert.equal(snapshot.resources[0]?.nextActions[0]?.releaseCondition, "owner-releases-claim");
 });
 
 test("incomplete evidence remains unresolved instead of claiming no conflict", () => {

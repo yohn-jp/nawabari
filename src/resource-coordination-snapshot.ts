@@ -115,6 +115,27 @@ export type CoordinationNextAction =
       readonly ownerClaimId: string;
       readonly requestedMode: ResourceClaimMode;
       readonly currentMode: ResourceClaimMode;
+      readonly releaseCondition: "owner-releases-claim";
+    }
+  | {
+      readonly actionId: "wait-for-owner-change";
+      readonly kind: "wait";
+      readonly resource: string;
+      readonly ownerSessionId: string;
+      readonly ownerClaimId: string;
+      readonly requestedMode: ResourceClaimMode;
+      readonly currentMode: ResourceClaimMode;
+      readonly releaseCondition: "owner-changes-claim";
+    }
+  | {
+      readonly actionId: "wait-for-owner-close";
+      readonly kind: "wait";
+      readonly resource: string;
+      readonly ownerSessionId: string;
+      readonly ownerClaimId: string;
+      readonly requestedMode: ResourceClaimMode;
+      readonly currentMode: ResourceClaimMode;
+      readonly releaseCondition: "owner-session-closes";
     }
   | {
       readonly actionId: "refresh-coordination-evidence";
@@ -525,15 +546,7 @@ function projectNextActions(
   const actions: CoordinationNextAction[] = [];
   for (const blocker of blockers) {
     if (blocker.kind === "claim-conflict") {
-      actions.push({
-        actionId: "wait-for-owner-release",
-        kind: "wait",
-        resource,
-        ownerSessionId: blocker.ownerSessionId,
-        ownerClaimId: blocker.ownerClaimId,
-        requestedMode: blocker.requestedMode,
-        currentMode: blocker.currentMode,
-      });
+      actions.push(projectWaitAction(resource, blocker));
     }
   }
   const changed = participants.find((participant) => participant.observedChange === "modified");
@@ -552,6 +565,27 @@ function projectNextActions(
     }
   }
   return dedupeActions(actions);
+}
+
+function projectWaitAction(
+  resource: string,
+  blocker: Extract<ResourceWaitReason, { readonly kind: "claim-conflict" }>,
+): CoordinationNextAction {
+  const details = {
+    kind: "wait" as const,
+    resource,
+    ownerSessionId: blocker.ownerSessionId,
+    ownerClaimId: blocker.ownerClaimId,
+    requestedMode: blocker.requestedMode,
+    currentMode: blocker.currentMode,
+  };
+  if (blocker.releaseCondition === "owner-releases-claim") {
+    return { actionId: "wait-for-owner-release", ...details, releaseCondition: blocker.releaseCondition };
+  }
+  if (blocker.releaseCondition === "owner-changes-claim") {
+    return { actionId: "wait-for-owner-change", ...details, releaseCondition: blocker.releaseCondition };
+  }
+  return { actionId: "wait-for-owner-close", ...details, releaseCondition: blocker.releaseCondition };
 }
 
 function dedupeWaitReasons(reasons: readonly ResourceWaitReason[]): ResourceWaitReason[] {
