@@ -134,6 +134,29 @@ test("only an explicit completion observation can complete a matching receipt", 
 test("mismatched or unobserved physical state stays unresolved", () => {
   const state = createFileOperationRegistryState();
   const recorded = reservedAndRecorded(state);
+  const beforeAmbiguousObservation = JSON.stringify(recorded);
+  assert.throws(
+    () =>
+      reconcileFileOperationReceipt(
+        recorded,
+        { ...createObservation(recorded), executionCompleted: "false" } as unknown as FileOperationObservation,
+        now(2),
+      ),
+    (error: unknown) =>
+      typeof error === "object" && error !== null && "code" in error && error.code === "FILE_OPERATION_INVALID",
+  );
+  assert.throws(
+    () =>
+      reconcileFileOperationReceipt(
+        recorded,
+        { ...createObservation(recorded), effectObserved: "true" } as unknown as FileOperationObservation,
+        now(2),
+      ),
+    (error: unknown) =>
+      typeof error === "object" && error !== null && "code" in error && error.code === "FILE_OPERATION_INVALID",
+  );
+  assert.equal(JSON.stringify(recorded), beforeAmbiguousObservation);
+
   const mismatch = reconcileFileOperationReceipt(
     recorded,
     createObservation(recorded, {

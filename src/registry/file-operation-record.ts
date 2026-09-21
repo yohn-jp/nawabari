@@ -713,6 +713,11 @@ export function reconcileFileOperationReceipt(
   if (!isRecord(observation)) {
     throw new FileOperationError("FILE_OPERATION_INVALID", "File-operation observation must be an object");
   }
+  if (typeof observation.effectObserved !== "boolean" || typeof observation.executionCompleted !== "boolean") {
+    throw new FileOperationError("FILE_OPERATION_INVALID", "Observation effect and completion flags must be booleans", {
+      operationId: record.operationId,
+    });
+  }
   assertString(observation.authorityToken, "observation.authorityToken");
   assertFenceEpoch(observation.fenceEpoch, "observation.fenceEpoch");
   if (observation.authorityToken !== record.authorityToken || observation.fenceEpoch !== record.fenceEpoch) {
