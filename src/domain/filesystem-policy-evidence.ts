@@ -499,7 +499,8 @@ export function projectFilesystemPolicyEvidence(
     denied: Object.freeze(denied),
     unresolved: Object.freeze(unresolved),
     violations: Object.freeze(violations),
-    complete: observation.complete && unresolved.length === 0,
+    complete:
+      observation.complete && unresolved.length === 0 && entries.every((entry) => entry.claim_status !== "unresolved"),
   };
   return success(Object.freeze({ ...withoutHash, evidence_hash: evidenceHash(withoutHash) }));
 }
