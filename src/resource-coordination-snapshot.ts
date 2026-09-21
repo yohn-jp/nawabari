@@ -131,6 +131,12 @@ export type CoordinationNextAction =
       readonly actionId: "proceed-without-claim";
       readonly kind: "proceed";
       readonly resource: string;
+    }
+  | {
+      readonly actionId: "acquire-claim";
+      readonly kind: "acquire";
+      readonly resource: string;
+      readonly requestedMode: "write" | "exclusive-write";
     };
 
 export interface ResourceCoordinationRecord {
@@ -301,6 +307,7 @@ function projectResource(
     facts.resource,
     boundedBlockers,
     participants,
+    requestedModes,
     classification,
     authorityComplete && !blockerTruncated && !participantProjection.truncated,
   );
@@ -511,6 +518,7 @@ function projectNextActions(
   resource: string,
   blockers: readonly ResourceWaitReason[],
   participants: readonly ResourceCoordinationParticipant[],
+  requestedModes: readonly ResourceClaimMode[],
   classification: CoordinationClassification,
   complete: boolean,
 ): CoordinationNextAction[] {
@@ -536,7 +544,12 @@ function projectNextActions(
     actions.push({ actionId: "refresh-coordination-evidence", kind: "refresh", resource });
   }
   if (actions.length === 0 && classification === "available") {
-    actions.push({ actionId: "proceed-without-claim", kind: "proceed", resource });
+    const mutationMode = requestedModes.find((mode) => mode !== "read");
+    if (mutationMode === "write" || mutationMode === "exclusive-write") {
+      actions.push({ actionId: "acquire-claim", kind: "acquire", resource, requestedMode: mutationMode });
+    } else {
+      actions.push({ actionId: "proceed-without-claim", kind: "proceed", resource });
+    }
   }
   return dedupeActions(actions);
 }

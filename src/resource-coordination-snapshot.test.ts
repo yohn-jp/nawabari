@@ -153,6 +153,36 @@ test("declared incomplete reasons fail closed even when the axes have positive e
   );
 });
 
+test("an unblocked write intent requires typed claim acquisition", () => {
+  const snapshot = projectResourceCoordinationSnapshot(
+    input({
+      contract: {
+        complete: true,
+        resourceIntents: [{ sessionId: "writer", resource: "src/a.ts", mode: "write" }],
+        mergeability: [{ sessionId: "writer", resource: "src/a.ts", state: "mergeable" }],
+      },
+    }),
+  );
+  assert.deepEqual(snapshot.resources[0]?.nextActions, [
+    { actionId: "acquire-claim", kind: "acquire", resource: "src/a.ts", requestedMode: "write" },
+  ]);
+});
+
+test("an unblocked exclusive-write intent requires typed claim acquisition", () => {
+  const snapshot = projectResourceCoordinationSnapshot(
+    input({
+      contract: {
+        complete: true,
+        resourceIntents: [{ sessionId: "writer", resource: "src/a.ts", mode: "exclusive-write" }],
+        mergeability: [{ sessionId: "writer", resource: "src/a.ts", state: "mergeable" }],
+      },
+    }),
+  );
+  assert.deepEqual(snapshot.resources[0]?.nextActions, [
+    { actionId: "acquire-claim", kind: "acquire", resource: "src/a.ts", requestedMode: "exclusive-write" },
+  ]);
+});
+
 test("claims, intents, and changes are deterministically ordered and bounded", () => {
   const snapshot = projectResourceCoordinationSnapshot(
     input({
