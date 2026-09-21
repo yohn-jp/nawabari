@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -744,6 +745,22 @@ export interface ClaimSetSnapshot {
   readonly claimSetGeneration: number;
 }
 
+/**
+ * One immutable read of the repository registry authority.
+ *
+ * Sessions and claims intentionally come from the same parsed registry
+ * document.  `revision` is a content token for that document, so consumers
+ * can detect a registry generation change without reading either collection
+ * separately.
+ */
+export interface RepositoryRegistryView {
+  readonly schemaVersion: typeof REGISTRY_SCHEMA_VERSION;
+  readonly sessions: readonly SessionRecord[];
+  readonly claims: readonly ResourceClaim[];
+  readonly claimSetGeneration: number;
+  readonly revision: string;
+}
+
 export interface RegistryMigrationResult {
   readonly migrated: boolean;
   readonly registrySchemaVersion: typeof REGISTRY_SCHEMA_VERSION;
@@ -962,6 +979,7 @@ interface RegistryState {
   readonly sessions: readonly SessionRecord[];
   readonly claims: readonly ResourceClaim[];
   readonly claimSetGeneration: number;
+  readonly revision: string;
   readonly legacyClaimsAbsent: boolean;
   readonly legacyClaimsSchemaVersion?: typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
 }
@@ -1094,6 +1112,23 @@ export class SessionRegistry {
       claims: state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim),
       claimSetGeneration: state.claimSetGeneration,
     };
+  }
+
+  /**
+   * Return one immutable repository registry generation for snapshot
+   * producers.  This is deliberately a single internal read: callers must
+   * not combine `list()` and `listClaimsSnapshot()` because those methods can
+   * observe different persisted generations.
+   */
+  readRepositoryView(): RepositoryRegistryView {
+    const state = this.readStateUnsafe();
+    return Object.freeze({
+      schemaVersion: REGISTRY_SCHEMA_VERSION,
+      sessions: Object.freeze(state.sessions.map(cloneSessionRecord)),
+      claims: Object.freeze(state.claims.map(cloneResourceClaim)),
+      claimSetGeneration: state.claimSetGeneration,
+      revision: state.revision,
+    });
   }
 
   /**
@@ -5381,7 +5416,13 @@ export class SessionRegistry {
       contents = fs.readFileSync(this.paths.registry, "utf8");
     } catch (error: unknown) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        return { sessions: [], claims: [], claimSetGeneration: 0, legacyClaimsAbsent: false };
+        return {
+          sessions: [],
+          claims: [],
+          claimSetGeneration: 0,
+          revision: emptyRegistryRevision(),
+          legacyClaimsAbsent: false,
+        };
       }
       throw new SessionRegistryError(
         "REGISTRY_IO_FAILURE",
@@ -5407,7 +5448,7 @@ export class SessionRegistry {
       );
     }
 
-    return parseRegistry(parsed, this.repository.repositoryId, allowLegacyClaimSchema);
+    return parseRegistry(parsed, this.repository.repositoryId, allowLegacyClaimSchema, registryRevision(contents));
   }
 
   private readUnsafe(): readonly SessionRecord[] {
@@ -7978,7 +8019,20 @@ export function toPersistedResourceClaim(
   };
 }
 
-function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacyClaimSchema = false): RegistryState {
+function registryRevision(contents: string): string {
+  return createHash("sha256").update(contents, "utf8").digest("hex");
+}
+
+function emptyRegistryRevision(): string {
+  return registryRevision("");
+}
+
+function parseRegistry(
+  value: unknown,
+  expectedRepositoryId: string,
+  allowLegacyClaimSchema = false,
+  revision = registryRevision(JSON.stringify(value)),
+): RegistryState {
   if (!isRecord(value)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry root must be an object");
   }
@@ -8026,7 +8080,7 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
   if (!hasClaimsSchema) {
     // v0.1.0 had no claim section. It is a deterministic empty claim set,
     // materialized on the next locked mutation or via migrate().
-    return { sessions: records, claims: [], claimSetGeneration, legacyClaimsAbsent: true };
+    return { sessions: records, claims: [], claimSetGeneration, revision, legacyClaimsAbsent: true };
   }
   const claimSchemaVersion = value.claims_schema_version;
   const isLegacyClaimSchema = claimSchemaVersion === LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
@@ -8064,6 +8118,7 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
     sessions: records,
     claims: sortResourceClaims(claims),
     claimSetGeneration,
+    revision,
     legacyClaimsAbsent: false,
     ...(isLegacyClaimSchema ? { legacyClaimsSchemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION } : {}),
   };
