@@ -369,7 +369,9 @@ export function parseWorktreeFileOperationCli(
     }
     if (!payloadFile && !payloadStdin) return missing("--payload-file <path> or --payload-stdin");
   } else {
-    if (expectedDigest === undefined) return missing("--expected-digest <sha256>");
+    if (expectedDigest === undefined && identity === undefined) {
+      return missing("--expected-digest <sha256> or --expected-identity <json>");
+    }
     if (absent) return invalid("DELETE and RENAME require expected existing-target digest evidence.");
     if (payloadFile !== null || payloadStdin) return invalid("Payload input is valid only for CREATE.");
     if (operation === "RENAME" && destinationPath === null) return missing("--to-path <exact-path>");
@@ -409,7 +411,7 @@ export function parseWorktreeFileOperationCli(
       operation,
       path: pathResult.value,
       ...(toPathResult === null ? {} : { to_path: toPathResult.value }),
-      expected_digest: expectedDigest as string | null,
+      expected_digest: expectedDigest ?? null,
       ...(identity === undefined ? {} : { expected_identity: identity }),
       requested_generation: generation,
       ...(payload === undefined ? {} : { payload_ref: payload }),

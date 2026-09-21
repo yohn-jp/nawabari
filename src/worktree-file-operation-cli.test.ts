@@ -143,6 +143,53 @@ test("DELETE and RENAME require expected target evidence and reject payload argv
   if (!renameResult.ok) assert.equal(renameResult.error.code, "INVALID_ARGUMENT");
 });
 
+test("DELETE and RENAME accept identity-only expected target evidence", () => {
+  const identity = JSON.stringify(IDENTITY);
+  const deleteResult = parseWorktreeFileOperationCli([
+    "session",
+    "file",
+    "delete",
+    "--session",
+    "session-1",
+    "--operation-id",
+    "operation-delete-identity",
+    "--path",
+    "docs/remove.txt",
+    "--if-generation",
+    "2",
+    "--expected-identity",
+    identity,
+  ]);
+  assert.equal(deleteResult.ok, true);
+  if (deleteResult.ok) {
+    assert.equal(deleteResult.value.expected_digest, null);
+    assert.deepEqual(deleteResult.value.expected_identity, IDENTITY);
+  }
+
+  const renameResult = parseWorktreeFileOperationCli([
+    "session",
+    "file",
+    "rename",
+    "--session",
+    "session-1",
+    "--operation-id",
+    "operation-rename-identity",
+    "--path",
+    "docs/source.txt",
+    "--to-path",
+    "docs/target.txt",
+    "--if-generation",
+    "2",
+    "--expected-identity",
+    identity,
+  ]);
+  assert.equal(renameResult.ok, true);
+  if (renameResult.ok) {
+    assert.equal(renameResult.value.expected_digest, null);
+    assert.deepEqual(renameResult.value.expected_identity, IDENTITY);
+  }
+});
+
 test("operation ID and CAS are forwarded unchanged for retry reconciliation", async () => {
   const operationIds: string[] = [];
   const generations: number[] = [];
