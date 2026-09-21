@@ -378,6 +378,21 @@ function canonicalPathList(value: unknown, field: string): DomainResult<readonly
     : invalid(field, "must be sorted and canonical");
 }
 
+function canonicalTextList(value: unknown, field: string): DomainResult<readonly string[]> {
+  if (!Array.isArray(value) || value.length > MAX_DIAGNOSTICS) return invalid(field, "expected a bounded array");
+  const values: string[] = [];
+  for (const [index, item] of value.entries()) {
+    const parsed = boundedText(item, `${field}[${index}]`);
+    if (!parsed.ok) return parsed;
+    values.push(parsed.value);
+  }
+  if (new Set(values).size !== values.length) return invalid(field, "contains duplicate values");
+  const sorted = Object.freeze([...values].sort(compareText));
+  return JSON.stringify(value) === JSON.stringify(sorted)
+    ? success(sorted)
+    : invalid(field, "must be sorted and canonical");
+}
+
 function sameValue(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -436,7 +451,7 @@ export function validateFilesystemPolicyEvidence(input: unknown): DomainResult<F
   if (input.observation.atomic !== false) return invalid("evidence.observation.atomic", "must be false");
   if (typeof input.observation.complete !== "boolean")
     return invalid("evidence.observation.complete", "expected a boolean");
-  const incompleteReasons = canonicalPathList(
+  const incompleteReasons = canonicalTextList(
     input.observation.incomplete_reasons,
     "evidence.observation.incomplete_reasons",
   );
