@@ -76,6 +76,9 @@ import {
   RESOURCE_CLAIM_SCHEMA_VERSION,
   sortResourceClaims,
   type ClaimOwnerContext,
+  type CoordinationFacts,
+  type WorktreeIdentityEvidence,
+  type CanonicalResourceClaimInput,
   type ResourceClaim,
   type ResourceClaimRecoveryAction,
   type ResourceClaimInput,
@@ -958,6 +961,7 @@ export interface PersistedResourceClaim {
   readonly worktree_path: string;
   readonly resource: string;
   readonly mode: ResourceClaimMode;
+  readonly sharing?: { readonly kind: "isolated-worktree"; readonly group_id: string };
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -978,7 +982,7 @@ export interface PersistedRegistryV2 {
   readonly schema_version: RegistrySchemaVersion;
   readonly repository_id: string;
   readonly sessions: readonly PersistedSessionRecord[];
-  readonly claims_schema_version: typeof RESOURCE_CLAIM_SCHEMA_VERSION;
+  readonly claims_schema_version: typeof RESOURCE_CLAIM_SCHEMA_VERSION | typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
   readonly claims: readonly PersistedResourceClaim[];
   readonly claim_set_generation: number;
   readonly registry_revision: number;
@@ -1340,11 +1344,7 @@ export class SessionRegistry {
     return claim === undefined ? undefined : cloneResourceClaim(claim);
   }
 
-  /**
-   * Explicitly materialize a claim section or upgrade its semantics. A v1
-   * claim registry is intentionally unreadable through ordinary operations;
-   * only this locked, explicit migration rewrites it as v2.
-   */
+  /** Explicitly materialize a claim section or upgrade legacy claims as v3. */
   migrate(): RegistryMigrationResult {
     return this.withLock(() => {
       let state: RegistryState;
@@ -1438,6 +1438,8 @@ export class SessionRegistry {
         owner,
         state.claims.filter((claim) => claim.sessionId !== sessionId),
         state.sessions,
+        undefined,
+        (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
       );
       const nextIds = new Set(next.map((claim) => claim.claimId));
       const released = current.filter((claim) => !nextIds.has(claim.claimId));
@@ -1538,7 +1540,14 @@ export class SessionRegistry {
       const externalClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
       // Validate the resulting complete set, including pairwise ownership
       // invariants, before exposing any persistence side effect.
-      this.assertCompleteClaimSet(nextSessionClaims, owner, externalClaims, state.sessions);
+      this.assertCompleteClaimSet(
+        nextSessionClaims,
+        owner,
+        externalClaims,
+        state.sessions,
+        state.claimSetGeneration,
+        (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+      );
       const nextClaims = sortResourceClaims([...externalClaims, ...nextSessionClaims]);
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
       if (claimSetGeneration !== state.claimSetGeneration) {
@@ -1818,7 +1827,14 @@ export class SessionRegistry {
             : this.canonicalClaimInputs(options.initialClaims, owner, true).map((input) =>
                 createResourceClaim(input, owner, toTimestamp(this.clock())),
               );
-        this.assertCompleteClaimSet(initialClaims, owner, state.claims, [...state.sessions, record]);
+        this.assertCompleteClaimSet(
+          initialClaims,
+          owner,
+          state.claims,
+          [...state.sessions, record],
+          state.claimSetGeneration,
+          (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, [...state.sessions, record]),
+        );
         const nextClaims = sortResourceClaims([...state.claims, ...initialClaims]);
         this.writeUnsafe(
           [...state.sessions, record],
@@ -4266,9 +4282,11 @@ export class SessionRegistry {
     owner: ClaimOwner,
     externalClaims: readonly ResourceClaim[],
     sessions: readonly SessionRecord[],
+    claimSetGeneration: number,
+    coordinationFacts: (left: ResourceClaim, right: ResourceClaim) => CoordinationFacts | undefined,
   ): void {
     this.assertNoOverlappingClaims(candidates);
-    this.validateRequestedClaims(candidates, owner, externalClaims, sessions);
+    this.validateRequestedClaims(candidates, owner, externalClaims, sessions, claimSetGeneration, coordinationFacts);
   }
 
   /**
@@ -4365,14 +4383,17 @@ export class SessionRegistry {
     inputs: readonly ResourceClaimInput[],
     owner: ClaimOwner,
     allowEmpty = false,
-  ): readonly { resource: string; mode: ResourceClaimMode }[] {
+  ): readonly CanonicalResourceClaimInput[] {
     if (!Array.isArray(inputs) || (!allowEmpty && inputs.length === 0)) {
       throw claimError("INVALID_CLAIM", "At least one resource claim is required");
     }
     const canonical = inputs
       .map((input) => canonicalizeClaimInput(input, owner))
       .sort((left, right) =>
-        compareCodePointStrings(`${left.resource}\u0000${left.mode}`, `${right.resource}\u0000${right.mode}`),
+        compareCodePointStrings(
+          `${left.resource}\u0000${left.mode}\u0000${left.sharing?.kind ?? ""}\u0000${left.sharing?.groupId ?? ""}`,
+          `${right.resource}\u0000${right.mode}\u0000${right.sharing?.kind ?? ""}\u0000${right.sharing?.groupId ?? ""}`,
+        ),
       );
     const timestamp = toTimestamp(this.clock());
     const claims = canonical.map((input) => createResourceClaim(input, owner, timestamp));
@@ -4383,7 +4404,7 @@ export class SessionRegistry {
   private addClaimsUnsafe(
     state: RegistryState,
     owner: ClaimOwner,
-    requested: readonly { resource: string; mode: ResourceClaimMode }[],
+    requested: readonly CanonicalResourceClaimInput[],
   ): ClaimMutationResult {
     const timestamp = toTimestamp(this.clock());
     const candidates = requested.map((input) => createResourceClaim(input, owner, timestamp));
@@ -4395,6 +4416,7 @@ export class SessionRegistry {
       [...existing, ...current],
       state.sessions,
       state.claimSetGeneration,
+      (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
     );
     const nextClaims = sortResourceClaims([
       ...state.claims,
@@ -4414,6 +4436,7 @@ export class SessionRegistry {
     existing: readonly ResourceClaim[],
     sessions: readonly SessionRecord[] = [],
     additiveClaimSetGeneration?: number,
+    coordinationFacts?: (left: ResourceClaim, right: ResourceClaim) => CoordinationFacts | undefined,
   ): readonly ResourceClaim[] {
     for (const candidate of candidates) {
       const exact = existing.find((claim) => claim.claimId === candidate.claimId);
@@ -4466,7 +4489,7 @@ export class SessionRegistry {
                 }),
           });
         }
-        if (claimsConflict(candidate, current)) {
+        if (claimsConflict(candidate, current, coordinationFacts?.(candidate, current))) {
           const conflictDetails = this.resourceClaimConflictDetails(candidate, current, {
             sessions,
             claims: existing,
@@ -4485,6 +4508,46 @@ export class SessionRegistry {
       }
     }
     return candidates;
+  }
+
+  private coordinationFacts(
+    left: ResourceClaim,
+    right: ResourceClaim,
+    generation: number,
+    suppliedRecords?: readonly SessionRecord[],
+  ): CoordinationFacts | undefined {
+    const records = suppliedRecords ?? this.readUnsafe();
+    const identity = (claim: ResourceClaim): WorktreeIdentityEvidence => {
+      const record = records.find((candidate) => candidate.sessionId === claim.sessionId);
+      if (record === undefined || record.state !== "active") return { status: "missing" };
+      try {
+        const physical = verifyPhysicalExecutionContext({
+          repository: this.repository,
+          worktreePath: record.worktreePath,
+          branchName: record.branchName,
+          git: this.git,
+        });
+        if (physical.worktreeId !== record.worktreeId || physical.worktreePath !== record.worktreePath)
+          return { status: "ambiguous" };
+        return {
+          status: "verified",
+          repositoryId: physical.repositoryId,
+          sessionId: record.sessionId,
+          worktreeId: physical.worktreeId,
+          worktreePath: physical.worktreePath,
+        };
+      } catch {
+        return { status: "missing" };
+      }
+    };
+    return {
+      left,
+      right,
+      leftIdentity: identity(left),
+      rightIdentity: identity(right),
+      claimSetGeneration: generation,
+      observedClaimSetGeneration: generation,
+    };
   }
 
   private closeUnsafe(
@@ -5556,7 +5619,12 @@ export class SessionRegistry {
       );
     }
 
-    return parseRegistry(parsed, this.repository.repositoryId, allowLegacyClaimSchema);
+    return parseRegistry(
+      parsed,
+      this.repository.repositoryId,
+      allowLegacyClaimSchema,
+      (left, right, generation, records) => this.coordinationFacts(left, right, generation, records),
+    );
   }
 
   private readUnsafe(): readonly SessionRecord[] {
@@ -8146,12 +8214,25 @@ export function toPersistedResourceClaim(
     worktree_path: validated.worktreePath,
     resource: validated.resource,
     mode: validated.mode,
+    ...(validated.sharing === undefined
+      ? {}
+      : { sharing: { kind: validated.sharing.kind, group_id: validated.sharing.groupId } }),
     created_at: validated.createdAt,
     updated_at: validated.updatedAt,
   };
 }
 
-function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacyClaimSchema = false): RegistryState {
+function parseRegistry(
+  value: unknown,
+  expectedRepositoryId: string,
+  allowLegacyClaimSchema = false,
+  coordinationFacts?: (
+    left: ResourceClaim,
+    right: ResourceClaim,
+    generation: number,
+    records: readonly SessionRecord[],
+  ) => CoordinationFacts | undefined,
+): RegistryState {
   if (!isRecord(value)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry root must be an object");
   }
@@ -8236,17 +8317,8 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
       { schemaVersion: claimSchemaVersion as number },
     );
   }
-  if (isLegacyClaimSchema && !allowLegacyClaimSchema) {
-    throw new SessionRegistryError(
-      "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
-      "Resource claim schema v1 requires explicit migration before use",
-      {
-        schemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
-        migrationRequired: true,
-        recoveryHints: [...MIGRATION_RECOVERY_HINTS],
-      },
-    );
-  }
+  // Schema 2 is readable for ordinary operations, but retains its legacy
+  // no-sharing semantics and canonical IDs until explicit migration.
   if (!Array.isArray(value.claims)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry claims must be an array");
   }
@@ -8258,7 +8330,14 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
       isLegacyClaimSchema ? LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION : undefined,
     ),
   );
-  validateRegistryClaims(records, claims, expectedRepositoryId, isLegacyClaimSchema);
+  validateRegistryClaims(
+    records,
+    claims,
+    expectedRepositoryId,
+    isLegacyClaimSchema,
+    coordinationFacts,
+    claimSetGeneration,
+  );
   return {
     registrySchemaVersion,
     registryRevision,
@@ -8350,6 +8429,8 @@ function sameClaimSet(left: readonly ResourceClaim[], right: readonly ResourceCl
       a.worktreePath !== b.worktreePath ||
       a.resource !== b.resource ||
       a.mode !== b.mode ||
+      a.sharing?.kind !== b.sharing?.kind ||
+      a.sharing?.groupId !== b.sharing?.groupId ||
       a.createdAt !== b.createdAt ||
       a.updatedAt !== b.updatedAt
     ) {
@@ -8380,7 +8461,7 @@ function parseResourceClaim(
       "created_at",
       "updated_at",
     ],
-    [],
+    expectedSchemaVersion === RESOURCE_CLAIM_SCHEMA_VERSION ? ["sharing"] : [],
     index,
   );
   if (value.schema_version !== expectedSchemaVersion) {
@@ -8390,6 +8471,7 @@ function parseResourceClaim(
       { schemaVersion: value.schema_version as number, index, expectedSchemaVersion },
     );
   }
+  const isLegacy = expectedSchemaVersion === LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
   const claim: ResourceClaim = {
     schemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
     claimId: requireString(value.claim_id, index, "claim_id"),
@@ -8398,13 +8480,22 @@ function parseResourceClaim(
     worktreePath: requireString(value.worktree_path, index, "worktree_path"),
     resource: requireString(value.resource, index, "resource"),
     mode: requireClaimMode(value.mode, index),
+    ...(isLegacy || value.sharing === undefined ? {} : { sharing: parsePersistedSharing(value.sharing, index) }),
     createdAt: requireString(value.created_at, index, "created_at"),
     updatedAt: requireString(value.updated_at, index, "updated_at"),
   };
-  return validateResourceClaim(claim, expectedRepositoryId, index);
+  if (claim.sharing !== undefined && claim.mode !== "write") {
+    throw invalidRecord(index, "claim sharing requires write mode");
+  }
+  return validateResourceClaim(claim, expectedRepositoryId, index, isLegacy);
 }
 
-function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: string, index?: number): ResourceClaim {
+function validateResourceClaim(
+  claim: ResourceClaim,
+  expectedRepositoryId: string,
+  index?: number,
+  legacySchema = false,
+): ResourceClaim {
   const position = index === undefined ? "" : ` at index ${index}`;
   if (claim.schemaVersion !== RESOURCE_CLAIM_SCHEMA_VERSION) {
     throw new SessionRegistryError("UNSUPPORTED_CLAIM_SCHEMA_VERSION", `Unsupported claim schema version${position}`, {
@@ -8425,7 +8516,9 @@ function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: strin
     throw invalidRecord(index, `claim worktree_path must be an absolute canonical path${position}`);
   }
   assertCanonicalClaimResource(claim.resource);
-  if (claim.claimId !== canonicalClaimId(claim.sessionId, claim.resource, claim.mode)) {
+  const expectedClaimId = canonicalClaimId(claim.sessionId, claim.resource, claim.mode, claim.sharing);
+  const legacyClaimId = canonicalClaimId(claim.sessionId, claim.resource, claim.mode);
+  if (claim.claimId !== (legacySchema ? legacyClaimId : expectedClaimId)) {
     throw invalidRecord(index, `claim_id is not the canonical claim identity${position}`);
   }
   if (!isTimestamp(claim.createdAt) || !isTimestamp(claim.updatedAt)) {
@@ -8437,11 +8530,31 @@ function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: strin
   return Object.freeze({ ...claim });
 }
 
+function parsePersistedSharing(value: unknown, index: number): ResourceClaim["sharing"] {
+  if (
+    !isRecord(value) ||
+    value.kind !== "isolated-worktree" ||
+    typeof value.group_id !== "string" ||
+    value.group_id.length === 0 ||
+    value.group_id.length > 128
+  ) {
+    throw invalidRecord(index, "claim sharing is invalid");
+  }
+  return { kind: "isolated-worktree", groupId: value.group_id };
+}
+
 function validateRegistryClaims(
   records: readonly SessionRecord[],
   claims: readonly ResourceClaim[],
   expectedRepositoryId: string,
   legacySemantics = false,
+  coordinationFacts?: (
+    left: ResourceClaim,
+    right: ResourceClaim,
+    generation: number,
+    records: readonly SessionRecord[],
+  ) => CoordinationFacts | undefined,
+  claimSetGeneration = 0,
 ): void {
   const sessions = new Map(records.map((record) => [record.sessionId, record]));
   const claimIds = new Set<string>();
@@ -8485,7 +8598,12 @@ function validateRegistryClaims(
           { claimId: current.claimId, ownerClaimId: prior.claimId },
         );
       }
-      if (!(legacySemantics ? legacyClaimsConflict(current, prior) : claimsConflict(current, prior))) continue;
+      if (
+        !(legacySemantics
+          ? legacyClaimsConflict(current, prior)
+          : claimsConflict(current, prior, coordinationFacts?.(current, prior, claimSetGeneration, records)))
+      )
+        continue;
       const conflictDetails = resourceClaimConflictDetails(current, prior, records);
       throw claimError("RESOURCE_CLAIM_CONFLICT", "Persisted claims contain an unresolved conflict", {
         claimId: current.claimId,

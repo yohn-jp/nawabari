@@ -199,13 +199,12 @@ test("local backend migrates legacy claim state and restores ordinary reads", as
       claims_schema_version: number;
       claims: Array<{ schema_version: number }>;
     };
-    persisted.claims_schema_version = 1;
-    for (const claim of persisted.claims) claim.schema_version = 1;
+    persisted.claims_schema_version = 2;
+    for (const claim of persisted.claims) claim.schema_version = 2;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(persisted)}\n`);
 
-    const blocked = await backend.status({ cwd: worktreePath });
-    assert.equal(blocked.ok, false);
-    if (!blocked.ok) assert.equal(blocked.error.code, "UNSUPPORTED_CLAIM_SCHEMA_VERSION");
+    const readable = await backend.status({ cwd: worktreePath });
+    assert.equal(readable.ok, true);
 
     const migrationOutput: string[] = [];
     const migrationExitCode = await runCli(["migrate", "--json"], {
@@ -218,7 +217,7 @@ test("local backend migrates legacy claim state and restores ordinary reads", as
       command: "migrate",
       migrated: true,
       registry_schema_version: 1,
-      claim_schema_version: 2,
+      claim_schema_version: 3,
     });
 
     const status = await backend.status({ cwd: worktreePath });
@@ -227,13 +226,13 @@ test("local backend migrates legacy claim state and restores ordinary reads", as
       claims_schema_version: number;
       claims: Array<{ schema_version: number }>;
     };
-    assert.equal(after.claims_schema_version, 2);
-    assert.equal(after.claims[0]?.schema_version, 2);
+    assert.equal(after.claims_schema_version, 3);
+    assert.equal(after.claims[0]?.schema_version, 3);
 
     const retry = await backend.migrate({ cwd: worktreePath });
     assert.deepEqual(retry, {
       ok: true,
-      value: { migrated: false, registry_schema_version: 1, claim_schema_version: 2 },
+      value: { migrated: false, registry_schema_version: 1, claim_schema_version: 3 },
     });
   } finally {
     removeWorktree(repositoryPath, worktreePath);
@@ -264,7 +263,7 @@ test("resource claims expose canonical machine fields through the backend and CL
     assert.equal(claimed.ok, true, claimed.ok ? "claim succeeded" : JSON.stringify(claimed.error));
     if (!claimed.ok) return;
     assert.equal(claimed.value.claims.length, 1);
-    assert.equal(claimed.value.claims[0]?.schema_version, 2);
+    assert.equal(claimed.value.claims[0]?.schema_version, 3);
     assert.match(claimed.value.claims[0]?.claim_id ?? "", /^claim-[0-9a-f]{64}$/u);
     assert.equal(claimed.value.claims[0]?.resource, "README.md");
     assert.equal(claimed.value.claims[0]?.mode, "read");
