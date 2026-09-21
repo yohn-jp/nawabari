@@ -72,6 +72,7 @@ export function loadWorktreeProfileCatalog(
 }
 
 function mergeProfile(parent: CatalogWorktreeProfile, child: CatalogWorktreeProfile): DomainResult<CatalogWorktreeProfile> {
+  if (parent.version !== child.version) return error("RUNTIME_PROFILE_AMBIGUOUS", `Profile '${child.id}' conflicts with inherited profile version.`);
   const fields = ["materialSelection", "filesystem", "tools", "shell", "environment", "git", "execution"] as const;
   const { extends: _parentExtends, ...parentFields } = parent;
   const { extends: childExtends, ...childFields } = child;

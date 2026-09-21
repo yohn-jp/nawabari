@@ -36,3 +36,11 @@ test("cycles, missing parents, and unknown parameters fail closed", () => {
     if (resolved.ok) assert.equal(substituteProfileParameters(resolved.value, { command: "rm -rf" }).ok, false);
   }
 });
+
+test("profiles with differing versions fail closed during inheritance", () => {
+  const catalog = validateWorktreeProfileCatalog({
+    profiles: [profile("child", ["base"]), { ...profile("base"), version: "2" }],
+  });
+  assert.equal(catalog.ok, true);
+  if (catalog.ok) assert.equal(resolveWorktreeProfile({ profile: "child" }, catalog.value).ok, false);
+});
