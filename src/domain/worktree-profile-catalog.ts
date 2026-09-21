@@ -54,6 +54,8 @@ export function validateWorktreeProfileCatalog(input: unknown): DomainResult<Wor
     if (!Array.isArray(item.extends) || item.extends.some((parent) => typeof parent !== "string"))
       return error("RUNTIME_PROFILE_INVALID", `Catalog profile ${index} has invalid extends.`);
     const { extends: parents, ...profileInput } = item;
+    if (new Set(parents).size !== parents.length)
+      return error("RUNTIME_PROFILE_AMBIGUOUS", `Catalog profile ${index} has duplicate parent profiles.`);
     const result = validateWorktreeRuntimeProfile(profileInput);
     if (!result.ok) return failure(result.error);
     if (ids.has(result.value.id))

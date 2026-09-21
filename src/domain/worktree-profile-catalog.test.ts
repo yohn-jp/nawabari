@@ -56,3 +56,9 @@ test("profiles with differing versions fail closed during inheritance", () => {
   assert.equal(catalog.ok, true);
   if (catalog.ok) assert.equal(resolveWorktreeProfile({ profile: "child" }, catalog.value).ok, false);
 });
+
+test("duplicate parent profiles fail closed during catalog validation", () => {
+  const catalog = validateWorktreeProfileCatalog({ profiles: [profile("child", ["base", "base"])] });
+  assert.equal(catalog.ok, false);
+  if (!catalog.ok) assert.equal(catalog.error.code, "RUNTIME_PROFILE_AMBIGUOUS");
+});
