@@ -1,4 +1,4 @@
-import { DomainError, failure, success, type DomainResult } from "./errors.js";
+import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import type { GitCommandRunner, RepositoryContext } from "../git.js";
 import { defaultGit } from "../git.js";
 import {
@@ -24,7 +24,7 @@ function record(value: unknown): value is RecordValue {
 function error(
   code: "RUNTIME_PROFILE_INVALID" | "RUNTIME_PROFILE_AMBIGUOUS" | "RUNTIME_PROFILE_MISSING",
   message: string,
-  details: RecordValue = {},
+  details: JsonObject = {},
 ): DomainResult<never> {
   return failure(new DomainError(code, message, details));
 }
@@ -138,7 +138,7 @@ export function resolveWorktreeProfile(
         profile_id: id,
       });
     visiting.add(id);
-    let current: DomainResult<ResolvedWorktreeRuntimeProfile> = success(profile);
+    let current: DomainResult<CatalogWorktreeProfile> = success(profile);
     for (const parent of (profile as WorktreeRuntimeProfile & { extends?: readonly string[] }).extends ?? []) {
       const parentResult = visit(parent, depth + 1);
       if (!parentResult.ok) {
@@ -152,6 +152,7 @@ export function resolveWorktreeProfile(
       }
     }
     visiting.delete(id);
+    if (!current.ok) return current;
     resolved.set(id, current.value);
     return current;
   };
