@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { ResourceClaim } from "./resource-claims.js";
+import { canonicalClaimId } from "./resource-claims.js";
 import {
   RESOURCE_HANDOFF_OPERATION,
   RESOURCE_HANDOFF_SCHEMA_VERSION,
@@ -25,7 +26,7 @@ const timestamp = "2026-01-01T00:00:00.000Z";
 function claim(sessionId: string, resource: string, mode: ResourceClaim["mode"] = "write"): ResourceClaim {
   return {
     schemaVersion: 3,
-    claimId: `${sessionId}-${resource}-${mode}`,
+    claimId: canonicalClaimId(sessionId, resource, mode),
     sessionId,
     repositoryId: "repo-1",
     worktreePath: `/worktrees/${sessionId}`,
@@ -137,6 +138,28 @@ test("rejects duplicate sessions and invalid persisted claim schema, mode, and t
     snapshot({ claims: [{ ...claim("source", "src/owned.ts"), mode: "invalid" as ResourceClaim["mode"] }] }),
   );
   assertRegistryCorrupt(snapshot({ claims: [{ ...claim("source", "src/owned.ts"), createdAt: "not-a-timestamp" }] }));
+  assertRegistryCorrupt(
+    snapshot({ claims: [{ ...claim("source", "src/owned.ts"), createdAt: "2026-02-29T00:00:00.000Z" }] }),
+  );
+  assertRegistryCorrupt(
+    snapshot({
+      claims: [
+        {
+          ...claim("source", "src/owned.ts"),
+          createdAt: "2026-01-02T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+    }),
+  );
+  assertRegistryCorrupt(
+    snapshot({
+      claims: [
+        claim("source", "src/owned.ts"),
+        { ...claim("destination", "src/other.ts"), claimId: claim("source", "src/owned.ts").claimId },
+      ],
+    }),
+  );
 });
 
 test("retains unrelated destination claims as an integration invariant and rejects overlap", () => {
@@ -258,6 +281,32 @@ test("malformed commit evidence is a controlled corruption outcome retaining the
   assert.equal(result.code, "REGISTRY_CORRUPT");
   assert.equal(result.sourceClaim?.sessionId, "source");
   assert.deepEqual(authority.calls, ["read", "read", "commit"]);
+});
+
+test("commit evidence requires a complete canonical destination claim", async () => {
+  const validDestination = claim("destination", "src/owned.ts");
+  const malformedClaims: unknown[] = [
+    { sessionId: "destination", resource: "src/owned.ts", mode: "write" },
+    { ...validDestination, schemaVersion: 2 },
+    { ...validDestination, claimId: "claim-not-canonical" },
+    { ...validDestination, repositoryId: "other-repository" },
+    { ...validDestination, worktreePath: "/other-worktree" },
+    { ...validDestination, createdAt: "2026-02-29T00:00:00.000Z" },
+    { ...validDestination, updatedAt: "2025-12-31T23:59:59.000Z" },
+  ];
+  for (const destinationClaim of malformedClaims) {
+    const authority = new FakeAuthority([snapshot(), snapshot()], false, {
+      status: "transferred",
+      operationId: "operation-1",
+      claimSetGeneration: 5,
+      sourceClaim: null,
+      destinationClaim,
+    } as ResourceHandoffCommitResult);
+    const result = await handoffResources(authority, new FakeExecution(), options());
+    assert.equal(result.status, "unresolved");
+    assert.equal(result.code, "REGISTRY_CORRUPT");
+    assert.equal(result.sourceClaim?.sessionId, "source");
+  }
 });
 
 test("fences, drains, revalidates, and commits through one atomic authority boundary", async () => {

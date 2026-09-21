@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 
 import {
   assertCanonicalClaimResource,
+  canonicalClaimId,
   claimsOverlap,
   isResourceClaimMode,
+  RESOURCE_CLAIM_SHARING_KIND,
   resourceMatchesClaim,
   RESOURCE_CLAIM_SCHEMA_VERSION,
   type ResourceClaim,
@@ -208,6 +211,7 @@ export interface NormalizedHandoffOptions {
 const MAX_OPERATION_ID_LENGTH = 128;
 const MAX_SESSION_ID_LENGTH = 256;
 const MAX_RESOURCE_LENGTH = 4_096;
+const MAX_CLAIM_GROUP_ID_LENGTH = 128;
 const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 /**
@@ -559,7 +563,7 @@ export async function handoffResources(
         );
   }
   try {
-    assertCommitResult(committed, normalized, initial.registry.claimSetGeneration);
+    assertCommitResult(committed, normalized, initial.registry.claimSetGeneration, current);
   } catch (error: unknown) {
     return unresolvedResult(
       normalized,
@@ -681,6 +685,7 @@ function assertSnapshot(snapshot: ResourceHandoffSnapshot): void {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff snapshot registry evidence is invalid");
   }
   const sessionIds = new Set<string>();
+  const sessionsById = new Map<string, ResourceHandoffSession>();
   for (const session of registry.sessions) {
     if (
       !isRecord(session) ||
@@ -697,22 +702,19 @@ function assertSnapshot(snapshot: ResourceHandoffSnapshot): void {
       });
     }
     sessionIds.add(session.sessionId);
+    sessionsById.set(session.sessionId, session as unknown as ResourceHandoffSession);
   }
+  const claimIds = new Set<string>();
   for (const claim of registry.claims) {
-    if (
-      !isRecord(claim) ||
-      claim.schemaVersion !== RESOURCE_CLAIM_SCHEMA_VERSION ||
-      !boundedText(claim.claimId, MAX_OPERATION_ID_LENGTH) ||
-      !boundedText(claim.sessionId, MAX_SESSION_ID_LENGTH) ||
-      !boundedText(claim.repositoryId, MAX_SESSION_ID_LENGTH) ||
-      !boundedText(claim.worktreePath, MAX_RESOURCE_LENGTH) ||
-      !boundedText(claim.resource, MAX_RESOURCE_LENGTH) ||
-      !isResourceClaimMode(claim.mode) ||
-      !canonicalTimestamp(claim.createdAt) ||
-      !canonicalTimestamp(claim.updatedAt)
-    ) {
+    if (!isCanonicalSnapshotClaim(claim, registry, sessionsById) || !isRecord(claim)) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff snapshot contains an invalid claim");
     }
+    if (claimIds.has(claim.claimId)) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff snapshot contains duplicate claim IDs", {
+        claimId: claim.claimId,
+      });
+    }
+    claimIds.add(claim.claimId);
   }
   if (registry.completedOperations !== undefined) {
     if (!Array.isArray(registry.completedOperations)) {
@@ -733,6 +735,74 @@ function assertSnapshot(snapshot: ResourceHandoffSnapshot): void {
       operationIds.add(operation.operationId);
     }
   }
+}
+
+function isCanonicalSnapshotClaim(
+  value: unknown,
+  registry: ResourceHandoffRegistrySnapshot,
+  sessionsById: ReadonlyMap<string, ResourceHandoffSession>,
+): value is ResourceClaim {
+  if (!isRecord(value) || typeof value.sessionId !== "string") return false;
+  const owner = sessionsById.get(value.sessionId);
+  return owner !== undefined && isCanonicalResourceClaim(value, registry.repositoryId, owner);
+}
+
+function isCanonicalCommitDestinationClaim(
+  value: unknown,
+  normalized: NormalizedHandoffOptions,
+  snapshot: ResourceHandoffSnapshot,
+): value is ResourceClaim {
+  const owner = snapshot.registry.sessions.find((session) => session.sessionId === normalized.toSessionId);
+  return (
+    owner !== undefined &&
+    isCanonicalResourceClaim(value, snapshot.registry.repositoryId, owner) &&
+    value.sessionId === normalized.toSessionId &&
+    value.resource === normalized.resource &&
+    value.mode === normalized.mode
+  );
+}
+
+function isCanonicalResourceClaim(
+  value: unknown,
+  expectedRepositoryId: string,
+  owner: ResourceHandoffSession,
+): value is ResourceClaim {
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== RESOURCE_CLAIM_SCHEMA_VERSION ||
+    !boundedText(value.claimId, MAX_OPERATION_ID_LENGTH) ||
+    !boundedText(value.sessionId, MAX_SESSION_ID_LENGTH) ||
+    !boundedText(value.repositoryId, MAX_SESSION_ID_LENGTH) ||
+    !canonicalAbsolutePath(value.worktreePath) ||
+    !boundedText(value.resource, MAX_RESOURCE_LENGTH) ||
+    !isResourceClaimMode(value.mode) ||
+    !canonicalTimestamp(value.createdAt) ||
+    !canonicalTimestamp(value.updatedAt) ||
+    Date.parse(value.updatedAt) < Date.parse(value.createdAt) ||
+    value.repositoryId !== expectedRepositoryId ||
+    owner.repositoryId !== expectedRepositoryId ||
+    value.sessionId !== owner.sessionId ||
+    value.worktreePath !== owner.worktreePath ||
+    !isCanonicalClaimSharing(value.sharing, value.mode)
+  ) {
+    return false;
+  }
+  try {
+    assertCanonicalClaimResource(value.resource);
+  } catch {
+    return false;
+  }
+  return value.claimId === canonicalClaimId(value.sessionId, value.resource, value.mode, value.sharing);
+}
+
+function isCanonicalClaimSharing(value: unknown, mode: ResourceClaimMode): value is ResourceClaim["sharing"] {
+  if (value === undefined) return true;
+  return (
+    mode === "write" &&
+    isRecord(value) &&
+    value.kind === RESOURCE_CLAIM_SHARING_KIND &&
+    boundedText(value.groupId, MAX_CLAIM_GROUP_ID_LENGTH)
+  );
 }
 
 function validateSessionIdentities(
@@ -955,15 +1025,12 @@ function assertCommitResult(
   result: ResourceHandoffCommitResult,
   normalized: NormalizedHandoffOptions,
   initialGeneration: number,
+  snapshot: ResourceHandoffSnapshot,
 ): void {
   if (!isRecord(result)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Atomic handoff authority returned invalid commit evidence");
   }
-  const destinationMatches =
-    isRecord(result.destinationClaim) &&
-    result.destinationClaim.sessionId === normalized.toSessionId &&
-    result.destinationClaim.resource === normalized.resource &&
-    result.destinationClaim.mode === normalized.mode;
+  const destinationMatches = isCanonicalCommitDestinationClaim(result.destinationClaim, normalized, snapshot);
   if (
     !["transferred", "idempotent"].includes(result.status) ||
     result.operationId !== normalized.operationId ||
@@ -1005,7 +1072,18 @@ function boundedText(value: unknown, maxLength: number): value is string {
 }
 
 function canonicalTimestamp(value: unknown): value is string {
-  return typeof value === "string" && ISO_TIMESTAMP_PATTERN.test(value) && !Number.isNaN(Date.parse(value));
+  return (
+    typeof value === "string" &&
+    ISO_TIMESTAMP_PATTERN.test(value) &&
+    !Number.isNaN(Date.parse(value)) &&
+    new Date(value).toISOString() === value
+  );
+}
+
+function canonicalAbsolutePath(value: unknown): value is string {
+  return (
+    typeof value === "string" && path.isAbsolute(value) && path.resolve(value) === value && !value.includes("\u0000")
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
