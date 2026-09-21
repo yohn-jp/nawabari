@@ -3731,7 +3731,7 @@ export class SessionRegistry {
             records,
             claims,
             claimSetGeneration,
-            nextRegistryRevision(state),
+            nextRegistryRevision(this.readStateUnsafe()),
             state.runtimeEpoch,
             state.runtimeRecords,
           );
@@ -4600,7 +4600,7 @@ export class SessionRegistry {
         closingRecords,
         nextClaims,
         claimSetGeneration,
-        nextRegistryRevision(state),
+        nextRegistryRevision(this.readStateUnsafe()),
         state.runtimeEpoch,
         state.runtimeRecords,
       );
@@ -4753,7 +4753,7 @@ export class SessionRegistry {
         closingRecords,
         nextClaims,
         claimSetGeneration,
-        nextRegistryRevision(state),
+        nextRegistryRevision(this.readStateUnsafe()),
         state.runtimeEpoch,
         state.runtimeRecords,
       );

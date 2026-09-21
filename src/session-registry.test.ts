@@ -308,6 +308,80 @@ test("migrates a legacy registry without changing session ownership or claim mod
   }
 });
 
+test("close increments registry revision for both lifecycle writes", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-close-revision`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/close-revision" });
+    const before = readJson(registry.paths.registry) as PersistedRegistry;
+
+    const result = registry.close(session.sessionId);
+    const after = readJson(registry.paths.registry) as PersistedRegistry;
+
+    assert.equal(result.session.state, "closed");
+    assert.equal(after.registry_revision, before.registry_revision + 2);
+    assert.equal(registry.get(session.sessionId)?.state, "closed");
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("discard increments registry revision for both lifecycle writes", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-revision`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-revision" });
+    const before = readJson(registry.paths.registry) as PersistedRegistry;
+
+    const result = registry.discard(session.sessionId);
+    const after = readJson(registry.paths.registry) as PersistedRegistry;
+
+    assert.equal(result.session.state, "closed");
+    assert.equal(after.registry_revision, before.registry_revision + 2);
+    assert.equal(registry.get(session.sessionId)?.state, "closed");
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("gc assigns distinct monotonic revisions across multiple prunable candidates", () => {
+  const fixture = createRepositoryFixture();
+  const firstWorktreePath = `${fixture.repositoryPath}-gc-revision-first`;
+  const secondWorktreePath = `${fixture.repositoryPath}-gc-revision-second`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const first = registry.provision({ worktreePath: firstWorktreePath, branchName: "feature/gc-revision-first" });
+    const second = registry.provision({
+      worktreePath: secondWorktreePath,
+      branchName: "feature/gc-revision-second",
+    });
+    const before = readJson(registry.paths.registry) as PersistedRegistry;
+
+    fs.rmSync(firstWorktreePath, { recursive: true, force: true });
+    fs.rmSync(secondWorktreePath, { recursive: true, force: true });
+
+    const result = registry.garbageCollect({ apply: true });
+    const after = readJson(registry.paths.registry) as PersistedRegistry;
+
+    assert.deepEqual(
+      new Set(result.cleaned.map((record) => record.sessionId)),
+      new Set([first.sessionId, second.sessionId]),
+    );
+    assert.deepEqual(result.blocked, []);
+    assert.equal(after.registry_revision, before.registry_revision + 6);
+    assert.equal(registry.get(first.sessionId)?.state, "closed");
+    assert.equal(registry.get(second.sessionId)?.state, "closed");
+  } finally {
+    removeWorktree(fixture.repositoryPath, firstWorktreePath);
+    removeWorktree(fixture.repositoryPath, secondWorktreePath);
+    fixture.cleanup();
+  }
+});
+
 test("does not rewrite a registry containing an unsupported feature", () => {
   const fixture = createRepositoryFixture();
   try {
@@ -591,6 +665,15 @@ function readJson(filePath: string): unknown {
 function writeRegistry(registry: SessionRegistry, value: PersistedRegistry): void {
   fs.mkdirSync(registry.paths.directory, { recursive: true });
   fs.writeFileSync(registry.paths.registry, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function removeWorktree(repositoryPath: string, worktreePath: string): void {
+  try {
+    runGit(["worktree", "remove", "--force", worktreePath], repositoryPath);
+  } catch {
+    // The directory cleanup remains safe when Git metadata was already removed.
+  }
+  fs.rmSync(worktreePath, { recursive: true, force: true });
 }
 
 function assertRegistryError(operation: () => unknown, code: SessionRegistryError["code"]): void {
