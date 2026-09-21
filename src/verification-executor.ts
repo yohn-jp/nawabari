@@ -324,8 +324,13 @@ function deriveVerificationRuntimeProjection(
   });
   if (!projectedWorkingSet.ok) return failure(projectedWorkingSet.error);
 
+  const {
+    filesystem_policy: _filesystemPolicy,
+    auxiliary_state: _auxiliaryState,
+    ...verificationBase
+  } = runtimeProjection;
   const projected = validateSessionRuntimeProjection({
-    ...runtimeProjection,
+    ...verificationBase,
     working_set: projectedWorkingSet.value,
   });
   if (!projected.ok) return failure(projected.error);
@@ -355,7 +360,15 @@ export async function executeVerification(
   if (!verifierProjection.ok) return verifierProjection;
   // This request is invocation-local. It never writes the verifier scope back
   // to the caller's agent Effective Working Set or session registry.
-  const verifierRequest = { ...request, runtime_projection: verifierProjection.value };
+  const verifierRequest = {
+    ...request,
+    runtime_projection: verifierProjection.value,
+    // Verification receives its own read-only projection. The agent's
+    // materialized enforcement plan must never widen that invocation-local
+    // authority.
+    filesystem_policy: undefined,
+    auxiliary_state: undefined,
+  };
   const command: SandboxCommand = { command: profile.value.executable, args: profile.value.argv };
   const execute =
     dependencies.execute ??

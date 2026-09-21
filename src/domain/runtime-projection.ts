@@ -5,6 +5,8 @@ import {
   validateWorkingSetRuntimeProjection,
   type WorkingSetRuntimeProjection,
 } from "./working-set-runtime-projection.js";
+import { validateAuxiliaryStateVisibility, type AuxiliaryStateVisibility } from "./auxiliary-state-policy.js";
+import { serializeFilesystemPolicy, type MaterializedFilesystemPolicy } from "./filesystem-policy-materialization.js";
 
 /** Versioned identity for the Session Runtime Projection domain contract. */
 export const SESSION_RUNTIME_PROJECTION_CONTRACT_ID = "nawabari.session-runtime-projection.v1" as const;
@@ -105,6 +107,10 @@ export type RuntimeProjectionInput = Readonly<{
   executables: readonly ProjectedExecutableEntrypoint[];
   /** Optional strict agent visibility constraint; absent preserves legacy sessions. */
   readonly working_set?: WorkingSetRuntimeProjection;
+  /** Optional validated repository-local auxiliary-state visibility. */
+  readonly auxiliary_state?: AuxiliaryStateVisibility;
+  /** Optional filesystem materialization consumed by the sandbox integrator. */
+  readonly filesystem_policy?: MaterializedFilesystemPolicy;
 }>;
 
 export type SessionRuntimeProjection = RuntimeProjectionInput &
@@ -377,6 +383,21 @@ export function validateSessionRuntimeProjection(input: unknown): DomainResult<S
     workingSet = result.value;
   }
 
+  let auxiliaryState: AuxiliaryStateVisibility | undefined;
+  if (input.auxiliary_state !== undefined) {
+    const result = validateAuxiliaryStateVisibility(input.auxiliary_state);
+    if (!result.ok) return failure(result.error);
+    auxiliaryState = result.value;
+  }
+
+  let filesystemPolicy: MaterializedFilesystemPolicy | undefined;
+  if (input.filesystem_policy !== undefined) {
+    const candidate = input.filesystem_policy as MaterializedFilesystemPolicy;
+    const serialized = serializeFilesystemPolicy(candidate);
+    if (!serialized.ok) return failure(serialized.error);
+    filesystemPolicy = candidate;
+  }
+
   const requirements: RuntimeRequirement[] = [];
   for (const [index, value] of input.requirements.entries()) {
     const result = validateRequirement(value, index);
@@ -425,6 +446,8 @@ export function validateSessionRuntimeProjection(input: unknown): DomainResult<S
         ),
       ),
       ...(workingSet === undefined ? {} : { working_set: workingSet }),
+      ...(auxiliaryState === undefined ? {} : { auxiliary_state: auxiliaryState }),
+      ...(filesystemPolicy === undefined ? {} : { filesystem_policy: filesystemPolicy }),
     }),
   );
 }
@@ -482,7 +505,16 @@ export const SESSION_RUNTIME_PROJECTION_DESCRIPTOR: JsonObject = Object.freeze({
     compatibility: "explicit-only",
     unrestricted_host_fallback: "never-implicit",
   },
-  fields: ["policy", "profile", "requirements", "filesystem", "executables", "working_set"],
+  fields: [
+    "policy",
+    "profile",
+    "requirements",
+    "filesystem",
+    "executables",
+    "working_set",
+    "filesystem_policy",
+    "auxiliary_state",
+  ],
   ownership: {
     resolves_before: "nawabari.sandbox-execution.v1",
     isolation_backend: "SandboxExecutionRequest",

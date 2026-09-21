@@ -32,6 +32,8 @@ import {
   compileWorkingSetRuntimeProjection,
   type WorkingSetRuntimeProjection,
 } from "./working-set-runtime-projection.js";
+import { validateAuxiliaryStateVisibility, type AuxiliaryStateVisibility } from "./auxiliary-state-policy.js";
+import type { MaterializedFilesystemPolicy } from "./filesystem-policy-materialization.js";
 import { fhsDevelopmentRuntimeReadiness, readFhsDevelopmentExecutableCandidates } from "./fhs-development-runtime.js";
 import type { FhsRuntimeExecutableDeclaration } from "./fhs-runtime.js";
 import {
@@ -210,6 +212,10 @@ export type SandboxExecutionRequest = {
   landlock_required?: boolean;
   /** Validated explicit runtime view; protected launch rejects omission. */
   runtime_projection?: SessionRuntimeProjection;
+  /** Materialized repository policy consumed by the protected launcher. */
+  filesystem_policy?: MaterializedFilesystemPolicy;
+  /** Validated bounded auxiliary-state visibility for this invocation. */
+  auxiliary_state?: AuxiliaryStateVisibility;
   /** Policy/profile/materializer evidence for the resolved runtime. */
   runtime_resolution?: RuntimeResolutionEvidence;
 };
@@ -238,6 +244,10 @@ export type SandboxExecutionOptions = {
   landlock_required?: boolean;
   /** Validated runtime projection consumed by the existing sandbox launcher. */
   runtime_projection?: SessionRuntimeProjection;
+  /** Materialized repository policy consumed by the protected launcher. */
+  filesystem_policy?: MaterializedFilesystemPolicy;
+  /** Validated bounded auxiliary-state visibility for this invocation. */
+  auxiliary_state?: AuxiliaryStateVisibility;
   /** Explicit policy selection; omitted means the strict default. */
   runtime_policy?: RuntimePolicy;
   /** Internal validated profile/adapter seams; the CLI uses the canonical default. */
@@ -964,6 +974,41 @@ export async function resolveSandboxExecutionRequest(
     runtimeProjection = undefined;
   }
 
+  let auxiliaryState = options.auxiliary_state;
+  if (auxiliaryState !== undefined) {
+    const validated = validateAuxiliaryStateVisibility(auxiliaryState);
+    if (!validated.ok) return failure(validated.error);
+    auxiliaryState = validated.value;
+  }
+  if (runtimeProjection?.auxiliary_state !== undefined) {
+    if (
+      auxiliaryState !== undefined &&
+      JSON.stringify(auxiliaryState) !== JSON.stringify(runtimeProjection.auxiliary_state)
+    ) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "The caller-provided auxiliary-state visibility does not match the runtime projection.",
+          { session_id: decision.session_id },
+        ),
+      );
+    }
+    auxiliaryState = runtimeProjection.auxiliary_state;
+  }
+  let filesystemPolicy = options.filesystem_policy;
+  if (runtimeProjection?.filesystem_policy !== undefined) {
+    if (filesystemPolicy !== undefined && filesystemPolicy.digest !== runtimeProjection.filesystem_policy.digest) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "The caller-provided filesystem policy does not match the runtime projection.",
+          { session_id: decision.session_id },
+        ),
+      );
+    }
+    filesystemPolicy = runtimeProjection.filesystem_policy;
+  }
+
   return success({
     schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
     contract_id: SANDBOX_CONTRACT_ID,
@@ -998,6 +1043,8 @@ export async function resolveSandboxExecutionRequest(
     landlock_state: doctor.landlock.effective_state,
     landlock_required: landlockRequired,
     ...(runtimeProjection === undefined ? {} : { runtime_projection: runtimeProjection }),
+    ...(filesystemPolicy === undefined ? {} : { filesystem_policy: filesystemPolicy }),
+    ...(auxiliaryState === undefined ? {} : { auxiliary_state: auxiliaryState }),
     ...(runtimeResolution === undefined ? {} : { runtime_resolution: runtimeResolution }),
   });
 }

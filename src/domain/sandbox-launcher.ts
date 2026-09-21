@@ -22,6 +22,14 @@ import {
 } from "./sandbox-seccomp.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import {
+  compileFilesystemPolicyEnforcement,
+  deriveFilesystemPolicyLandlockRules,
+  validateFilesystemPolicyEnforcementRuntime,
+  type FilesystemPolicyEnforcementPlan,
+  type FilesystemPolicyMount,
+} from "./filesystem-policy-enforcement.js";
+import { validateAuxiliaryStateVisibility } from "./auxiliary-state-policy.js";
+import {
   CANONICAL_EXECUTABLE_ROOT,
   compileRuntimeExecutableProjection,
   type RuntimeExecutableProjectionEntry,
@@ -565,6 +573,14 @@ function addDirectory(args: string[], destination: string, seen: Set<string>): v
   }
 }
 
+function addDirectoryNode(args: string[], destination: string, seen: Set<string>): void {
+  addDirectory(args, destination, seen);
+  if (destination !== "/" && !seen.has(destination)) {
+    seen.add(destination);
+    args.push("--dir", destination);
+  }
+}
+
 // Landlock is an allowlist.  Working-set directories therefore receive only
 // traversal/listing access; file content and file mutation access are granted
 // per materialized path.  This keeps an omitted/denied sibling outside the
@@ -710,6 +726,16 @@ function boundedBaselineRules(rules: readonly LandlockRule[]): readonly Landlock
   return result;
 }
 
+function mergeLandlockRules(...ruleSets: readonly (readonly LandlockRule[])[]): readonly LandlockRule[] {
+  const merged = new Map<string, number>();
+  for (const rules of ruleSets) {
+    for (const rule of rules) merged.set(rule.path, (merged.get(rule.path) ?? 0) | rule.allowed_access);
+  }
+  return [...merged.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([rulePath, allowed_access]) => ({ path: rulePath, allowed_access }));
+}
+
 function addReadOnlyBind(args: string[], source: string, destination: string, seenDirectories: Set<string>): void {
   addDirectory(args, destination, seenDirectories);
   args.push("--ro-bind", source, destination);
@@ -730,6 +756,62 @@ function addProjectionBind(args: string[], projection: ValidatedProjectionMount,
     args.push("--ro-bind", projection.source, projection.target);
   } else {
     args.push("--bind", projection.source, projection.target);
+  }
+}
+
+function addFilesystemPolicyMount(args: string[], mount: FilesystemPolicyMount, seenDirectories: Set<string>): void {
+  if (mount.source_kind === "directory") addDirectoryNode(args, mount.target, seenDirectories);
+  if (mount.access_mode === "read-only") addReadOnlyBind(args, mount.source, mount.target, seenDirectories);
+  else addReadWriteBind(args, mount.source, mount.target, seenDirectories);
+}
+
+function compileAuxiliaryStateMounts(
+  topology: ValidatedTopology,
+  visibility: NonNullable<SandboxExecutionRequest["auxiliary_state"]>,
+): DomainResult<readonly FilesystemPolicyMount[]> {
+  const validated = validateAuxiliaryStateVisibility(visibility);
+  if (!validated.ok) return failure(validated.error);
+  if (validated.value.visibility === "unsupported") return success(Object.freeze([]));
+
+  const target = path.resolve(topology.worktree, validated.value.auxiliary.target_path);
+  if (!isWithin(topology.worktree, target)) {
+    return topologyError("Auxiliary-state target escaped the authoritative worktree.", {
+      target: validated.value.auxiliary.target_path,
+    });
+  }
+  let targetStat: fs.Stats;
+  try {
+    targetStat = fs.lstatSync(target);
+    if (targetStat.isSymbolicLink() || (!targetStat.isDirectory() && !targetStat.isFile())) {
+      return topologyError("Auxiliary-state target is not a canonical regular path.", { target });
+    }
+    if (fs.realpathSync.native(target) !== target) {
+      return topologyError("Auxiliary-state target resolves through a symlink.", { target });
+    }
+  } catch {
+    return topologyError("Auxiliary-state target is unavailable in the managed worktree.", { target });
+  }
+
+  try {
+    const stat = fs.lstatSync(target);
+    if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) {
+      return topologyError("Auxiliary-state target is not a canonical regular path.", { target });
+    }
+    if (fs.realpathSync.native(target) !== target) {
+      return topologyError("Auxiliary-state target resolves through a symlink.", { target });
+    }
+    return success(
+      Object.freeze([
+        Object.freeze({
+          source: target,
+          target,
+          access_mode: "read-only" as const,
+          source_kind: stat.isDirectory() ? ("directory" as const) : ("file" as const),
+        }),
+      ]),
+    );
+  } catch {
+    return topologyError("Auxiliary-state visibility cannot be physically observed.", { target });
   }
 }
 
@@ -1117,6 +1199,31 @@ export function compileSandboxInvocation(
       : landlockAbi === null
         ? "reduced-defense"
         : "incompatible";
+  const filesystemPolicy =
+    request.filesystem_policy === undefined
+      ? success<FilesystemPolicyEnforcementPlan | null>(null)
+      : compileFilesystemPolicyEnforcement(request.filesystem_policy);
+  if (!filesystemPolicy.ok) return failure(filesystemPolicy.error);
+  const projectedAuxiliaryState = runtimeProjection.value?.auxiliary_state;
+  if (
+    request.auxiliary_state !== undefined &&
+    projectedAuxiliaryState !== undefined &&
+    JSON.stringify(request.auxiliary_state) !== JSON.stringify(projectedAuxiliaryState)
+  ) {
+    return failure(
+      new DomainError(
+        "RUNTIME_PROJECTION_INVALID",
+        "The caller-provided auxiliary-state visibility does not match the runtime projection.",
+        { session_id: request.session_id },
+      ),
+    );
+  }
+  const auxiliaryState = request.auxiliary_state ?? projectedAuxiliaryState;
+  const auxiliaryMounts =
+    auxiliaryState === undefined
+      ? success<readonly FilesystemPolicyMount[]>(Object.freeze([]))
+      : compileAuxiliaryStateMounts(topology.value, auxiliaryState);
+  if (!auxiliaryMounts.ok) return failure(auxiliaryMounts.error);
   const boundedWorkingSet = runtimeProjection.value?.working_set;
   if (boundedWorkingSet !== undefined && runtimeProjection.value?.policy.mode !== "strict") {
     return failure(
@@ -1130,7 +1237,8 @@ export function compileSandboxInvocation(
   // A bounded working set is meaningful only when the second filesystem
   // boundary is actually installed.  If Landlock or its adapter is absent,
   // reject the protected request instead of returning an unbounded worktree.
-  const landlockRequired = request.landlock_required === true || boundedWorkingSet !== undefined;
+  const landlockRequired =
+    request.landlock_required === true || boundedWorkingSet !== undefined || filesystemPolicy.value !== null;
   if (landlockRequired && !landlockSupported) {
     return failure(
       new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The required Landlock ABI is unavailable or incompatible.", {
@@ -1151,6 +1259,33 @@ export function compileSandboxInvocation(
         abi: landlockAbi,
       }),
     );
+  }
+  if (filesystemPolicy.value !== null) {
+    if (filesystemPolicy.value.worktree !== topology.value.worktree) {
+      return failure(
+        new DomainError("SANDBOX_TOPOLOGY_INVALID", "The filesystem policy is bound to a different worktree.", {
+          request_worktree: topology.value.worktree,
+          policy_worktree: filesystemPolicy.value.worktree,
+        }),
+      );
+    }
+    const policyRuntime = validateFilesystemPolicyEnforcementRuntime(filesystemPolicy.value, {
+      landlock_abi: landlockAbi,
+      landlock_helper: landlockExecutable.value,
+    });
+    if (!policyRuntime.ok) return failure(policyRuntime.error);
+    if (
+      boundedWorkingSet !== undefined &&
+      JSON.stringify(boundedWorkingSet) !== JSON.stringify(request.filesystem_policy?.working_set)
+    ) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "The materialized filesystem policy does not match the runtime working-set projection.",
+          { session_id: request.session_id },
+        ),
+      );
+    }
   }
   const landlockAdapterProjected =
     runtimeProjection.value === null ||
@@ -1185,14 +1320,29 @@ export function compileSandboxInvocation(
             })),
           ],
         };
+  const boundedFilesystem = boundedWorkingSet !== undefined || filesystemPolicy.value !== null;
+  if (auxiliaryState?.visibility === "bounded" && !boundedFilesystem) {
+    return failure(
+      new DomainError(
+        "RUNTIME_PROJECTION_INVALID",
+        "Bounded auxiliary-state visibility requires a bounded filesystem policy or working-set projection.",
+        { session_id: request.session_id },
+      ),
+    );
+  }
   const landlockRules = deriveLandlockRules(
-    boundedWorkingSet === undefined ? request.filesystem : { ...request.filesystem, owned_worktree: "/nawabari/git" },
+    boundedFilesystem ? { ...request.filesystem, owned_worktree: "/nawabari/git" } : request.filesystem,
     landlockProjection,
   );
-  const boundedLandlockRules =
-    boundedWorkingSet === undefined
-      ? landlockRules
-      : [...boundedBaselineRules(landlockRules), ...deriveWorkingSetRules(topology.value, boundedWorkingSet)];
+  const boundedLandlockRules = !boundedFilesystem
+    ? landlockRules
+    : mergeLandlockRules(
+        boundedBaselineRules(landlockRules),
+        filesystemPolicy.value === null
+          ? deriveWorkingSetRules(topology.value, boundedWorkingSet as WorkingSetRuntimeProjection)
+          : filesystemPolicy.value.landlock_rules,
+        deriveFilesystemPolicyLandlockRules(auxiliaryMounts.value),
+      );
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
   // An explicit strict projection exposes one canonical executable surface;
@@ -1269,7 +1419,22 @@ export function compileSandboxInvocation(
   ];
   const seenDirectories = new Set<string>();
   const worktreeDestination = topology.value.worktree;
-  addReadWriteBind(args, topology.value.worktree, worktreeDestination, seenDirectories);
+  if (filesystemPolicy.value === null) {
+    addReadWriteBind(args, topology.value.worktree, worktreeDestination, seenDirectories);
+  } else {
+    addDirectoryNode(args, worktreeDestination, seenDirectories);
+    for (const mount of filesystemPolicy.value.mounts) {
+      addFilesystemPolicyMount(args, mount, seenDirectories);
+    }
+    for (const mount of auxiliaryMounts.value) {
+      if (!filesystemPolicy.value.mounts.some((candidate) => candidate.target === mount.target)) {
+        addFilesystemPolicyMount(args, mount, seenDirectories);
+      }
+    }
+    for (const operation of filesystemPolicy.value.registry_operations) {
+      if (operation.parent !== undefined) addDirectoryNode(args, operation.parent.path, seenDirectories);
+    }
+  }
   addReadWriteBind(args, topology.value.home, SANDBOX_HOME, seenDirectories);
   addReadWriteBind(args, topology.value.cache, SANDBOX_CACHE_HOME, seenDirectories);
   addReadWriteBind(args, topology.value.persistent_home, SANDBOX_SHARED_HOME, seenDirectories);
