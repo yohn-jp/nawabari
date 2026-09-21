@@ -47,3 +47,20 @@ test("rejects Bash material from a non-canonical provider", () => {
   });
   assert.equal(result.ok, false);
 });
+
+test("rejects an incompatible Bash runtime version", () => {
+  const result = resolveProfileShell(
+    { ...profile, requirements: [{ ...profile.requirements[0], version: "4" }] },
+    {
+      executables: [
+        {
+          name: "bash",
+          target: "/nawabari/bin/bash",
+          provider: { id: "fhs-bash-runtime-provider", requirement_id: "bash-runtime" },
+          provenance: "runtime-profile",
+        },
+      ],
+    },
+  );
+  assert.equal(result.ok, false);
+});

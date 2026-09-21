@@ -35,7 +35,11 @@ export function resolveProfileShell(
 ): DomainResult<ResolvedShellRuntime> {
   const selected = profile.requirements.find((requirement) => requirement.id === BASH_REQUIREMENT.id);
   if (selected === undefined) return missing("the profile did not select Bash");
-  if (selected.kind !== BASH_REQUIREMENT.kind || selected.name !== BASH_REQUIREMENT.name) {
+  if (
+    selected.kind !== BASH_REQUIREMENT.kind ||
+    selected.name !== BASH_REQUIREMENT.name ||
+    selected.version !== BASH_REQUIREMENT.version
+  ) {
     return missing("the Bash requirement is inconsistent");
   }
   const entrypoint = materialized.executables.find(
