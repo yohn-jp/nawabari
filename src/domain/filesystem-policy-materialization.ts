@@ -627,15 +627,26 @@ function matchesSelector(selector: string, relativePath: string): boolean {
   return globRegex(selector).test(relativePath);
 }
 
+function deniedPath(scope: SelectorScope, relativePath: string): boolean {
+  return scope.deny.some((selector) => matchesSelector(selector, relativePath));
+}
+
 function namespaceRoot(selector: string): string | null {
   if (selector.endsWith("/**")) return selector.slice(0, -3);
   return null;
 }
 
 function denyHole(scope: SelectorScope, root: string): boolean {
-  return scope.deny.some(
-    (deny) => deny === root || deny.startsWith(`${root}/`) || matchesSelector(deny, `${root}/hole`),
-  );
+  return scope.deny.some((deny) => {
+    const prefix = literalPrefix(deny);
+    return (
+      deny === root ||
+      deny.startsWith(`${root}/`) ||
+      prefix === root ||
+      prefix.startsWith(`${root}/`) ||
+      matchesSelector(deny, `${root}/hole`)
+    );
+  });
 }
 
 function operationForScope(
@@ -716,7 +727,9 @@ function buildPlan(
         continue;
       }
       for (const entry of resolution.complete ? matched : []) {
-        if (entry.kind !== "file") {
+        if (deniedPath(scope, entry.relativePath)) {
+          unsupported.push({ selector, operation, reason: "DENY overrides the exact capability." });
+        } else if (entry.kind !== "file") {
           unsupported.push({ selector, operation, reason: "Directory exact READ/WRITE is not safely representable." });
         } else rules.push({ selector, relativePath: entry.relativePath, operation, kind: "native-path-rule" });
       }
@@ -731,6 +744,10 @@ function buildPlan(
       }
       const matched = resolvedBySelector.get(selector) ?? [];
       const existing = matched[0];
+      if (deniedPath(scope, selector) || (existing !== undefined && deniedPath(scope, existing.relativePath))) {
+        unsupported.push({ selector, operation, reason: "DENY overrides the exact capability." });
+        continue;
+      }
       if (existing !== undefined) {
         registryOperations.push({ selector, relativePath: existing.relativePath, operation, parent: existing.parent });
         continue;
