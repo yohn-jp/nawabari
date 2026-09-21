@@ -426,7 +426,25 @@ export function recordExecutionState(
   if (input.supervisor !== undefined) {
     const supplied = validateSupervisor(input.supervisor);
     if (!supplied.ok) return supplied;
-    supervisor = supplied.value;
+    if (current.value.supervisor_pid !== null && current.value.supervisor_starttime !== null) {
+      if (
+        supplied.value.pid !== current.value.supervisor_pid ||
+        supplied.value.starttime !== current.value.supervisor_starttime
+      ) {
+        return executionError("supervisor identity cannot change after attach.", { field: "supervisor" });
+      }
+      supervisor = Object.freeze({
+        pid: current.value.supervisor_pid,
+        starttime: current.value.supervisor_starttime,
+      });
+    } else {
+      if (current.value.state !== "starting" || input.state !== "attached") {
+        return executionError("supervisor identity may only be established by initial attach.", {
+          field: "supervisor",
+        });
+      }
+      supervisor = supplied.value;
+    }
   }
   if ((input.state === "attached" || input.state === "running") && supervisor.pid === null) {
     return executionError(`${input.state} state requires supervisor identity.`, { field: "supervisor" });
@@ -440,6 +458,9 @@ export function recordExecutionState(
       : validateReleaseAttempt(input.release_attempt, "release_attempt");
   if (!releaseAttemptResult.ok) return releaseAttemptResult;
   const releaseAttempt = releaseAttemptResult.value;
+  if (input.release_attempt === null && current.value.release_attempt !== null) {
+    return executionError("release-attempt evidence cannot be cleared.", { field: "release_attempt" });
+  }
   if (
     releaseAttempt !== null &&
     current.value.release_attempt !== null &&
@@ -540,8 +561,7 @@ const nativeIdentityReader: SessionExecutionIdentityReader = Object.freeze({
 
 function cgroupPathMatches(cgroupPath: string, expectedName: string): boolean {
   if (!isSafeText(cgroupPath, 4_096)) return false;
-  const normalized = cgroupPath;
-  return normalized === `/${expectedName}` || normalized.endsWith(`/${expectedName}`);
+  return cgroupPath === `/nawabari/${expectedName}`;
 }
 
 /**

@@ -80,9 +80,45 @@ test("state recording preserves all identity evidence and enforces lifecycle ord
   assert.equal(running.ok, true, running.ok ? "" : JSON.stringify(running.error));
   if (!running.ok) return;
 
+  const replacement = recordExecutionState(attachedRecord, {
+    state: "running",
+    supervisor: { pid: 4124, starttime: "9002" },
+    now: "2026-09-21T00:00:02.000Z",
+  });
+  assert.equal(replacement.ok, false);
+  if (!replacement.ok) assert.equal(replacement.error.code, "INVALID_ARGUMENT");
+
   const invalid = recordExecutionState(reservation(), { state: "running", now: "2026-09-21T00:00:01.000Z" });
   assert.equal(invalid.ok, false);
   if (!invalid.ok) assert.equal(invalid.error.code, "INVALID_ARGUMENT");
+});
+
+test("release-attempt evidence is monotonic and cannot be cleared", () => {
+  const released = recordExecutionState(attached(), {
+    state: "exited",
+    release_attempt: {
+      attempt: 1,
+      outcome: "unresolved",
+      attempted_at: "2026-09-21T00:00:02.000Z",
+    },
+    now: "2026-09-21T00:00:02.000Z",
+  });
+  assert.equal(released.ok, true, released.ok ? "" : JSON.stringify(released.error));
+  if (!released.ok) return;
+
+  const cleared = recordExecutionState(released.value, {
+    state: "exited",
+    release_attempt: null,
+    now: "2026-09-21T00:00:03.000Z",
+  });
+  assert.equal(cleared.ok, false);
+
+  const preserved = recordExecutionState(released.value, {
+    state: "exited",
+    now: "2026-09-21T00:00:03.000Z",
+  });
+  assert.equal(preserved.ok, true, preserved.ok ? "" : JSON.stringify(preserved.error));
+  if (preserved.ok) assert.equal(preserved.value.release_attempt?.attempt, 1);
 });
 
 test("serialization round-trips after a restart without changing execution identity", () => {
@@ -120,6 +156,15 @@ test("observation accepts only matching boot, process generation, and cgroup ide
   });
   assert.equal(differentCgroup.ok, true);
   if (differentCgroup.ok) assert.equal(differentCgroup.value.classification, "different-cgroup");
+
+  const sameBasenameDifferentHierarchy = observeExecutionIdentity(record, {
+    reader: reader(record, { cgroup_path: `/foreign/${deriveCgroupScopeName(record.cgroup_identity)}` }),
+  });
+  assert.equal(sameBasenameDifferentHierarchy.ok, true);
+  if (sameBasenameDifferentHierarchy.ok) {
+    assert.equal(sameBasenameDifferentHierarchy.value.matches, false);
+    assert.equal(sameBasenameDifferentHierarchy.value.classification, "different-cgroup");
+  }
 });
 
 test("missing supervisor evidence remains unresolved instead of becoming active", () => {
