@@ -1,0 +1,886 @@
+import { createHash } from "node:crypto";
+
+import { DomainError, failure, success, type DomainResult } from "./errors.js";
+import type { AuxiliaryStateDeclaration } from "./auxiliary-state-projection.js";
+import {
+  claimModeGrantsAccess,
+  resourceMatchesClaim,
+  type ResourceClaim,
+  type ResourceClaimMode,
+} from "../resource-claims.js";
+import type { RepositoryIdentity } from "../working-set.js";
+
+/** Stable identity for the operation-level filesystem policy contract. */
+export const EFFECTIVE_FILESYSTEM_POLICY_CONTRACT_ID = "nawabari.effective-filesystem-policy.v1" as const;
+export const EFFECTIVE_FILESYSTEM_POLICY_SCHEMA_VERSION = 1 as const;
+export const FILESYSTEM_POLICY_SERIALIZATION_KEY = "filesystem-policy" as const;
+
+export const EFFECTIVE_FILESYSTEM_OPERATIONS = Object.freeze([
+  "READONLY",
+  "WRITE",
+  "CREATE",
+  "DELETE",
+  "RENAME",
+] as const);
+export type EffectiveFilesystemOperation = (typeof EFFECTIVE_FILESYSTEM_OPERATIONS)[number];
+export type EffectiveFilesystemDomain = "repository" | "runtime" | "package" | "infrastructure";
+export type FilesystemPolicyBoundaryStatus = "applied" | "unapplied-legacy" | "unknown";
+export type FilesystemDecisionStatus = "allow" | "deny" | "unresolved";
+
+const SCOPE_KEYS = ["readOnly", "write", "create", "delete", "rename", "deny"] as const;
+type ScopeKey = (typeof SCOPE_KEYS)[number];
+const MAX_SELECTORS = 4_096;
+const MAX_CLAIMS = 4_096;
+const MAX_TEXT = 2_048;
+
+type UnknownRecord = Record<string, unknown>;
+
+export type FilesystemPolicySelector = Readonly<{
+  readonly path: string;
+  readonly domain?: EffectiveFilesystemDomain;
+}>;
+
+export type EffectiveFilesystemScope = Readonly<{
+  readonly readOnly: readonly FilesystemPolicySelector[];
+  readonly write: readonly FilesystemPolicySelector[];
+  readonly create: readonly FilesystemPolicySelector[];
+  readonly delete: readonly FilesystemPolicySelector[];
+  readonly rename: readonly FilesystemPolicySelector[];
+  readonly deny: readonly FilesystemPolicySelector[];
+}>;
+
+/** A bounded factual input for a single producer authority. */
+export type FilesystemPolicyBoundary = Readonly<{
+  readonly status?: FilesystemPolicyBoundaryStatus;
+  readonly identity?: string;
+  readonly digest?: string;
+  readonly revision?: number | string | null;
+  readonly epoch?: number | string | null;
+  readonly scope?: unknown;
+}>;
+
+export type FilesystemBackendRequirement = Readonly<{
+  readonly operation: EffectiveFilesystemOperation;
+  readonly path: string;
+  readonly destination?: string;
+  readonly domain?: EffectiveFilesystemDomain;
+  readonly status?: FilesystemPolicyBoundaryStatus;
+}>;
+
+export type EffectiveFilesystemPolicyInputs = Readonly<{
+  /** Worktree Runtime Profile filesystem baseline. */
+  readonly profile?: unknown;
+  readonly worktree_profile?: unknown;
+  readonly worktreeProfile?: unknown;
+  /** Effective Working Set; a scope object is accepted only as factual input. */
+  readonly working_set?: unknown;
+  readonly workingSet?: unknown;
+  /** Resource-coordination claims and their observed registry generation. */
+  readonly claims?: readonly ResourceClaim[] | unknown;
+  readonly resource_claims?: readonly ResourceClaim[] | unknown;
+  readonly claim_set_generation?: number | null;
+  readonly claimSetGeneration?: number | null;
+  /** Explicit repository-local auxiliary state declarations. */
+  readonly auxiliary_state?: readonly AuxiliaryStateDeclaration[] | unknown;
+  readonly auxiliaryState?: readonly AuxiliaryStateDeclaration[] | unknown;
+  /** Runtime epoch is intentionally explicit; host observation is not performed here. */
+  readonly runtime_epoch?: number | string | null;
+  readonly runtimeEpoch?: number | string | null;
+  readonly runtime?: { readonly epoch?: number | string | null; readonly status?: FilesystemPolicyBoundaryStatus };
+  /** Backend CREATE/DELETE/rename requirements are a separate authority. */
+  readonly backend_requirements?: readonly FilesystemBackendRequirement[] | unknown;
+  readonly backendRequirements?: readonly FilesystemBackendRequirement[] | unknown;
+  readonly repository?: RepositoryIdentity;
+}>;
+
+type CompiledBoundary = Readonly<{
+  readonly status: FilesystemPolicyBoundaryStatus;
+  readonly identity: string | null;
+  readonly digest: string | null;
+  readonly revision: number | string | null;
+  readonly epoch: number | string | null;
+  readonly scope: EffectiveFilesystemScope;
+}>;
+
+type CompiledClaimAuthority = Readonly<{
+  readonly status: FilesystemPolicyBoundaryStatus;
+  readonly generation: number | null;
+  readonly claims: readonly ResourceClaim[];
+}>;
+
+type CompiledBackendAuthority = Readonly<{
+  readonly status: FilesystemPolicyBoundaryStatus;
+  readonly requirements: readonly FilesystemBackendRequirement[];
+}>;
+
+export type EffectiveFilesystemPolicy = Readonly<{
+  readonly contract_id: typeof EFFECTIVE_FILESYSTEM_POLICY_CONTRACT_ID;
+  readonly schema_version: typeof EFFECTIVE_FILESYSTEM_POLICY_SCHEMA_VERSION;
+  readonly serialization_key: typeof FILESYSTEM_POLICY_SERIALIZATION_KEY;
+  readonly digest: string;
+  readonly profile: CompiledBoundary;
+  readonly working_set: CompiledBoundary;
+  readonly claims: CompiledClaimAuthority;
+  readonly backend: CompiledBackendAuthority;
+  readonly auxiliary: CompiledBoundary;
+  readonly provenance: Readonly<{
+    readonly profile_digest: string | null;
+    readonly working_set_revision: number | string | null;
+    readonly claim_set_generation: number | null;
+    readonly runtime_epoch: number | string | null;
+  }>;
+  readonly legacy_boundaries: readonly string[];
+}>;
+
+export type EffectivePathAccessFacts = Readonly<{
+  readonly policy: EffectiveFilesystemPolicy;
+  readonly operation: EffectiveFilesystemOperation;
+  readonly path: string;
+  readonly destination?: string;
+  readonly domain?: EffectiveFilesystemDomain;
+}>;
+
+export type EffectivePathAccessReason = Readonly<{
+  readonly authority: string;
+  readonly status: "allowed" | "denied" | "unresolved" | "legacy";
+  readonly reason: string;
+}>;
+
+export type EffectivePathAccessDecision = Readonly<{
+  readonly operation: EffectiveFilesystemOperation;
+  readonly path: string;
+  readonly destination?: string;
+  readonly domain: EffectiveFilesystemDomain;
+  readonly allowed: boolean;
+  readonly status: FilesystemDecisionStatus;
+  readonly decision: FilesystemDecisionStatus;
+  readonly reason: string;
+  readonly reasons: readonly EffectivePathAccessReason[];
+  readonly legacy_boundaries: readonly string[];
+  readonly provenance: EffectiveFilesystemPolicy["provenance"];
+}>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function compare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function stableClone(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableClone);
+  if (isRecord(value)) {
+    const result: UnknownRecord = {};
+    for (const key of Object.keys(value).sort(compare)) result[key] = stableClone(value[key]);
+    return result;
+  }
+  return value;
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(stableClone(value));
+}
+
+function invalid(field: string, reason: string): DomainResult<never> {
+  return failure(
+    new DomainError("RUNTIME_PROJECTION_INVALID", `Filesystem policy field '${field}' is invalid: ${reason}.`, {
+      field,
+    }),
+  );
+}
+
+function text(value: unknown, field: string): DomainResult<string> {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_TEXT || value.includes("\u0000")) {
+    return invalid(field, "expected bounded non-empty text");
+  }
+  return success(value.normalize("NFC"));
+}
+
+function positiveInteger(value: unknown, field: string): DomainResult<number> {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) return invalid(field, "expected a positive integer");
+  return success(value as number);
+}
+
+function identityKey(value: unknown, field: string): DomainResult<string> {
+  const parsed = text(value, field);
+  if (!parsed.ok) return parsed;
+  return success(parsed.value);
+}
+
+function domain(value: unknown, field: string): DomainResult<EffectiveFilesystemDomain> {
+  if (value === undefined) return success("repository");
+  if (value === "repository" || value === "runtime" || value === "package" || value === "infrastructure") {
+    return success(value);
+  }
+  return invalid(field, "unsupported projection domain");
+}
+
+function normalizePath(value: unknown, field: string, selectedDomain: EffectiveFilesystemDomain): DomainResult<string> {
+  const parsed = text(value, field);
+  if (!parsed.ok) return parsed;
+  const normalized = parsed.value.replaceAll("\\", "/");
+  const absolute = normalized.startsWith("/");
+  if (selectedDomain === "repository") {
+    const relative = normalized.replace(/^\.\//u, "");
+    if (
+      relative.length === 0 ||
+      relative.startsWith("/") ||
+      relative.includes("//") ||
+      relative.split("/").some((part) => part === "" || part === "." || part === "..")
+    ) {
+      return invalid(field, "expected a normalized repository-relative selector");
+    }
+    return success(relative);
+  }
+  if (!absolute || normalized.includes("//") || normalized.split("/").some((part) => part === "..")) {
+    return invalid(field, "expected a normalized absolute projection path");
+  }
+  return success(normalized);
+}
+
+function selector(
+  value: unknown,
+  field: string,
+  fallbackDomain: EffectiveFilesystemDomain,
+): DomainResult<FilesystemPolicySelector> {
+  if (typeof value === "string") {
+    const pathValue = normalizePath(value, field, fallbackDomain);
+    if (!pathValue.ok) return pathValue;
+    return success(Object.freeze({ path: pathValue.value, domain: fallbackDomain }));
+  }
+  if (!isRecord(value)) return invalid(field, "expected a selector string or object");
+  const selectedDomain = domain(value.domain, `${field}.domain`);
+  if (!selectedDomain.ok) return selectedDomain;
+  const pathValue = normalizePath(value.path, `${field}.path`, selectedDomain.value);
+  if (!pathValue.ok) return pathValue;
+  return success(Object.freeze({ path: pathValue.value, domain: selectedDomain.value }));
+}
+
+function emptyScope(): EffectiveFilesystemScope {
+  return Object.freeze({
+    readOnly: Object.freeze([]),
+    write: Object.freeze([]),
+    create: Object.freeze([]),
+    delete: Object.freeze([]),
+    rename: Object.freeze([]),
+    deny: Object.freeze([]),
+  });
+}
+
+function scopeFromValue(
+  value: unknown,
+  field: string,
+  fallbackDomain: EffectiveFilesystemDomain = "repository",
+): DomainResult<EffectiveFilesystemScope> {
+  if (!isRecord(value)) return invalid(field, "expected a scope object");
+  const result = {} as Record<ScopeKey, readonly FilesystemPolicySelector[]>;
+  for (const key of SCOPE_KEYS) {
+    const raw = value[key] ?? (key === "rename" ? value.renames : undefined) ?? [];
+    if (!Array.isArray(raw) || raw.length > MAX_SELECTORS)
+      return invalid(`${field}.${key}`, "expected a bounded array");
+    const parsed: FilesystemPolicySelector[] = [];
+    for (const [index, entry] of raw.entries()) {
+      const item = selector(entry, `${field}.${key}[${index}]`, fallbackDomain);
+      if (!item.ok) return item;
+      parsed.push(item.value);
+    }
+    parsed.sort((left, right) => compare(`${left.domain}:${left.path}`, `${right.domain}:${right.path}`));
+    result[key] = Object.freeze(parsed);
+  }
+  return success(Object.freeze(result));
+}
+
+function scopeFromBoundary(value: unknown, field: string): DomainResult<EffectiveFilesystemScope> {
+  if (value === undefined) return success(emptyScope());
+  if (!isRecord(value)) return invalid(field, "expected a boundary object");
+  const nested = value.scope ?? value.filesystem ?? value.paths ?? value;
+  return scopeFromValue(nested, `${field}.scope`, "repository");
+}
+
+function boundaryStatus(
+  value: unknown,
+  field: string,
+  defaultStatus: FilesystemPolicyBoundaryStatus,
+): DomainResult<FilesystemPolicyBoundaryStatus> {
+  if (value === undefined) return success(defaultStatus);
+  if (value === "applied" || value === "unapplied-legacy" || value === "unknown") return success(value);
+  return invalid(field, "unsupported boundary status");
+}
+
+function compileBoundary(
+  value: unknown,
+  field: string,
+  defaultStatus: FilesystemPolicyBoundaryStatus = "unapplied-legacy",
+): DomainResult<CompiledBoundary> {
+  if (value === undefined || value === null) {
+    return success(
+      Object.freeze({
+        status: "unapplied-legacy",
+        identity: null,
+        digest: null,
+        revision: null,
+        epoch: null,
+        scope: emptyScope(),
+      }),
+    );
+  }
+  if (!isRecord(value)) return invalid(field, "expected a boundary object");
+  const status = boundaryStatus(value.status, `${field}.status`, defaultStatus);
+  if (!status.ok) return status;
+  const scopeValue = scopeFromBoundary(value, field);
+  if (!scopeValue.ok) return scopeValue;
+  const identityValue =
+    value.identity === undefined ? success<string | null>(null) : identityKey(value.identity, `${field}.identity`);
+  if (!identityValue.ok) return identityValue;
+  const digestValue = value.digest === undefined ? value.profile_digest : value.digest;
+  const digest = digestValue === undefined ? success<string | null>(null) : identityKey(digestValue, `${field}.digest`);
+  if (!digest.ok) return digest;
+  let revisionValue: number | string | null = null;
+  if (value.revision !== undefined && value.revision !== null) {
+    if (typeof value.revision === "string") revisionValue = value.revision;
+    else if (Number.isSafeInteger(value.revision) && (value.revision as number) >= 1)
+      revisionValue = value.revision as number;
+    else return invalid(`${field}.revision`, "expected a positive revision");
+  }
+  let epochValue: number | string | null = null;
+  if (value.epoch !== undefined && value.epoch !== null) {
+    if (typeof value.epoch === "string") epochValue = value.epoch;
+    else if (Number.isSafeInteger(value.epoch) && (value.epoch as number) >= 1) epochValue = value.epoch as number;
+    else return invalid(`${field}.epoch`, "expected a positive epoch");
+  }
+  if (status.value === "applied" && digest.value === null && field === "profile")
+    return invalid(`${field}.digest`, "applied profile requires a digest");
+  if (status.value === "unknown")
+    return success(
+      Object.freeze({
+        status: status.value,
+        identity: identityValue.value,
+        digest: digest.value,
+        revision: revisionValue,
+        epoch: epochValue,
+        scope: emptyScope(),
+      }),
+    );
+  return success(
+    Object.freeze({
+      status: status.value,
+      identity: identityValue.value,
+      digest: digest.value,
+      revision: revisionValue,
+      epoch: epochValue,
+      scope: scopeValue.value,
+    }),
+  );
+}
+
+function claimsArray(value: unknown, field: string): DomainResult<readonly ResourceClaim[]> {
+  if (value === undefined || value === null) return success(Object.freeze([]));
+  if (!Array.isArray(value) || value.length > MAX_CLAIMS) return invalid(field, "expected a bounded claim array");
+  const result: ResourceClaim[] = [];
+  for (const [index, claim] of value.entries()) {
+    if (!isRecord(claim)) return invalid(`${field}[${index}]`, "expected a claim object");
+    if (typeof claim.resource !== "string" || typeof claim.mode !== "string")
+      return invalid(`${field}[${index}]`, "claim resource and mode are required");
+    if (claim.mode !== "read" && claim.mode !== "write" && claim.mode !== "exclusive-write")
+      return invalid(`${field}[${index}].mode`, "unsupported claim mode");
+    result.push(claim as unknown as ResourceClaim);
+  }
+  result.sort((left, right) =>
+    compare(`${left.resource}:${left.mode}:${left.claimId}`, `${right.resource}:${right.mode}:${right.claimId}`),
+  );
+  return success(Object.freeze(result));
+}
+
+function claimGeneration(value: unknown, field: string): DomainResult<number | null> {
+  if (value === undefined || value === null) return success(null);
+  return positiveInteger(value, field);
+}
+
+function workingSetBoundary(value: unknown): DomainResult<CompiledBoundary> {
+  if (value === undefined || value === null) return compileBoundary(undefined, "working_set");
+  if (!isRecord(value)) return invalid("working_set", "expected an Effective Working Set or scope object");
+  const scopeValue = value.scope ?? value;
+  const scope = scopeFromValue(scopeValue, "working_set.scope");
+  if (!scope.ok) return scope;
+  let revision: number | string | null = null;
+  if (value.revision !== undefined && value.revision !== null) {
+    if (typeof value.revision === "string") revision = value.revision;
+    else if (Number.isSafeInteger(value.revision) && (value.revision as number) >= 1)
+      revision = value.revision as number;
+    else return invalid("working_set.revision", "expected a positive revision");
+  }
+  const status = value.status === undefined ? "applied" : value.status;
+  const parsedStatus = boundaryStatus(status, "working_set.status", "applied");
+  if (!parsedStatus.ok) return parsedStatus;
+  const identityValue = value.id === undefined ? null : value.id;
+  if (identityValue !== null && typeof identityValue !== "string") return invalid("working_set.id", "expected text");
+  return success(
+    Object.freeze({
+      status: parsedStatus.value,
+      identity: identityValue,
+      digest: null,
+      revision,
+      epoch: null,
+      scope: parsedStatus.value === "unknown" ? emptyScope() : scope.value,
+    }),
+  );
+}
+
+function auxiliaryBoundary(value: unknown): DomainResult<CompiledBoundary> {
+  if (value === undefined || value === null) return compileBoundary(undefined, "auxiliary");
+  const source = isRecord(value) ? (value.declarations ?? value.items) : value;
+  const parsedStatus = boundaryStatus(isRecord(value) ? value.status : undefined, "auxiliary_state.status", "applied");
+  if (!parsedStatus.ok) return parsedStatus;
+  if (parsedStatus.value === "unknown")
+    return success(
+      Object.freeze({
+        status: "unknown",
+        identity: null,
+        digest: null,
+        revision: null,
+        epoch: null,
+        scope: emptyScope(),
+      }),
+    );
+  if (!Array.isArray(source) || source.length > MAX_SELECTORS)
+    return invalid("auxiliary_state", "expected a bounded declaration array");
+  const readOnly: FilesystemPolicySelector[] = [];
+  for (const [index, item] of source.entries()) {
+    if (!isRecord(item) || !isRecord(item.target))
+      return invalid(`auxiliary_state[${index}]`, "expected an auxiliary declaration");
+    const target = selector(item.target.path, `auxiliary_state[${index}].target.path`, "repository");
+    if (!target.ok) return target;
+    readOnly.push(target.value);
+  }
+  return success(
+    Object.freeze({
+      status: "applied",
+      identity: null,
+      digest: null,
+      revision: null,
+      epoch: null,
+      scope: Object.freeze({ ...emptyScope(), readOnly: Object.freeze(readOnly) }),
+    }),
+  );
+}
+
+function backendBoundary(value: unknown): DomainResult<CompiledBackendAuthority> {
+  if (value === undefined || value === null)
+    return success(Object.freeze({ status: "unapplied-legacy", requirements: Object.freeze([]) }));
+  const source = isRecord(value) ? (value.requirements ?? value.items) : value;
+  const parsedStatus = boundaryStatus(
+    isRecord(value) ? value.status : undefined,
+    "backend_requirements.status",
+    "applied",
+  );
+  if (!parsedStatus.ok) return parsedStatus;
+  if (parsedStatus.value === "unknown")
+    return success(Object.freeze({ status: "unknown", requirements: Object.freeze([]) }));
+  if (!Array.isArray(source) || source.length > MAX_SELECTORS)
+    return invalid("backend_requirements", "expected a bounded requirement array");
+  const requirements: FilesystemBackendRequirement[] = [];
+  for (const [index, item] of source.entries()) {
+    if (!isRecord(item)) return invalid(`backend_requirements[${index}]`, "expected an object");
+    const operation = item.operation;
+    if (!EFFECTIVE_FILESYSTEM_OPERATIONS.includes(operation as EffectiveFilesystemOperation))
+      return invalid(`backend_requirements[${index}].operation`, "unsupported operation");
+    const selectedDomain = domain(item.domain, `backend_requirements[${index}].domain`);
+    if (!selectedDomain.ok) return selectedDomain;
+    const pathValue = normalizePath(item.path, `backend_requirements[${index}].path`, selectedDomain.value);
+    if (!pathValue.ok) return pathValue;
+    const destination =
+      item.destination === undefined
+        ? undefined
+        : normalizePath(item.destination, `backend_requirements[${index}].destination`, selectedDomain.value);
+    if (destination !== undefined && !destination.ok) return destination;
+    if (operation === "RENAME" && destination === undefined)
+      return invalid(`backend_requirements[${index}].destination`, "rename requires a destination");
+    const status = boundaryStatus(item.status, `backend_requirements[${index}].status`, "applied");
+    if (!status.ok) return status;
+    requirements.push(
+      Object.freeze({
+        operation: operation as EffectiveFilesystemOperation,
+        path: pathValue.value,
+        ...(destination === undefined ? {} : { destination: destination.value }),
+        domain: selectedDomain.value,
+        status: status.value,
+      }),
+    );
+  }
+  requirements.sort((left, right) =>
+    compare(
+      `${left.operation}:${left.domain}:${left.path}:${left.destination ?? ""}`,
+      `${right.operation}:${right.domain}:${right.path}:${right.destination ?? ""}`,
+    ),
+  );
+  const unknown = requirements.some((item) => item.status === "unknown");
+  return success(
+    Object.freeze({ status: unknown ? "unknown" : parsedStatus.value, requirements: Object.freeze(requirements) }),
+  );
+}
+
+function readInputValue(inputs: UnknownRecord, ...keys: string[]): unknown {
+  for (const key of keys) if (inputs[key] !== undefined) return inputs[key];
+  return undefined;
+}
+
+function runtimeEpoch(inputs: UnknownRecord): DomainResult<number | string | null> {
+  const runtime = isRecord(inputs.runtime) ? inputs.runtime : undefined;
+  const value = readInputValue(inputs, "runtime_epoch", "runtimeEpoch") ?? runtime?.epoch;
+  if (value === undefined || value === null) return success(null);
+  if (typeof value === "number") return positiveInteger(value, "runtime_epoch");
+  return text(value, "runtime_epoch");
+}
+
+function selectorMatches(
+  item: FilesystemPolicySelector,
+  pathValue: string,
+  selectedDomain: EffectiveFilesystemDomain,
+): boolean {
+  if ((item.domain ?? "repository") !== selectedDomain) return false;
+  let expression = "^";
+  for (let index = 0; index < item.path.length; index += 1) {
+    const character = item.path[index] as string;
+    if (character === "*" && item.path[index + 1] === "*") {
+      expression += ".*";
+      index += 1;
+    } else if (character === "*") expression += "[^/]*";
+    else if (character === "?") expression += "[^/]";
+    else expression += character.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  }
+  return new RegExp(`${expression}$`, "u").test(pathValue);
+}
+
+function scopeEntries(
+  scope: EffectiveFilesystemScope,
+  operation: EffectiveFilesystemOperation,
+): readonly FilesystemPolicySelector[] {
+  if (operation === "READONLY") return scope.readOnly;
+  if (operation === "WRITE") return scope.write;
+  if (operation === "CREATE") return scope.create;
+  if (operation === "DELETE") return scope.delete;
+  return scope.rename;
+}
+
+function scopeAllows(
+  scope: EffectiveFilesystemScope,
+  operation: EffectiveFilesystemOperation,
+  pathValue: string,
+  selectedDomain: EffectiveFilesystemDomain,
+): boolean {
+  return scopeEntries(scope, operation).some((item) => selectorMatches(item, pathValue, selectedDomain));
+}
+
+function scopeDenies(
+  scope: EffectiveFilesystemScope,
+  pathValue: string,
+  selectedDomain: EffectiveFilesystemDomain,
+): boolean {
+  return scope.deny.some((item) => selectorMatches(item, pathValue, selectedDomain));
+}
+
+function operationClaimMode(operation: EffectiveFilesystemOperation): ResourceClaimMode {
+  return operation === "READONLY" ? "read" : "write";
+}
+
+function policyDigest(policy: Omit<EffectiveFilesystemPolicy, "digest">): string {
+  return createHash("sha256").update(stableJson(policy)).digest("hex");
+}
+
+function compileInputs(input: unknown): DomainResult<EffectiveFilesystemPolicy> {
+  if (!isRecord(input)) return invalid("inputs", "expected an object");
+  const profile = compileBoundary(readInputValue(input, "profile", "worktree_profile", "worktreeProfile"), "profile");
+  if (!profile.ok) return profile;
+  const workingSet = workingSetBoundary(readInputValue(input, "working_set", "workingSet"));
+  if (!workingSet.ok) return workingSet;
+  const claimSource = readInputValue(input, "claims", "resource_claims");
+  const claimRecord = isRecord(claimSource) ? claimSource : undefined;
+  const claimValue = claimRecord === undefined ? claimSource : (claimRecord.claims ?? claimRecord.items);
+  const claims = claimsArray(claimValue, "claims");
+  if (!claims.ok) return claims;
+  const claimStatusResult = boundaryStatus(
+    claimRecord?.status,
+    "claims.status",
+    claimSource === undefined ? "unapplied-legacy" : "applied",
+  );
+  if (!claimStatusResult.ok) return claimStatusResult;
+  const generation = claimGeneration(
+    readInputValue(input, "claim_set_generation", "claimSetGeneration") ?? claimRecord?.generation,
+    "claim_set_generation",
+  );
+  if (!generation.ok) return generation;
+  const runtime = runtimeEpoch(input);
+  if (!runtime.ok) return runtime;
+  const runtimeStatus = isRecord(input.runtime) ? input.runtime.status : undefined;
+  const claimStatus = claimStatusResult.value;
+  if (claimStatus === "applied" && generation.value === null)
+    return invalid("claim_set_generation", "applied claims require a generation");
+  const claimAuthority: CompiledClaimAuthority = Object.freeze({
+    status: claimStatus,
+    generation: generation.value,
+    claims: claims.value,
+  });
+  const auxiliary = auxiliaryBoundary(readInputValue(input, "auxiliary_state", "auxiliaryState"));
+  if (!auxiliary.ok) return auxiliary;
+  const backend = backendBoundary(readInputValue(input, "backend_requirements", "backendRequirements"));
+  if (!backend.ok) return backend;
+  const runtimeBoundary: CompiledBoundary = Object.freeze({
+    ...profile.value,
+    status: runtimeStatus === "unknown" ? "unknown" : profile.value.status,
+    scope: runtimeStatus === "unknown" ? emptyScope() : profile.value.scope,
+    epoch: runtime.value,
+  });
+  const provenance = Object.freeze({
+    profile_digest: profile.value.digest,
+    working_set_revision: workingSet.value.revision,
+    claim_set_generation: generation.value,
+    runtime_epoch: runtime.value,
+  });
+  const withoutDigest: Omit<EffectiveFilesystemPolicy, "digest"> = {
+    contract_id: EFFECTIVE_FILESYSTEM_POLICY_CONTRACT_ID,
+    schema_version: EFFECTIVE_FILESYSTEM_POLICY_SCHEMA_VERSION,
+    serialization_key: FILESYSTEM_POLICY_SERIALIZATION_KEY,
+    profile: runtimeBoundary,
+    working_set: workingSet.value,
+    claims: claimAuthority,
+    backend: backend.value,
+    auxiliary: auxiliary.value,
+    provenance,
+    legacy_boundaries: Object.freeze([
+      ...(profile.value.status === "unapplied-legacy" ? ["profile"] : []),
+      ...(workingSet.value.status === "unapplied-legacy" ? ["working_set"] : []),
+      ...(claimAuthority.status === "unapplied-legacy" ? ["claims"] : []),
+      ...(backend.value.status === "unapplied-legacy" ? ["backend"] : []),
+      ...(auxiliary.value.status === "unapplied-legacy" ? ["auxiliary"] : []),
+    ]),
+  };
+  return success(Object.freeze({ ...withoutDigest, digest: policyDigest(withoutDigest) }));
+}
+
+/** Compile only supplied producer facts; no filesystem or host observation is performed. */
+export function compileEffectiveFilesystemPolicy(
+  inputs: EffectiveFilesystemPolicyInputs | unknown,
+): DomainResult<EffectiveFilesystemPolicy> {
+  return compileInputs(inputs);
+}
+
+function pathValue(value: unknown, field: string, selectedDomain: EffectiveFilesystemDomain): DomainResult<string> {
+  return normalizePath(value, field, selectedDomain);
+}
+
+function decision(
+  facts: EffectivePathAccessFacts,
+  status: FilesystemDecisionStatus,
+  reason: string,
+  reasons: readonly EffectivePathAccessReason[],
+  selectedDomain: EffectiveFilesystemDomain,
+): EffectivePathAccessDecision {
+  return Object.freeze({
+    operation: facts.operation,
+    path: facts.path,
+    ...(facts.destination === undefined ? {} : { destination: facts.destination }),
+    domain: selectedDomain,
+    allowed: status === "allow",
+    status,
+    decision: status,
+    reason,
+    reasons: Object.freeze([...reasons]),
+    legacy_boundaries: facts.policy.legacy_boundaries,
+    provenance: facts.policy.provenance,
+  });
+}
+
+function authorityDecision(
+  boundary: CompiledBoundary,
+  authority: string,
+  operation: EffectiveFilesystemOperation,
+  pathValue: string,
+  selectedDomain: EffectiveFilesystemDomain,
+): EffectivePathAccessReason {
+  if (boundary.status === "unknown")
+    return Object.freeze({ authority, status: "unresolved", reason: "authority observation is incomplete" });
+  if (boundary.status === "unapplied-legacy")
+    return Object.freeze({ authority, status: "legacy", reason: "legacy boundary was not applied" });
+  if (scopeDenies(boundary.scope, pathValue, selectedDomain))
+    return Object.freeze({ authority, status: "denied", reason: "explicit deny matches" });
+  if (!scopeAllows(boundary.scope, operation, pathValue, selectedDomain))
+    return Object.freeze({ authority, status: "denied", reason: "path is outside the operation scope" });
+  return Object.freeze({ authority, status: "allowed", reason: "operation scope matches" });
+}
+
+/** Decide one operation independently; WRITE never implies READONLY. */
+export function decideEffectivePathAccess(facts: EffectivePathAccessFacts): EffectivePathAccessDecision {
+  const selectedDomain = facts.domain ?? "repository";
+  const normalized = pathValue(facts.path, "path", selectedDomain);
+  if (!normalized.ok)
+    return decision(
+      { ...facts, path: String(facts.path) },
+      "deny",
+      normalized.error.message,
+      [{ authority: "input", status: "denied", reason: normalized.error.message }],
+      selectedDomain,
+    );
+  const destination =
+    facts.destination === undefined ? undefined : pathValue(facts.destination, "destination", selectedDomain);
+  if (destination !== undefined && !destination.ok)
+    return decision(
+      { ...facts, path: normalized.value, destination: String(facts.destination) },
+      "deny",
+      destination.error.message,
+      [{ authority: "input", status: "denied", reason: destination.error.message }],
+      selectedDomain,
+    );
+  const canonicalFacts = {
+    ...facts,
+    path: normalized.value,
+    ...(destination === undefined ? {} : { destination: destination.value }),
+  };
+  const reasons: EffectivePathAccessReason[] = [];
+  const paths = [normalized.value, ...(destination !== undefined && destination.ok ? [destination.value] : [])];
+
+  for (const currentPath of paths) {
+    for (const [authority, boundary] of [
+      ["profile", facts.policy.profile],
+      ["working_set", facts.policy.working_set],
+      ["auxiliary", facts.policy.auxiliary],
+    ] as const) {
+      if (selectedDomain !== "repository" && authority !== "profile") {
+        reasons.push({
+          authority,
+          status: "legacy",
+          reason: "repository-content authority does not apply to this domain",
+        });
+        continue;
+      }
+      const outcome = authorityDecision(boundary, authority, facts.operation, currentPath, selectedDomain);
+      reasons.push(outcome);
+      if (outcome.status === "unresolved")
+        return decision(canonicalFacts, "unresolved", outcome.reason, reasons, selectedDomain);
+      if (outcome.status === "denied") return decision(canonicalFacts, "deny", outcome.reason, reasons, selectedDomain);
+    }
+  }
+
+  const backend = facts.policy.backend;
+  if (backend.status === "unknown")
+    return decision(
+      canonicalFacts,
+      "unresolved",
+      "backend authority observation is incomplete",
+      [...reasons, { authority: "backend", status: "unresolved", reason: "authority observation is incomplete" }],
+      selectedDomain,
+    );
+  if (backend.status === "applied") {
+    const operationRequirements = backend.requirements.filter(
+      (requirement) => requirement.operation === facts.operation && requirement.domain === selectedDomain,
+    );
+    if (operationRequirements.length === 0) {
+      reasons.push({
+        authority: "backend",
+        status: "legacy",
+        reason: "no backend requirement was declared for this operation",
+      });
+    } else {
+      const matched =
+        facts.operation === "RENAME"
+          ? operationRequirements.some(
+              (requirement) =>
+                requirement.status !== "unknown" &&
+                requirement.path === canonicalFacts.path &&
+                requirement.destination === canonicalFacts.destination,
+            )
+          : paths.every((currentPath) =>
+              operationRequirements.some(
+                (requirement) => requirement.status !== "unknown" && requirement.path === currentPath,
+              ),
+            );
+      const unknown = operationRequirements.some(
+        (requirement) =>
+          requirement.status === "unknown" &&
+          (facts.operation === "RENAME" ? requirement.path === canonicalFacts.path : paths.includes(requirement.path)),
+      );
+      if (unknown)
+        return decision(
+          canonicalFacts,
+          "unresolved",
+          "backend requirement is unknown",
+          [...reasons, { authority: "backend", status: "unresolved", reason: "requirement observation is incomplete" }],
+          selectedDomain,
+        );
+      if (!matched)
+        return decision(
+          canonicalFacts,
+          "deny",
+          "path is outside backend requirements",
+          [...reasons, { authority: "backend", status: "denied", reason: "no matching backend requirement" }],
+          selectedDomain,
+        );
+      reasons.push({ authority: "backend", status: "allowed", reason: "backend requirement matches" });
+    }
+  } else reasons.push({ authority: "backend", status: "legacy", reason: "legacy boundary was not applied" });
+
+  if (selectedDomain !== "repository") {
+    reasons.push({ authority: "claims", status: "legacy", reason: "resource claims apply only to repository content" });
+  } else if (facts.policy.claims.status === "unknown")
+    return decision(
+      canonicalFacts,
+      "unresolved",
+      "claim authority observation is incomplete",
+      [...reasons, { authority: "claims", status: "unresolved", reason: "authority observation is incomplete" }],
+      selectedDomain,
+    );
+  else if (facts.policy.claims.status === "applied") {
+    const required = operationClaimMode(facts.operation);
+    for (const currentPath of paths) {
+      const matching = facts.policy.claims.claims.filter((claim) => resourceMatchesClaim(claim, currentPath));
+      if (!matching.some((claim) => claimModeGrantsAccess(claim.mode, required))) {
+        return decision(
+          canonicalFacts,
+          "deny",
+          "resource claim does not grant the required operation",
+          [...reasons, { authority: "claims", status: "denied", reason: `required ${required} claim is absent` }],
+          selectedDomain,
+        );
+      }
+    }
+    reasons.push({ authority: "claims", status: "allowed", reason: `required ${required} claim matches` });
+  } else reasons.push({ authority: "claims", status: "legacy", reason: "legacy boundary was not applied" });
+
+  return decision(canonicalFacts, "allow", "all effective authorities allow the operation", reasons, selectedDomain);
+}
+
+/** Validate a compiled policy and return its canonical form. */
+export function validateEffectiveFilesystemPolicy(input: unknown): DomainResult<EffectiveFilesystemPolicy> {
+  if (!isRecord(input)) return invalid("policy", "expected an object");
+  if (
+    input.contract_id !== EFFECTIVE_FILESYSTEM_POLICY_CONTRACT_ID ||
+    input.schema_version !== EFFECTIVE_FILESYSTEM_POLICY_SCHEMA_VERSION
+  )
+    return invalid("policy", "unsupported contract or schema version");
+  if (
+    input.serialization_key !== FILESYSTEM_POLICY_SERIALIZATION_KEY ||
+    !isRecord(input.profile) ||
+    !isRecord(input.working_set) ||
+    !isRecord(input.claims) ||
+    !isRecord(input.backend) ||
+    !isRecord(input.auxiliary) ||
+    !isRecord(input.provenance) ||
+    !Array.isArray(input.legacy_boundaries) ||
+    typeof input.digest !== "string"
+  ) {
+    return invalid("policy", "compiled policy shape is incomplete");
+  }
+  const { digest: _digest, ...withoutDigest } = input;
+  const expected = policyDigest(withoutDigest as Omit<EffectiveFilesystemPolicy, "digest">);
+  if (input.digest !== expected) return invalid("policy.digest", "does not match canonical policy identity");
+  return success(input as unknown as EffectiveFilesystemPolicy);
+}
+
+/** Serialize only a validated policy; serialization never consults host state. */
+export function serializeEffectiveFilesystemPolicy(input: unknown): DomainResult<string> {
+  const policy = validateEffectiveFilesystemPolicy(input);
+  return policy.ok ? success(stableJson(policy.value)) : failure(policy.error);
+}
+
+export const serializeFilesystemPolicy = serializeEffectiveFilesystemPolicy;
+export const projectEffectiveFilesystemPolicy = compileEffectiveFilesystemPolicy;
