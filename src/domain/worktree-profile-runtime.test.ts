@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -236,6 +237,99 @@ test("entrypoint selection matches exact provider identity and serialization use
     assert.equal(serialized.ok, true, serialized.ok ? "" : JSON.stringify(serialized.error));
     if (!serialized.ok) return;
     assert.deepEqual(Object.keys(JSON.parse(serialized.value) as object), [RUNTIME_RESOLUTION_SERIALIZATION_KEY]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("composes one explicitly declared material with the existing runtime projection", () => {
+  const fixture = candidateFixture();
+  try {
+    const executable = path.join(fixture.root, "declared-tool");
+    fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const stat = fs.statSync(executable, { bigint: true });
+    const material = {
+      id: "declared-tool-material",
+      requirement_id: "declared-tool",
+      version: "1",
+      entrypoint: "declared-tool",
+      executable: {
+        source: executable,
+        digest: createHash("sha256").update(fs.readFileSync(executable)).digest("hex"),
+        identity: { dev: stat.dev.toString(10), ino: stat.ino.toString(10) },
+      },
+      source_closure: [
+        {
+          source: executable,
+          digest: createHash("sha256").update(fs.readFileSync(executable)).digest("hex"),
+          identity: { dev: stat.dev.toString(10), ino: stat.ino.toString(10) },
+        },
+      ],
+    };
+    const result = resolveWorktreeProfileRuntime(
+      profile([
+        {
+          entrypoint: "declared-tool",
+          material_id: "declared-tool-material",
+          provider: { id: "declared-tool-material", requirement_id: "declared-tool" },
+        },
+        {
+          entrypoint: "node",
+          provider: { id: NIX_RUNTIME_PROVIDER_IDS["node-runtime"], requirement_id: "node-runtime" },
+        },
+      ]),
+      fixture.layout,
+      {
+        platform: "linux",
+        nix: { store_root: fixture.store, command_runner: fixture.runner },
+        declared_materials: [material],
+      },
+    );
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (!result.ok) return;
+    const declared = result.value.projection.executables.find((entrypoint) => entrypoint.name === "declared-tool");
+    assert.deepEqual(declared?.provider, { id: "declared-tool-material", requirement_id: "declared-tool" });
+    assert.equal(
+      result.value.projection.requirements.some((requirement) => requirement.id === "declared-tool"),
+      true,
+    );
+    assert.equal(
+      result.value.projection.filesystem.some((entry) => entry.source === executable),
+      true,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("declared material selection fails closed for missing and duplicate identities", () => {
+  const fixture = candidateFixture();
+  try {
+    const missing = resolveWorktreeProfileRuntime(
+      profile([
+        {
+          entrypoint: "declared-tool",
+          material_id: "missing-material",
+          provider: { id: "missing-material", requirement_id: "declared-tool" },
+        },
+        {
+          entrypoint: "node",
+          provider: { id: NIX_RUNTIME_PROVIDER_IDS["node-runtime"], requirement_id: "node-runtime" },
+        },
+      ]),
+      fixture.layout,
+      { platform: "linux", nix: { store_root: fixture.store, command_runner: fixture.runner }, declared_materials: [] },
+    );
+    assert.equal(missing.ok, false);
+    if (!missing.ok) assert.equal(missing.error.code, "RUNTIME_PROVIDER_MISSING");
+
+    const duplicate = resolveWorktreeProfileRuntime(profile(), fixture.layout, {
+      platform: "linux",
+      nix: { store_root: fixture.store, command_runner: fixture.runner },
+      declared_materials: [{ id: "duplicate" }, { id: "duplicate" }],
+    });
+    assert.equal(duplicate.ok, false);
+    if (!duplicate.ok) assert.equal(duplicate.error.code, "RUNTIME_PROJECTION_AMBIGUOUS");
   } finally {
     fixture.cleanup();
   }

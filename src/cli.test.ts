@@ -691,6 +691,8 @@ test("command-specific help is projected from one spec and marks session create 
     "--worktree-root",
     "--base",
     "--label",
+    "--profile",
+    "--profile-parameter",
     "--resource",
     "--mode",
     "--auxiliary-state",
@@ -735,6 +737,84 @@ test("resource list help displays only resource-list options and does not inheri
   assert.ok(!response.options.some((option) => option.name === "--history"));
 });
 
+test("profile commands compose the accepted producer with the canonical dispatcher", async () => {
+  const listOutput = capture();
+  assert.equal(await runCli(["--json", "profile", "list"], { io: listOutput.io, cwd: os.tmpdir() }), 0);
+  const listed = JSON.parse(listOutput.stdout[0] ?? "") as {
+    command: string;
+    profiles: Array<{ reference: string; ready: boolean }>;
+  };
+  assert.equal(listed.command, "profile list");
+  assert.deepEqual(
+    listed.profiles.map((profile) => profile.reference),
+    ["builtin:minimal", "builtin:standard-shell"],
+  );
+  assert.equal(listed.profiles.find((profile) => profile.reference === "builtin:minimal")?.ready, true);
+  assert.equal(listed.profiles.find((profile) => profile.reference === "builtin:standard-shell")?.ready, false);
+
+  const showOutput = capture();
+  assert.equal(
+    await runCli(["--json", "profile", "show", "--profile", "builtin:minimal"], {
+      io: showOutput.io,
+      cwd: os.tmpdir(),
+    }),
+    0,
+  );
+  const shown = JSON.parse(showOutput.stdout[0] ?? "") as {
+    command: string;
+    source: { reference: string };
+    profile: { id: string };
+  };
+  assert.equal(shown.command, "profile show");
+  assert.equal(shown.source.reference, "builtin:minimal");
+  assert.equal(shown.profile.id, "minimal");
+});
+
+test("session create forwards a resolved ready profile and rejects unavailable material before backend use", async () => {
+  let receivedProfile: unknown = undefined;
+  const output = capture();
+  const exitCode = await runCli(
+    [
+      "--json",
+      "session",
+      "create",
+      "--profile",
+      "builtin:minimal",
+      "--profile-parameter",
+      '{"shell.entrypoint":"node"}',
+    ],
+    {
+      cwd: os.tmpdir(),
+      backend: backendForTests({
+        createSession: async (_context, options) => {
+          receivedProfile = options.profile;
+          return success(sampleSession);
+        },
+      }),
+      io: output.io,
+    },
+  );
+  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.deepEqual(receivedProfile, {
+    selection: { profile: "builtin:minimal" },
+    parameters: { "shell.entrypoint": "node" },
+  });
+
+  const unavailable = capture();
+  const unavailableExit = await runCli(["--json", "session", "create", "--profile", "builtin:standard-shell"], {
+    cwd: os.tmpdir(),
+    backend: backendForTests({
+      createSession: async () => {
+        throw new Error("backend must not run for an unavailable profile");
+      },
+    }),
+    io: unavailable.io,
+  });
+  assert.equal(unavailableExit, 4);
+  const failure = JSON.parse(unavailable.stdout[0] ?? "") as { code: string };
+  assert.equal(failure.code, "RUNTIME_MATERIALIZATION_MISSING");
+});
+
 test("canonical command registry resolves aliases without duplicating option definitions", () => {
   const publicDefinitions = publicCliCommandDefinitions();
   const publicNames = publicDefinitions.map((definition) => definition.name);
@@ -752,6 +832,8 @@ test("canonical command registry resolves aliases without duplicating option def
   assert.deepEqual(publicNames, [
     "session create",
     "session id",
+    "profile list",
+    "profile show",
     "session show",
     "session inspect",
     "session scope expand",
@@ -1044,6 +1126,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
     commands: [
       "session create",
       "session id",
+      "profile list",
+      "profile show",
       "session show",
       "session inspect",
       "session scope expand",
@@ -1087,6 +1171,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--worktree-root",
       "--base",
       "--label",
+      "--profile",
+      "--profile-parameter",
       "--resource",
       "--mode",
       "--auxiliary-state",

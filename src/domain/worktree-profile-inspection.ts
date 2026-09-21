@@ -1,5 +1,7 @@
 import type { JsonObject } from "./errors.js";
+import { BUILTIN_WORKTREE_PROFILE_CATALOG } from "./worktree-profile-builtins.js";
 import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
+import { builtinWorktreeProfileRevision } from "./worktree-profile-pinning.js";
 import type { WorktreeProfileCatalog } from "./worktree-profile-catalog.js";
 import type { RuntimeExecutableProvider } from "./runtime-projection.js";
 import type { RuntimeMaterializer } from "./runtime-resolution.js";
@@ -39,8 +41,11 @@ export type WorktreeProfileInspection = Readonly<{
   /** The catalog and selection declared by the pinned session authority. */
   readonly declared: Readonly<{
     readonly catalog: Readonly<{
-      readonly path: string;
-      readonly digest: string;
+      readonly kind: "repository" | "builtin";
+      readonly path?: string;
+      readonly digest?: string;
+      readonly id?: string;
+      readonly revision?: string;
     }>;
     readonly selection: Readonly<{
       readonly profile: string;
@@ -90,9 +95,28 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function isBuiltinCatalogSource(
+  catalog: PinnedWorktreeProfile["provenance"]["catalog"],
+): catalog is Extract<PinnedWorktreeProfile["provenance"]["catalog"], { readonly kind: "builtin" }> {
+  return "kind" in catalog && catalog.kind === "builtin";
+}
+
 function driftFor(pinned: PinnedWorktreeProfile, current: WorktreeProfileCatalogObservation): WorktreeProfileDrift {
+  if (isBuiltinCatalogSource(pinned.provenance.catalog)) {
+    return builtinWorktreeProfileRevision(pinned.provenance.catalog.id) === pinned.provenance.catalog.revision
+      ? "same"
+      : "changed";
+  }
   if (current.status === "unknown") return "unknown";
   return current.digest === pinned.provenance.catalog.blob_oid ? "same" : "changed";
+}
+
+function declaredCatalogProjection(pinned: PinnedWorktreeProfile): WorktreeProfileInspection["declared"]["catalog"] {
+  const catalog = pinned.provenance.catalog;
+  if (isBuiltinCatalogSource(catalog)) {
+    return { kind: "builtin", id: catalog.id, revision: catalog.revision };
+  }
+  return { kind: "repository", path: catalog.path, digest: catalog.blob_oid };
 }
 
 function currentCatalogProjection(observation: WorktreeProfileCatalogObservation): WorktreeProfileCatalogObservation {
@@ -128,6 +152,14 @@ export function inspectWorktreeProfile(
   currentCatalogObservation: WorktreeProfileCatalogObservation,
   runtimeObservation: WorktreeProfileRuntimeObservation,
 ): WorktreeProfileInspection {
+  const builtinCatalog = isBuiltinCatalogSource(pinned.provenance.catalog)
+    ? ({
+        status: "available",
+        digest: builtinWorktreeProfileRevision(pinned.provenance.catalog.id),
+        catalog: BUILTIN_WORKTREE_PROFILE_CATALOG,
+      } satisfies WorktreeProfileCatalogObservation)
+    : null;
+  const currentCatalog = builtinCatalog === null ? currentCatalogProjection(currentCatalogObservation) : builtinCatalog;
   const tools = [...pinned.resolved.tools]
     .sort((left, right) => compareText(left.entrypoint, right.entrypoint))
     .map((tool) => ({
@@ -140,8 +172,7 @@ export function inspectWorktreeProfile(
     schema_version: WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION,
     declared: {
       catalog: {
-        path: pinned.provenance.catalog.path,
-        digest: pinned.provenance.catalog.blob_oid,
+        ...declaredCatalogProjection(pinned),
       },
       selection: clone(pinned.provenance.selection),
     },
@@ -151,8 +182,8 @@ export function inspectWorktreeProfile(
       digest: pinned.digest,
     },
     current: {
-      catalog: currentCatalogProjection(currentCatalogObservation),
-      drift: driftFor(pinned, currentCatalogObservation),
+      catalog: currentCatalog,
+      drift: driftFor(pinned, currentCatalog),
     },
     runtime: {
       status: runtimeObservation.status,

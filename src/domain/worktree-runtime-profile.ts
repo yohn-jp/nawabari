@@ -35,10 +35,12 @@ export type WorktreeRuntimeFilesystemCeiling = Readonly<{
   readonly immutable: readonly string[];
 }>;
 
-/** A tool exposes only an entrypoint and the logical provider requirement that supplies it. */
+/** A tool exposes an entrypoint, provider requirement, and optional declared material identity. */
 export type WorktreeRuntimeToolReference = Readonly<{
   readonly entrypoint: string;
   readonly provider: RuntimeExecutableProvider;
+  /** Host-declared material selected explicitly for this tool, when present. */
+  readonly material_id?: string;
 }>;
 
 export type WorktreeRuntimeShellReference = Readonly<{
@@ -302,7 +304,7 @@ function filesystem(value: unknown): DomainResult<WorktreeRuntimeFilesystemCeili
 function tool(value: unknown, index: number): DomainResult<WorktreeRuntimeToolReference> {
   const field = `tools[${index}]`;
   if (!isRecord(value)) return invalid(field, "expected an object");
-  const keys = assertKeys(value, ["entrypoint", "provider"], field);
+  const keys = assertKeys(value, ["entrypoint", "provider", "material_id"], field);
   if (!keys.ok) return keys;
   const name = entrypoint(value.entrypoint, `${field}.entrypoint`);
   if (!name.ok) return name;
@@ -313,10 +315,17 @@ function tool(value: unknown, index: number): DomainResult<WorktreeRuntimeToolRe
   if (!providerId.ok) return providerId;
   const requirementId = stableIdentifier(value.provider.requirement_id, `${field}.provider.requirement_id`);
   if (!requirementId.ok) return requirementId;
+  let materialId: string | undefined;
+  if (value.material_id !== undefined) {
+    const checked = stableIdentifier(value.material_id, `${field}.material_id`);
+    if (!checked.ok) return checked;
+    materialId = checked.value;
+  }
   return success(
     Object.freeze({
       entrypoint: name.value,
       provider: Object.freeze({ id: providerId.value, requirement_id: requirementId.value }),
+      ...(materialId === undefined ? {} : { material_id: materialId }),
     }),
   );
 }

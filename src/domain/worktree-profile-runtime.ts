@@ -1,5 +1,6 @@
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
 import { compileRuntimeExecutableProjection } from "./runtime-executable-projection.js";
+import { projectDeclaredToolMaterial } from "./runtime-provider-declared.js";
 import {
   RUNTIME_RESOLUTION_SERIALIZATION_KEY,
   resolveRuntimeProjection,
@@ -14,6 +15,8 @@ import {
   validateSessionRuntimeProjection,
   type ProjectedExecutableEntrypoint,
   type RuntimeExecutableProvider,
+  type RuntimeFilesystemProjection,
+  type RuntimeRequirement,
   type SessionRuntimeProjection,
 } from "./runtime-projection.js";
 import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
@@ -48,6 +51,8 @@ export type WorktreeProfileRuntimeOptions = Readonly<{
   readonly platform?: string;
   readonly nix?: NixRuntimeClosureOptions;
   readonly fhs?: RuntimeResolutionFhsOptions;
+  /** Explicit host-declared material set keyed by each material's canonical id. */
+  readonly declared_materials?: readonly unknown[];
 }>;
 
 /** A materialized result accepted by the pure entrypoint selector. */
@@ -177,6 +182,162 @@ function runtimeLayoutParts(
   };
 }
 
+function declaredMaterialSet(value: readonly unknown[] | undefined): DomainResult<ReadonlyMap<string, unknown>> {
+  if (value === undefined) return success(new Map());
+  if (!Array.isArray(value)) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "Declared runtime materials must be an array.", {
+        field: "declared_materials",
+      }),
+    );
+  }
+  const materials = new Map<string, unknown>();
+  for (const [index, material] of value.entries()) {
+    if (!isRecord(material) || typeof material.id !== "string" || material.id.length === 0) {
+      return failure(
+        new DomainError("RUNTIME_PROJECTION_INVALID", "A declared runtime material must have one stable id.", {
+          field: `declared_materials[${index}].id`,
+        }),
+      );
+    }
+    if (materials.has(material.id)) {
+      return failure(
+        new DomainError("RUNTIME_PROJECTION_AMBIGUOUS", "A declared runtime material id is duplicated.", {
+          field: "declared_materials.id",
+          value: material.id,
+        }),
+      );
+    }
+    materials.set(material.id, material);
+  }
+  return success(materials);
+}
+
+function declaredEntrypoint(
+  material: unknown,
+  binding: WorktreeRuntimeToolReference,
+  requirement: RuntimeRequirement | undefined,
+): DomainResult<{
+  readonly executable: ProjectedExecutableEntrypoint;
+  readonly filesystem: readonly RuntimeFilesystemProjection[];
+  readonly requirement: RuntimeRequirement;
+}> {
+  if (binding.material_id === undefined) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "A declared material binding requires material_id.", {
+        field: "tools.material_id",
+      }),
+    );
+  }
+  const projected = projectDeclaredToolMaterial(
+    material,
+    { material_id: binding.material_id, entrypoint: binding.entrypoint, provenance: "runtime-profile" },
+    requirement,
+  );
+  if (!projected.ok) return projected;
+  if (projected.value.requirement_id !== binding.provider.requirement_id) {
+    return failure(
+      new DomainError(
+        "RUNTIME_PROJECTION_INVALID",
+        "Declared material requirement does not match the profile tool requirement.",
+        {
+          field: "tools.material_id",
+          material_id: binding.material_id,
+          expected_requirement_id: binding.provider.requirement_id,
+          actual_requirement_id: projected.value.requirement_id,
+        },
+      ),
+    );
+  }
+  if (projected.value.executable.provider.id !== binding.provider.id) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "Declared material provider does not match the profile tool.", {
+        field: "tools.provider.id",
+        material_id: binding.material_id,
+        expected_provider_id: binding.provider.id,
+        actual_provider_id: projected.value.executable.provider.id,
+      }),
+    );
+  }
+  return success({
+    executable: projected.value.executable,
+    filesystem: projected.value.filesystem,
+    requirement: {
+      id: projected.value.requirement_id,
+      kind: requirement?.kind ?? "package",
+      name: projected.value.executable.name,
+      version: projected.value.version,
+    },
+  });
+}
+
+function selectProfileRuntimeSurface(
+  base: SessionRuntimeProjection,
+  bindings: ProfileRuntimeBindings,
+  materials: ReadonlyMap<string, unknown>,
+): DomainResult<{
+  readonly executables: readonly ProjectedExecutableEntrypoint[];
+  readonly filesystem: readonly RuntimeFilesystemProjection[];
+  readonly requirements: readonly RuntimeRequirement[];
+}> {
+  const selected: ProjectedExecutableEntrypoint[] = [];
+  const filesystem: RuntimeFilesystemProjection[] = [...base.filesystem];
+  const requirements: RuntimeRequirement[] = [...base.requirements];
+  const names = new Set<string>();
+  for (const binding of bindings) {
+    if (names.has(binding.entrypoint)) {
+      return failure(
+        new DomainError("RUNTIME_PROJECTION_AMBIGUOUS", "A worktree runtime tool entrypoint is duplicated.", {
+          field: "tools.entrypoint",
+          value: binding.entrypoint,
+        }),
+      );
+    }
+    names.add(binding.entrypoint);
+
+    if (binding.material_id === undefined) {
+      const entrypoint = selectedEntrypoint(base.executables, binding);
+      if (entrypoint === null) return providerMissing(binding);
+      selected.push(entrypoint);
+      continue;
+    }
+
+    const material = materials.get(binding.material_id);
+    if (material === undefined) {
+      return failure(
+        runtimeProviderMissingError(binding.material_id, binding.entrypoint, binding.provider.requirement_id),
+      );
+    }
+    const requirement = base.requirements.find((candidate) => candidate.id === binding.provider.requirement_id);
+    const projected = declaredEntrypoint(material, binding, requirement);
+    if (!projected.ok) return projected;
+    const existingRequirement = requirements.find((candidate) => candidate.id === projected.value.requirement.id);
+    if (existingRequirement !== undefined) {
+      if (
+        existingRequirement.version !== projected.value.requirement.version ||
+        existingRequirement.kind !== projected.value.requirement.kind
+      ) {
+        return failure(
+          new DomainError("RUNTIME_PROJECTION_AMBIGUOUS", "Declared material conflicts with an existing requirement.", {
+            field: "requirements",
+            value: projected.value.requirement.id,
+          }),
+        );
+      }
+    } else {
+      requirements.push(projected.value.requirement);
+    }
+    filesystem.push(...projected.value.filesystem);
+    selected.push(projected.value.executable);
+  }
+  selected.sort((left, right) => compareText(`${left.name}\u0000${left.target}`, `${right.name}\u0000${right.target}`));
+  return success({
+    executables: Object.freeze(selected),
+    filesystem: Object.freeze(filesystem),
+    requirements: Object.freeze(requirements),
+  });
+}
+
 /**
  * Resolve a worktree profile through the existing material/profile resolver,
  * then narrow its user-visible executable surface to the declared tools.
@@ -199,15 +360,17 @@ export function resolveWorktreeProfileRuntime(
   });
   if (!resolved.ok) return failure(resolved.error);
 
-  const selected = selectProfileEntrypoints(resolved.value, checked.value.tools);
-  if (!selected.ok) return failure(selected.error);
+  const materials = declaredMaterialSet(options.declared_materials);
+  if (!materials.ok) return materials;
+  const selected = selectProfileRuntimeSurface(resolved.value.projection, checked.value.tools, materials.value);
+  if (!selected.ok) return selected;
 
   const projection = projectSessionRuntimeProjection({
     policy: resolved.value.policy,
     profile: resolved.value.profile,
-    requirements: resolved.value.projection.requirements,
-    filesystem: resolved.value.projection.filesystem,
-    executables: selected.value,
+    requirements: selected.value.requirements,
+    filesystem: selected.value.filesystem,
+    executables: selected.value.executables,
     ...(resolved.value.projection.working_set === undefined
       ? {}
       : { working_set: resolved.value.projection.working_set }),
@@ -243,8 +406,14 @@ export const WORKTREE_PROFILE_RUNTIME_DESCRIPTOR = Object.freeze({
   serialization_key: WORKTREE_PROFILE_RUNTIME_SERIALIZATION_KEY,
   authorities: {
     material: "resolveRuntimeProjection",
+    declared_material: "runtime-resolution.declared_materials",
     executable: "compileRuntimeExecutableProjection",
     profile: "validateWorktreeRuntimeProfile",
+  },
+  declared_material: {
+    input: "declared_materials",
+    binding: "tools[].material_id",
+    projection: "runtime-resolution",
   },
   excludes: ["ambient PATH", "host fallback", "provider aliases", "infrastructure helper removal"],
 });
