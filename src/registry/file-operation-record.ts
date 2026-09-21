@@ -443,6 +443,26 @@ function assertRecord(record: FileOperationRecord): void {
       operationId: record.operationId,
     });
   }
+  const validStageFlags =
+    (record.stage === "prepared" &&
+      record.applyAttempts === 0 &&
+      !record.effectObserved &&
+      !record.executionCompleted) ||
+    (record.stage === "apply-recorded" &&
+      record.applyAttempts > 0 &&
+      !record.effectObserved &&
+      !record.executionCompleted) ||
+    (record.stage === "completed" && record.applyAttempts > 0 && record.effectObserved && record.executionCompleted) ||
+    (record.stage === "unresolved" && record.applyAttempts > 0 && !record.executionCompleted);
+  if (!validStageFlags) {
+    throw new FileOperationError("FILE_OPERATION_CORRUPT", "File-operation stage and proof flags are inconsistent", {
+      operationId: record.operationId,
+      stage: record.stage,
+      applyAttempts: record.applyAttempts,
+      effectObserved: record.effectObserved,
+      executionCompleted: record.executionCompleted,
+    });
+  }
   assertTimestamp(record.createdAt, "createdAt");
   assertTimestamp(record.updatedAt, "updatedAt");
   if (record.expectedIdentity !== null) assertJsonValue(record.expectedIdentity, "expectedIdentity");
@@ -473,11 +493,6 @@ function assertState(state: FileOperationRegistryState): void {
       });
     }
     ids.add(record.operationId);
-    if (record.stage === "completed" && !record.executionCompleted) {
-      throw new FileOperationError("FILE_OPERATION_CORRUPT", "Completed receipt lacks execution proof", {
-        operationId: record.operationId,
-      });
-    }
   }
 }
 
