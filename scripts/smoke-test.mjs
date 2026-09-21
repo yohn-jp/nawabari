@@ -1000,7 +1000,7 @@ async function main() {
       createHelp.help_for !== "session create" ||
       createHelp.required_options?.length !== 0 ||
       createHelp.optional_options?.join(",") !==
-        "--branch,--worktree,--worktree-root,--base,--label,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file" ||
+        "--branch,--worktree,--worktree-root,--base,--label,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file,--enforce-claims" ||
       createHelp.defaults?.["--base"] !== "HEAD"
     ) {
       fail("installed session create help did not expose the optional/defaulted contract");
