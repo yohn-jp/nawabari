@@ -2,7 +2,14 @@ import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import { FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS, FHS_LANDLOCK_HELPER_REQUIREMENT_ID } from "./fhs-development-runtime.js";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
+import type { RuntimeExecutableProviderMaterialization } from "./runtime-executable-projection.js";
+import {
+  STRICT_RUNTIME_POLICY,
+  validateSessionRuntimeProjection,
+  type SessionRuntimeProjection,
+} from "./runtime-projection.js";
 import { WORKTREE_FILE_OPERATION_HELPER } from "./worktree-file-operation-helper.js";
 import type { ResourceClaimMode } from "../resource-claims.js";
 
@@ -110,8 +117,10 @@ export type SerializedWorktreeFileOperation = Readonly<{
 }>;
 
 export type WorktreeFileOperationExecutionOptions = Readonly<{
-  /** Canonical executable selected by the strict Landlock runtime materialization. */
-  readonly landlock_helper: string | null;
+  /** Provider materialization selected by the strict Landlock runtime. */
+  readonly landlock_helper: RuntimeExecutableProviderMaterialization | null;
+  /** The exact strict projection which materialized the provider source. */
+  readonly runtime_projection: SessionRuntimeProjection | null;
   /** Test seam for the fixed helper protocol; production uses the fixed spawn below. */
   readonly run_helper?: (packet: string) => string;
   readonly timeout_ms?: number;
@@ -477,23 +486,76 @@ function helperResponse(value: unknown): DomainResult<HelperResponse> {
   );
 }
 
-function validateLandlockHelper(value: string | null): DomainResult<string> {
-  if (process.platform !== "linux" || value === null || !path.isAbsolute(value) || value.includes("\0")) {
+function validateLandlockHelper(
+  value: RuntimeExecutableProviderMaterialization | null,
+  projection: SessionRuntimeProjection | null,
+): DomainResult<string> {
+  if (
+    process.platform !== "linux" ||
+    value === null ||
+    projection === null ||
+    value.provider.id !== FHS_DEVELOPMENT_RUNTIME_PROVIDER_IDS[FHS_LANDLOCK_HELPER_REQUIREMENT_ID] ||
+    value.provider.requirement_id !== FHS_LANDLOCK_HELPER_REQUIREMENT_ID ||
+    !path.isAbsolute(value.source) ||
+    value.source.includes("\0")
+  ) {
     return failure(
       new DomainError(
         "SANDBOX_CAPABILITY_UNAVAILABLE",
-        "The strictly materialized Landlock Python executable is unavailable.",
+        "The strictly materialized Landlock Python executable provider is unavailable.",
       ),
     );
   }
   try {
-    const canonical = fs.realpathSync.native(value);
+    const validatedProjection = validateSessionRuntimeProjection(projection);
+    if (!validatedProjection.ok) {
+      return failure(
+        new DomainError(
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "The strict runtime projection for the Landlock Python executable is unavailable.",
+        ),
+      );
+    }
+    const canonical = fs.realpathSync.native(value.source);
     const stat = fs.statSync(canonical);
-    if (!stat.isFile() || (stat.mode & 0o111) === 0 || !/^python3(?:\.[0-9]+)*$/u.test(path.basename(canonical))) {
+    if (
+      value.source !== canonical ||
+      !stat.isFile() ||
+      (stat.mode & 0o111) === 0 ||
+      !/^python3(?:\.[0-9]+)*$/u.test(path.basename(canonical))
+    ) {
       return failure(
         new DomainError(
           "SANDBOX_CAPABILITY_UNAVAILABLE",
           "The Landlock Python executable is not a canonical materialized runtime executable.",
+        ),
+      );
+    }
+    if (
+      validatedProjection.value.policy.mode !== STRICT_RUNTIME_POLICY.mode ||
+      validatedProjection.value.policy.host_visibility !== STRICT_RUNTIME_POLICY.host_visibility ||
+      validatedProjection.value.policy.compatibility !== STRICT_RUNTIME_POLICY.compatibility ||
+      validatedProjection.value.policy.unrestricted_host_fallback !== STRICT_RUNTIME_POLICY.unrestricted_host_fallback
+    ) {
+      return failure(
+        new DomainError(
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "The Landlock Python executable is not backed by the strict runtime projection.",
+        ),
+      );
+    }
+    const matchingProjections = validatedProjection.value.filesystem.filter(
+      (entry) =>
+        entry.source === canonical &&
+        entry.target === canonical &&
+        entry.access_mode === "read-only" &&
+        entry.provenance === "runtime-profile",
+    );
+    if (matchingProjections.length !== 1) {
+      return failure(
+        new DomainError(
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "The Landlock Python executable is not backed by its selected strict runtime materialization.",
         ),
       );
     }
@@ -526,9 +588,9 @@ function spawnFixedHelper(executable: string, packet: string, timeout: number, c
 /** Execute exactly one prepared operation through the fixed Linux helper. */
 export function executeWorktreeFileOperation(
   preparedOperation: PreparedWorktreeFileOperation,
-  options: WorktreeFileOperationExecutionOptions = { landlock_helper: null },
+  options: WorktreeFileOperationExecutionOptions = { landlock_helper: null, runtime_projection: null },
 ): DomainResult<WorktreeFileOperationResult> {
-  const helper = validateLandlockHelper(options.landlock_helper);
+  const helper = validateLandlockHelper(options.landlock_helper, options.runtime_projection);
   if (!helper.ok) return helper;
   const timeout = options.timeout_ms ?? 10_000;
   if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 60_000)
@@ -619,7 +681,7 @@ export function executeWorktreeFileOperation(
 /** Complete the bounded producer operation without exposing shell execution. */
 export function mutateWorktreeFile(
   input: unknown,
-  options: WorktreeFileOperationExecutionOptions = { landlock_helper: null },
+  options: WorktreeFileOperationExecutionOptions = { landlock_helper: null, runtime_projection: null },
 ): DomainResult<WorktreeFileOperationResult> {
   const prepared = prepareWorktreeFileOperation(input);
   if (!prepared.ok) return prepared;
