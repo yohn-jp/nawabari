@@ -131,6 +131,7 @@ test("wait policy leaves an active execution fenced and finalize fails closed", 
   assert.equal(started.ok, true);
   if (!started.ok) return;
   const completion = observeDrainCompletion(started.value, {
+    observed_epoch: started.value.admission_epoch,
     executions: [execution("exec-1", "active")],
     kernel_empty: false,
   });
@@ -156,7 +157,11 @@ test("explicit terminate policy advertises termination but never performs it", (
   );
   assert.equal(started.ok, true);
   if (!started.ok) return;
-  const completion = observeDrainCompletion(started.value, { kernel_empty: false });
+  const completion = observeDrainCompletion(started.value, {
+    observed_epoch: started.value.admission_epoch,
+    executions: [execution("exec-1", "active")],
+    kernel_empty: false,
+  });
   assert.equal(completion.ok, true);
   if (!completion.ok) return;
   assert.equal(completion.value.next_action, "terminate-owned-executions");
@@ -176,16 +181,24 @@ test("unknown occupancy and stale epochs prevent destructive finalization", () =
   );
   assert.equal(started.ok, true);
   if (!started.ok) return;
-  const unknown = observeDrainCompletion(started.value, { kernel_empty: true });
+  const unknown = observeDrainCompletion(started.value, {
+    observed_epoch: started.value.admission_epoch,
+    executions: [execution("exec-1", "unknown")],
+    kernel_empty: true,
+  });
   assert.equal(unknown.ok, true);
   if (!unknown.ok) return;
   assert.equal(unknown.value.next_action, "reobserve-drain");
-  const stale = observeDrainCompletion(started.value, { observed_epoch: 9, kernel_empty: true });
+  const stale = observeDrainCompletion(started.value, {
+    observed_epoch: 9,
+    executions: [execution("exec-1", "unknown")],
+    kernel_empty: true,
+  });
   assert.equal(stale.ok, false);
   if (!stale.ok) assert.equal(stale.error.code, "OPERATION_REJECTED");
 });
 
-test("empty proof can finalize, while serialization keeps registry/lifecycle authorities distinct", () => {
+test("only fresh post-admission empty proof can finalize", () => {
   const started = beginExecutionDrain(
     "session-1",
     7,
@@ -199,11 +212,24 @@ test("empty proof can finalize, while serialization keeps registry/lifecycle aut
   );
   assert.equal(started.ok, true);
   if (!started.ok) return;
-  const completion = observeDrainCompletion(started.value);
+  const preGateFinalization = finalizeExecutionDrain(started.value);
+  assert.equal(preGateFinalization.ok, false);
+  const preGateObservation = observeDrainCompletion(started.value, {
+    observed_epoch: started.value.expected_epoch,
+    executions: [execution("exec-1", "empty")],
+    kernel_empty: true,
+  });
+  assert.equal(preGateObservation.ok, false);
+  const completion = observeDrainCompletion(started.value, {
+    observed_epoch: started.value.admission_epoch,
+    executions: [execution("exec-1", "empty")],
+    kernel_empty: true,
+  });
   assert.equal(completion.ok, true);
   if (!completion.ok) return;
   const finalized = finalizeExecutionDrain(completion.value.fence);
   assert.equal(finalized.ok, true);
+  if (finalized.ok) assert.equal(finalized.value.admission_epoch, started.value.admission_epoch);
   const serialized = serializeExecutionDrainFence(completion.value.fence);
   assert.deepEqual(Object.keys(serialized), ["registry", "lifecycle"]);
   assert.equal((serialized.registry as { admission: string }).admission, "closed");
@@ -278,6 +304,58 @@ test("boot and cgroup identity mismatches fail closed", () => {
   assert.equal(wrongScopeResult.ok, false);
 });
 
+test("malformed nested cgroups evidence returns typed failure instead of throwing", () => {
+  const valid = execution("exec-1", "empty");
+  const malformed: SessionDrainExecution = {
+    record: valid.record,
+    observation: {
+      ...valid.observation,
+      cgroups: {
+        ...(valid.observation.cgroups as NonNullable<OwnedExecutionObservation["cgroups"]>),
+        population: null,
+      } as unknown as NonNullable<OwnedExecutionObservation["cgroups"]>,
+    },
+  };
+  const result = beginExecutionDrain(
+    "session-1",
+    7,
+    { operation: "close", policy: "wait", executions: [malformed] },
+    closeAdmission,
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "INVALID_ARGUMENT");
+});
+
+test("distinct long idempotency keys receive distinct bounded fence identities", () => {
+  const first = beginExecutionDrain(
+    "session-1",
+    7,
+    {
+      operation: "close",
+      policy: "wait",
+      idempotency_key: "a".repeat(512),
+    },
+    closeAdmission,
+  );
+  const second = beginExecutionDrain(
+    "session-1",
+    7,
+    {
+      operation: "close",
+      policy: "wait",
+      idempotency_key: `${"a".repeat(511)}b`,
+    },
+    closeAdmission,
+  );
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  if (first.ok && second.ok) {
+    assert.notEqual(first.value.fence_id, second.value.fence_id);
+    assert.ok(first.value.fence_id.length <= 512);
+    assert.ok(second.value.fence_id.length <= 512);
+  }
+});
+
 test("missing execution coverage remains fenced and malformed fence evidence is rejected", () => {
   const started = beginExecutionDrain(
     "session-1",
@@ -292,26 +370,32 @@ test("missing execution coverage remains fenced and malformed fence evidence is 
   );
   assert.equal(started.ok, true);
   if (!started.ok) return;
-  const missing = observeDrainCompletion(started.value, { executions: [], kernel_empty: true });
+  const missing = observeDrainCompletion(started.value, {
+    observed_epoch: started.value.admission_epoch,
+    executions: [],
+    kernel_empty: true,
+  });
   assert.equal(missing.ok, true);
   if (!missing.ok) return;
   assert.deepEqual(missing.value.missing_execution_ids, ["exec-1"]);
   assert.equal(missing.value.safe_to_finalize, false);
 
   const malformedKernel = observeDrainCompletion(started.value, {
+    observed_epoch: started.value.admission_epoch,
+    executions: [execution("exec-1", "empty")],
     kernel_empty: "yes" as unknown as boolean,
   });
   assert.equal(malformedKernel.ok, false);
 
   const malformedFence = observeDrainCompletion(
     { ...started.value, contract_id: "other-contract" } as unknown as typeof started.value,
-    { kernel_empty: true },
+    { observed_epoch: started.value.admission_epoch, executions: [execution("exec-1", "empty")], kernel_empty: true },
   );
   assert.equal(malformedFence.ok, false);
 
   const malformedOperation = observeDrainCompletion(
     { ...started.value, operation: "gc" } as unknown as typeof started.value,
-    { kernel_empty: true },
+    { observed_epoch: started.value.admission_epoch, executions: [execution("exec-1", "empty")], kernel_empty: true },
   );
   assert.equal(malformedOperation.ok, false);
 });

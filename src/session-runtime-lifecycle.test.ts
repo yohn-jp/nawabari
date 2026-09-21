@@ -149,8 +149,10 @@ test("explicit terminate runs only the caller supplied ownership operation, then
           kernel_empty: true,
         };
       },
-      mutate: ({ fence }) => {
-        events.push(`mutate:${fence.status}`);
+      mutate: ({ admission_epoch, fence }) => {
+        assert.equal(admission_epoch, runtimeEpoch);
+        assert.equal(fence.admission_epoch, runtimeEpoch);
+        events.push(`mutate:${fence.status}:${admission_epoch}`);
         return "discarded";
       },
     },
@@ -161,7 +163,7 @@ test("explicit terminate runs only the caller supplied ownership operation, then
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.equal(result.value.status, "completed");
-  assert.deepEqual(events, ["observe", "close-admission", "observe", "terminate", "observe", "mutate:ready"]);
+  assert.deepEqual(events, ["observe", "close-admission", "observe", "terminate", "observe", "mutate:ready:5"]);
 });
 
 test("claim release is blocked by unknown occupancy and never reaches mutation", async () => {

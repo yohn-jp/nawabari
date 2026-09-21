@@ -26,6 +26,8 @@ export type SessionRuntimeLifecycleSnapshot = Readonly<{
 export type SessionRuntimeLifecycleMutation = Readonly<{
   readonly operation: SessionDrainOperation;
   readonly session_id: string;
+  /** The canonical mutation must compare this with its current runtime epoch. */
+  readonly admission_epoch: RuntimeEpoch;
   readonly fence: SessionDrainFinalization;
 }>;
 
@@ -197,6 +199,7 @@ async function runMutation<T>(
   const value = await adapter.mutate({
     operation: options.operation,
     session_id: sessionId,
+    admission_epoch: finalization.value.admission_epoch,
     fence: finalization.value,
   });
   return success({

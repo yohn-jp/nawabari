@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { validateSessionExecutionRecord, type SessionExecutionRecord } from "./session-execution-record.js";
 import { deriveCgroupScopeName } from "./cgroups-v2.js";
 import {
@@ -72,6 +74,8 @@ export type SessionDrainFence = Readonly<{
   readonly admission_epoch: RuntimeEpoch;
   /** Admission is closed from this point until the fence is finalized/retried. */
   readonly admission: "closed";
+  /** True only after an explicit post-admission observation has been accepted. */
+  readonly completion_observed: boolean;
   readonly status: SessionDrainStatus;
   readonly executions: readonly SessionDrainExecution[];
   readonly active_execution_ids: readonly string[];
@@ -99,6 +103,8 @@ export type SessionDrainFinalization = Readonly<{
   readonly fence_id: string;
   readonly operation: SessionDrainOperation;
   readonly expected_epoch: RuntimeEpoch;
+  /** The canonical mutation must recheck this post-gate epoch. */
+  readonly admission_epoch: RuntimeEpoch;
   readonly admission: "closed";
   readonly status: "ready";
   /** The caller may now invoke the canonical registry mutation. */
@@ -106,9 +112,10 @@ export type SessionDrainFinalization = Readonly<{
 }>;
 
 export type SessionDrainObservation = Readonly<{
-  readonly observed_epoch?: RuntimeEpoch;
-  readonly executions?: readonly SessionDrainExecution[];
-  readonly kernel_empty?: boolean;
+  /** All three fields are required so pre-gate evidence cannot be reused. */
+  readonly observed_epoch: RuntimeEpoch;
+  readonly executions: readonly SessionDrainExecution[];
+  readonly kernel_empty: boolean;
 }>;
 
 const MAX_ID_LENGTH = 256;
@@ -214,21 +221,45 @@ function validateExecution(value: unknown, index: number): DomainResult<SessionD
       return controlError("A drain observation without a cgroups scope cannot prove occupancy.", { index });
     }
   } else {
+    const cgroups: unknown = observation.cgroups;
+    if (typeof cgroups !== "object" || cgroups === null || Array.isArray(cgroups)) {
+      return invalid("A drain process observation has malformed cgroups evidence.", { index });
+    }
+    const cgroupEvidence = cgroups as {
+      readonly scope?: unknown;
+      readonly population?: unknown;
+      readonly accounting?: unknown;
+    };
+    if (
+      !isBoundedText(cgroupEvidence.scope) ||
+      typeof cgroupEvidence.population !== "object" ||
+      cgroupEvidence.population === null ||
+      Array.isArray(cgroupEvidence.population) ||
+      typeof cgroupEvidence.accounting !== "object" ||
+      cgroupEvidence.accounting === null ||
+      Array.isArray(cgroupEvidence.accounting)
+    ) {
+      return invalid("A drain process observation has malformed cgroups evidence.", { index });
+    }
+    const population = cgroupEvidence.population as { readonly state?: unknown };
+    if (population.state !== "populated" && population.state !== "empty" && population.state !== "unknown") {
+      return invalid("A drain process observation has malformed cgroups population evidence.", { index });
+    }
     let expectedScope: string;
     try {
       expectedScope = deriveCgroupScopeName(normalizedRecord.cgroup_identity);
     } catch {
       return controlError("A drain execution record has an invalid cgroups identity.", { index });
     }
-    if (observation.cgroups.scope !== expectedScope) {
+    if (cgroupEvidence.scope !== expectedScope) {
       return controlError("A drain observation belongs to a different cgroups scope.", {
         index,
         execution_id: normalizedRecord.execution_id,
         expected_scope: expectedScope,
-        observed_scope: observation.cgroups.scope,
+        observed_scope: cgroupEvidence.scope,
       });
     }
-    const populationState = observation.cgroups.population.state;
+    const populationState = population.state;
     const consistentState =
       (observation.state === "active" && populationState === "populated") ||
       (observation.state === "empty" && populationState === "empty") ||
@@ -301,7 +332,11 @@ function validateIntent(value: SessionDrainIntent | string): DomainResult<Sessio
 
 function fenceId(sessionId: string, epoch: RuntimeEpoch, intent: SessionDrainIntent): string {
   const key = intent.idempotency_key ?? `${sessionId}:${String(epoch)}:${intent.operation}`;
-  return `drain-${key}`.slice(0, MAX_FENCE_LENGTH);
+  // Keep the wire identity bounded without truncating caller-controlled keys.
+  // Hashing the complete canonical key avoids collisions between distinct long
+  // idempotency keys while retaining a stable retry identity.
+  const digest = createHash("sha256").update(key, "utf8").digest("hex");
+  return `drain-${digest}`;
 }
 
 function summarize(executions: readonly SessionDrainExecution[]): {
@@ -376,6 +411,9 @@ function validateFenceShape(value: unknown): DomainResult<SessionDrainFence> {
   if (!operation(candidate.operation) || !policy(candidate.policy) || candidate.admission !== "closed") {
     return invalid("A drain fence operation or admission state is invalid.");
   }
+  if (typeof candidate.completion_observed !== "boolean") {
+    return invalid("A drain fence completion evidence marker is invalid.");
+  }
   if (candidate.idempotency_key !== undefined && !isBoundedText(candidate.idempotency_key, MAX_FENCE_LENGTH)) {
     return invalid("A drain fence idempotency_key is invalid.");
   }
@@ -407,7 +445,11 @@ function completionFor(fence: SessionDrainFence): SessionDrainCompletion {
   const current = summarize(fence.executions);
   const summary = { ...current, missing: fence.missing_execution_ids };
   const complete =
-    summary.active.length === 0 && summary.unknown.length === 0 && summary.missing.length === 0 && fence.kernel_empty;
+    fence.completion_observed &&
+    summary.active.length === 0 &&
+    summary.unknown.length === 0 &&
+    summary.missing.length === 0 &&
+    fence.kernel_empty;
   const nextAction: SessionDrainNextAction = complete
     ? "finalize-lifecycle"
     : summary.unknown.length > 0 || summary.missing.length > 0
@@ -529,6 +571,7 @@ export function beginExecutionDrain(
     policy: checkedIntent.value.policy,
     admission_epoch: closure.value.runtime_epoch,
     admission: "closed",
+    completion_observed: false,
     status: "draining",
     executions: checkedIntent.value.executions ?? Object.freeze([]),
     active_execution_ids: summary.active,
@@ -546,7 +589,7 @@ export function beginExecutionDrain(
 /** Re-observe process occupancy after waiting or an explicit termination. */
 export function observeDrainCompletion(
   fence: SessionDrainFence,
-  observation: SessionDrainObservation = {},
+  observation: SessionDrainObservation,
 ): DomainResult<SessionDrainCompletion> {
   const validatedFence = validateFenceShape(fence);
   if (!validatedFence.ok) return validatedFence;
@@ -554,13 +597,19 @@ export function observeDrainCompletion(
   if (typeof observation !== "object" || observation === null || Array.isArray(observation)) {
     return invalid("A drain completion observation must be an object.");
   }
-  if (observation.kernel_empty !== undefined && typeof observation.kernel_empty !== "boolean") {
+  if (
+    !isEpoch(observation.observed_epoch) ||
+    !Array.isArray(observation.executions) ||
+    typeof observation.kernel_empty !== "boolean"
+  ) {
+    return invalid("A drain completion observation must contain fresh epoch, execution, and kernel evidence.");
+  }
+  if (typeof observation.kernel_empty !== "boolean") {
     return invalid("A drain completion kernel_empty value must be boolean.");
   }
-  const checkedExecutions = validateExecutions(observation.executions ?? canonicalFence.executions);
+  const checkedExecutions = validateExecutions(observation.executions);
   if (!checkedExecutions.ok) return checkedExecutions;
-  const observedEpoch = observation.observed_epoch ?? canonicalFence.observed_epoch;
-  if (!isEpoch(observedEpoch)) return invalid("A drain completion epoch is invalid.");
+  const observedEpoch = observation.observed_epoch;
   if (!sameEpoch(observedEpoch, canonicalFence.admission_epoch)) {
     return controlError("The lifecycle epoch changed while the session was draining.", {
       session_id: canonicalFence.session_id,
@@ -573,9 +622,10 @@ export function observeDrainCompletion(
   const refreshed = Object.freeze({
     ...canonicalFence,
     observed_epoch: observedEpoch,
+    completion_observed: true,
     executions: mergeExecutions(canonicalFence.executions, checkedExecutions.value),
     missing_execution_ids: summary.missing,
-    kernel_empty: observation.kernel_empty ?? canonicalFence.kernel_empty,
+    kernel_empty: observation.kernel_empty,
   });
   return success(completionFor(refreshed));
 }
@@ -610,6 +660,7 @@ export function finalizeExecutionDrain(
       fence_id: canonicalFence.fence_id,
       operation: canonicalFence.operation,
       expected_epoch: canonicalFence.expected_epoch,
+      admission_epoch: canonicalFence.admission_epoch,
       admission: "closed",
       status: "ready",
       next_action: "finalize-lifecycle",
