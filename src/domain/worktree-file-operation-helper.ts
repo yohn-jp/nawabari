@@ -17,7 +17,11 @@ import stat
 import sys
 
 MAX_PACKET = 2 * 1024 * 1024
-MAX_PAYLOAD = 8 * 1024 * 1024
+# The TypeScript validator uses the same one-megabyte ceiling.  Keeping the
+# decoded payload below the two-megabyte packet bound leaves room for the
+# validated operation envelope and prevents an oversized stdin write from
+# becoming an ambiguous helper invocation.
+MAX_PAYLOAD = 1 * 1024 * 1024
 RENAME_NOREPLACE = 1
 AT_FDCWD = -100
 
@@ -74,11 +78,15 @@ def inspect_at(parent_fd, name):
     value = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if not stat.S_ISREG(value.st_mode):
         raise OSError(errno.EINVAL, "target is not a regular file")
+    if value.st_nlink != 1:
+        raise OSError(errno.EMLINK, "target has an unknown hardlink identity")
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
     try:
         opened = os.fstat(fd)
         if (opened.st_dev, opened.st_ino) != (value.st_dev, value.st_ino):
             raise OSError(errno.EAGAIN, "target identity changed")
+        if opened.st_nlink != 1:
+            raise OSError(errno.EMLINK, "target has an unknown hardlink identity")
         return fd, identity_from_stat(opened, digest_fd(fd))
     except BaseException:
         os.close(fd)
@@ -158,6 +166,10 @@ def delete(packet, root_fd):
             fd, identity = inspect_at(parent_fd, name)
         except FileNotFoundError:
             return fail("TARGET_ABSENT", "DELETE target is absent")
+        except OSError as error:
+            if error.errno in (errno.EAGAIN, errno.EINVAL, errno.ELOOP, errno.EMLINK):
+                return fail("TARGET_IDENTITY_UNAVAILABLE", str(error))
+            raise
         try:
             if not same_expected(identity, packet.get("expected")):
                 return fail("EXPECTED_IDENTITY_MISMATCH", "DELETE target identity does not match")
@@ -183,6 +195,10 @@ def rename(packet, root_fd):
             source_fd, identity = inspect_at(source_parent, source_name)
         except FileNotFoundError:
             return fail("SOURCE_ABSENT", "RENAME source is absent")
+        except OSError as error:
+            if error.errno in (errno.EAGAIN, errno.EINVAL, errno.ELOOP, errno.EMLINK):
+                return fail("SOURCE_IDENTITY_UNAVAILABLE", str(error))
+            raise
         if not same_expected(identity, packet.get("expected")):
             return fail("EXPECTED_IDENTITY_MISMATCH", "RENAME source identity does not match")
         try:
