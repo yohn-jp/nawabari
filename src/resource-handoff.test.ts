@@ -104,6 +104,40 @@ test("validates repository, state, exact ownership, and destination maximum scop
   assert.equal(denied.sourceRetained, true);
 });
 
+test("rejects malformed destination maximum scope before selector matching", () => {
+  const maximumScope = session("destination").maxScope!;
+  const malformedScopes: unknown[] = [
+    { ...maximumScope, write: [null] },
+    { ...maximumScope, write: ["./src/**"] },
+    { ...maximumScope, write: ["src//**"] },
+    { ...maximumScope, write: ["src/**", "src/**"] },
+    { ...maximumScope, write: undefined },
+  ];
+  for (const malformedScope of malformedScopes) {
+    assert.throws(
+      () =>
+        validateResourceHandoff(
+          snapshot({
+            sessions: [
+              session("source"),
+              { ...session("destination"), maxScope: malformedScope as ResourceHandoffSession["maxScope"] },
+            ],
+          }),
+          options(),
+        ),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+    );
+  }
+
+  assert.equal(
+    validateResourceHandoff(
+      snapshot({ sessions: [session("source"), { ...session("destination"), maxScope: undefined }] }),
+      options(),
+    ).code,
+    "OPERATION_REJECTED",
+  );
+});
+
 test("rejects stale generation, inactive sessions, mismatched identities, and missing exact claims", () => {
   assert.equal(validateResourceHandoff(snapshot({ claimSetGeneration: 5 }), options()).code, "STALE_CLAIM_SET");
   assert.equal(

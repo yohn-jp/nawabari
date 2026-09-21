@@ -212,7 +212,11 @@ const MAX_OPERATION_ID_LENGTH = 128;
 const MAX_SESSION_ID_LENGTH = 256;
 const MAX_RESOURCE_LENGTH = 4_096;
 const MAX_CLAIM_GROUP_ID_LENGTH = 128;
+const MAX_SCOPE_ENTRIES = 2_048;
+const MAX_SCOPE_SELECTOR_LENGTH = 1_024;
 const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+const SCOPE_SELECTOR_PATTERN = /^(?!\/)(?![A-Za-z]:)(?!\.\.?\/)(?!.*(?:\\|\/\/))[A-Za-z0-9_.*?/@+:-]+$/u;
+const MAXIMUM_SCOPE_KEYS = ["readOnly", "write", "create", "delete", "deny"] as const;
 
 /**
  * Validate one immutable registry snapshot. This function has no mutation or
@@ -692,7 +696,8 @@ function assertSnapshot(snapshot: ResourceHandoffSnapshot): void {
       !boundedText(session.sessionId, MAX_SESSION_ID_LENGTH) ||
       !boundedText(session.repositoryId, MAX_SESSION_ID_LENGTH) ||
       !canonicalAbsolutePath(session.worktreePath) ||
-      !boundedText(session.state, MAX_SESSION_ID_LENGTH)
+      !boundedText(session.state, MAX_SESSION_ID_LENGTH) ||
+      !isMaximumScopeEvidence(session.maxScope)
     ) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Resource handoff snapshot contains an invalid session");
     }
@@ -747,6 +752,32 @@ function isCanonicalSnapshotClaim(
   if (!isRecord(value) || typeof value.sessionId !== "string") return false;
   const owner = sessionsById.get(value.sessionId);
   return owner !== undefined && isCanonicalResourceClaim(value, registry.repositoryId, owner);
+}
+
+function isMaximumScopeEvidence(value: unknown): value is EffectiveWorkingSetScope | null | undefined {
+  if (value === undefined || value === null) return true;
+  if (!isRecord(value) || Object.keys(value).some((key) => !(MAXIMUM_SCOPE_KEYS as readonly string[]).includes(key))) {
+    return false;
+  }
+  for (const key of MAXIMUM_SCOPE_KEYS) {
+    const entries = value[key];
+    if (!Array.isArray(entries) || entries.length > MAX_SCOPE_ENTRIES) return false;
+    const selectors = new Set<string>();
+    for (const entry of entries) {
+      if (!isCanonicalScopeSelector(entry) || selectors.has(entry)) return false;
+      selectors.add(entry);
+    }
+  }
+  return true;
+}
+
+function isCanonicalScopeSelector(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_SCOPE_SELECTOR_LENGTH &&
+    SCOPE_SELECTOR_PATTERN.test(value)
+  );
 }
 
 function isCanonicalCommitDestinationClaim(
