@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,7 @@ import { withDirectoryFsyncFailure } from "./testing/fs-fault-injection.js";
 import {
   canonicalizeClaimResource,
   canonicalizeConcretePath,
+  canonicalClaimId,
   classifyResourceClaimTransition,
   claimsConflict,
   createResourceClaim,
@@ -23,6 +25,22 @@ import {
   type ResourceClaimTransition,
 } from "./resource-claims.js";
 import { SessionRegistry, type PersistedRegistry } from "./session-registry.js";
+
+test("canonical claim ids preserve the no-sharing digest input and delimit sharing fields", () => {
+  const sessionId = "session";
+  const mode = "write" as const;
+  const resource = "src/file.ts";
+  const digest = (input: string) => createHash("sha256").update(input).digest("hex");
+
+  assert.equal(
+    canonicalClaimId(sessionId, resource, mode),
+    `claim-${digest(`${sessionId}\u0000${mode}\u0000${resource}`)}`,
+  );
+  assert.equal(
+    canonicalClaimId(sessionId, resource, mode, { kind: "isolated-worktree", groupId: "group" }),
+    `claim-${digest(`${sessionId}\u0000${mode}\u0000${resource}\u0000isolated-worktree\u0000group`)}`,
+  );
+});
 
 test("defines every overlapping mode combination in the compatibility matrix", () => {
   assert.deepEqual(RESOURCE_CLAIM_COMPATIBILITY_MATRIX, {

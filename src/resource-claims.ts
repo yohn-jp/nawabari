@@ -190,13 +190,8 @@ export function canonicalClaimId(
   sharing?: SharedWriteBinding,
 ): string {
   const digest = createHash("sha256")
-    .update(sessionId)
-    .update("\u0000")
-    .update(mode)
-    .update("\u0000")
-    .update(resource)
-    .update("\u0000")
-    .update(sharing === undefined ? "" : `${sharing.kind}\u0000${sharing.groupId}`)
+    .update(`${sessionId}\u0000${mode}\u0000${resource}`)
+    .update(sharing === undefined ? "" : `\u0000${sharing.kind}\u0000${sharing.groupId}`)
     .digest("hex");
   return `${CLAIM_ID_PREFIX}${digest}`;
 }
