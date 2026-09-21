@@ -119,6 +119,7 @@ export type FhsDevelopmentRuntimeReadiness = Readonly<{
 const FHS_DISCOVERABLE_REQUIREMENT_IDS = Object.freeze([
   ...FHS_DEVELOPMENT_RUNTIME_REQUIREMENT_IDS,
   "pnpm-package",
+  "bash-runtime",
   FHS_LANDLOCK_HELPER_REQUIREMENT_ID,
 ] as const);
 
