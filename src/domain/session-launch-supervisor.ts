@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
+import path from "node:path";
 import process from "node:process";
+import type { Readable, Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 import {
   attachProcessToCgroup,
@@ -24,6 +27,8 @@ export const SESSION_LAUNCH_SUPERVISOR_SCHEMA_VERSION = 1 as const;
 
 const DEFAULT_RESULT_TIMEOUT_MS = 5 * 60 * 1_000;
 const MAX_TEXT_LENGTH = 4_096;
+const MAX_PRIVATE_ENVELOPE_BYTES = 2 * 1_024 * 1_024;
+const MAX_PAYLOAD_OUTPUT_BYTES = 1_024 * 1_024;
 
 export type SupervisorStdioValue = "ignore" | "inherit" | "pipe" | number;
 
@@ -126,6 +131,13 @@ export function serializeTrustedSupervisorGoMessage(request: SupervisorStartRequ
       seccomp_fd: 3,
     },
   });
+}
+
+function boundedPrivateEnvelope(value: string): string {
+  if (Buffer.byteLength(value, "utf8") > MAX_PRIVATE_ENVELOPE_BYTES) {
+    throw new Error("trusted supervisor private envelope exceeds its 2 MiB bound");
+  }
+  return value;
 }
 
 export type SessionLaunchSupervisorPacket = {
@@ -284,44 +296,151 @@ function scrubHostNodeEnvironment(environment: Readonly<Record<string, string>> 
   return safe;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSandboxExecutionResult(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (
+    (typeof value.exit_code !== "number" && value.exit_code !== null) ||
+    (typeof value.exit_code === "number" && !Number.isSafeInteger(value.exit_code)) ||
+    (typeof value.signal !== "string" && value.signal !== null) ||
+    (typeof value.signal === "string" && value.signal.length > MAX_TEXT_LENGTH) ||
+    typeof value.stdout !== "string" ||
+    typeof value.stderr !== "string" ||
+    typeof value.duration_ms !== "number" ||
+    !Number.isFinite(value.duration_ms) ||
+    value.duration_ms < 0
+  ) {
+    return false;
+  }
+  return Buffer.byteLength(value.stdout, "utf8") + Buffer.byteLength(value.stderr, "utf8") <= MAX_PAYLOAD_OUTPUT_BYTES;
+}
+
+function parseSupervisorChildResult(value: Buffer): SupervisorChildResult | null {
+  if (value.byteLength > MAX_PRIVATE_ENVELOPE_BYTES) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value.toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (
+    !isRecord(parsed) ||
+    (parsed.status !== "completed" && parsed.status !== "failed" && parsed.status !== "unknown")
+  ) {
+    return null;
+  }
+  if (parsed.status === "completed") {
+    return isSandboxExecutionResult(parsed.result) ? { status: "completed", result: parsed.result } : null;
+  }
+  if (parsed.status === "failed") {
+    if (parsed.error !== undefined && (typeof parsed.error !== "string" || parsed.error.length > MAX_TEXT_LENGTH)) {
+      return null;
+    }
+    return { status: "failed", ...(parsed.error === undefined ? {} : { error: parsed.error }) };
+  }
+  return { status: "unknown" };
+}
+
 function defaultSupervisorFactory(request: SupervisorStartRequest): TrustedSupervisorProcess {
-  const trusted = request.trusted;
-  const child = spawn(trusted.node_executable ?? process.execPath, [trusted.entrypoint, ...(trusted.args ?? [])], {
-    cwd: trusted.cwd,
-    env: scrubHostNodeEnvironment(trusted.env),
+  const workerEntrypoint = fileURLToPath(new URL("./session-launch-supervisor-worker.js", import.meta.url));
+  const workerCwd = path.dirname(workerEntrypoint);
+  const child = spawn(request.trusted.node_executable ?? process.execPath, [workerEntrypoint], {
+    // The package-owned worker is resolved from this module, never from the
+    // caller's entrypoint or PATH.  Its own 0/1/2 topology carries the
+    // payload's terminal topology; private control/result channels are fd 4/5.
+    cwd: workerCwd,
+    env: scrubHostNodeEnvironment(request.trusted.env),
     shell: false,
-    // fd 3 is deliberately passed through to the trusted package.  The
-    // package receives the GO message on stdin and must not expose a public
-    // command server.
-    stdio: ["pipe", "pipe", "pipe", request.payload.seccomp_fd],
+    stdio: [
+      request.payload.stdio[0],
+      request.payload.stdio[1],
+      request.payload.stdio[2],
+      request.payload.seccomp_fd,
+      "pipe",
+      "pipe",
+    ],
   });
 
+  const channels = child.stdio as Array<Readable | Writable | null | undefined>;
+  const resultStream = channels[5] as Readable | null | undefined;
+  let resultBytes = 0;
+  const resultChunks: Buffer[] = [];
+  let resultOverflow = false;
+  let resultEnded = resultStream == null;
+  if (resultStream != null) {
+    resultStream.on("data", (value: Buffer | string) => {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      resultBytes += chunk.byteLength;
+      if (resultBytes <= MAX_PRIVATE_ENVELOPE_BYTES) resultChunks.push(chunk);
+      else resultOverflow = true;
+    });
+    resultStream.once("end", () => {
+      resultEnded = true;
+    });
+    resultStream.once("close", () => {
+      resultEnded = true;
+    });
+    resultStream.once("error", () => {
+      resultOverflow = true;
+      resultEnded = true;
+    });
+  }
+  // A worker must never block on accidental diagnostics written to its
+  // inherited payload streams while the parent waits for fd 5.
+  child.stdout?.resume();
+  child.stderr?.resume();
+
   let settled = false;
+  let childResult: SupervisorChildResult | null = null;
   const waitPromise = new Promise<SupervisorChildResult>((resolve) => {
     const finish = (result: SupervisorChildResult): void => {
       if (settled) return;
       settled = true;
       resolve(result);
     };
-    child.once("error", (error: Error) => finish({ status: "failed", error: error.message.slice(0, 240) }));
-    child.once("close", (code, signal) => {
-      if (code === 0) finish({ status: "completed" });
-      else finish({ status: "failed", error: `supervisor exited with ${signal ?? `code ${code ?? "unknown"}`}` });
+    child.once("error", () => finish({ status: "unknown" }));
+    child.once("close", (code) => {
+      if (code !== 0 || !resultEnded || resultOverflow) {
+        finish({ status: "unknown" });
+        return;
+      }
+      childResult = parseSupervisorChildResult(Buffer.concat(resultChunks));
+      finish(childResult ?? { status: "unknown" });
     });
   });
-  const wait = (): Promise<SupervisorChildResult> => waitPromise;
+  let goSent = false;
+  const send_go = (): Promise<void> => {
+    if (goSent) return Promise.reject(new Error("trusted supervisor GO was already sent"));
+    goSent = true;
+    const control = channels[4] as Writable | null | undefined;
+    if (control === null || control === undefined || control.destroyed || typeof control.write !== "function") {
+      return Promise.reject(new Error("trusted supervisor control channel is unavailable"));
+    }
+    const message = boundedPrivateEnvelope(serializeTrustedSupervisorGoMessage(request));
+    return new Promise<void>((resolve, reject) => {
+      let settledWrite = false;
+      const finishWrite = (error?: Error): void => {
+        if (settledWrite) return;
+        settledWrite = true;
+        control.removeListener("error", onError);
+        if (error === undefined) resolve();
+        else reject(error);
+      };
+      const onError = (error: Error): void => finishWrite(error);
+      control.once("error", onError);
+      control.end(`${message}\n`, () => finishWrite());
+    });
+  };
   return {
     pid: child.pid ?? -1,
-    send_go: () => {
-      if (child.stdin === null || child.stdin.destroyed) throw new Error("trusted supervisor stdin is unavailable");
-      const message = serializeTrustedSupervisorGoMessage(request);
-      child.stdin.write(`${message}\n`);
-      child.stdin.end();
-    },
+    send_go,
     terminate: () => {
       if (!child.killed) child.kill("SIGKILL");
     },
-    wait,
+    wait: () => waitPromise,
   };
 }
 
