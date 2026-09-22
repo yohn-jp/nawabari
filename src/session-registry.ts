@@ -415,7 +415,9 @@ export type CleanupReconciliationOutcome = "completed" | "retryable" | "unresolv
 export interface RuntimeFinalizationEvidence {
   readonly expectedEpoch: number;
   readonly admissionEpoch: number;
-  readonly revalidate: () => Readonly<{ runtimeEpoch: number; kernelEmpty: boolean }>;
+  /** Physical observation captured after admission was durably closed and immediately before the locked mutation. */
+  readonly observedRuntimeEpoch: number;
+  readonly kernelEmpty: boolean;
 }
 
 /** Bounded, identity-bound evidence for a destructive lifecycle retry. */
@@ -4637,26 +4639,12 @@ export class SessionRegistry {
         throw new SessionRegistryError("OPERATION_REJECTED", "Runtime admission epoch is stale", { sessionId });
       }
     }
-    let observed: Readonly<{ runtimeEpoch: number; kernelEmpty: boolean }>;
-    try {
-      observed = finalization.revalidate();
-    } catch (error: unknown) {
-      throw new SessionRegistryError(
-        "PHYSICAL_OBSERVATION_UNAVAILABLE",
-        "Final runtime observation failed",
-        {
-          sessionId,
-          reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
-        },
-        error,
-      );
-    }
-    if (observed.runtimeEpoch !== state.runtimeEpoch || !observed.kernelEmpty) {
+    if (finalization.observedRuntimeEpoch !== state.runtimeEpoch || !finalization.kernelEmpty) {
       throw new SessionRegistryError("OPERATION_REJECTED", "Final runtime drain evidence is stale or non-empty", {
         sessionId,
-        observedEpoch: observed.runtimeEpoch,
+        observedEpoch: finalization.observedRuntimeEpoch,
         runtimeEpoch: state.runtimeEpoch,
-        kernelEmpty: observed.kernelEmpty,
+        kernelEmpty: finalization.kernelEmpty,
       });
     }
   }
