@@ -1122,6 +1122,10 @@ export class SessionRegistry {
     return record === undefined ? undefined : cloneSessionRecord(record);
   }
 
+  get runtimeEpoch(): number {
+    return this.readStateUnsafe().runtimeEpoch;
+  }
+
   /** Return the single authoritative claim set, optionally scoped to a session. */
   listClaims(sessionId?: string | null): readonly ResourceClaim[] {
     const claims = this.readStateUnsafe().claims;
