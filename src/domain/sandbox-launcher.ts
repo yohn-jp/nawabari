@@ -1347,6 +1347,36 @@ export function compileSandboxInvocation(
       landlock_helper: request.landlock_executable,
     });
     if (!runtime.ok) return runtime;
+    const unauthorizedProjection = projectionMounts.value.find(
+      (projection) =>
+        isWithin(topology.value.worktree, projection.source) &&
+        !isWithinNamespace(topology.value.worktree, projection.target),
+    );
+    if (unauthorizedProjection !== undefined) {
+      return topologyError(
+        "A filesystem projection sourced from the authoritative worktree cannot target outside the enforced worktree.",
+        {
+          source: unauthorizedProjection.source,
+          target: unauthorizedProjection.target,
+          session_id: request.session_id,
+        },
+      );
+    }
+    const unauthorizedExecutable = executableProjection.value.find(
+      (projection) =>
+        isWithin(topology.value.worktree, projection.source) &&
+        !isWithinNamespace(topology.value.worktree, projection.target),
+    );
+    if (unauthorizedExecutable !== undefined) {
+      return topologyError(
+        "An executable projection sourced from the authoritative worktree cannot target outside the enforced worktree.",
+        {
+          source: unauthorizedExecutable.source,
+          target: unauthorizedExecutable.target,
+          session_id: request.session_id,
+        },
+      );
+    }
   }
   const landlockRequired =
     request.landlock_required === true || boundedWorkingSet !== undefined || filesystemEnforcement !== undefined;
