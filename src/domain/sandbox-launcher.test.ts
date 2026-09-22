@@ -386,6 +386,39 @@ test("filesystem enforcement rejects an executable projection alias sourced from
   }
 });
 
+test("filesystem enforcement rejects an ancestor projection source containing the worktree", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const projection = validatedProjection([
+      {
+        source: path.dirname(worktree),
+        target: "/runtime/worktree-ancestor",
+        access_mode: "read-only",
+        provenance: "package",
+      },
+    ]);
+    const compiled = compileSandboxInvocation(
+      {
+        ...request,
+        landlock_abi: 1,
+        landlock_executable: request.sandbox_executable,
+        runtime_projection: projection,
+      },
+      { command: "true" },
+      { filesystem_enforcement: filesystemEnforcementBundle(worktree) },
+    );
+    assert.equal(compiled.ok, false);
+    if (!compiled.ok) assert.equal(compiled.error.code, "SANDBOX_TOPOLOGY_INVALID");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
 test("explicit projections compile a regular-file source without misrepresenting it as a directory", async () => {
   const repository = createRepository();
   const worktree = `${repository}-owned`;

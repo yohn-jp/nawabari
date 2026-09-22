@@ -1146,7 +1146,8 @@ export function compileSandboxInvocation(
     if (!runtime.ok) return runtime;
     const unauthorizedProjection = projectionMounts.value.find(
       (projection) =>
-        isWithin(topology.value.worktree, projection.source) &&
+        (isWithin(topology.value.worktree, projection.source) ||
+          isWithin(projection.source, topology.value.worktree)) &&
         !isWithinNamespace(topology.value.worktree, projection.target),
     );
     if (unauthorizedProjection !== undefined) {
@@ -1161,7 +1162,8 @@ export function compileSandboxInvocation(
     }
     const unauthorizedExecutable = executableProjection.value.find(
       (projection) =>
-        isWithin(topology.value.worktree, projection.source) &&
+        (isWithin(topology.value.worktree, projection.source) ||
+          isWithin(projection.source, topology.value.worktree)) &&
         !isWithinNamespace(topology.value.worktree, projection.target),
     );
     if (unauthorizedExecutable !== undefined) {
