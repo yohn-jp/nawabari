@@ -5,6 +5,7 @@ import {
   DomainError,
   EXIT_CODES,
   failure,
+  success,
   type DomainResult,
   type JsonObject,
   type JsonValue,
@@ -23,12 +24,20 @@ import {
   type SessionDiagnosticOptions,
   type SessionDiagnosticSchemaVersion,
   type SessionListOptions,
+  type FileOperationOptions,
   type ClaimDeltasOptions,
   type ReleaseClaimsOptions,
   type ResourceClaimDelta,
   DEFAULT_SESSION_LIST_LIMIT,
   MAX_SESSION_LIST_LIMIT,
 } from "./domain/session.js";
+import {
+  materializeWorktreeFileOperationCliRequest,
+  parseWorktreeFileOperationCli,
+  projectWorktreeFileOperationCliOutcome,
+  serializeWorktreeFileOperationCliOutcome,
+  type WorktreeFileOperationCliAuthority,
+} from "./worktree-file-operation-cli.js";
 import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS, EVIDENCE_MAX_DIFF_PATHS } from "./repository-evidence.js";
 import { isResourceClaimMode } from "./resource-claims.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
@@ -93,7 +102,6 @@ export {
   canonicalCommandForName,
 } from "./cli-command-registry.js";
 export type { CliCommandDefinition, CliHelpOptionSpec, CommandId, OptionId } from "./cli-command-registry.js";
-
 function optionNames(definition: CliCommandDefinition): readonly string[] {
   return definition.options.flatMap((candidate) => [candidate.name, ...(candidate.aliases ?? [])]);
 }
@@ -143,7 +151,7 @@ function helpSpecFor(commandArguments: readonly string[]): CliCommandDefinition 
   const key =
     commandArguments[0] === "resource"
       ? `resource ${commandArguments[1] ?? "list"}`
-      : commandArguments[0] === "session" && commandArguments[1] === "coordination"
+      : commandArguments[0] === "session" && ["coordination", "file"].includes(commandArguments[1] ?? "")
         ? commandArguments.slice(0, 3).join(" ")
         : commandArguments.slice(0, 2).join(" ");
   return resolveCliCommandDefinition(key) ?? resolveCliCommandDefinition(commandArguments[0]) ?? ROOT_HELP_SPEC;
@@ -1692,6 +1700,9 @@ async function executeCommand(
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
+    if (subcommand === "file") {
+      return executeSessionFileOperation(rest, dependencies.backend, context);
+    }
     if (subcommand === "claim") {
       const parsed = parseSingleClaimPair(rest);
       if (!parsed.ok) return parsed;
@@ -2273,9 +2284,49 @@ async function executeCommand(
   return failure(new DomainError("UNKNOWN_COMMAND", `Unknown command: ${command}.`, { command }));
 }
 
+async function executeSessionFileOperation(
+  arguments_: string[],
+  backend: SessionBackend,
+  context: SessionContext,
+): Promise<DomainResult<JsonObject>> {
+  const operation = arguments_[0]?.toUpperCase();
+  if (operation !== "CREATE" && operation !== "DELETE" && operation !== "RENAME") {
+    return failure(
+      new DomainError("UNKNOWN_COMMAND", `Unknown session file operation: ${arguments_[0] ?? "<missing>"}.`),
+    );
+  }
+  const parsed = parseWorktreeFileOperationCli(["session", "file", operation, ...arguments_.slice(1)]);
+  if (!parsed.ok) return parsed;
+  if (backend.fileOperation === undefined || backend.listClaims === undefined) {
+    return failure(new DomainError("BACKEND_UNAVAILABLE", "File-operation capability is not available."));
+  }
+  const session = await backend.getSession(context, parsed.value.session_id);
+  if (!session.ok) return session;
+  const claims = await backend.listClaims(context, parsed.value.session_id);
+  if (!claims.ok) return claims;
+  const authority: WorktreeFileOperationCliAuthority = {
+    worktree_root: session.value.worktree,
+    scope: {
+      create:
+        operation === "DELETE"
+          ? []
+          : [operation === "RENAME" ? (parsed.value.to_path ?? parsed.value.path) : parsed.value.path],
+      delete: operation === "CREATE" ? [] : [parsed.value.path],
+      deny: [],
+    },
+    claims: claims.value.claims.map((claim) => ({ resource: claim.resource, mode: claim.mode })),
+  };
+  const materialized = materializeWorktreeFileOperationCliRequest(parsed.value, authority);
+  const result: DomainResult<import("./domain/session.js").FileOperationResult> = materialized.ok
+    ? await backend.fileOperation(context, { operation: materialized.value } satisfies FileOperationOptions)
+    : (materialized as DomainResult<import("./domain/session.js").FileOperationResult>);
+  const outcome = projectWorktreeFileOperationCliOutcome(result, parsed.value.operation_id, parsed.value.operation);
+  return success(serializeWorktreeFileOperationCliOutcome(outcome) as unknown as JsonObject);
+}
+
 function commandName(commandArguments: string[]): string {
   if (commandArguments[0] === "session") {
-    if (commandArguments[1] === "coordination") return commandArguments.slice(0, 3).join(" ");
+    if (["coordination", "file"].includes(commandArguments[1] ?? "")) return commandArguments.slice(0, 3).join(" ");
     return commandArguments.slice(0, 2).join(" ");
   }
   if (commandArguments[0] === "profile") return commandArguments.slice(0, 2).join(" ");
