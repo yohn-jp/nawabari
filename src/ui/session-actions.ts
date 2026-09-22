@@ -40,7 +40,7 @@ function previewField(object: PreviewObject, field: string): unknown {
 
 function previewText(value: unknown, field: string, nullable = false): DomainResult<string | null> {
   if (nullable && value === null) return success(null);
-  if (typeof value !== "string" || value.length === 0 || [...value].length > PREVIEW_MAX_TEXT_CODE_POINTS) {
+  if (typeof value !== "string" || [...value].length > PREVIEW_MAX_TEXT_CODE_POINTS) {
     return failure(
       new DomainError("INVALID_ARGUMENT", `Invalid discard preview field '${field}': expected bounded text.`, {
         field,

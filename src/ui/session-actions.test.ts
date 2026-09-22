@@ -382,3 +382,21 @@ test("discard preview parser preserves the declared shape and rejects forged dis
   assert.equal(forgedEvidence.ok, false);
   if (!forgedEvidence.ok) assert.equal(forgedEvidence.error.code, "INVALID_ARGUMENT");
 });
+
+test("discard preview parser preserves empty strings allowed by the declared JSON shape", () => {
+  const record = session("one");
+  const preview = discardPreviewFor(record);
+  const parsed = parseSessionDiscardPreview({
+    ...preview,
+    warning: "",
+    recoverable_commits: {
+      ...preview.recoverable_commits,
+      evidence: [{ code: "GIT_COMMAND_FAILED", message: "", details: { "": "" } }],
+    },
+  });
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.warning, "");
+  assert.equal(parsed.value.recoverable_commits.evidence[0]?.message, "");
+  assert.deepEqual(parsed.value.recoverable_commits.evidence[0]?.details, { "": "" });
+});
