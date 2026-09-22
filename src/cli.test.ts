@@ -1655,6 +1655,73 @@ test("session discard --preview emits one stable destructive summary without inv
   });
 });
 
+test("session action preview JSON is bounded without changing discard boolean preview", async () => {
+  let getSessionCalls = 0;
+  let discardPreviewCalls = 0;
+  const backend = backendForTests({
+    getSession: async () => {
+      getSessionCalls += 1;
+      return success(sampleSession);
+    },
+    discardPreview: async () => {
+      discardPreviewCalls += 1;
+      return success({} as SessionDiscardPreview);
+    },
+  });
+
+  const malformedOutput = capture();
+  const malformedExit = await runCli(
+    [
+      "--json",
+      "session",
+      "action",
+      "--session",
+      sampleSession.session_id,
+      "--action",
+      "discard-session",
+      "--token",
+      "{}",
+      "--confirm",
+      "--preview",
+      "{}",
+    ],
+    { backend, io: malformedOutput.io },
+  );
+  assert.equal(malformedExit, 2);
+  assert.equal(JSON.parse(malformedOutput.stdout[0] ?? "").code, "INVALID_ARGUMENT");
+
+  const oversizedOutput = capture();
+  const oversizedPreview = JSON.stringify("x".repeat(1024 * 1024));
+  const oversizedExit = await runCli(
+    [
+      "--json",
+      "session",
+      "action",
+      "--session",
+      sampleSession.session_id,
+      "--action",
+      "discard-session",
+      "--token",
+      "{}",
+      "--confirm",
+      "--preview",
+      oversizedPreview,
+    ],
+    { backend, io: oversizedOutput.io },
+  );
+  assert.equal(oversizedExit, 2);
+  assert.equal(JSON.parse(oversizedOutput.stdout[0] ?? "").code, "INVALID_ARGUMENT");
+  assert.equal(getSessionCalls, 0);
+
+  const booleanPreviewOutput = capture();
+  const booleanPreviewExit = await runCli(["--json", "session", "discard", sampleSession.session_id, "--preview"], {
+    backend,
+    io: booleanPreviewOutput.io,
+  });
+  assert.equal(booleanPreviewExit, 0);
+  assert.equal(discardPreviewCalls, 1);
+});
+
 test("all session target aliases carry the same positional session identity", async () => {
   const seen: string[] = [];
   const backend = backendForTests({
