@@ -21,6 +21,12 @@
  */
 
 import { SessionRegistry } from "./session-registry.js";
+import type { DomainResult, JsonValue } from "./domain/errors.js";
+import {
+  getNawabariRepositoryRuntimeSnapshot as projectRepositoryRuntimeSnapshot,
+  type RepositoryRuntimeObservation,
+} from "./repository-runtime-snapshot.js";
+import { reconcileSessionRuntimeEvidence, type RuntimeReconciliationResult } from "./session-runtime-reconciliation.js";
 import {
   availableLifecycleOperations,
   classifySessionLifecycle,
@@ -96,6 +102,35 @@ export function nawabariTransitionDecision(
 /** Commands the canonical machine currently admits for an already-classified snapshot. */
 export function availableNawabariCommands(snapshot: NawabariStateSnapshot): readonly NawabariCommand[] {
   return availableLifecycleOperations(snapshot);
+}
+
+/**
+ * Compose the authoritative registry snapshot with caller-observed runtime
+ * sections, then project the frozen reconciliation diagnostics.  Observation
+ * producers remain caller-owned; this boundary performs no I/O beyond the
+ * existing registry read and never applies a proposed action.
+ */
+export function reconcileNawabariRepositoryRuntime(input: {
+  readonly cwd?: string;
+  readonly captured_at: string;
+  readonly coordination?: RepositoryRuntimeObservation<JsonValue>;
+  readonly profiles?: RepositoryRuntimeObservation<JsonValue>;
+  readonly filesystem?: RepositoryRuntimeObservation<JsonValue>;
+  readonly processes?: RepositoryRuntimeObservation<JsonValue>;
+  readonly lifecycle?: RepositoryRuntimeObservation<JsonValue>;
+}): DomainResult<RuntimeReconciliationResult> {
+  const registry = new SessionRegistry(input.cwd === undefined ? undefined : { cwd: input.cwd });
+  const snapshot = projectRepositoryRuntimeSnapshot({
+    registry: registry.readRepositoryView(),
+    captured_at: input.captured_at,
+    coordination: input.coordination,
+    profiles: input.profiles,
+    filesystem: input.filesystem,
+    processes: input.processes,
+    lifecycle: input.lifecycle,
+  });
+  if (!snapshot.ok) return snapshot;
+  return reconcileSessionRuntimeEvidence(snapshot.value);
 }
 
 export interface NawabariSessionSnapshotOptions {

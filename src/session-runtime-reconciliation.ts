@@ -52,9 +52,9 @@ export function reconcileSessionRuntimeEvidence(
 
   const findings: RuntimeReconciliationFinding[] = [];
   for (const session of snapshot.sessions) {
-    const process = processes.value?.get(session.sessionId);
-    const file = filesystem.value?.get(session.sessionId);
-    const life = lifecycle.value?.get(session.sessionId);
+    const process = processes.value?.get(session.sessionId) as ProcessObservation | undefined;
+    const file = filesystem.value?.get(session.sessionId) as FilesystemObservation | undefined;
+    const life = lifecycle.value?.get(session.sessionId) as LifecycleObservation | undefined;
     let finding: RuntimeReconciliationFinding;
     if (processes.value === null || filesystem.value === null || lifecycle.value === null || process === undefined) {
       finding = make(session.sessionId, "execution-unknown", "blocked", ["inspect-processes"], "required observation is unknown or missing");
@@ -99,7 +99,7 @@ function make(session_id: string | null, code: RuntimeReconciliationCode, dispos
   return Object.freeze({ session_id, code, disposition, proposed_actions: Object.freeze([...proposed_actions]), reason, ...(worktree_path === undefined ? {} : { worktree_path }) });
 }
 
-type ParsedSections = { value: Map<string, any> | null; raw_unmanaged: { worktree_path: string; reason: string | null }[] };
+type ParsedSections = { value: Map<string, Record<string, unknown>> | null; raw_unmanaged: { worktree_path: string; reason: string | null }[] };
 function section(observation: unknown, name: string): DomainResult<ParsedSections> {
   if (!observation || typeof observation !== "object") return success({ value: null, raw_unmanaged: [] });
   const o = observation as { status?: string; value?: JsonValue };
@@ -113,7 +113,7 @@ function section(observation: unknown, name: string): DomainResult<ParsedSection
   if (value.contract_id !== contract || value.schema_version !== 1) return invalid(name, "invalid contract_id or schema_version");
   const list = value.sessions;
   if (!Array.isArray(list) || list.length > MAX_ITEMS) return invalid(name, "sessions must be an array of at most 1024 entries");
-  const map = new Map<string, any>();
+  const map = new Map<string, Record<string, unknown>>();
   for (const item of list) {
     if (!item || typeof item !== "object" || Array.isArray(item)) return invalid(name, "session entry must be an object");
     const id = (item as Record<string, unknown>).session_id;
