@@ -1035,6 +1035,7 @@ export {
   runSandboxedCommand,
   type SandboxCommand,
   type SandboxExecutionResult,
+  type SandboxFilesystemEnforcementOptions,
   type SandboxInvocation,
   type SandboxLauncherOptions,
 } from "./sandbox-launcher.js";
