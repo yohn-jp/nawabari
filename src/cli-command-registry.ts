@@ -295,8 +295,13 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
   {
     name: "session enter",
     summary: "Enter an active session through the protected runtime",
-    usage: `${CLI_NAME} session enter --session <id>`,
-    options: [option("--session", "Select the active owned session", { value: "<id>" })],
+    usage: `${CLI_NAME} session enter --session <id> [--runtime-policy <strict|compatibility>]`,
+    options: [
+      option("--session", "Select the active owned session", { value: "<id>" }),
+      option("--runtime-policy", "Select strict or explicit compatibility runtime visibility", {
+        value: "<strict|compatibility>", values: ["strict", "compatibility"], default: "strict",
+      }),
+    ],
   },
   {
     name: "session processes",
