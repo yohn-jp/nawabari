@@ -518,6 +518,7 @@ test("finalization collects policy outside the lock and rejects a post-helper cl
     const initial = readRegistry(fixture.registry);
     const helperCalls = { value: 0 };
     let policyCalls = 0;
+    let finalizationPolicyMutationCompleted = false;
     const first = fixture.registry.executeFileOperation;
     assert.throws(
       () =>
@@ -525,7 +526,10 @@ test("finalization collects policy outside the lock and rejects a post-helper cl
           ...executionOptions(source, successfulHelper(helperCalls)),
           policy: () => {
             policyCalls += 1;
-            if (policyCalls === 4) fixture.registry.releaseSessionClaims(fixture.session.sessionId);
+            if (policyCalls === 4) {
+              fixture.registry.releaseSessionClaims(fixture.session.sessionId);
+              finalizationPolicyMutationCompleted = true;
+            }
             return policy;
           },
         }),
@@ -533,6 +537,7 @@ test("finalization collects policy outside the lock and rejects a post-helper cl
     );
 
     assert.equal(policyCalls, 4);
+    assert.equal(finalizationPolicyMutationCompleted, true);
     assert.equal(helperCalls.value, 1);
     const final = readRegistry(fixture.registry);
     assert.equal(final.registry_revision, (initial.registry_revision ?? 0) + 3);
