@@ -237,6 +237,17 @@ export interface SessionRecord {
   readonly workingSet?: EffectiveWorkingSet;
 }
 
+export interface RepositoryRegistryView {
+  readonly repositoryId: string;
+  readonly registrySchemaVersion: number;
+  readonly registryRevision: number;
+  readonly runtimeEpoch: number;
+  readonly claimSetGeneration: number;
+  readonly sessions: readonly SessionRecord[];
+  readonly claims: readonly ResourceClaim[];
+  readonly runtimeRecords: ParsedRuntimeRecords;
+}
+
 export interface CreateSessionOptions {
   readonly worktreePath?: string;
   readonly branchName?: string;
@@ -1103,6 +1114,20 @@ export class SessionRegistry {
 
   read(): readonly SessionRecord[] {
     return this.readUnsafe().map(cloneSessionRecord);
+  }
+
+  readRepositoryView(): RepositoryRegistryView {
+    const state = this.readStateUnsafe();
+    return Object.freeze({
+      repositoryId: this.repository.repositoryId,
+      registrySchemaVersion: state.registrySchemaVersion,
+      registryRevision: state.registryRevision,
+      runtimeEpoch: state.runtimeEpoch,
+      claimSetGeneration: state.claimSetGeneration,
+      sessions: Object.freeze(state.sessions.map(cloneSessionRecord)),
+      claims: Object.freeze(state.claims.map(cloneResourceClaim)),
+      runtimeRecords: state.runtimeRecords,
+    });
   }
 
   list(): readonly SessionRecord[] {
