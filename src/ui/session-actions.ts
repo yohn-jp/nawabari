@@ -18,6 +18,7 @@ import { IMPLEMENTATION_FAILURE_CODE_VOCABULARY } from "../failure-code-vocabula
 export const SESSION_ACTIONS_SCHEMA_VERSION = 1 as const;
 
 const PREVIEW_MAX_TEXT_CODE_POINTS = 4_096;
+const PREVIEW_MAX_JSON_DEPTH = 32;
 const SESSION_STATES: readonly SessionState[] = ["new", "active", "closing", "closed", "stale"];
 const READINESS_STATES = ["ready", "not_due", "blocked", "external_evidence_required", "ambiguous"] as const;
 const RESULT_STATES = ["complete", "ambiguous", "stale", "external_evidence_required"] as const;
@@ -80,19 +81,29 @@ function previewNullableBoolean(value: unknown, field: string): DomainResult<boo
   return previewBoolean(value, field);
 }
 
-function previewJsonObject(value: unknown, field: string): DomainResult<JsonObject> {
+function previewJsonDepthFailure(field: string): DomainResult<never> {
+  return failure(
+    new DomainError("INVALID_ARGUMENT", `Invalid discard preview field '${field}': maximum JSON depth exceeded.`, {
+      field,
+    }),
+  );
+}
+
+function previewJsonObject(value: unknown, field: string, depth = 0): DomainResult<JsonObject> {
+  if (depth > PREVIEW_MAX_JSON_DEPTH) return previewJsonDepthFailure(field);
   const object = previewObject(value, field);
   if (!object.ok) return object;
   for (const [key, child] of Object.entries(object.value)) {
     const text = previewText(key, `${field}.${key}`);
     if (!text.ok) return text as DomainResult<never>;
-    const valid = previewJson(child, `${field}.${key}`);
+    const valid = previewJson(child, `${field}.${key}`, depth + 1);
     if (!valid.ok) return valid;
   }
   return success(object.value as JsonObject);
 }
 
-function previewJson(value: unknown, field: string): DomainResult<JsonValue> {
+function previewJson(value: unknown, field: string, depth = 0): DomainResult<JsonValue> {
+  if (depth > PREVIEW_MAX_JSON_DEPTH) return previewJsonDepthFailure(field);
   if (value === null || typeof value === "boolean" || typeof value === "number") {
     if (typeof value === "number" && !Number.isFinite(value)) {
       return failure(
@@ -105,13 +116,13 @@ function previewJson(value: unknown, field: string): DomainResult<JsonValue> {
   if (Array.isArray(value)) {
     const result: JsonValue[] = [];
     for (const [index, child] of value.entries()) {
-      const parsed = previewJson(child, `${field}[${index}]`);
+      const parsed = previewJson(child, `${field}[${index}]`, depth + 1);
       if (!parsed.ok) return parsed;
       result.push(parsed.value);
     }
     return success(result);
   }
-  return previewJsonObject(value, field);
+  return previewJsonObject(value, field, depth);
 }
 
 function previewEvidence(value: unknown, field: string): DomainResult<SessionDiscardPreviewEvidence> {

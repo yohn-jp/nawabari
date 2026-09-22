@@ -109,6 +109,12 @@ function discardPreviewForHead(record: SessionRecord, head: string): SessionDisc
   };
 }
 
+function nestedJsonObject(depth: number): Record<string, unknown> {
+  let value: Record<string, unknown> = {};
+  for (let index = 0; index < depth; index += 1) value = { nested: value };
+  return value;
+}
+
 function discardResultFor(record: SessionRecord): SessionDiscardResult {
   return {
     schema_version: 1,
@@ -399,4 +405,27 @@ test("discard preview parser preserves empty strings allowed by the declared JSO
   assert.equal(parsed.value.warning, "");
   assert.equal(parsed.value.recoverable_commits.evidence[0]?.message, "");
   assert.deepEqual(parsed.value.recoverable_commits.evidence[0]?.details, { "": "" });
+});
+
+test("discard preview parser bounds recursively nested evidence details", () => {
+  const record = session("one");
+  const preview = discardPreviewFor(record);
+  const withinBound = parseSessionDiscardPreview({
+    ...preview,
+    recoverable_commits: {
+      ...preview.recoverable_commits,
+      evidence: [{ code: "GIT_COMMAND_FAILED", message: "", details: nestedJsonObject(32) }],
+    },
+  });
+  assert.equal(withinBound.ok, true);
+
+  const beyondBound = parseSessionDiscardPreview({
+    ...preview,
+    recoverable_commits: {
+      ...preview.recoverable_commits,
+      evidence: [{ code: "GIT_COMMAND_FAILED", message: "", details: nestedJsonObject(33) }],
+    },
+  });
+  assert.equal(beyondBound.ok, false);
+  if (!beyondBound.ok) assert.equal(beyondBound.error.code, "INVALID_ARGUMENT");
 });
