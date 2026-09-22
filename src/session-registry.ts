@@ -2052,13 +2052,6 @@ export class SessionRegistry {
       const resources = this.resolveProvisioningResources(options, sessionId);
       const pinnedProfile = this.resolvePinnedProfile(options.profile, resources.baseRevision);
       const workingSet = this.composeProvisionedWorkingSet(options, resources);
-      if (workingSet !== undefined && pinnedProfile === undefined) {
-        throw new DomainError(
-          "RUNTIME_MATERIALIZATION_MISSING",
-          "Managed bootstrap requires an explicit pinned worktree runtime profile.",
-          { session_id: sessionId },
-        );
-      }
       if (pinnedProfile?.resolved.execution.processTracking === "required") {
         const doctor = sandboxDoctorReport(this.sandboxProbe);
         if (!doctor.ready) {
@@ -2148,7 +2141,7 @@ export class SessionRegistry {
         const nextClaims = sortResourceClaims([...state.claims, ...initialClaims]);
         const nextEpoch = nextRuntimeEpoch(state);
         let runtimeRecords =
-          workingSet === undefined
+          pinnedProfile === undefined
             ? state.runtimeRecords
             : withRuntimeSession(state.runtimeRecords, {
                 kind: "session-admission",
@@ -4635,11 +4628,12 @@ export class SessionRegistry {
       const parsed = parseSessionAdmissionRecord(candidate);
       return parsed.session_id === sessionId;
     });
-    if (session.workingSet !== undefined) {
-      if (admission === undefined || parseSessionAdmissionRecord(admission).admission !== "closed") {
+    if (admission !== undefined) {
+      const parsedAdmission = parseSessionAdmissionRecord(admission);
+      if (parsedAdmission.admission !== "closed") {
         throw new SessionRegistryError("OPERATION_REJECTED", "Runtime admission is not durably closed", { sessionId });
       }
-      if (parseSessionAdmissionRecord(admission).runtime_epoch !== state.runtimeEpoch) {
+      if (parsedAdmission.runtime_epoch !== state.runtimeEpoch) {
         throw new SessionRegistryError("OPERATION_REJECTED", "Runtime admission epoch is stale", { sessionId });
       }
     }
@@ -4677,7 +4671,13 @@ export class SessionRegistry {
       return { runtimeEpoch: state.runtimeEpoch, runtimeRecords: state.runtimeRecords };
     }
     const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
-    if (session === undefined || session.workingSet === undefined) {
+    if (session === undefined) {
+      return { runtimeEpoch: state.runtimeEpoch, runtimeRecords: state.runtimeRecords };
+    }
+    const admission = (state.runtimeRecords.records.runtime_sessions ?? []).find((candidate) => {
+      return parseSessionAdmissionRecord(candidate).session_id === sessionId;
+    });
+    if (admission === undefined) {
       return { runtimeEpoch: state.runtimeEpoch, runtimeRecords: state.runtimeRecords };
     }
     if (session.state !== "active") {
@@ -4686,10 +4686,7 @@ export class SessionRegistry {
         state: session.state,
       });
     }
-    const admission = (state.runtimeRecords.records.runtime_sessions ?? []).find((candidate) => {
-      return parseSessionAdmissionRecord(candidate).session_id === sessionId;
-    });
-    if (admission === undefined || parseSessionAdmissionRecord(admission).admission !== "closed") {
+    if (parseSessionAdmissionRecord(admission).admission !== "closed") {
       throw new SessionRegistryError("OPERATION_REJECTED", "Runtime admission is not closed for reopening", {
         sessionId,
       });
@@ -8904,20 +8901,12 @@ function withRuntimeSession(runtimeRecords: ParsedRuntimeRecords, admission: Ses
 
 function assertExecutionAdmission(state: RegistryState, record: PersistedSessionExecutionRecord): void {
   const owner = state.sessions.find((session) => session.sessionId === record.session_id);
-  if (owner?.workingSet === undefined) return;
+  if (owner === undefined) return;
   const admissionRecord = (state.runtimeRecords.records.runtime_sessions ?? []).find((candidate) => {
     const admission = parseSessionAdmissionRecord(candidate);
     return admission.session_id === record.session_id;
   });
-  if (admissionRecord === undefined) {
-    throw new SessionRegistryError(
-      "REGISTRY_DURABILITY_UNCERTAIN",
-      "Managed session has no durable open admission gate",
-      {
-        sessionId: record.session_id,
-      },
-    );
-  }
+  if (admissionRecord === undefined) return;
   const admission = parseSessionAdmissionRecord(admissionRecord);
   if (admission.admission !== "open" || admission.runtime_epoch !== state.runtimeEpoch) {
     throw new SessionRegistryError("OPERATION_REJECTED", "Managed session launch admission is closed or stale", {
