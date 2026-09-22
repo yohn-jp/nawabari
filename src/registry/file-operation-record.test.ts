@@ -10,6 +10,7 @@ import {
   parseFileOperationRegistry,
   recordFileOperationApplyAttempt,
   reconcileFileOperationReceipt,
+  reconcileFileOperationReceiptAuthority,
   reserveFileOperation,
   serializeFileOperationRegistry,
   type FileOperationObservation,
@@ -129,6 +130,20 @@ test("only an explicit completion observation can complete a matching receipt", 
   assert.equal(completed.disposition, "completed");
   assert.equal(completed.record.stage, "completed");
   assert.equal(completed.record.executionCompleted, true);
+});
+
+test("stale authority preserves matching effect and helper completion without certifying completion", () => {
+  const state = createFileOperationRegistryState();
+  const recorded = reservedAndRecorded(state);
+  const reconciled = reconcileFileOperationReceiptAuthority(recorded, createObservation(recorded), false, now(3));
+
+  assert.equal(reconciled.effectMatches, true);
+  assert.equal(reconciled.helperExecutionCompleted, true);
+  assert.equal(reconciled.completionProven, false);
+  assert.equal(reconciled.disposition, "unresolved");
+  assert.equal(reconciled.record.stage, "unresolved");
+  assert.equal(reconciled.record.effectObserved, true);
+  assert.equal(reconciled.record.executionCompleted, false);
 });
 
 test("mismatched or unobserved physical state stays unresolved", () => {
