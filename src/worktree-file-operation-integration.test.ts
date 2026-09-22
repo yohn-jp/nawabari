@@ -508,7 +508,7 @@ test("stale pre-I/O authority performs no helper I/O and persists unresolved evi
   }
 });
 
-test("final locked authority rejects a post-helper claim race without replaying physical I/O", () => {
+test("finalization collects policy outside the lock and rejects a post-helper claim race without replaying I/O", () => {
   const fixture = createFixture();
   const source = python3Source();
   try {
@@ -525,7 +525,7 @@ test("final locked authority rejects a post-helper claim race without replaying 
           ...executionOptions(source, successfulHelper(helperCalls)),
           policy: () => {
             policyCalls += 1;
-            if (policyCalls === 3) fixture.registry.releaseSessionClaims(fixture.session.sessionId);
+            if (policyCalls === 4) fixture.registry.releaseSessionClaims(fixture.session.sessionId);
             return policy;
           },
         }),

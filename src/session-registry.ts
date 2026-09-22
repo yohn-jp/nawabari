@@ -5831,6 +5831,12 @@ export class SessionRegistry {
     executionOptions: FileOperationExecutionOptions,
     observation: FileOperationObservation,
   ): ReturnType<typeof reconcileFileOperationReceiptAuthority> {
+    let finalPolicyInput: CollectedFileOperationPolicyInput | undefined;
+    try {
+      finalPolicyInput = { value: resolveFileOperationPolicyInput(executionOptions) };
+    } catch {
+      // An unavailable external policy observation is unresolved below.
+    }
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
@@ -5840,12 +5846,14 @@ export class SessionRegistry {
           operationId,
         });
       }
-      let authorityCurrent = true;
-      try {
-        const current = currentFileOperationAuthority(this, state, operation, executionOptions);
-        authorityCurrent = validateFilesystemPolicyToken(token, current.token).ok;
-      } catch {
-        authorityCurrent = false;
+      let authorityCurrent = false;
+      if (finalPolicyInput !== undefined) {
+        try {
+          const current = currentFileOperationAuthority(this, state, operation, executionOptions, finalPolicyInput);
+          authorityCurrent = validateFilesystemPolicyToken(token, current.token).ok;
+        } catch {
+          authorityCurrent = false;
+        }
       }
       const reconciliation = reconcileFileOperationReceiptAuthority(record, observation, authorityCurrent);
       if (reconciliation.record === record) return reconciliation;
@@ -5937,6 +5945,10 @@ interface FileOperationReservationContext {
 interface FileOperationAuthorityContext {
   readonly policy: EffectiveFilesystemPolicy;
   readonly token: FilesystemPolicyToken;
+}
+
+interface CollectedFileOperationPolicyInput {
+  readonly value: EffectiveFilesystemPolicyInputs;
 }
 
 function fileOperationStateFromRuntimeRecords(runtimeRecords: ParsedRuntimeRecords): FileOperationRegistryState {
@@ -6080,6 +6092,7 @@ function currentFileOperationAuthority(
   state: RegistryState,
   operation: WorktreeFileOperation,
   executionOptions: FileOperationExecutionOptions,
+  policyInput?: CollectedFileOperationPolicyInput,
 ): FileOperationAuthorityContext {
   const session = state.sessions.find((candidate) => candidate.sessionId === operation.session_id);
   if (session === undefined) {
@@ -6087,7 +6100,7 @@ function currentFileOperationAuthority(
       sessionId: operation.session_id,
     });
   }
-  const policy = compileFileOperationPolicy(registry, state, session, operation, executionOptions);
+  const policy = compileFileOperationPolicy(registry, state, session, operation, executionOptions, policyInput);
   const decision = decideEffectivePathAccess({
     policy,
     operation: effectiveOperation(operation),
@@ -6134,9 +6147,9 @@ function compileFileOperationPolicy(
   session: SessionRecord,
   _operation: WorktreeFileOperation,
   executionOptions: FileOperationExecutionOptions,
+  policyInput?: CollectedFileOperationPolicyInput,
 ): EffectiveFilesystemPolicy {
-  const supplied =
-    typeof executionOptions.policy === "function" ? executionOptions.policy() : (executionOptions.policy ?? {});
+  const supplied = policyInput === undefined ? resolveFileOperationPolicyInput(executionOptions) : policyInput.value;
   const suppliedWorkingSet = supplied.working_set ?? supplied.workingSet;
   const workingSet = suppliedWorkingSet ?? session.workingSet;
   const workingSetRecord = isRecordValue(workingSet) ? workingSet : undefined;
@@ -6160,6 +6173,17 @@ function compileFileOperationPolicy(
   });
   if (!result.ok) throw sessionRegistryOperationError(result.error.message, result.error.details);
   return result.value;
+}
+
+function resolveFileOperationPolicyInput(
+  executionOptions: FileOperationExecutionOptions,
+): EffectiveFilesystemPolicyInputs {
+  const supplied =
+    typeof executionOptions.policy === "function" ? executionOptions.policy() : (executionOptions.policy ?? {});
+  if (!isRecordValue(supplied)) {
+    throw new SessionRegistryError("OPERATION_REJECTED", "Filesystem policy input must be an object");
+  }
+  return supplied as EffectiveFilesystemPolicyInputs;
 }
 
 function rebuildFileOperation(
