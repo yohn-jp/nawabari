@@ -54,6 +54,28 @@ test("round-trips session metadata through common Git state", () => {
   }
 });
 
+test("readRepositoryView returns one immutable numeric registry projection", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    const view = registry.readRepositoryView();
+
+    assert.equal(view.repositoryId, registry.repository.repositoryId);
+    assert.equal(view.registrySchemaVersion, 2);
+    assert.equal(view.registryRevision, 1);
+    assert.equal(view.runtimeEpoch, 1);
+    assert.equal(view.claimSetGeneration, 0);
+    assert.deepEqual(view.sessions, [session]);
+    assert.deepEqual(view.claims, []);
+    assert.equal(Object.isFrozen(view), true);
+    assert.equal(Object.isFrozen(view.sessions), true);
+    assert.equal(Object.isFrozen(view.claims), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("expands a governed working set atomically with revision CAS and claim checks", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-expansion");
