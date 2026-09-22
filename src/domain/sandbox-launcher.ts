@@ -45,6 +45,8 @@ import {
   type CgroupAccounting,
   type CgroupScope,
 } from "./cgroups-v2.js";
+import type { FilesystemEnforcementIntegrationResult } from "./filesystem-enforcement-integration.js";
+import { validateFilesystemPolicyEnforcementRuntime } from "./filesystem-policy-enforcement.js";
 
 const SANDBOX_HOME = "/home/nawabari";
 const SANDBOX_CONFIG_HOME = `${SANDBOX_HOME}/.config`;
@@ -106,7 +108,11 @@ export type SandboxExecutionResult = {
   readonly runtime_resolution?: SandboxExecutionRequest["runtime_resolution"];
 };
 
-export type SandboxLauncherOptions = {
+export type SandboxFilesystemEnforcementOptions = Readonly<{
+  readonly filesystem_enforcement?: FilesystemEnforcementIntegrationResult;
+}>;
+
+export type SandboxLauncherOptions = SandboxFilesystemEnforcementOptions & {
   readonly timeout_ms?: number;
   readonly max_output_bytes?: number;
   /** Attach the caller's existing stdio and use no bounded-output timeout. */
@@ -1049,6 +1055,7 @@ function prepareGitMetadata(request: SandboxExecutionRequest, topology: Validate
 export function compileSandboxInvocation(
   request: SandboxExecutionRequest,
   command: SandboxCommand,
+  options: SandboxFilesystemEnforcementOptions = {},
 ): DomainResult<SandboxInvocation> {
   const executable = validateExecutable(request);
   if (!executable.ok) return executable;
@@ -1130,7 +1137,16 @@ export function compileSandboxInvocation(
   // A bounded working set is meaningful only when the second filesystem
   // boundary is actually installed.  If Landlock or its adapter is absent,
   // reject the protected request instead of returning an unbounded worktree.
-  const landlockRequired = request.landlock_required === true || boundedWorkingSet !== undefined;
+  const filesystemEnforcement = options.filesystem_enforcement;
+  if (filesystemEnforcement !== undefined) {
+    const runtime = validateFilesystemPolicyEnforcementRuntime(filesystemEnforcement.enforcement, {
+      landlock_abi: request.landlock_abi,
+      landlock_helper: request.landlock_executable,
+    });
+    if (!runtime.ok) return runtime;
+  }
+  const landlockRequired =
+    request.landlock_required === true || boundedWorkingSet !== undefined || filesystemEnforcement !== undefined;
   if (landlockRequired && !landlockSupported) {
     return failure(
       new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "The required Landlock ABI is unavailable or incompatible.", {
@@ -1185,14 +1201,22 @@ export function compileSandboxInvocation(
             })),
           ],
         };
-  const landlockRules = deriveLandlockRules(
+  const derivedLandlockRules = deriveLandlockRules(
     boundedWorkingSet === undefined ? request.filesystem : { ...request.filesystem, owned_worktree: "/nawabari/git" },
     landlockProjection,
   );
-  const boundedLandlockRules =
+  const existingLandlockRules =
+    filesystemEnforcement === undefined
+      ? derivedLandlockRules
+      : derivedLandlockRules.filter((rule) => rule.path !== topology.value.worktree);
+  const boundedExistingLandlockRules =
     boundedWorkingSet === undefined
-      ? landlockRules
-      : [...boundedBaselineRules(landlockRules), ...deriveWorkingSetRules(topology.value, boundedWorkingSet)];
+      ? existingLandlockRules
+      : [...boundedBaselineRules(existingLandlockRules), ...deriveWorkingSetRules(topology.value, boundedWorkingSet)];
+  const boundedLandlockRules =
+    filesystemEnforcement === undefined
+      ? boundedExistingLandlockRules
+      : [...boundedExistingLandlockRules, ...filesystemEnforcement.landlock_rules];
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
   // An explicit strict projection exposes one canonical executable surface;
@@ -1269,7 +1293,24 @@ export function compileSandboxInvocation(
   ];
   const seenDirectories = new Set<string>();
   const worktreeDestination = topology.value.worktree;
-  addReadWriteBind(args, topology.value.worktree, worktreeDestination, seenDirectories);
+  if (filesystemEnforcement === undefined) {
+    addReadWriteBind(args, topology.value.worktree, worktreeDestination, seenDirectories);
+  } else {
+    if (filesystemEnforcement.enforcement.worktree !== topology.value.worktree) {
+      return topologyError("The filesystem enforcement bundle does not match the authoritative worktree.", {
+        bundle_worktree: filesystemEnforcement.enforcement.worktree,
+        request_worktree: topology.value.worktree,
+      });
+    }
+    for (const argument of filesystemEnforcement.mount_arguments) {
+      if (argument.includes("\0")) {
+        return topologyError("Filesystem enforcement mount arguments cannot contain NUL bytes.", {
+          session_id: request.session_id,
+        });
+      }
+      args.push(argument);
+    }
+  }
   addReadWriteBind(args, topology.value.home, SANDBOX_HOME, seenDirectories);
   addReadWriteBind(args, topology.value.cache, SANDBOX_CACHE_HOME, seenDirectories);
   addReadWriteBind(args, topology.value.persistent_home, SANDBOX_SHARED_HOME, seenDirectories);
@@ -1292,6 +1333,7 @@ export function compileSandboxInvocation(
     for (const source of request.filesystem.system_paths) addReadOnlyBind(args, source, source, seenDirectories);
   }
   for (const projection of projectionMounts.value) {
+    if (filesystemEnforcement !== undefined && isWithinNamespace(worktreeDestination, projection.target)) continue;
     addProjectionBind(args, projection, seenDirectories);
   }
   for (const projection of executableProjection.value) {
@@ -1457,7 +1499,7 @@ export function runSandboxedCommand(
   command: SandboxCommand,
   options: SandboxLauncherOptions = {},
 ): Promise<DomainResult<SandboxExecutionResult>> {
-  const invocation = compileSandboxInvocation(request, command);
+  const invocation = compileSandboxInvocation(request, command, options);
   if (!invocation.ok) return Promise.resolve(invocation);
   const interactive = options.interactive === true;
   const timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
