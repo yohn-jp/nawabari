@@ -298,6 +298,7 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
     }
     assert.equal(population.state, "populated");
     assert.ok(population.processes?.includes(descendantPid), JSON.stringify(population));
+    fs.writeFileSync(release, "release");
     const outcome = await runPromise;
     if (!outcome.ok && !scopeCreated) {
       const code = outcome.error.code;
