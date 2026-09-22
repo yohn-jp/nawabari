@@ -4,36 +4,89 @@ import {
   repositoryScreenJson,
   repositoryScreenRowIds,
   repositoryScreenViews,
+  escapeTerminalText,
   type RepositoryScreenModel,
   type RepositoryScreenSelection,
   type RepositoryScreenView,
   type RepositoryScreenViewport,
 } from "./repository-screen.js";
 import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
+import { type DomainResult, type JsonObject } from "../domain/errors.js";
+import { projectFileSessionMatrix } from "../resource-coordination-view.js";
+import { projectAgentRuntimeStatus, projectSessionAttention } from "../session-attention.js";
+import type { SessionActionDispatcher, SessionActionIdentity, SessionActionToken } from "./session-actions.js";
+import type { SessionLifecycleAction } from "../domain/session.js";
 
 /** Map one canonical runtime snapshot into the screen's projection-only model. */
-export function repositoryScreenModelFromRuntimeSnapshot(snapshot: RepositoryRuntimeSnapshot): RepositoryScreenModel {
-  const observations = snapshot.observations;
+export function repositoryScreenModelFromRuntimeSnapshot(
+  snapshot: RepositoryRuntimeSnapshot,
+): DomainResult<RepositoryScreenModel> {
+  const matrix = projectFileSessionMatrix(snapshot, { limit: 4_096 });
+  if (!matrix.ok) return matrix;
+  const attention = projectSessionAttention(snapshot);
+  if (!attention.ok) return attention;
+
+  const runtime: Record<string, unknown>[] = [];
+  for (const session of snapshot.sessions) {
+    const status = projectAgentRuntimeStatus(snapshot, session.sessionId, 4_096);
+    if (!status.ok) return status;
+    runtime.push(status.value as unknown as Record<string, unknown>);
+  }
+
+  const unavailable_sections: Record<string, JsonObject> = {};
+  if (matrix.value.status === "unavailable") {
+    const reason = matrix.value.reason;
+    unavailable_sections.files = { status: "unavailable", source: "projectFileSessionMatrix", reason };
+    unavailable_sections.conflicts = { status: "unavailable", source: "projectFileSessionMatrix", reason };
+  }
+  const unknownObservations = ["coordination", "profiles", "filesystem", "processes", "lifecycle"].filter(
+    (name) => snapshot.observations[name as keyof typeof snapshot.observations].status === "unknown",
+  );
+  if (unknownObservations.length > 0) {
+    const reason = `observations unavailable: ${unknownObservations.join(", ")}`;
+    unavailable_sections.attention = { status: "unavailable", source: "projectSessionAttention", reason };
+    unavailable_sections.runtime = { status: "unavailable", source: "projectAgentRuntimeStatus", reason };
+  }
+
+  const matrixRows = matrix.value.status === "available" ? matrix.value.rows : [];
+  const conflicts = matrixRows.filter(
+    (row) =>
+      row.conflict !== "none" ||
+      row.permission !== "allowed" ||
+      row.mergeability === "conflict" ||
+      row.mergeability === "unknown" ||
+      row.blockers.length > 0,
+  );
+  const token = JSON.stringify({
+    repository_id: snapshot.repository_id,
+    registry_revision: snapshot.registry.revision,
+    runtime_epoch: snapshot.registry.runtime_epoch,
+    claim_set_generation: snapshot.registry.claim_set_generation,
+  });
   return {
-    snapshot_token: `${snapshot.registry.revision}:${snapshot.registry.claim_set_generation}`,
-    sessions: snapshot.sessions.map((session) => ({
-      session_id: session.sessionId,
-      branch: session.branchName,
-      state: session.state,
-      worktree: session.worktreePath,
-    })),
-    files: observations.filesystem.status === "available" ? observations.filesystem.value : [],
-    matrix: observations.coordination.status === "available" ? observations.coordination.value : [],
-    attention: observations.lifecycle.status === "available" ? observations.lifecycle.value : [],
-    runtime: observations.profiles.status === "available" ? observations.profiles.value : [],
-    conflicts: snapshot.claims.map((claim) => ({
-      claim_id: claim.claimId,
-      resource: claim.resource,
-      session_id: claim.sessionId,
-      mode: claim.mode,
-    })),
-    truncated: !snapshot.complete,
-    next_cursor: null,
+    ok: true,
+    value: {
+      snapshot_token: token,
+      snapshot_identity: JSON.parse(token) as JsonObject,
+      sessions: snapshot.sessions.map((session) => ({
+        session_id: session.sessionId,
+        repository: session.repositoryId,
+        branch: session.branchName,
+        state: session.state,
+        worktree: session.worktreePath,
+      })),
+      files: matrixRows,
+      matrix: matrixRows,
+      attention: attention.value,
+      runtime,
+      conflicts,
+      truncated:
+        !snapshot.complete ||
+        (matrix.value.status === "available" && matrix.value.truncated) ||
+        runtime.some((item) => item.truncated === true),
+      next_cursor: matrix.value.status === "available" ? matrix.value.cursor : null,
+      ...(Object.keys(unavailable_sections).length === 0 ? {} : { unavailable_sections }),
+    },
   };
 }
 
@@ -61,6 +114,8 @@ export type RepositoryTerminalController = {
   readonly json?: boolean;
   readonly isTTY?: boolean;
   readonly signal?: AbortSignal;
+  /** Existing typed lifecycle action adapter; presentation never mutates state directly. */
+  readonly sessionActions?: SessionActionDispatcher;
 };
 
 export type RepositoryTerminalResult = {
@@ -151,6 +206,59 @@ function safeError(error: unknown): string {
   );
 }
 
+function selectedSessionIdentity(
+  model: RepositoryScreenModel,
+  selection: RepositoryScreenSelection,
+): SessionActionIdentity | null {
+  if (selection.view !== "sessions" || selection.selected_id === null || !Array.isArray(model.sessions)) return null;
+  const row = model.sessions.find((candidate) => {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const record = candidate as Record<string, unknown>;
+    const id = record.session_id ?? record.id;
+    return typeof id === "string" && id === selection.selected_id;
+  });
+  if (row === undefined || row === null || typeof row !== "object" || Array.isArray(row)) return null;
+  const record = row as Record<string, unknown>;
+  if (
+    typeof record.session_id !== "string" ||
+    typeof record.repository !== "string" ||
+    typeof record.worktree !== "string"
+  )
+    return null;
+  return { session_id: record.session_id, repository: record.repository, worktree: record.worktree };
+}
+
+type ActionMenu = {
+  readonly identity: SessionActionIdentity;
+  readonly token: SessionActionToken;
+  readonly actions: readonly SessionLifecycleAction[];
+};
+
+type ActionConfirmation = {
+  readonly identity: SessionActionIdentity;
+  readonly action_id: SessionLifecycleAction["action_id"];
+  readonly token: SessionActionToken;
+  readonly preview?: import("../domain/session.js").SessionDiscardPreview;
+};
+
+function actionId(action: SessionLifecycleAction): string {
+  return action.action_id;
+}
+
+function boundedActionJson(value: unknown): string {
+  try {
+    const encoded = JSON.stringify(value);
+    if (new TextEncoder().encode(encoded).byteLength <= 16 * 1024) return encoded;
+  } catch {
+    // The fallback remains a safe printable diagnostic.
+  }
+  return "<bounded preview unavailable>";
+}
+
+function actionLine(action: SessionLifecycleAction, index: number): string {
+  return `  ${index + 1}. ${actionId(action)}`;
+}
+
 function reasonResult(
   interactive: boolean,
   reason: RepositoryTerminalResult["reason"],
@@ -202,6 +310,9 @@ export async function runRepositoryTerminal(
   let settled = false;
   let rawMode = false;
   let pending = "";
+  let actionMenu: ActionMenu | null = null;
+  let confirmation: ActionConfirmation | null = null;
+  let actionMessage: string | null = null;
   let resolveResult: (result: RepositoryTerminalResult) => void = () => undefined;
 
   const result = new Promise<RepositoryTerminalResult>((resolve) => {
@@ -226,7 +337,103 @@ export async function runRepositoryTerminal(
   };
 
   const draw = (): void => {
-    write(output, `${CLEAR_FRAME}${renderRepositoryScreen(model, viewport, selection)}\n`);
+    const lines = [renderRepositoryScreen(model, viewport, selection)];
+    if (actionMenu !== null) {
+      lines.push(
+        `ACTIONS for ${escapeTerminalText(actionMenu.identity.session_id)} (choose 1-${actionMenu.actions.length}, Escape cancels):`,
+        ...actionMenu.actions.map(actionLine),
+      );
+    }
+    if (confirmation !== null) {
+      lines.push(
+        `CONFIRM ${escapeTerminalText(confirmation.action_id)} for ${escapeTerminalText(confirmation.identity.session_id)}: press y to authorize, n/Escape to cancel`,
+        ...(confirmation.preview === undefined
+          ? []
+          : [`preview=${escapeTerminalText(boundedActionJson(confirmation.preview))}`]),
+      );
+    }
+    if (actionMessage !== null) lines.push(`action: ${escapeTerminalText(actionMessage)}`);
+    write(output, `${CLEAR_FRAME}${lines.join("\n")}\n`);
+  };
+
+  const openActionMenu = async (): Promise<void> => {
+    if (controller.sessionActions === undefined) {
+      actionMessage = "typed session actions are unavailable";
+      if (!settled) draw();
+      return;
+    }
+    const identity = selectedSessionIdentity(model, selection);
+    if (identity === null) {
+      actionMessage = "select a stable session row before opening actions";
+      if (!settled) draw();
+      return;
+    }
+    const snapshot = await controller.sessionActions.readSessionActionSnapshot(identity);
+    if (!snapshot.ok) {
+      actionMessage = snapshot.error.message;
+      if (!settled) draw();
+      return;
+    }
+    actionMenu = {
+      identity,
+      token: snapshot.value.token,
+      actions: (snapshot.value.diagnostic.next_actions ?? []).slice(0, 9),
+    };
+    confirmation = null;
+    actionMessage = actionMenu.actions.length === 0 ? "no currently authorized actions" : null;
+    if (!settled) draw();
+  };
+
+  const chooseAction = async (index: number): Promise<void> => {
+    if (actionMenu === null || controller.sessionActions === undefined) return;
+    const action = actionMenu.actions[index];
+    if (action === undefined) return;
+    const dispatched = await controller.sessionActions.dispatchSessionAction(
+      action.action_id,
+      actionMenu.identity,
+      actionMenu.token,
+      { confirmed: false },
+    );
+    if (dispatched.ok) {
+      if (dispatched.value.status === "confirmation-required") {
+        confirmation = {
+          identity: actionMenu.identity,
+          action_id: action.action_id,
+          token: dispatched.value.token,
+          preview: dispatched.value.preview,
+        };
+        actionMessage = "authoritative preview received";
+      } else {
+        actionMessage = `${action.action_id}: ${dispatched.value.status}`;
+      }
+    } else if (
+      dispatched.error.code === "OPERATION_REJECTED" &&
+      dispatched.error.details !== null &&
+      dispatched.error.details.reason === "confirmation-required"
+    ) {
+      confirmation = { identity: actionMenu.identity, action_id: action.action_id, token: actionMenu.token };
+      actionMessage = "explicit confirmation required";
+    } else {
+      actionMessage = dispatched.error.message;
+    }
+    if (!settled) draw();
+  };
+
+  const confirmAction = async (): Promise<void> => {
+    if (confirmation === null || controller.sessionActions === undefined) return;
+    const request = confirmation;
+    const dispatched = await controller.sessionActions.dispatchSessionAction(
+      request.action_id,
+      request.identity,
+      request.token,
+      {
+        confirmed: true,
+        ...(request.preview === undefined ? {} : { preview: request.preview }),
+      },
+    );
+    confirmation = null;
+    actionMessage = dispatched.ok ? `${request.action_id}: ${dispatched.value.status}` : dispatched.error.message;
+    if (!settled) draw();
   };
 
   const refresh = async (): Promise<void> => {
@@ -234,6 +441,9 @@ export async function runRepositoryTerminal(
       const next = await readSnapshot();
       model = next;
       selection = reconcileScreenSelection(selection, next);
+      actionMenu = null;
+      confirmation = null;
+      actionMessage = null;
       if (!settled) draw();
     } catch (error) {
       write(output, `\nrefresh unavailable: ${safeError(error)}\n`);
@@ -260,10 +470,23 @@ export async function runRepositoryTerminal(
         key = pending[0];
         pending = pending.slice(1);
       }
-      if (key === "q" || key === "Q" || key === "\u001b") cleanup("quit");
+      if (key === "\u001b" && (actionMenu !== null || confirmation !== null)) {
+        actionMenu = null;
+        confirmation = null;
+        actionMessage = "action cancelled";
+      } else if (key === "q" || key === "Q" || key === "\u001b") cleanup("quit");
       else if (key === "\u0003") cleanup("interrupt");
       else if (key === "r" || key === "R") void refresh();
-      else if (key === "\u001b[A" || key === "k") selection = changeSelection(model, selection, -1);
+      else if (confirmation !== null && (key === "n" || key === "N")) {
+        confirmation = null;
+        actionMessage = "action cancelled";
+      } else if (confirmation !== null && (key === "y" || key === "Y")) {
+        void confirmAction();
+      } else if (actionMenu !== null && key !== undefined && /^[1-9]$/u.test(key)) {
+        void chooseAction(Number(key) - 1);
+      } else if (key === "a" || key === "A") {
+        void openActionMenu();
+      } else if (key === "\u001b[A" || key === "k") selection = changeSelection(model, selection, -1);
       else if (key === "\u001b[B" || key === "j") selection = changeSelection(model, selection, 1);
       else if (key === "\u001b[D" || key === "h") selection = changeView(model, selection, -1);
       else if (key === "\u001b[C" || key === "l") selection = changeView(model, selection, 1);

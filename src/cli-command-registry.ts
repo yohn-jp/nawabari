@@ -298,6 +298,16 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     ],
   },
   {
+    name: "ui",
+    summary: "Open the read-only repository runtime UI",
+    usage: `${CLI_NAME} ui`,
+    options: [],
+    notes: [
+      "The UI reads one canonical repository runtime snapshot at startup and on refresh; it never mutates registry, Git, or filesystem state.",
+      "Non-interactive callers receive one bounded projection and may combine this command with --json.",
+    ],
+  },
+  {
     name: "session list",
     summary: "List bounded repository session records",
     usage: `${CLI_NAME} session list [--all|--history] [--limit <n>] [--offset <n>]`,

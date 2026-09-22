@@ -11,7 +11,7 @@ import type {
   SessionLifecycleAction,
   SessionRecord,
 } from "../domain/session.js";
-import { createSessionActions, type SessionActionIdentity } from "./session-actions.js";
+import { createSessionActions, parseSessionDiscardPreview, type SessionActionIdentity } from "./session-actions.js";
 
 const context: SessionContext = { cwd: "/repo" };
 
@@ -358,4 +358,17 @@ test("unknown action IDs never become shell commands or backend mutations", asyn
   if (!result.ok) assert.equal(result.error.code, "OPERATION_REJECTED");
   assert.deepEqual(calls.close, []);
   assert.deepEqual(calls.discard, []);
+});
+
+test("discard preview parser preserves the declared shape and rejects forged discriminants", () => {
+  const record = session("one");
+  const parsed = parseSessionDiscardPreview(discardPreviewFor(record));
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.operation, "discard-preview");
+  assert.equal(parsed.value.destructive, true);
+
+  const forged = parseSessionDiscardPreview({ ...discardPreviewFor(record), destructive: false });
+  assert.equal(forged.ok, false);
+  if (!forged.ok) assert.equal(forged.error.code, "INVALID_ARGUMENT");
 });
