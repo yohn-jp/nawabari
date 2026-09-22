@@ -51,6 +51,7 @@ import {
   STRICT_RUNTIME_POLICY,
   type RuntimePolicyMode,
 } from "./domain/runtime-projection.js";
+import { listSessionProcesses } from "./domain/session-console.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -94,6 +95,8 @@ export const DISPATCHER_COMMAND_INVENTORY = [
   "session run",
   "session exec",
   "session shell",
+  "session enter",
+  "session processes",
   "session list",
   "session claim",
   "resource claim",
@@ -156,6 +159,8 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session reconcile": ["--session", "--apply"],
   "session run": ["--session", "--runtime-policy"],
   "session shell": ["--session", "--runtime-policy"],
+  "session enter": ["--session", "--runtime-policy"],
+  "session processes": ["--session"],
   "session list": ["--all", "--history", "--limit", "--offset"],
   "session claim": ["--resource", "--mode", "--session", "--repository"],
   "session update": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
@@ -1565,6 +1570,22 @@ async function executeCommand(
     // of creating a second launch path.
     if (canonicalCommandForName(`session ${subcommand}`)?.name === "session run") {
       return executeProtectedSessionCommand(rest, dependencies, context);
+    }
+    if (subcommand === "processes") {
+      const parsed = parseTargetedOptions(rest, dispatcherAllowedOptions("session processes"));
+      if (!parsed.ok) return parsed;
+      const sessionId = parsed.value.session_id;
+      if (sessionId === null || dependencies.backend.listSessionExecutions === undefined) {
+        return failure(usageError("MISSING_ARGUMENT", "session processes requires --session and execution persistence."));
+      }
+      const result = await listSessionProcesses(context, dependencies.backend, {
+        session_id: sessionId,
+        read_executions: (id) => dependencies.backend.listSessionExecutions!(context, id).then((value) => {
+          if (!value.ok) throw value.error;
+          return value.value;
+        }),
+      });
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "claim") {
       const parsed = parseSingleClaimPair(rest);

@@ -6,6 +6,10 @@ import type {
 } from "../session-lifecycle-classification.js";
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
+import type {
+  PersistedSessionExecutionRecord,
+  SessionExecutionStateInput,
+} from "./session-execution-record.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -886,6 +890,10 @@ export interface SessionBackend {
     sessionId: string | null,
   ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation: number }>>;
   migrate?(context: SessionContext): Promise<DomainResult<RegistryMigrationResult>>;
+  listSessionExecutions?(context: SessionContext, sessionId: string): Promise<DomainResult<readonly PersistedSessionExecutionRecord[]>>;
+  persistSessionExecution?(context: SessionContext, record: PersistedSessionExecutionRecord): Promise<DomainResult<PersistedSessionExecutionRecord>>;
+  transitionSessionExecution?(context: SessionContext, executionId: string, input: SessionExecutionStateInput): Promise<DomainResult<PersistedSessionExecutionRecord>>;
+  closeSessionLaunchAdmission?(context: SessionContext, sessionId: string, expectedEpoch: number): Promise<DomainResult<{ runtimeEpoch: number }>>;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {

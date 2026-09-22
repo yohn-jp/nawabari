@@ -68,6 +68,7 @@ import {
   type UpdateClaimsOptions,
 } from "./session.js";
 import type { SandboxGitIdentity } from "./sandbox.js";
+import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
@@ -180,6 +181,26 @@ export class LocalSessionBackend implements SessionBackend {
     this.git = options.git;
     this.gitIdentity = options.gitIdentity;
     this.registryOptions = options.registry ?? {};
+  }
+
+  public async listSessionExecutions(context: SessionContext, sessionId: string): Promise<DomainResult<readonly PersistedSessionExecutionRecord[]>> {
+    try { return success(this.registryFor(context).listSessionExecutions(sessionId)); }
+    catch (error: unknown) { return failure(toDomainError(error)); }
+  }
+
+  public async persistSessionExecution(context: SessionContext, record: PersistedSessionExecutionRecord): Promise<DomainResult<PersistedSessionExecutionRecord>> {
+    try { return success(this.registryFor(context).persistSessionExecution(record)); }
+    catch (error: unknown) { return failure(toDomainError(error)); }
+  }
+
+  public async transitionSessionExecution(context: SessionContext, executionId: string, input: SessionExecutionStateInput): Promise<DomainResult<PersistedSessionExecutionRecord>> {
+    try { return success(this.registryFor(context).transitionSessionExecution(executionId, input)); }
+    catch (error: unknown) { return failure(toDomainError(error)); }
+  }
+
+  public async closeSessionLaunchAdmission(context: SessionContext, sessionId: string, expectedEpoch: number): Promise<DomainResult<{ runtimeEpoch: number }>> {
+    try { return success(this.registryFor(context).closeSessionLaunchAdmission(sessionId, expectedEpoch)); }
+    catch (error: unknown) { return failure(toDomainError(error)); }
   }
 
   public async createSession(
