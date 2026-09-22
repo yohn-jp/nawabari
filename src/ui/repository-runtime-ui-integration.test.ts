@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { repositoryRuntimeUiModel } from "../cli.js";
+import { repositoryRuntimeUiModel, runCli } from "../cli.js";
 import { getNawabariRepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
 import type { RepositoryRegistryView } from "../session-registry.js";
 import { success } from "../domain/errors.js";
 import type { SessionBackend } from "../domain/session.js";
+import type { SessionRecord } from "../domain/session.js";
 
 test("CLI UI model consumes the canonical runtime snapshot and preserves its token", async () => {
   const registry: RepositoryRegistryView = {
@@ -31,4 +32,46 @@ test("CLI UI model consumes the canonical runtime snapshot and preserves its tok
   assert.equal(model.value.snapshot_token, "7:2");
   assert.deepEqual(model.value.sessions, []);
   assert.equal(model.value.truncated, true);
+});
+
+test("CLI action route delegates typed dispatch without executing command metadata", async () => {
+  const session: SessionRecord = {
+    schema_version: 1,
+    session_id: "0190f1e0-0000-7000-8000-000000000001",
+    repository: "/tmp/repository",
+    worktree: "/tmp/worktree",
+    branch: "feature/demo",
+    state: "active",
+    created_at: "2026-01-02T03:04:05.006Z",
+    updated_at: "2026-01-02T03:04:05.006Z",
+  };
+  let dispatched = false;
+  const backend = {
+    getSession: async () => success(session),
+    sessionActions: () => ({
+      dispatchSessionAction: async (actionId: string) => {
+        dispatched = true;
+        assert.equal(actionId, "retain-session");
+        return success({ action_id: "retain-session", status: "observed", token: {}, diagnostic: {} } as never);
+      },
+    }),
+  } as unknown as SessionBackend;
+  const output: string[] = [];
+  const code = await runCli(
+    [
+      "--json",
+      "session",
+      "action",
+      "--session",
+      session.session_id,
+      "--action",
+      "retain-session",
+      "--token",
+      JSON.stringify({ schema_version: 1 }),
+    ],
+    { backend, cwd: "/tmp/repository", io: { stdout: (line) => output.push(line), stderr: () => undefined } },
+  );
+  assert.equal(code, 0);
+  assert.equal(dispatched, true);
+  assert.equal(output.join("").includes("session inspect"), false);
 });

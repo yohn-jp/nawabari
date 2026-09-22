@@ -315,7 +315,15 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
   PROTECTED_EXECUTION_CAPABILITY,
   {
     id: "session-lifecycle",
-    commands: ["session create", "session id", "session show", "session list", "status", "session close"],
+    commands: [
+      "session create",
+      "session id",
+      "session show",
+      "session list",
+      "status",
+      "session close",
+      "session action",
+    ],
     result_schema: "session.v1",
     result_schema_version: 1,
     result_schemas: [
@@ -324,14 +332,26 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
         version: 1,
         commands: ["session create", "session id", "session show", "session list", "status", "session close"],
       },
+      { schema: "session-action.v1", version: 1, commands: ["session action"] },
     ],
-    identities: ["session_id", "repository", "worktree", "branch", "state"],
+    identities: ["session_id", "repository", "worktree", "branch", "state", "action_id", "token", "preview", "result"],
     failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-lifecycle"],
     failure_code_policy: {
       source: "implementation-owned session-lifecycle vocabulary",
       missing_or_extra: "deterministic conformance failure",
       internal_exceptions: [],
     },
+    action_ids: [
+      "retain-session",
+      "supply-exact-integrated-revision",
+      "retry-close-with-bounded-integration-fetch",
+      "discard-session",
+      "reconcile-physical-state",
+    ],
+    reauthorize_before_dispatch: true,
+    shell_execution: false,
+    destructive_confirmation: "typed-preview-and-explicit-intent",
+    action_authority: "existing-session-lifecycle-and-cleanup-backend",
     registry_lock_recovery: {
       contract_id: REGISTRY_LOCK_RECOVERY_CONTRACT_ID,
       contract_version: REGISTRY_LOCK_RECOVERY_CONTRACT_VERSION,
@@ -808,8 +828,12 @@ export function machineContract(packageVersion: string): JsonObject {
         ? { compatibility_result_schemas: jsonClone(capability.compatibility_result_schemas) }
         : {}),
       identities: [...capability.identities],
-      failure_codes: [...capability.failure_codes],
-      failure_code_policy: jsonClone(capability.failure_code_policy),
+      ...(capability.failure_codes === undefined
+        ? { no_failure_codes: true }
+        : {
+            failure_codes: [...capability.failure_codes],
+            failure_code_policy: jsonClone(capability.failure_code_policy),
+          }),
       ...(capability.id === "resource-claims"
         ? {
             contract_id: capability.contract_id,

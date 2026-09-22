@@ -69,6 +69,7 @@ import {
 } from "./session.js";
 import type { SandboxGitIdentity } from "./sandbox.js";
 import { getNawabariRepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
+import { createSessionActions } from "../ui/session-actions.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
@@ -196,6 +197,10 @@ export class LocalSessionBackend implements SessionBackend {
     } catch (error) {
       return failure(toDomainError(error));
     }
+  }
+
+  public sessionActions(context: SessionContext): import("../ui/session-actions.js").SessionActionDispatcher {
+    return createSessionActions(this, context);
   }
 
   public async createSession(
