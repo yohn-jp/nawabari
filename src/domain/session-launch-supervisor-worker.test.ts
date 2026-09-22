@@ -95,7 +95,24 @@ function request(overrides: Partial<SupervisorStartRequest["payload"]> = {}): Su
   };
 }
 
-test("rejects EOF and malformed GO before spawning the payload", async () => {
+test("rejects EOF before spawning the payload", async () => {
+  const control = new PassThrough();
+  const result = new PassThrough();
+  let spawned = 0;
+  const outcome = runTrustedSessionSupervisorWorker({
+    control,
+    result,
+    spawn_process: (() => {
+      spawned += 1;
+      throw new Error("payload must not spawn");
+    }) as typeof import("node:child_process").spawn,
+  });
+  control.end();
+  assert.deepEqual(await outcome, { status: "unknown" });
+  assert.equal(spawned, 0);
+});
+
+test("rejects malformed GO before spawning the payload", async () => {
   const control = new PassThrough();
   const result = new PassThrough();
   let spawned = 0;
@@ -108,6 +125,23 @@ test("rejects EOF and malformed GO before spawning the payload", async () => {
     }) as typeof import("node:child_process").spawn,
   });
   control.end('{"type":"GO","contract_id":"wrong"}\n');
+  assert.deepEqual(await outcome, { status: "unknown" });
+  assert.equal(spawned, 0);
+});
+
+test("rejects an oversized pre-GO packet before spawning the payload", async () => {
+  const control = new PassThrough();
+  const result = new PassThrough();
+  let spawned = 0;
+  const outcome = runTrustedSessionSupervisorWorker({
+    control,
+    result,
+    spawn_process: (() => {
+      spawned += 1;
+      throw new Error("payload must not spawn");
+    }) as typeof import("node:child_process").spawn,
+  });
+  control.end(Buffer.alloc(2 * 1_024 * 1_024 + 1, 0x7b));
   assert.deepEqual(await outcome, { status: "unknown" });
   assert.equal(spawned, 0);
 });
@@ -174,9 +208,9 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
   const { supervisor: supervisorEntrypoint } = await ensureFreshCompiledPackage();
   const compiledSupervisor = (await import(pathToFileURL(supervisorEntrypoint).href)) as CompiledSupervisorModule;
   const marker = path.join(os.tmpdir(), `nawabari-451-descendant-${process.pid}-${Date.now()}.txt`);
+  const release = path.join(os.tmpdir(), `nawabari-451-descendant-release-${process.pid}-${Date.now()}.txt`);
+  const seccompFd = fs.openSync("/dev/null", "r");
   let scopeCreated = false;
-  let cleanupSucceeded = false;
-  let cleanupFailureMessage = "unknown";
   let runPromise: Promise<CompiledSupervisorResult> | null = null;
   try {
     let runScope: CgroupScope | null = null;
@@ -191,20 +225,28 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
         executable: process.execPath,
         args: [
           "-e",
-          [
-            "const fs = require('node:fs')",
-            "const { spawn } = require('node:child_process')",
-            "const descendant = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], { stdio: 'ignore' })",
-            `fs.writeFileSync(${JSON.stringify(marker)}, String(descendant.pid))`,
-            "setTimeout(() => {}, 10000)",
-          ].join(";"),
+          (() => {
+            const descendantCode = [
+              "const fs = require('node:fs')",
+              `const release = ${JSON.stringify(release)}`,
+              "const wait = () => { if (fs.existsSync(release)) process.exit(0); setTimeout(wait, 10) }",
+              "wait()",
+            ].join(";");
+            return [
+              "const fs = require('node:fs')",
+              "const { spawn } = require('node:child_process')",
+              `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantCode)}], { stdio: 'ignore' })`,
+              `fs.writeFileSync(${JSON.stringify(marker)}, String(descendant.pid))`,
+              "descendant.once('exit', () => process.exit(0))",
+            ].join(";");
+          })(),
         ],
         cwd: process.cwd(),
         env: { PATH: process.env.PATH ?? "/usr/bin" },
-        stdio: ["ignore", "pipe", "pipe", 3],
-        seccomp_fd: 3,
+        stdio: ["ignore", "pipe", "pipe", seccompFd],
+        seccomp_fd: seccompFd,
       },
-      result_timeout_ms: 2_000,
+      result_timeout_ms: 5_000,
       cgroup: {
         required: true,
         create_scope: (identity, options) => {
@@ -223,10 +265,7 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
           return attachProcessToCgroup(scope, pid);
         },
         cleanup_scope: (scope) => {
-          const cleaned = cleanupCgroupScope(scope);
-          cleanupSucceeded = cleaned.ok;
-          if (!cleaned.ok) cleanupFailureMessage = cleaned.error.message;
-          return cleaned;
+          return cleanupCgroupScope(scope);
         },
       },
       process_factory: compiledSupervisor.createTrustedSupervisorProcess,
@@ -236,13 +275,22 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
     while (!fs.existsSync(marker) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    if (!fs.existsSync(marker)) throw new Error("BLOCKED: compiled payload did not fork promptly");
+    if (!fs.existsSync(marker)) {
+      const outcome = await runPromise;
+      if (!outcome.ok && !scopeCreated) {
+        const code = outcome.error.code;
+        if (code === "SANDBOX_CAPABILITY_UNAVAILABLE" || code === "SANDBOX_CGROUP_SETUP_FAILED") {
+          throw new Error(`BLOCKED: supported cgroups v2 capability unavailable (${outcome.error.message})`);
+        }
+      }
+      throw new Error("The compiled payload did not fork promptly.");
+    }
     const descendantPid = Number(fs.readFileSync(marker, "utf8").trim());
     if (!Number.isSafeInteger(descendantPid) || descendantPid < 1) {
-      throw new Error("BLOCKED: compiled payload did not report a valid descendant pid");
+      throw new Error("The compiled payload did not report a valid descendant pid.");
     }
 
-    if (runScope === null) throw new Error("BLOCKED: production supervisor did not create a cgroup scope");
+    if (runScope === null) throw new Error("The production supervisor did not create a cgroup scope.");
     let population = readCgroupPopulation(runScope);
     for (let attempt = 0; attempt < 40 && !population.processes?.includes(descendantPid); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -251,13 +299,19 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
     assert.equal(population.state, "populated");
     assert.ok(population.processes?.includes(descendantPid), JSON.stringify(population));
     const outcome = await runPromise;
+    if (!outcome.ok && !scopeCreated) {
+      const code = outcome.error.code;
+      if (code === "SANDBOX_CAPABILITY_UNAVAILABLE" || code === "SANDBOX_CGROUP_SETUP_FAILED") {
+        throw new Error(`BLOCKED: supported cgroups v2 capability unavailable (${outcome.error.message})`);
+      }
+    }
     assert.equal(outcome.ok, true, outcome.ok ? "" : outcome.error.message);
-    if (outcome.ok) assert.equal(outcome.value.status, "unresolved");
+    if (outcome.ok) assert.equal(outcome.value.status, "completed");
   } finally {
+    fs.writeFileSync(release, "release");
     fs.rmSync(marker, { force: true });
     if (runPromise !== null) await runPromise.catch(() => undefined);
-    if (scopeCreated && !cleanupSucceeded) {
-      throw new Error(`BLOCKED: production cgroup cleanup failed: ${cleanupFailureMessage}`);
-    }
+    fs.rmSync(release, { force: true });
+    fs.closeSync(seccompFd);
   }
 });

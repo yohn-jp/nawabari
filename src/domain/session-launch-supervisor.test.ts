@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { success } from "./errors.js";
+import { DomainError, failure, success } from "./errors.js";
 import { decideExecutionAdmission, type ExecutionAdmissionReservation } from "./session-admission-decision.js";
 import {
   runSessionLaunchSupervisor,
@@ -253,4 +253,53 @@ test("timeout after GO is unresolved without automatic replay", async () => {
     assert.equal(result.value.retryable, false);
   }
   assert.equal(sends, 1);
+});
+
+test("timeout after GO surfaces cleanup failure without claiming resolution", async () => {
+  const base = packet();
+  const result = await runSessionLaunchSupervisor({
+    ...base,
+    cgroup: {
+      ...base.cgroup,
+      cleanup_scope: () =>
+        failure(new DomainError("SANDBOX_CGROUP_CLEANUP_FAILED", "descendant remains in the supervisor scope.")),
+    },
+    process_factory: async () => ({
+      pid: 4242,
+      send_go: () => undefined,
+      terminate: () => undefined,
+      wait: () => new Promise<never>(() => undefined),
+    }),
+    result_timeout_ms: 10,
+  });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, "SANDBOX_CGROUP_CLEANUP_FAILED");
+  assert.equal(result.error.details?.uncertainty, "timeout");
+  assert.equal(result.error.details?.reason, "descendant remains in the supervisor scope.");
+});
+
+test("parent disconnect after GO surfaces a throwing cleanup callback", async () => {
+  const base = packet();
+  const result = await runSessionLaunchSupervisor({
+    ...base,
+    parent: { is_connected: () => true, wait_for_disconnect: Promise.resolve() },
+    cgroup: {
+      ...base.cgroup,
+      cleanup_scope: () => {
+        throw new Error("cleanup callback failed");
+      },
+    },
+    process_factory: async () => ({
+      pid: 4242,
+      send_go: () => undefined,
+      terminate: () => undefined,
+      wait: () => new Promise<never>(() => undefined),
+    }),
+  });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, "SANDBOX_CGROUP_CLEANUP_FAILED");
+  assert.equal(result.error.details?.uncertainty, "parent-disconnected-after-go");
+  assert.equal(result.error.details?.reason, "cleanup callback failed");
 });
