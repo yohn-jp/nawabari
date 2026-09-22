@@ -1044,6 +1044,7 @@ export {
   runSandboxedCommand,
   type SandboxCommand,
   type SandboxExecutionResult,
+  type SandboxFilesystemEnforcementOptions,
   type SandboxInvocation,
   type SandboxLauncherOptions,
   type SeccompProfileHandle,
