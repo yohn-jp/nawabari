@@ -6,6 +6,8 @@ import type {
 } from "../session-lifecycle-classification.js";
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
+import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
+import type { SessionActionDispatcher } from "../ui/session-actions.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -885,6 +887,10 @@ export interface SessionBackend {
     context: SessionContext,
     sessionId: string | null,
   ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation: number }>>;
+  /** Read-only repository-wide projection consumed by CLI and UI surfaces. */
+  repositoryRuntimeSnapshot?(context: SessionContext): Promise<DomainResult<RepositoryRuntimeSnapshot>>;
+  /** Typed lifecycle action adapter; command strings are never executed. */
+  sessionActions?(context: SessionContext): SessionActionDispatcher;
   migrate?(context: SessionContext): Promise<DomainResult<RegistryMigrationResult>>;
 }
 

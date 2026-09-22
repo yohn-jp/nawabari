@@ -34,6 +34,14 @@ import { isResourceClaimMode } from "./resource-claims.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
+import { repositoryScreenModelFromRuntimeSnapshot } from "./ui/repository-terminal.js";
+import type { RepositoryScreenModel } from "./ui/repository-screen.js";
+import type {
+  SessionActionConfirmation,
+  SessionActionId,
+  SessionActionIdentity,
+  SessionActionToken,
+} from "./ui/session-actions.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
 import {
   resolveSandboxExecutionRequest,
@@ -94,6 +102,7 @@ export const DISPATCHER_COMMAND_INVENTORY = [
   "session run",
   "session exec",
   "session shell",
+  "session action",
   "session list",
   "session claim",
   "resource claim",
@@ -156,6 +165,7 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session reconcile": ["--session", "--apply"],
   "session run": ["--session", "--runtime-policy"],
   "session shell": ["--session", "--runtime-policy"],
+  "session action": ["--session", "--action", "--token", "--confirm", "--preview", "--operation-id"],
   "session list": ["--all", "--history", "--limit", "--offset"],
   "session claim": ["--resource", "--mode", "--session", "--repository"],
   "session update": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
@@ -460,6 +470,11 @@ type ParsedOptions = {
   schema_version: SessionDiagnosticSchemaVersion | null;
   summary: boolean;
   unresolved: boolean;
+  action_id: string | null;
+  action_token: SessionActionToken | null;
+  action_preview: unknown | null;
+  operation_id: string | null;
+  confirm: boolean;
 };
 
 function usageError(
@@ -570,6 +585,11 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     schema_version: null,
     summary: false,
     unresolved: false,
+    action_id: null,
+    action_token: null,
+    action_preview: null,
+    operation_id: null,
+    confirm: false,
   };
   let dryRun = false;
 
@@ -590,7 +610,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       name === "--patch" ||
       name === "--preview" ||
       name === "--summary" ||
-      name === "--unresolved"
+      name === "--unresolved" ||
+      name === "--confirm"
     ) {
       if (inlineValue !== null) {
         return failure(usageError("INVALID_ARGUMENT", `${name} does not accept a value.`, { option: name }));
@@ -605,7 +626,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       else if (name === "--patch") options.patch = true;
       else if (name === "--preview") options.preview = true;
       else if (name === "--summary") options.summary = true;
-      else options.unresolved = true;
+      else if (name === "--unresolved") options.unresolved = true;
+      else options.confirm = true;
       continue;
     }
 
@@ -616,7 +638,22 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     if (inlineValue === null) index += 1;
 
     if (name === "--session") options.session_id = value;
-    else if (name === "--runtime-policy") {
+    else if (name === "--action") options.action_id = value;
+    else if (name === "--operation-id") options.operation_id = value;
+    else if (name === "--token" || name === "--preview") {
+      try {
+        const parsed = JSON.parse(value) as unknown;
+        if (name === "--token") options.action_token = parsed as SessionActionToken;
+        else options.action_preview = parsed;
+      } catch (error: unknown) {
+        return failure(
+          usageError("INVALID_ARGUMENT", `${name} requires valid JSON.`, {
+            option: name,
+            reason: error instanceof Error ? error.message : "invalid JSON",
+          }),
+        );
+      }
+    } else if (name === "--runtime-policy") {
       if (options.runtime_policy !== null) {
         return failure(usageError("INVALID_ARGUMENT", "--runtime-policy may be supplied only once.", { option: name }));
       }
@@ -1553,6 +1590,61 @@ async function executeCommand(
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
 
+  if (command === "session" && subcommand === "action") {
+    const parsed = parseOptions(rest, dispatcherAllowedOptions("session action"));
+    if (!parsed.ok) return parsed;
+    if (parsed.value.session_id === null || parsed.value.action_id === null || parsed.value.action_token === null) {
+      return failure(
+        usageError("MISSING_ARGUMENT", "session action requires --session, --action, and --token.", {
+          required: ["--session", "--action", "--token"],
+        }),
+      );
+    }
+    const actionIds: readonly SessionActionId[] = [
+      "retain-session",
+      "supply-exact-integrated-revision",
+      "retry-close-with-bounded-integration-fetch",
+      "discard-session",
+      "reconcile-physical-state",
+    ];
+    if (!actionIds.includes(parsed.value.action_id as SessionActionId)) {
+      return failure(
+        usageError("INVALID_ARGUMENT", "session action received an unknown typed action ID.", {
+          action_id: parsed.value.action_id,
+          values: [...actionIds],
+        }),
+      );
+    }
+    if (dependencies.backend.sessionActions === undefined) {
+      return failure(
+        new DomainError("BACKEND_UNAVAILABLE", "Typed session action capability is not available.", {
+          operation: "session.action",
+        }),
+      );
+    }
+    const session = await dependencies.backend.getSession(context, parsed.value.session_id);
+    if (!session.ok) return session;
+    const identity: SessionActionIdentity = {
+      session_id: session.value.session_id,
+      repository: session.value.repository,
+      worktree: session.value.worktree,
+    };
+    const confirmation: SessionActionConfirmation = {
+      confirmed: parsed.value.confirm,
+      ...(parsed.value.operation_id === null ? {} : { operation_id: parsed.value.operation_id }),
+      ...(parsed.value.action_preview === null ? {} : { preview: parsed.value.action_preview as never }),
+    };
+    const result = await dependencies.backend
+      .sessionActions(context)
+      .dispatchSessionAction(
+        parsed.value.action_id as SessionActionId,
+        identity,
+        parsed.value.action_token,
+        confirmation,
+      );
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  }
+
   if (command === "session") {
     if (subcommand === undefined) {
       return failure(usageError("MISSING_ARGUMENT", "session requires a subcommand."));
@@ -2457,4 +2549,19 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   } catch {
     return emitFailure(mode, command, new DomainError("INTERNAL_ERROR", "An unexpected internal error occurred."), io);
   }
+}
+
+/** Read the canonical repository projection for CLI/TUI callers. */
+export async function repositoryRuntimeUiModel(
+  dependencies: Required<Pick<CliDependencies, "backend" | "cwd">>,
+): Promise<DomainResult<RepositoryScreenModel>> {
+  if (dependencies.backend.repositoryRuntimeSnapshot === undefined) {
+    return failure(
+      new DomainError("BACKEND_UNAVAILABLE", "Repository runtime snapshot capability is not available.", {
+        operation: "repository.ui",
+      }),
+    );
+  }
+  const snapshot = await dependencies.backend.repositoryRuntimeSnapshot(sessionContext(dependencies.cwd));
+  return snapshot.ok ? { ok: true, value: repositoryScreenModelFromRuntimeSnapshot(snapshot.value) } : snapshot;
 }
