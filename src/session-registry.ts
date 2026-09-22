@@ -62,6 +62,7 @@ import {
   createFileOperationRegistryState,
   fileOperationRequestDigest,
   parseFileOperationRegistry,
+  reconcileFileOperationReceiptAuthority,
   reconcileFileOperationReceipt,
   recordFileOperationApplyAttempt,
   reserveFileOperation,
@@ -1218,6 +1219,8 @@ export class SessionRegistry {
       this.finalizeFileOperation(
         operation.operation_id,
         reservation.token,
+        reservation.operation,
+        executionOptions,
         observeFileOperationWithoutResult(reservation.record, prepared.value.request),
       );
       throw uncertainFileOperation(
@@ -1229,23 +1232,26 @@ export class SessionRegistry {
       this.finalizeFileOperation(
         operation.operation_id,
         reservation.token,
+        reservation.operation,
+        executionOptions,
         observeFileOperationWithoutResult(reservation.record, prepared.value.request),
       );
       throw uncertainFileOperation(operation.operation_id, physical.error.message);
     }
 
     const observation = observeFileOperationEffect(reservation.record, physical.value, prepared.value.request);
-    let afterIoFence = false;
     try {
       const currentAfterIo = this.fileOperationAuthority(operation, executionOptions);
-      afterIoFence = validateFilesystemPolicyToken(reservation.token, currentAfterIo.token).ok;
+      validateFilesystemPolicyToken(reservation.token, currentAfterIo.token);
     } catch {
-      afterIoFence = false;
+      // The final locked authority read is the completion decision.
     }
     const reconciled = this.finalizeFileOperation(
       operation.operation_id,
       reservation.token,
-      afterIoFence ? observation : unresolvedObservation(reservation.record, observation),
+      reservation.operation,
+      executionOptions,
+      observation,
     );
     if (reconciled.disposition !== "completed") {
       throw uncertainFileOperation(
@@ -5820,9 +5826,11 @@ export class SessionRegistry {
 
   private finalizeFileOperation(
     operationId: string,
-    _token: FilesystemPolicyToken,
+    token: FilesystemPolicyToken,
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
     observation: FileOperationObservation,
-  ): ReturnType<typeof reconcileFileOperationReceipt> {
+  ): ReturnType<typeof reconcileFileOperationReceiptAuthority> {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
@@ -5832,7 +5840,14 @@ export class SessionRegistry {
           operationId,
         });
       }
-      const reconciliation = reconcileFileOperationReceipt(record, observation);
+      let authorityCurrent = true;
+      try {
+        const current = currentFileOperationAuthority(this, state, operation, executionOptions);
+        authorityCurrent = validateFilesystemPolicyToken(token, current.token).ok;
+      } catch {
+        authorityCurrent = false;
+      }
+      const reconciliation = reconcileFileOperationReceiptAuthority(record, observation, authorityCurrent);
       if (reconciliation.record === record) return reconciliation;
       const replacementIndex = fileOperations.fileOperations.findIndex(
         (candidate) => candidate.operationId === reconciliation.record.operationId,

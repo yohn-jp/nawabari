@@ -172,6 +172,11 @@ export interface FileOperationReconciliation {
   readonly disposition: "completed" | "unresolved";
 }
 
+export interface FileOperationAuthorityReconciliation extends FileOperationReconciliation {
+  /** Whether the helper reported completion, independent of current authority. */
+  readonly helperExecutionCompleted: boolean;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -713,18 +718,7 @@ export function fileOperationEffectMatches(
   );
 }
 
-/**
- * Reconcile an apply-recorded receipt against an executor observation.  A
- * matching effect without an explicit completion observation remains
- * unresolved by design: bytes/absence prove an effect was seen, not who
- * completed it or whether the apply response was delivered.
- */
-export function reconcileFileOperationReceipt(
-  record: FileOperationRecord,
-  observation: FileOperationObservation,
-  now = new Date().toISOString(),
-): FileOperationReconciliation {
-  assertRecord(record);
+function validateFileOperationObservation(record: FileOperationRecord, observation: FileOperationObservation): void {
   if (!isRecord(observation)) {
     throw new FileOperationError("FILE_OPERATION_INVALID", "File-operation observation must be an object");
   }
@@ -745,12 +739,23 @@ export function reconcileFileOperationReceipt(
       operationId: record.operationId,
     });
   }
+}
+
+function reconcileFileOperationReceiptWithAuthority(
+  record: FileOperationRecord,
+  observation: FileOperationObservation,
+  authorityCurrent: boolean,
+  now: string,
+): FileOperationAuthorityReconciliation {
+  assertRecord(record);
+  validateFileOperationObservation(record, observation);
   if (record.stage === "completed" || record.stage === "unresolved") {
     return {
       record,
       effectMatches: record.effectObserved,
       completionProven: record.executionCompleted,
       disposition: record.stage,
+      helperExecutionCompleted: observation.executionCompleted,
     };
   }
   if (record.stage !== "apply-recorded") {
@@ -764,7 +769,7 @@ export function reconcileFileOperationReceipt(
     );
   }
   const effectMatches = observation.effectObserved && fileOperationEffectMatches(record, observation);
-  const completionProven = effectMatches && observation.executionCompleted;
+  const completionProven = authorityCurrent === true && effectMatches && observation.executionCompleted;
   const next = updatedRecord(
     record,
     {
@@ -779,7 +784,42 @@ export function reconcileFileOperationReceipt(
     effectMatches,
     completionProven,
     disposition: completionProven ? "completed" : "unresolved",
+    helperExecutionCompleted: observation.executionCompleted,
   };
+}
+
+/**
+ * Reconcile an apply-recorded receipt against an executor observation.  A
+ * matching effect without an explicit completion observation remains
+ * unresolved by design: bytes/absence prove an effect was seen, not who
+ * completed it or whether the apply response was delivered.
+ */
+export function reconcileFileOperationReceipt(
+  record: FileOperationRecord,
+  observation: FileOperationObservation,
+  now = new Date().toISOString(),
+): FileOperationReconciliation {
+  const result = reconcileFileOperationReceiptWithAuthority(record, observation, true, now);
+  return {
+    record: result.record,
+    effectMatches: result.effectMatches,
+    completionProven: result.completionProven,
+    disposition: result.disposition,
+  };
+}
+
+/**
+ * Reconcile a helper observation only after the final registry state has
+ * revalidated the authority fence.  Physical evidence and helper completion
+ * remain visible even when the authority is stale or unavailable.
+ */
+export function reconcileFileOperationReceiptAuthority(
+  record: FileOperationRecord,
+  observation: FileOperationObservation,
+  authorityCurrent: boolean,
+  now = new Date().toISOString(),
+): FileOperationAuthorityReconciliation {
+  return reconcileFileOperationReceiptWithAuthority(record, observation, authorityCurrent, now);
 }
 
 function serializeRecord(record: FileOperationRecord): PersistedFileOperationRecord {

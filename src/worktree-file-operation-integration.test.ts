@@ -508,6 +508,62 @@ test("stale pre-I/O authority performs no helper I/O and persists unresolved evi
   }
 });
 
+test("final locked authority rejects a post-helper claim race without replaying physical I/O", () => {
+  const fixture = createFixture();
+  const source = python3Source();
+  try {
+    if (source === null) return;
+    const operationValue = operation(fixture, "stale-final-lock", "docs/stale.txt");
+    const policy = policyFor(fixture, profileBoundary(PROFILE_DIGEST_A));
+    const initial = readRegistry(fixture.registry);
+    const helperCalls = { value: 0 };
+    let policyCalls = 0;
+    const first = fixture.registry.executeFileOperation;
+    assert.throws(
+      () =>
+        first.call(fixture.registry, operationValue, {
+          ...executionOptions(source, successfulHelper(helperCalls)),
+          policy: () => {
+            policyCalls += 1;
+            if (policyCalls === 3) fixture.registry.releaseSessionClaims(fixture.session.sessionId);
+            return policy;
+          },
+        }),
+      assertUncertain,
+    );
+
+    assert.equal(policyCalls, 4);
+    assert.equal(helperCalls.value, 1);
+    const final = readRegistry(fixture.registry);
+    assert.equal(final.registry_revision, (initial.registry_revision ?? 0) + 3);
+    const stored = receipt(fixture.registry, operationValue.operation_id);
+    assert.equal(stored.stage, "unresolved");
+    assert.equal(stored.effectObserved, true);
+    assert.equal(stored.executionCompleted, false);
+    assert.equal(fs.existsSync(path.join(fixture.session.worktreePath, operationValue.path)), true);
+
+    assert.throws(
+      () =>
+        fixture.registry.executeFileOperation(operationValue, {
+          ...executionOptions(source, () => {
+            helperCalls.value += 1;
+            throw new Error("unresolved receipt must not replay helper I/O");
+          }),
+          policy,
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /uncertain|reconciliation|stale/u);
+        return true;
+      },
+    );
+    assert.equal(helperCalls.value, 1);
+    assert.deepEqual(readRegistry(fixture.registry), final);
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
 test("completed, apply-recorded, and unresolved retries never execute a second helper", () => {
   const fixture = createFixture();
   const source = python3Source();
