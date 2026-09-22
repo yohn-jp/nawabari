@@ -1213,11 +1213,13 @@ export class SessionRegistry {
       if (!current.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", "Invalid execution record");
       const next = recordExecutionState(current.value, input);
       if (!next.ok) {
-        throw new SessionRegistryError(
-          "OPERATION_REJECTED",
-          next.error.message,
-          (next.error.details ?? {}) as unknown as RegistryErrorDetails,
-        );
+        const domainDetails = next.error.details;
+        const details: RegistryErrorDetails = {
+          ...(typeof domainDetails?.field === "string" ? { field: domainDetails.field } : {}),
+          ...(typeof domainDetails?.from === "string" ? { from: domainDetails.from } : {}),
+          ...(typeof domainDetails?.to === "string" ? { to: domainDetails.to } : {}),
+        };
+        throw new SessionRegistryError("OPERATION_REJECTED", next.error.message, details);
       }
       const persisted = toPersistedSessionExecutionRecord(next.value);
       const updated = [...executions];
