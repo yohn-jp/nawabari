@@ -29,7 +29,12 @@ test("CLI UI model consumes the canonical runtime snapshot and preserves its tok
   const model = await repositoryRuntimeUiModel({ backend, cwd: "/tmp/repo" });
   assert.equal(model.ok, true);
   if (!model.ok) return;
-  assert.equal(model.value.snapshot_token, "7:2");
+  assert.deepEqual(JSON.parse(model.value.snapshot_token as string), {
+    repository_id: "repo-1",
+    registry_revision: 7,
+    runtime_epoch: 3,
+    claim_set_generation: 2,
+  });
   assert.deepEqual(model.value.sessions, []);
   assert.equal(model.value.truncated, true);
 });
@@ -74,4 +79,34 @@ test("CLI action route delegates typed dispatch without executing command metada
   assert.equal(code, 0);
   assert.equal(dispatched, true);
   assert.equal(output.join("").includes("session inspect"), false);
+});
+
+test("root ui routes the canonical snapshot reader through the bounded non-TTY terminal", async () => {
+  const registry: RepositoryRegistryView = {
+    repositoryId: "repo-ui",
+    registrySchemaVersion: 2,
+    registryRevision: 11,
+    runtimeEpoch: 4,
+    claimSetGeneration: 8,
+    sessions: [],
+    claims: [],
+    runtimeRecords: { requiredFeatures: [], records: {} },
+  };
+  const snapshot = getNawabariRepositoryRuntimeSnapshot({
+    registry,
+    captured_at: "2026-01-02T03:04:05.006Z",
+  });
+  assert.equal(snapshot.ok, true);
+  if (!snapshot.ok) return;
+  const output: string[] = [];
+  const code = await runCli(["--json", "ui"], {
+    backend: { repositoryRuntimeSnapshot: async () => success(snapshot.value) } as unknown as SessionBackend,
+    cwd: "/tmp/repository",
+    io: { stdout: (line) => output.push(line), stderr: () => undefined },
+  });
+  assert.equal(code, 0);
+  const rendered = JSON.parse(output.join("")) as Record<string, unknown>;
+  assert.equal(rendered.ui, "repository");
+  assert.equal(rendered.interactive, false);
+  assert.equal(typeof rendered.snapshot_token, "string");
 });

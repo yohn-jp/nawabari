@@ -56,6 +56,7 @@ import { materializeTgrepRgProvider } from "./domain/runtime-provider-tgrep.js";
 import type { SessionRuntimeProjection } from "./domain/runtime-projection.js";
 import type { NixCommandRunner } from "./domain/nix-runtime-closure.js";
 import type { CliIO } from "./presentation.js";
+import type { SessionActionDispatcher } from "./ui/session-actions.js";
 
 const sampleSession: SessionRecord = {
   schema_version: 1,
@@ -84,6 +85,57 @@ function boundedWorkingSet(revision = 1): NonNullable<SessionRecord["working_set
       base: { branch: "main", revision: "a".repeat(40) },
     },
   } as unknown as NonNullable<SessionRecord["working_set"]>;
+}
+
+function nestedPreviewDetails(depth: number): Record<string, unknown> {
+  let value: Record<string, unknown> = {};
+  for (let index = 0; index < depth; index += 1) value = { nested: value };
+  return value;
+}
+
+function actionPreviewFixture(details: Record<string, unknown>): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    operation: "discard-preview",
+    destructive: true,
+    warning: "Actual session discard is destructive.",
+    session_id: sampleSession.session_id,
+    repository: sampleSession.repository,
+    worktree: sampleSession.worktree,
+    branch: sampleSession.branch,
+    session: sampleSession,
+    current_state: "active",
+    persisted_state: "active",
+    physical_state: "healthy",
+    worktree_present: true,
+    branch_present: true,
+    head: "a".repeat(40),
+    worktree_head: "a".repeat(40),
+    branch_head: "a".repeat(40),
+    expected_head: null,
+    recoverable_commits: {
+      observable: true,
+      present: false,
+      evidence: [{ code: "GIT_COMMAND_FAILED", message: "", details }],
+    },
+    uncommitted_work: { observable: true, present: false, evidence: [] },
+    claims: [],
+    claim_count: 0,
+    claims_truncated: false,
+    destructive_scope: {
+      worktree: true,
+      branch: true,
+      unintegrated_commits: false,
+      uncommitted_work: false,
+      claims: 0,
+    },
+    diagnostic: {
+      close_readiness: "ready",
+      cleanup_readiness: "not_due",
+      result_state: "complete",
+      blockers: [],
+    },
+  };
 }
 
 function capture(): { stdout: string[]; stderr: string[]; io: CliIO } {
@@ -760,6 +812,7 @@ test("canonical command registry resolves aliases without duplicating option def
     "session exec",
     "session shell",
     "session action",
+    "ui",
     "session list",
     "session claim",
     "resource claim",
@@ -1053,6 +1106,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session exec",
       "session shell",
       "session action",
+      "ui",
       "session list",
       "session claim",
       "resource claim",
@@ -1104,15 +1158,15 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--operation",
       "--reason",
       "--evidence",
-        "--unresolved",
-        "--apply",
-        "--runtime-policy",
-        "--action",
-        "--token",
-        "--confirm",
-        "--preview",
-        "--operation-id",
-        "--limit",
+      "--unresolved",
+      "--apply",
+      "--runtime-policy",
+      "--action",
+      "--token",
+      "--confirm",
+      "--preview",
+      "--operation-id",
+      "--limit",
       "--offset",
       "--if-generation",
       "--force",
@@ -1120,7 +1174,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--release-resource",
       "--claim-id",
       "--fetch-remote",
-        "--fetch-branch",
+      "--fetch-branch",
     ],
     authorization_options: ["--session", "--operation", "--resource"],
     checkpoint_options: ["--session"],
@@ -1651,6 +1705,116 @@ test("session discard --preview emits one stable destructive summary without inv
     command: "session discard",
     ...preview,
   });
+});
+
+test("session action preview JSON is bounded without changing discard boolean preview", async () => {
+  let getSessionCalls = 0;
+  let discardPreviewCalls = 0;
+  const backend = backendForTests({
+    getSession: async () => {
+      getSessionCalls += 1;
+      return success(sampleSession);
+    },
+    discardPreview: async () => {
+      discardPreviewCalls += 1;
+      return success({} as SessionDiscardPreview);
+    },
+  });
+
+  const malformedOutput = capture();
+  const malformedExit = await runCli(
+    [
+      "--json",
+      "session",
+      "action",
+      "--session",
+      sampleSession.session_id,
+      "--action",
+      "discard-session",
+      "--token",
+      "{}",
+      "--confirm",
+      "--preview",
+      "{}",
+    ],
+    { backend, io: malformedOutput.io },
+  );
+  assert.equal(malformedExit, 2);
+  assert.equal(JSON.parse(malformedOutput.stdout[0] ?? "").code, "INVALID_ARGUMENT");
+
+  const oversizedOutput = capture();
+  const oversizedPreview = JSON.stringify("x".repeat(1024 * 1024));
+  const oversizedExit = await runCli(
+    [
+      "--json",
+      "session",
+      "action",
+      "--session",
+      sampleSession.session_id,
+      "--action",
+      "discard-session",
+      "--token",
+      "{}",
+      "--confirm",
+      "--preview",
+      oversizedPreview,
+    ],
+    { backend, io: oversizedOutput.io },
+  );
+  assert.equal(oversizedExit, 2);
+  assert.equal(JSON.parse(oversizedOutput.stdout[0] ?? "").code, "INVALID_ARGUMENT");
+  assert.equal(getSessionCalls, 0);
+
+  const booleanPreviewOutput = capture();
+  const booleanPreviewExit = await runCli(["--json", "session", "discard", sampleSession.session_id, "--preview"], {
+    backend,
+    io: booleanPreviewOutput.io,
+  });
+  assert.equal(booleanPreviewExit, 0);
+  assert.equal(discardPreviewCalls, 1);
+});
+
+test("CLI session action preview accepts depth 32 and rejects depth 33", async () => {
+  let dispatchCalls = 0;
+  const sessionActions: SessionActionDispatcher = {
+    readSessionActionSnapshot: async () => success({} as never),
+    dispatchSessionAction: async () => {
+      dispatchCalls += 1;
+      return success({} as never);
+    },
+    confirmDestructiveSessionAction: async () => success({} as never),
+  };
+  const backend = backendForTests({ sessionActions: () => sessionActions });
+  const actionArguments = [
+    "--json",
+    "session",
+    "action",
+    "--session",
+    sampleSession.session_id,
+    "--action",
+    "discard-session",
+    "--token",
+    "{}",
+    "--preview",
+  ];
+
+  // preview → recoverable_commits → evidence[] → evidence → details consumes four levels.
+  const acceptedOutput = capture();
+  const acceptedExit = await runCli(
+    [...actionArguments, JSON.stringify(actionPreviewFixture(nestedPreviewDetails(28)))],
+    { backend, io: acceptedOutput.io },
+  );
+  assert.equal(acceptedExit, 0, acceptedOutput.stderr.join("\n"));
+  assert.equal(dispatchCalls, 1);
+
+  const rejectedOutput = capture();
+  const rejectedExit = await runCli(
+    [...actionArguments, JSON.stringify(actionPreviewFixture(nestedPreviewDetails(29)))],
+    { backend, io: rejectedOutput.io },
+  );
+  assert.equal(rejectedExit, 2);
+  assert.equal(JSON.parse(rejectedOutput.stdout[0] ?? "").code, "INVALID_ARGUMENT");
+  assert.equal(dispatchCalls, 1);
 });
 
 test("all session target aliases carry the same positional session identity", async () => {

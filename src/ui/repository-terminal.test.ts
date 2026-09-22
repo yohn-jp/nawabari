@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
+import { DomainError, failure, success } from "../domain/errors.js";
+import type {
+  SessionDiagnostic,
+  SessionDiscardPreview,
+  SessionDiscardResult,
+  SessionLifecycleAction,
+} from "../domain/session.js";
 import {
   runRepositoryTerminal,
   type RepositoryTerminalInput,
   type RepositoryTerminalOutput,
 } from "./repository-terminal.js";
 import type { RepositoryScreenModel } from "./repository-screen.js";
+import type { SessionActionConfirmation, SessionActionDispatcher, SessionActionToken } from "./session-actions.js";
 
 class FakeInput extends EventEmitter {
   readonly isTTY: boolean;
@@ -49,6 +57,99 @@ function sample(token = "token-1"): RepositoryScreenModel {
     runtime: [],
     conflicts: [],
   };
+}
+
+const discardAction: SessionLifecycleAction = {
+  schema_version: 1,
+  action_id: "discard-session",
+  kind: "explicit-discard",
+  command: "session discard",
+  session_id: "session-1",
+  requires_explicit_intent: true,
+};
+
+const actionToken: SessionActionToken = {
+  schema_version: 1,
+  session_id: "session-1",
+  session_updated_at: "updated",
+  claim_set_generation: 1,
+  lifecycle_state: "active",
+  physical_state: "healthy",
+  working_set_revision: null,
+};
+
+const actionPreview = {
+  operation: "discard-preview",
+  destructive: true,
+  warning: "authoritative-preview",
+} as unknown as SessionDiscardPreview;
+
+type ActionCall = {
+  readonly action_id: string;
+  readonly confirmation: SessionActionConfirmation;
+};
+
+function actionSample(): RepositoryScreenModel {
+  return {
+    ...sample(),
+    sessions: [
+      { session_id: "session-1", repository: "repo", worktree: "/worktree", branch: "feature/demo", state: "active" },
+    ],
+  };
+}
+
+function actionDispatcher(calls: ActionCall[]): SessionActionDispatcher {
+  const identity = { session_id: "session-1", repository: "repo", worktree: "/worktree" };
+  const diagnostic = { next_actions: [discardAction] } as unknown as SessionDiagnostic;
+  return {
+    readSessionActionSnapshot: async () => success({ identity, token: actionToken, diagnostic }),
+    dispatchSessionAction: async (actionId, _identity, _token, confirmation) => {
+      calls.push({ action_id: actionId, confirmation });
+      if (!confirmation.confirmed) {
+        return success({
+          action_id: "discard-session",
+          status: "confirmation-required",
+          token: actionToken,
+          preview: actionPreview,
+        });
+      }
+      return success({
+        action_id: "discard-session",
+        status: "completed",
+        token: actionToken,
+        result: {} as SessionDiscardResult,
+      });
+    },
+    confirmDestructiveSessionAction: async () => failure(new DomainError("OPERATION_REJECTED", "unused")),
+  };
+}
+
+async function flushTerminal(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+async function openDiscardConfirmation(
+  input: FakeInput,
+  output: FakeOutput,
+  calls: ActionCall[],
+): Promise<{ readonly running: ReturnType<typeof runRepositoryTerminal> }> {
+  const running = runRepositoryTerminal({
+    stdin: input as unknown as RepositoryTerminalInput,
+    stdout: output as unknown as RepositoryTerminalOutput,
+    readSnapshot: () => actionSample(),
+    sessionActions: actionDispatcher(calls),
+  });
+  await flushTerminal();
+  input.emit("data", "j");
+  input.emit("data", "a");
+  await flushTerminal();
+  input.emit("data", "1");
+  await flushTerminal();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.action_id, "discard-session");
+  assert.equal(calls[0]?.confirmation.confirmed, false);
+  assert.match(output.writes.join(""), /authoritative-preview/u);
+  return { running };
 }
 
 test("non-TTY mode never enables raw input and emits JSON fallback", async () => {
@@ -105,6 +206,51 @@ test("Ctrl-C exits through the same cleanup path", async () => {
   const result = await running;
   assert.equal(result.reason, "interrupt");
   assert.deepEqual(input.rawModes, [true, false]);
+});
+
+test("TTY action flow selects a session, previews authoritatively, and confirms with y", async () => {
+  const input = new FakeInput(true);
+  const output = new FakeOutput(true);
+  const calls: ActionCall[] = [];
+  const { running } = await openDiscardConfirmation(input, output, calls);
+
+  input.emit("data", "y");
+  await flushTerminal();
+  input.emit("data", "q");
+  const result = await running;
+  assert.equal(result.reason, "quit");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1]?.action_id, "discard-session");
+  assert.equal(calls[1]?.confirmation.confirmed, true);
+  if (calls[1]?.confirmation.confirmed) assert.equal(calls[1].confirmation.preview, actionPreview);
+});
+
+test("TTY action n cancels the authoritative preview without dispatching confirmation", async () => {
+  const input = new FakeInput(true);
+  const output = new FakeOutput(true);
+  const calls: ActionCall[] = [];
+  const { running } = await openDiscardConfirmation(input, output, calls);
+
+  input.emit("data", "n");
+  await flushTerminal();
+  input.emit("data", "q");
+  const result = await running;
+  assert.equal(result.reason, "quit");
+  assert.equal(calls.length, 1);
+});
+
+test("TTY action Escape cancels the authoritative preview without dispatching confirmation", async () => {
+  const input = new FakeInput(true);
+  const output = new FakeOutput(true);
+  const calls: ActionCall[] = [];
+  const { running } = await openDiscardConfirmation(input, output, calls);
+
+  input.emit("data", "\u001b");
+  await flushTerminal();
+  input.emit("data", "q");
+  const result = await running;
+  assert.equal(result.reason, "quit");
+  assert.equal(calls.length, 1);
 });
 
 test("an already-aborted signal resolves before raw mode or listeners are installed", async () => {

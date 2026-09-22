@@ -34,7 +34,12 @@ import { isResourceClaimMode } from "./resource-claims.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
-import { repositoryScreenModelFromRuntimeSnapshot } from "./ui/repository-terminal.js";
+import {
+  repositoryScreenModelFromRuntimeSnapshot,
+  runRepositoryTerminal,
+  type RepositoryTerminalInput,
+  type RepositoryTerminalOutput,
+} from "./ui/repository-terminal.js";
 import type { RepositoryScreenModel } from "./ui/repository-screen.js";
 import type {
   SessionActionConfirmation,
@@ -42,6 +47,8 @@ import type {
   SessionActionIdentity,
   SessionActionToken,
 } from "./ui/session-actions.js";
+import { parseSessionDiscardPreview } from "./ui/session-actions.js";
+import type { SessionDiscardPreview } from "./domain/session.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
 import {
   resolveSandboxExecutionRequest,
@@ -103,6 +110,7 @@ export const DISPATCHER_COMMAND_INVENTORY = [
   "session exec",
   "session shell",
   "session action",
+  "ui",
   "session list",
   "session claim",
   "resource claim",
@@ -166,6 +174,7 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
   "session run": ["--session", "--runtime-policy"],
   "session shell": ["--session", "--runtime-policy"],
   "session action": ["--session", "--action", "--token", "--confirm", "--preview", "--operation-id"],
+  ui: [],
   "session list": ["--all", "--history", "--limit", "--offset"],
   "session claim": ["--resource", "--mode", "--session", "--repository"],
   "session update": ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
@@ -406,6 +415,14 @@ export type CliDependencies = {
   backend?: SessionBackend;
   cwd?: string;
   io?: CliIO;
+  repositoryTerminal?: {
+    readonly stdin: RepositoryTerminalInput;
+    readonly stdout: RepositoryTerminalOutput;
+    readonly stderr?: RepositoryTerminalOutput;
+    readonly viewport?: import("./ui/repository-screen.js").RepositoryScreenViewport;
+    readonly isTTY?: boolean;
+    readonly signal?: AbortSignal;
+  };
   version?: string;
   sandboxRunner?: (
     request: import("./domain/sandbox.js").SandboxExecutionRequest,
@@ -472,7 +489,7 @@ type ParsedOptions = {
   unresolved: boolean;
   action_id: string | null;
   action_token: SessionActionToken | null;
-  action_preview: unknown | null;
+  action_preview: SessionDiscardPreview | null;
   operation_id: string | null;
   confirm: boolean;
 };
@@ -537,6 +554,66 @@ function optionParts(argument: string): { name: string; inlineValue: string | nu
   const separator = argument.indexOf("=");
   if (separator === -1) return { name: argument, inlineValue: null };
   return { name: argument.slice(0, separator), inlineValue: argument.slice(separator + 1) };
+}
+
+const MAX_CLI_JSON_BYTES = 1024 * 1024;
+const MAX_CLI_JSON_DEPTH = 32;
+const MAX_CLI_JSON_TEXT_CODE_POINTS = 4_096;
+
+function boundedJsonInput(value: string, option: string): DomainResult<unknown> {
+  if (new TextEncoder().encode(value).byteLength > MAX_CLI_JSON_BYTES) {
+    return failure(usageError("INVALID_ARGUMENT", `${option} exceeds the 1 MiB JSON input limit.`, { option }));
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch (error: unknown) {
+    return failure(
+      usageError("INVALID_ARGUMENT", `${option} requires valid JSON.`, {
+        option,
+        reason: error instanceof Error ? error.message : "invalid JSON",
+      }),
+    );
+  }
+
+  const validate = (candidate: unknown, depth: number, field: string): DomainResult<null> => {
+    if (depth > MAX_CLI_JSON_DEPTH) {
+      return failure(
+        usageError("INVALID_ARGUMENT", `${option} exceeds the maximum JSON depth of 32.`, { option, field }),
+      );
+    }
+    if (typeof candidate === "string") {
+      if ([...candidate].length > MAX_CLI_JSON_TEXT_CODE_POINTS || /\p{Cc}|\p{Cf}/u.test(candidate)) {
+        return failure(
+          usageError("INVALID_ARGUMENT", `${option} contains an oversized or control-corrupted text field.`, {
+            option,
+            field,
+          }),
+        );
+      }
+      return { ok: true, value: null };
+    }
+    if (candidate === null || typeof candidate === "boolean" || typeof candidate === "number")
+      return { ok: true, value: null };
+    if (Array.isArray(candidate)) {
+      for (const [index, child] of candidate.entries()) {
+        const checked = validate(child, depth + 1, `${field}[${index}]`);
+        if (!checked.ok) return checked;
+      }
+      return { ok: true, value: null };
+    }
+    if (typeof candidate === "object") {
+      for (const [key, child] of Object.entries(candidate)) {
+        const checkedKey = validate(key, depth + 1, `${field}.${key}`);
+        if (!checkedKey.ok) return checkedKey;
+        const checked = validate(child, depth + 1, `${field}.${key}`);
+        if (!checked.ok) return checked;
+      }
+    }
+    return { ok: true, value: null };
+  };
+  const checked = validate(parsed, 0, option);
+  return checked.ok ? { ok: true, value: parsed } : checked;
 }
 
 function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): DomainResult<ParsedOptions> {
@@ -608,7 +685,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       name === "--all" ||
       name === "--history" ||
       name === "--patch" ||
-      name === "--preview" ||
+      (name === "--preview" && !allowed.has("--token")) ||
       name === "--summary" ||
       name === "--unresolved" ||
       name === "--confirm"
@@ -640,18 +717,14 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     if (name === "--session") options.session_id = value;
     else if (name === "--action") options.action_id = value;
     else if (name === "--operation-id") options.operation_id = value;
-    else if (name === "--token" || name === "--preview") {
-      try {
-        const parsed = JSON.parse(value) as unknown;
-        if (name === "--token") options.action_token = parsed as SessionActionToken;
-        else options.action_preview = parsed;
-      } catch (error: unknown) {
-        return failure(
-          usageError("INVALID_ARGUMENT", `${name} requires valid JSON.`, {
-            option: name,
-            reason: error instanceof Error ? error.message : "invalid JSON",
-          }),
-        );
+    else if (name === "--token" || (name === "--preview" && allowed.has("--token"))) {
+      const parsed = boundedJsonInput(value, name);
+      if (!parsed.ok) return parsed;
+      if (name === "--token") options.action_token = parsed.value as SessionActionToken;
+      else {
+        const preview = parseSessionDiscardPreview(parsed.value);
+        if (!preview.ok) return preview;
+        options.action_preview = preview.value;
       }
     } else if (name === "--runtime-policy") {
       if (options.runtime_policy !== null) {
@@ -1585,10 +1658,64 @@ async function executeProtectedSessionCommand(
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
-    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout" | "sandboxRuntimeProjection">,
+    Pick<
+      CliDependencies,
+      | "sandboxRunner"
+      | "sandboxProbe"
+      | "sandboxRuntimeLayout"
+      | "sandboxRuntimeProjection"
+      | "repositoryTerminal"
+      | "io"
+    > & { readonly json: boolean },
 ): Promise<DomainResult<JsonObject>> {
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
+
+  if (command === "ui") {
+    const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
+    if (!parsed.ok) return parsed;
+    if (dependencies.backend.repositoryRuntimeSnapshot === undefined) {
+      return failure(
+        new DomainError("BACKEND_UNAVAILABLE", "Repository runtime snapshot capability is not available.", {
+          operation: "repository.ui",
+        }),
+      );
+    }
+    const callbackOutput = (writer: (line: string) => void): RepositoryTerminalOutput =>
+      ({
+        isTTY: false,
+        write(value: string): boolean {
+          writer(value);
+          return true;
+        },
+      }) as unknown as RepositoryTerminalOutput;
+    const terminal =
+      dependencies.repositoryTerminal ??
+      ({
+        stdin: process.stdin as unknown as RepositoryTerminalInput,
+        stdout:
+          dependencies.io === undefined
+            ? (process.stdout as unknown as RepositoryTerminalOutput)
+            : callbackOutput(dependencies.io.stdout),
+        stderr:
+          dependencies.io === undefined
+            ? (process.stderr as unknown as RepositoryTerminalOutput)
+            : callbackOutput(dependencies.io.stderr),
+      } as const);
+    const terminalResult = await runRepositoryTerminal({
+      ...terminal,
+      json: dependencies.json,
+      ...(dependencies.backend.sessionActions === undefined
+        ? {}
+        : { sessionActions: dependencies.backend.sessionActions(context) }),
+      readSnapshot: async () => {
+        const model = await repositoryRuntimeUiModel({ backend: dependencies.backend, cwd: dependencies.cwd });
+        if (!model.ok) throw model.error;
+        return model.value;
+      },
+    });
+    return { ok: true, value: terminalResult as unknown as JsonObject };
+  }
 
   if (command === "session" && subcommand === "action") {
     const parsed = parseOptions(rest, dispatcherAllowedOptions("session action"));
@@ -1629,11 +1756,13 @@ async function executeCommand(
       repository: session.value.repository,
       worktree: session.value.worktree,
     };
-    const confirmation: SessionActionConfirmation = {
-      confirmed: parsed.value.confirm,
-      ...(parsed.value.operation_id === null ? {} : { operation_id: parsed.value.operation_id }),
-      ...(parsed.value.action_preview === null ? {} : { preview: parsed.value.action_preview as never }),
-    };
+    const confirmation: SessionActionConfirmation = parsed.value.confirm
+      ? {
+          confirmed: true,
+          ...(parsed.value.operation_id === null ? {} : { operation_id: parsed.value.operation_id }),
+          ...(parsed.value.action_preview === null ? {} : { preview: parsed.value.action_preview }),
+        }
+      : { confirmed: false };
     const result = await dependencies.backend
       .sessionActions(context)
       .dispatchSessionAction(
@@ -2523,6 +2652,9 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     const result = await executeCommand(parsed.value.commandArguments, {
       backend,
       cwd,
+      io,
+      json: mode === "json",
+      repositoryTerminal: dependencies.repositoryTerminal,
       sandboxRunner: dependencies.sandboxRunner,
       sandboxProbe: dependencies.sandboxProbe,
       sandboxRuntimeLayout: runtimeLayout,
@@ -2535,7 +2667,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     const childExitCode = result.value.exit_code;
     const childSignal = result.value.signal;
     const interactive = command === "session shell";
-    if (!interactive) io.stdout(renderSuccess(mode, command, result.value));
+    if (!interactive && command !== "ui") io.stdout(renderSuccess(mode, command, result.value));
     if (
       (command === "session run" || command === "session exec" || interactive) &&
       (childSignal !== null || (typeof childExitCode === "number" && childExitCode !== 0))
@@ -2563,5 +2695,5 @@ export async function repositoryRuntimeUiModel(
     );
   }
   const snapshot = await dependencies.backend.repositoryRuntimeSnapshot(sessionContext(dependencies.cwd));
-  return snapshot.ok ? { ok: true, value: repositoryScreenModelFromRuntimeSnapshot(snapshot.value) } : snapshot;
+  return snapshot.ok ? repositoryScreenModelFromRuntimeSnapshot(snapshot.value) : snapshot;
 }

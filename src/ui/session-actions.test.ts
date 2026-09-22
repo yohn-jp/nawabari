@@ -11,7 +11,7 @@ import type {
   SessionLifecycleAction,
   SessionRecord,
 } from "../domain/session.js";
-import { createSessionActions, type SessionActionIdentity } from "./session-actions.js";
+import { createSessionActions, parseSessionDiscardPreview, type SessionActionIdentity } from "./session-actions.js";
 
 const context: SessionContext = { cwd: "/repo" };
 
@@ -107,6 +107,12 @@ function discardPreviewForHead(record: SessionRecord, head: string): SessionDisc
     branch_head: head,
     expected_head: head,
   };
+}
+
+function nestedJsonObject(depth: number): Record<string, unknown> {
+  let value: Record<string, unknown> = {};
+  for (let index = 0; index < depth; index += 1) value = { nested: value };
+  return value;
 }
 
 function discardResultFor(record: SessionRecord): SessionDiscardResult {
@@ -358,4 +364,68 @@ test("unknown action IDs never become shell commands or backend mutations", asyn
   if (!result.ok) assert.equal(result.error.code, "OPERATION_REJECTED");
   assert.deepEqual(calls.close, []);
   assert.deepEqual(calls.discard, []);
+});
+
+test("discard preview parser preserves the declared shape and rejects forged discriminants", () => {
+  const record = session("one");
+  const parsed = parseSessionDiscardPreview(discardPreviewFor(record));
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.operation, "discard-preview");
+  assert.equal(parsed.value.destructive, true);
+
+  const forged = parseSessionDiscardPreview({ ...discardPreviewFor(record), destructive: false });
+  assert.equal(forged.ok, false);
+  if (!forged.ok) assert.equal(forged.error.code, "INVALID_ARGUMENT");
+
+  const forgedEvidence = parseSessionDiscardPreview({
+    ...discardPreviewFor(record),
+    recoverable_commits: {
+      ...discardPreviewFor(record).recoverable_commits,
+      evidence: [{ code: "NOT_AN_ERROR_CODE", message: "forged", details: {} }],
+    },
+  });
+  assert.equal(forgedEvidence.ok, false);
+  if (!forgedEvidence.ok) assert.equal(forgedEvidence.error.code, "INVALID_ARGUMENT");
+});
+
+test("discard preview parser preserves empty strings allowed by the declared JSON shape", () => {
+  const record = session("one");
+  const preview = discardPreviewFor(record);
+  const parsed = parseSessionDiscardPreview({
+    ...preview,
+    warning: "",
+    recoverable_commits: {
+      ...preview.recoverable_commits,
+      evidence: [{ code: "GIT_COMMAND_FAILED", message: "", details: { "": "" } }],
+    },
+  });
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.warning, "");
+  assert.equal(parsed.value.recoverable_commits.evidence[0]?.message, "");
+  assert.deepEqual(parsed.value.recoverable_commits.evidence[0]?.details, { "": "" });
+});
+
+test("discard preview parser bounds recursively nested evidence details", () => {
+  const record = session("one");
+  const preview = discardPreviewFor(record);
+  const withinBound = parseSessionDiscardPreview({
+    ...preview,
+    recoverable_commits: {
+      ...preview.recoverable_commits,
+      evidence: [{ code: "GIT_COMMAND_FAILED", message: "", details: nestedJsonObject(32) }],
+    },
+  });
+  assert.equal(withinBound.ok, true);
+
+  const beyondBound = parseSessionDiscardPreview({
+    ...preview,
+    recoverable_commits: {
+      ...preview.recoverable_commits,
+      evidence: [{ code: "GIT_COMMAND_FAILED", message: "", details: nestedJsonObject(33) }],
+    },
+  });
+  assert.equal(beyondBound.ok, false);
+  if (!beyondBound.ok) assert.equal(beyondBound.error.code, "INVALID_ARGUMENT");
 });

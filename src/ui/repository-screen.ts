@@ -30,6 +30,8 @@ export type RepositoryScreenModel = ScreenRecord & {
   readonly lifecycle?: unknown;
   readonly truncated?: unknown;
   readonly next_cursor?: unknown;
+  /** Producer failures/unavailable observations remain explicit to callers. */
+  readonly unavailable_sections?: unknown;
 };
 
 export type RepositoryScreenViewport = {
@@ -174,6 +176,15 @@ function sectionRows(value: unknown): readonly ScreenRecord[] {
   return record === null ? [] : [record];
 }
 
+function unavailableReason(model: RepositoryScreenModel, view: RepositoryScreenView): string | null {
+  const sections = asRecord(model.unavailable_sections);
+  if (sections === null) return null;
+  const entry = asRecord(sections[view]);
+  if (entry === null) return null;
+  const reason = scalar(recordValue(entry, ["reason", "message", "detail"]));
+  return reason === null || reason.length === 0 ? "producer evidence is unavailable" : reason;
+}
+
 function rowText(record: ScreenRecord, view: RepositoryScreenView, index: number): string {
   const id = escapeTerminalText(stableId(record, `${view}-${index + 1}`));
   if (view === "sessions") {
@@ -262,7 +273,8 @@ function renderSection(
   const rows = rowsForView(model, view);
   const lines = [`${view.toUpperCase()}:`];
   if (rows.length === 0) {
-    lines.push("  unavailable");
+    const reason = unavailableReason(model, view);
+    lines.push(reason === null ? "  unavailable" : `  unavailable: ${escapeTerminalText(reason)}`);
     return lines;
   }
   const limit = Math.min(rows.length, MAX_ROWS_PER_SECTION);
