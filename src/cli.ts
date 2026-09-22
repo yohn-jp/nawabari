@@ -51,7 +51,8 @@ import {
   STRICT_RUNTIME_POLICY,
   type RuntimePolicyMode,
 } from "./domain/runtime-projection.js";
-import { enterSessionConsole, listSessionProcesses } from "./domain/session-console.js";
+import { enterProtectedSession } from "./domain/session-protected-launch.js";
+import { listSessionProcesses } from "./domain/session-console.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -1577,7 +1578,7 @@ async function executeCommand(
       if (parsed.value.session_id === null || dependencies.backend.persistSessionExecution === undefined) {
         return failure(usageError("MISSING_ARGUMENT", "session enter requires --session and execution persistence."));
       }
-      const result = await enterSessionConsole(context, dependencies.backend, {
+      const result = await enterProtectedSession(context, dependencies.backend, {
         session_id: parsed.value.session_id,
         ...(parsed.value.runtime_policy === null ? {} : { runtime_policy: parsed.value.runtime_policy }),
         ...(dependencies.sandboxProbe === undefined ? {} : { sandbox_probe: dependencies.sandboxProbe }),
