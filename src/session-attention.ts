@@ -97,7 +97,9 @@ interface AttentionObservationIndex {
 }
 
 /** Project bounded operator attention from the canonical snapshot facts. */
-export function projectSessionAttention(snapshot: RepositoryRuntimeSnapshot): DomainResult<readonly SessionAttention[]> {
+export function projectSessionAttention(
+  snapshot: RepositoryRuntimeSnapshot,
+): DomainResult<readonly SessionAttention[]> {
   const parsed = parseObservationIndex(snapshot);
   if (!parsed.ok) return parsed;
   const evidence_revision = String(snapshot.registry.revision);
@@ -110,76 +112,87 @@ export function projectSessionAttention(snapshot: RepositoryRuntimeSnapshot): Do
     const blocker = row.blockers[0];
     const sessions = affectedSessions(row, blocker);
     for (const session_id of sessions) {
-      attention.push(createAttention({
-        code,
-        severity,
-        session_id,
-        owner_session_id: blocker?.session_id ?? null,
-        resource: row.resource,
-        reason: blocker?.reason ?? coordinationReason(row, code),
-        evidence_revision,
-      }));
+      attention.push(
+        createAttention({
+          code,
+          severity,
+          session_id,
+          owner_session_id: blocker?.session_id ?? null,
+          resource: row.resource,
+          reason: blocker?.reason ?? coordinationReason(row, code),
+          evidence_revision,
+        }),
+      );
     }
   }
 
   for (const profile of parsed.value.profiles) {
     if (profile.status === "drift") {
-      attention.push(createAttention({
-        code: "profile-drift",
-        severity: "info",
-        session_id: profile.session_id,
-        owner_session_id: null,
-        resource: "",
-        reason: profile.reason ?? "profile drift",
-        evidence_revision,
-      }));
+      attention.push(
+        createAttention({
+          code: "profile-drift",
+          severity: "info",
+          session_id: profile.session_id,
+          owner_session_id: null,
+          resource: "",
+          reason: profile.reason ?? "profile drift",
+          evidence_revision,
+        }),
+      );
     }
   }
 
   for (const process of parsed.value.processes) {
     if (process.status === "unknown") {
-      attention.push(createAttention({
-        code: "process-unknown",
-        severity: "warning",
-        session_id: process.session_id,
-        owner_session_id: null,
-        resource: "",
-        reason: process.reason ?? "process status is unknown",
-        evidence_revision,
-      }));
+      attention.push(
+        createAttention({
+          code: "process-unknown",
+          severity: "warning",
+          session_id: process.session_id,
+          owner_session_id: null,
+          resource: "",
+          reason: process.reason ?? "process status is unknown",
+          evidence_revision,
+        }),
+      );
     }
   }
 
   for (const filesystem of parsed.value.filesystem) {
     if (filesystem.status === "violation") {
-      attention.push(createAttention({
-        code: "policy-violation",
-        severity: "error",
-        session_id: filesystem.session_id,
-        owner_session_id: null,
-        resource: "",
-        reason: filesystem.reason ?? "filesystem policy violation",
-        evidence_revision,
-      }));
+      attention.push(
+        createAttention({
+          code: "policy-violation",
+          severity: "error",
+          session_id: filesystem.session_id,
+          owner_session_id: null,
+          resource: "",
+          reason: filesystem.reason ?? "filesystem policy violation",
+          evidence_revision,
+        }),
+      );
     }
   }
 
   for (const lifecycle of parsed.value.lifecycle) {
-    const code = lifecycle.state === "unmanaged" || lifecycle.physical_state === "unmanaged"
-      ? "unmanaged-worktree"
-      : lifecycle.state === "stale-inconsistent" || lifecycle.state === "blocked-recoverable"
-        ? "runtime-drift"
-        : null;
+    const code =
+      lifecycle.state === "unmanaged" || lifecycle.physical_state === "unmanaged"
+        ? "unmanaged-worktree"
+        : lifecycle.state === "stale-inconsistent" || lifecycle.state === "blocked-recoverable"
+          ? "runtime-drift"
+          : null;
     if (code === null) continue;
-    attention.push(createAttention({
-      code,
-      severity: "warning",
-      session_id: lifecycle.session_id,
-      owner_session_id: null,
-      resource: "",
-      reason: lifecycle.reason ?? lifecycle.state,
-      evidence_revision,
-    }));
+    attention.push(
+      createAttention({
+        code,
+        severity: "warning",
+        session_id: lifecycle.session_id,
+        owner_session_id: null,
+        resource: "",
+        reason: lifecycle.reason ?? lifecycle.state,
+        evidence_revision,
+      }),
+    );
   }
 
   const byIdentity = new Map<string, SessionAttention>();
@@ -206,7 +219,9 @@ export function projectAgentRuntimeStatus(
   const parsed = parseObservationIndex(snapshot);
   if (!parsed.ok) return parsed;
   if (!snapshot.sessions.some((session) => session.sessionId === sessionId)) {
-    return failure(new DomainError("SESSION_NOT_FOUND", `Session '${sessionId}' was not found.`, { session_id: sessionId }));
+    return failure(
+      new DomainError("SESSION_NOT_FOUND", `Session '${sessionId}' was not found.`, { session_id: sessionId }),
+    );
   }
   const attention = projectSessionAttention(snapshot);
   if (!attention.ok) return attention;
@@ -220,24 +235,27 @@ export function projectAgentRuntimeStatus(
     ? encodeStatusCursor(snapshot.registry.revision, ownAttention[Math.max(0, budget - 1)]?.resource ?? "")
     : null;
 
-  return success(Object.freeze({
-    session_id: sessionId,
-    lifecycle_state: lifecycle?.state ?? null,
-    physical_state: lifecycle?.physical_state ?? null,
-    profile_status: profile?.status ?? "unknown",
-    runtime_status: lifecycle?.state ?? "unknown",
-    process_status: process?.status ?? "unknown",
-    blocker: blocker === undefined
-      ? null
-      : Object.freeze({
-          code: blocker.code,
-          owner_session_id: blocker.owner_session_id,
-          resource: blocker.resource,
-          reason: blocker.reason,
-        }),
-    truncated,
-    cursor,
-  }));
+  return success(
+    Object.freeze({
+      session_id: sessionId,
+      lifecycle_state: lifecycle?.state ?? null,
+      physical_state: lifecycle?.physical_state ?? null,
+      profile_status: profile?.status ?? "unknown",
+      runtime_status: lifecycle?.state ?? "unknown",
+      process_status: process?.status ?? "unknown",
+      blocker:
+        blocker === undefined
+          ? null
+          : Object.freeze({
+              code: blocker.code,
+              owner_session_id: blocker.owner_session_id,
+              resource: blocker.resource,
+              reason: blocker.reason,
+            }),
+      truncated,
+      cursor,
+    }),
+  );
 }
 
 function parseObservationIndex(snapshot: RepositoryRuntimeSnapshot): DomainResult<AttentionObservationIndex> {
@@ -252,20 +270,25 @@ function parseObservationIndex(snapshot: RepositoryRuntimeSnapshot): DomainResul
   if (!filesystem.ok) return filesystem;
   const lifecycle = parseLifecycle(snapshot.observations.lifecycle);
   if (!lifecycle.ok) return lifecycle;
-  return success(Object.freeze({
-    coordination,
-    profiles: profiles.value,
-    processes: processes.value,
-    filesystem: filesystem.value,
-    lifecycle: lifecycle.value,
-  }));
+  return success(
+    Object.freeze({
+      coordination,
+      profiles: profiles.value,
+      processes: processes.value,
+      filesystem: filesystem.value,
+      lifecycle: lifecycle.value,
+    }),
+  );
 }
 
-function parseProfiles(observation: RepositoryRuntimeObservation<JsonValue>): DomainResult<readonly ProfileObservation[]> {
+function parseProfiles(
+  observation: RepositoryRuntimeObservation<JsonValue>,
+): DomainResult<readonly ProfileObservation[]> {
   if (observation.status === "unknown") return success(Object.freeze([]));
   const root = exactObject(observation.value, ["contract_id", "schema_version", "sessions"], "profiles");
   if (!root.ok) return root;
-  if (root.value.contract_id !== "nawabari.repository-profile-observation.v1") return invalid("profiles.contract_id", "expected the v1 profile contract");
+  if (root.value.contract_id !== "nawabari.repository-profile-observation.v1")
+    return invalid("profiles.contract_id", "expected the v1 profile contract");
   if (root.value.schema_version !== 1) return invalid("profiles.schema_version", "expected schema version 1");
   return parseSessionArray(root.value.sessions, "profiles", (item, field) => {
     const object = exactObject(item, ["session_id", "status", "profile_id", "reason"], field);
@@ -278,15 +301,25 @@ function parseProfiles(observation: RepositoryRuntimeObservation<JsonValue>): Do
     if (!profile_id.ok) return profile_id;
     const reason = nullableString(object.value.reason, `${field}.reason`);
     if (!reason.ok) return reason;
-    return success(Object.freeze({ session_id: session_id.value, status: status.value, profile_id: profile_id.value, reason: reason.value }));
+    return success(
+      Object.freeze({
+        session_id: session_id.value,
+        status: status.value,
+        profile_id: profile_id.value,
+        reason: reason.value,
+      }),
+    );
   });
 }
 
-function parseProcesses(observation: RepositoryRuntimeObservation<JsonValue>): DomainResult<readonly ProcessObservation[]> {
+function parseProcesses(
+  observation: RepositoryRuntimeObservation<JsonValue>,
+): DomainResult<readonly ProcessObservation[]> {
   if (observation.status === "unknown") return success(Object.freeze([]));
   const root = exactObject(observation.value, ["contract_id", "schema_version", "sessions"], "processes");
   if (!root.ok) return root;
-  if (root.value.contract_id !== "nawabari.repository-process-observation.v1") return invalid("processes.contract_id", "expected the v1 process contract");
+  if (root.value.contract_id !== "nawabari.repository-process-observation.v1")
+    return invalid("processes.contract_id", "expected the v1 process contract");
   if (root.value.schema_version !== 1) return invalid("processes.schema_version", "expected schema version 1");
   return parseSessionArray(root.value.sessions, "processes", (item, field) => {
     const object = exactObject(item, ["session_id", "status", "reason"], field);
@@ -301,11 +334,14 @@ function parseProcesses(observation: RepositoryRuntimeObservation<JsonValue>): D
   });
 }
 
-function parseFilesystem(observation: RepositoryRuntimeObservation<JsonValue>): DomainResult<readonly FilesystemObservation[]> {
+function parseFilesystem(
+  observation: RepositoryRuntimeObservation<JsonValue>,
+): DomainResult<readonly FilesystemObservation[]> {
   if (observation.status === "unknown") return success(Object.freeze([]));
   const root = exactObject(observation.value, ["contract_id", "schema_version", "sessions"], "filesystem");
   if (!root.ok) return root;
-  if (root.value.contract_id !== "nawabari.repository-filesystem-observation.v1") return invalid("filesystem.contract_id", "expected the v1 filesystem contract");
+  if (root.value.contract_id !== "nawabari.repository-filesystem-observation.v1")
+    return invalid("filesystem.contract_id", "expected the v1 filesystem contract");
   if (root.value.schema_version !== 1) return invalid("filesystem.schema_version", "expected schema version 1");
   return parseSessionArray(root.value.sessions, "filesystem", (item, field) => {
     const object = exactObject(item, ["session_id", "status", "reason"], field);
@@ -320,11 +356,14 @@ function parseFilesystem(observation: RepositoryRuntimeObservation<JsonValue>): 
   });
 }
 
-function parseLifecycle(observation: RepositoryRuntimeObservation<JsonValue>): DomainResult<readonly LifecycleObservation[]> {
+function parseLifecycle(
+  observation: RepositoryRuntimeObservation<JsonValue>,
+): DomainResult<readonly LifecycleObservation[]> {
   if (observation.status === "unknown") return success(Object.freeze([]));
   const root = exactObject(observation.value, ["contract_id", "schema_version", "sessions"], "lifecycle");
   if (!root.ok) return root;
-  if (root.value.contract_id !== "nawabari.repository-lifecycle-observation.v1") return invalid("lifecycle.contract_id", "expected the v1 lifecycle contract");
+  if (root.value.contract_id !== "nawabari.repository-lifecycle-observation.v1")
+    return invalid("lifecycle.contract_id", "expected the v1 lifecycle contract");
   if (root.value.schema_version !== 1) return invalid("lifecycle.schema_version", "expected schema version 1");
   return parseSessionArray(root.value.sessions, "lifecycle", (item, field) => {
     const object = exactObject(item, ["session_id", "state", "physical_state", "reason"], field);
@@ -337,14 +376,21 @@ function parseLifecycle(observation: RepositoryRuntimeObservation<JsonValue>): D
     if (!physical_state.ok) return physical_state;
     const reason = nullableString(object.value.reason, `${field}.reason`);
     if (!reason.ok) return reason;
-    return success(Object.freeze({ session_id: session_id.value, state: state.value, physical_state: physical_state.value, reason: reason.value }));
+    return success(
+      Object.freeze({
+        session_id: session_id.value,
+        state: state.value,
+        physical_state: physical_state.value,
+        reason: reason.value,
+      }),
+    );
   });
 }
 
 function parseSessionArray<T>(
-  value: JsonValue,
+  value: unknown,
   name: string,
-  parser: (value: JsonValue, field: string) => DomainResult<T>,
+  parser: (value: unknown, field: string) => DomainResult<T>,
 ): DomainResult<readonly T[]> {
   if (!Array.isArray(value)) return invalid(`${name}.sessions`, "expected an array");
   if (value.length > MAX_SESSION_OBSERVATIONS) return invalid(`${name}.sessions`, "at most 1024 sessions are allowed");
@@ -358,7 +404,9 @@ function parseSessionArray<T>(
     seen.add(sessionId);
     entries.push(parsed.value);
   }
-  entries.sort((left, right) => compare((left as { session_id: string }).session_id, (right as { session_id: string }).session_id));
+  entries.sort((left, right) =>
+    compare((left as { session_id: string }).session_id, (right as { session_id: string }).session_id),
+  );
   return success(Object.freeze(entries));
 }
 
@@ -370,7 +418,10 @@ function coordinationCode(row: FileSessionMatrixRow): SessionAttentionCode | nul
   return null;
 }
 
-function affectedSessions(row: FileSessionMatrixRow, blocker: ResourceCoordinationBlocker | undefined): readonly string[] {
+function affectedSessions(
+  row: FileSessionMatrixRow,
+  blocker: ResourceCoordinationBlocker | undefined,
+): readonly string[] {
   const blockedSession = blocker?.session_id;
   if (blockedSession !== undefined && blockedSession !== null) return [blockedSession];
   const sessions = row.participants.map((participant) => participant.session_id);
@@ -378,7 +429,8 @@ function affectedSessions(row: FileSessionMatrixRow, blocker: ResourceCoordinati
 }
 
 function coordinationReason(row: FileSessionMatrixRow, code: SessionAttentionCode): string {
-  if (code === "coordination-blocked") return row.permission === "blocked" ? "coordination permission is blocked" : "coordination has blockers";
+  if (code === "coordination-blocked")
+    return row.permission === "blocked" ? "coordination permission is blocked" : "coordination has blockers";
   if (row.permission === "unresolved") return "coordination permission is unresolved";
   if (row.conflict === "unknown") return "coordination conflict is unknown";
   return "coordination mergeability is unknown";
@@ -422,8 +474,13 @@ function nullableString(value: unknown, field: string): DomainResult<string | nu
   return boundedString(value, field);
 }
 
-function enumValue<const T extends readonly string[]>(value: unknown, values: T, field: string): DomainResult<T[number]> {
-  if (typeof value !== "string" || !(values as readonly string[]).includes(value)) return invalid(field, "contains an unsupported value");
+function enumValue<const T extends readonly string[]>(
+  value: unknown,
+  values: T,
+  field: string,
+): DomainResult<T[number]> {
+  if (typeof value !== "string" || !(values as readonly string[]).includes(value))
+    return invalid(field, "contains an unsupported value");
   return success(value as T[number]);
 }
 
@@ -432,7 +489,11 @@ function compare(left: string, right: string): number {
 }
 
 function invalid(field: string, reason: string): DomainResult<never> {
-  return failure(new DomainError("INVALID_ARGUMENT", `Repository runtime observation field '${field}' is invalid: ${reason}.`, { field }));
+  return failure(
+    new DomainError("INVALID_ARGUMENT", `Repository runtime observation field '${field}' is invalid: ${reason}.`, {
+      field,
+    }),
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

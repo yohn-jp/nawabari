@@ -4,28 +4,37 @@ import { test } from "node:test";
 import {
   getNawabariRepositoryRuntimeSnapshot,
   type RepositoryRuntimeSnapshotInput,
+  type RepositoryRuntimeSnapshot,
 } from "./repository-runtime-snapshot.js";
-import {
-  projectFileSessionMatrix,
-} from "./resource-coordination-view.js";
+import { projectFileSessionMatrix } from "./resource-coordination-view.js";
 import type { RepositoryRegistryView, SessionRecord } from "./session-registry.js";
 
 const TIMESTAMP = "2026-01-02T03:04:05.006Z";
 
 test("projects an A-write/B-read coordination row from the canonical observation", () => {
-  const result = projectFileSessionMatrix(snapshot({
-    rows: [row("src/a.ts", [participant("session-a", "write", "modified"), participant("session-b", "read", "none")])],
-  }), {});
+  const result = projectFileSessionMatrix(
+    snapshot({
+      rows: [
+        row("src/a.ts", [participant("session-a", "write", "modified"), participant("session-b", "read", "none")]),
+      ],
+    }),
+    {},
+  );
   assert.equal(result.ok, true);
   if (!result.ok || result.value.status !== "available") return;
   assert.equal(result.value.rows[0]?.row_kind, "observed-path");
-  assert.deepEqual(result.value.rows[0]?.participants.map((item) => item.session_id), ["session-a", "session-b"]);
+  assert.deepEqual(
+    result.value.rows[0]?.participants.map((item) => item.session_id),
+    ["session-a", "session-b"],
+  );
 });
 
 test("keeps blocked and unresolved facts from the coordination producer", () => {
-  const result = projectFileSessionMatrix(snapshot({
-    rows: [row("src/b.ts", [participant("session-a", "write", "none")], { permission: "blocked" })],
-  }));
+  const result = projectFileSessionMatrix(
+    snapshot({
+      rows: [row("src/b.ts", [participant("session-a", "write", "none")], { permission: "blocked" })],
+    }),
+  );
   assert.equal(result.ok, true);
   if (!result.ok || result.value.status !== "available") return;
   assert.equal(result.value.rows[0]?.permission, "blocked");
@@ -50,12 +59,18 @@ test("uses deterministic pagination and rejects a cursor from another registry r
   const first = projectFileSessionMatrix(input, { limit: 2 });
   assert.equal(first.ok, true);
   if (!first.ok || first.value.status !== "available" || first.value.cursor === null) return;
-  assert.deepEqual(first.value.rows.map((item) => item.resource), ["a", "b"]);
+  assert.deepEqual(
+    first.value.rows.map((item) => item.resource),
+    ["a", "b"],
+  );
 
   const second = projectFileSessionMatrix(input, { cursor: first.value.cursor, limit: 2 });
   assert.equal(second.ok, true);
   if (!second.ok || second.value.status !== "available") return;
-  assert.deepEqual(second.value.rows.map((item) => item.resource), ["c"]);
+  assert.deepEqual(
+    second.value.rows.map((item) => item.resource),
+    ["c"],
+  );
 
   const changed = snapshot({ rows: [row("a", []), row("b", []), row("c", [])], revision: 8 });
   const stale = projectFileSessionMatrix(changed, { cursor: first.value.cursor });
@@ -65,7 +80,7 @@ test("uses deterministic pagination and rejects a cursor from another registry r
 });
 
 test("rejects malformed available coordination data instead of downgrading it", () => {
-  const result = projectFileSessionMatrix(snapshot({ rows: [{ resource: "a" }] } as never));
+  const result = projectFileSessionMatrix(snapshot({ rows: [{ resource: "a" }] }));
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.error.code, "INVALID_ARGUMENT");
@@ -74,7 +89,7 @@ test("rejects malformed available coordination data instead of downgrading it", 
 function snapshot(options: {
   readonly rows: readonly Record<string, unknown>[];
   readonly revision?: number;
-}): ReturnType<typeof getNawabariRepositoryRuntimeSnapshot> extends { ok: true; value: infer T } ? T : never {
+}): RepositoryRuntimeSnapshot {
   const result = getNawabariRepositoryRuntimeSnapshot({
     registry: registry(options.revision ?? 7),
     captured_at: TIMESTAMP,
@@ -87,20 +102,24 @@ function snapshot(options: {
         rows: options.rows,
       },
     },
-  } as RepositoryRuntimeSnapshotInput);
+  } as unknown as RepositoryRuntimeSnapshotInput);
   assert.equal(result.ok, true);
-  if (!result.ok) throw result.error;
-  return result.value;
+  if (result.ok) return result.value;
+  throw new Error("fixture snapshot projection failed");
 }
 
-function snapshotWithoutCoordination() {
+function snapshotWithoutCoordination(): RepositoryRuntimeSnapshot {
   const result = getNawabariRepositoryRuntimeSnapshot({ registry: registry(), captured_at: TIMESTAMP });
   assert.equal(result.ok, true);
-  if (!result.ok) throw result.error;
-  return result.value;
+  if (result.ok) return result.value;
+  throw new Error("fixture snapshot projection failed");
 }
 
-function row(resource: string, participants: readonly Record<string, unknown>[], overrides: Record<string, unknown> = {}) {
+function row(
+  resource: string,
+  participants: readonly Record<string, unknown>[],
+  overrides: Record<string, unknown> = {},
+) {
   return {
     resource,
     participants,
@@ -128,7 +147,7 @@ function participant(session_id: string, mode: string, observed_change: string) 
   };
 }
 
-function registry(revision: number): RepositoryRegistryView {
+function registry(revision = 7): RepositoryRegistryView {
   return {
     repositoryId: "repo-1",
     registrySchemaVersion: 2,

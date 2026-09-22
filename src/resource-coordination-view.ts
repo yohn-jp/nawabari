@@ -2,8 +2,7 @@ import { DomainError, failure, success, type DomainResult, type JsonValue } from
 import type { RepositoryRuntimeSnapshot } from "./repository-runtime-snapshot.js";
 import { compareCodePointStrings } from "./resource-claims.js";
 
-export const RESOURCE_COORDINATION_OBSERVATION_CONTRACT_ID =
-  "nawabari.repository-coordination-observation.v1" as const;
+export const RESOURCE_COORDINATION_OBSERVATION_CONTRACT_ID = "nawabari.repository-coordination-observation.v1" as const;
 export const RESOURCE_COORDINATION_OBSERVATION_SCHEMA_VERSION = 1 as const;
 
 const MAX_TEXT_CODE_POINTS = 4_096;
@@ -120,12 +119,13 @@ export function projectFileSessionMatrix(
   const start = firstIndex < 0 ? rows.length : firstIndex;
   const page = rows.slice(start, start + parsedFilter.value.limit);
   const truncated = start + page.length < rows.length;
-  const nextCursor = truncated === false || page.length === 0
-    ? null
-    : encodeCursor({
-        snapshot_registry_revision: snapshot.registry.revision,
-        last_resource: page.at(-1)!.resource,
-      });
+  const nextCursor =
+    truncated === false || page.length === 0
+      ? null
+      : encodeCursor({
+          snapshot_registry_revision: snapshot.registry.revision,
+          last_resource: page.at(-1)!.resource,
+        });
 
   return success(
     Object.freeze({
@@ -166,7 +166,7 @@ function parseCoordinationValue(value: JsonValue): DomainResult<CoordinationObse
   return success(Object.freeze({ rows: Object.freeze(rows) }));
 }
 
-function parseRow(value: JsonValue, index: number): DomainResult<FileSessionMatrixRow> {
+function parseRow(value: unknown, index: number): DomainResult<FileSessionMatrixRow> {
   const field = `coordination.rows[${index}]`;
   const object = exactObject(
     value,
@@ -188,13 +188,29 @@ function parseRow(value: JsonValue, index: number): DomainResult<FileSessionMatr
   if (!resource.ok) return resource;
   const participants = parseParticipants(object.value.participants, `${field}.participants`);
   if (!participants.ok) return participants;
-  const permission = enumValue(object.value.permission, ["allowed", "blocked", "unresolved"] as const, `${field}.permission`);
+  const permission = enumValue(
+    object.value.permission,
+    ["allowed", "blocked", "unresolved"] as const,
+    `${field}.permission`,
+  );
   if (!permission.ok) return permission;
-  const conflict = enumValue(object.value.conflict, ["none", "read-write", "write-write", "exclusive", "unknown"] as const, `${field}.conflict`);
+  const conflict = enumValue(
+    object.value.conflict,
+    ["none", "read-write", "write-write", "exclusive", "unknown"] as const,
+    `${field}.conflict`,
+  );
   if (!conflict.ok) return conflict;
-  const physical = enumValue(object.value.physical_modification, ["none", "observed", "unknown"] as const, `${field}.physical_modification`);
+  const physical = enumValue(
+    object.value.physical_modification,
+    ["none", "observed", "unknown"] as const,
+    `${field}.physical_modification`,
+  );
   if (!physical.ok) return physical;
-  const mergeability = enumValue(object.value.mergeability, ["clean", "conflict", "not-applicable", "unknown"] as const, `${field}.mergeability`);
+  const mergeability = enumValue(
+    object.value.mergeability,
+    ["clean", "conflict", "not-applicable", "unknown"] as const,
+    `${field}.mergeability`,
+  );
   if (!mergeability.ok) return mergeability;
   const classification = boundedString(object.value.classification, `${field}.classification`);
   if (!classification.ok) return classification;
@@ -202,10 +218,15 @@ function parseRow(value: JsonValue, index: number): DomainResult<FileSessionMatr
   if (!blockers.ok) return blockers;
   const actions = parseActions(object.value.next_actions, `${field}.next_actions`);
   if (!actions.ok) return actions;
-  const rowKind = resource.value.includes("*") || resource.value.includes("?") || resource.value.includes("[") ||
-    participants.value.every((participant) => !["modified", "added", "deleted", "renamed"].includes(participant.observed_change))
-    ? "declared-selector"
-    : "observed-path";
+  const rowKind =
+    resource.value.includes("*") ||
+    resource.value.includes("?") ||
+    resource.value.includes("[") ||
+    participants.value.every(
+      (participant) => !["modified", "added", "deleted", "renamed"].includes(participant.observed_change),
+    )
+      ? "declared-selector"
+      : "observed-path";
   return success(
     Object.freeze({
       resource: resource.value,
@@ -222,13 +243,17 @@ function parseRow(value: JsonValue, index: number): DomainResult<FileSessionMatr
   );
 }
 
-function parseParticipants(value: JsonValue, field: string): DomainResult<readonly ResourceCoordinationParticipant[]> {
+function parseParticipants(value: unknown, field: string): DomainResult<readonly ResourceCoordinationParticipant[]> {
   if (!Array.isArray(value)) return invalid(field, "expected an array");
   const sessions = new Set<string>();
   const participants: ResourceCoordinationParticipant[] = [];
   for (const [index, item] of value.entries()) {
     const child = `${field}[${index}]`;
-    const object = exactObject(item, ["session_id", "worktree_path", "state", "claim_id", "mode", "requested_mode", "observed_change", "integrated"], child);
+    const object = exactObject(
+      item,
+      ["session_id", "worktree_path", "state", "claim_id", "mode", "requested_mode", "observed_change", "integrated"],
+      child,
+    );
     if (!object.ok) return object;
     const session = boundedString(object.value.session_id, `${child}.session_id`);
     if (!session.ok) return session;
@@ -242,29 +267,39 @@ function parseParticipants(value: JsonValue, field: string): DomainResult<readon
     if (!claim.ok) return claim;
     const mode = enumValue(object.value.mode, ["read", "write", "exclusive-write"] as const, `${child}.mode`);
     if (!mode.ok) return mode;
-    const requested = nullableEnum(object.value.requested_mode, ["read", "write", "exclusive-write"] as const, `${child}.requested_mode`);
+    const requested = nullableEnum(
+      object.value.requested_mode,
+      ["read", "write", "exclusive-write"] as const,
+      `${child}.requested_mode`,
+    );
     if (!requested.ok) return requested;
-    const observed = enumValue(object.value.observed_change, ["modified", "added", "deleted", "renamed", "none", "unknown"] as const, `${child}.observed_change`);
+    const observed = enumValue(
+      object.value.observed_change,
+      ["modified", "added", "deleted", "renamed", "none", "unknown"] as const,
+      `${child}.observed_change`,
+    );
     if (!observed.ok) return observed;
     if (typeof object.value.integrated !== "boolean" && object.value.integrated !== null) {
       return invalid(`${child}.integrated`, "expected boolean or null");
     }
-    participants.push(Object.freeze({
-      session_id: session.value,
-      worktree_path: worktree.value,
-      state: state.value,
-      claim_id: claim.value,
-      mode: mode.value,
-      requested_mode: requested.value,
-      observed_change: observed.value,
-      integrated: object.value.integrated,
-    }));
+    participants.push(
+      Object.freeze({
+        session_id: session.value,
+        worktree_path: worktree.value,
+        state: state.value,
+        claim_id: claim.value,
+        mode: mode.value,
+        requested_mode: requested.value,
+        observed_change: observed.value,
+        integrated: object.value.integrated,
+      }),
+    );
   }
   participants.sort((left, right) => compare(left.session_id, right.session_id));
   return success(Object.freeze(participants));
 }
 
-function parseBlockers(value: JsonValue, field: string): DomainResult<readonly ResourceCoordinationBlocker[]> {
+function parseBlockers(value: unknown, field: string): DomainResult<readonly ResourceCoordinationBlocker[]> {
   if (!Array.isArray(value)) return invalid(field, "expected an array");
   if (value.length > MAX_BLOCKERS_PER_ROW) return invalid(field, "at most 64 blockers are allowed");
   const blockers: ResourceCoordinationBlocker[] = [];
@@ -283,7 +318,7 @@ function parseBlockers(value: JsonValue, field: string): DomainResult<readonly R
   return success(Object.freeze(blockers));
 }
 
-function parseActions(value: JsonValue, field: string): DomainResult<readonly string[]> {
+function parseActions(value: unknown, field: string): DomainResult<readonly string[]> {
   if (!Array.isArray(value)) return invalid(field, "expected an array");
   if (value.length > MAX_ACTIONS_PER_ROW) return invalid(field, "at most 32 actions are allowed");
   const actions: string[] = [];
@@ -295,17 +330,19 @@ function parseActions(value: JsonValue, field: string): DomainResult<readonly st
   return success(Object.freeze(actions));
 }
 
-function validateFilter(filter: FileSessionMatrixFilter): DomainResult<Readonly<{ limit: number; cursor: string | null }>> {
+function validateFilter(filter: unknown): DomainResult<Readonly<{ limit: number; cursor: string | null }>> {
   if (!isRecord(filter)) return invalid("filter", "expected an object");
   const allowed = new Set(["limit", "cursor"]);
   if (Object.keys(filter).some((key) => !allowed.has(key))) return invalid("filter", "contains an unknown field");
-  const limit = filter.limit === undefined ? MAX_PAGE_SIZE : filter.limit;
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE) {
+  const limitValue = filter.limit;
+  const limit = limitValue === undefined ? MAX_PAGE_SIZE : limitValue;
+  if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE) {
     return invalid("filter.limit", "expected an integer from 1 through 4096");
   }
-  const cursor = filter.cursor === undefined || filter.cursor === null ? null : filter.cursor;
+  const cursorValue = filter.cursor;
+  const cursor = cursorValue === undefined || cursorValue === null ? null : cursorValue;
   if (cursor !== null && typeof cursor !== "string") return invalid("filter.cursor", "expected text or null");
-  return success(Object.freeze({ limit, cursor }));
+  return success(Object.freeze({ limit, cursor: cursor as string | null }));
 }
 
 function decodeCursor(value: string, revision: number): DomainResult<ParsedCursor> {
@@ -317,21 +354,26 @@ function decodeCursor(value: string, revision: number): DomainResult<ParsedCurso
   }
   const object = exactObject(parsed, CURSOR_KEYS, "filter.cursor");
   if (!object.ok) return object;
-  if (!Number.isSafeInteger(object.value.snapshot_registry_revision) || object.value.snapshot_registry_revision < 0) {
+  const snapshotRevision = object.value.snapshot_registry_revision;
+  if (typeof snapshotRevision !== "number" || !Number.isSafeInteger(snapshotRevision) || snapshotRevision < 0) {
     return invalid("filter.cursor.snapshot_registry_revision", "expected a non-negative integer");
   }
   const resource = boundedString(object.value.last_resource, "filter.cursor.last_resource");
   if (!resource.ok) return resource;
-  if (object.value.snapshot_registry_revision !== revision) {
-    return failure(new DomainError("STALE_REGISTRY", "The file/session matrix cursor is stale.", {
-      cursor_revision: object.value.snapshot_registry_revision,
-      snapshot_revision: revision,
-    }));
+  if (snapshotRevision !== revision) {
+    return failure(
+      new DomainError("STALE_REGISTRY", "The file/session matrix cursor is stale.", {
+        cursor_revision: snapshotRevision,
+        snapshot_revision: revision,
+      }),
+    );
   }
-  return success(Object.freeze({
-    snapshot_registry_revision: object.value.snapshot_registry_revision,
-    last_resource: resource.value,
-  }));
+  return success(
+    Object.freeze({
+      snapshot_registry_revision: snapshotRevision,
+      last_resource: resource.value,
+    }),
+  );
 }
 
 function encodeCursor(cursor: ParsedCursor): string {
@@ -357,12 +399,21 @@ function nullableString(value: unknown, field: string): DomainResult<string | nu
   return boundedString(value, field);
 }
 
-function enumValue<const T extends readonly string[]>(value: unknown, values: T, field: string): DomainResult<T[number]> {
-  if (typeof value !== "string" || !(values as readonly string[]).includes(value)) return invalid(field, "contains an unsupported value");
+function enumValue<const T extends readonly string[]>(
+  value: unknown,
+  values: T,
+  field: string,
+): DomainResult<T[number]> {
+  if (typeof value !== "string" || !(values as readonly string[]).includes(value))
+    return invalid(field, "contains an unsupported value");
   return success(value as T[number]);
 }
 
-function nullableEnum<const T extends readonly string[]>(value: unknown, values: T, field: string): DomainResult<T[number] | null> {
+function nullableEnum<const T extends readonly string[]>(
+  value: unknown,
+  values: T,
+  field: string,
+): DomainResult<T[number] | null> {
   if (value === null) return success(null);
   return enumValue(value, values, field);
 }
@@ -371,7 +422,10 @@ function compare(left: string, right: string): number {
   return compareCodePointStrings(left, right);
 }
 
-function compareParticipants(left: readonly ResourceCoordinationParticipant[], right: readonly ResourceCoordinationParticipant[]): number {
+function compareParticipants(
+  left: readonly ResourceCoordinationParticipant[],
+  right: readonly ResourceCoordinationParticipant[],
+): number {
   const count = Math.min(left.length, right.length);
   for (let index = 0; index < count; index += 1) {
     const result = compare(left[index]!.session_id, right[index]!.session_id);
@@ -381,7 +435,11 @@ function compareParticipants(left: readonly ResourceCoordinationParticipant[], r
 }
 
 function invalid(field: string, reason: string): DomainResult<never> {
-  return failure(new DomainError("INVALID_ARGUMENT", `Repository coordination observation field '${field}' is invalid: ${reason}.`, { field }));
+  return failure(
+    new DomainError("INVALID_ARGUMENT", `Repository coordination observation field '${field}' is invalid: ${reason}.`, {
+      field,
+    }),
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

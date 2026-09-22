@@ -3,44 +3,53 @@ import { test } from "node:test";
 
 import {
   getNawabariRepositoryRuntimeSnapshot,
+  type RepositoryRuntimeObservation,
+  type RepositoryRuntimeSnapshot,
   type RepositoryRuntimeSnapshotInput,
 } from "./repository-runtime-snapshot.js";
-import {
-  projectAgentRuntimeStatus,
-  projectSessionAttention,
-} from "./session-attention.js";
+import type { JsonValue } from "./domain/errors.js";
+import { projectAgentRuntimeStatus, projectSessionAttention } from "./session-attention.js";
 import type { RepositoryRegistryView, SessionRecord } from "./session-registry.js";
 
 const TIMESTAMP = "2026-01-02T03:04:05.006Z";
 
 test("maps fixed attention codes and severity, with deterministic evidence identity", () => {
-  const result = projectSessionAttention(snapshot({
-    coordinationRows: [coordinationRow("src/a.ts", "session-a", { permission: "blocked" })],
-    profiles: [{ session_id: "session-a", status: "drift", profile_id: null, reason: "profile changed" }],
-    processes: [{ session_id: "session-a", status: "unknown", reason: "not observed" }],
-    filesystem: [{ session_id: "session-a", status: "violation", reason: "outside policy" }],
-    lifecycle: [{ session_id: "session-a", state: "unmanaged", physical_state: null, reason: "not owned" }],
-  }));
+  const result = projectSessionAttention(
+    snapshot({
+      coordinationRows: [coordinationRow("src/a.ts", "session-a", { permission: "blocked" })],
+      profiles: [{ session_id: "session-a", status: "drift", profile_id: null, reason: "profile changed" }],
+      processes: [{ session_id: "session-a", status: "unknown", reason: "not observed" }],
+      filesystem: [{ session_id: "session-a", status: "violation", reason: "outside policy" }],
+      lifecycle: [{ session_id: "session-a", state: "unmanaged", physical_state: null, reason: "not owned" }],
+    }),
+  );
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.deepEqual(result.value.map((item) => [item.code, item.severity]), [
-    ["coordination-blocked", "error"],
-    ["policy-violation", "error"],
-    ["process-unknown", "warning"],
-    ["unmanaged-worktree", "warning"],
-    ["profile-drift", "info"],
-  ]);
+  assert.deepEqual(
+    result.value.map((item) => [item.code, item.severity]),
+    [
+      ["coordination-blocked", "error"],
+      ["policy-violation", "error"],
+      ["process-unknown", "warning"],
+      ["unmanaged-worktree", "warning"],
+      ["profile-drift", "info"],
+    ],
+  );
   assert.equal(result.value[0]?.evidence_revision, "7");
   assert.equal(result.value[0]?.identity, JSON.stringify(["coordination-blocked", "session-a", "src/a.ts", "7"]));
 });
 
 test("redacts arbitrary repository content from agent runtime status", () => {
-  const result = projectAgentRuntimeStatus(snapshot({
-    coordinationRows: [coordinationRow("src/a.ts", "session-a", { permission: "blocked" })],
-    profiles: [{ session_id: "session-a", status: "current", profile_id: "profile-1", reason: null }],
-    processes: [{ session_id: "session-a", status: "active", reason: null }],
-    lifecycle: [{ session_id: "session-a", state: "active", physical_state: "healthy", reason: null }],
-  }), "session-a", 10);
+  const result = projectAgentRuntimeStatus(
+    snapshot({
+      coordinationRows: [coordinationRow("src/a.ts", "session-a", { permission: "blocked" })],
+      profiles: [{ session_id: "session-a", status: "current", profile_id: "profile-1", reason: null }],
+      processes: [{ session_id: "session-a", status: "active", reason: null }],
+      lifecycle: [{ session_id: "session-a", state: "active", physical_state: "healthy", reason: null }],
+    }),
+    "session-a",
+    10,
+  );
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.deepEqual(Object.keys(result.value).sort(), [
@@ -60,12 +69,16 @@ test("redacts arbitrary repository content from agent runtime status", () => {
 });
 
 test("truncates agent attention within budget and returns an opaque cursor", () => {
-  const result = projectAgentRuntimeStatus(snapshot({
-    profiles: [{ session_id: "session-a", status: "drift", profile_id: "profile-1", reason: "profile changed" }],
-    processes: [{ session_id: "session-a", status: "unknown", reason: "not observed" }],
-    filesystem: [{ session_id: "session-a", status: "violation", reason: "outside policy" }],
-    lifecycle: [{ session_id: "session-a", state: "unmanaged", physical_state: null, reason: "not owned" }],
-  }), "session-a", 2);
+  const result = projectAgentRuntimeStatus(
+    snapshot({
+      profiles: [{ session_id: "session-a", status: "drift", profile_id: "profile-1", reason: "profile changed" }],
+      processes: [{ session_id: "session-a", status: "unknown", reason: "not observed" }],
+      filesystem: [{ session_id: "session-a", status: "violation", reason: "outside policy" }],
+      lifecycle: [{ session_id: "session-a", state: "unmanaged", physical_state: null, reason: "not owned" }],
+    }),
+    "session-a",
+    2,
+  );
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.equal(result.value.truncated, true);
@@ -87,7 +100,9 @@ test("truncates agent attention within budget and returns an opaque cursor", () 
 });
 
 test("invalid available optional observations fail closed", () => {
-  const result = projectSessionAttention(snapshot({ profiles: [{ session_id: "session-a", status: "drift" }] } as never));
+  const result = projectSessionAttention(
+    snapshot({ profiles: [{ session_id: "session-a", status: "drift" }] } as never),
+  );
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.error.code, "INVALID_ARGUMENT");
@@ -101,7 +116,7 @@ interface FixtureOptions {
   readonly lifecycle?: readonly Record<string, unknown>[];
 }
 
-function snapshot(options: FixtureOptions = {}) {
+function snapshot(options: FixtureOptions = {}): RepositoryRuntimeSnapshot {
   const input: RepositoryRuntimeSnapshotInput = {
     registry: registry(),
     captured_at: TIMESTAMP,
@@ -133,12 +148,12 @@ function snapshot(options: FixtureOptions = {}) {
   };
   const result = getNawabariRepositoryRuntimeSnapshot(input);
   assert.equal(result.ok, true);
-  if (!result.ok) throw result.error;
-  return result.value;
+  if (result.ok) return result.value;
+  throw new Error("fixture snapshot projection failed");
 }
 
-function available(value: Record<string, unknown>) {
-  return { status: "available" as const, observed_at: TIMESTAMP, value };
+function available(value: unknown): RepositoryRuntimeObservation<JsonValue> {
+  return { status: "available", observed_at: TIMESTAMP, value: value as JsonValue };
 }
 
 function coordinationRow(resource: string, session_id: string, overrides: Record<string, unknown> = {}) {
