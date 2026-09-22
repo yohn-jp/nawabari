@@ -371,4 +371,14 @@ test("discard preview parser preserves the declared shape and rejects forged dis
   const forged = parseSessionDiscardPreview({ ...discardPreviewFor(record), destructive: false });
   assert.equal(forged.ok, false);
   if (!forged.ok) assert.equal(forged.error.code, "INVALID_ARGUMENT");
+
+  const forgedEvidence = parseSessionDiscardPreview({
+    ...discardPreviewFor(record),
+    recoverable_commits: {
+      ...discardPreviewFor(record).recoverable_commits,
+      evidence: [{ code: "NOT_AN_ERROR_CODE", message: "forged", details: {} }],
+    },
+  });
+  assert.equal(forgedEvidence.ok, false);
+  if (!forgedEvidence.ok) assert.equal(forgedEvidence.error.code, "INVALID_ARGUMENT");
 });

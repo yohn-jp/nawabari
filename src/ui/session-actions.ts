@@ -12,6 +12,7 @@ import type {
   SessionRecord,
   SessionState,
 } from "../domain/session.js";
+import { IMPLEMENTATION_FAILURE_CODE_VOCABULARY } from "../failure-code-vocabulary.js";
 
 /** The UI action projection is a caller, not a second lifecycle authority. */
 export const SESSION_ACTIONS_SCHEMA_VERSION = 1 as const;
@@ -20,6 +21,7 @@ const PREVIEW_MAX_TEXT_CODE_POINTS = 4_096;
 const SESSION_STATES: readonly SessionState[] = ["new", "active", "closing", "closed", "stale"];
 const READINESS_STATES = ["ready", "not_due", "blocked", "external_evidence_required", "ambiguous"] as const;
 const RESULT_STATES = ["complete", "ambiguous", "stale", "external_evidence_required"] as const;
+const ERROR_CODE_VOCABULARY = new Set<string>(Object.values(IMPLEMENTATION_FAILURE_CODE_VOCABULARY).flat());
 
 type PreviewObject = Record<string, unknown>;
 
@@ -117,6 +119,13 @@ function previewEvidence(value: unknown, field: string): DomainResult<SessionDis
   if (!object.ok) return object;
   const code = previewText(previewField(object.value, "code"), `${field}.code`);
   if (!code.ok || code.value === null) return code as DomainResult<never>;
+  if (!ERROR_CODE_VOCABULARY.has(code.value)) {
+    return failure(
+      new DomainError("INVALID_ARGUMENT", `Invalid discard preview field '${field}.code': unknown error code.`, {
+        field: `${field}.code`,
+      }),
+    );
+  }
   const message = previewText(previewField(object.value, "message"), `${field}.message`);
   if (!message.ok || message.value === null) return message as DomainResult<never>;
   const details = previewJsonObject(previewField(object.value, "details"), `${field}.details`);
