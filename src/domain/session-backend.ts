@@ -57,6 +57,9 @@ import {
   type SessionListResult,
   type SessionListOptions,
   type SessionRecord,
+  type FileOperationOptions,
+  type FileOperationRecordsResult,
+  type FileOperationResult,
   type SessionStatusRecord,
   type IntegrationProof as DomainIntegrationProof,
   boundedSessionListing,
@@ -150,6 +153,13 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   RESOURCE_CLAIM_CONFLICT: "RESOURCE_CLAIM_CONFLICT",
   CLAIM_NOT_FOUND: "CLAIM_NOT_FOUND",
   SESSION_NOT_ACTIVE: "SESSION_NOT_ACTIVE",
+  FILE_OPERATION_INVALID: "FILE_OPERATION_INVALID",
+  FILE_OPERATION_ID_CONFLICT: "FILE_OPERATION_ID_CONFLICT",
+  FILE_OPERATION_INVALID_TRANSITION: "FILE_OPERATION_INVALID_TRANSITION",
+  FILE_OPERATION_LIMIT: "FILE_OPERATION_LIMIT",
+  FILE_OPERATION_AUTHORITY_DENIED: "FILE_OPERATION_AUTHORITY_DENIED",
+  FILE_OPERATION_UNSUPPORTED_SCHEMA: "FILE_OPERATION_UNSUPPORTED_SCHEMA",
+  FILE_OPERATION_CORRUPT: "FILE_OPERATION_CORRUPT",
   UNSUPPORTED_CLAIM_SCHEMA_VERSION: "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
   INVALID_COMMIT_MESSAGE: "INVALID_COMMIT_MESSAGE",
   COMMIT_EMPTY_DIFF: "COMMIT_EMPTY_DIFF",
@@ -233,6 +243,33 @@ export class LocalSessionBackend implements SessionBackend {
         );
       }
       return success(toDomainRecord(record));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async fileOperation(
+    context: SessionContext,
+    options: FileOperationOptions,
+  ): Promise<DomainResult<FileOperationResult>> {
+    try {
+      const result = this.registryFor(context).executeFileOperation(options.operation, options.execution_options);
+      return success(result);
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async fileOperations(
+    context: SessionContext,
+    sessionId?: string | null,
+  ): Promise<DomainResult<FileOperationRecordsResult>> {
+    try {
+      return success(
+        this.registryFor(context)
+          .fileOperations(sessionId)
+          .map((record) => ({ ...record })),
+      );
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }

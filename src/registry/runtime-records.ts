@@ -1,5 +1,10 @@
 import type { JsonObject, JsonValue } from "../domain/errors.js";
-import { SessionRegistryError } from "../errors.js";
+import { SessionRegistryError, type RegistryErrorCode, type RegistryErrorDetails } from "../errors.js";
+import {
+  parseFileOperationRegistry,
+  serializeFileOperationRegistry,
+  type PersistedFileOperationRecord,
+} from "./file-operation-record.js";
 
 /**
  * Optional registry areas are deliberately a closed, versioned vocabulary.
@@ -17,8 +22,8 @@ export const REGISTRY_FEATURES = Object.freeze([
 
 export type RegistryFeature = (typeof REGISTRY_FEATURES)[number];
 
-/** No optional record authority is implemented by the registry migration. */
-export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([] as const);
+/** File-operation receipts are owned by the F10 durable record authority. */
+export const SUPPORTED_REGISTRY_FEATURES = Object.freeze(["file-operations.v1"] as const);
 
 export const MAX_RUNTIME_RECORDS = 256 as const;
 export const MAX_RUNTIME_RECORD_KEYS = 32 as const;
@@ -32,7 +37,7 @@ export interface RuntimeRecords {
   readonly executions?: readonly RuntimeRecord[];
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
-  readonly file_operations?: readonly RuntimeRecord[];
+  readonly file_operations?: readonly PersistedFileOperationRecord[];
 }
 
 export interface ParsedRuntimeRecords {
@@ -81,7 +86,7 @@ export function parseRuntimeRecords(
     throw unsupportedFeatureError(unsupported);
   }
 
-  const records: Record<string, readonly RuntimeRecord[]> = {};
+  const records: Record<string, readonly unknown[]> = {};
   for (const definition of FEATURE_DEFINITIONS) {
     const present = Object.hasOwn(input, definition.field);
     const required = requiredFeatures.includes(definition.feature);
@@ -96,6 +101,10 @@ export function parseRuntimeRecords(
       );
     }
     if (!present) continue;
+    if (definition.field === "file_operations") {
+      records[definition.field] = parsePersistedFileOperationRecords(input[definition.field]);
+      continue;
+    }
     records[definition.field] = parseRecordList(input[definition.field], definition.field);
   }
 
@@ -107,15 +116,70 @@ export function parseRuntimeRecords(
 
 /** Convert parsed optional areas back to their bounded persisted fields. */
 export function toPersistedRuntimeRecords(parsed: ParsedRuntimeRecords): RuntimeRecords {
+  const fileOperations = parsed.records.file_operations;
   return Object.freeze(
     Object.fromEntries(
       FEATURE_DEFINITIONS.flatMap(({ feature, field }) =>
         parsed.requiredFeatures.includes(feature) && parsed.records[field] !== undefined
-          ? [[field, parsed.records[field]]]
+          ? [
+              [
+                field,
+                field === "file_operations"
+                  ? serializePersistedFileOperationRecords(fileOperations)
+                  : parsed.records[field],
+              ],
+            ]
           : [],
       ),
     ),
   ) as RuntimeRecords;
+}
+
+function parsePersistedFileOperationRecords(value: unknown): readonly PersistedFileOperationRecord[] {
+  try {
+    return Object.freeze(
+      serializeFileOperationRegistry(
+        parseFileOperationRegistry({ schema_version: 1, file_operations: value }),
+      ).file_operations.map((record) => Object.freeze({ ...record })),
+    );
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+    const fileOperationCodes = new Set([
+      "FILE_OPERATION_INVALID",
+      "FILE_OPERATION_ID_CONFLICT",
+      "FILE_OPERATION_INVALID_TRANSITION",
+      "FILE_OPERATION_LIMIT",
+      "FILE_OPERATION_AUTHORITY_DENIED",
+      "FILE_OPERATION_UNSUPPORTED_SCHEMA",
+      "FILE_OPERATION_CORRUPT",
+    ]);
+    if (fileOperationCodes.has(String(code))) {
+      const details =
+        typeof error === "object" && error !== null && "details" in error && isRecord(error.details)
+          ? (error.details as Record<string, unknown>)
+          : {};
+      throw new SessionRegistryError(
+        String(code) as RegistryErrorCode,
+        error instanceof Error ? error.message : "Registry file-operation records are invalid",
+        details as RegistryErrorDetails,
+        error,
+      );
+    }
+    throw new SessionRegistryError(
+      "REGISTRY_CORRUPT",
+      "Registry file-operation records are invalid",
+      { field: "file_operations" },
+      error,
+    );
+  }
+}
+
+function serializePersistedFileOperationRecords(
+  value: readonly PersistedFileOperationRecord[] | undefined,
+): readonly PersistedFileOperationRecord[] {
+  if (value === undefined) return [];
+  return parsePersistedFileOperationRecords(value);
 }
 
 export function emptyRuntimeRecords(): ParsedRuntimeRecords {

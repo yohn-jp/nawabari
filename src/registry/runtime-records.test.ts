@@ -18,7 +18,7 @@ test("registry optional areas are a finite feature-gated contract", () => {
     "recent-events.v1",
     "file-operations.v1",
   ]);
-  assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, []);
+  assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, ["file-operations.v1"]);
   assert.deepEqual(parseRuntimeRecords({}), { requiredFeatures: [], records: {} });
 });
 
