@@ -18,7 +18,7 @@ export const REGISTRY_FEATURES = Object.freeze([
 export type RegistryFeature = (typeof REGISTRY_FEATURES)[number];
 
 /** No optional record authority is implemented by the registry migration. */
-export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([] as const);
+export const SUPPORTED_REGISTRY_FEATURES = Object.freeze(["executions.v1"] as const);
 
 export const MAX_RUNTIME_RECORDS = 256 as const;
 export const MAX_RUNTIME_RECORD_KEYS = 32 as const;

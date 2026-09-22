@@ -109,6 +109,13 @@ import {
 } from "./repository-evidence.js";
 import type { SandboxGitIdentity } from "./domain/sandbox.js";
 import {
+  parseSessionExecutionRecord,
+  recordExecutionState,
+  toPersistedSessionExecutionRecord,
+  type PersistedSessionExecutionRecord,
+  type SessionExecutionStateInput,
+} from "./domain/session-execution-record.js";
+import {
   classifySessionLifecycle,
   lifecycleTransition,
   type SessionLifecycleClassification,
@@ -1115,6 +1122,10 @@ export class SessionRegistry {
     return record === undefined ? undefined : cloneSessionRecord(record);
   }
 
+  get runtimeEpoch(): number {
+    return this.readStateUnsafe().runtimeEpoch;
+  }
+
   /** Return the single authoritative claim set, optionally scoped to a session. */
   listClaims(sessionId?: string | null): readonly ResourceClaim[] {
     const claims = this.readStateUnsafe().claims;
@@ -1134,6 +1145,85 @@ export class SessionRegistry {
       claims: state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim),
       claimSetGeneration: state.claimSetGeneration,
     };
+  }
+
+  /** Read the durable execution ledger for one explicit session. */
+  listSessionExecutions(sessionId: string): readonly PersistedSessionExecutionRecord[] {
+    assertSessionId(sessionId);
+    const records = this.readStateUnsafe().runtimeRecords.records.executions ?? [];
+    return records.map((candidate, index) => {
+      const parsed = parseSessionExecutionRecord(candidate);
+      if (!parsed.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid execution record at index ${index}`);
+      if (parsed.value.session_id !== sessionId) return null;
+      return toPersistedSessionExecutionRecord(parsed.value);
+    }).filter((record): record is PersistedSessionExecutionRecord => record !== null);
+  }
+
+  /** Persist a new execution reservation, advancing only registry_revision. */
+  persistSessionExecution(record: PersistedSessionExecutionRecord): PersistedSessionExecutionRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const parsed = parseSessionExecutionRecord(record);
+      if (!parsed.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", "Invalid execution record");
+      if (!state.sessions.some((session) => session.sessionId === parsed.value.session_id)) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${parsed.value.session_id}`);
+      }
+      const executions = state.runtimeRecords.records.executions ?? [];
+      if (executions.some((candidate) => {
+        const existing = parseSessionExecutionRecord(candidate);
+        return existing.ok && existing.value.execution_id === parsed.value.execution_id;
+      })) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Execution ID already exists", {
+          executionId: parsed.value.execution_id,
+        });
+      }
+      const nextRecords = withExecutions(state.runtimeRecords, [...executions, toPersistedSessionExecutionRecord(parsed.value)]);
+      this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, nextRegistryRevision(state), state.runtimeEpoch, nextRecords);
+      return toPersistedSessionExecutionRecord(parsed.value);
+    });
+  }
+
+  /** Apply the producer-owned execution transition matrix under the registry lock. */
+  transitionSessionExecution(executionId: string, input: SessionExecutionStateInput): PersistedSessionExecutionRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const executions = state.runtimeRecords.records.executions ?? [];
+      const index = executions.findIndex((candidate) => {
+        const parsed = parseSessionExecutionRecord(candidate);
+        return parsed.ok && parsed.value.execution_id === executionId;
+      });
+      if (index < 0) throw new SessionRegistryError("OPERATION_REJECTED", "Execution ID was not found", { executionId });
+      const current = parseSessionExecutionRecord(executions[index]);
+      if (!current.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", "Invalid execution record");
+      const next = recordExecutionState(current.value, input);
+      if (!next.ok) throw new SessionRegistryError("OPERATION_REJECTED", next.error.message, next.error);
+      const persisted = toPersistedSessionExecutionRecord(next.value);
+      const updated = [...executions];
+      updated[index] = persisted;
+      this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, nextRegistryRevision(state), state.runtimeEpoch, withExecutions(state.runtimeRecords, updated));
+      return persisted;
+    });
+  }
+
+  /** Close launch admission and advance runtime_epoch atomically. */
+  closeSessionLaunchAdmission(sessionId: string, expectedEpoch: number): { runtimeEpoch: number } {
+    return this.withLock(() => {
+      assertSessionId(sessionId);
+      const state = this.readStateUnsafe();
+      if (!state.sessions.some((session) => session.sessionId === sessionId)) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch !== state.runtimeEpoch) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Runtime epoch is stale", {
+          sessionId,
+          expectedEpoch,
+          runtimeEpoch: state.runtimeEpoch,
+        });
+      }
+      const nextEpoch = nextRuntimeEpoch(state);
+      this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, nextRegistryRevision(state), nextEpoch, state.runtimeRecords);
+      return { runtimeEpoch: nextEpoch };
+    });
   }
 
   /**
@@ -8307,6 +8397,13 @@ function nextRuntimeEpoch(state: RegistryState): number {
     throw new SessionRegistryError("OPERATION_REJECTED", "Runtime epoch exhausted");
   }
   return state.runtimeEpoch + 1;
+}
+
+function withExecutions(runtimeRecords: ParsedRuntimeRecords, executions: readonly RuntimeRecord[]): ParsedRuntimeRecords {
+  return Object.freeze({
+    requiredFeatures: Object.freeze([...new Set([...runtimeRecords.requiredFeatures, "executions.v1" as RegistryFeature])]),
+    records: Object.freeze({ ...runtimeRecords.records, executions: Object.freeze([...executions]) }),
+  });
 }
 
 function migrationReadError(error: unknown): SessionRegistryError {
