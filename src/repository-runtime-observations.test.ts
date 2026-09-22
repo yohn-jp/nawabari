@@ -156,6 +156,40 @@ test("keeps unknown sections explicit instead of treating empty maps as observed
   });
 });
 
+test("preserves string-only bounded semantics for v1 and v2 fields", () => {
+  const observations = v1Observations();
+  observations.profiles = available({
+    contract_id: "nawabari.repository-profile-observation.v1",
+    schema_version: 1,
+    sessions: [{ session_id: "", status: "current", profile_id: "\u0000", reason: "\u0001" }],
+  });
+  observations.processes = available({
+    contract_id: "nawabari.repository-process-observation.v1",
+    schema_version: 1,
+    sessions: [{ session_id: "", status: "inactive", reason: "\u0002" }],
+  });
+  observations.filesystem = available({
+    contract_id: "nawabari.repository-filesystem-observation.v2",
+    schema_version: 2,
+    sessions: [{ session_id: "", policy_status: "clean", runtime_status: "clean", owner: "proven", reason: "\u0003" }],
+    unmanaged_worktrees: [{ worktree_path: "", reason: "\u0004" }],
+  });
+  observations.lifecycle = available({
+    contract_id: "nawabari.repository-lifecycle-observation.v1",
+    schema_version: 1,
+    sessions: [{ session_id: "", state: "", physical_state: "\u0005", reason: "\u0006" }],
+  });
+  const result = parseRepositoryRuntimeObservations(snapshot(observations));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.value.profiles.has(""), true);
+  assert.equal(result.value.filesystem.has(""), true);
+  assert.deepEqual(
+    result.value.unmanaged_worktrees.map(({ worktree_path }) => worktree_path),
+    [""],
+  );
+});
+
 test("rejects incompatible historical extensions, unknown keys, duplicates and bounds", () => {
   const extended = v1Observations();
   observationValue(extended.filesystem).sessions![0]!.owner = "proven";

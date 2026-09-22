@@ -110,7 +110,7 @@ function parseSection<T>(
   if (observation === undefined) return success({ unknown: true, entries: new Map() });
   if (!isRecord(observation)) return invalid(name, "expected an observation envelope");
   if (observation.status === "unknown") {
-    if (!validString(observation.reason, false)) return invalid(`${name}.reason`, "expected bounded text");
+    if (!validString(observation.reason)) return invalid(`${name}.reason`, "expected bounded text");
     return success({ unknown: true, entries: new Map() });
   }
   if (observation.status !== "available" || !Object.hasOwn(observation, "value") || !isJsonValue(observation.value)) {
@@ -130,7 +130,7 @@ function parseFilesystem(observation: unknown): DomainResult<
     return success({ unknown: true, entries: new Map(), unmanaged_worktrees: Object.freeze([]) });
   if (!isRecord(observation)) return invalid("filesystem", "expected an observation envelope");
   if (observation.status === "unknown") {
-    if (!validString(observation.reason, false)) return invalid("filesystem.reason", "expected bounded text");
+    if (!validString(observation.reason)) return invalid("filesystem.reason", "expected bounded text");
     return success({ unknown: true, entries: new Map(), unmanaged_worktrees: Object.freeze([]) });
   }
   if (observation.status !== "available" || !Object.hasOwn(observation, "value") || !isJsonValue(observation.value)) {
@@ -402,8 +402,7 @@ function parseUnmanagedWorktrees(value: unknown): DomainResult<readonly Reposito
     const object = exactObject(entry, ["worktree_path", "reason"], field);
     if (!object.ok) return object;
     const worktree_path = boundedString(object.value.worktree_path, `${field}.worktree_path`);
-    if (!worktree_path.ok || worktree_path.value.length === 0)
-      return invalid(`${field}.worktree_path`, "expected non-empty bounded text");
+    if (!worktree_path.ok) return worktree_path;
     if (seen.has(worktree_path.value)) return invalid(`${field}.worktree_path`, "duplicate worktree_path");
     seen.add(worktree_path.value);
     const reason = nullableString(object.value.reason, `${field}.reason`);
@@ -423,24 +422,16 @@ function exactObject(value: unknown, keys: readonly string[], field: string): Do
 }
 
 function sessionId(value: unknown, field: string): DomainResult<string> {
-  const parsed = boundedString(value, field);
-  if (!parsed.ok) return parsed;
-  if (parsed.value.length === 0) return invalid(field, "expected non-empty bounded text");
-  return parsed;
+  return boundedString(value, field);
 }
 
 function boundedString(value: unknown, field: string): DomainResult<string> {
-  if (!validString(value, true)) return invalid(field, "expected bounded text");
+  if (!validString(value)) return invalid(field, "expected bounded text");
   return success(value as string);
 }
 
-function validString(value: unknown, allowEmpty: boolean): value is string {
-  return (
-    typeof value === "string" &&
-    (allowEmpty || value.length > 0) &&
-    [...value].length <= MAX_TEXT_CODE_POINTS &&
-    !/[\u0000-\u001f\u007f]/u.test(value)
-  );
+function validString(value: unknown): value is string {
+  return typeof value === "string" && [...value].length <= MAX_TEXT_CODE_POINTS;
 }
 
 function nullableString(value: unknown, field: string): DomainResult<string | null> {
