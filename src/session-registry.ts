@@ -1151,12 +1151,15 @@ export class SessionRegistry {
   listSessionExecutions(sessionId: string): readonly PersistedSessionExecutionRecord[] {
     assertSessionId(sessionId);
     const records = this.readStateUnsafe().runtimeRecords.records.executions ?? [];
-    return records.map((candidate, index) => {
-      const parsed = parseSessionExecutionRecord(candidate);
-      if (!parsed.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid execution record at index ${index}`);
-      if (parsed.value.session_id !== sessionId) return null;
-      return toPersistedSessionExecutionRecord(parsed.value);
-    }).filter((record): record is PersistedSessionExecutionRecord => record !== null);
+    return records
+      .map((candidate, index) => {
+        const parsed = parseSessionExecutionRecord(candidate);
+        if (!parsed.ok)
+          throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid execution record at index ${index}`);
+        if (parsed.value.session_id !== sessionId) return null;
+        return toPersistedSessionExecutionRecord(parsed.value);
+      })
+      .filter((record): record is PersistedSessionExecutionRecord => record !== null);
   }
 
   /** Persist a new execution reservation, advancing only registry_revision. */
@@ -1169,16 +1172,28 @@ export class SessionRegistry {
         throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${parsed.value.session_id}`);
       }
       const executions = state.runtimeRecords.records.executions ?? [];
-      if (executions.some((candidate) => {
-        const existing = parseSessionExecutionRecord(candidate);
-        return existing.ok && existing.value.execution_id === parsed.value.execution_id;
-      })) {
+      if (
+        executions.some((candidate) => {
+          const existing = parseSessionExecutionRecord(candidate);
+          return existing.ok && existing.value.execution_id === parsed.value.execution_id;
+        })
+      ) {
         throw new SessionRegistryError("OPERATION_REJECTED", "Execution ID already exists", {
           executionId: parsed.value.execution_id,
         });
       }
-      const nextRecords = withExecutions(state.runtimeRecords, [...executions, toPersistedSessionExecutionRecord(parsed.value)]);
-      this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, nextRegistryRevision(state), state.runtimeEpoch, nextRecords);
+      const nextRecords = withExecutions(state.runtimeRecords, [
+        ...executions,
+        toPersistedSessionExecutionRecord(parsed.value),
+      ]);
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        nextRecords,
+      );
       return toPersistedSessionExecutionRecord(parsed.value);
     });
   }
@@ -1192,15 +1207,29 @@ export class SessionRegistry {
         const parsed = parseSessionExecutionRecord(candidate);
         return parsed.ok && parsed.value.execution_id === executionId;
       });
-      if (index < 0) throw new SessionRegistryError("OPERATION_REJECTED", "Execution ID was not found", { executionId });
+      if (index < 0)
+        throw new SessionRegistryError("OPERATION_REJECTED", "Execution ID was not found", { executionId });
       const current = parseSessionExecutionRecord(executions[index]);
       if (!current.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", "Invalid execution record");
       const next = recordExecutionState(current.value, input);
-      if (!next.ok) throw new SessionRegistryError("OPERATION_REJECTED", next.error.message, next.error);
+      if (!next.ok) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          next.error.message,
+          (next.error.details ?? {}) as unknown as RegistryErrorDetails,
+        );
+      }
       const persisted = toPersistedSessionExecutionRecord(next.value);
       const updated = [...executions];
       updated[index] = persisted;
-      this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, nextRegistryRevision(state), state.runtimeEpoch, withExecutions(state.runtimeRecords, updated));
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        withExecutions(state.runtimeRecords, updated),
+      );
       return persisted;
     });
   }
@@ -1221,7 +1250,14 @@ export class SessionRegistry {
         });
       }
       const nextEpoch = nextRuntimeEpoch(state);
-      this.writeUnsafe(state.sessions, state.claims, state.claimSetGeneration, nextRegistryRevision(state), nextEpoch, state.runtimeRecords);
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        nextEpoch,
+        state.runtimeRecords,
+      );
       return { runtimeEpoch: nextEpoch };
     });
   }
@@ -8399,9 +8435,14 @@ function nextRuntimeEpoch(state: RegistryState): number {
   return state.runtimeEpoch + 1;
 }
 
-function withExecutions(runtimeRecords: ParsedRuntimeRecords, executions: readonly RuntimeRecord[]): ParsedRuntimeRecords {
+function withExecutions(
+  runtimeRecords: ParsedRuntimeRecords,
+  executions: readonly RuntimeRecord[],
+): ParsedRuntimeRecords {
   return Object.freeze({
-    requiredFeatures: Object.freeze([...new Set([...runtimeRecords.requiredFeatures, "executions.v1" as RegistryFeature])]),
+    requiredFeatures: Object.freeze([
+      ...new Set([...runtimeRecords.requiredFeatures, "executions.v1" as RegistryFeature]),
+    ]),
     records: Object.freeze({ ...runtimeRecords.records, executions: Object.freeze([...executions]) }),
   });
 }

@@ -69,7 +69,13 @@ import {
 } from "./session.js";
 import type { SandboxGitIdentity } from "./sandbox.js";
 import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
-import { releaseSessionClaimsWithRuntimeDrain, closeSessionWithRuntimeDrain, discardSessionWithRuntimeDrain, type SessionRuntimeLifecycleAdapter } from "../session-runtime-lifecycle.js";
+import {
+  releaseSessionClaimsWithRuntimeDrain,
+  closeSessionWithRuntimeDrain,
+  discardSessionWithRuntimeDrain,
+  type SessionRuntimeLifecycleAdapter,
+  type SessionRuntimeLifecycleMutation,
+} from "../session-runtime-lifecycle.js";
 import type { SessionDrainExecution } from "./session-execution-control.js";
 import { SESSION_PROCESS_OBSERVATION_CONTRACT_ID } from "./session-process-observation.js";
 import { parseSessionExecutionRecord } from "./session-execution-record.js";
@@ -187,24 +193,50 @@ export class LocalSessionBackend implements SessionBackend {
     this.registryOptions = options.registry ?? {};
   }
 
-  public async listSessionExecutions(context: SessionContext, sessionId: string): Promise<DomainResult<readonly PersistedSessionExecutionRecord[]>> {
-    try { return success(this.registryFor(context).listSessionExecutions(sessionId)); }
-    catch (error: unknown) { return failure(toDomainError(error)); }
+  public async listSessionExecutions(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<DomainResult<readonly PersistedSessionExecutionRecord[]>> {
+    try {
+      return success(this.registryFor(context).listSessionExecutions(sessionId));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
   }
 
-  public async persistSessionExecution(context: SessionContext, record: PersistedSessionExecutionRecord): Promise<DomainResult<PersistedSessionExecutionRecord>> {
-    try { return success(this.registryFor(context).persistSessionExecution(record)); }
-    catch (error: unknown) { return failure(toDomainError(error)); }
+  public async persistSessionExecution(
+    context: SessionContext,
+    record: PersistedSessionExecutionRecord,
+  ): Promise<DomainResult<PersistedSessionExecutionRecord>> {
+    try {
+      return success(this.registryFor(context).persistSessionExecution(record));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
   }
 
-  public async transitionSessionExecution(context: SessionContext, executionId: string, input: SessionExecutionStateInput): Promise<DomainResult<PersistedSessionExecutionRecord>> {
-    try { return success(this.registryFor(context).transitionSessionExecution(executionId, input)); }
-    catch (error: unknown) { return failure(toDomainError(error)); }
+  public async transitionSessionExecution(
+    context: SessionContext,
+    executionId: string,
+    input: SessionExecutionStateInput,
+  ): Promise<DomainResult<PersistedSessionExecutionRecord>> {
+    try {
+      return success(this.registryFor(context).transitionSessionExecution(executionId, input));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
   }
 
-  public async closeSessionLaunchAdmission(context: SessionContext, sessionId: string, expectedEpoch: number): Promise<DomainResult<{ runtimeEpoch: number }>> {
-    try { return success(this.registryFor(context).closeSessionLaunchAdmission(sessionId, expectedEpoch)); }
-    catch (error: unknown) { return failure(toDomainError(error)); }
+  public async closeSessionLaunchAdmission(
+    context: SessionContext,
+    sessionId: string,
+    expectedEpoch: number,
+  ): Promise<DomainResult<{ runtimeEpoch: number }>> {
+    try {
+      return success(this.registryFor(context).closeSessionLaunchAdmission(sessionId, expectedEpoch));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
   }
 
   public async createSession(
@@ -454,30 +486,47 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const registry = this.registryFor(context);
       const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
-      const drained = closeSessionWithRuntimeDrain(runtimeLifecycleAdapter(registry), sessionId, registry.runtimeEpoch);
+      const drained = closeSessionWithRuntimeDrain(
+        runtimeLifecycleAdapter(registry, ({ session_id: mutationSessionId }) =>
+          registryMutation(() =>
+            registry.close({
+              sessionId: mutationSessionId,
+              integratedRevision: options.integrated_revision ?? undefined,
+              fetchRemote: options.fetch_remote ?? undefined,
+              fetchBranch: options.fetch_branch ?? undefined,
+            }),
+          ),
+        ),
+        sessionId,
+        registry.runtimeEpoch,
+      );
       return drained.then((outcome) => {
         if (!outcome.ok) return outcome as DomainResult<SessionCloseResult>;
         if (outcome.value.status !== "completed" || outcome.value.value === undefined) {
-          return failure(new DomainError("OPERATION_REJECTED", "Session close is blocked until owned executions drain."));
+          return failure(
+            new DomainError("OPERATION_REJECTED", "Session close is blocked until owned executions drain."),
+          );
         }
-        const result = outcome.value.value;
-      return Promise.resolve(
-        success({
-          session: toDomainRecord(result.session),
-          worktree_removed: result.worktreeRemoved,
-          branch_removed: result.branchRemoved,
-          idempotent: result.idempotent,
-          claim_set_generation: result.claimSetGeneration,
-          ...(result.reconciliation === undefined
-            ? {}
-            : { reconciliation: toDomainCleanupReconciliation(result.reconciliation) }),
-          ...(result.integrationProof === undefined
-            ? {}
-            : {
-                integration_proof: toDomainIntegrationProof(result.integrationProof),
-              }),
-        }),
-      );
+        const mutation = outcome.value.value;
+        if (!mutation.ok) return mutation;
+        const result = mutation.value;
+        return Promise.resolve(
+          success({
+            session: toDomainRecord(result.session),
+            worktree_removed: result.worktreeRemoved,
+            branch_removed: result.branchRemoved,
+            idempotent: result.idempotent,
+            claim_set_generation: result.claimSetGeneration,
+            ...(result.reconciliation === undefined
+              ? {}
+              : { reconciliation: toDomainCleanupReconciliation(result.reconciliation) }),
+            ...(result.integrationProof === undefined
+              ? {}
+              : {
+                  integration_proof: toDomainIntegrationProof(result.integrationProof),
+                }),
+          }),
+        );
       });
     } catch (error: unknown) {
       return Promise.resolve(failure(toDomainError(error, "NO_CURRENT_SESSION")));
@@ -487,12 +536,22 @@ export class LocalSessionBackend implements SessionBackend {
   public discardSession(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardResult>> {
     try {
       const registry = this.registryFor(context);
-      return discardSessionWithRuntimeDrain(runtimeLifecycleAdapter(registry), sessionId, registry.runtimeEpoch).then((outcome) => {
+      return discardSessionWithRuntimeDrain(
+        runtimeLifecycleAdapter(registry, ({ session_id: mutationSessionId }) =>
+          registryMutation(() => registry.discard({ sessionId: mutationSessionId })),
+        ),
+        sessionId,
+        registry.runtimeEpoch,
+      ).then((outcome) => {
         if (!outcome.ok) return outcome as DomainResult<SessionDiscardResult>;
         if (outcome.value.status !== "completed" || outcome.value.value === undefined) {
-          return failure(new DomainError("OPERATION_REJECTED", "Session discard is blocked until owned executions drain."));
+          return failure(
+            new DomainError("OPERATION_REJECTED", "Session discard is blocked until owned executions drain."),
+          );
         }
-        return success(toDomainSessionDiscardResult(outcome.value.value));
+        const mutation = outcome.value.value;
+        if (!mutation.ok) return mutation;
+        return success(toDomainSessionDiscardResult(mutation.value));
       });
     } catch (error: unknown) {
       return Promise.resolve(failure(toDomainError(error)));
@@ -605,12 +664,29 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const registry = this.registryFor(context);
       const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
-      const drained = await releaseSessionClaimsWithRuntimeDrain(runtimeLifecycleAdapter(registry, options), sessionId, registry.runtimeEpoch);
+      const drained = await releaseSessionClaimsWithRuntimeDrain(
+        runtimeLifecycleAdapter(registry, ({ session_id: mutationSessionId }) =>
+          registryMutation(() =>
+            registry.releaseClaims({
+              sessionId: mutationSessionId,
+              resources: options.resources ?? undefined,
+              claimIds: options.claim_ids ?? undefined,
+              all: options.all === true,
+              expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+              force: options.force === true,
+            }),
+          ),
+        ),
+        sessionId,
+        registry.runtimeEpoch,
+      );
       if (!drained.ok) return drained as DomainResult<ReleaseClaimsResult>;
       if (drained.value.status !== "completed" || drained.value.value === undefined) {
         return failure(new DomainError("OPERATION_REJECTED", "Claim release is blocked until owned executions drain."));
       }
-      const result = drained.value.value;
+      const mutation = drained.value.value;
+      if (!mutation.ok) return mutation;
+      const result = mutation.value;
       /* The lifecycle adapter performs the canonical release mutation. */
       return success({
         session_id: result.sessionId,
@@ -667,13 +743,17 @@ export function createLocalSessionBackend(options: LocalSessionBackendOptions = 
   return new LocalSessionBackend(options);
 }
 
-function runtimeLifecycleAdapter(registry: SessionRegistry, releaseOptions?: ReleaseClaimsOptions): SessionRuntimeLifecycleAdapter<unknown> {
+function runtimeLifecycleAdapter<T>(
+  registry: SessionRegistry,
+  mutate: (mutation: SessionRuntimeLifecycleMutation) => T | Promise<T>,
+): SessionRuntimeLifecycleAdapter<T> {
   return {
     observe: (sessionId) => {
       const executions: SessionDrainExecution[] = [];
       for (const persisted of registry.listSessionExecutions(sessionId)) {
         const parsed = parseSessionExecutionRecord(persisted);
-        if (!parsed.ok || parsed.value.state === "exited" || parsed.value.state === "released") continue;
+        if (!parsed.ok) throw parsed.error;
+        if (parsed.value.state === "exited") continue;
         executions.push({
           record: parsed.value,
           observation: {
@@ -686,21 +766,37 @@ function runtimeLifecycleAdapter(registry: SessionRegistry, releaseOptions?: Rel
           },
         });
       }
-      return { session_id: sessionId, runtime_epoch: registry.runtimeEpoch, executions, kernel_empty: executions.length === 0 };
+      return {
+        session_id: sessionId,
+        runtime_epoch: registry.runtimeEpoch,
+        executions,
+        kernel_empty: executions.length === 0,
+      };
     },
     close_admission: (request) => {
       try {
-        return { ok: true, value: { admission: "closed" as const, runtime_epoch: registry.closeSessionLaunchAdmission(request.session_id, Number(request.expected_epoch)).runtimeEpoch } };
+        return {
+          ok: true,
+          value: {
+            admission: "closed" as const,
+            runtime_epoch: registry.closeSessionLaunchAdmission(request.session_id, Number(request.expected_epoch))
+              .runtimeEpoch,
+          },
+        };
       } catch (error: unknown) {
         return failure(toDomainError(error));
       }
     },
-    mutate: ({ operation, session_id }) => {
-      if (operation === "close") return registry.close({ sessionId: session_id });
-      if (operation === "discard") return registry.discard({ sessionId: session_id });
-      return registry.releaseClaims({ ...(releaseOptions ?? {}), sessionId: session_id });
-    },
+    mutate,
   };
+}
+
+function registryMutation<T>(mutation: () => T): DomainResult<T> {
+  try {
+    return success(mutation());
+  } catch (error: unknown) {
+    return failure(toDomainError(error));
+  }
 }
 
 function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
