@@ -535,7 +535,7 @@ function readBootId(): string {
   return value;
 }
 
-function readProcessStarttime(pid: number): string {
+export function readProcessStarttime(pid: number): string {
   const value = parseProcessStarttime(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
   if (value === null) throw new Error("process starttime is unavailable");
   return value;

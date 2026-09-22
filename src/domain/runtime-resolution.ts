@@ -385,3 +385,13 @@ export function resolveRuntimeProjection(options: RuntimeResolutionOptions): Dom
 
 export const resolveRuntimeResolution = resolveRuntimeProjection;
 export const resolveSessionRuntimeProjection = resolveRuntimeProjection;
+
+export const RUNTIME_RESOLUTION_SERIALIZATION_KEY = "runtime-resolution" as const;
+
+/** Serialize a validated runtime resolution under its governed document key. */
+export function serializeRuntimeResolution(input: unknown): DomainResult<string> {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return failure(new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution must be an object.", {}));
+  }
+  return success(JSON.stringify({ [RUNTIME_RESOLUTION_SERIALIZATION_KEY]: input }));
+}

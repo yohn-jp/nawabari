@@ -77,7 +77,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     summary: "Request a new Nawabari session",
     usage:
       `${CLI_NAME} session create [--branch <name>] [--worktree <path>|--worktree-root <path>] ` +
-      `[--base <ref>] [--label <text>] ` +
+      `[--base <ref>] [--label <text>] [--profile <id> --profile-parameter <json>] ` +
       `[--execution-scope-file <path> --candidate-working-set-file <path>] ` +
       `[--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
     options: [
@@ -100,6 +100,8 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
       ),
       option("--base", "Commit-resolving base ref for the new worktree", { value: "<ref>", default: "HEAD" }),
       option("--label", "Optional display label; never used as an identity", { value: "<text>", default: "omitted" }),
+      option("--profile", "Explicit worktree runtime profile selection", { value: "<id>" }),
+      option("--profile-parameter", "Typed JSON object of profile parameters; requires --profile", { value: "<json>" }),
       option(
         "--resource",
         "Initial repository-relative resource claim; repeatable, each paired with the --mode immediately after it",
@@ -299,7 +301,9 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     options: [
       option("--session", "Select the active owned session", { value: "<id>" }),
       option("--runtime-policy", "Select strict or explicit compatibility runtime visibility", {
-        value: "<strict|compatibility>", values: ["strict", "compatibility"], default: "strict",
+        value: "<strict|compatibility>",
+        values: ["strict", "compatibility"],
+        default: "strict",
       }),
     ],
   },

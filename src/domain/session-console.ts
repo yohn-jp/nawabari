@@ -35,6 +35,8 @@ import type {
   StrictRuntimePolicy,
 } from "./runtime-projection.js";
 import type { ResolvedRuntimeProfile, RuntimeProfileSelection } from "./runtime-profile.js";
+import type { ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
+import type { CompiledSessionEnvironment } from "./session-environment.js";
 import type { RuntimeResolutionFhsOptions } from "./runtime-resolution.js";
 import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
 import type { SessionBackend, SessionContext, SessionRecord } from "./session.js";
@@ -68,6 +70,25 @@ export type SessionConsoleRunner = (
   options: SandboxLauncherOptions,
 ) => Promise<DomainResult<SandboxExecutionResult>>;
 
+export type SessionConsoleProtectedLauncher = (
+  input: Readonly<{
+    readonly request: SandboxExecutionRequest;
+    readonly command: SandboxCommand;
+    readonly starting_record: SessionExecutionRecord;
+    readonly profile: ResolvedWorktreeRuntimeProfile;
+    readonly compiled_environment: CompiledSessionEnvironment;
+    readonly profile_digest: string;
+    readonly filesystem_token: string;
+  }>,
+) => Promise<
+  DomainResult<
+    Readonly<{
+      readonly execution: SessionExecutionRecord;
+      readonly result?: SandboxExecutionResult;
+    }>
+  >
+>;
+
 export type SessionConsoleEnterOptions = Readonly<{
   /** Interactive entry always requires an explicit machine session id. */
   readonly session_id: string | null;
@@ -82,6 +103,11 @@ export type SessionConsoleEnterOptions = Readonly<{
   readonly sandbox_runner?: SessionConsoleRunner;
   /** Canonical durable execution-record writer owned by the integration layer. */
   readonly persist_execution?: SessionExecutionDurableWriter;
+  /** Managed sessions must supply the #498 protected-launch composition. */
+  readonly protected_launch?: SessionConsoleProtectedLauncher;
+  /** Upper profile/environment issued by the managed bootstrap authority. */
+  readonly worktree_runtime_profile?: ResolvedWorktreeRuntimeProfile;
+  readonly compiled_session_environment?: CompiledSessionEnvironment;
   /** Optional identity inputs supplied by the execution-record owner. */
   readonly execution_id?: string;
   readonly boot_id?: string;
@@ -255,7 +281,9 @@ function updateExecution(
   return recordExecutionState(record, { state, now: now() });
 }
 
-function cgroupObservationRecord(record: SessionExecutionRecord): Parameters<typeof observeOwnedExecution>[0] {
+export function sessionExecutionObservationRecord(
+  record: SessionExecutionRecord,
+): Parameters<typeof observeOwnedExecution>[0] {
   const name = deriveCgroupScopeName(record.cgroup_identity);
   return {
     schema_version: 1,
@@ -272,6 +300,23 @@ function cgroupObservationRecord(record: SessionExecutionRecord): Parameters<typ
       boot_id: record.boot_id,
       identity: record.cgroup_identity,
     },
+  };
+}
+
+function unknownIdentityObservation(record: SessionExecutionRecord): SessionExecutionIdentityObservation {
+  return {
+    session_id: record.session_id,
+    execution_id: record.execution_id,
+    classification: "unresolved",
+    matches: false,
+    active: false,
+    expected: {
+      pid: record.supervisor_pid ?? 0,
+      starttime: record.supervisor_starttime ?? "",
+      boot_id: record.boot_id,
+      cgroup_name: deriveCgroupScopeName(record.cgroup_identity),
+    },
+    observed: null,
   };
 }
 
@@ -321,6 +366,23 @@ export async function enterSessionConsole(
     );
   }
 
+  let managed = false;
+  let managedEpoch: number | undefined;
+  if (backend.getSessionRuntimeAdmission !== undefined) {
+    const admission = await backend.getSessionRuntimeAdmission(context, sessionId.value);
+    if (!admission.ok) return admission;
+    managed = admission.value.managed;
+    managedEpoch = admission.value.runtime_epoch;
+    if (managed && admission.value.admission !== "open") {
+      return failure(
+        new DomainError("OPERATION_REJECTED", "Managed session launch admission is closed.", {
+          session_id: sessionId.value,
+          runtime_epoch: admission.value.runtime_epoch,
+        }),
+      );
+    }
+  }
+
   const executionId = options.execution_id ?? crypto.randomUUID();
   const boot = options.boot_id === undefined ? bootId() : boundedIdentity(options.boot_id, "boot_id");
   if (!boot.ok) return boot;
@@ -365,7 +427,7 @@ export async function enterSessionConsole(
       options.profile_digest ?? digest(request.value.runtime_projection?.profile ?? request.value.runtime_resolution),
     filesystem_token: options.filesystem_token ?? digest(request.value.filesystem),
     runtime_epoch:
-      options.runtime_epoch ??
+      (managedEpoch === undefined ? options.runtime_epoch : managedEpoch) ??
       request.value.runtime_resolution?.profile.version ??
       request.value.runtime_projection?.profile.version ??
       "unknown",
@@ -373,6 +435,67 @@ export async function enterSessionConsole(
     now: now(),
   });
   if (!reservation.ok) return reservation;
+
+  const command: SandboxCommand = { command: projectedShell.value.command, args: projectedShell.value.args };
+  if (managed) {
+    if (options.protected_launch === undefined) {
+      return failure(
+        new DomainError(
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "Managed execution requires the #498 protected-launch path.",
+          {
+            session_id: sessionId.value,
+          },
+        ),
+      );
+    }
+    if (options.worktree_runtime_profile === undefined || options.compiled_session_environment === undefined) {
+      return failure(
+        new DomainError(
+          "RUNTIME_MATERIALIZATION_MISSING",
+          "Managed execution requires the pinned upper profile and compiled environment.",
+          {
+            session_id: sessionId.value,
+          },
+        ),
+      );
+    }
+    const protectedResult = await options.protected_launch({
+      request: request.value,
+      command,
+      starting_record: reservation.value,
+      profile: options.worktree_runtime_profile,
+      compiled_environment: options.compiled_session_environment,
+      profile_digest: options.profile_digest ?? digest(options.worktree_runtime_profile),
+      filesystem_token: options.filesystem_token ?? digest(request.value.filesystem),
+    });
+    if (!protectedResult.ok) return protectedResult;
+    if (protectedResult.value.result === undefined) {
+      return failure(
+        new DomainError("SANDBOX_EXECUTION_FAILED", "Managed interactive launch did not produce a result.", {
+          session_id: sessionId.value,
+          execution_id: executionId,
+        }),
+      );
+    }
+    const effectiveRevision = managedEpoch ?? options.runtime_epoch ?? "unknown";
+    return success({
+      contract_id: SESSION_CONSOLE_CONTRACT_ID,
+      schema_version: SESSION_CONSOLE_SCHEMA_VERSION,
+      operation: SESSION_CONSOLE_OPERATION_ENTER,
+      session_id: sessionId.value,
+      execution_id: executionId,
+      session: session.value,
+      cwd: request.value.worktree,
+      shell: projectedShell.value,
+      prompt: prompt(sessionId.value, effectiveRevision),
+      effective_revision: effectiveRevision,
+      execution: serializeSessionExecutionRecord(protectedResult.value.execution),
+      result: protectedResult.value.result,
+      session_closed: false,
+    });
+  }
+
   const persistedStarting = await persist(options.persist_execution, reservation.value, "reserve");
   if (!persistedStarting.ok) return persistedStarting;
 
@@ -454,24 +577,32 @@ export async function listSessionProcesses(
         }),
       );
     }
-    const observation = observeExecutionIdentity(record.value, {
+    const observedIdentity = observeExecutionIdentity(record.value, {
       ...(options.identity_reader === undefined ? {} : { reader: options.identity_reader }),
     });
-    if (!observation.ok) return observation;
+    const observation = observedIdentity.ok ? observedIdentity.value : unknownIdentityObservation(record.value);
     let cgroups: OwnedExecutionObservation | null = null;
-    if (record.value.state === "attached" || record.value.state === "running" || record.value.state === "unresolved") {
-      const observe = options.observe_owned_execution ?? observeOwnedExecution;
-      const cgroupRecord = cgroupObservationRecord(record.value);
-      const cgroupObservation = observe(cgroupRecord, {
-        ...(options.cgroup_filesystem === undefined ? {} : { filesystem: options.cgroup_filesystem }),
-        ...(options.current_boot_id === undefined ? {} : { current_boot_id: options.current_boot_id }),
-      });
-      if (!cgroupObservation.ok) return cgroupObservation;
+    const observe = options.observe_owned_execution ?? observeOwnedExecution;
+    const cgroupRecord = sessionExecutionObservationRecord(record.value);
+    const cgroupObservation = observe(cgroupRecord, {
+      ...(options.cgroup_filesystem === undefined ? {} : { filesystem: options.cgroup_filesystem }),
+      ...(options.current_boot_id === undefined ? {} : { current_boot_id: options.current_boot_id }),
+    });
+    if (cgroupObservation.ok) {
       cgroups = cgroupObservation.value;
+    } else {
+      cgroups = {
+        contract_id: "nawabari.session-process-observation.v1",
+        session_id: record.value.session_id,
+        execution_id: record.value.execution_id,
+        boot_id: record.value.boot_id,
+        state: "unknown",
+        cgroups: null,
+      };
     }
     processes.push({
       execution: serializeSessionExecutionRecord(record.value),
-      observation: observation.value,
+      observation,
       cgroups,
     });
   }

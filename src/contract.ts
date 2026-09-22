@@ -73,7 +73,7 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
   id: "protected-execution",
   contract_id: SANDBOX_CONTRACT_ID,
   schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
-  commands: ["session run", "session exec", "session shell"],
+  commands: ["session run", "session exec", "session shell", "session enter", "session processes"],
   command_aliases: [{ alias: "session exec", canonical: "session run" }],
   result_schema: "sandbox-execution.v1",
   result_schema_version: SANDBOX_CONTRACT_SCHEMA_VERSION,
@@ -81,7 +81,7 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
     {
       schema: "sandbox-execution.v1",
       version: SANDBOX_CONTRACT_SCHEMA_VERSION,
-      commands: ["session run", "session exec", "session shell"],
+      commands: ["session run", "session exec", "session shell", "session enter", "session processes"],
     },
   ],
   identities: ["session_id", "repository", "worktree", "branch", "network_mode"],
@@ -102,6 +102,10 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
     compatibility: "explicit-only",
     materializers: ["nix", "fhs"],
     projection_required_when_enforced: true,
+    execution_persistence: "runtime-records.executions.v1",
+    admission_gate: "runtime-records.runtime-sessions.v1",
+    process_observation: "owned-cgroup-v2",
+    lifecycle_drain: "session-runtime-lifecycle.v1",
   },
   failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["protected-execution"],
   failure_code_policy: {

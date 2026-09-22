@@ -1,5 +1,6 @@
 import type { JsonObject, JsonValue } from "../domain/errors.js";
 import { SessionRegistryError } from "../errors.js";
+import { parsePinnedProfileRecord } from "../domain/worktree-profile-pinning.js";
 
 /**
  * Optional registry areas are deliberately a closed, versioned vocabulary.
@@ -17,14 +18,29 @@ export const REGISTRY_FEATURES = Object.freeze([
 
 export type RegistryFeature = (typeof REGISTRY_FEATURES)[number];
 
-/** No optional record authority is implemented by the registry migration. */
-export const SUPPORTED_REGISTRY_FEATURES = Object.freeze(["executions.v1"] as const);
+/** Runtime lifecycle owns the durable admission and execution record areas. */
+export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([
+  "pinned-profiles.v1",
+  "runtime-sessions.v1",
+  "executions.v1",
+] as const);
 
 export const MAX_RUNTIME_RECORDS = 256 as const;
 export const MAX_RUNTIME_RECORD_KEYS = 32 as const;
 export const MAX_UNSUPPORTED_REGISTRY_FEATURES = 8 as const;
 
 export type RuntimeRecord = Readonly<JsonObject>;
+
+export const SESSION_ADMISSION_KIND = "session-admission" as const;
+export const SESSION_ADMISSION_SCHEMA_VERSION = 1 as const;
+
+export type SessionAdmission = Readonly<{
+  readonly kind: typeof SESSION_ADMISSION_KIND;
+  readonly schema_version: typeof SESSION_ADMISSION_SCHEMA_VERSION;
+  readonly session_id: string;
+  readonly admission: "open" | "closed";
+  readonly runtime_epoch: number;
+}>;
 
 export interface RuntimeRecords {
   readonly pinned_profiles?: readonly RuntimeRecord[];
@@ -96,7 +112,22 @@ export function parseRuntimeRecords(
       );
     }
     if (!present) continue;
-    records[definition.field] = parseRecordList(input[definition.field], definition.field);
+    const parsed = parseRecordList(input[definition.field], definition.field);
+    records[definition.field] =
+      definition.feature === "runtime-sessions.v1"
+        ? parsed.map((record, index) => parseSessionAdmissionRecord(record, index))
+        : definition.feature === "pinned-profiles.v1"
+          ? parsed.map((record) => {
+              try {
+                return parsePinnedProfileRecord(record) as unknown as RuntimeRecord;
+              } catch (error: unknown) {
+                throw new SessionRegistryError(
+                  "REGISTRY_CORRUPT",
+                  error instanceof Error ? error.message : "Invalid pinned profile record",
+                );
+              }
+            })
+          : parsed;
   }
 
   return Object.freeze({
@@ -226,4 +257,39 @@ function cloneRecord(value: Record<string, unknown>): RuntimeRecord {
 
 export function registryFeatureForField(field: string): RegistryFeature | undefined {
   return FEATURE_BY_FIELD.get(field as RuntimeRecordField);
+}
+
+/** Parse the strict per-session runtime admission record. */
+export function parseSessionAdmissionRecord(value: unknown, index = 0): SessionAdmission {
+  if (!isRecord(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry runtime_sessions[${index}] must be an object`);
+  }
+  const allowed = new Set(["kind", "schema_version", "session_id", "admission", "runtime_epoch"]);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown !== undefined) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Runtime admission record contains an unsupported field", {
+      field: unknown,
+      index,
+    });
+  }
+  if (
+    value.kind !== SESSION_ADMISSION_KIND ||
+    value.schema_version !== SESSION_ADMISSION_SCHEMA_VERSION ||
+    typeof value.session_id !== "string" ||
+    value.session_id.length === 0 ||
+    value.session_id.length > 256 ||
+    value.session_id.includes("\0") ||
+    (value.admission !== "open" && value.admission !== "closed") ||
+    !Number.isSafeInteger(value.runtime_epoch) ||
+    (value.runtime_epoch as number) < 0
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Runtime admission record is invalid", { index });
+  }
+  return Object.freeze({
+    kind: SESSION_ADMISSION_KIND,
+    schema_version: SESSION_ADMISSION_SCHEMA_VERSION,
+    session_id: value.session_id,
+    admission: value.admission,
+    runtime_epoch: value.runtime_epoch as number,
+  });
 }

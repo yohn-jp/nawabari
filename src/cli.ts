@@ -51,7 +51,7 @@ import {
   STRICT_RUNTIME_POLICY,
   type RuntimePolicyMode,
 } from "./domain/runtime-projection.js";
-import { enterProtectedSession } from "./domain/session-protected-launch.js";
+import { enterProtectedSession, launchManagedProtectedSessionExecution } from "./domain/session-protected-launch.js";
 import { listSessionProcesses } from "./domain/session-console.js";
 
 const CLI_NAME = "nawabari";
@@ -136,6 +136,8 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
     "--worktree-root",
     "--base",
     "--label",
+    "--profile",
+    "--profile-parameter",
     "--resource",
     "--mode",
     "--auxiliary-state",
@@ -428,6 +430,8 @@ type ParsedOptions = {
   worktree_root: string | null;
   base: string | null;
   label: string | null;
+  profile: string | null;
+  profile_parameter: string | null;
   auxiliary_states: unknown[];
   resource: string | null;
   resources: string[];
@@ -538,6 +542,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     worktree_root: null,
     base: null,
     label: null,
+    profile: null,
+    profile_parameter: null,
     auxiliary_states: [],
     resource: null,
     resources: [],
@@ -622,7 +628,19 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     if (inlineValue === null) index += 1;
 
     if (name === "--session") options.session_id = value;
-    else if (name === "--runtime-policy") {
+    else if (name === "--profile") {
+      if (options.profile !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--profile may be supplied only once.", { option: name }));
+      }
+      options.profile = value;
+    } else if (name === "--profile-parameter") {
+      if (options.profile_parameter !== null) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--profile-parameter may be supplied only once.", { option: name }),
+        );
+      }
+      options.profile_parameter = value;
+    } else if (name === "--runtime-policy") {
       if (options.runtime_policy !== null) {
         return failure(usageError("INVALID_ARGUMENT", "--runtime-policy may be supplied only once.", { option: name }));
       }
@@ -753,6 +771,8 @@ type ClaimReplacementPairs = {
   worktree_root: string | null;
   base: string | null;
   label: string | null;
+  profile: string | null;
+  profile_parameter: string | null;
   auxiliary_states: unknown[];
   execution_scope_file: string | null;
   candidate_working_set_file: string | null;
@@ -1170,6 +1190,8 @@ function parseClaimReplacementPairs(
   let worktreeRoot: string | null = null;
   let base: string | null = null;
   let label: string | null = null;
+  let profile: string | null = null;
+  let profileParameter: string | null = null;
   const auxiliaryStates: unknown[] = [];
   let executionScopeFile: string | null = null;
   let candidateWorkingSetFile: string | null = null;
@@ -1225,6 +1247,8 @@ function parseClaimReplacementPairs(
     else if (name === "--worktree-root") worktreeRoot = value;
     else if (name === "--base") base = value;
     else if (name === "--label") label = value;
+    else if (name === "--profile") profile = value;
+    else if (name === "--profile-parameter") profileParameter = value;
     else if (name === "--auxiliary-state") {
       try {
         auxiliaryStates.push(JSON.parse(value) as unknown);
@@ -1283,6 +1307,8 @@ function parseClaimReplacementPairs(
       worktree_root: worktreeRoot,
       base,
       label,
+      profile,
+      profile_parameter: profileParameter,
       auxiliary_states: auxiliaryStates,
       execution_scope_file: executionScopeFile,
       candidate_working_set_file: candidateWorkingSetFile,
@@ -1528,8 +1554,36 @@ async function executeProtectedSessionCommand(
   );
   if (!request.ok) return request;
 
+  if (dependencies.backend.getSessionRuntimeAdmission !== undefined) {
+    const admission = await dependencies.backend.getSessionRuntimeAdmission(context, request.value.session_id);
+    if (!admission.ok) return admission;
+    if (admission.value.managed) {
+      const managed = await launchManagedProtectedSessionExecution(context, dependencies.backend, request.value, {
+        command: executable.value,
+        args: arguments_.slice(delimiter + 2),
+      });
+      if (!managed.ok) return managed;
+      if (managed.value.result === undefined) {
+        return failure(
+          new DomainError("SANDBOX_EXECUTION_FAILED", "Managed protected launch did not produce a result.", {
+            session_id: request.value.session_id,
+          }),
+        );
+      }
+      return {
+        ok: true,
+        value: {
+          ...(managed.value.result as unknown as JsonObject),
+          ...(request.value.runtime_resolution === undefined
+            ? {}
+            : { runtime_resolution: request.value.runtime_resolution }),
+        },
+      };
+    }
+  }
+
   // `sandboxRunner` is an injection seam for unit tests. Production always
-  // reaches the canonical protected launcher exported by #145.
+  // reaches the canonical protected launcher for legacy sessions.
   const runner = dependencies.sandboxRunner ?? runSandboxedCommand;
   const result = await runner(
     request.value,
@@ -1741,12 +1795,38 @@ async function executeCommand(
         executionScope = execution.value;
         candidateWorkingSet = candidate.value;
       }
+      let profile: SessionCreateOptions["profile"];
+      if (parsed.value.profile_parameter !== null && parsed.value.profile === null) {
+        return failure(usageError("INVALID_ARGUMENT", "--profile-parameter requires --profile."));
+      }
+      if (parsed.value.profile !== null) {
+        let parameters: unknown = {};
+        if (parsed.value.profile_parameter !== null) {
+          try {
+            parameters = JSON.parse(parsed.value.profile_parameter) as unknown;
+          } catch (error: unknown) {
+            return failure(
+              usageError("INVALID_ARGUMENT", "--profile-parameter requires valid JSON.", {
+                reason: error instanceof Error ? error.message : "invalid JSON",
+              }),
+            );
+          }
+          if (parameters === null || typeof parameters !== "object" || Array.isArray(parameters)) {
+            return failure(usageError("INVALID_ARGUMENT", "--profile-parameter requires a JSON object."));
+          }
+        }
+        profile = {
+          selection: { profile: parsed.value.profile },
+          parameters: parameters as import("./domain/errors.js").JsonObject,
+        };
+      }
       const options: SessionCreateOptions = {
         branch: parsed.value.branch,
         worktree: parsed.value.worktree,
         worktree_root: parsed.value.worktree_root,
         base: parsed.value.base,
         label: parsed.value.label,
+        ...(profile === undefined ? {} : { profile }),
         ...(parsed.value.pairs.length === 0
           ? {}
           : {

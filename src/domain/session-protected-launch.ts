@@ -1,5 +1,11 @@
+import crypto from "node:crypto";
+import path from "node:path";
+import fs from "node:fs";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import {
+  compileSessionEnvironment,
   materializeSessionRuntimeDirectories,
   validateSessionRuntimeDirectoryManifest,
   type CompiledSessionEnvironment,
@@ -10,7 +16,9 @@ import {
   type ExecutionAdmissionReservation,
 } from "./session-admission-decision.js";
 import {
+  readProcessStarttime,
   recordExecutionState,
+  reserveExecution,
   serializeSessionExecutionRecord,
   validateSessionExecutionRecord,
   type PersistedSessionExecutionRecord,
@@ -35,9 +43,15 @@ import {
   type SandboxInvocation,
 } from "./sandbox-launcher.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
+import { CGROUPS_V2_ROOT } from "./cgroups-v2.js";
+import { SessionRegistry } from "../session-registry.js";
 import { validateWorktreeRuntimeProfile, type ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 import type { SessionBackend, SessionContext } from "./session.js";
-import { enterSessionConsole, type SessionConsoleEnterOptions } from "./session-console.js";
+import {
+  enterSessionConsole,
+  type SessionConsoleEnterOptions,
+  type SessionConsoleProtectedLauncher,
+} from "./session-console.js";
 
 export {
   resolveSandboxExecutionRequest,
@@ -51,6 +65,7 @@ export {
   listSessionProcesses,
   type SessionConsoleEnterOptions,
   type SessionConsoleProcessesOptions,
+  type SessionConsoleProtectedLauncher,
   type SessionConsoleRunner,
 } from "./session-console.js";
 
@@ -419,7 +434,138 @@ export async function launchProtectedSessionExecution(
   return success({ supervisor: supervised.value, execution: persistedTerminal.value });
 }
 
-/** Protected launch composition consumed by the session-enter integration. */
+function runtimeIdentityDigest(value: unknown): string {
+  return crypto.createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+}
+
+function currentBootId(): DomainResult<string> {
+  try {
+    const value = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    if (value.length === 0 || value.length > 256 || value.includes("\0")) {
+      return failure(new DomainError("PHYSICAL_OBSERVATION_UNAVAILABLE", "The kernel boot identity is invalid.", {}));
+    }
+    return success(value);
+  } catch (error: unknown) {
+    return failure(
+      new DomainError("PHYSICAL_OBSERVATION_UNAVAILABLE", "The kernel boot identity could not be observed.", {
+        reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+      }),
+    );
+  }
+}
+
+/** Route one managed run/exec/shell request through the accepted #498 launch. */
+export async function launchManagedProtectedSessionExecution(
+  context: SessionContext,
+  backend: SessionBackend,
+  request: SandboxExecutionRequest,
+  command: SandboxCommand,
+): Promise<DomainResult<SessionProtectedLaunchResult>> {
+  if (
+    backend.getSessionRuntimeAdmission === undefined ||
+    backend.getSessionRuntimeProfile === undefined ||
+    backend.persistSessionExecution === undefined
+  ) {
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "Managed execution authorities are unavailable.", {
+        session_id: request.session_id,
+      }),
+    );
+  }
+  const admission = await backend.getSessionRuntimeAdmission(context, request.session_id);
+  if (!admission.ok) return admission;
+  if (!admission.value.managed) {
+    return failure(
+      new DomainError("OPERATION_REJECTED", "The managed protected-launch path requires a managed session.", {
+        session_id: request.session_id,
+      }),
+    );
+  }
+  if (admission.value.admission !== "open") {
+    return failure(
+      new DomainError("OPERATION_REJECTED", "Managed session launch admission is closed.", {
+        session_id: request.session_id,
+        runtime_epoch: admission.value.runtime_epoch,
+      }),
+    );
+  }
+  const profile = await backend.getSessionRuntimeProfile(context, request.session_id);
+  if (!profile.ok) return profile;
+  const validatedProfile = validateWorktreeRuntimeProfile(profile.value.profile);
+  if (!validatedProfile.ok) return validatedProfile;
+  const session = await backend.getSession(context, request.session_id);
+  if (!session.ok) return session;
+  const executionId = crypto.randomUUID();
+  const boot = currentBootId();
+  if (!boot.ok) return boot;
+  const ownerUid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const ownerGid = typeof process.getgid === "function" ? process.getgid() : 0;
+  const environment = compileSessionEnvironment(validatedProfile.value, {
+    session_id: request.session_id,
+    execution_id: executionId,
+    session_root: path.join(session.value.worktree, ".nawabari", "runtime", "session"),
+    execution_root: path.join(session.value.worktree, ".nawabari", "runtime", "executions", executionId),
+    owner_uid: ownerUid,
+    owner_gid: ownerGid,
+  });
+  if (!environment.ok) return environment;
+  const filesystemToken = runtimeIdentityDigest(request.filesystem);
+  const starting = reserveExecution({
+    session_id: request.session_id,
+    execution_id: executionId,
+    profile_digest: profile.value.digest,
+    filesystem_token: filesystemToken,
+    runtime_epoch: admission.value.runtime_epoch,
+    boot_id: boot.value,
+  });
+  if (!starting.ok) return starting;
+  const snapshot = {
+    lifecycle: "active" as const,
+    launch_permitted: true,
+    profile_token: profile.value.digest,
+    profile_revision: 1,
+    filesystem_token: filesystemToken,
+    filesystem_revision: 1,
+    generation: 1,
+    epoch: admission.value.runtime_epoch,
+  };
+  return launchProtectedSessionExecution(
+    {
+      profile: validatedProfile.value,
+      compiled_environment: environment.value,
+      request: { ...request, cgroups: { ...(request.cgroups ?? { required: true }), execution_id: executionId } },
+      command,
+      admission: {
+        session_id: request.session_id,
+        execution_id: executionId,
+        current: snapshot,
+        expected: snapshot,
+      },
+      starting_record: starting.value,
+      supervisor: {
+        trusted: {
+          entrypoint: fileURLToPath(new URL("./session-launch-supervisor-worker.js", import.meta.url)),
+          cwd: path.dirname(fileURLToPath(new URL("./session-launch-supervisor-worker.js", import.meta.url))),
+          node_executable: process.execPath,
+        },
+        cgroup: { required: true, root: CGROUPS_V2_ROOT },
+      },
+    },
+    {
+      materializeSessionRuntimeDirectories,
+      compileSandboxInvocation,
+      runSessionLaunchSupervisor,
+      persist_execution: async (record) => {
+        const result = await backend.persistSessionExecution!(context, record);
+        if (!result.ok) throw result.error;
+      },
+      read_process_starttime: readProcessStarttime,
+      read_runtime_epoch: () => new SessionRegistry({ cwd: context.cwd }).runtimeEpoch,
+    },
+  );
+}
+
+/** Protected launch composition consumed by session enter and ordinary commands. */
 export async function enterProtectedSession(
   context: SessionContext,
   backend: SessionBackend,
@@ -428,13 +574,107 @@ export async function enterProtectedSession(
   if (backend.persistSessionExecution === undefined) {
     throw new Error("Protected session launch requires durable execution persistence");
   }
+  const persist_execution =
+    options.persist_execution ??
+    (async (record: PersistedSessionExecutionRecord) => {
+      const result = await backend.persistSessionExecution!(context, record);
+      if (!result.ok) throw result.error;
+    });
+
+  let managed = false;
+  let managedProfile: ResolvedWorktreeRuntimeProfile | undefined = options.worktree_runtime_profile;
+  let compiledEnvironment = options.compiled_session_environment;
+  let executionId = options.execution_id ?? crypto.randomUUID();
+  if (backend.getSessionRuntimeAdmission !== undefined) {
+    const admission = await backend.getSessionRuntimeAdmission(context, options.session_id ?? "");
+    if (!admission.ok) return admission;
+    managed = admission.value.managed;
+    if (managed) {
+      if (backend.getSessionRuntimeProfile === undefined) {
+        return failure(
+          new DomainError("RUNTIME_MATERIALIZATION_MISSING", "Managed session profile authority is unavailable.", {}),
+        );
+      }
+      const profile = await backend.getSessionRuntimeProfile(context, options.session_id ?? "");
+      if (!profile.ok) return profile;
+      const validated = validateWorktreeRuntimeProfile(profile.value.profile);
+      if (!validated.ok) return validated;
+      managedProfile = validated.value;
+      const session = await backend.getSession(context, options.session_id ?? "");
+      if (!session.ok) return session;
+      const ownerUid = typeof process.getuid === "function" ? process.getuid() : 0;
+      const ownerGid = typeof process.getgid === "function" ? process.getgid() : 0;
+      const compiled = compileSessionEnvironment(managedProfile, {
+        session_id: options.session_id ?? "",
+        execution_id: executionId,
+        session_root: path.join(session.value.worktree, ".nawabari", "runtime", "session"),
+        execution_root: path.join(session.value.worktree, ".nawabari", "runtime", "executions", executionId),
+        owner_uid: ownerUid,
+        owner_gid: ownerGid,
+      });
+      if (!compiled.ok) return compiled;
+      compiledEnvironment = compiled.value;
+      options = { ...options, execution_id: executionId, runtime_epoch: admission.value.runtime_epoch };
+    }
+  }
+
+  const protected_launch: SessionConsoleProtectedLauncher | undefined =
+    options.protected_launch ??
+    (managed && managedProfile !== undefined && compiledEnvironment !== undefined
+      ? async (input) => {
+          const epoch =
+            typeof input.starting_record.runtime_epoch === "number" ? input.starting_record.runtime_epoch : 0;
+          const snapshot = {
+            lifecycle: "active" as const,
+            launch_permitted: true,
+            profile_token: input.profile_digest,
+            profile_revision: 1,
+            filesystem_token: input.filesystem_token,
+            filesystem_revision: 1,
+            generation: 1,
+            epoch,
+          };
+          const result = await launchProtectedSessionExecution(
+            {
+              profile: input.profile,
+              compiled_environment: input.compiled_environment,
+              request: input.request,
+              command: input.command,
+              admission: {
+                session_id: input.starting_record.session_id,
+                execution_id: input.starting_record.execution_id,
+                current: snapshot,
+                expected: snapshot,
+              },
+              starting_record: input.starting_record,
+              supervisor: {
+                trusted: {
+                  entrypoint: fileURLToPath(new URL("./session-launch-supervisor-worker.js", import.meta.url)),
+                  cwd: path.dirname(fileURLToPath(new URL("./session-launch-supervisor-worker.js", import.meta.url))),
+                  node_executable: process.execPath,
+                },
+                cgroup: { required: true, root: CGROUPS_V2_ROOT },
+              },
+            },
+            {
+              materializeSessionRuntimeDirectories,
+              compileSandboxInvocation,
+              runSessionLaunchSupervisor,
+              persist_execution,
+              read_process_starttime: readProcessStarttime,
+              read_runtime_epoch: () => new SessionRegistry({ cwd: context.cwd }).runtimeEpoch,
+            },
+          );
+          if (!result.ok) return result;
+          return success({ execution: result.value.execution, result: result.value.result });
+        }
+      : undefined);
+
   return enterSessionConsole(context, backend, {
     ...options,
-    persist_execution:
-      options.persist_execution ??
-      (async (record) => {
-        const result = await backend.persistSessionExecution!(context, record);
-        if (!result.ok) throw result.error;
-      }),
+    ...(managedProfile === undefined ? {} : { worktree_runtime_profile: managedProfile }),
+    ...(compiledEnvironment === undefined ? {} : { compiled_session_environment: compiledEnvironment }),
+    ...(protected_launch === undefined ? {} : { protected_launch }),
+    persist_execution,
   });
 }

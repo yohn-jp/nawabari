@@ -6,10 +6,7 @@ import type {
 } from "../session-lifecycle-classification.js";
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
-import type {
-  PersistedSessionExecutionRecord,
-  SessionExecutionStateInput,
-} from "./session-execution-record.js";
+import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -54,6 +51,12 @@ export type SessionCreateOptions = {
   candidate_working_set?: unknown | null;
   /** Optional repository identity used by the transport-neutral working-set contract. */
   working_set_repository?: RepositoryIdentity | null;
+  /** Upper worktree runtime profile selection pinned during managed bootstrap. */
+  profile?: {
+    selection: { profile: string };
+    parameters?: JsonObject;
+    provenance?: { catalog?: { path?: string; blob_oid?: string } };
+  } | null;
 };
 
 export type WorkingSetExpansionOptions = {
@@ -846,6 +849,12 @@ export type RegistryMigrationResult = {
   claim_schema_version: number;
 };
 
+export type SessionRuntimeAdmission = {
+  admission: "open" | "closed";
+  runtime_epoch: number;
+  managed: boolean;
+};
+
 export interface SessionBackend {
   createSession(context: SessionContext, options: SessionCreateOptions): Promise<DomainResult<SessionRecord>>;
   resolveCurrentSession(context: SessionContext): Promise<DomainResult<SessionRecord>>;
@@ -890,10 +899,37 @@ export interface SessionBackend {
     sessionId: string | null,
   ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation: number }>>;
   migrate?(context: SessionContext): Promise<DomainResult<RegistryMigrationResult>>;
-  listSessionExecutions?(context: SessionContext, sessionId: string): Promise<DomainResult<readonly PersistedSessionExecutionRecord[]>>;
-  persistSessionExecution?(context: SessionContext, record: PersistedSessionExecutionRecord): Promise<DomainResult<PersistedSessionExecutionRecord>>;
-  transitionSessionExecution?(context: SessionContext, executionId: string, input: SessionExecutionStateInput): Promise<DomainResult<PersistedSessionExecutionRecord>>;
-  closeSessionLaunchAdmission?(context: SessionContext, sessionId: string, expectedEpoch: number): Promise<DomainResult<{ runtimeEpoch: number }>>;
+  listSessionExecutions?(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<DomainResult<readonly PersistedSessionExecutionRecord[]>>;
+  persistSessionExecution?(
+    context: SessionContext,
+    record: PersistedSessionExecutionRecord,
+  ): Promise<DomainResult<PersistedSessionExecutionRecord>>;
+  transitionSessionExecution?(
+    context: SessionContext,
+    executionId: string,
+    input: SessionExecutionStateInput,
+  ): Promise<DomainResult<PersistedSessionExecutionRecord>>;
+  closeSessionLaunchAdmission?(
+    context: SessionContext,
+    sessionId: string,
+    expectedEpoch: number,
+  ): Promise<DomainResult<{ runtimeEpoch: number }>>;
+  getSessionRuntimeAdmission?(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<DomainResult<SessionRuntimeAdmission>>;
+  getSessionRuntimeProfile?(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<
+    DomainResult<{
+      digest: string;
+      profile: JsonObject;
+    }>
+  >;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {
