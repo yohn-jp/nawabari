@@ -39,6 +39,47 @@ test("maps fixed attention codes and severity, with deterministic evidence ident
   assert.equal(result.value[0]?.identity, JSON.stringify(["coordination-blocked", "session-a", "src/a.ts", "7"]));
 });
 
+test("keeps v2 policy and runtime evidence independent", () => {
+  const current = snapshot({
+    filesystemValue: {
+      contract_id: "nawabari.repository-filesystem-observation.v2",
+      schema_version: 2,
+      sessions: [
+        {
+          session_id: "session-a",
+          policy_status: "violation",
+          runtime_status: "runtime-residual",
+          owner: "proven",
+          reason: "outside policy",
+        },
+      ],
+      unmanaged_worktrees: [],
+    },
+    lifecycleValue: {
+      contract_id: "nawabari.repository-lifecycle-observation.v2",
+      schema_version: 2,
+      sessions: [
+        {
+          session_id: "session-a",
+          state: "stale-inconsistent",
+          physical_state: "present",
+          recoverable_work: "unknown",
+          integration: "unknown",
+          cleanup: "unknown",
+          reason: "stale",
+        },
+      ],
+    },
+  });
+  const result = projectSessionAttention(current);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(
+    result.value.map(({ code }) => code),
+    ["policy-violation", "runtime-drift"],
+  );
+});
+
 test("redacts arbitrary repository content from agent runtime status", () => {
   const result = projectAgentRuntimeStatus(
     snapshot({
@@ -114,6 +155,8 @@ interface FixtureOptions {
   readonly processes?: readonly Record<string, unknown>[];
   readonly filesystem?: readonly Record<string, unknown>[];
   readonly lifecycle?: readonly Record<string, unknown>[];
+  readonly filesystemValue?: Record<string, unknown>;
+  readonly lifecycleValue?: Record<string, unknown>;
 }
 
 function snapshot(options: FixtureOptions = {}): RepositoryRuntimeSnapshot {
@@ -135,16 +178,20 @@ function snapshot(options: FixtureOptions = {}): RepositoryRuntimeSnapshot {
       schema_version: 1,
       sessions: options.processes ?? [],
     }),
-    filesystem: available({
-      contract_id: "nawabari.repository-filesystem-observation.v1",
-      schema_version: 1,
-      sessions: options.filesystem ?? [],
-    }),
-    lifecycle: available({
-      contract_id: "nawabari.repository-lifecycle-observation.v1",
-      schema_version: 1,
-      sessions: options.lifecycle ?? [],
-    }),
+    filesystem: available(
+      options.filesystemValue ?? {
+        contract_id: "nawabari.repository-filesystem-observation.v1",
+        schema_version: 1,
+        sessions: options.filesystem ?? [],
+      },
+    ),
+    lifecycle: available(
+      options.lifecycleValue ?? {
+        contract_id: "nawabari.repository-lifecycle-observation.v1",
+        schema_version: 1,
+        sessions: options.lifecycle ?? [],
+      },
+    ),
   };
   const result = getNawabariRepositoryRuntimeSnapshot(input);
   assert.equal(result.ok, true);
