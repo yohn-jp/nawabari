@@ -1046,13 +1046,16 @@ function runtimeFinalizationEvidence(
   runtimeObservation: LocalSessionBackendOptions["runtime_observation"],
   mutation: SessionRuntimeLifecycleMutation,
 ) {
+  // Admission is already durably closed by the drain producer. Observe the
+  // owned kernel scopes immediately before entering the registry mutation;
+  // the locked writer then binds this evidence to the unchanged admission
+  // epoch, so no physical I/O or callback runs while RepositoryLock is held.
+  const snapshot = readRuntimeSnapshot(registry, runtimeObservation, mutation.session_id);
   return {
     expectedEpoch: Number(mutation.fence.expected_epoch),
     admissionEpoch: Number(mutation.fence.admission_epoch),
-    revalidate: () => {
-      const snapshot = readRuntimeSnapshot(registry, runtimeObservation, mutation.session_id);
-      return { runtimeEpoch: snapshot.runtime_epoch as number, kernelEmpty: snapshot.kernel_empty };
-    },
+    observedRuntimeEpoch: Number(snapshot.runtime_epoch),
+    kernelEmpty: snapshot.kernel_empty,
   };
 }
 
