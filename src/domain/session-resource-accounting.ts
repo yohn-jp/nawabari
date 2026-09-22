@@ -2,6 +2,7 @@ import {
   CGROUPS_V2_ROOT,
   deriveCgroupScopeName,
   readCgroupAccounting,
+  readCgroupPopulation,
   type CgroupAccounting,
   type CgroupFileSystem,
   type CgroupScope,
@@ -150,6 +151,14 @@ export function projectSessionResourceAccounting(
         };
       }
     } catch {
+      return {
+        execution_id: record.execution_id,
+        status: "unavailable",
+        accounting: null,
+        reason: "cgroup-unavailable",
+      };
+    }
+    if (readCgroupPopulation(scope, options.filesystem).state === "unknown") {
       return {
         execution_id: record.execution_id,
         status: "unavailable",

@@ -19,7 +19,8 @@ function fixture(id: string, files: Record<string, string>) {
   const filesystem: CgroupFileSystem = {
     statSync: () => ({ isDirectory: () => true, isFile: () => true }),
     realpathSync: (file) => file,
-    readFileSync: (file) => files[file] ?? files[file.split("/").pop() ?? file] ?? "",
+    readFileSync: (file) =>
+      files[file] ?? files[file.split("/").pop() ?? file] ?? (file.endsWith("cgroup.events") ? "populated 0\n" : ""),
     writeFileSync: () => {},
     mkdirSync: () => {},
     rmdirSync: () => {},
@@ -84,4 +85,74 @@ test("sorts and bounds entries", () => {
     ["a", "b"],
   );
   assert.equal(result.aggregate.memory_peak_bytes, null);
+});
+
+test("classifies missing scopes, unreadable accounting, and bad ownership", () => {
+  const entry = fixture("c", { "cpu.stat": "bad", "memory.current": "bad" });
+  const missing = projectSessionResourceAccounting([entry.record], {
+    filesystem: { ...entry.filesystem, statSync: () => ({ isDirectory: () => false, isFile: () => false }) },
+    observations: new Map([["c", entry.observation]]),
+    scopes: new Map([["c", entry.scope]]),
+  });
+  assert.equal(missing.entries[0]?.reason, "cgroup-unavailable");
+  const unreadable = projectSessionResourceAccounting([entry.record], {
+    filesystem: entry.filesystem,
+    observations: new Map([["c", entry.observation]]),
+    scopes: new Map([["c", entry.scope]]),
+  });
+  assert.equal(unreadable.entries[0]?.reason, "accounting-unreadable");
+  const bad = projectSessionResourceAccounting([entry.record], {
+    filesystem: entry.filesystem,
+    observations: new Map([["c", { ...entry.observation, matches: false, classification: "different-cgroup" }]]),
+    scopes: new Map([["c", entry.scope]]),
+  });
+  assert.equal(bad.entries[0]?.reason, "identity-unverified");
+});
+
+test("keeps partial aggregates incomplete and aggregates boolean events", () => {
+  const first = fixture("d", {
+    "cpu.stat": "usage_usec 1\nuser_usec 1\nsystem_usec 1\nthrottled_usec 1\n",
+    "memory.current": "2",
+    "memory.peak": "9",
+    "pids.current": "3",
+    "memory.events": "oom_kill 1\nmax 0\n",
+    "pids.events": "max 1\n",
+  });
+  const second = fixture("e", {
+    "cpu.stat": "usage_usec 4\nuser_usec 4\nsystem_usec 4\nthrottled_usec 0\n",
+    "memory.current": "5",
+    "memory.peak": "12",
+    "pids.current": "6",
+    "memory.events": "oom_kill 0\nmax 1\n",
+    "pids.events": "max 1\n",
+  });
+  const options = {
+    filesystem: first.filesystem,
+    observations: new Map([
+      ["d", first.observation],
+      ["e", second.observation],
+    ]),
+    scopes: new Map([
+      ["d", first.scope],
+      ["e", second.scope],
+    ]),
+  };
+  const result = projectSessionResourceAccounting([first.record, second.record], options);
+  assert.equal(result.aggregate.cpu_usage_usec, 2);
+  assert.equal(result.aggregate.memory_peak_bytes, null);
+  assert.equal(result.aggregate.memory_limit_exceeded, true);
+  assert.equal(result.aggregate.pids_limit_exceeded, true);
+});
+
+test("bounds more than 256 persisted records", () => {
+  const entry = fixture("f", { "cpu.stat": "usage_usec 1\n" });
+  const records = Array.from({ length: 257 }, () => entry.record);
+  const result = projectSessionResourceAccounting(records, {
+    filesystem: entry.filesystem,
+    observations: new Map([["f", entry.observation]]),
+    scopes: new Map([["f", entry.scope]]),
+  });
+  assert.equal(result.entries.length, 256);
+  assert.equal(result.truncated, true);
+  assert.equal(result.aggregate.complete, false);
 });
