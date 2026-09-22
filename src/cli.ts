@@ -34,6 +34,8 @@ import { isResourceClaimMode } from "./resource-claims.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
+import { repositoryScreenModelFromRuntimeSnapshot } from "./ui/repository-terminal.js";
+import type { RepositoryScreenModel } from "./ui/repository-screen.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
 import {
   resolveSandboxExecutionRequest,
@@ -2457,4 +2459,19 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   } catch {
     return emitFailure(mode, command, new DomainError("INTERNAL_ERROR", "An unexpected internal error occurred."), io);
   }
+}
+
+/** Read the canonical repository projection for CLI/TUI callers. */
+export async function repositoryRuntimeUiModel(
+  dependencies: Required<Pick<CliDependencies, "backend" | "cwd">>,
+): Promise<DomainResult<RepositoryScreenModel>> {
+  if (dependencies.backend.repositoryRuntimeSnapshot === undefined) {
+    return failure(
+      new DomainError("BACKEND_UNAVAILABLE", "Repository runtime snapshot capability is not available.", {
+        operation: "repository.ui",
+      }),
+    );
+  }
+  const snapshot = await dependencies.backend.repositoryRuntimeSnapshot(sessionContext(dependencies.cwd));
+  return snapshot.ok ? { ok: true, value: repositoryScreenModelFromRuntimeSnapshot(snapshot.value) } : snapshot;
 }

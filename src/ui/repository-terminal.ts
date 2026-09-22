@@ -9,6 +9,33 @@ import {
   type RepositoryScreenView,
   type RepositoryScreenViewport,
 } from "./repository-screen.js";
+import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
+
+/** Map one canonical runtime snapshot into the screen's projection-only model. */
+export function repositoryScreenModelFromRuntimeSnapshot(snapshot: RepositoryRuntimeSnapshot): RepositoryScreenModel {
+  const observations = snapshot.observations;
+  return {
+    snapshot_token: `${snapshot.registry.revision}:${snapshot.registry.claim_set_generation}`,
+    sessions: snapshot.sessions.map((session) => ({
+      session_id: session.sessionId,
+      branch: session.branchName,
+      state: session.state,
+      worktree: session.worktreePath,
+    })),
+    files: observations.filesystem.status === "available" ? observations.filesystem.value : [],
+    matrix: observations.coordination.status === "available" ? observations.coordination.value : [],
+    attention: observations.lifecycle.status === "available" ? observations.lifecycle.value : [],
+    runtime: observations.profiles.status === "available" ? observations.profiles.value : [],
+    conflicts: snapshot.claims.map((claim) => ({
+      claim_id: claim.claimId,
+      resource: claim.resource,
+      session_id: claim.sessionId,
+      mode: claim.mode,
+    })),
+    truncated: !snapshot.complete,
+    next_cursor: null,
+  };
+}
 
 export type RepositoryTerminalInput = NodeJS.ReadableStream & {
   readonly isTTY?: boolean;

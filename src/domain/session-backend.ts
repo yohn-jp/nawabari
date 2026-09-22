@@ -68,6 +68,7 @@ import {
   type UpdateClaimsOptions,
 } from "./session.js";
 import type { SandboxGitIdentity } from "./sandbox.js";
+import { getNawabariRepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
@@ -180,6 +181,21 @@ export class LocalSessionBackend implements SessionBackend {
     this.git = options.git;
     this.gitIdentity = options.gitIdentity;
     this.registryOptions = options.registry ?? {};
+  }
+
+  /** Project the registry's canonical read view without mutating state. */
+  public async repositoryRuntimeSnapshot(
+    context: SessionContext,
+  ): Promise<DomainResult<import("../repository-runtime-snapshot.js").RepositoryRuntimeSnapshot>> {
+    try {
+      const registry = this.registryFor(context);
+      return getNawabariRepositoryRuntimeSnapshot({
+        registry: registry.readRepositoryView(),
+        captured_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      return failure(toDomainError(error));
+    }
   }
 
   public async createSession(
