@@ -1580,9 +1580,18 @@ async function executeCommand(
       }
       const result = await enterProtectedSession(context, dependencies.backend, {
         session_id: parsed.value.session_id,
-        ...(parsed.value.runtime_policy === null ? {} : { runtime_policy: parsed.value.runtime_policy }),
+        ...(parsed.value.runtime_policy === null
+          ? {}
+          : {
+              runtime_policy:
+                parsed.value.runtime_policy === "compatibility"
+                  ? EXPLICIT_COMPATIBILITY_RUNTIME_POLICY
+                  : STRICT_RUNTIME_POLICY,
+            }),
         ...(dependencies.sandboxProbe === undefined ? {} : { sandbox_probe: dependencies.sandboxProbe }),
-        ...(dependencies.sandboxRuntimeLayout === undefined ? {} : { sandbox_runtime_layout: dependencies.sandboxRuntimeLayout }),
+        ...(dependencies.sandboxRuntimeLayout === undefined
+          ? {}
+          : { sandbox_runtime_layout: dependencies.sandboxRuntimeLayout }),
         ...(dependencies.sandboxRunner === undefined ? {} : { sandbox_runner: dependencies.sandboxRunner }),
         persist_execution: async (record) => {
           const persisted = await dependencies.backend.persistSessionExecution!(context, record);
@@ -1596,14 +1605,17 @@ async function executeCommand(
       if (!parsed.ok) return parsed;
       const sessionId = parsed.value.session_id;
       if (sessionId === null || dependencies.backend.listSessionExecutions === undefined) {
-        return failure(usageError("MISSING_ARGUMENT", "session processes requires --session and execution persistence."));
+        return failure(
+          usageError("MISSING_ARGUMENT", "session processes requires --session and execution persistence."),
+        );
       }
       const result = await listSessionProcesses(context, dependencies.backend, {
         session_id: sessionId,
-        read_executions: (id) => dependencies.backend.listSessionExecutions!(context, id).then((value) => {
-          if (!value.ok) throw value.error;
-          return value.value;
-        }),
+        read_executions: (id) =>
+          dependencies.backend.listSessionExecutions!(context, id).then((value) => {
+            if (!value.ok) throw value.error;
+            return value.value;
+          }),
       });
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }

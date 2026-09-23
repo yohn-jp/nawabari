@@ -22,6 +22,17 @@ import {
 } from "./sandbox-seccomp.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import {
+  SESSION_RUNTIME_LOGICAL_CACHE_HOME,
+  SESSION_RUNTIME_LOGICAL_CONFIG_HOME,
+  SESSION_RUNTIME_LOGICAL_DATA_HOME,
+  SESSION_RUNTIME_LOGICAL_HOME,
+  SESSION_RUNTIME_LOGICAL_STATE_HOME,
+  SESSION_RUNTIME_LOGICAL_TMPDIR,
+  validateSessionRuntimeDirectoryManifest,
+  type CompiledSessionEnvironment,
+  type SessionRuntimeDirectoryManifest,
+} from "./session-environment.js";
+import {
   CANONICAL_EXECUTABLE_ROOT,
   compileRuntimeExecutableProjection,
   type RuntimeExecutableProjectionEntry,
@@ -46,10 +57,13 @@ import {
   type CgroupScope,
 } from "./cgroups-v2.js";
 
-const SANDBOX_HOME = "/home/nawabari";
-const SANDBOX_CONFIG_HOME = `${SANDBOX_HOME}/.config`;
-const SANDBOX_LOCAL_HOME = `${SANDBOX_HOME}/.local`;
-const SANDBOX_CACHE_HOME = `${SANDBOX_HOME}/.cache`;
+const SANDBOX_HOME = SESSION_RUNTIME_LOGICAL_HOME;
+const SANDBOX_CONFIG_HOME = SESSION_RUNTIME_LOGICAL_CONFIG_HOME;
+const SANDBOX_LOCAL_HOME = "/home/nawabari/.local";
+const SANDBOX_CACHE_HOME = SESSION_RUNTIME_LOGICAL_CACHE_HOME;
+const SANDBOX_DATA_HOME = SESSION_RUNTIME_LOGICAL_DATA_HOME;
+const SANDBOX_STATE_HOME = SESSION_RUNTIME_LOGICAL_STATE_HOME;
+const SANDBOX_TMPDIR = SESSION_RUNTIME_LOGICAL_TMPDIR;
 const SANDBOX_SHARED_HOME = `${SANDBOX_HOME}/.nawabari`;
 const COMPATIBILITY_USER_TOOL_TARGETS = new Set([
   `${SANDBOX_LOCAL_HOME}/bin`,
@@ -215,7 +229,138 @@ function preparePrivateDirectory(candidate: string, repository: string, label: s
   return canonicalPath(candidate, label);
 }
 
-function validateTopology(request: SandboxExecutionRequest): DomainResult<ValidatedTopology> {
+function canonicalMaterializedDirectory(candidate: string, label: string): DomainResult<string> {
+  if (
+    !path.isAbsolute(candidate) ||
+    candidate.includes("\0") ||
+    path.normalize(candidate) !== candidate ||
+    candidate === "/"
+  ) {
+    return topologyError(`${label} must be a canonical absolute path.`, { label, path: candidate });
+  }
+  try {
+    const stat = fs.lstatSync(candidate);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      return topologyError(`${label} must be a real directory, not a symlink.`, { label, path: candidate });
+    }
+    if ((stat.mode & 0o777) !== 0o700) {
+      return topologyError(`${label} must have private mode 0700.`, { label, path: candidate });
+    }
+    if (fs.realpathSync.native(candidate) !== candidate) {
+      return topologyError(`${label} must resolve without a symlink.`, { label, path: candidate });
+    }
+    return success(candidate);
+  } catch (error: unknown) {
+    return topologyError(`${label} is not a materialized directory.`, {
+      label,
+      path: candidate,
+      reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+    });
+  }
+}
+
+const COMPILED_SESSION_ENVIRONMENT_KEYS = new Set([
+  "PATH",
+  "SHELL",
+  "HOME",
+  "TMPDIR",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "GIT_CONFIG_NOSYSTEM",
+  "GIT_CONFIG_GLOBAL",
+  "TERM",
+]);
+
+function validateCompiledSessionEnvironment(
+  request: SandboxExecutionRequest,
+): DomainResult<CompiledSessionEnvironment | null> {
+  const supplied = request.compiled_session_environment;
+  if (supplied === undefined) return success(null);
+  const manifest = validateSessionRuntimeDirectoryManifest(supplied.manifest);
+  if (!manifest.ok) return failure(manifest.error);
+  if (manifest.value.session_id !== request.session_id) {
+    return topologyError("The compiled session environment belongs to a different session.", {
+      request_session_id: request.session_id,
+      manifest_session_id: manifest.value.session_id,
+    });
+  }
+  if (request.cgroups !== undefined && request.cgroups.execution_id !== manifest.value.execution_id) {
+    return topologyError("The compiled session environment execution identity differs from the request.", {
+      request_execution_id: request.cgroups.execution_id,
+      manifest_execution_id: manifest.value.execution_id,
+    });
+  }
+  const paths = [
+    ["session root", manifest.value.session.root.path],
+    ["session home", manifest.value.session.home.path],
+    ["session config", manifest.value.session.xdg.config.path],
+    ["session cache", manifest.value.session.xdg.cache.path],
+    ["session data", manifest.value.session.xdg.data.path],
+    ["session state", manifest.value.session.xdg.state.path],
+    ["execution root", manifest.value.execution.root.path],
+    ["execution tmp", manifest.value.execution.tmp.path],
+  ] as const;
+  const checkedPaths = new Set<string>();
+  for (const [label, candidate] of paths) {
+    if (checkedPaths.has(candidate)) continue;
+    checkedPaths.add(candidate);
+    const checked = canonicalMaterializedDirectory(candidate, `compiled environment ${label}`);
+    if (!checked.ok) return checked;
+  }
+
+  const environment = supplied.environment;
+  const keys = Object.keys(environment);
+  const unknown = keys.find((key) => !COMPILED_SESSION_ENVIRONMENT_KEYS.has(key));
+  if (unknown !== undefined) {
+    return topologyError("The compiled session environment contains an unsupported key.", { key: unknown });
+  }
+  for (const key of COMPILED_SESSION_ENVIRONMENT_KEYS) {
+    if (key !== "TERM" && !(key in environment)) {
+      return topologyError("The compiled session environment is missing a required key.", { key });
+    }
+  }
+  for (const [key, value] of Object.entries(environment)) {
+    if (typeof value !== "string" || value.length === 0 || value.length > 1_024 || value.includes("\0")) {
+      return topologyError("The compiled session environment contains an invalid value.", { key });
+    }
+  }
+  const expected = {
+    PATH: CANONICAL_EXECUTABLE_ROOT,
+    HOME: SANDBOX_HOME,
+    TMPDIR: SANDBOX_TMPDIR,
+    XDG_CONFIG_HOME: SANDBOX_CONFIG_HOME,
+    XDG_CACHE_HOME: SANDBOX_CACHE_HOME,
+    XDG_DATA_HOME: SANDBOX_DATA_HOME,
+    XDG_STATE_HOME: SANDBOX_STATE_HOME,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+  } as const;
+  for (const [key, value] of Object.entries(expected)) {
+    if (environment[key] !== value) {
+      return topologyError("The compiled session environment has a non-canonical value.", {
+        key,
+        expected: value,
+        actual: environment[key] ?? null,
+      });
+    }
+  }
+  if (!environment.SHELL.startsWith(`${CANONICAL_EXECUTABLE_ROOT}/`)) {
+    return topologyError("The compiled SHELL must use the canonical executable projection.", {
+      shell: environment.SHELL,
+    });
+  }
+  if (environment.TERM !== undefined && !/^[\x20-\x7e]{1,128}$/u.test(environment.TERM)) {
+    return topologyError("The compiled TERM value is not bounded display text.", {});
+  }
+  return success(Object.freeze({ environment: Object.freeze({ ...environment }), manifest: manifest.value }));
+}
+
+function validateTopology(
+  request: SandboxExecutionRequest,
+  compiledManifest: SessionRuntimeDirectoryManifest | null = null,
+): DomainResult<ValidatedTopology> {
   const repository = canonicalPath(request.repository, "repository");
   if (!repository.ok) return repository;
   const worktree = canonicalPath(request.worktree, "worktree");
@@ -227,9 +372,15 @@ function validateTopology(request: SandboxExecutionRequest): DomainResult<Valida
     });
   }
 
-  const home = preparePrivateDirectory(request.filesystem.home, repository.value, "session home");
+  const home =
+    compiledManifest === null
+      ? preparePrivateDirectory(request.filesystem.home, repository.value, "session home")
+      : canonicalMaterializedDirectory(compiledManifest.session.home.path, "compiled session home");
   if (!home.ok) return home;
-  const cache = preparePrivateDirectory(request.filesystem.cache, repository.value, "session cache");
+  const cache =
+    compiledManifest === null
+      ? preparePrivateDirectory(request.filesystem.cache, repository.value, "session cache")
+      : canonicalMaterializedDirectory(compiledManifest.session.xdg.cache.path, "compiled session cache");
   if (!cache.ok) return cache;
   const persistentHome = preparePrivateDirectory(
     request.filesystem.persistent_home,
@@ -248,7 +399,10 @@ function validateTopology(request: SandboxExecutionRequest): DomainResult<Valida
     });
   }
 
-  if (!isWithin(repository.value, home.value) || !isWithin(repository.value, cache.value)) {
+  if (
+    compiledManifest === null &&
+    (!isWithin(repository.value, home.value) || !isWithin(repository.value, cache.value))
+  ) {
     return topologyError("Session-private state escaped the authoritative repository.", {
       repository: repository.value,
       home: home.value,
@@ -1062,7 +1216,9 @@ export function compileSandboxInvocation(
     return topologyError("Sandbox command arguments cannot contain NUL bytes.", { session_id: request.session_id });
   }
 
-  const topology = validateTopology(request);
+  const compiledEnvironment = validateCompiledSessionEnvironment(request);
+  if (!compiledEnvironment.ok) return compiledEnvironment;
+  const topology = validateTopology(request, compiledEnvironment.value?.manifest ?? null);
   if (!topology.ok) return topology;
   const profilePaths = validateProfilePaths(request);
   if (!profilePaths.ok) return profilePaths;
@@ -1090,6 +1246,14 @@ export function compileSandboxInvocation(
       : compileRuntimeExecutableProjection(runtimeProjection.value);
   if (!executableProjection.ok) return failure(executableProjection.error);
   const legacyProfile = runtimeProjection.value === null;
+  if (compiledEnvironment.value !== null) {
+    const shell = compiledEnvironment.value.environment.SHELL;
+    if (!executableProjection.value.some((entry) => entry.target === shell && entry.source_kind === "file")) {
+      return topologyError("The compiled SHELL is not an executable in the canonical runtime projection.", {
+        shell,
+      });
+    }
+  }
   if (
     request.seccomp_profile.id !== SANDBOX_SECCOMP_PROFILE_ID ||
     request.seccomp_profile.version !== SANDBOX_SECCOMP_PROFILE_VERSION ||
@@ -1198,9 +1362,28 @@ export function compileSandboxInvocation(
   // An explicit strict projection exposes one canonical executable surface;
   // compatibility PATH is derived from its explicit filesystem targets.
   const pathValue =
-    runtimeProjection.value?.policy.mode === "compatibility"
+    compiledEnvironment.value?.environment.PATH ??
+    (runtimeProjection.value?.policy.mode === "compatibility"
       ? pathEntriesForEnvironment(runtimeProjection.value).join(":")
-      : CANONICAL_EXECUTABLE_ROOT;
+      : CANONICAL_EXECUTABLE_ROOT);
+  const launchEnvironment: Record<string, string> = {
+    ...(compiledEnvironment.value?.environment ?? {
+      PATH: pathValue,
+      HOME: SANDBOX_HOME,
+      TMPDIR: SANDBOX_TMPDIR,
+      XDG_CONFIG_HOME: SANDBOX_CONFIG_HOME,
+      XDG_CACHE_HOME: SANDBOX_CACHE_HOME,
+      XDG_DATA_HOME: SANDBOX_DATA_HOME,
+    }),
+    USER: "nawabari",
+    LOGNAME: "nawabari",
+    NAWABARI_SESSION_ID: request.session_id,
+  };
+  const argsEnvironment = {
+    ...launchEnvironment,
+    GIT_DIR: "/nawabari/git",
+    GIT_WORK_TREE: topology.value.worktree,
+  };
 
   const args: string[] = [
     "--die-with-parent",
@@ -1219,59 +1402,30 @@ export function compileSandboxInvocation(
     "--seccomp",
     "3",
     "--clearenv",
-    "--setenv",
-    "HOME",
-    SANDBOX_HOME,
-    "--setenv",
-    "TMPDIR",
-    "/tmp",
-    "--setenv",
-    "XDG_CONFIG_HOME",
-    SANDBOX_CONFIG_HOME,
-    "--setenv",
-    "XDG_CACHE_HOME",
-    SANDBOX_CACHE_HOME,
-    "--setenv",
-    "XDG_DATA_HOME",
-    `${SANDBOX_LOCAL_HOME}/share`,
-    "--setenv",
-    "USER",
-    "nawabari",
-    "--setenv",
-    "LOGNAME",
-    "nawabari",
-    "--setenv",
-    "NAWABARI_SESSION_ID",
-    request.session_id,
-    "--setenv",
-    "PATH",
-    pathValue,
-    "--setenv",
-    "GIT_DIR",
-    "/nawabari/git",
-    "--setenv",
-    "GIT_WORK_TREE",
-    topology.value.worktree,
-    "--setenv",
-    "GIT_CONFIG_NOSYSTEM",
-    "1",
-    "--setenv",
-    "GIT_CONFIG_GLOBAL",
-    "/dev/null",
-    "--tmpfs",
-    "/",
-    "--dev",
-    "/dev",
-    "--proc",
-    "/proc",
-    "--tmpfs",
-    "/tmp",
   ];
+  for (const [key, value] of Object.entries(argsEnvironment)) args.push("--setenv", key, value);
+  args.push("--tmpfs", "/", "--dev", "/dev", "--proc", "/proc");
+  if (compiledEnvironment.value === null) args.push("--tmpfs", "/tmp");
+
   const seenDirectories = new Set<string>();
   const worktreeDestination = topology.value.worktree;
   addReadWriteBind(args, topology.value.worktree, worktreeDestination, seenDirectories);
-  addReadWriteBind(args, topology.value.home, SANDBOX_HOME, seenDirectories);
-  addReadWriteBind(args, topology.value.cache, SANDBOX_CACHE_HOME, seenDirectories);
+  if (compiledEnvironment.value === null) {
+    addReadWriteBind(args, topology.value.home, SANDBOX_HOME, seenDirectories);
+    addReadWriteBind(args, topology.value.cache, SANDBOX_CACHE_HOME, seenDirectories);
+  } else {
+    const manifest = compiledEnvironment.value.manifest;
+    addReadWriteBind(args, manifest.session.home.path, SANDBOX_HOME, seenDirectories);
+    addReadWriteBind(args, manifest.session.xdg.config.path, SANDBOX_CONFIG_HOME, seenDirectories);
+    if (manifest.session.xdg.cache.access === "read-only") {
+      addReadOnlyBind(args, manifest.session.xdg.cache.path, SANDBOX_CACHE_HOME, seenDirectories);
+    } else {
+      addReadWriteBind(args, manifest.session.xdg.cache.path, SANDBOX_CACHE_HOME, seenDirectories);
+    }
+    addReadWriteBind(args, manifest.session.xdg.data.path, SANDBOX_DATA_HOME, seenDirectories);
+    addReadWriteBind(args, manifest.session.xdg.state.path, SANDBOX_STATE_HOME, seenDirectories);
+    addReadWriteBind(args, manifest.execution.tmp.path, SANDBOX_TMPDIR, seenDirectories);
+  }
   addReadWriteBind(args, topology.value.persistent_home, SANDBOX_SHARED_HOME, seenDirectories);
   addReadWriteBind(args, topology.value.git_metadata, "/nawabari/git", seenDirectories);
   addReadOnlyBind(args, topology.value.git_objects, "/nawabari/git/objects", seenDirectories);
@@ -1316,22 +1470,11 @@ export function compileSandboxInvocation(
     : [command.command, ...commandArgs];
   args.push("--chdir", worktreeDestination, "--", ...commandArgv);
 
-  const env: Record<string, string> = {
-    PATH: pathValue,
-    HOME: SANDBOX_HOME,
-    TMPDIR: "/tmp",
-    XDG_CONFIG_HOME: SANDBOX_CONFIG_HOME,
-    XDG_CACHE_HOME: SANDBOX_CACHE_HOME,
-    XDG_DATA_HOME: `${SANDBOX_LOCAL_HOME}/share`,
-    USER: "nawabari",
-    LOGNAME: "nawabari",
-    NAWABARI_SESSION_ID: request.session_id,
-  };
   return success({
     executable: executable.value,
     args,
     cwd: topology.value.worktree,
-    env,
+    env: Object.freeze({ ...launchEnvironment }),
     seccomp_profile: seccompProfile.value,
     seccomp_profile_metadata: request.seccomp_profile,
     landlock: {
@@ -1342,7 +1485,7 @@ export function compileSandboxInvocation(
   });
 }
 
-type SeccompProfileHandle = {
+export type SeccompProfileHandle = {
   readonly fd: number;
   readonly close: () => void;
 };
@@ -1351,24 +1494,33 @@ type SeccompProfileHandle = {
  * Give bubblewrap an unlinked, read-only profile file.  The descriptor stays
  * open only for the launch; no profile pathname is exposed inside the child.
  */
-function openSeccompProfile(profile: Uint8Array): DomainResult<SeccompProfileHandle> {
+export function openSeccompProfile(profile: Uint8Array, privateDirectory?: string): DomainResult<SeccompProfileHandle> {
   let directory: string | null = null;
   let fd: number | null = null;
   try {
-    directory = fs.mkdtempSync(path.join(requirementTempDirectory(), "nawabari-seccomp-"));
+    const baseDirectory =
+      privateDirectory === undefined
+        ? success(requirementTempDirectory())
+        : canonicalMaterializedDirectory(privateDirectory, "seccomp private directory");
+    if (!baseDirectory.ok) return baseDirectory;
+    directory = fs.mkdtempSync(path.join(baseDirectory.value, "nawabari-seccomp-"));
     const profilePath = path.join(directory, "profile.bpf");
     fs.writeFileSync(profilePath, profile, { mode: 0o600 });
     fd = fs.openSync(profilePath, fs.constants.O_RDONLY);
     fs.unlinkSync(profilePath);
     fs.rmdirSync(directory);
     directory = null;
+    const openedFd = fd;
+    let closed = false;
     return success({
-      fd,
+      fd: openedFd,
       close: () => {
+        if (closed) return;
+        closed = true;
         try {
-          fs.closeSync(fd as number);
+          fs.closeSync(openedFd);
         } catch {
-          // Closing an already-closed descriptor is harmless cleanup.
+          // Preserve the original launch result while keeping cleanup idempotent.
         }
       },
     });

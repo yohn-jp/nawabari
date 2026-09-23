@@ -23,6 +23,7 @@ import {
   runtimeMaterializationMissingError,
   STRICT_RUNTIME_POLICY,
   validateRuntimePolicy,
+  validateSessionRuntimeProjection,
   type RuntimeFilesystemProjection,
   type RuntimePolicy,
   type RuntimeProfileIdentity,
@@ -78,6 +79,9 @@ export type RuntimeDoctorReport = Readonly<
     readonly compatibility_policy: RuntimePolicy;
   }
 >;
+
+/** Governed document key for a serialized runtime-resolution result. */
+export const RUNTIME_RESOLUTION_SERIALIZATION_KEY = "runtime-resolution" as const;
 
 /** The ordinary pass-through commands owned by the canonical development profile. */
 const DEVELOPMENT_EXECUTABLE_RELATIVE_PATHS: Readonly<Record<string, string>> = Object.freeze({
@@ -385,3 +389,141 @@ export function resolveRuntimeProjection(options: RuntimeResolutionOptions): Dom
 
 export const resolveRuntimeResolution = resolveRuntimeProjection;
 export const resolveSessionRuntimeProjection = resolveRuntimeProjection;
+
+function validateRuntimeResolution(value: unknown): DomainResult<RuntimeResolution> {
+  if (!isRecord(value)) {
+    return failure(new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution must be an object."));
+  }
+  if (
+    value.materializer !== "nix" &&
+    value.materializer !== "fhs" &&
+    value.materializer !== "compatibility" &&
+    value.materializer !== "provided"
+  ) {
+    return failure(new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution materializer is invalid."));
+  }
+  const projection = validateSessionRuntimeProjection(value.projection);
+  if (!projection.ok) return failure(projection.error);
+  if (
+    !isRecord(value.profile) ||
+    value.profile.id !== projection.value.profile.id ||
+    value.profile.version !== projection.value.profile.version
+  ) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution profile evidence is inconsistent."),
+    );
+  }
+  const policy = validateRuntimePolicy(value.policy);
+  if (!policy.ok) return failure(policy.error);
+  if (policy.value.mode !== projection.value.policy.mode) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "Runtime resolution policy evidence is inconsistent."),
+    );
+  }
+  const materializer = value.materializer as RuntimeMaterializer;
+  if (materializer === "compatibility") {
+    if (projection.value.policy.mode !== "compatibility") {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "Compatibility materialization requires the explicit compatibility policy.",
+          { field: "materializer", materializer, policy: projection.value.policy.mode },
+        ),
+      );
+    }
+    if (projection.value.executables.length !== 0) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "Compatibility materialization cannot declare executable providers.",
+          { field: "projection.executables", materializer },
+        ),
+      );
+    }
+    if (projection.value.filesystem.some((entry) => entry.provenance !== "compatibility")) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "Compatibility materialization requires compatibility filesystem provenance.",
+          { field: "projection.filesystem.provenance", materializer },
+        ),
+      );
+    }
+  } else if (materializer === "nix" || materializer === "fhs") {
+    if (projection.value.policy.mode !== "strict") {
+      return failure(
+        new DomainError("RUNTIME_PROJECTION_INVALID", "Strict materialization requires the strict runtime policy.", {
+          field: "materializer",
+          materializer,
+          policy: projection.value.policy.mode,
+        }),
+      );
+    }
+    if (
+      projection.value.filesystem.some(
+        (entry) => entry.provenance !== "runtime-profile" && entry.provenance !== "package",
+      )
+    ) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "Strict materialization requires runtime or package filesystem provenance.",
+          { field: "projection.filesystem.provenance", materializer },
+        ),
+      );
+    }
+    const requirements = new Map(projection.value.requirements.map((requirement) => [requirement.id, requirement]));
+    for (const entrypoint of projection.value.executables) {
+      const requirement = requirements.get(entrypoint.provider.requirement_id);
+      if (requirement === undefined) continue;
+      const expectedProvider = `${materializer}-${requirement.id}-provider`;
+      if (entrypoint.provider.id !== expectedProvider) {
+        return failure(
+          new DomainError(
+            "RUNTIME_PROJECTION_INVALID",
+            "Strict materialization provider identity does not match its materializer.",
+            {
+              field: "projection.executables.provider.id",
+              materializer,
+              requirement_id: requirement.id,
+              expected_provider: expectedProvider,
+              provider: entrypoint.provider.id,
+            },
+          ),
+        );
+      }
+      const expectedProvenance = requirement.kind === "runtime" ? "runtime-profile" : "package";
+      if (entrypoint.provenance !== expectedProvenance) {
+        return failure(
+          new DomainError(
+            "RUNTIME_PROJECTION_INVALID",
+            "Strict materialization executable provenance does not match its requirement.",
+            {
+              field: "projection.executables.provenance",
+              materializer,
+              requirement_id: requirement.id,
+              expected_provenance: expectedProvenance,
+              provenance: entrypoint.provenance,
+            },
+          ),
+        );
+      }
+    }
+  }
+  return success(
+    Object.freeze({
+      policy: projection.value.policy,
+      profile: projection.value.profile,
+      materializer,
+      projection: projection.value,
+    }),
+  );
+}
+
+/** Serialize only a validated runtime resolution under its governed key. */
+export function serializeRuntimeResolution(input: unknown): DomainResult<string> {
+  const checked = validateRuntimeResolution(input);
+  return checked.ok
+    ? success(JSON.stringify({ [RUNTIME_RESOLUTION_SERIALIZATION_KEY]: checked.value }))
+    : failure(checked.error);
+}

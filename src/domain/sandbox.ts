@@ -21,6 +21,7 @@ import {
   sandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
 import type { CgroupLimitProfile } from "./cgroups-v2.js";
+import type { CompiledSessionEnvironment } from "./session-environment.js";
 import {
   DEFAULT_RUNTIME_POLICY,
   validateRuntimePolicy,
@@ -212,6 +213,8 @@ export type SandboxExecutionRequest = {
   runtime_projection?: SessionRuntimeProjection;
   /** Policy/profile/materializer evidence for the resolved runtime. */
   runtime_resolution?: RuntimeResolutionEvidence;
+  /** Accepted #448 environment; protected composition supplies this additively. */
+  compiled_session_environment?: CompiledSessionEnvironment;
 };
 
 export type SandboxCgroupConfig = {
@@ -1031,12 +1034,14 @@ export {
   CANONICAL_EXECUTABLE_ROOT,
   compileSandboxInvocation,
   deriveLandlockRules,
+  openSeccompProfile,
   runInteractiveSandboxedCommand,
   runSandboxedCommand,
   type SandboxCommand,
   type SandboxExecutionResult,
   type SandboxInvocation,
   type SandboxLauncherOptions,
+  type SeccompProfileHandle,
 } from "./sandbox-launcher.js";
 
 export {
