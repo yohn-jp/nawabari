@@ -6,6 +6,7 @@ import {
   cleanupCgroupScope,
   readCgroupAccounting,
   readCgroupPopulation,
+  terminateCgroupScope,
   type CgroupAccounting,
   type CgroupFileSystem,
   type CgroupPopulation,
@@ -52,6 +53,11 @@ export type SessionProcessObservationOptions = {
   readonly current_boot_id?: string;
 };
 
+export type TerminateOwnedExecutionOptions = SessionProcessObservationOptions & {
+  /** Prove the owned scope empty after termination while keeping it observable. */
+  readonly retain_scope?: boolean;
+};
+
 export type OwnedExecutionObservation = {
   readonly contract_id: typeof SESSION_PROCESS_OBSERVATION_CONTRACT_ID;
   readonly session_id: string;
@@ -81,7 +87,7 @@ export type OwnedExecutionTermination = {
   readonly population_before: CgroupPopulation;
   readonly population_after: CgroupPopulation;
   readonly scope_removed: boolean;
-  /** Terminalization follows the observed zero-population and scope removal. */
+  /** Terminalization follows zero-population proof; default termination also removes the scope. */
   readonly record_terminalized: true;
   readonly record: SessionExecutionRecord;
   readonly retryable: boolean;
@@ -190,15 +196,15 @@ export function observeOwnedExecution(
 }
 
 /**
- * Terminate only after an explicit identity/boot proof.  The cgroup kernel
+ * Terminate only after an explicit identity/boot proof. The cgroup kernel
  * control is the sole destructive operation; individual PIDs are never
- * signalled.  Cleanup returns retryable evidence when any postcondition is
- * not proven, preserving the lease for a later reconciliation attempt.
+ * signalled. Termination returns retryable evidence when any postcondition
+ * is not proven, preserving the lease for a later reconciliation attempt.
  */
 export function terminateOwnedExecution(
   record: SessionExecutionRecord,
   intent: TerminationIntent,
-  options: SessionProcessObservationOptions = {},
+  options: TerminateOwnedExecutionOptions = {},
 ): DomainResult<OwnedExecutionTermination> {
   if (options.current_boot_id === undefined || options.current_boot_id !== record.boot_id) {
     return observationError("A live boot identity is required for destructive execution termination.", {
@@ -233,9 +239,19 @@ export function terminateOwnedExecution(
       scope: scope.value.name,
     });
   }
-  const cleaned = cleanupCgroupScope(scope.value, options.filesystem);
-  if (!cleaned.ok) return cleaned;
-  const populationAfter = cleaned.value.after_population;
+  let populationAfter: CgroupPopulation;
+  let scopeRemoved: boolean;
+  if (options.retain_scope === true) {
+    const termination = terminateCgroupScope(scope.value, options.filesystem);
+    if (!termination.ok) return termination;
+    populationAfter = termination.value.after_population;
+    scopeRemoved = false;
+  } else {
+    const cleaned = cleanupCgroupScope(scope.value, options.filesystem);
+    if (!cleaned.ok) return cleaned;
+    populationAfter = cleaned.value.after_population;
+    scopeRemoved = cleaned.value.removed;
+  }
   if (populationAfter.state !== "empty") {
     return observationError("The cgroups scope did not prove empty after termination.", {
       scope: scope.value.name,
@@ -249,7 +265,7 @@ export function terminateOwnedExecution(
     killed: populationBefore.state === "populated",
     population_before: populationBefore,
     population_after: populationAfter,
-    scope_removed: cleaned.value.removed,
+    scope_removed: scopeRemoved,
     record_terminalized: true,
     record: { ...record, state: "terminal" },
     retryable: false,

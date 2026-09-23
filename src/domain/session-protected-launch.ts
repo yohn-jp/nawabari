@@ -25,6 +25,7 @@ import {
   type SessionLaunchSupervisorResult,
   type SupervisorAttachedEvidence,
   type SupervisorReleaseAttemptEvidence,
+  type SupervisorStdioValue,
   type TrustedSandboxPayload,
 } from "./session-launch-supervisor.js";
 import {
@@ -64,6 +65,7 @@ export type SessionProtectedLaunchInput = Readonly<{
   readonly compiled_environment: CompiledSessionEnvironment;
   readonly request: SandboxExecutionRequest;
   readonly command: SandboxCommand;
+  readonly stdio?: readonly [SupervisorStdioValue, SupervisorStdioValue, SupervisorStdioValue];
   readonly admission: ExecutionAdmissionFacts;
   readonly starting_record: SessionExecutionRecord;
   readonly supervisor: Omit<SessionLaunchSupervisorPacket, "admission" | "payload" | "durability">;
@@ -100,6 +102,33 @@ function sameJson(left: unknown, right: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+function isSupervisorStdioValue(value: unknown): value is SupervisorStdioValue {
+  return (
+    (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) ||
+    value === "ignore" ||
+    value === "inherit" ||
+    value === "pipe"
+  );
+}
+
+function validatedProtectedStdio(
+  stdio: unknown,
+): DomainResult<readonly [SupervisorStdioValue, SupervisorStdioValue, SupervisorStdioValue]> {
+  if (
+    !Array.isArray(stdio) ||
+    stdio.length !== 3 ||
+    !isSupervisorStdioValue(stdio[0]) ||
+    !isSupervisorStdioValue(stdio[1]) ||
+    !isSupervisorStdioValue(stdio[2])
+  ) {
+    return compositionFailure(
+      "INVALID_ARGUMENT",
+      "Protected launch stdio must contain three valid standard descriptor modes.",
+    );
+  }
+  return success([stdio[0], stdio[1], stdio[2]]);
 }
 
 type AdmissionDenial = {
@@ -156,7 +185,10 @@ function validateInputIdentities(input: SessionProtectedLaunchInput): DomainResu
   readonly profile: ResolvedWorktreeRuntimeProfile;
   readonly environment: CompiledSessionEnvironment;
   readonly record: SessionExecutionRecord;
+  readonly stdio: readonly [SupervisorStdioValue, SupervisorStdioValue, SupervisorStdioValue];
 }> {
+  const stdio = validatedProtectedStdio(input.stdio === undefined ? ["ignore", "pipe", "pipe"] : input.stdio);
+  if (!stdio.ok) return stdio;
   const profile = validateWorktreeRuntimeProfile(input.profile);
   if (!profile.ok) return failure(profile.error);
   const manifest = validateSessionRuntimeDirectoryManifest(input.compiled_environment.manifest);
@@ -245,6 +277,7 @@ function validateInputIdentities(input: SessionProtectedLaunchInput): DomainResu
       manifest: manifest.value,
     }),
     record: record.value,
+    stdio: stdio.value,
   });
 }
 
@@ -327,7 +360,7 @@ export async function launchProtectedSessionExecution(
     args: invocation.value.args,
     cwd: invocation.value.cwd,
     env: invocation.value.env,
-    stdio: ["ignore", "pipe", "pipe", profile.value.fd],
+    stdio: [identities.value.stdio[0], identities.value.stdio[1], identities.value.stdio[2], profile.value.fd],
     seccomp_fd: profile.value.fd,
   };
 

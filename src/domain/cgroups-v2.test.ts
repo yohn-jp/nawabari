@@ -11,6 +11,7 @@ import {
   deriveCgroupScopeName,
   readCgroupAccounting,
   readCgroupPopulation,
+  terminateCgroupScope,
   type CgroupFileSystem,
 } from "./cgroups-v2.js";
 
@@ -159,6 +160,44 @@ test("cleanup refuses to remove a scope when occupancy evidence is unavailable",
     assert.equal(cleaned.ok, false);
     if (!cleaned.ok) assert.equal(cleaned.error.code, "SANDBOX_CGROUP_CLEANUP_FAILED");
     assert.equal(fs.existsSync(created.value.path), true);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("termination kills an occupied descendant scope and leaves an empty scope observable", () => {
+  const testFixture = fixture();
+  try {
+    const descendant = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-descendant" },
+      { root: testFixture.root, filesystem: testFixture.filesystem },
+    );
+    assert.equal(descendant.ok, true, descendant.ok ? "" : JSON.stringify(descendant.error));
+    if (!descendant.ok) return;
+    fs.writeFileSync(path.join(descendant.value.path, "cgroup.events"), "populated 1\n", "utf8");
+    fs.writeFileSync(path.join(descendant.value.path, "cgroup.procs"), "", "utf8");
+
+    const terminatedDescendant = terminateCgroupScope(descendant.value);
+    assert.equal(
+      terminatedDescendant.ok,
+      true,
+      terminatedDescendant.ok ? "" : JSON.stringify(terminatedDescendant.error),
+    );
+    if (!terminatedDescendant.ok) return;
+    assert.equal(terminatedDescendant.value.after_population.state, "empty");
+    assert.equal(fs.existsSync(descendant.value.path), true);
+
+    const empty = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-empty" },
+      { root: testFixture.root, filesystem: testFixture.filesystem },
+    );
+    assert.equal(empty.ok, true, empty.ok ? "" : JSON.stringify(empty.error));
+    if (!empty.ok) return;
+    const terminatedEmpty = terminateCgroupScope(empty.value);
+    assert.equal(terminatedEmpty.ok, true, terminatedEmpty.ok ? "" : JSON.stringify(terminatedEmpty.error));
+    if (!terminatedEmpty.ok) return;
+    assert.equal(terminatedEmpty.value.after_population.state, "empty");
+    assert.equal(fs.existsSync(empty.value.path), true);
   } finally {
     testFixture.cleanup();
   }

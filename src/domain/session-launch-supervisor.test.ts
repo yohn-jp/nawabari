@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
+import { createCgroupScope, readCgroupPopulation, type CgroupFileSystem } from "./cgroups-v2.js";
 import { DomainError, failure, success } from "./errors.js";
 import { decideExecutionAdmission, type ExecutionAdmissionReservation } from "./session-admission-decision.js";
 import {
@@ -54,6 +58,34 @@ const trusted = {
   cwd: "/opt/nawabari-supervisor",
   env: { PATH: "/usr/bin", NODE_OPTIONS: "--require attacker.js" },
 };
+
+function cgroupFixture(): {
+  readonly root: string;
+  readonly filesystem: CgroupFileSystem;
+  readonly cleanup: () => void;
+} {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-supervisor-test-"));
+  const filesystem: CgroupFileSystem = {
+    statSync: (file) => fs.statSync(file),
+    realpathSync: (file) => fs.realpathSync.native(file),
+    readFileSync: (file) => fs.readFileSync(file, "utf8"),
+    writeFileSync: (file, value) => fs.writeFileSync(file, value, "utf8"),
+    mkdirSync: (file, options) => {
+      fs.mkdirSync(file, options);
+      if (path.basename(file) === "nawabari") {
+        fs.writeFileSync(path.join(file, "cgroup.subtree_control"), "+cpu +memory +pids\n", "utf8");
+      }
+      if (path.basename(file).startsWith("nawabari-")) {
+        fs.writeFileSync(path.join(file, "cgroup.procs"), "", "utf8");
+        fs.writeFileSync(path.join(file, "cgroup.events"), "populated 0\n", "utf8");
+      }
+    },
+    rmdirSync: (file) => fs.rmSync(file, { recursive: true }),
+  };
+  fs.writeFileSync(path.join(root, "cgroup.controllers"), "cpu memory pids\n", "utf8");
+  fs.writeFileSync(path.join(root, "cgroup.subtree_control"), "+cpu +memory +pids\n", "utf8");
+  return { root, filesystem, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
 
 function fakeProcess(
   events: string[],
@@ -147,6 +179,29 @@ test("attaches the supervisor, durably revalidates, and sends one GO before wait
   assert.deepEqual(events, ["attached", "epoch", "release-attempt", "epoch", "go", "wait"]);
 });
 
+test("default supervisor mode still cleans up its owned scope", async () => {
+  const base = packet();
+  let cleanupCalls = 0;
+  const result = await runSessionLaunchSupervisor({
+    ...base,
+    cgroup: {
+      ...base.cgroup,
+      cleanup_scope: () => {
+        cleanupCalls += 1;
+        return success({
+          removed: true,
+          after_population: { state: "empty", populated: false, processes: [], events: { populated: 0 } },
+        });
+      },
+    },
+    process_factory: async () => fakeProcess([]),
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+  if (!result.ok) return;
+  assert.equal(result.value.status, "completed");
+  assert.equal(cleanupCalls, 1);
+});
+
 test("parent death before GO never starts the user payload", async () => {
   let factoryCalled = false;
   const result = await runSessionLaunchSupervisor({
@@ -164,6 +219,105 @@ test("parent death before GO never starts the user payload", async () => {
     assert.equal(result.value.started, false);
   }
   assert.equal(factoryCalled, false);
+});
+
+test("retained supervisor scope is observable as empty after worker completion", async () => {
+  const testFixture = cgroupFixture();
+  try {
+    const created = createCgroupScope(
+      { session_id: "session-1", execution_id: "execution-1" },
+      { root: testFixture.root, filesystem: testFixture.filesystem },
+    );
+    assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+    if (!created.ok) return;
+    const result = await runSessionLaunchSupervisor({
+      ...packet(),
+      cgroup: {
+        required: true,
+        retain_scope: true,
+        root: testFixture.root,
+        filesystem: testFixture.filesystem,
+        create_scope: () => created,
+      },
+      process_factory: async () => ({
+        pid: 4242,
+        send_go: () => undefined,
+        terminate: () => undefined,
+        wait: async () => {
+          fs.writeFileSync(path.join(created.value.path, "cgroup.procs"), "", "utf8");
+          fs.writeFileSync(path.join(created.value.path, "cgroup.events"), "populated 0\n", "utf8");
+          return { status: "completed" };
+        },
+      }),
+    });
+    assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+    if (!result.ok) return;
+    assert.equal(result.value.status, "completed");
+    assert.equal(result.value.cgroup_scope, created.value.name);
+    assert.equal(readCgroupPopulation(created.value, testFixture.filesystem).state, "empty");
+    assert.equal(fs.existsSync(created.value.path), true);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("retained supervisor scope remains observable after an uncertain worker result", async () => {
+  let cleanupCalls = 0;
+  const result = await runSessionLaunchSupervisor({
+    ...packet({ result_timeout_ms: 10 }),
+    cgroup: {
+      ...packet().cgroup,
+      retain_scope: true,
+      cleanup_scope: () => {
+        cleanupCalls += 1;
+        return success({
+          removed: true,
+          after_population: { state: "empty", populated: false, processes: [], events: { populated: 0 } },
+        });
+      },
+    },
+    process_factory: async () => ({
+      pid: 4242,
+      send_go: () => undefined,
+      terminate: () => undefined,
+      wait: () => new Promise<never>(() => undefined),
+    }),
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+  if (!result.ok) return;
+  assert.equal(result.value.status, "unresolved");
+  assert.equal(result.value.reason, "timeout");
+  assert.equal(result.value.cgroup_scope, "scope");
+  assert.equal(cleanupCalls, 0);
+});
+
+test("retained supervisor scope remains observable after termination before GO", async () => {
+  const events: string[] = [];
+  let cleanupCalls = 0;
+  const base = packet();
+  const result = await runSessionLaunchSupervisor({
+    ...base,
+    cgroup: {
+      ...base.cgroup,
+      retain_scope: true,
+      cleanup_scope: () => {
+        cleanupCalls += 1;
+        return success({
+          removed: true,
+          after_population: { state: "empty", populated: false, processes: [], events: { populated: 0 } },
+        });
+      },
+    },
+    process_factory: async () => fakeProcess(events),
+    durability: { revalidate_epoch: () => false },
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+  if (!result.ok) return;
+  assert.equal(result.value.status, "not-started");
+  assert.equal(result.value.reason, "stale-epoch");
+  assert.equal(result.value.cgroup_scope, "scope");
+  assert.deepEqual(events, ["terminate"]);
+  assert.equal(cleanupCalls, 0);
 });
 
 test("a stale epoch terminates the attached supervisor without sending GO", async () => {

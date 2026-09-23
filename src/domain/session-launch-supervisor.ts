@@ -83,6 +83,8 @@ export type SupervisorDurability = {
 
 export type SupervisorCgroupOptions = {
   readonly required?: boolean;
+  /** Keep the owned scope available for a later kernel observation. */
+  readonly retain_scope?: boolean;
   readonly root?: string;
   readonly limits?: CgroupLimitProfile;
   readonly filesystem?: CgroupFileSystem;
@@ -571,11 +573,11 @@ function cgroupErrorDetails(error: unknown): string {
 
 function cleanupSupervisorScope(
   scope: CgroupScope | null,
-  cleanup: typeof cleanupCgroupScope | undefined,
+  options: SupervisorCgroupOptions | undefined,
 ): string | null {
-  if (scope === null) return null;
+  if (scope === null || options?.retain_scope === true) return null;
   try {
-    const result = (cleanup ?? cleanupCgroupScope)(scope);
+    const result = (options?.cleanup_scope ?? cleanupCgroupScope)(scope);
     return result.ok ? null : cgroupErrorDetails(result.error);
   } catch (error: unknown) {
     return cgroupErrorDetails(error);
@@ -661,7 +663,7 @@ export async function runSessionLaunchSupervisor(
   try {
     supervisor = await factory({ reservation, trusted: trusted.value, payload: payload.value });
   } catch (error: unknown) {
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     return failure(
       new DomainError("SANDBOX_EXECUTION_FAILED", "The trusted supervisor could not be started.", {
         reason: error instanceof Error ? error.message.slice(0, 240) : "unknown",
@@ -671,7 +673,7 @@ export async function runSessionLaunchSupervisor(
   }
   if (!Number.isSafeInteger(supervisor.pid) || supervisor.pid < 1) {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     if (cleanupError !== null) return cleanupFailure(cleanupError, { prior_error: "invalid-supervisor-pid" });
     return failure(
       new DomainError("SANDBOX_EXECUTION_FAILED", "The trusted supervisor did not expose a valid pid.", {}),
@@ -682,7 +684,7 @@ export async function runSessionLaunchSupervisor(
     const attach = (cgroup?.attach_process ?? attachProcessToCgroup)(scope, supervisor.pid);
     if (!attach.ok) {
       supervisor.terminate();
-      const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+      const cleanupError = cleanupSupervisorScope(scope, cgroup);
       if (cleanupError !== null) return cleanupFailure(cleanupError, { prior_error: attach.error.message });
       return attach;
     }
@@ -702,7 +704,7 @@ export async function runSessionLaunchSupervisor(
     );
   } catch (error: unknown) {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     return failure(
       new DomainError("SANDBOX_EXECUTION_FAILED", "The durable attached transition failed.", {
         reason: cgroupErrorDetails(error),
@@ -715,7 +717,7 @@ export async function runSessionLaunchSupervisor(
   // supervisor is terminated before this function returns that fact.
   if (!parent.is_connected()) {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     if (cleanupError !== null) {
       return cleanupFailure(cleanupError, { not_started_reason: "parent-disconnected-before-go" });
     }
@@ -723,7 +725,7 @@ export async function runSessionLaunchSupervisor(
   }
   if (!(await epochIsCurrent(reservation, durability))) {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     if (cleanupError !== null) return cleanupFailure(cleanupError, { not_started_reason: "stale-epoch" });
     return success(notStarted(reservation, "stale-epoch", supervisor.pid, scope?.name ?? null));
   }
@@ -737,7 +739,7 @@ export async function runSessionLaunchSupervisor(
     );
   } catch (error: unknown) {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     return failure(
       new DomainError("SANDBOX_EXECUTION_FAILED", "The durable release-attempt record failed.", {
         reason: cgroupErrorDetails(error),
@@ -750,13 +752,13 @@ export async function runSessionLaunchSupervisor(
   // supervisor can never release a payload after that record.
   if (!(await epochIsCurrent(reservation, durability))) {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     if (cleanupError !== null) return cleanupFailure(cleanupError, { not_started_reason: "stale-epoch" });
     return success(notStarted(reservation, "stale-epoch", supervisor.pid, scope?.name ?? null));
   }
   if (!parent.is_connected()) {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     if (cleanupError !== null) {
       return cleanupFailure(cleanupError, { not_started_reason: "parent-disconnected-before-go" });
     }
@@ -767,7 +769,7 @@ export async function runSessionLaunchSupervisor(
     await supervisor.send_go();
   } catch (error: unknown) {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     if (cleanupError !== null) {
       return uncertainCleanupFailure(reservation, "go-send-failed", supervisor.pid, scope?.name ?? null, cleanupError);
     }
@@ -800,7 +802,7 @@ export async function runSessionLaunchSupervisor(
 
   if (observed.kind === "timeout") {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     if (cleanupError !== null) {
       return uncertainCleanupFailure(reservation, "timeout", supervisor.pid, scope?.name ?? null, cleanupError);
     }
@@ -808,7 +810,7 @@ export async function runSessionLaunchSupervisor(
   }
   if (observed.kind === "disconnected") {
     supervisor.terminate();
-    const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+    const cleanupError = cleanupSupervisorScope(scope, cgroup);
     if (cleanupError !== null) {
       return uncertainCleanupFailure(
         reservation,
@@ -821,7 +823,7 @@ export async function runSessionLaunchSupervisor(
     return success(unresolved(reservation, "parent-disconnected-after-go", supervisor.pid, scope?.name ?? null));
   }
 
-  const cleanupError = cleanupSupervisorScope(scope, cgroup?.cleanup_scope);
+  const cleanupError = cleanupSupervisorScope(scope, cgroup);
   if (cleanupError !== null) {
     return cleanupFailure(cleanupError);
   }
