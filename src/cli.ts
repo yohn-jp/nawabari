@@ -52,7 +52,7 @@ import {
   type RuntimePolicyMode,
 } from "./domain/runtime-projection.js";
 import { enterProtectedSession } from "./domain/session-protected-launch.js";
-import { listSessionProcesses } from "./domain/session-console.js";
+import { launchManagedSessionCommand, listSessionProcesses } from "./domain/session-console.js";
 
 const CLI_NAME = "nawabari";
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -136,6 +136,8 @@ export const DISPATCHER_OPTION_INVENTORY: Readonly<Record<string, readonly strin
     "--worktree-root",
     "--base",
     "--label",
+    "--profile",
+    "--profile-parameter",
     "--resource",
     "--mode",
     "--auxiliary-state",
@@ -753,6 +755,8 @@ type ClaimReplacementPairs = {
   worktree_root: string | null;
   base: string | null;
   label: string | null;
+  profile: string | null;
+  profile_parameter: string | null;
   auxiliary_states: unknown[];
   execution_scope_file: string | null;
   candidate_working_set_file: string | null;
@@ -1170,6 +1174,8 @@ function parseClaimReplacementPairs(
   let worktreeRoot: string | null = null;
   let base: string | null = null;
   let label: string | null = null;
+  let profile: string | null = null;
+  let profileParameter: string | null = null;
   const auxiliaryStates: unknown[] = [];
   let executionScopeFile: string | null = null;
   let candidateWorkingSetFile: string | null = null;
@@ -1225,7 +1231,19 @@ function parseClaimReplacementPairs(
     else if (name === "--worktree-root") worktreeRoot = value;
     else if (name === "--base") base = value;
     else if (name === "--label") label = value;
-    else if (name === "--auxiliary-state") {
+    else if (name === "--profile") {
+      if (profile !== null) {
+        return failure(usageError("INVALID_ARGUMENT", "--profile may be supplied only once.", { option: name }));
+      }
+      profile = value;
+    } else if (name === "--profile-parameter") {
+      if (profileParameter !== null) {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--profile-parameter may be supplied only once.", { option: name }),
+        );
+      }
+      profileParameter = value;
+    } else if (name === "--auxiliary-state") {
       try {
         auxiliaryStates.push(JSON.parse(value) as unknown);
       } catch (error: unknown) {
@@ -1268,6 +1286,9 @@ function parseClaimReplacementPairs(
   if (requirePairs && pairs.length === 0) {
     return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
   }
+  if (profileParameter !== null && profile === null) {
+    return failure(usageError("INVALID_ARGUMENT", "--profile-parameter requires --profile.", { option: "--profile" }));
+  }
   const concurrency = finalizeClaimConcurrency(concurrencyState, requireConcurrencyIntent);
   if (!concurrency.ok) return concurrency;
   return {
@@ -1283,6 +1304,8 @@ function parseClaimReplacementPairs(
       worktree_root: worktreeRoot,
       base,
       label,
+      profile,
+      profile_parameter: profileParameter,
       auxiliary_states: auxiliaryStates,
       execution_scope_file: executionScopeFile,
       candidate_working_set_file: candidateWorkingSetFile,
@@ -1511,6 +1534,49 @@ async function executeProtectedSessionCommand(
       : { ok: true as const, value: command };
   if (!executable.ok) return executable;
 
+  let managedSessionId = parsed.value.session_id;
+  if (managedSessionId === null) {
+    const current = await dependencies.backend.resolveCurrentSession(context);
+    if (!current.ok) return current;
+    managedSessionId = current.value.session_id;
+  }
+  const managed = await launchManagedSessionCommand(context, dependencies.backend, {
+    session_id: managedSessionId,
+    command: { command: executable.value, args: arguments_.slice(delimiter + 2) },
+    ...(parsed.value.runtime_policy === null
+      ? {}
+      : {
+          runtime_policy:
+            parsed.value.runtime_policy === "compatibility"
+              ? EXPLICIT_COMPATIBILITY_RUNTIME_POLICY
+              : STRICT_RUNTIME_POLICY,
+        }),
+    ...(dependencies.sandboxProbe === undefined ? {} : { sandbox_probe: dependencies.sandboxProbe }),
+    ...(dependencies.sandboxRuntimeLayout === undefined
+      ? {}
+      : { sandbox_runtime_layout: dependencies.sandboxRuntimeLayout }),
+  });
+  if (!managed.ok) return managed;
+  if (managed.value !== null) {
+    if (managed.value.supervisor.status !== "completed" || managed.value.result === undefined) {
+      return failure(
+        new DomainError("SANDBOX_EXECUTION_FAILED", "The managed protected command did not complete.", {
+          session_id: parsed.value.session_id,
+          execution_id: managed.value.execution.execution_id,
+          status: managed.value.supervisor.status,
+        }),
+      );
+    }
+    return {
+      ok: true,
+      value: {
+        ...(managed.value.result as unknown as JsonObject),
+        execution: managed.value.execution as unknown as JsonObject,
+        supervisor: managed.value.supervisor as unknown as JsonObject,
+      },
+    };
+  }
+
   const request = await resolveSandboxExecutionRequest(
     dependencies.backend,
     context,
@@ -1730,6 +1796,27 @@ async function executeCommand(
       }
       let executionScope: unknown | undefined;
       let candidateWorkingSet: unknown | undefined;
+      let profileParameters: JsonObject | undefined;
+      if (parsed.value.profile_parameter !== null) {
+        try {
+          const value: unknown = JSON.parse(parsed.value.profile_parameter);
+          if (typeof value !== "object" || value === null || Array.isArray(value)) {
+            return failure(
+              usageError("INVALID_ARGUMENT", "--profile-parameter requires a JSON object.", {
+                option: "--profile-parameter",
+              }),
+            );
+          }
+          profileParameters = value as JsonObject;
+        } catch (error: unknown) {
+          return failure(
+            usageError("INVALID_ARGUMENT", "--profile-parameter requires a valid JSON object.", {
+              option: "--profile-parameter",
+              reason: error instanceof Error ? error.message : "invalid JSON",
+            }),
+          );
+        }
+      }
       if (parsed.value.execution_scope_file !== null && parsed.value.candidate_working_set_file !== null) {
         const execution = readWorkingSetArtifactFile(parsed.value.execution_scope_file, "--execution-scope-file");
         if (!execution.ok) return execution;
@@ -1760,6 +1847,14 @@ async function executeCommand(
           : { auxiliary_state: parsed.value.auxiliary_states as SessionCreateOptions["auxiliary_state"] }),
         ...(executionScope === undefined ? {} : { execution_scope: executionScope }),
         ...(candidateWorkingSet === undefined ? {} : { candidate_working_set: candidateWorkingSet }),
+        ...(parsed.value.profile === null
+          ? {}
+          : {
+              profile: {
+                selection: { profile: parsed.value.profile },
+                ...(profileParameters === undefined ? {} : { parameters: profileParameters }),
+              },
+            }),
       };
       const result = await dependencies.backend.createSession(context, options);
       return result.ok ? { ok: true, value: result.value } : result;

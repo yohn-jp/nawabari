@@ -7,6 +7,13 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { SessionRegistryError } from "./errors.js";
+import {
+  recordExecutionState,
+  reserveExecution,
+  toPersistedSessionExecutionRecord,
+} from "./domain/session-execution-record.js";
+import { SESSION_EXECUTION_CONTROL_CONTRACT_ID } from "./domain/session-execution-control.js";
+import type { CgroupFileSystem } from "./domain/cgroups-v2.js";
 import { resolveRepositoryContext } from "./git.js";
 import { RepositoryLock } from "./registry/lock.js";
 import { SessionRegistry, toPersistedSessionRecord, type PersistedRegistry } from "./session-registry.js";
@@ -248,7 +255,7 @@ test("fails closed for corrupt, unsupported, and repository-mismatched state", (
     assertRegistryError(() => registry.list(), "UNSUPPORTED_SCHEMA_VERSION");
 
     writeRegistry(registry, {
-      schema_version: 1,
+      schema_version: 1 as const,
       repository_id: path.join(registry.repository.commonGitDirectory, "different-repository"),
       sessions: [],
     });
@@ -265,7 +272,7 @@ test("fails closed when persisted records contain duplicate ownership", () => {
     const first = registry.create({ label: "first" });
     const persisted = toPersistedSessionRecord(first);
     writeRegistry(registry, {
-      schema_version: 1,
+      schema_version: 1 as const,
       repository_id: registry.repository.repositoryId,
       sessions: [persisted, { ...persisted, session_id: "01936f5e-7b00-7abc-8def-0123456789ab" }],
     });
@@ -292,6 +299,7 @@ test("migrates a legacy registry without changing session ownership or claim mod
     delete legacy.registry_revision;
     delete legacy.runtime_epoch;
     delete legacy.required_features;
+    delete legacy.runtime_sessions;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     const result = registry.migrate();
@@ -303,6 +311,377 @@ test("migrates a legacy registry without changing session ownership or claim mod
     assert.equal((migrated.claims?.[0] as { mode?: string } | undefined)?.mode, "write");
     assert.equal(registry.listClaims()[0]?.sessionId, session.sessionId);
     assert.equal(registry.listClaims()[0]?.mode, "write");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("managed close, discard, and claim release reject direct calls without drain finalization", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    registry.claimResources({ sessionId: session.sessionId, claims: [{ resource: "README.md", mode: "write" }] });
+    const base = readJson(registry.paths.registry) as Record<string, unknown>;
+    const epoch = Number(base.runtime_epoch);
+    writeRegistry(registry, {
+      ...base,
+      required_features: ["runtime-sessions.v1"],
+      runtime_sessions: [
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: session.sessionId,
+          admission: "open",
+          runtime_epoch: epoch,
+        },
+      ],
+    } as unknown as PersistedRegistry);
+
+    const managed = new SessionRegistry({ cwd: fixture.repositoryPath });
+    assertRegistryError(() => managed.close(session.sessionId), "OPERATION_REJECTED");
+    assertRegistryError(() => managed.discard(session.sessionId), "OPERATION_REJECTED");
+    assertRegistryError(
+      () => managed.releaseClaims({ sessionId: session.sessionId, all: true, force: true }),
+      "OPERATION_REJECTED",
+    );
+    assert.equal(managed.get(session.sessionId)?.state, "active");
+    assert.equal(managed.listClaims(session.sessionId).length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("epoch writes preserve closed gates and reject stale execution reservations", () => {
+  const fixture = createRepositoryFixture();
+  const extraWorktreePath = `${fixture.repositoryPath}-epoch-trigger`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const openSession = registry.create({ worktreePath: fixture.repositoryPath, branchName: "main" });
+    const closedSession = registry.create({
+      worktreePath: fixture.linkedWorktreePath,
+      branchName: "feature/linked",
+    });
+    const base = readJson(registry.paths.registry) as Record<string, unknown>;
+    const epoch = Number(base.runtime_epoch);
+    writeRegistry(registry, {
+      ...base,
+      required_features: ["runtime-sessions.v1", "executions.v1"],
+      runtime_sessions: [
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: openSession.sessionId,
+          admission: "open",
+          runtime_epoch: epoch,
+        },
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: closedSession.sessionId,
+          admission: "closed",
+          runtime_epoch: epoch,
+        },
+      ],
+      executions: [],
+    } as unknown as PersistedRegistry);
+
+    const stale = reserveExecution({
+      session_id: openSession.sessionId,
+      execution_id: "stale-after-epoch-write",
+      profile_digest: "a".repeat(64),
+      filesystem_token: "b".repeat(64),
+      runtime_epoch: epoch,
+      boot_id: "epoch-write-boot",
+      now: "2026-09-22T00:00:00.000Z",
+    });
+    assert.equal(stale.ok, true);
+    if (!stale.ok) return;
+
+    runGit(["worktree", "add", "-b", "feature/epoch-trigger", extraWorktreePath], fixture.repositoryPath);
+    registry.create({ worktreePath: extraWorktreePath, branchName: "feature/epoch-trigger" });
+    const advanced = registry.runtimeEpoch;
+    const openAdmission = registry.getSessionManagedRuntime(openSession.sessionId).admission;
+    const closedAdmission = registry.getSessionManagedRuntime(closedSession.sessionId).admission;
+    assert.equal(openAdmission?.admission, "open");
+    assert.equal(openAdmission?.runtime_epoch, advanced);
+    assert.equal(closedAdmission?.admission, "closed");
+    assert.equal(closedAdmission?.runtime_epoch, epoch);
+    assert.throws(
+      () => registry.persistSessionExecution(toPersistedSessionExecutionRecord(stale.value)),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        error.message.includes("Session launch admission is not open at the current epoch"),
+    );
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", extraWorktreePath], fixture.repositoryPath);
+    } catch {
+      // Remove the directory below when Git did not register the worktree.
+    }
+    fs.rmSync(extraWorktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("managed finalization treats a tracked admission with no execution records as unknown", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    const base = readJson(registry.paths.registry) as Record<string, unknown>;
+    const admissionEpoch = Number(base.runtime_epoch) + 1;
+    writeRegistry(registry, {
+      ...base,
+      runtime_epoch: admissionEpoch,
+      required_features: ["runtime-sessions.v1"],
+      runtime_sessions: [
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: session.sessionId,
+          admission: "closed",
+          runtime_epoch: admissionEpoch,
+        },
+      ],
+    } as unknown as PersistedRegistry);
+
+    const finalization = {
+      contract_id: SESSION_EXECUTION_CONTROL_CONTRACT_ID,
+      schema_version: 1 as const,
+      session_id: session.sessionId,
+      fence_id: "test-fence",
+      operation: "close" as const,
+      expected_epoch: admissionEpoch - 1,
+      admission_epoch: admissionEpoch,
+      admission: "closed" as const,
+      status: "ready" as const,
+      next_action: "finalize-lifecycle" as const,
+    };
+    assert.throws(
+      () => new SessionRegistry({ cwd: fixture.repositoryPath }).close(session.sessionId, finalization),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        error.message.includes("No owned execution records are available"),
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("managed finalization rejects a stale locked admission epoch", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    const base = readJson(registry.paths.registry) as Record<string, unknown>;
+    const currentAdmissionEpoch = Number(base.runtime_epoch) + 2;
+    writeRegistry(registry, {
+      ...base,
+      runtime_epoch: currentAdmissionEpoch,
+      required_features: ["runtime-sessions.v1"],
+      runtime_sessions: [
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: session.sessionId,
+          admission: "closed",
+          runtime_epoch: currentAdmissionEpoch,
+        },
+      ],
+    } as unknown as PersistedRegistry);
+
+    const finalization = {
+      contract_id: SESSION_EXECUTION_CONTROL_CONTRACT_ID,
+      schema_version: 1 as const,
+      session_id: session.sessionId,
+      fence_id: "stale-fence",
+      operation: "close" as const,
+      expected_epoch: currentAdmissionEpoch - 2,
+      admission_epoch: currentAdmissionEpoch - 1,
+      admission: "closed" as const,
+      status: "ready" as const,
+      next_action: "finalize-lifecycle" as const,
+    };
+    assert.throws(
+      () => new SessionRegistry({ cwd: fixture.repositoryPath }).close(session.sessionId, finalization),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        error.message.includes("Runtime drain admission fence is stale"),
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("managed finalization reobserves owned cgroup occupancy under the registry lock", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const starting = reserveExecution({
+      session_id: session.sessionId,
+      execution_id: "locked-finalization-check",
+      profile_digest: "a".repeat(64),
+      filesystem_token: "b".repeat(64),
+      runtime_epoch: registry.runtimeEpoch,
+      boot_id: bootId,
+      now: "2026-01-02T03:04:05.006Z",
+    });
+    assert.equal(starting.ok, true);
+    if (!starting.ok) return;
+    const terminal = recordExecutionState(starting.value, {
+      state: "exited",
+      now: "2026-01-02T03:04:06.006Z",
+    });
+    assert.equal(terminal.ok, true);
+    if (!terminal.ok) return;
+    const base = readJson(registry.paths.registry) as Record<string, unknown>;
+    const admissionEpoch = Number(base.runtime_epoch) + 1;
+    writeRegistry(registry, {
+      ...base,
+      runtime_epoch: admissionEpoch,
+      required_features: ["runtime-sessions.v1", "executions.v1"],
+      runtime_sessions: [
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: session.sessionId,
+          admission: "closed",
+          runtime_epoch: admissionEpoch,
+        },
+      ],
+      executions: [toPersistedSessionExecutionRecord(terminal.value)],
+    } as unknown as PersistedRegistry);
+
+    const populatedFilesystem = {
+      statSync: () => ({ isDirectory: () => true, isFile: () => true }),
+      realpathSync: (file: string) => file,
+      readFileSync: (file: string) => {
+        if (file.endsWith("cgroup.events")) return "populated 1\n";
+        if (file.endsWith("cgroup.procs")) return "";
+        throw new Error("unobserved cgroup file");
+      },
+      writeFileSync: () => undefined,
+      mkdirSync: () => undefined,
+      rmdirSync: () => undefined,
+    } as unknown as CgroupFileSystem;
+    const managed = new SessionRegistry({ cwd: fixture.repositoryPath, cgroupFilesystem: populatedFilesystem });
+    const finalization = {
+      contract_id: SESSION_EXECUTION_CONTROL_CONTRACT_ID,
+      schema_version: 1 as const,
+      session_id: session.sessionId,
+      fence_id: "test-fence",
+      operation: "close" as const,
+      expected_epoch: admissionEpoch - 1,
+      admission_epoch: admissionEpoch,
+      admission: "closed" as const,
+      status: "ready" as const,
+      next_action: "finalize-lifecycle" as const,
+    };
+    assert.throws(
+      () => managed.close(session.sessionId, finalization),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        error.message.includes("Owned execution scope is not proven empty") &&
+        error.details.population === "populated",
+    );
+    assert.equal(managed.get(session.sessionId)?.state, "active");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("claim release reopens managed admission only after locked empty-scope proof", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    registry.claimResources({ sessionId: session.sessionId, claims: [{ resource: "README.md", mode: "write" }] });
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const base = readJson(registry.paths.registry) as Record<string, unknown>;
+    const epoch = Number(base.runtime_epoch);
+    writeRegistry(registry, {
+      ...base,
+      required_features: ["runtime-sessions.v1", "executions.v1"],
+      runtime_sessions: [
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: session.sessionId,
+          admission: "open",
+          runtime_epoch: epoch,
+        },
+      ],
+      executions: [],
+    } as unknown as PersistedRegistry);
+
+    const starting = reserveExecution({
+      session_id: session.sessionId,
+      execution_id: "claim-release-finalization",
+      profile_digest: "a".repeat(64),
+      filesystem_token: "b".repeat(64),
+      runtime_epoch: epoch,
+      boot_id: bootId,
+      now: "2026-09-22T00:00:00.000Z",
+    });
+    assert.equal(starting.ok, true);
+    if (!starting.ok) return;
+    registry.persistSessionExecution(toPersistedSessionExecutionRecord(starting.value));
+    const terminal = recordExecutionState(starting.value, {
+      state: "exited",
+      now: "2026-09-22T00:00:01.000Z",
+    });
+    assert.equal(terminal.ok, true);
+    if (!terminal.ok) return;
+    registry.transitionSessionExecution(
+      terminal.value.execution_id,
+      { state: "exited", now: terminal.value.updated_at },
+      toPersistedSessionExecutionRecord(terminal.value),
+    );
+    const closed = registry.closeSessionLaunchAdmission(session.sessionId, epoch);
+
+    const emptyFilesystem = {
+      statSync: () => ({ isDirectory: () => true, isFile: () => true }),
+      realpathSync: (file: string) => file,
+      readFileSync: (file: string) => {
+        if (file.endsWith("cgroup.events")) return "populated 0\n";
+        if (file.endsWith("cgroup.procs")) return "";
+        throw new Error("unobserved cgroup file");
+      },
+      writeFileSync: () => undefined,
+      mkdirSync: () => undefined,
+      rmdirSync: () => undefined,
+    } as unknown as CgroupFileSystem;
+    const managed = new SessionRegistry({ cwd: fixture.repositoryPath, cgroupFilesystem: emptyFilesystem });
+    const finalization = {
+      contract_id: SESSION_EXECUTION_CONTROL_CONTRACT_ID,
+      schema_version: 1 as const,
+      session_id: session.sessionId,
+      fence_id: "claim-release-fence",
+      operation: "release-claims" as const,
+      expected_epoch: epoch,
+      admission_epoch: closed.runtimeEpoch,
+      admission: "closed" as const,
+      status: "ready" as const,
+      next_action: "finalize-lifecycle" as const,
+    };
+    const released = managed.releaseClaims(
+      { sessionId: session.sessionId, all: true, force: true },
+      undefined,
+      finalization,
+    );
+    assert.equal(released.released.length, 1);
+    assert.equal(managed.listClaims(session.sessionId).length, 0);
+    const reopened = managed.getSessionManagedRuntime(session.sessionId).admission;
+    assert.equal(reopened?.admission, "open");
+    assert.equal(reopened?.runtime_epoch, managed.runtimeEpoch);
+    assert.ok(managed.runtimeEpoch > closed.runtimeEpoch);
   } finally {
     fixture.cleanup();
   }

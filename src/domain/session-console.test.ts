@@ -5,6 +5,7 @@ import { deriveCgroupScopeName } from "./cgroups-v2.js";
 import { DomainError, failure, success } from "./errors.js";
 import {
   enterSessionConsole,
+  launchManagedSessionCommand,
   listSessionProcesses,
   sessionConsolePrompt,
   type SessionConsoleRunner,
@@ -280,4 +281,82 @@ test("process inspection retains cgroup observation for unresolved executions", 
   assert.equal(observedRecords.length, 1);
   assert.equal(observedRecords[0]?.cgroups?.identity.execution_id, record.execution_id);
   assert.equal(result.value.processes[0]?.cgroups?.state, "empty");
+});
+
+test("managed command path fails closed before launch when cgroups are unavailable", async () => {
+  let persisted = 0;
+  const managedBackend = {
+    getSessionManagedRuntime: async (_context: SessionContext, sessionId: string, executionId?: string) =>
+      success({
+        runtime_epoch: 7,
+        registry_revision: 11,
+        claim_set_generation: 3,
+        admission: {
+          kind: "session-admission" as const,
+          schema_version: 1 as const,
+          session_id: sessionId,
+          admission: "open" as const,
+          runtime_epoch: 7,
+        },
+        profile: { digest: "a".repeat(64) },
+        runtime_environment_identity: {
+          session_id: sessionId,
+          execution_id: executionId ?? "unused",
+          session_root: "/private/session-home",
+          execution_root: "/private/execution",
+          owner_uid: 1000,
+          owner_gid: 1000,
+        },
+      }),
+    listClaims: async () => success({ claims: [], claim_set_generation: 3 }),
+    persistSessionExecution: async () => {
+      persisted += 1;
+      return failure(new DomainError("REGISTRY_DURABILITY_UNCERTAIN", "unexpected persistence"));
+    },
+    readSessionRuntimeEpoch: () => 7,
+  } as unknown as SessionBackend;
+
+  const result = await launchManagedSessionCommand(context, managedBackend, {
+    session_id: session.session_id,
+    command: { command: "/nawabari/bin/node", args: ["-e", "process.exit(0)"] },
+    sandbox_probe: { hasCgroupsV2: () => false } as unknown as import("./sandbox.js").SandboxProbe,
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+  assert.equal(persisted, 0);
+});
+
+test("managed interactive entry fails closed when the protected producer cannot preserve terminal input", async () => {
+  let runnerCalls = 0;
+  const managedBackend = {
+    ...backend(),
+    getSessionManagedRuntime: async () =>
+      success({
+        runtime_epoch: 7,
+        registry_revision: 11,
+        claim_set_generation: 3,
+        admission: {
+          kind: "session-admission" as const,
+          schema_version: 1 as const,
+          session_id: session.session_id,
+          admission: "open" as const,
+          runtime_epoch: 7,
+        },
+        profile: { digest: "a".repeat(64) },
+      }),
+  } as unknown as SessionBackend;
+
+  const result = await enterSessionConsole(context, managedBackend, {
+    session_id: session.session_id,
+    persist_execution: async () => undefined,
+    sandbox_runner: async () => {
+      runnerCalls += 1;
+      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+    },
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+  assert.equal(runnerCalls, 0);
 });

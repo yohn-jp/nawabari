@@ -1,7 +1,11 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
 
 import {
+  defaultSandboxProbe,
+  discoverSandboxRuntimeLayout,
   resolveSandboxExecutionRequest,
   type SandboxCommand,
   type SandboxExecutionRequest,
@@ -9,7 +13,11 @@ import {
   type SandboxProbe,
   type SandboxRuntimeLayout,
 } from "./sandbox.js";
-import { runInteractiveSandboxedCommand, type SandboxLauncherOptions } from "./sandbox-launcher.js";
+import {
+  compileSandboxInvocation,
+  runInteractiveSandboxedCommand,
+  type SandboxLauncherOptions,
+} from "./sandbox-launcher.js";
 import {
   observeExecutionIdentity,
   parseSessionExecutionRecord,
@@ -25,6 +33,7 @@ import {
 import { CGROUPS_V2_CONTRACT_ID, CGROUPS_V2_ROOT, deriveCgroupScopeName, type CgroupFileSystem } from "./cgroups-v2.js";
 import {
   observeOwnedExecution,
+  SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
   type OwnedExecutionObservation,
   type SessionProcessObservationOptions,
 } from "./session-process-observation.js";
@@ -37,7 +46,18 @@ import type {
 import type { ResolvedRuntimeProfile, RuntimeProfileSelection } from "./runtime-profile.js";
 import type { RuntimeResolutionFhsOptions } from "./runtime-resolution.js";
 import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
-import type { SessionBackend, SessionContext, SessionRecord } from "./session.js";
+import type { SessionBackend, SessionContext, SessionManagedRuntimeState, SessionRecord } from "./session.js";
+import {
+  cleanupSessionRuntimeDirectories,
+  compileSessionEnvironment,
+  materializeSessionRuntimeDirectories,
+} from "./session-environment.js";
+import { compileWorkingSetRuntimeProjection } from "./working-set-runtime-projection.js";
+import type { EffectiveWorkingSet } from "../working-set.js";
+import { resolveProfileRuntimeScope } from "./worktree-profile-scope.js";
+import { resolveWorktreeProfileRuntime } from "./worktree-profile-runtime.js";
+import { runSessionLaunchSupervisor } from "./session-launch-supervisor.js";
+import type { SessionLaunchSupervisorResult } from "./session-launch-supervisor.js";
 import { BASH_REQUIREMENT, BASH_STARTUP_ARGS } from "./shell-runtime.js";
 import { CANONICAL_EXECUTABLE_ROOT } from "./runtime-executable-projection.js";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
@@ -255,6 +275,269 @@ function updateExecution(
   return recordExecutionState(record, { state, now: now() });
 }
 
+function processStarttime(pid: number): string {
+  const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  const starttime = raw
+    .slice(raw.lastIndexOf(")") + 1)
+    .trim()
+    .split(/\s+/u)[19];
+  if (starttime === undefined || !/^\d+$/u.test(starttime)) throw new Error("process starttime is unavailable");
+  return starttime;
+}
+
+function managedRuntimeUnavailable(sessionId: string): DomainResult<never> {
+  return failure(
+    new DomainError("BACKEND_UNAVAILABLE", "The managed protected execution authority is unavailable.", {
+      session_id: sessionId,
+    }),
+  );
+}
+
+/** Launch one pinned managed command through the durable #498 composition. */
+export async function launchManagedSessionCommand(
+  context: SessionContext,
+  backend: SessionBackend,
+  input: Readonly<{
+    session_id: string;
+    command: SandboxCommand;
+    execution_id?: string;
+    runtime_policy?: RuntimePolicy;
+    sandbox_probe?: SandboxProbe;
+    sandbox_runtime_layout?: SandboxRuntimeLayout;
+    now?: () => string;
+  }>,
+): Promise<
+  DomainResult<Readonly<{
+    supervisor: SessionLaunchSupervisorResult;
+    execution: SessionExecutionRecord;
+    result?: SandboxExecutionResult;
+  }> | null>
+> {
+  const executionId = input.execution_id ?? crypto.randomUUID();
+  if (backend.getSessionManagedRuntime === undefined) return success(null);
+  const observed = await backend.getSessionManagedRuntime(context, input.session_id, executionId);
+  if (!observed.ok) return observed;
+  if (observed.value.profile === null && observed.value.admission === null) return success(null);
+  if (
+    backend.listClaims === undefined ||
+    backend.persistSessionExecution === undefined ||
+    backend.readSessionRuntimeEpoch === undefined
+  )
+    return managedRuntimeUnavailable(input.session_id);
+  const initial = observed.value;
+  const pin = initial.profile;
+  if (pin === null || initial.admission === null) {
+    return failure(
+      new DomainError("REGISTRY_CORRUPT", "Managed session profile and admission authority disagree.", {
+        session_id: input.session_id,
+      }),
+    );
+  }
+  if (
+    initial.admission.admission !== "open" ||
+    initial.admission.runtime_epoch !== initial.runtime_epoch ||
+    initial.runtime_environment_identity === undefined
+  ) {
+    return failure(
+      new DomainError("OPERATION_REJECTED", "Managed session launch admission is not open at its current epoch.", {
+        session_id: input.session_id,
+        runtime_epoch: initial.runtime_epoch,
+        admission_epoch: initial.admission.runtime_epoch,
+        admission: initial.admission.admission,
+      }),
+    );
+  }
+  const probe = input.sandbox_probe ?? defaultSandboxProbe;
+  if (!probe.hasCgroupsV2()) {
+    return failure(
+      new DomainError(
+        "SANDBOX_CAPABILITY_UNAVAILABLE",
+        "Managed execution requires cgroups v2 for durable process ownership and quiescence.",
+        { session_id: input.session_id, capability: "cgroups_v2" },
+      ),
+    );
+  }
+
+  const session = await backend.getSession(context, input.session_id);
+  if (!session.ok) return session;
+  if (session.value.state !== "active") {
+    return failure(
+      new DomainError("SESSION_NOT_ACTIVE", `Session is not active: ${input.session_id}`, {
+        session_id: input.session_id,
+        state: session.value.state,
+      }),
+    );
+  }
+  const claimsResult = await backend.listClaims(context, input.session_id);
+  if (!claimsResult.ok) return claimsResult;
+  const workingSet =
+    session.value.working_set === undefined
+      ? undefined
+      : compileWorkingSetRuntimeProjection(session.value.working_set as unknown as EffectiveWorkingSet);
+  if (workingSet !== undefined && !workingSet.ok) return workingSet;
+  const profile = pin.resolved;
+  const claims = claimsResult.value.claims.map((claim) => ({
+    resource: claim.resource,
+    repositoryId: claim.repository,
+    mode: claim.mode,
+  }));
+  const pathRequests = [
+    ...profile.filesystem.readOnly.map((path) => ({ path, operation: "READONLY" as const })),
+    ...profile.filesystem.write.map((path) => ({ path, operation: "WRITE" as const })),
+  ];
+  const scope = resolveProfileRuntimeScope(
+    profile,
+    {
+      repositoryId: pin.provenance.repository.id,
+      claims,
+      ...(workingSet === undefined ? {} : { workingSet: workingSet.value, externalArtifact: true }),
+    },
+    { paths: pathRequests.map((request) => request.path), requests: pathRequests },
+  );
+  if (!scope.ok) return scope;
+  if (scope.value.status !== "ready") {
+    return failure(
+      new DomainError("RUNTIME_PROFILE_REQUIREMENT_MISSING", "Managed profile filesystem scope is unavailable.", {
+        session_id: input.session_id,
+        diagnostic: scope.value.diagnostics[0] ?? null,
+      }),
+    );
+  }
+
+  const layout = input.sandbox_runtime_layout ?? discoverSandboxRuntimeLayout();
+  const runtime = resolveWorktreeProfileRuntime(profile, layout);
+  if (!runtime.ok) return runtime;
+  if (input.runtime_policy !== undefined && input.runtime_policy.mode !== runtime.value.policy.mode) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "Requested runtime policy differs from the pinned profile.", {
+        requested_policy: input.runtime_policy.mode,
+        pinned_policy: runtime.value.policy.mode,
+      }),
+    );
+  }
+  const boot = bootId();
+  if (!boot.ok) return boot;
+  const request = await resolveSandboxExecutionRequest(
+    backend,
+    context,
+    {
+      session_id: input.session_id,
+      enforce: true,
+      runtime_policy: runtime.value.policy,
+      runtime_projection: runtime.value.projection,
+      cgroups: { required: true, execution_id: executionId },
+    },
+    input.sandbox_probe,
+    layout,
+  );
+  if (!request.ok) return request;
+  if (request.value.worktree !== session.value.worktree) {
+    return failure(
+      new DomainError("WORKTREE_MISMATCH", "The protected request worktree differs from the selected session.", {
+        session_id: input.session_id,
+        session_worktree: session.value.worktree,
+        request_worktree: request.value.worktree,
+      }),
+    );
+  }
+
+  const fresh = await backend.getSessionManagedRuntime(context, input.session_id, executionId);
+  if (!fresh.ok) return fresh;
+  if (
+    fresh.value.profile?.digest !== pin.digest ||
+    fresh.value.admission?.admission !== "open" ||
+    fresh.value.admission.runtime_epoch !== fresh.value.runtime_epoch ||
+    fresh.value.runtime_epoch !== initial.runtime_epoch ||
+    fresh.value.claim_set_generation !== initial.claim_set_generation ||
+    fresh.value.registry_revision !== initial.registry_revision ||
+    fresh.value.runtime_environment_identity?.execution_id !== executionId
+  ) {
+    return failure(
+      new DomainError("OPERATION_REJECTED", "Managed session authority changed during protected launch preparation.", {
+        session_id: input.session_id,
+        execution_id: executionId,
+      }),
+    );
+  }
+  const live = fresh.value;
+  const filesystemToken = digest({ scope: scope.value, claim_set_generation: live.claim_set_generation });
+  const snapshot = {
+    lifecycle: "active" as const,
+    launch_permitted: true,
+    profile_token: pin.digest,
+    profile_revision: live.registry_revision,
+    filesystem_token: filesystemToken,
+    filesystem_revision: live.claim_set_generation,
+    generation: live.claim_set_generation,
+    epoch: live.runtime_epoch,
+  };
+  const reservation = reserveExecution({
+    session_id: input.session_id,
+    execution_id: executionId,
+    profile_digest: pin.digest,
+    filesystem_token: filesystemToken,
+    runtime_epoch: live.runtime_epoch,
+    boot_id: boot.value,
+    now: (input.now ?? (() => new Date().toISOString()))(),
+  });
+  if (!reservation.ok) return reservation;
+  const compiled = compileSessionEnvironment(profile, live.runtime_environment_identity);
+  if (!compiled.ok) return compiled;
+  const protectedRequest: SandboxExecutionRequest = {
+    ...request.value,
+    runtime_resolution: {
+      policy: runtime.value.policy,
+      profile: runtime.value.profile,
+      materializer: runtime.value.materializer,
+    },
+  };
+  const { launchProtectedSessionExecution } = await import("./session-protected-launch.js");
+  const launched = await launchProtectedSessionExecution(
+    {
+      profile,
+      compiled_environment: compiled.value,
+      request: protectedRequest,
+      command: input.command,
+      admission: { session_id: input.session_id, execution_id: executionId, current: snapshot, expected: snapshot },
+      starting_record: reservation.value,
+      supervisor: {
+        trusted: { entrypoint: process.execPath, cwd: path.dirname(process.execPath) },
+        cgroup: { required: true },
+      },
+    },
+    {
+      materializeSessionRuntimeDirectories,
+      compileSandboxInvocation,
+      runSessionLaunchSupervisor,
+      persist_execution: async (record) => {
+        const persisted = await backend.persistSessionExecution!(context, record);
+        if (!persisted.ok) throw persisted.error;
+      },
+      read_process_starttime: processStarttime,
+      read_runtime_epoch: () => backend.readSessionRuntimeEpoch!(context, input.session_id),
+    },
+  );
+  if (!launched.ok) return launched;
+  if (launched.value.execution.state === "exited" && launched.value.supervisor.started) {
+    const owned = observeOwnedExecution(cgroupObservationRecord(launched.value.execution), {
+      current_boot_id: boot.value,
+    });
+    if (!owned.ok) return owned;
+    if (owned.value.state !== "empty" || owned.value.cgroups?.population.state !== "empty") {
+      return failure(
+        new DomainError(
+          "SANDBOX_CGROUP_CLEANUP_FAILED",
+          "The completed managed execution did not provide fresh owned-scope emptiness for runtime cleanup.",
+          { session_id: input.session_id, execution_id: executionId, state: owned.value.state },
+        ),
+      );
+    }
+    const cleaned = cleanupSessionRuntimeDirectories(compiled.value.manifest);
+    if (!cleaned.ok) return cleaned;
+  }
+  return success(launched.value);
+}
+
 function cgroupObservationRecord(record: SessionExecutionRecord): Parameters<typeof observeOwnedExecution>[0] {
   const name = deriveCgroupScopeName(record.cgroup_identity);
   return {
@@ -319,6 +602,20 @@ export async function enterSessionConsole(
         state: session.value.state,
       }),
     );
+  }
+
+  if (backend.getSessionManagedRuntime !== undefined) {
+    const managedRuntime = await backend.getSessionManagedRuntime(context, sessionId.value);
+    if (!managedRuntime.ok) return managedRuntime;
+    if (managedRuntime.value.profile !== null || managedRuntime.value.admission !== null) {
+      return failure(
+        new DomainError(
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "Managed interactive entry requires a protected launch with terminal stdio support.",
+          { session_id: sessionId.value, capability: "protected-interactive-stdio" },
+        ),
+      );
+    }
   }
 
   const executionId = options.execution_id ?? crypto.randomUUID();
@@ -458,17 +755,13 @@ export async function listSessionProcesses(
       ...(options.identity_reader === undefined ? {} : { reader: options.identity_reader }),
     });
     if (!observation.ok) return observation;
-    let cgroups: OwnedExecutionObservation | null = null;
-    if (record.value.state === "attached" || record.value.state === "running" || record.value.state === "unresolved") {
-      const observe = options.observe_owned_execution ?? observeOwnedExecution;
-      const cgroupRecord = cgroupObservationRecord(record.value);
-      const cgroupObservation = observe(cgroupRecord, {
-        ...(options.cgroup_filesystem === undefined ? {} : { filesystem: options.cgroup_filesystem }),
-        ...(options.current_boot_id === undefined ? {} : { current_boot_id: options.current_boot_id }),
-      });
-      if (!cgroupObservation.ok) return cgroupObservation;
-      cgroups = cgroupObservation.value;
-    }
+    const observe = options.observe_owned_execution ?? observeOwnedExecution;
+    const cgroupRecord = cgroupObservationRecord(record.value);
+    const cgroupObservation = observe(cgroupRecord, {
+      ...(options.cgroup_filesystem === undefined ? {} : { filesystem: options.cgroup_filesystem }),
+      ...(options.current_boot_id === undefined ? {} : { current_boot_id: options.current_boot_id }),
+    });
+    const cgroups = cgroupObservation.ok ? cgroupObservation.value : unknownOwnedObservation(record.value);
     processes.push({
       execution: serializeSessionExecutionRecord(record.value),
       observation: observation.value,
@@ -484,6 +777,17 @@ export async function listSessionProcesses(
     session: session.value,
     processes,
   });
+}
+
+function unknownOwnedObservation(record: SessionExecutionRecord): OwnedExecutionObservation {
+  return {
+    contract_id: SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
+    session_id: record.session_id,
+    execution_id: record.execution_id,
+    boot_id: record.boot_id,
+    state: "unknown",
+    cgroups: null,
+  };
 }
 
 export function serializeSessionConsoleResult(

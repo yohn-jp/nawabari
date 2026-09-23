@@ -8,6 +8,11 @@ import { test } from "node:test";
 import { runCli } from "../cli.js";
 import { SessionRegistry } from "../session-registry.js";
 import { withDirectoryFsyncFailure } from "../testing/fs-fault-injection.js";
+import {
+  recordExecutionState,
+  reserveExecution,
+  toPersistedSessionExecutionRecord,
+} from "./session-execution-record.js";
 import { LocalSessionBackend } from "./session-backend.js";
 
 test("local session backend provisions through the domain contract", async () => {
@@ -26,6 +31,12 @@ test("local session backend provisions through the domain contract", async () =>
     assert.equal(result.value.worktree, fs.realpathSync.native(worktreePath));
     assert.equal(result.value.label, "domain");
     assert.equal(result.value.state, "active");
+    const managedRuntime = await backend.getSessionManagedRuntime({ cwd: repositoryPath }, result.value.session_id);
+    assert.equal(managedRuntime.ok, true);
+    if (managedRuntime.ok) {
+      assert.equal(managedRuntime.value.admission, null);
+      assert.equal(managedRuntime.value.profile, null);
+    }
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });
@@ -56,6 +67,131 @@ test("local session backend provisions initial claims in the same registry mutat
       ["write"],
     );
     assert.equal(registry.listClaims(result.value.session_id)[0]?.resource, "README.md");
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("same-ID execution transitions persist through the backend and survive restart", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-managed-execution-ledger`;
+  try {
+    const context = { cwd: repositoryPath };
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(context, {
+      branch: "feature/managed-execution-ledger",
+      worktree: worktreePath,
+      label: null,
+      base: null,
+    });
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as Record<string, unknown>;
+    const runtimeEpoch = Number(persisted.runtime_epoch);
+    fs.writeFileSync(
+      registry.paths.registry,
+      `${JSON.stringify({
+        ...persisted,
+        required_features: ["runtime-sessions.v1", "executions.v1"],
+        runtime_sessions: [
+          {
+            kind: "session-admission",
+            schema_version: 1,
+            session_id: created.value.session_id,
+            admission: "open",
+            runtime_epoch: runtimeEpoch,
+          },
+        ],
+        executions: [],
+      })}\n`,
+    );
+
+    const reserved = reserveExecution({
+      session_id: created.value.session_id,
+      execution_id: "managed-ledger-execution",
+      profile_digest: "a".repeat(64),
+      filesystem_token: "b".repeat(64),
+      runtime_epoch: runtimeEpoch,
+      boot_id: "managed-ledger-boot",
+      now: "2026-09-22T00:00:00.000Z",
+    });
+    assert.equal(reserved.ok, true);
+    if (!reserved.ok) return;
+
+    const starting = await backend.persistSessionExecution(context, toPersistedSessionExecutionRecord(reserved.value));
+    assert.equal(starting.ok, true);
+    if (!starting.ok) return;
+
+    const attached = recordExecutionState(reserved.value, {
+      state: "attached",
+      supervisor: { pid: process.pid, starttime: "1" },
+      now: "2026-09-22T00:00:01.000Z",
+    });
+    assert.equal(attached.ok, true);
+    if (!attached.ok) return;
+    const attachedWrite = await backend.persistSessionExecution(
+      context,
+      toPersistedSessionExecutionRecord(attached.value),
+    );
+    assert.equal(attachedWrite.ok, true);
+    if (!attachedWrite.ok) return;
+
+    const releasing = recordExecutionState(attached.value, {
+      state: "running",
+      release_attempt: {
+        attempt: 1,
+        outcome: "unresolved",
+        attempted_at: "2026-09-22T00:00:02.000Z",
+        reason: "test evidence",
+      },
+      now: "2026-09-22T00:00:02.000Z",
+    });
+    assert.equal(releasing.ok, true);
+    if (!releasing.ok) return;
+    const releaseWrite = await backend.persistSessionExecution(
+      context,
+      toPersistedSessionExecutionRecord(releasing.value),
+    );
+    assert.equal(releaseWrite.ok, true);
+    if (!releaseWrite.ok) return;
+
+    const terminal = recordExecutionState(releasing.value, {
+      state: "exited",
+      now: "2026-09-22T00:00:03.000Z",
+    });
+    assert.equal(terminal.ok, true);
+    if (!terminal.ok) return;
+    const terminalWrite = await backend.persistSessionExecution(
+      context,
+      toPersistedSessionExecutionRecord(terminal.value),
+    );
+    assert.equal(terminalWrite.ok, true);
+    if (!terminalWrite.ok) return;
+
+    const conflictingIdentity = {
+      ...terminal.value,
+      filesystem_token: "c".repeat(64),
+    };
+    const rejected = await backend.persistSessionExecution(
+      context,
+      toPersistedSessionExecutionRecord(conflictingIdentity),
+    );
+    assert.equal(rejected.ok, false);
+    if (!rejected.ok) assert.equal(rejected.error.code, "OPERATION_REJECTED");
+
+    const restarted = new LocalSessionBackend();
+    const restored = await restarted.listSessionExecutions(context, created.value.session_id);
+    assert.equal(restored.ok, true);
+    if (restored.ok) {
+      assert.equal(restored.value.length, 1);
+      assert.equal(restored.value[0]?.execution_id, "managed-ledger-execution");
+      assert.equal(restored.value[0]?.state, "exited");
+      assert.equal(restored.value[0]?.release_attempt?.attempt, 1);
+      assert.equal(restored.value[0]?.supervisor_pid, process.pid);
+    }
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });
