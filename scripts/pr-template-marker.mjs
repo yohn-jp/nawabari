@@ -16,8 +16,7 @@
 // extractTemplateIdentityMarker happens to read, so that check is done here
 // before handing the body to gh-inari.
 
-const TEMPLATE_IDENTITY_MARKER_LINE_PATTERN =
-  /^<!-- inari:template \{.*\} -->$/u;
+const TEMPLATE_IDENTITY_MARKER_LINE_PATTERN = /^<!-- inari:template \{.*\} -->$/u;
 
 /**
  * Count how many lines in the body attempt the reserved template-identity
@@ -28,8 +27,5 @@ const TEMPLATE_IDENTITY_MARKER_LINE_PATTERN =
  */
 export function countTemplateIdentityMarkerAttempts(body) {
   if (typeof body !== "string" || body.length === 0) return 0;
-  return body
-    .split("\n")
-    .filter((line) => TEMPLATE_IDENTITY_MARKER_LINE_PATTERN.test(line.trim()))
-    .length;
+  return body.split("\n").filter((line) => TEMPLATE_IDENTITY_MARKER_LINE_PATTERN.test(line.trim())).length;
 }

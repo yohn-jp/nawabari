@@ -23,14 +23,14 @@ export function classifyPullRequestBranch({ branch } = {}) {
   if (release?.kind === "invalid-release") {
     return {
       classification: release.kind,
-      errors: release.errors
+      errors: release.errors,
     };
   }
   if (release?.kind === "release") {
     return {
       classification: release.kind,
       version: release.version,
-      errors: []
+      errors: [],
     };
   }
   return { classification: "ordinary", errors: [] };

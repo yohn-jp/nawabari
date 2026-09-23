@@ -6,17 +6,14 @@ import { fileURLToPath } from "node:url";
 import {
   extractTemplateIdentityMarker,
   validateExistingPullRequestArtifact,
-  validateRequiredMetadataString
+  validateRequiredMetadataString,
 } from "gh-inari/artifact";
 import { compileLocalGovernedContract } from "gh-inari/governance";
 import { classifyPullRequestBranch } from "./pr-contract-routing.mjs";
 import { countTemplateIdentityMarkerAttempts } from "./pr-template-marker.mjs";
 import { classifyEpicPrTitle } from "./epic-branch.mjs";
 
-const REPOSITORY_ROOT = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  ".."
-);
+const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
  * Validate a pull-request event against the checked-out repository's local
@@ -36,24 +33,19 @@ const REPOSITORY_ROOT = path.resolve(
  * itself attempting the epic type; every ordinary/release title remains
  * unaffected.
  */
-export async function validatePullRequest({
-  title,
-  body,
-  root = REPOSITORY_ROOT,
-  branch
-}) {
+export async function validatePullRequest({ title, body, root = REPOSITORY_ROOT, branch }) {
   const routing = classifyPullRequestBranch({ branch });
   if (routing.errors.length > 0) {
     const violations = routing.errors.map((message) => ({
       code: "GOVERNANCE_RELEASE_BRANCH_INVALID",
       path: "$.pull_request.head.ref",
-      message
+      message,
     }));
     return {
       valid: false,
       branchClassification: routing.classification,
       violations,
-      errors: violations.map((violation) => violation.message)
+      errors: violations.map((violation) => violation.message),
     };
   }
 
@@ -63,19 +55,12 @@ export async function validatePullRequest({
       valid: false,
       branchClassification: routing.classification,
       violations: resolution.violations,
-      errors: resolution.violations.map((violation) => violation.message)
+      errors: resolution.violations.map((violation) => violation.message),
     };
   }
 
-  const result = validateExistingPullRequestArtifact(
-    resolution.contract,
-    resolution.body
-  );
-  return report(
-    { contract: resolution.contract, result },
-    title,
-    routing.classification
-  );
+  const result = validateExistingPullRequestArtifact(resolution.contract, resolution.body);
+  return report({ contract: resolution.contract, result }, title, routing.classification);
 }
 
 /**
@@ -92,10 +77,9 @@ async function resolveTemplateContract(root, body) {
         {
           code: "GOVERNANCE_TEMPLATE_MARKER_AMBIGUOUS",
           path: "$.pull_request.body",
-          message:
-            "Pull-request body contains more than one inari:template marker."
-        }
-      ]
+          message: "Pull-request body contains more than one inari:template marker.",
+        },
+      ],
     };
   }
 
@@ -107,25 +91,21 @@ async function resolveTemplateContract(root, body) {
         {
           code: "GOVERNANCE_TEMPLATE_MARKER_MISSING",
           path: "$.pull_request.body",
-          message:
-            "Pull-request body is missing the required inari:template marker."
-        }
-      ]
+          message: "Pull-request body is missing the required inari:template marker.",
+        },
+      ],
     };
   }
-  if (
-    extracted.status === "malformed" ||
-    extracted.status === "unsupported-version"
-  ) {
+  if (extracted.status === "malformed" || extracted.status === "unsupported-version") {
     return {
       valid: false,
       violations: [
         {
           code: "GOVERNANCE_TEMPLATE_MARKER_INVALID",
           path: "$.pull_request.body",
-          message: "Pull-request body has a malformed inari:template marker."
-        }
-      ]
+          message: "Pull-request body has a malformed inari:template marker.",
+        },
+      ],
     };
   }
 
@@ -137,18 +117,14 @@ async function resolveTemplateContract(root, body) {
         {
           code: "GOVERNANCE_TEMPLATE_MARKER_WRONG_KIND",
           path: "$.pull_request.body",
-          message: `Pull-request body's inari:template marker declares kind "${marker.kind}", not "pull_request".`
-        }
-      ]
+          message: `Pull-request body's inari:template marker declares kind "${marker.kind}", not "pull_request".`,
+        },
+      ],
     };
   }
 
   try {
-    const contract = await compileLocalGovernedContract(
-      "pr",
-      root,
-      marker.path
-    );
+    const contract = await compileLocalGovernedContract("pr", root, marker.path);
     return { valid: true, contract, body: extracted.body };
   } catch {
     return {
@@ -157,9 +133,9 @@ async function resolveTemplateContract(root, body) {
         {
           code: "GOVERNANCE_TEMPLATE_UNAVAILABLE",
           path: "$.pull_request.body",
-          message: `Pull-request body's inari:template marker references an unavailable template: "${marker.path}".`
-        }
-      ]
+          message: `Pull-request body's inari:template marker references an unavailable template: "${marker.path}".`,
+        },
+      ],
     };
   }
 }
@@ -177,7 +153,7 @@ function report(outcome, title, branchClassification) {
       violations.unshift({
         code: "GOVERNANCE_EPIC_PR_TITLE_INVALID",
         path: "$.pull_request.title",
-        message: epicTitle.errors[0]
+        message: epicTitle.errors[0],
       });
     }
   }
@@ -187,14 +163,13 @@ function report(outcome, title, branchClassification) {
     branchClassification,
     result: outcome.result,
     violations,
-    errors: violations.map((violation) => violation.message)
+    errors: violations.map((violation) => violation.message),
   };
 }
 
 async function main() {
   const eventPathArgIndex = process.argv.indexOf("--event");
-  if (eventPathArgIndex === -1)
-    throw new Error("--event <path-to-github-event-json> is required");
+  if (eventPathArgIndex === -1) throw new Error("--event <path-to-github-event-json> is required");
   const eventPath = process.argv[eventPathArgIndex + 1];
   if (eventPath === undefined) throw new Error("--event requires a path");
   const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
@@ -202,36 +177,26 @@ async function main() {
 
   const branchIndex = process.argv.indexOf("--branch");
   const pullRequest = event.pull_request;
-  const branch =
-    branchIndex === -1 ? pullRequest.head?.ref : process.argv[branchIndex + 1];
+  const branch = branchIndex === -1 ? pullRequest.head?.ref : process.argv[branchIndex + 1];
   const result = await validatePullRequest({
     title: pullRequest.title ?? "",
     body: pullRequest.body ?? "",
     root: process.cwd(),
-    branch
+    branch,
   });
   console.log(
     JSON.stringify({
       valid: result.valid,
-      ...(result.contract === undefined
-        ? {}
-        : { template: result.contract.templateIdentity }),
-      ...(result.branchClassification === undefined
-        ? {}
-        : { branchClassification: result.branchClassification }),
-      ...(result.result === undefined
-        ? {}
-        : { classification: result.result.classification }),
-      violations: result.violations
-    })
+      ...(result.contract === undefined ? {} : { template: result.contract.templateIdentity }),
+      ...(result.branchClassification === undefined ? {} : { branchClassification: result.branchClassification }),
+      ...(result.result === undefined ? {} : { classification: result.result.classification }),
+      violations: result.violations,
+    }),
   );
   if (!result.valid) process.exitCode = 1;
 }
 
-if (
-  process.argv[1] &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
-) {
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
