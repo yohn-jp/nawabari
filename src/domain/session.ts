@@ -7,6 +7,8 @@ import type {
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
 import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
+import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
+import type { SessionRuntimeEnvironmentIdentity } from "./session-environment.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -35,6 +37,27 @@ export type SessionContext = {
   cwd: string;
 };
 
+export type SessionManagedRuntimeState = Readonly<{
+  readonly runtime_epoch: number;
+  readonly registry_revision: number;
+  readonly claim_set_generation: number;
+  readonly admission: Readonly<{
+    readonly kind: "session-admission";
+    readonly schema_version: 1;
+    readonly session_id: string;
+    readonly admission: "open" | "closed";
+    readonly runtime_epoch: number;
+  }> | null;
+  readonly profile: PinnedWorktreeProfile | null;
+  readonly runtime_environment_identity?: SessionRuntimeEnvironmentIdentity;
+}>;
+
+export type WorktreeProfileSessionCreateOptions = {
+  selection: { profile: string };
+  parameters?: JsonObject;
+  provenance?: { catalog?: { path?: string; blob_oid?: string } };
+};
+
 export type SessionCreateOptions = {
   branch: string | null;
   worktree: string | null;
@@ -51,6 +74,8 @@ export type SessionCreateOptions = {
   candidate_working_set?: unknown | null;
   /** Optional repository identity used by the transport-neutral working-set contract. */
   working_set_repository?: RepositoryIdentity | null;
+  /** Optional immutable worktree runtime profile selected during bootstrap. */
+  profile?: WorktreeProfileSessionCreateOptions | null;
 };
 
 export type WorkingSetExpansionOptions = {
@@ -905,6 +930,12 @@ export interface SessionBackend {
     sessionId: string,
     expectedEpoch: number,
   ): Promise<DomainResult<{ runtimeEpoch: number }>>;
+  getSessionManagedRuntime?(
+    context: SessionContext,
+    sessionId: string,
+    executionId?: string,
+  ): Promise<DomainResult<SessionManagedRuntimeState>>;
+  readSessionRuntimeEpoch?(context: SessionContext, sessionId: string): number;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {

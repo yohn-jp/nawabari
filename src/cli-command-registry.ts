@@ -100,6 +100,12 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
       ),
       option("--base", "Commit-resolving base ref for the new worktree", { value: "<ref>", default: "HEAD" }),
       option("--label", "Optional display label; never used as an identity", { value: "<text>", default: "omitted" }),
+      option("--profile", "Upper worktree runtime profile to resolve and pin atomically during managed bootstrap", {
+        value: "<profile-id>",
+      }),
+      option("--profile-parameter", "Typed JSON object of parameters for the selected worktree runtime profile", {
+        value: "<json-object>",
+      }),
       option(
         "--resource",
         "Initial repository-relative resource claim; repeatable, each paired with the --mode immediately after it",
@@ -126,6 +132,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     notes: [
       "All create options are optional. Use status --json to discover managed_worktree_root.",
       "--worktree and --worktree-root cannot be combined.",
+      "--profile-parameter requires --profile; ambiguous unqualified profile ids are rejected.",
       "Initial claims are provisioned atomically with the session; each --resource must be immediately followed by its own --mode, and zero pairs remains backward compatible.",
       "Providing one bounded working-set artifact requires the other; both are validated before worktree ownership is established.",
       "A claim conflict returns blocking-owner evidence. A durability-uncertain result is retry-safe only after re-reading the reported registry state; an existing owner is never silently adopted.",

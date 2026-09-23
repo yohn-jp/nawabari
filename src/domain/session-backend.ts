@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import {
   SessionRegistry,
@@ -43,6 +44,7 @@ import {
   type CleanupReconciliation,
   type SessionContext,
   type SessionCreateOptions,
+  type SessionManagedRuntimeState,
   type WorkingSetExpansionOptions,
   type WorkingSetExpansionResult,
   type SessionDiagnostic,
@@ -68,7 +70,14 @@ import {
   type UpdateClaimsOptions,
 } from "./session.js";
 import type { SandboxGitIdentity } from "./sandbox.js";
-import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
+import {
+  parseSessionExecutionRecord,
+  recordExecutionState,
+  toPersistedSessionExecutionRecord,
+  type PersistedSessionExecutionRecord,
+  type SessionExecutionRecord,
+  type SessionExecutionStateInput,
+} from "./session-execution-record.js";
 import {
   releaseSessionClaimsWithRuntimeDrain,
   closeSessionWithRuntimeDrain,
@@ -76,9 +85,20 @@ import {
   type SessionRuntimeLifecycleAdapter,
   type SessionRuntimeLifecycleMutation,
 } from "../session-runtime-lifecycle.js";
-import type { SessionDrainExecution } from "./session-execution-control.js";
-import { SESSION_PROCESS_OBSERVATION_CONTRACT_ID } from "./session-process-observation.js";
-import { parseSessionExecutionRecord } from "./session-execution-record.js";
+import type {
+  SessionDrainExecution,
+  SessionDrainFence,
+  SessionDrainFinalization,
+  SessionDrainObservation,
+} from "./session-execution-control.js";
+import {
+  observeOwnedExecution,
+  SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
+  terminateOwnedExecution,
+  type OwnedExecutionObservation,
+  type SessionExecutionRecord as OwnedSessionExecutionRecord,
+} from "./session-process-observation.js";
+import { CGROUPS_V2_CONTRACT_ID, CGROUPS_V2_ROOT, deriveCgroupScopeName, type CgroupFileSystem } from "./cgroups-v2.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
@@ -209,7 +229,54 @@ export class LocalSessionBackend implements SessionBackend {
     record: PersistedSessionExecutionRecord,
   ): Promise<DomainResult<PersistedSessionExecutionRecord>> {
     try {
-      return success(this.registryFor(context).persistSessionExecution(record));
+      const registry = this.registryFor(context);
+      const desired = parseSessionExecutionRecord(record);
+      if (!desired.ok) return desired;
+      const wanted = toPersistedSessionExecutionRecord(desired.value);
+      const currentRecord = registry
+        .listSessionExecutions(desired.value.session_id)
+        .find((candidate) => candidate.execution_id === desired.value.execution_id);
+      if (currentRecord === undefined) return success(registry.persistSessionExecution(wanted));
+
+      const current = parseSessionExecutionRecord(currentRecord);
+      if (!current.ok) return current;
+      if (!sameSessionExecutionIdentity(current.value, desired.value)) {
+        throw new DomainError("OPERATION_REJECTED", "Execution transition changed its immutable identity", {
+          execution_id: desired.value.execution_id,
+          session_id: desired.value.session_id,
+        });
+      }
+      const persistedCurrent = toPersistedSessionExecutionRecord(current.value);
+      if (JSON.stringify(persistedCurrent) === JSON.stringify(wanted)) return success(persistedCurrent);
+
+      const input: SessionExecutionStateInput = {
+        state: desired.value.state,
+        now: desired.value.updated_at,
+        ...(desired.value.supervisor_pid === null || desired.value.supervisor_starttime === null
+          ? {}
+          : {
+              supervisor: {
+                pid: desired.value.supervisor_pid,
+                starttime: desired.value.supervisor_starttime,
+              },
+            }),
+        ...(JSON.stringify(desired.value.release_attempt) === JSON.stringify(current.value.release_attempt)
+          ? {}
+          : { release_attempt: desired.value.release_attempt }),
+      };
+      const preview = recordExecutionState(current.value, input);
+      if (!preview.ok) return failure(preview.error);
+      if (JSON.stringify(toPersistedSessionExecutionRecord(preview.value)) !== JSON.stringify(wanted)) {
+        throw new DomainError(
+          "OPERATION_REJECTED",
+          "Execution transition does not match the canonical lifecycle result",
+          {
+            execution_id: desired.value.execution_id,
+            session_id: desired.value.session_id,
+          },
+        );
+      }
+      return success(registry.transitionSessionExecution(desired.value.execution_id, input, wanted));
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -239,6 +306,22 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
+  public async getSessionManagedRuntime(
+    context: SessionContext,
+    sessionId: string,
+    executionId?: string,
+  ): Promise<DomainResult<SessionManagedRuntimeState>> {
+    try {
+      return success(this.registryFor(context).getSessionManagedRuntime(sessionId, executionId));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public readSessionRuntimeEpoch(context: SessionContext, sessionId: string): number {
+    return this.registryFor(context).readSessionRuntimeEpoch(sessionId);
+  }
+
   public async createSession(
     context: SessionContext,
     options: SessionCreateOptions,
@@ -266,6 +349,7 @@ export class LocalSessionBackend implements SessionBackend {
         ...(options.working_set_repository === null || options.working_set_repository === undefined
           ? {}
           : { workingSetRepository: options.working_set_repository }),
+        ...(options.profile === null || options.profile === undefined ? {} : { profile: options.profile }),
       });
       return success(toDomainRecord(record));
     } catch (error: unknown) {
@@ -486,17 +570,20 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const registry = this.registryFor(context);
       const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
+      const registryOptions = {
+        sessionId,
+        integratedRevision: options.integrated_revision ?? undefined,
+        fetchRemote: options.fetch_remote ?? undefined,
+        fetchBranch: options.fetch_branch ?? undefined,
+      };
+      const close = (fence?: import("./session-execution-control.js").SessionDrainFinalization) =>
+        registryMutation(() => registry.close(registryOptions, fence));
+      if (registry.getSessionLaunchAdmission(sessionId) === undefined) {
+        const mutation = close();
+        return Promise.resolve(mutation.ok ? success(toDomainCloseSessionResult(mutation.value)) : mutation);
+      }
       const drained = closeSessionWithRuntimeDrain(
-        runtimeLifecycleAdapter(registry, ({ session_id: mutationSessionId }) =>
-          registryMutation(() =>
-            registry.close({
-              sessionId: mutationSessionId,
-              integratedRevision: options.integrated_revision ?? undefined,
-              fetchRemote: options.fetch_remote ?? undefined,
-              fetchBranch: options.fetch_branch ?? undefined,
-            }),
-          ),
-        ),
+        runtimeLifecycleAdapter(registry, ({ fence }) => close(fence), this.registryOptions.cgroupFilesystem),
         sessionId,
         registry.runtimeEpoch,
       );
@@ -509,24 +596,7 @@ export class LocalSessionBackend implements SessionBackend {
         }
         const mutation = outcome.value.value;
         if (!mutation.ok) return mutation;
-        const result = mutation.value;
-        return Promise.resolve(
-          success({
-            session: toDomainRecord(result.session),
-            worktree_removed: result.worktreeRemoved,
-            branch_removed: result.branchRemoved,
-            idempotent: result.idempotent,
-            claim_set_generation: result.claimSetGeneration,
-            ...(result.reconciliation === undefined
-              ? {}
-              : { reconciliation: toDomainCleanupReconciliation(result.reconciliation) }),
-            ...(result.integrationProof === undefined
-              ? {}
-              : {
-                  integration_proof: toDomainIntegrationProof(result.integrationProof),
-                }),
-          }),
-        );
+        return Promise.resolve(success(toDomainCloseSessionResult(mutation.value)));
       });
     } catch (error: unknown) {
       return Promise.resolve(failure(toDomainError(error, "NO_CURRENT_SESSION")));
@@ -536,9 +606,16 @@ export class LocalSessionBackend implements SessionBackend {
   public discardSession(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardResult>> {
     try {
       const registry = this.registryFor(context);
+      if (registry.getSessionLaunchAdmission(sessionId) === undefined) {
+        const mutation = registryMutation(() => registry.discard(sessionId));
+        return Promise.resolve(mutation.ok ? success(toDomainSessionDiscardResult(mutation.value)) : mutation);
+      }
       return discardSessionWithRuntimeDrain(
-        runtimeLifecycleAdapter(registry, ({ session_id: mutationSessionId }) =>
-          registryMutation(() => registry.discard({ sessionId: mutationSessionId })),
+        runtimeLifecycleAdapter(
+          registry,
+          ({ session_id: mutationSessionId, fence }) =>
+            registryMutation(() => registry.discard({ sessionId: mutationSessionId }, fence)),
+          this.registryOptions.cgroupFilesystem,
         ),
         sessionId,
         registry.runtimeEpoch,
@@ -610,12 +687,25 @@ export class LocalSessionBackend implements SessionBackend {
     options: ClaimResourcesOptions,
   ): Promise<DomainResult<ClaimResourcesResult>> {
     try {
-      const result = this.registryFor(context).claimResources({
-        sessionId: options.session_id ?? undefined,
-        repositoryId: options.repository ?? undefined,
-        claims: options.claims.map(toRegistryClaimInput),
-      });
-      return success(toDomainClaimResult(result));
+      const registry = this.registryFor(context);
+      const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
+      const result = await mutateClaimsWithRuntimeDrain(
+        registry,
+        sessionId,
+        this.registryOptions.cgroupFilesystem,
+        (fence) =>
+          registryMutation(() =>
+            registry.claimResources(
+              {
+                sessionId: options.session_id ?? undefined,
+                repositoryId: options.repository ?? undefined,
+                claims: options.claims.map(toRegistryClaimInput),
+              },
+              fence,
+            ),
+          ),
+      );
+      return result.ok ? success(toDomainClaimResult(result.value)) : result;
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -626,14 +716,27 @@ export class LocalSessionBackend implements SessionBackend {
     options: UpdateClaimsOptions,
   ): Promise<DomainResult<ClaimResourcesResult>> {
     try {
-      const result = this.registryFor(context).updateClaims({
-        sessionId: options.session_id ?? undefined,
-        repositoryId: options.repository ?? undefined,
-        claims: options.claims.map(toRegistryClaimInput),
-        expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
-        force: options.force === true,
-      });
-      return success(toDomainClaimResult(result));
+      const registry = this.registryFor(context);
+      const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
+      const result = await mutateClaimsWithRuntimeDrain(
+        registry,
+        sessionId,
+        this.registryOptions.cgroupFilesystem,
+        (fence) =>
+          registryMutation(() =>
+            registry.updateClaims(
+              {
+                sessionId: options.session_id ?? undefined,
+                repositoryId: options.repository ?? undefined,
+                claims: options.claims.map(toRegistryClaimInput),
+                expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+                force: options.force === true,
+              },
+              fence,
+            ),
+          ),
+      );
+      return result.ok ? success(toDomainClaimResult(result.value)) : result;
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -644,14 +747,27 @@ export class LocalSessionBackend implements SessionBackend {
     options: ClaimDeltasOptions,
   ): Promise<DomainResult<ClaimDeltasResult>> {
     try {
-      const result = this.registryFor(context).applyClaimDeltas({
-        sessionId: options.session_id ?? undefined,
-        repositoryId: options.repository ?? undefined,
-        deltas: options.deltas,
-        expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
-        force: options.force === true,
-      });
-      return success(toDomainClaimDeltasResult(result));
+      const registry = this.registryFor(context);
+      const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
+      const result = await mutateClaimsWithRuntimeDrain(
+        registry,
+        sessionId,
+        this.registryOptions.cgroupFilesystem,
+        (fence) =>
+          registryMutation(() =>
+            registry.applyClaimDeltas(
+              {
+                sessionId: options.session_id ?? undefined,
+                repositoryId: options.repository ?? undefined,
+                deltas: options.deltas,
+                expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+                force: options.force === true,
+              },
+              fence,
+            ),
+          ),
+      );
+      return result.ok ? success(toDomainClaimDeltasResult(result.value)) : result;
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -664,36 +780,34 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const registry = this.registryFor(context);
       const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
-      const drained = await releaseSessionClaimsWithRuntimeDrain(
-        runtimeLifecycleAdapter(registry, ({ session_id: mutationSessionId }) =>
-          registryMutation(() =>
-            registry.releaseClaims({
-              sessionId: mutationSessionId,
-              resources: options.resources ?? undefined,
-              claimIds: options.claim_ids ?? undefined,
-              all: options.all === true,
-              expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
-              force: options.force === true,
-            }),
-          ),
-        ),
+      const result = await mutateClaimsWithRuntimeDrain(
+        registry,
         sessionId,
-        registry.runtimeEpoch,
+        this.registryOptions.cgroupFilesystem,
+        (fence) =>
+          registryMutation(() =>
+            registry.releaseClaims(
+              {
+                sessionId,
+                resources: options.resources ?? undefined,
+                claimIds: options.claim_ids ?? undefined,
+                all: options.all === true,
+                expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+                force: options.force === true,
+              },
+              undefined,
+              fence,
+            ),
+          ),
       );
-      if (!drained.ok) return drained as DomainResult<ReleaseClaimsResult>;
-      if (drained.value.status !== "completed" || drained.value.value === undefined) {
-        return failure(new DomainError("OPERATION_REJECTED", "Claim release is blocked until owned executions drain."));
-      }
-      const mutation = drained.value.value;
-      if (!mutation.ok) return mutation;
-      const result = mutation.value;
-      /* The lifecycle adapter performs the canonical release mutation. */
+      if (!result.ok) return result;
+      const released = result.value;
       return success({
-        session_id: result.sessionId,
-        released: result.released.map(toDomainClaim),
-        remaining: result.remaining.map(toDomainClaim),
-        idempotent: result.idempotent,
-        claim_set_generation: result.claimSetGeneration,
+        session_id: released.sessionId,
+        released: released.released.map(toDomainClaim),
+        remaining: released.remaining.map(toDomainClaim),
+        idempotent: released.idempotent,
+        claim_set_generation: released.claimSetGeneration,
       });
     } catch (error: unknown) {
       return failure(toDomainError(error));
@@ -746,33 +860,44 @@ export function createLocalSessionBackend(options: LocalSessionBackendOptions = 
 function runtimeLifecycleAdapter<T>(
   registry: SessionRegistry,
   mutate: (mutation: SessionRuntimeLifecycleMutation) => T | Promise<T>,
+  cgroupFilesystem?: CgroupFileSystem,
 ): SessionRuntimeLifecycleAdapter<T> {
+  const snapshot = (sessionId: string) => {
+    const executions: SessionDrainExecution[] = [];
+    const currentBootId = observeKernelBootId();
+    for (const persisted of registry.listSessionExecutions(sessionId)) {
+      const parsed = parseSessionExecutionRecord(persisted);
+      if (!parsed.ok) throw parsed.error;
+      const owned =
+        currentBootId === null
+          ? null
+          : observeOwnedExecution(ownedExecutionRecord(parsed.value), {
+              current_boot_id: currentBootId,
+              ...(cgroupFilesystem === undefined ? {} : { filesystem: cgroupFilesystem }),
+            });
+      executions.push({
+        record: parsed.value,
+        observation: owned === null || !owned.ok ? unknownOwnedExecution(parsed.value) : owned.value,
+      });
+    }
+    const trackedAdmission = registry.getSessionLaunchAdmission(sessionId);
+    return {
+      session_id: sessionId,
+      runtime_epoch: registry.runtimeEpoch,
+      executions,
+      kernel_empty:
+        trackedAdmission !== undefined &&
+        executions.length > 0 &&
+        executions.every(
+          ({ observation }) =>
+            observation.state === "empty" &&
+            observation.cgroups !== null &&
+            observation.cgroups.population.state === "empty",
+        ),
+    };
+  };
   return {
-    observe: (sessionId) => {
-      const executions: SessionDrainExecution[] = [];
-      for (const persisted of registry.listSessionExecutions(sessionId)) {
-        const parsed = parseSessionExecutionRecord(persisted);
-        if (!parsed.ok) throw parsed.error;
-        if (parsed.value.state === "exited") continue;
-        executions.push({
-          record: parsed.value,
-          observation: {
-            contract_id: SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
-            session_id: parsed.value.session_id,
-            execution_id: parsed.value.execution_id,
-            boot_id: parsed.value.boot_id,
-            state: "unknown",
-            cgroups: null,
-          },
-        });
-      }
-      return {
-        session_id: sessionId,
-        runtime_epoch: registry.runtimeEpoch,
-        executions,
-        kernel_empty: executions.length === 0,
-      };
-    },
+    observe: snapshot,
     close_admission: (request) => {
       try {
         return {
@@ -787,8 +912,143 @@ function runtimeLifecycleAdapter<T>(
         return failure(toDomainError(error));
       }
     },
+    terminate: (sessionId, fence: SessionDrainFence): SessionDrainObservation => {
+      if (
+        fence.session_id !== sessionId ||
+        fence.policy !== "terminate" ||
+        fence.admission !== "closed" ||
+        fence.admission_epoch !== registry.runtimeEpoch
+      ) {
+        throw new DomainError(
+          "OPERATION_REJECTED",
+          "Owned termination requires the exact closed session drain fence.",
+          {
+            session_id: sessionId,
+            fence_session_id: fence.session_id,
+          },
+        );
+      }
+      const currentBootId = observeKernelBootId();
+      if (currentBootId !== null) {
+        const records = new Map(
+          registry.listSessionExecutions(sessionId).map((persisted) => {
+            const parsed = parseSessionExecutionRecord(persisted);
+            if (!parsed.ok) throw parsed.error;
+            return [parsed.value.execution_id, parsed.value] as const;
+          }),
+        );
+        for (const fenced of fence.executions) {
+          const record = records.get(fenced.record.execution_id);
+          if (record === undefined || record.session_id !== sessionId) continue;
+          if (
+            JSON.stringify(record.cgroup_identity) !== JSON.stringify(fenced.record.cgroup_identity) ||
+            record.boot_id !== fenced.record.boot_id
+          ) {
+            throw new DomainError("OPERATION_REJECTED", "The owned execution identity changed during termination.", {
+              session_id: sessionId,
+              execution_id: record.execution_id,
+            });
+          }
+          const owned = ownedExecutionRecord(record);
+          const termination = terminateOwnedExecution(
+            owned,
+            {
+              kind: "terminate",
+              session_id: sessionId,
+              execution_id: record.execution_id,
+              boot_id: record.boot_id,
+            },
+            {
+              current_boot_id: currentBootId,
+              retain_scope: true,
+              ...(cgroupFilesystem === undefined ? {} : { filesystem: cgroupFilesystem }),
+            },
+          );
+          if (!termination.ok) continue;
+          if (record.state !== "exited") {
+            const terminal = recordExecutionState(record, { state: "exited" });
+            if (!terminal.ok) throw terminal.error;
+            registry.transitionSessionExecution(
+              record.execution_id,
+              { state: "exited", now: terminal.value.updated_at },
+              toPersistedSessionExecutionRecord(terminal.value),
+            );
+          }
+        }
+      }
+      const afterTermination = snapshot(sessionId);
+      return {
+        observed_epoch: afterTermination.runtime_epoch,
+        executions: afterTermination.executions,
+        kernel_empty: afterTermination.kernel_empty,
+      };
+    },
     mutate,
   };
+}
+
+async function mutateClaimsWithRuntimeDrain<T>(
+  registry: SessionRegistry,
+  sessionId: string,
+  cgroupFilesystem: CgroupFileSystem | undefined,
+  mutation: (fence?: SessionDrainFinalization) => DomainResult<T>,
+): Promise<DomainResult<T>> {
+  if (registry.getSessionLaunchAdmission(sessionId) === undefined) return mutation();
+  const drained = await releaseSessionClaimsWithRuntimeDrain(
+    runtimeLifecycleAdapter(registry, ({ fence }) => mutation(fence), cgroupFilesystem),
+    sessionId,
+    registry.runtimeEpoch,
+  );
+  if (!drained.ok) return drained;
+  if (drained.value.status !== "completed" || drained.value.value === undefined) {
+    return failure(
+      new DomainError("OPERATION_REJECTED", "Managed claim mutation is blocked until owned executions drain.", {
+        session_id: sessionId,
+        status: drained.value.status,
+      }),
+    );
+  }
+  return drained.value.value;
+}
+
+function ownedExecutionRecord(record: SessionExecutionRecord): OwnedSessionExecutionRecord {
+  const name = deriveCgroupScopeName(record.cgroup_identity);
+  return {
+    schema_version: 1,
+    session_id: record.session_id,
+    execution_id: record.execution_id,
+    boot_id: record.boot_id,
+    state: record.state === "attached" || record.state === "running" ? "active" : "terminal",
+    cgroups: {
+      contract_id: CGROUPS_V2_CONTRACT_ID,
+      root: CGROUPS_V2_ROOT,
+      parent: `${CGROUPS_V2_ROOT}/nawabari`,
+      path: `${CGROUPS_V2_ROOT}/nawabari/${name}`,
+      name,
+      boot_id: record.boot_id,
+      identity: { session_id: record.session_id, execution_id: record.execution_id },
+    },
+  };
+}
+
+function unknownOwnedExecution(record: SessionExecutionRecord): OwnedExecutionObservation {
+  return {
+    contract_id: SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
+    session_id: record.session_id,
+    execution_id: record.execution_id,
+    boot_id: record.boot_id,
+    state: "unknown",
+    cgroups: null,
+  };
+}
+
+function observeKernelBootId(): string | null {
+  try {
+    const value = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return value.length > 0 && value.length <= 256 && !value.includes("\0") ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 function registryMutation<T>(mutation: () => T): DomainResult<T> {
@@ -797,6 +1057,21 @@ function registryMutation<T>(mutation: () => T): DomainResult<T> {
   } catch (error: unknown) {
     return failure(toDomainError(error));
   }
+}
+
+function sameSessionExecutionIdentity(current: SessionExecutionRecord, next: SessionExecutionRecord): boolean {
+  return (
+    current.contract_id === next.contract_id &&
+    current.schema_version === next.schema_version &&
+    current.session_id === next.session_id &&
+    current.execution_id === next.execution_id &&
+    current.profile_digest === next.profile_digest &&
+    current.filesystem_token === next.filesystem_token &&
+    current.runtime_epoch === next.runtime_epoch &&
+    current.boot_id === next.boot_id &&
+    current.created_at === next.created_at &&
+    JSON.stringify(current.cgroup_identity) === JSON.stringify(next.cgroup_identity)
+  );
 }
 
 function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
@@ -1297,6 +1572,22 @@ function toDomainSessionDiscardResult(
   };
 }
 
+function toDomainCloseSessionResult(result: ReturnType<SessionRegistry["close"]>): SessionCloseResult {
+  return {
+    session: toDomainRecord(result.session),
+    worktree_removed: result.worktreeRemoved,
+    branch_removed: result.branchRemoved,
+    idempotent: result.idempotent,
+    claim_set_generation: result.claimSetGeneration,
+    ...(result.reconciliation === undefined
+      ? {}
+      : { reconciliation: toDomainCleanupReconciliation(result.reconciliation) }),
+    ...(result.integrationProof === undefined
+      ? {}
+      : { integration_proof: toDomainIntegrationProof(result.integrationProof) }),
+  };
+}
+
 function toDomainSessionDiscardPreview(
   preview: import("../session-registry.js").DiscardPreview,
 ): SessionDiscardPreview {
@@ -1456,6 +1747,7 @@ function toDomainClaim(claim: RegistryResourceClaim): ResourceClaim {
 }
 
 function toDomainError(error: unknown, fallbackCode?: ErrorCode): DomainError {
+  if (error instanceof DomainError) return error;
   if (!isSessionRegistryError(error)) {
     const cause = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     return new DomainError(
