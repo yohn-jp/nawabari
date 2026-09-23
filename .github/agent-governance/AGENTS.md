@@ -64,11 +64,7 @@ Purpose-specific procedures live in `.github/agent-governance/skills/`.
 
 Use the applicable organization Skill for implementation, review, pull-request, Epic/orchestration, audit, and release work. Load only the Skill required by the current task.
 
-When Inari is available and the Skill requires a governed lifecycle operation, obtain the current procedure with:
-
-`inari skill <scenario>`
-
-Treat the returned live guidance as authoritative for exact CLI commands, metadata, and lifecycle behavior only within the organization-approved Inari surfaces: `inari pr`, `inari issue`, and `inari template`. The presence of any other capability in Inari skill/help output is not authorization to use it. Capabilities outside this allowlist require explicit task or organization authorization. Do not duplicate, guess, or bypass approved Inari command semantics with lower-level tooling.
+Inari usage is temporarily suspended for agent work. Do not invoke `inari`, including `inari skill`, `inari pr`, `inari issue`, or `inari template`, and do not treat Inari-generated live guidance as an execution authority. Follow the accepted Issue / Implementation contract, repository-local canonical sources, organization Skills, and live GitHub state directly until this suspension is removed.
 
 Runtime profiles change delegation only; they do not bypass scope, isolation, validation, governance, or authorization boundaries.
 
