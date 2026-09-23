@@ -10,6 +10,9 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { resolveSandboxExecutionRequest } from "../dist/domain/sandbox.js";
+import { STRICT_RUNTIME_POLICY } from "../dist/domain/runtime-projection.js";
+import { createLocalSessionBackend } from "../dist/domain/session-backend.js";
 import { seedOfflineRuntimeDependencyOverrides } from "./seed-offline-runtime-dependencies.mjs";
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -180,37 +183,6 @@ function materializeBoundedSessionFixture(installDirectory, fixtureName, baseRev
   const outputPath = path.join(installDirectory, `bounded-session-${fixtureName}`);
   fs.writeFileSync(outputPath, fixture);
   return outputPath;
-}
-
-function executableOnPath(name) {
-  for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
-    if (directory.length === 0) continue;
-    const candidate = path.join(directory, name);
-    try {
-      if (fs.statSync(candidate).isFile() && (fs.statSync(candidate).mode & 0o111) !== 0) return candidate;
-    } catch {
-      // Continue through the caller's selected PATH.
-    }
-  }
-  return null;
-}
-
-function nixRuntimeClosure(executables) {
-  const nix = executableOnPath("nix");
-  if (nix === null) return null;
-  const paths = new Set();
-  for (const executable of executables) {
-    if (!executable.startsWith("/nix/store/")) return null;
-    const result = spawnSync(nix, ["path-info", "--recursive", executable], {
-      encoding: "utf8",
-      timeout: 15_000,
-    });
-    if (result.error || result.status !== 0) return null;
-    for (const entry of result.stdout.split(/\r?\n/u)) {
-      if (entry.startsWith("/nix/store/")) paths.add(entry);
-    }
-  }
-  return paths.size === 0 ? null : [...paths].sort();
 }
 
 function runPackedVerification(installDirectory, input) {
@@ -3146,17 +3118,15 @@ async function main() {
         "bounded-session state before verification API",
       );
       const agentWorkingSet = beforeVerification.working_set;
-      const nodeExecutable = fs.realpathSync.native(process.execPath);
-      const pythonPath = executableOnPath("python3");
-      const pythonExecutable = pythonPath === null ? null : fs.realpathSync.native(pythonPath);
-      const runtimePaths = pythonExecutable === null ? null : nixRuntimeClosure([nodeExecutable, pythonExecutable]);
-      const runtimeReady = runtimePaths !== null && pythonExecutable !== null;
-      const bubblewrap = executableOnPath("bwrap");
-      const verificationExecutionReady =
-        protectedExecutionDoctor.sandbox.ready === true &&
-        protectedExecutionDoctor.sandbox.landlock?.supported === true &&
-        runtimeReady &&
-        bubblewrap !== null;
+      const runtimeRequest = await resolveSandboxExecutionRequest(
+        createLocalSessionBackend(),
+        { cwd: boundedWorktree },
+        {
+          session_id: boundedSessionId,
+          enforce: true,
+          runtime_policy: STRICT_RUNTIME_POLICY,
+        },
+      );
       const verificationOnlyPath = path.join(boundedWorktree, "bounded-session", "verification-only.txt");
       const mutationTargetPath = path.join(boundedWorktree, "bounded-session", "mutable.txt");
       const verificationScript =
@@ -3177,105 +3147,20 @@ async function main() {
         timeout_ms: 30_000,
         max_output_bytes: 16_384,
       };
-      const verificationRuntimeFilesystem = (runtimePaths ?? []).map((storePath) => ({
-        source: storePath,
-        target: storePath,
-        access_mode: "read-only",
-        provenance: "runtime-profile",
-      }));
-      const sessionRuntimeProjection = {
-        contract_id: "nawabari.session-runtime-projection.v1",
-        schema_version: 1,
-        policy: {
-          mode: "strict",
-          host_visibility: "default-deny",
-          compatibility: "disabled",
-          unrestricted_host_fallback: "forbidden",
-        },
-        profile: { id: "packed-verification-runtime", version: "1" },
-        requirements: [{ id: "verification-node", kind: "runtime", name: "node", version: process.version }],
-        filesystem: verificationRuntimeFilesystem,
-        executables: [
-          {
-            name: "node",
-            target: nodeExecutable,
-            provider: { id: "packed-verification-node", requirement_id: "verification-node" },
-            provenance: "package",
-          },
-        ],
-        working_set: {
-          contract_id: "nawabari.working-set-runtime-projection.v1",
-          schema_version: 1,
-          working_set_id: agentWorkingSet?.id,
-          revision: agentWorkingSet?.revision,
-          repository: agentWorkingSet?.repository,
-          base: agentWorkingSet?.base,
-          scope: agentWorkingSet?.scope,
-        },
-      };
-      const sessionStateRoot = path.join(lifecycleRepository, "nawabari", "sandbox", boundedSessionId);
-      const gitObjectsPath = path.resolve(
-        lifecycleRepository,
-        run("git", ["rev-parse", "--git-path", "objects"], { cwd: lifecycleRepository }).stdout.trim(),
-      );
-      const verificationRequest = {
-        schema_version: 1,
-        contract_id: "nawabari.sandbox-execution.v1",
-        enforce: true,
-        session_id: boundedSessionId,
-        repository: lifecycleRepository,
-        worktree: boundedWorktree,
-        branch: "feature/bounded-compatible",
-        network_mode: protectedExecutionDoctor.sandbox.network_mode,
-        sandbox_executable: verificationExecutionReady ? bubblewrap : null,
-        identity: {
-          real_uid: typeof process.getuid === "function" ? process.getuid() : null,
-          real_gid: typeof process.getgid === "function" ? process.getgid() : null,
-          namespace_uid: 0,
-          namespace_gid: 0,
-        },
-        git_identity: { host_global_name: null, host_global_email: null },
-        filesystem: {
-          owned_worktree: boundedWorktree,
-          home: path.join(sessionStateRoot, "home"),
-          cache: path.join(sessionStateRoot, "cache"),
-          persistent_home: path.join(lifecycleRepository, "nawabari", "sandbox", "shared-home"),
-          git_metadata: path.join(sessionStateRoot, "git"),
-          git_objects: gitObjectsPath,
-          user_tool_paths: [],
-          user_tool_home: null,
-          runtime_paths: runtimePaths ?? [],
-          system_paths: [],
-        },
-        required_capabilities: [
-          "bubblewrap",
-          "user_namespaces",
-          "mount_namespaces",
-          "pid_namespace",
-          "ipc_namespace",
-          "uts_namespace",
-          "seccomp",
-          "capabilities",
-        ],
-        seccomp_profile: protectedExecutionDoctor.sandbox.seccomp_profile,
-        capability_baseline: protectedExecutionDoctor.sandbox.capability_baseline,
-        landlock_executable: pythonExecutable,
-        landlock_abi: protectedExecutionDoctor.sandbox.landlock?.abi ?? null,
-        landlock_state: protectedExecutionDoctor.sandbox.landlock?.effective_state ?? "reduced-defense",
-        landlock_required: true,
-        runtime_projection: sessionRuntimeProjection,
-      };
-      const packedVerification = runPackedVerification(installDirectory, {
-        profile: verificationContractProfile,
-        request: verificationRequest,
-      });
-      const packedVerificationContract = packedVerification.contract;
+      const packedVerification = runtimeRequest.ok
+        ? runPackedVerification(installDirectory, {
+            profile: verificationContractProfile,
+            request: runtimeRequest.value,
+          })
+        : null;
+      const packedVerificationContract = packedVerification?.contract;
       if (
-        packedVerificationContract?.contract_id !== "nawabari.verification-profile.v1" ||
-        packedVerificationContract?.write_policy !== "deny" ||
-        packedVerificationContract?.mutates_working_set !== false ||
-        packedVerificationContract?.mutates_session_registry !== false ||
-        !packedVerificationContract?.read_visibility?.includes("repository")
+        packedVerificationContract !== undefined &&
+        (packedVerificationContract.contract_id !== "nawabari.verification-profile.v1" ||
+          packedVerificationContract.write_policy !== "deny" ||
+          packedVerificationContract.mutates_working_set !== false ||
+          packedVerificationContract.mutates_session_registry !== false ||
+          !packedVerificationContract.read_visibility?.includes("repository"))
       ) {
         recordBoundedDefect(
           "nawabari/contract.nawabariVerificationContract()",
@@ -3283,7 +3168,21 @@ async function main() {
           packedVerificationContract,
         );
       }
-      const verificationResult = packedVerification.result;
+      const verificationResult = packedVerification?.result;
+      if (!runtimeRequest.ok) {
+        const error = runtimeRequest.error;
+        if (error.code === "RUNTIME_MATERIALIZATION_MISSING") {
+          recordEnvironmentBlock("canonical protected verification runtime", error.code, error.details);
+        } else if (["SANDBOX_CAPABILITY_UNAVAILABLE", "SANDBOX_UNSUPPORTED_PLATFORM"].includes(error.code)) {
+          recordEnvironmentBlock("canonical protected verification execution", error.code, error.details);
+        } else {
+          recordBoundedDefect(
+            "resolveSandboxExecutionRequest()",
+            "resolve the canonical protected runtime for the active bounded session",
+            { code: error.code, details: error.details },
+          );
+        }
+      }
       if (verificationResult?.ok === true && verificationResult.value?.working_set_mutated !== false) {
         recordBoundedDefect(
           "nawabari/contract.runVerification()",
@@ -3323,25 +3222,23 @@ async function main() {
         } else {
           console.log("packed verification API broader-read/default-deny certification passed.");
         }
-      } else if (verificationResult?.ok === true && verificationResult.value?.status === "unavailable") {
+      } else if (
+        runtimeRequest.ok &&
+        verificationResult?.ok === true &&
+        verificationResult.value?.status === "unavailable"
+      ) {
         const diagnostic = verificationResult.value.stderr?.text ?? "";
         if (/was not materialized/iu.test(diagnostic)) {
           recordEnvironmentBlock("packed verification API protected runtime", "RUNTIME_MATERIALIZATION_MISSING", {
             diagnostic,
           });
         } else {
-          if (!runtimeReady) {
-            recordEnvironmentBlock("packed verification API host runtime", "VERIFICATION_RUNTIME_UNAVAILABLE", {
-              node: nodeExecutable,
-              landlock_helper: pythonExecutable,
-            });
-          }
           recordEnvironmentBlock("packed verification API protected execution", "PROTECTED_EXECUTION_UNAVAILABLE", {
             diagnostic,
             missing: protectedExecutionDoctor.sandbox.missing_required,
           });
         }
-      } else {
+      } else if (runtimeRequest.ok) {
         const verificationError = verificationResult?.error;
         if (verificationError?.code === "RUNTIME_MATERIALIZATION_MISSING") {
           recordEnvironmentBlock(
@@ -3491,7 +3388,7 @@ async function main() {
       const verificationStatus =
         verificationResult?.ok === true
           ? verificationResult.value.status
-          : (verificationResult?.error?.code ?? "invalid");
+          : (verificationResult?.error?.code ?? (runtimeRequest.ok ? "invalid" : runtimeRequest.error.code));
       console.log(
         `bounded-session evidence: bootstrap and negative cases exercised; READ expansion ${readExpansionGranted ? "granted 1->2" : "blocked"}; mutation expansion ${mutationExpansionDenied ? "denied without revision advance" : "blocked"}; verification ${verificationStatus}; public recovery exercised`,
       );
