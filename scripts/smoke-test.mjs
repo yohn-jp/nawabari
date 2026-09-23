@@ -551,6 +551,23 @@ async function main() {
       if (result.error) fail(`${args.join(" ")} failed to start: ${result.error.message}`);
       return result;
     };
+
+    const createHelp = parseInstalledJson(
+      invokeInstalled(["session", "create", "--help", "--json"], lifecycleRepository),
+      "session create help",
+    );
+    if (
+      createHelp.ok !== true ||
+      createHelp.help_for !== "session create" ||
+      createHelp.required_options?.length !== 0 ||
+      createHelp.optional_options?.join(",") !==
+        "--branch,--worktree,--worktree-root,--base,--label,--profile,--profile-parameter,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file" ||
+      !createHelp.usage?.includes("--profile <profile-id> [--profile-parameter <json-object>]") ||
+      createHelp.defaults?.["--base"] !== "HEAD"
+    ) {
+      fail("installed session create help did not expose the optional/defaulted contract");
+    }
+
     const invokeInstalledAsync = (args, cwd) =>
       new Promise((resolve, reject) => {
         const child = spawn(installedBinary, args, {
@@ -989,21 +1006,6 @@ async function main() {
       initialList.history_included !== false
     ) {
       fail("default session list did not expose bounded active-session metadata");
-    }
-
-    const createHelp = parseInstalledJson(
-      invokeInstalled(["session", "create", "--help", "--json"], lifecycleRepository),
-      "session create help",
-    );
-    if (
-      createHelp.ok !== true ||
-      createHelp.help_for !== "session create" ||
-      createHelp.required_options?.length !== 0 ||
-      createHelp.optional_options?.join(",") !==
-        "--branch,--worktree,--worktree-root,--base,--label,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file" ||
-      createHelp.defaults?.["--base"] !== "HEAD"
-    ) {
-      fail("installed session create help did not expose the optional/defaulted contract");
     }
 
     const lifecycleHelp = [
