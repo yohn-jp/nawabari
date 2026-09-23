@@ -537,13 +537,13 @@ export function readCgroupAccounting(scope: CgroupScope, filesystemOverride?: Cg
   };
 }
 
-/** Remove only an identity-verified, empty scope. Populated scopes are killed first through cgroup.kill. */
-export function cleanupCgroupScope(
+function terminateCgroupScopeContents(
   scope: CgroupScope,
+  operation: "cleanup" | "termination",
   filesystemOverride?: CgroupFileSystem,
-): DomainResult<{ readonly removed: boolean; readonly after_population: CgroupPopulation }> {
+): DomainResult<{ readonly after_population: CgroupPopulation }> {
   if (!verifiesScopeIdentity(scope)) {
-    return cleanupError("The cgroups v2 scope identity could not be verified for cleanup.", { scope: scope.name });
+    return cleanupError(`The cgroups v2 scope identity could not be verified for ${operation}.`, { scope: scope.name });
   }
   const filesystem = filesystemFor(scope, filesystemOverride);
   let population = readCgroupPopulation(scope, filesystem);
@@ -565,13 +565,32 @@ export function cleanupCgroupScope(
     }
     const afterKill = readCgroupPopulation(scope, filesystem);
     if (afterKill.state !== "empty") {
-      return cleanupError("The cgroups v2 scope remained occupied after cleanup.", { scope: scope.name });
+      return cleanupError(`The cgroups v2 scope remained occupied after ${operation}.`, { scope: scope.name });
     }
     population = afterKill;
   }
+  return success({ after_population: population });
+}
+
+/** Kill an occupied, identity-verified scope and prove it empty without removing it. */
+export function terminateCgroupScope(
+  scope: CgroupScope,
+  filesystemOverride?: CgroupFileSystem,
+): DomainResult<{ readonly after_population: CgroupPopulation }> {
+  return terminateCgroupScopeContents(scope, "termination", filesystemOverride);
+}
+
+/** Remove only an identity-verified, empty scope. Populated scopes are killed first through cgroup.kill. */
+export function cleanupCgroupScope(
+  scope: CgroupScope,
+  filesystemOverride?: CgroupFileSystem,
+): DomainResult<{ readonly removed: boolean; readonly after_population: CgroupPopulation }> {
+  const terminated = terminateCgroupScopeContents(scope, "cleanup", filesystemOverride);
+  if (!terminated.ok) return terminated;
+  const filesystem = filesystemFor(scope, filesystemOverride);
   try {
     filesystem.rmdirSync(scope.path);
-    return success({ removed: true, after_population: population });
+    return success({ removed: true, after_population: terminated.value.after_population });
   } catch (error: unknown) {
     return cleanupError("The cgroups v2 scope could not be removed.", {
       scope: scope.name,
