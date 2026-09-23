@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { createCgroupScope, type CgroupFileSystem } from "./cgroups-v2.js";
+import { createCgroupScope, readCgroupPopulation, type CgroupFileSystem } from "./cgroups-v2.js";
 import {
   observeOwnedExecution,
   serializeSessionExecutionRecord,
@@ -166,6 +166,147 @@ test("termination requires exact session, execution, and boot identity and uses 
     assert.equal(terminated.value.record_terminalized, true);
     assert.equal(terminated.value.record.state, "terminal");
     assert.equal(fs.existsSync(created.value.path), false);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("retained termination verifies an empty scope and leaves it observable", () => {
+  const testFixture = fixture();
+  try {
+    const created = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-retained-empty" },
+      { root: testFixture.root, filesystem: testFixture.filesystem, boot_id: "boot-a" },
+    );
+    assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+    if (!created.ok) return;
+    const execution: SessionExecutionRecord = {
+      schema_version: 1,
+      session_id: "session-a",
+      execution_id: "run-retained-empty",
+      boot_id: "boot-a",
+      state: "terminating",
+      cgroups: {
+        contract_id: created.value.contract_id,
+        root: created.value.root,
+        parent: created.value.parent,
+        path: created.value.path,
+        name: created.value.name,
+        boot_id: "boot-a",
+        identity: created.value.identity,
+        scope: created.value,
+      },
+    };
+    const terminated = terminateOwnedExecution(
+      execution,
+      { kind: "terminate", session_id: "session-a", execution_id: "run-retained-empty", boot_id: "boot-a" },
+      { current_boot_id: "boot-a", retain_scope: true },
+    );
+    assert.equal(terminated.ok, true, terminated.ok ? "" : JSON.stringify(terminated.error));
+    if (!terminated.ok) return;
+    assert.equal(terminated.value.killed, false);
+    assert.equal(terminated.value.population_after.state, "empty");
+    assert.equal(terminated.value.scope_removed, false);
+    assert.equal(terminated.value.record.state, "terminal");
+    assert.equal(fs.existsSync(created.value.path), true);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("retained termination kills populated descendants, proves empty, and preserves the scope", () => {
+  const testFixture = fixture();
+  try {
+    const created = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-retained-descendant" },
+      { root: testFixture.root, filesystem: testFixture.filesystem, boot_id: "boot-a" },
+    );
+    assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+    if (!created.ok) return;
+    fs.writeFileSync(path.join(created.value.path, "cgroup.events"), "populated 1\n", "utf8");
+    fs.writeFileSync(path.join(created.value.path, "cgroup.procs"), "", "utf8");
+    const execution: SessionExecutionRecord = {
+      schema_version: 1,
+      session_id: "session-a",
+      execution_id: "run-retained-descendant",
+      boot_id: "boot-a",
+      state: "terminating",
+      cgroups: {
+        contract_id: created.value.contract_id,
+        root: created.value.root,
+        parent: created.value.parent,
+        path: created.value.path,
+        name: created.value.name,
+        boot_id: "boot-a",
+        identity: created.value.identity,
+        scope: created.value,
+      },
+    };
+    const terminated = terminateOwnedExecution(
+      execution,
+      {
+        kind: "terminate",
+        session_id: "session-a",
+        execution_id: "run-retained-descendant",
+        boot_id: "boot-a",
+      },
+      { current_boot_id: "boot-a", retain_scope: true },
+    );
+    assert.equal(terminated.ok, true, terminated.ok ? "" : JSON.stringify(terminated.error));
+    if (!terminated.ok) return;
+    assert.equal(terminated.value.killed, true);
+    assert.equal(terminated.value.population_before.populated, true);
+    assert.equal(terminated.value.population_after.state, "empty");
+    assert.equal(terminated.value.scope_removed, false);
+    assert.equal(readCgroupPopulation(created.value).state, "empty");
+    assert.equal(fs.existsSync(created.value.path), true);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("retained termination fails closed when scope evidence is missing", () => {
+  const testFixture = fixture();
+  try {
+    const created = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-retained-unknown" },
+      { root: testFixture.root, filesystem: testFixture.filesystem, boot_id: "boot-a" },
+    );
+    assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+    if (!created.ok) return;
+    const execution: SessionExecutionRecord = {
+      schema_version: 1,
+      session_id: "session-a",
+      execution_id: "run-retained-unknown",
+      boot_id: "boot-a",
+      state: "terminating",
+      cgroups: {
+        contract_id: created.value.contract_id,
+        root: created.value.root,
+        parent: created.value.parent,
+        path: created.value.path,
+        name: created.value.name,
+        boot_id: "boot-a",
+        identity: created.value.identity,
+        scope: created.value,
+      },
+    };
+    const intent = {
+      kind: "terminate" as const,
+      session_id: "session-a",
+      execution_id: "run-retained-unknown",
+      boot_id: "boot-a",
+    };
+    fs.rmSync(path.join(created.value.path, "cgroup.events"));
+    const unknown = terminateOwnedExecution(execution, intent, { current_boot_id: "boot-a", retain_scope: true });
+    assert.equal(unknown.ok, false);
+    assert.equal(fs.existsSync(created.value.path), true);
+
+    const missing = terminateOwnedExecution({ ...execution, cgroups: null }, intent, {
+      current_boot_id: "boot-a",
+      retain_scope: true,
+    });
+    assert.equal(missing.ok, false);
   } finally {
     testFixture.cleanup();
   }
