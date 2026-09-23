@@ -143,7 +143,11 @@ function invocation(): SandboxInvocation {
   };
 }
 
-function dependencies(events: string[], records: SessionExecutionRecord[]): SessionProtectedLaunchDependencies {
+function dependencies(
+  events: string[],
+  records: SessionExecutionRecord[],
+  expectedStdio: NonNullable<SessionProtectedLaunchInput["stdio"]> = ["ignore", "pipe", "pipe"],
+): SessionProtectedLaunchDependencies {
   return {
     materializeSessionRuntimeDirectories: (manifest) => {
       events.push("materialize");
@@ -155,6 +159,7 @@ function dependencies(events: string[], records: SessionExecutionRecord[]): Sess
     },
     runSessionLaunchSupervisor: async (packet) => {
       events.push("supervisor");
+      assert.deepEqual(packet.payload.stdio.slice(0, 3), expectedStdio);
       assert.equal(packet.payload.stdio[3], packet.payload.seccomp_fd);
       await packet.durability?.mark_attached?.({
         contract_id: "nawabari.session-launch-supervisor.v1",
@@ -216,6 +221,35 @@ test("protected launch persists every gate in order and records actual worker ow
     assert.equal(records[1]?.supervisor_starttime, "9001");
     assert.equal(records[2]?.release_attempt?.outcome, "unresolved");
     assert.match(records[2]?.release_attempt?.reason ?? "", /pre-GO/u);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("protected launch propagates caller-selected interactive stdio", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-protected-launch-"));
+  try {
+    const { input: baseInput } = makeInput(root);
+    const stdio = ["inherit", "inherit", "inherit"] as const;
+    const input = { ...baseInput, stdio } satisfies SessionProtectedLaunchInput;
+    const result = await launchProtectedSessionExecution(input, dependencies([], [], stdio));
+    assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+    if (result.ok) assert.equal(result.value.supervisor.status, "completed");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("invalid protected stdio topology fails before starting durability or materialization", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-protected-launch-"));
+  try {
+    const { input } = makeInput(root);
+    const invalid = { ...input, stdio: ["inherit", "invalid", "pipe"] } as unknown as SessionProtectedLaunchInput;
+    const events: string[] = [];
+    const result = await launchProtectedSessionExecution(invalid, dependencies(events, []));
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "INVALID_ARGUMENT");
+    assert.deepEqual(events, []);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
