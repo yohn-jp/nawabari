@@ -3331,11 +3331,10 @@ async function main() {
           });
         } else {
           if (!runtimeReady) {
-            recordEnvironmentBlock(
-              "packed verification API host runtime",
-              "VERIFICATION_RUNTIME_UNAVAILABLE",
-              { node: nodeExecutable, landlock_helper: pythonExecutable },
-            );
+            recordEnvironmentBlock("packed verification API host runtime", "VERIFICATION_RUNTIME_UNAVAILABLE", {
+              node: nodeExecutable,
+              landlock_helper: pythonExecutable,
+            });
           }
           recordEnvironmentBlock("packed verification API protected execution", "PROTECTED_EXECUTION_UNAVAILABLE", {
             diagnostic,
