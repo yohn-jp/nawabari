@@ -1543,6 +1543,7 @@ async function executeProtectedSessionCommand(
   const managed = await launchManagedSessionCommand(context, dependencies.backend, {
     session_id: managedSessionId,
     command: { command: executable.value, args: arguments_.slice(delimiter + 2) },
+    ...(interactive ? { stdio: ["inherit", "inherit", "inherit"] as const } : {}),
     ...(parsed.value.runtime_policy === null
       ? {}
       : {

@@ -85,14 +85,20 @@ import {
   type SessionRuntimeLifecycleAdapter,
   type SessionRuntimeLifecycleMutation,
 } from "../session-runtime-lifecycle.js";
-import type { SessionDrainExecution, SessionDrainFinalization } from "./session-execution-control.js";
+import type {
+  SessionDrainExecution,
+  SessionDrainFence,
+  SessionDrainFinalization,
+  SessionDrainObservation,
+} from "./session-execution-control.js";
 import {
   observeOwnedExecution,
   SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
+  terminateOwnedExecution,
   type OwnedExecutionObservation,
   type SessionExecutionRecord as OwnedSessionExecutionRecord,
 } from "./session-process-observation.js";
-import { CGROUPS_V2_CONTRACT_ID, CGROUPS_V2_ROOT, deriveCgroupScopeName } from "./cgroups-v2.js";
+import { CGROUPS_V2_CONTRACT_ID, CGROUPS_V2_ROOT, deriveCgroupScopeName, type CgroupFileSystem } from "./cgroups-v2.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
@@ -577,7 +583,7 @@ export class LocalSessionBackend implements SessionBackend {
         return Promise.resolve(mutation.ok ? success(toDomainCloseSessionResult(mutation.value)) : mutation);
       }
       const drained = closeSessionWithRuntimeDrain(
-        runtimeLifecycleAdapter(registry, ({ fence }) => close(fence)),
+        runtimeLifecycleAdapter(registry, ({ fence }) => close(fence), this.registryOptions.cgroupFilesystem),
         sessionId,
         registry.runtimeEpoch,
       );
@@ -605,8 +611,11 @@ export class LocalSessionBackend implements SessionBackend {
         return Promise.resolve(mutation.ok ? success(toDomainSessionDiscardResult(mutation.value)) : mutation);
       }
       return discardSessionWithRuntimeDrain(
-        runtimeLifecycleAdapter(registry, ({ session_id: mutationSessionId, fence }) =>
-          registryMutation(() => registry.discard({ sessionId: mutationSessionId }, fence)),
+        runtimeLifecycleAdapter(
+          registry,
+          ({ session_id: mutationSessionId, fence }) =>
+            registryMutation(() => registry.discard({ sessionId: mutationSessionId }, fence)),
+          this.registryOptions.cgroupFilesystem,
         ),
         sessionId,
         registry.runtimeEpoch,
@@ -680,17 +689,21 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const registry = this.registryFor(context);
       const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
-      const result = await mutateClaimsWithRuntimeDrain(registry, sessionId, (fence) =>
-        registryMutation(() =>
-          registry.claimResources(
-            {
-              sessionId: options.session_id ?? undefined,
-              repositoryId: options.repository ?? undefined,
-              claims: options.claims.map(toRegistryClaimInput),
-            },
-            fence,
+      const result = await mutateClaimsWithRuntimeDrain(
+        registry,
+        sessionId,
+        this.registryOptions.cgroupFilesystem,
+        (fence) =>
+          registryMutation(() =>
+            registry.claimResources(
+              {
+                sessionId: options.session_id ?? undefined,
+                repositoryId: options.repository ?? undefined,
+                claims: options.claims.map(toRegistryClaimInput),
+              },
+              fence,
+            ),
           ),
-        ),
       );
       return result.ok ? success(toDomainClaimResult(result.value)) : result;
     } catch (error: unknown) {
@@ -705,19 +718,23 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const registry = this.registryFor(context);
       const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
-      const result = await mutateClaimsWithRuntimeDrain(registry, sessionId, (fence) =>
-        registryMutation(() =>
-          registry.updateClaims(
-            {
-              sessionId: options.session_id ?? undefined,
-              repositoryId: options.repository ?? undefined,
-              claims: options.claims.map(toRegistryClaimInput),
-              expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
-              force: options.force === true,
-            },
-            fence,
+      const result = await mutateClaimsWithRuntimeDrain(
+        registry,
+        sessionId,
+        this.registryOptions.cgroupFilesystem,
+        (fence) =>
+          registryMutation(() =>
+            registry.updateClaims(
+              {
+                sessionId: options.session_id ?? undefined,
+                repositoryId: options.repository ?? undefined,
+                claims: options.claims.map(toRegistryClaimInput),
+                expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+                force: options.force === true,
+              },
+              fence,
+            ),
           ),
-        ),
       );
       return result.ok ? success(toDomainClaimResult(result.value)) : result;
     } catch (error: unknown) {
@@ -732,19 +749,23 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const registry = this.registryFor(context);
       const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
-      const result = await mutateClaimsWithRuntimeDrain(registry, sessionId, (fence) =>
-        registryMutation(() =>
-          registry.applyClaimDeltas(
-            {
-              sessionId: options.session_id ?? undefined,
-              repositoryId: options.repository ?? undefined,
-              deltas: options.deltas,
-              expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
-              force: options.force === true,
-            },
-            fence,
+      const result = await mutateClaimsWithRuntimeDrain(
+        registry,
+        sessionId,
+        this.registryOptions.cgroupFilesystem,
+        (fence) =>
+          registryMutation(() =>
+            registry.applyClaimDeltas(
+              {
+                sessionId: options.session_id ?? undefined,
+                repositoryId: options.repository ?? undefined,
+                deltas: options.deltas,
+                expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+                force: options.force === true,
+              },
+              fence,
+            ),
           ),
-        ),
       );
       return result.ok ? success(toDomainClaimDeltasResult(result.value)) : result;
     } catch (error: unknown) {
@@ -759,21 +780,25 @@ export class LocalSessionBackend implements SessionBackend {
     try {
       const registry = this.registryFor(context);
       const sessionId = options.session_id ?? registry.resolveCurrentSession().sessionId;
-      const result = await mutateClaimsWithRuntimeDrain(registry, sessionId, (fence) =>
-        registryMutation(() =>
-          registry.releaseClaims(
-            {
-              sessionId,
-              resources: options.resources ?? undefined,
-              claimIds: options.claim_ids ?? undefined,
-              all: options.all === true,
-              expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
-              force: options.force === true,
-            },
-            undefined,
-            fence,
+      const result = await mutateClaimsWithRuntimeDrain(
+        registry,
+        sessionId,
+        this.registryOptions.cgroupFilesystem,
+        (fence) =>
+          registryMutation(() =>
+            registry.releaseClaims(
+              {
+                sessionId,
+                resources: options.resources ?? undefined,
+                claimIds: options.claim_ids ?? undefined,
+                all: options.all === true,
+                expectedClaimSetGeneration: options.expected_claim_set_generation ?? undefined,
+                force: options.force === true,
+              },
+              undefined,
+              fence,
+            ),
           ),
-        ),
       );
       if (!result.ok) return result;
       const released = result.value;
@@ -835,39 +860,44 @@ export function createLocalSessionBackend(options: LocalSessionBackendOptions = 
 function runtimeLifecycleAdapter<T>(
   registry: SessionRegistry,
   mutate: (mutation: SessionRuntimeLifecycleMutation) => T | Promise<T>,
+  cgroupFilesystem?: CgroupFileSystem,
 ): SessionRuntimeLifecycleAdapter<T> {
+  const snapshot = (sessionId: string) => {
+    const executions: SessionDrainExecution[] = [];
+    const currentBootId = observeKernelBootId();
+    for (const persisted of registry.listSessionExecutions(sessionId)) {
+      const parsed = parseSessionExecutionRecord(persisted);
+      if (!parsed.ok) throw parsed.error;
+      const owned =
+        currentBootId === null
+          ? null
+          : observeOwnedExecution(ownedExecutionRecord(parsed.value), {
+              current_boot_id: currentBootId,
+              ...(cgroupFilesystem === undefined ? {} : { filesystem: cgroupFilesystem }),
+            });
+      executions.push({
+        record: parsed.value,
+        observation: owned === null || !owned.ok ? unknownOwnedExecution(parsed.value) : owned.value,
+      });
+    }
+    const trackedAdmission = registry.getSessionLaunchAdmission(sessionId);
+    return {
+      session_id: sessionId,
+      runtime_epoch: registry.runtimeEpoch,
+      executions,
+      kernel_empty:
+        trackedAdmission !== undefined &&
+        executions.length > 0 &&
+        executions.every(
+          ({ observation }) =>
+            observation.state === "empty" &&
+            observation.cgroups !== null &&
+            observation.cgroups.population.state === "empty",
+        ),
+    };
+  };
   return {
-    observe: (sessionId) => {
-      const executions: SessionDrainExecution[] = [];
-      const currentBootId = observeKernelBootId();
-      for (const persisted of registry.listSessionExecutions(sessionId)) {
-        const parsed = parseSessionExecutionRecord(persisted);
-        if (!parsed.ok) throw parsed.error;
-        const owned =
-          currentBootId === null
-            ? null
-            : observeOwnedExecution(ownedExecutionRecord(parsed.value), { current_boot_id: currentBootId });
-        executions.push({
-          record: parsed.value,
-          observation: owned === null || !owned.ok ? unknownOwnedExecution(parsed.value) : owned.value,
-        });
-      }
-      const trackedAdmission = registry.getSessionLaunchAdmission(sessionId);
-      return {
-        session_id: sessionId,
-        runtime_epoch: registry.runtimeEpoch,
-        executions,
-        kernel_empty:
-          trackedAdmission !== undefined &&
-          executions.length > 0 &&
-          executions.every(
-            ({ observation }) =>
-              observation.state === "empty" &&
-              observation.cgroups !== null &&
-              observation.cgroups.population.state === "empty",
-          ),
-      };
-    },
+    observe: snapshot,
     close_admission: (request) => {
       try {
         return {
@@ -882,6 +912,77 @@ function runtimeLifecycleAdapter<T>(
         return failure(toDomainError(error));
       }
     },
+    terminate: (sessionId, fence: SessionDrainFence): SessionDrainObservation => {
+      if (
+        fence.session_id !== sessionId ||
+        fence.policy !== "terminate" ||
+        fence.admission !== "closed" ||
+        fence.admission_epoch !== registry.runtimeEpoch
+      ) {
+        throw new DomainError(
+          "OPERATION_REJECTED",
+          "Owned termination requires the exact closed session drain fence.",
+          {
+            session_id: sessionId,
+            fence_session_id: fence.session_id,
+          },
+        );
+      }
+      const currentBootId = observeKernelBootId();
+      if (currentBootId !== null) {
+        const records = new Map(
+          registry.listSessionExecutions(sessionId).map((persisted) => {
+            const parsed = parseSessionExecutionRecord(persisted);
+            if (!parsed.ok) throw parsed.error;
+            return [parsed.value.execution_id, parsed.value] as const;
+          }),
+        );
+        for (const fenced of fence.executions) {
+          const record = records.get(fenced.record.execution_id);
+          if (record === undefined || record.session_id !== sessionId) continue;
+          if (
+            JSON.stringify(record.cgroup_identity) !== JSON.stringify(fenced.record.cgroup_identity) ||
+            record.boot_id !== fenced.record.boot_id
+          ) {
+            throw new DomainError("OPERATION_REJECTED", "The owned execution identity changed during termination.", {
+              session_id: sessionId,
+              execution_id: record.execution_id,
+            });
+          }
+          const owned = ownedExecutionRecord(record);
+          const termination = terminateOwnedExecution(
+            owned,
+            {
+              kind: "terminate",
+              session_id: sessionId,
+              execution_id: record.execution_id,
+              boot_id: record.boot_id,
+            },
+            {
+              current_boot_id: currentBootId,
+              retain_scope: true,
+              ...(cgroupFilesystem === undefined ? {} : { filesystem: cgroupFilesystem }),
+            },
+          );
+          if (!termination.ok) continue;
+          if (record.state !== "exited") {
+            const terminal = recordExecutionState(record, { state: "exited" });
+            if (!terminal.ok) throw terminal.error;
+            registry.transitionSessionExecution(
+              record.execution_id,
+              { state: "exited", now: terminal.value.updated_at },
+              toPersistedSessionExecutionRecord(terminal.value),
+            );
+          }
+        }
+      }
+      const afterTermination = snapshot(sessionId);
+      return {
+        observed_epoch: afterTermination.runtime_epoch,
+        executions: afterTermination.executions,
+        kernel_empty: afterTermination.kernel_empty,
+      };
+    },
     mutate,
   };
 }
@@ -889,11 +990,12 @@ function runtimeLifecycleAdapter<T>(
 async function mutateClaimsWithRuntimeDrain<T>(
   registry: SessionRegistry,
   sessionId: string,
+  cgroupFilesystem: CgroupFileSystem | undefined,
   mutation: (fence?: SessionDrainFinalization) => DomainResult<T>,
 ): Promise<DomainResult<T>> {
   if (registry.getSessionLaunchAdmission(sessionId) === undefined) return mutation();
   const drained = await releaseSessionClaimsWithRuntimeDrain(
-    runtimeLifecycleAdapter(registry, ({ fence }) => mutation(fence)),
+    runtimeLifecycleAdapter(registry, ({ fence }) => mutation(fence), cgroupFilesystem),
     sessionId,
     registry.runtimeEpoch,
   );

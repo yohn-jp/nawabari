@@ -327,29 +327,49 @@ test("managed command path fails closed before launch when cgroups are unavailab
   assert.equal(persisted, 0);
 });
 
-test("managed interactive entry fails closed when the protected producer cannot preserve terminal input", async () => {
+test("managed interactive entry reaches the protected capability gate without using the legacy runner", async () => {
   let runnerCalls = 0;
+  let persisted = 0;
+  const observedExecutionIds: (string | undefined)[] = [];
   const managedBackend = {
     ...backend(),
-    getSessionManagedRuntime: async () =>
-      success({
+    getSessionManagedRuntime: async (_context: SessionContext, sessionId: string, executionId?: string) => {
+      observedExecutionIds.push(executionId);
+      return success({
         runtime_epoch: 7,
         registry_revision: 11,
         claim_set_generation: 3,
         admission: {
           kind: "session-admission" as const,
           schema_version: 1 as const,
-          session_id: session.session_id,
+          session_id: sessionId,
           admission: "open" as const,
           runtime_epoch: 7,
         },
         profile: { digest: "a".repeat(64) },
-      }),
+        runtime_environment_identity: {
+          session_id: sessionId,
+          execution_id: executionId ?? "unused",
+          session_root: "/private/session-home",
+          execution_root: "/private/execution",
+          owner_uid: 1000,
+          owner_gid: 1000,
+        },
+      });
+    },
+    listClaims: async () => success({ claims: [], claim_set_generation: 3 }),
+    persistSessionExecution: async () => {
+      persisted += 1;
+      return failure(new DomainError("REGISTRY_DURABILITY_UNCERTAIN", "unexpected persistence"));
+    },
+    readSessionRuntimeEpoch: () => 7,
   } as unknown as SessionBackend;
 
   const result = await enterSessionConsole(context, managedBackend, {
     session_id: session.session_id,
+    execution_id: "managed-console-execution",
     persist_execution: async () => undefined,
+    sandbox_probe: { hasCgroupsV2: () => false } as unknown as import("./sandbox.js").SandboxProbe,
     sandbox_runner: async () => {
       runnerCalls += 1;
       return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
@@ -359,4 +379,6 @@ test("managed interactive entry fails closed when the protected producer cannot 
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
   assert.equal(runnerCalls, 0);
+  assert.deepEqual(observedExecutionIds, ["managed-console-execution", "managed-console-execution"]);
+  assert.equal(persisted, 0);
 });

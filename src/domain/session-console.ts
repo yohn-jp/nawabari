@@ -57,7 +57,7 @@ import type { EffectiveWorkingSet } from "../working-set.js";
 import { resolveProfileRuntimeScope } from "./worktree-profile-scope.js";
 import { resolveWorktreeProfileRuntime } from "./worktree-profile-runtime.js";
 import { runSessionLaunchSupervisor } from "./session-launch-supervisor.js";
-import type { SessionLaunchSupervisorResult } from "./session-launch-supervisor.js";
+import type { SessionLaunchSupervisorResult, SupervisorStdioValue } from "./session-launch-supervisor.js";
 import { BASH_REQUIREMENT, BASH_STARTUP_ARGS } from "./shell-runtime.js";
 import { CANONICAL_EXECUTABLE_ROOT } from "./runtime-executable-projection.js";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
@@ -300,6 +300,7 @@ export async function launchManagedSessionCommand(
   input: Readonly<{
     session_id: string;
     command: SandboxCommand;
+    stdio?: readonly [SupervisorStdioValue, SupervisorStdioValue, SupervisorStdioValue];
     execution_id?: string;
     runtime_policy?: RuntimePolicy;
     sandbox_probe?: SandboxProbe;
@@ -310,6 +311,7 @@ export async function launchManagedSessionCommand(
   DomainResult<Readonly<{
     supervisor: SessionLaunchSupervisorResult;
     execution: SessionExecutionRecord;
+    effective_revision: number;
     result?: SandboxExecutionResult;
   }> | null>
 > {
@@ -407,6 +409,22 @@ export async function launchManagedSessionCommand(
   const layout = input.sandbox_runtime_layout ?? discoverSandboxRuntimeLayout();
   const runtime = resolveWorktreeProfileRuntime(profile, layout);
   if (!runtime.ok) return runtime;
+  if (input.stdio !== undefined) {
+    const shell = selectedShell(runtime.value.projection, undefined);
+    if (!shell.ok) return shell;
+    if (input.command.command !== shell.value.command) {
+      return failure(
+        new DomainError(
+          "RUNTIME_MATERIALIZATION_MISSING",
+          "Managed interactive entry requires the pinned Bash shell.",
+          {
+            session_id: input.session_id,
+            requirement_id: CANONICAL_SHELL_REQUIREMENT_ID,
+          },
+        ),
+      );
+    }
+  }
   if (input.runtime_policy !== undefined && input.runtime_policy.mode !== runtime.value.policy.mode) {
     return failure(
       new DomainError("RUNTIME_PROJECTION_INVALID", "Requested runtime policy differs from the pinned profile.", {
@@ -498,11 +516,12 @@ export async function launchManagedSessionCommand(
       compiled_environment: compiled.value,
       request: protectedRequest,
       command: input.command,
+      ...(input.stdio === undefined ? {} : { stdio: input.stdio }),
       admission: { session_id: input.session_id, execution_id: executionId, current: snapshot, expected: snapshot },
       starting_record: reservation.value,
       supervisor: {
         trusted: { entrypoint: process.execPath, cwd: path.dirname(process.execPath) },
-        cgroup: { required: true },
+        cgroup: { required: true, retain_scope: true },
       },
     },
     {
@@ -535,7 +554,7 @@ export async function launchManagedSessionCommand(
     const cleaned = cleanupSessionRuntimeDirectories(compiled.value.manifest);
     if (!cleaned.ok) return cleaned;
   }
-  return success(launched.value);
+  return success({ ...launched.value, effective_revision: live.registry_revision });
 }
 
 function cgroupObservationRecord(record: SessionExecutionRecord): Parameters<typeof observeOwnedExecution>[0] {
@@ -604,21 +623,58 @@ export async function enterSessionConsole(
     );
   }
 
+  const executionId = options.execution_id ?? crypto.randomUUID();
   if (backend.getSessionManagedRuntime !== undefined) {
-    const managedRuntime = await backend.getSessionManagedRuntime(context, sessionId.value);
+    const managedRuntime = await backend.getSessionManagedRuntime(context, sessionId.value, executionId);
     if (!managedRuntime.ok) return managedRuntime;
     if (managedRuntime.value.profile !== null || managedRuntime.value.admission !== null) {
-      return failure(
-        new DomainError(
-          "SANDBOX_CAPABILITY_UNAVAILABLE",
-          "Managed interactive entry requires a protected launch with terminal stdio support.",
-          { session_id: sessionId.value, capability: "protected-interactive-stdio" },
-        ),
-      );
+      const managed = await launchManagedSessionCommand(context, backend, {
+        session_id: sessionId.value,
+        command: { command: CANONICAL_SHELL_TARGET, args: BASH_STARTUP_ARGS },
+        stdio: ["inherit", "inherit", "inherit"],
+        execution_id: executionId,
+        ...(options.sandbox_probe === undefined ? {} : { sandbox_probe: options.sandbox_probe }),
+        ...(options.sandbox_runtime_layout === undefined
+          ? {}
+          : { sandbox_runtime_layout: options.sandbox_runtime_layout }),
+        ...(options.now === undefined ? {} : { now: options.now }),
+      });
+      if (!managed.ok) return managed;
+      if (managed.value === null) {
+        return failure(
+          new DomainError("OPERATION_REJECTED", "Managed session authority changed before protected entry.", {
+            session_id: sessionId.value,
+          }),
+        );
+      }
+      if (managed.value.supervisor.status !== "completed" || managed.value.result === undefined) {
+        return failure(
+          new DomainError("SANDBOX_EXECUTION_FAILED", "The managed interactive console did not complete.", {
+            session_id: sessionId.value,
+            execution_id: executionId,
+            status: managed.value.supervisor.status,
+          }),
+        );
+      }
+      const shell = { command: CANONICAL_SHELL_TARGET, args: BASH_STARTUP_ARGS };
+      return success({
+        contract_id: SESSION_CONSOLE_CONTRACT_ID,
+        schema_version: SESSION_CONSOLE_SCHEMA_VERSION,
+        operation: SESSION_CONSOLE_OPERATION_ENTER,
+        session_id: sessionId.value,
+        execution_id: executionId,
+        session: session.value,
+        cwd: session.value.worktree,
+        shell,
+        prompt: prompt(sessionId.value, managed.value.effective_revision),
+        effective_revision: managed.value.effective_revision,
+        execution: serializeSessionExecutionRecord(managed.value.execution),
+        result: managed.value.result,
+        session_closed: false,
+      });
     }
   }
 
-  const executionId = options.execution_id ?? crypto.randomUUID();
   const boot = options.boot_id === undefined ? bootId() : boundedIdentity(options.boot_id, "boot_id");
   if (!boot.ok) return boot;
 
