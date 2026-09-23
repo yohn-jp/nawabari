@@ -1146,8 +1146,7 @@ export class SessionRegistry {
         repository === null ||
         typeof repository !== "object" ||
         repository.repositoryHost !== owner.workingSet.repository.repositoryHost ||
-        repository.repositoryId !== owner.workingSet.repository.repositoryId ||
-        repository.repositoryId !== this.repository.repositoryId
+        repository.repositoryId !== owner.workingSet.repository.repositoryId
       ) {
         throw new SessionRegistryError(
           "REPOSITORY_MISMATCH",

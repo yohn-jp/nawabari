@@ -6,6 +6,7 @@ import process from "node:process";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import {
   deriveLandlockRules,
+  LANDLOCK_ACCESS_FS_ABI3,
   LANDLOCK_ABI_MINIMUM,
   LANDLOCK_SETUP_FAILURE_PREFIX,
   LANDLOCK_TRAMPOLINE,
@@ -695,6 +696,14 @@ function isNamespaceChild(candidate: string, root: string): boolean {
 function boundedBaselineRules(rules: readonly LandlockRule[]): readonly LandlockRule[] {
   const result: LandlockRule[] = [];
   for (const rule of rules) {
+    // A worktree may itself be mounted below /tmp. Keep the parent writable
+    // only through a separate scratch directory so that tmpfs access cannot
+    // bypass the effective working-set rules.
+    if (rule.path === "/tmp") {
+      result.push({ path: rule.path, allowed_access: WORKING_SET_DIRECTORY_TRAVERSE });
+      result.push({ path: "/tmp/nawabari-tmp", allowed_access: LANDLOCK_ACCESS_FS_ABI3 });
+      continue;
+    }
     // Git metadata/object access is Nawabari lifecycle authority, not an
     // implicit agent visibility grant. The authoritative worktree remains
     // mounted and truthful; lifecycle/Git callers run outside this process.
@@ -1166,6 +1175,14 @@ export function compileSandboxInvocation(
     );
   }
   const landlockEnabled = landlockSupported && landlockExecutable.value !== null && landlockAdapterProjected;
+  const boundedTempPath = "/tmp/nawabari-tmp";
+  if (boundedWorkingSet !== undefined && namespacePathsOverlap(topology.value.worktree, boundedTempPath)) {
+    return topologyError("The bounded worktree overlaps its private temporary-storage path.", {
+      worktree: topology.value.worktree,
+      temporary_directory: boundedTempPath,
+    });
+  }
+  const tempDirectory = boundedWorkingSet === undefined ? "/tmp" : boundedTempPath;
   const landlockProjection =
     legacyProfile || runtimeProjection.value === null
       ? undefined
@@ -1224,7 +1241,7 @@ export function compileSandboxInvocation(
     SANDBOX_HOME,
     "--setenv",
     "TMPDIR",
-    "/tmp",
+    tempDirectory,
     "--setenv",
     "XDG_CONFIG_HOME",
     SANDBOX_CONFIG_HOME,
@@ -1266,6 +1283,7 @@ export function compileSandboxInvocation(
     "/proc",
     "--tmpfs",
     "/tmp",
+    ...(boundedWorkingSet === undefined ? [] : ["--dir", tempDirectory]),
   ];
   const seenDirectories = new Set<string>();
   const worktreeDestination = topology.value.worktree;
@@ -1319,7 +1337,7 @@ export function compileSandboxInvocation(
   const env: Record<string, string> = {
     PATH: pathValue,
     HOME: SANDBOX_HOME,
-    TMPDIR: "/tmp",
+    TMPDIR: tempDirectory,
     XDG_CONFIG_HOME: SANDBOX_CONFIG_HOME,
     XDG_CACHE_HOME: SANDBOX_CACHE_HOME,
     XDG_DATA_HOME: `${SANDBOX_LOCAL_HOME}/share`,
