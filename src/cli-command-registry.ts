@@ -299,7 +299,9 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     options: [
       option("--session", "Select the active owned session", { value: "<id>" }),
       option("--runtime-policy", "Select strict or explicit compatibility runtime visibility", {
-        value: "<strict|compatibility>", values: ["strict", "compatibility"], default: "strict",
+        value: "<strict|compatibility>",
+        values: ["strict", "compatibility"],
+        default: "strict",
       }),
     ],
   },
