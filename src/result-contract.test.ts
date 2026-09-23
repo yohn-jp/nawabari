@@ -13,6 +13,7 @@ import {
 } from "./contract.js";
 import { publicCliCommandNames, runCli } from "./cli.js";
 import { success } from "./domain/errors.js";
+import { IMPLEMENTATION_FAILURE_CODE_VOCABULARY } from "./failure-code-vocabulary.js";
 import { SESSION_CONSOLE_CONTRACT_ID, SESSION_CONSOLE_SCHEMA_VERSION } from "./domain/session-console.js";
 import { SESSION_EXECUTION_CONTROL_CONTRACT_ID } from "./domain/session-execution-control.js";
 import { SESSION_EXECUTION_RECORD_CONTRACT_ID } from "./domain/session-execution-record.js";
@@ -171,6 +172,12 @@ test("managed console discovery publishes producer IDs and supported runtime gat
   assert.equal(consoleCapability.contract_id, SESSION_CONSOLE_CONTRACT_ID);
   assert.equal(consoleCapability.schema_version, SESSION_CONSOLE_SCHEMA_VERSION);
   assert.deepEqual(consoleCapability.commands, ["session enter", "session processes"]);
+  assert.deepEqual(consoleCapability.failure_codes, IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-console"]);
+  assert.ok((consoleCapability.failure_codes as string[]).includes("REGISTRY_DURABILITY_UNCERTAIN"));
+  assert.equal(
+    object(consoleCapability.failure_code_policy, "session-console failure-code policy").source,
+    "implementation-owned session-console vocabulary",
+  );
   assert.deepEqual(consoleCapability.producer_contract_ids, {
     execution_record: SESSION_EXECUTION_RECORD_CONTRACT_ID,
     process_observation: SESSION_PROCESS_OBSERVATION_CONTRACT_ID,

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { deriveCgroupScopeName } from "./cgroups-v2.js";
 import { DomainError, failure, success } from "./errors.js";
+import { IMPLEMENTATION_FAILURE_CODE_VOCABULARY } from "../failure-code-vocabulary.js";
 import {
   enterSessionConsole,
   launchManagedSessionCommand,
@@ -183,7 +184,12 @@ test("entry fails closed before launch when the execution writer is absent", asy
     },
   });
   assert.equal(result.ok, false);
-  if (!result.ok) assert.equal(result.error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+  if (!result.ok) {
+    assert.equal(result.error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+    assert.ok(
+      (IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-console"] as readonly string[]).includes(result.error.code),
+    );
+  }
   assert.equal(launches, 0);
 });
 

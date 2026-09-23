@@ -135,9 +135,9 @@ const SESSION_CONSOLE_CAPABILITY = Object.freeze({
     process_observation: SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
     execution_control: SESSION_EXECUTION_CONTROL_CONTRACT_ID,
   },
-  failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["protected-execution"],
+  failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-console"],
   failure_code_policy: {
-    source: "implementation-owned protected-execution vocabulary",
+    source: "implementation-owned session-console vocabulary",
     missing_or_extra: "deterministic conformance failure",
     internal_exceptions: [],
   },

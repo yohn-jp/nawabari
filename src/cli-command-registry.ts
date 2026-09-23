@@ -77,7 +77,7 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     summary: "Request a new Nawabari session",
     usage:
       `${CLI_NAME} session create [--branch <name>] [--worktree <path>|--worktree-root <path>] ` +
-      `[--base <ref>] [--label <text>] ` +
+      `[--base <ref>] [--label <text>] [--profile <profile-id> [--profile-parameter <json-object>]] ` +
       `[--execution-scope-file <path> --candidate-working-set-file <path>] ` +
       `[--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
     options: [

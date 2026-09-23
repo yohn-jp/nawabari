@@ -744,6 +744,7 @@ test("command-specific help is projected from one spec and marks session create 
   const response = JSON.parse(output.stdout[0] ?? "") as {
     command: string;
     help_for: string;
+    usage: string;
     required_options: string[];
     optional_options: string[];
     defaults: Record<string, string>;
@@ -751,6 +752,7 @@ test("command-specific help is projected from one spec and marks session create 
   };
   assert.equal(response.command, "help");
   assert.equal(response.help_for, "session create");
+  assert.match(response.usage, /--profile <profile-id> \[--profile-parameter <json-object>\]/u);
   assert.deepEqual(response.required_options, []);
   assert.deepEqual(response.optional_options, [
     "--branch",
