@@ -64,6 +64,12 @@ const NUMERIC_FIELDS = [
   "memory_max_events",
 ] as const;
 
+type MutableSessionResourceAggregate = {
+  -readonly [
+    Field in keyof SessionResourceAccountingProjection["aggregate"]
+  ]: SessionResourceAccountingProjection["aggregate"][Field];
+};
+
 function scopeFor(record: PersistedSessionExecutionRecord, root: string): CgroupScope {
   const name = deriveCgroupScopeName(record.cgroup_identity);
   return {
@@ -182,7 +188,7 @@ export function projectSessionResourceAccounting(
       entry.status === "available" && entry.accounting !== null,
   );
   const complete = !truncated && entries.every((entry) => entry.status === "available") && available.length > 0;
-  const aggregate = emptyAggregate(complete) as any;
+  const aggregate = emptyAggregate(complete) as MutableSessionResourceAggregate;
   for (const field of NUMERIC_FIELDS) {
     aggregate[field] =
       available.length > 0 && available.every((entry) => entry.accounting[field] !== null)
