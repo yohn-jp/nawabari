@@ -24,6 +24,7 @@ function reservation(): SessionExecutionRecord {
     filesystem_token: "filesystem-token-1",
     runtime_epoch: 7,
     boot_id: "boot-1",
+    cgroup_root: "/sys/fs/cgroup/user.slice/test.scope",
     now: timestamp,
   });
   if (!result.ok) throw result.error;
@@ -51,7 +52,8 @@ function reader(
   return {
     read_boot_id: () => overrides.boot_id ?? record.boot_id,
     read_process_starttime: () => overrides.starttime ?? record.supervisor_starttime ?? "0",
-    read_process_cgroup: () => overrides.cgroup_path ?? `/nawabari/${deriveCgroupScopeName(record.cgroup_identity)}`,
+    read_process_cgroup: () =>
+      overrides.cgroup_path ?? `/user.slice/test.scope/nawabari/${deriveCgroupScopeName(record.cgroup_identity)}`,
   };
 }
 
@@ -129,6 +131,21 @@ test("serialization round-trips after a restart without changing execution ident
   if (!restarted.ok) return;
   assert.deepEqual(restarted.value, record);
   assert.notEqual(restarted.value.session_id, restarted.value.execution_id);
+  assert.equal(restarted.value.cgroup_root, "/sys/fs/cgroup/user.slice/test.scope");
+});
+
+test("legacy missing and malformed cgroup roots never acquire new ownership", () => {
+  const record = attached();
+  const { cgroup_root: _root, ...legacy } = serializeSessionExecutionRecord(record);
+  const parsed = parseSessionExecutionRecord(legacy);
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.value.cgroup_root, null);
+    const observed = observeExecutionIdentity(parsed.value, { reader: reader(record) });
+    assert.equal(observed.ok, true);
+    if (observed.ok) assert.equal(observed.value.classification, "unresolved");
+  }
+  assert.equal(parseSessionExecutionRecord({ ...record, cgroup_root: "/sys/fs/cgroup/../other" }).ok, false);
 });
 
 test("observation accepts only matching boot, process generation, and cgroup identity", () => {

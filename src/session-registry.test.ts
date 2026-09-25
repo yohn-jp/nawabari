@@ -773,6 +773,7 @@ test("managed finalization reobserves owned cgroup occupancy under the registry 
     const starting = reserveExecution({
       session_id: session.sessionId,
       execution_id: "locked-finalization-check",
+      cgroup_root: "/sys/fs/cgroup/user.slice/test.scope",
       profile_digest: "a".repeat(64),
       filesystem_token: "b".repeat(64),
       runtime_epoch: registry.runtimeEpoch,
@@ -871,6 +872,7 @@ test("claim release reopens managed admission only after locked empty-scope proo
     const starting = reserveExecution({
       session_id: session.sessionId,
       execution_id: "claim-release-finalization",
+      cgroup_root: "/sys/fs/cgroup/user.slice/test.scope",
       profile_digest: "a".repeat(64),
       filesystem_token: "b".repeat(64),
       runtime_epoch: epoch,

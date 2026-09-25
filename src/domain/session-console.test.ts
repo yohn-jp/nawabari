@@ -100,6 +100,7 @@ function executionRecord(state: "starting" | "attached" | "unresolved" = "starti
     filesystem_token: "filesystem-console-1",
     runtime_epoch: 7,
     boot_id: "boot-console-1",
+    cgroup_root: "/sys/fs/cgroup/user.slice/test.scope",
     now: "2026-09-21T00:00:00.000Z",
   });
   if (!reserved.ok) throw reserved.error;
@@ -241,7 +242,7 @@ test("process inspection proves boot, PID generation, and cgroup identity", asyn
     identity_reader: {
       read_boot_id: () => record.boot_id,
       read_process_starttime: () => record.supervisor_starttime ?? "0",
-      read_process_cgroup: () => `/nawabari/${deriveCgroupScopeName(record.cgroup_identity)}`,
+      read_process_cgroup: () => `/user.slice/test.scope/nawabari/${deriveCgroupScopeName(record.cgroup_identity)}`,
     },
     observe_owned_execution: () =>
       success({
@@ -268,7 +269,7 @@ test("process inspection retains cgroup observation for unresolved executions", 
     identity_reader: {
       read_boot_id: () => record.boot_id,
       read_process_starttime: () => record.supervisor_starttime ?? "0",
-      read_process_cgroup: () => `/nawabari/${deriveCgroupScopeName(record.cgroup_identity)}`,
+      read_process_cgroup: () => `/user.slice/test.scope/nawabari/${deriveCgroupScopeName(record.cgroup_identity)}`,
     },
     observe_owned_execution: (ownedRecord) => {
       observedRecords.push(ownedRecord);

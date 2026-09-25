@@ -64,6 +64,7 @@ test("local session backend binds default managed readiness to protected sandbox
     const registryPath = new SessionRegistry({ cwd: repositoryPath }).paths.registry;
     const unavailable = await new LocalSessionBackend({
       sandboxProbe: readySandbox,
+      cgroupRoot: unusableCgroups.root,
       registry: { cgroupFilesystem: unusableCgroups.filesystem },
     }).createSession({ cwd: repositoryPath }, options);
     assert.equal(unavailable.ok, false);
@@ -78,6 +79,7 @@ test("local session backend binds default managed readiness to protected sandbox
 
     const authorized = await new LocalSessionBackend({
       sandboxProbe: readySandbox,
+      cgroupRoot: usableCgroups.root,
       registry: { cgroupFilesystem: usableCgroups.filesystem },
     }).createSession({ cwd: repositoryPath }, options);
     assert.equal(authorized.ok, true);
@@ -101,6 +103,7 @@ test("local managed readiness fails closed on cgroup observation or cleanup unce
     const branch = `feature/domain-managed-readiness-${failure}`;
     try {
       const result = await new LocalSessionBackend({
+        cgroupRoot: cgroups.root,
         sandboxProbe: {
           platform: () => "linux",
           uid: () => 1000,
@@ -144,6 +147,7 @@ test("local session backend preserves an explicitly injected managed readiness a
   let readinessCalls = 0;
   try {
     const result = await new LocalSessionBackend({
+      cgroupRoot: unusableCgroups.root,
       managedExecutionReadiness: () => {
         readinessCalls += 1;
         return { ready: true };
@@ -1289,12 +1293,13 @@ function readinessCgroupFixture(
     readonly failCleanup?: boolean;
   } = {},
 ): {
+  readonly root: string;
   readonly filesystem: CgroupFileSystem;
   readonly scopeCreateCount: number;
   readonly scopeCleanupCount: number;
   readonly activeScopeCount: number;
 } {
-  const root = "/sys/fs/cgroup";
+  const root = "/sys/fs/cgroup/nawabari-621-fixture";
   const directories = new Set([root]);
   const files = new Map<string, string>([[path.join(root, "cgroup.controllers"), "cpu memory pids\n"]]);
   const scopes = new Set<string>();
@@ -1349,6 +1354,7 @@ function readinessCgroupFixture(
     },
   };
   return {
+    root,
     filesystem,
     get scopeCreateCount() {
       return scopeCreateCount;

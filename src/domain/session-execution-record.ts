@@ -1,7 +1,12 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 
-import { deriveCgroupScopeName, type CgroupExecutionIdentity } from "./cgroups-v2.js";
+import {
+  CGROUPS_V2_ROOT,
+  deriveCgroupScopeName,
+  isCanonicalManagedCgroupRoot,
+  type CgroupExecutionIdentity,
+} from "./cgroups-v2.js";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 
 /** Durable execution ownership is a domain contract, not an orchestration record. */
@@ -59,6 +64,8 @@ export type SessionExecutionRecord = Readonly<{
   readonly supervisor_pid: number | null;
   readonly supervisor_starttime: string | null;
   readonly cgroup_identity: CgroupExecutionIdentity;
+  /** Null marks legacy executions whose exact scope root was not recorded. */
+  readonly cgroup_root?: string | null;
   readonly release_attempt: SessionExecutionReleaseAttempt | null;
   readonly created_at: string;
   readonly updated_at: string;
@@ -77,6 +84,7 @@ export type PersistedSessionExecutionRecord = Readonly<{
   readonly supervisor_pid: number | null;
   readonly supervisor_starttime: string | null;
   readonly cgroup_identity: CgroupExecutionIdentity;
+  readonly cgroup_root?: string | null;
   readonly release_attempt: SessionExecutionReleaseAttempt | null;
   readonly created_at: string;
   readonly updated_at: string;
@@ -91,6 +99,7 @@ export type SessionExecutionReservationInput = Readonly<{
   readonly runtime_epoch: string | number;
   readonly boot_id: string;
   readonly cgroup_identity?: CgroupExecutionIdentity;
+  readonly cgroup_root?: string;
   readonly now?: string;
   readonly id_generator?: () => string;
 }>;
@@ -257,6 +266,7 @@ function validateRecordShape(value: unknown): DomainResult<SessionExecutionRecor
     "supervisor_pid",
     "supervisor_starttime",
     "cgroup_identity",
+    "cgroup_root",
     "release_attempt",
     "created_at",
     "updated_at",
@@ -302,6 +312,13 @@ function validateRecordShape(value: unknown): DomainResult<SessionExecutionRecor
   }
   const identity = validateIdentity(value.cgroup_identity, "cgroup_identity");
   if (!identity.ok) return identity;
+  if (
+    value.cgroup_root !== undefined &&
+    value.cgroup_root !== null &&
+    !isCanonicalManagedCgroupRoot(value.cgroup_root)
+  ) {
+    return executionError("Execution record cgroup_root is invalid.", { field: "cgroup_root" });
+  }
   if (identity.value.session_id !== value.session_id || identity.value.execution_id !== value.execution_id) {
     return executionError("cgroup_identity must match the record's session and execution identity.", {
       field: "cgroup_identity",
@@ -323,6 +340,7 @@ function validateRecordShape(value: unknown): DomainResult<SessionExecutionRecor
       supervisor_pid: value.supervisor_pid,
       supervisor_starttime: value.supervisor_starttime,
       cgroup_identity: identity.value,
+      cgroup_root: (value.cgroup_root as string | null | undefined) ?? null,
       release_attempt: releaseAttempt.value,
       created_at: value.created_at,
       updated_at: value.updated_at,
@@ -355,6 +373,9 @@ export function reserveExecution(input: SessionExecutionReservationInput): Domai
     "cgroup_identity",
   );
   if (!cgroupIdentity.ok) return cgroupIdentity;
+  if (input.cgroup_root !== undefined && !isCanonicalManagedCgroupRoot(input.cgroup_root)) {
+    return executionError("cgroup_root must be a canonical delegated cgroups v2 path.", { field: "cgroup_root" });
+  }
   if (cgroupIdentity.value.session_id !== input.session_id || cgroupIdentity.value.execution_id !== executionId) {
     return executionError("cgroup_identity must match session_id and execution_id.", { field: "cgroup_identity" });
   }
@@ -374,6 +395,7 @@ export function reserveExecution(input: SessionExecutionReservationInput): Domai
       supervisor_pid: null,
       supervisor_starttime: null,
       cgroup_identity: cgroupIdentity.value,
+      cgroup_root: input.cgroup_root ?? null,
       release_attempt: null,
       created_at: timestamp,
       updated_at: timestamp,
@@ -559,9 +581,10 @@ const nativeIdentityReader: SessionExecutionIdentityReader = Object.freeze({
   read_process_cgroup: readProcessCgroup,
 });
 
-function cgroupPathMatches(cgroupPath: string, expectedName: string): boolean {
+function cgroupPathMatches(cgroupPath: string, root: string | null | undefined, expectedName: string): boolean {
   if (!isSafeText(cgroupPath, 4_096)) return false;
-  return cgroupPath === `/nawabari/${expectedName}`;
+  if (root === null || root === undefined) return false;
+  return cgroupPath === `${root.slice(CGROUPS_V2_ROOT.length)}/nawabari/${expectedName}`;
 }
 
 /**
@@ -575,6 +598,24 @@ export function observeExecutionIdentity(
 ): DomainResult<SessionExecutionIdentityObservation> {
   const validated = validateRecordShape(record);
   if (!validated.ok) return validated;
+  if (validated.value.cgroup_root === null) {
+    return success(
+      Object.freeze({
+        session_id: validated.value.session_id,
+        execution_id: validated.value.execution_id,
+        classification: "unresolved",
+        matches: false,
+        active: false,
+        expected: {
+          pid: 0,
+          starttime: "",
+          boot_id: validated.value.boot_id,
+          cgroup_name: deriveCgroupScopeName(validated.value.cgroup_identity),
+        },
+        observed: null,
+      }),
+    );
+  }
   if (validated.value.supervisor_pid === null || validated.value.supervisor_starttime === null) {
     return success(
       Object.freeze({
@@ -626,7 +667,7 @@ export function observeExecutionIdentity(
       ? "different-boot"
       : observed.starttime !== expected.starttime
         ? "pid-reused"
-        : !cgroupPathMatches(observed.cgroup_path, expected.cgroup_name)
+        : !cgroupPathMatches(observed.cgroup_path, validated.value.cgroup_root, expected.cgroup_name)
           ? "different-cgroup"
           : "matched";
   return success(

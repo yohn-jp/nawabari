@@ -8,6 +8,62 @@ import { DomainError, failure, success, type DomainResult, type JsonObject } fro
 export const CGROUPS_V2_CONTRACT_ID = "nawabari.cgroups-v2.v1" as const;
 export const CGROUPS_V2_ROOT = "/sys/fs/cgroup" as const;
 
+export function isCanonicalManagedCgroupRoot(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= 4_096 &&
+    !value.includes("\0") &&
+    path.normalize(value) === value &&
+    scopeWithin(CGROUPS_V2_ROOT, value)
+  );
+}
+
+/** Resolve the controller-owning parent of this process's delegated subgroup. */
+export function resolveManagedCgroupRoot(
+  options: {
+    readonly root?: string;
+    readonly membership?: string;
+    readonly filesystem?: CgroupFileSystem;
+  } = {},
+): DomainResult<string> {
+  if (process.platform !== "linux") {
+    return capabilityError("The unified cgroups v2 hierarchy requires Linux.", {});
+  }
+  let candidate = options.root;
+  if (candidate === undefined) {
+    let raw: string;
+    try {
+      raw = options.membership ?? fs.readFileSync("/proc/self/cgroup", "utf8");
+    } catch (error: unknown) {
+      return capabilityError("The current unified cgroup membership is unavailable.", {
+        reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+      });
+    }
+    const lines = raw.trim().split(/\r?\n/u);
+    const unified = lines.length === 1 ? /^0::(\/[\x20-\x7e]*)$/u.exec(lines[0] ?? "")?.[1] : undefined;
+    if (
+      unified === undefined ||
+      unified.length > 4_096 ||
+      unified === "/" ||
+      unified.split("/").some((segment) => segment === "." || segment === "..")
+    ) {
+      return capabilityError("The current unified cgroup membership is invalid.", {});
+    }
+    candidate = path.dirname(path.join(CGROUPS_V2_ROOT, unified));
+  }
+  if (!isCanonicalManagedCgroupRoot(candidate)) {
+    return capabilityError("The delegated cgroup root is unavailable.", {});
+  }
+  const filesystem = options.filesystem ?? nativeFileSystem;
+  const checked = validateRoot(candidate, filesystem);
+  if (!checked.ok) return checked;
+  if (checked.value !== candidate || !scopeWithin(CGROUPS_V2_ROOT, checked.value)) {
+    return capabilityError("The delegated cgroup root is not canonical.", { root: candidate });
+  }
+  const controllers = requiredControllers(checked.value, filesystem);
+  return controllers.ok ? success(checked.value) : controllers;
+}
+
 const CONTROLLERS = ["cpu", "memory", "pids"] as const;
 const MAX_MEMORY_LIMIT = 1_024 * 1_024 * 1_024 * 1_024;
 const MAX_PIDS_LIMIT = 1_000_000;

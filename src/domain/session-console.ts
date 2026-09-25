@@ -30,7 +30,12 @@ import {
   type SessionExecutionIdentityReader,
   type SessionExecutionRecord,
 } from "./session-execution-record.js";
-import { CGROUPS_V2_CONTRACT_ID, CGROUPS_V2_ROOT, deriveCgroupScopeName, type CgroupFileSystem } from "./cgroups-v2.js";
+import {
+  CGROUPS_V2_CONTRACT_ID,
+  deriveCgroupScopeName,
+  resolveManagedCgroupRoot,
+  type CgroupFileSystem,
+} from "./cgroups-v2.js";
 import {
   observeOwnedExecution,
   SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
@@ -359,6 +364,11 @@ export async function launchManagedSessionCommand(
       ),
     );
   }
+  const cgroupRoot =
+    "getManagedCgroupRoot" in backend && typeof backend.getManagedCgroupRoot === "function"
+      ? (backend.getManagedCgroupRoot() as DomainResult<string>)
+      : resolveManagedCgroupRoot();
+  if (!cgroupRoot.ok) return cgroupRoot;
 
   const session = await backend.getSession(context, input.session_id);
   if (!session.ok) return session;
@@ -496,6 +506,7 @@ export async function launchManagedSessionCommand(
     filesystem_token: filesystemToken,
     runtime_epoch: live.runtime_epoch,
     boot_id: boot.value,
+    cgroup_root: cgroupRoot.value,
     now: (input.now ?? (() => new Date().toISOString()))(),
   });
   if (!reservation.ok) return reservation;
@@ -523,7 +534,7 @@ export async function launchManagedSessionCommand(
       starting_record: reservation.value,
       supervisor: {
         trusted: { entrypoint: process.execPath, cwd: path.dirname(process.execPath) },
-        cgroup: { required: true, retain_scope: true },
+        cgroup: { required: true, retain_scope: true, root: cgroupRoot.value },
       },
     },
     {
@@ -561,21 +572,25 @@ export async function launchManagedSessionCommand(
 
 function cgroupObservationRecord(record: SessionExecutionRecord): Parameters<typeof observeOwnedExecution>[0] {
   const name = deriveCgroupScopeName(record.cgroup_identity);
+  const root = record.cgroup_root;
   return {
     schema_version: 1,
     session_id: record.session_id,
     execution_id: record.execution_id,
     boot_id: record.boot_id,
     state: record.state === "attached" || record.state === "running" ? "active" : "terminal",
-    cgroups: {
-      contract_id: CGROUPS_V2_CONTRACT_ID,
-      root: CGROUPS_V2_ROOT,
-      parent: `${CGROUPS_V2_ROOT}/nawabari`,
-      path: `${CGROUPS_V2_ROOT}/nawabari/${name}`,
-      name,
-      boot_id: record.boot_id,
-      identity: record.cgroup_identity,
-    },
+    cgroups:
+      root === null || root === undefined
+        ? null
+        : {
+            contract_id: CGROUPS_V2_CONTRACT_ID,
+            root,
+            parent: `${root}/nawabari`,
+            path: `${root}/nawabari/${name}`,
+            name,
+            boot_id: record.boot_id,
+            identity: record.cgroup_identity,
+          },
   };
 }
 
