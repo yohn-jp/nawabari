@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -26,6 +27,7 @@ import {
 } from "./runtime-projection.js";
 import { LANDLOCK_ACCESS_FS, LANDLOCK_TRAMPOLINE } from "./landlock.js";
 import { compileWorkingSetRuntimeProjection } from "./working-set-runtime-projection.js";
+import { validateWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 
 test("the seccomp baseline is versioned, deterministic, and uses bounded EPERM denials", () => {
   const first = compileSandboxSeccompProfile("x64");
@@ -1379,7 +1381,81 @@ test("the session-private Git config projects the host global identity when no r
     // alias, hook, or other global setting is imported alongside them.
     assert.doesNotMatch(config, /credential/iu);
     assert.doesNotMatch(config, /alias/iu);
-    assert.doesNotMatch(config, /hooksPath/iu);
+    assert.equal(
+      execFileSync(
+        "git",
+        ["config", "--file", path.join(request.filesystem.git_metadata, "config"), "--get", "core.hooksPath"],
+        {
+          encoding: "utf8",
+        },
+      ).trim(),
+      "/dev/null",
+    );
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("governed private Git hooks require approved material and bind only its verified executable", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const profile = validateWorktreeRuntimeProfile({
+      id: "governed-test",
+      version: "1",
+      materialSelection: { profiles: ["base"], operations: [] },
+      filesystem: { readOnly: [], write: [], create: [], delete: [], deny: [], immutable: [] },
+      tools: [{ entrypoint: "nawabari-hook", provider: { id: "hook", requirement_id: "hook-runtime" } }],
+      shell: { entrypoint: "nawabari-hook" },
+      environment: {
+        home: "session",
+        xdg: { config: "session", cache: "session", data: "session", state: "session" },
+        tmp: "execution",
+      },
+      git: { config: "session-private", globalConfig: "excluded", credentialHelpers: "disabled", hooks: "governed" },
+      execution: { policy: STRICT_RUNTIME_POLICY, processTracking: "required" },
+    });
+    assert.equal(profile.ok, true);
+    if (!profile.ok) return;
+    const missing = compileSandboxInvocation({ ...request, git_profile: profile.value }, { command: "true" });
+    assert.equal(missing.ok, false);
+    const material = {
+      kind: "provider" as const,
+      provider: { id: "hook", requirement_id: "hook-runtime" },
+      source: fixture.executable,
+      target: "/nawabari/bin/nawabari-hook",
+      digest: createHash("sha256").update(fs.readFileSync(fixture.executable)).digest("hex"),
+    };
+    const governed = compileSandboxInvocation(
+      { ...request, git_profile: profile.value, hook_material: material },
+      { command: "true" },
+    );
+    assert.equal(governed.ok, true, governed.ok ? "" : governed.error.message);
+    if (!governed.ok) return;
+    assert.ok(
+      governed.value.args.some(
+        (arg, index) =>
+          arg === "--ro-bind" &&
+          governed.value.args[index + 1] === material.source &&
+          governed.value.args[index + 2] === material.target,
+      ),
+    );
+    const configPath = path.join(request.filesystem.git_metadata, "config");
+    assert.equal(
+      execFileSync("git", ["config", "--file", configPath, "--get", "core.hooksPath"], { encoding: "utf8" }).trim(),
+      "/nawabari/git/hooks",
+    );
+    assert.equal(fs.readlinkSync(path.join(request.filesystem.git_metadata, "hooks", "pre-commit")), material.target);
+    fs.appendFileSync(material.source, "changed\n");
+    const stale = compileSandboxInvocation(
+      { ...request, git_profile: profile.value, hook_material: material },
+      { command: "true" },
+    );
+    assert.equal(stale.ok, false);
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);

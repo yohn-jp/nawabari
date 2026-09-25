@@ -668,6 +668,23 @@ async function main() {
       if (result.error) fail(`${args.join(" ")} failed to start: ${result.error.message}`);
       return result;
     };
+
+    const createHelp = parseInstalledJson(
+      invokeInstalled(["session", "create", "--help", "--json"], lifecycleRepository),
+      "session create help",
+    );
+    if (
+      createHelp.ok !== true ||
+      createHelp.help_for !== "session create" ||
+      createHelp.required_options?.length !== 0 ||
+      createHelp.optional_options?.join(",") !==
+        "--branch,--worktree,--worktree-root,--base,--label,--profile,--profile-parameter,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file,--enforce-claims" ||
+      !createHelp.usage?.includes("[--profile <id> --profile-parameter <json>]") ||
+      createHelp.defaults?.["--base"] !== "HEAD"
+    ) {
+      fail("installed session create help did not expose the optional/defaulted contract");
+    }
+
     const invokeInstalledAsync = (args, cwd) =>
       new Promise((resolve, reject) => {
         const child = spawn(installedBinary, args, {
@@ -873,7 +890,7 @@ async function main() {
 
     const managedCreateBefore = {
       registry: fs.readFileSync(profileRegistryPath, "utf8"),
-      branches: run("git", ["branch", "--list", "feature/packed-profile-managed-unavailable"], {
+      branches: run("git", ["branch", "--list", "feature/packed-profile-managed"], {
         cwd: profileRepository,
         env: gitEnvironment,
       }).stdout,
@@ -881,21 +898,13 @@ async function main() {
         .stdout,
     };
     const managedCreateResult = invokeInstalled(
-      [
-        "session",
-        "create",
-        "--branch",
-        "feature/packed-profile-managed-unavailable",
-        "--profile",
-        "builtin:minimal",
-        "--json",
-      ],
+      ["session", "create", "--branch", "feature/packed-profile-managed", "--profile", "builtin:minimal", "--json"],
       profileRepository,
     );
     const managedCreate = parseInstalledJson(managedCreateResult, "selected managed profile create");
     const managedCreateAfter = {
       registry: fs.readFileSync(profileRegistryPath, "utf8"),
-      branches: run("git", ["branch", "--list", "feature/packed-profile-managed-unavailable"], {
+      branches: run("git", ["branch", "--list", "feature/packed-profile-managed"], {
         cwd: profileRepository,
         env: gitEnvironment,
       }).stdout,
@@ -908,12 +917,52 @@ async function main() {
       managedCreateAfter.registry === managedCreateBefore.registry &&
       managedCreateAfter.branches === managedCreateBefore.branches &&
       managedCreateAfter.worktrees === managedCreateBefore.worktrees;
+    // The managed-execution readiness authority decides admission: without
+    // it the selected profile fails closed before any ownership mutation; on
+    // a supported host with delegated cgroups v2 it admits the session and
+    // must pin the exact built-in profile, wildcard ceiling included.
+    const managedCreateAdmitted = managedCreateResult.status === 0 && managedCreate.ok === true;
+    let managedCreateAdmissionEvidence = null;
+    if (managedCreateAdmitted) {
+      const admittedRegistry = JSON.parse(managedCreateAfter.registry);
+      const pinned = admittedRegistry.pinned_profiles?.filter(
+        (record) => record.session_id === managedCreate.session_id,
+      );
+      managedCreateAdmissionEvidence = {
+        command: managedCreate.command,
+        branch: managedCreate.branch,
+        branch_present: managedCreateAfter.branches.trim().length > 0,
+        worktree_present: typeof managedCreate.worktree === "string" && fs.existsSync(managedCreate.worktree),
+        worktree_listed:
+          typeof managedCreate.worktree === "string" &&
+          managedCreateAfter.worktrees.includes(`worktree ${managedCreate.worktree}\n`),
+        required_feature: admittedRegistry.required_features?.includes("pinned-profiles.v1") === true,
+        pinned_profile_id: pinned?.length === 1 ? pinned[0].resolved?.id : null,
+        pinned_read_only: pinned?.length === 1 ? pinned[0].resolved?.filesystem?.readOnly : null,
+        pinned_process_tracking: pinned?.length === 1 ? pinned[0].resolved?.execution?.processTracking : null,
+      };
+    }
+    const managedCreateAdmittedConformant =
+      managedCreateAdmissionEvidence !== null &&
+      managedCreateAdmissionEvidence.command === "session create" &&
+      managedCreateAdmissionEvidence.branch === "feature/packed-profile-managed" &&
+      managedCreateAdmissionEvidence.branch_present &&
+      managedCreateAdmissionEvidence.worktree_present &&
+      managedCreateAdmissionEvidence.worktree_listed &&
+      managedCreateAdmissionEvidence.required_feature &&
+      managedCreateAdmissionEvidence.pinned_profile_id === "minimal" &&
+      JSON.stringify(managedCreateAdmissionEvidence.pinned_read_only) === JSON.stringify(["**"]) &&
+      managedCreateAdmissionEvidence.pinned_process_tracking === "required";
     const managedCreateConformanceFailure =
-      managedCreateTypedUnavailable && managedCreateOwnershipUnchanged
+      (managedCreateTypedUnavailable && managedCreateOwnershipUnchanged) || managedCreateAdmittedConformant
         ? null
         : {
-            expected: { status: 4, code: "SANDBOX_CAPABILITY_UNAVAILABLE", ownership_unchanged: true },
+            expected: {
+              unavailable: { status: 4, code: "SANDBOX_CAPABILITY_UNAVAILABLE", ownership_unchanged: true },
+              admitted: { status: 0, pinned_profile_id: "minimal", pinned_read_only: ["**"] },
+            },
             actual: {
+              admission: managedCreateAdmissionEvidence,
               status: managedCreateResult.status,
               result: managedCreate,
               ownership_unchanged: managedCreateOwnershipUnchanged,
@@ -987,8 +1036,8 @@ async function main() {
     }).stdout;
     const supportedRegistryText = fs.readFileSync(migrationRegistryPath, "utf8");
     const unsupportedRegistry = JSON.parse(supportedRegistryText);
-    unsupportedRegistry.required_features = ["runtime-sessions.v1"];
-    unsupportedRegistry.runtime_sessions = [{ fixture: "preserve", payload: { nested: ["optional", 1, true] } }];
+    unsupportedRegistry.required_features = ["retentions.v1"];
+    unsupportedRegistry.retentions = [{ fixture: "preserve", payload: { nested: ["optional", 1, true] } }];
     const unsupportedRegistryText = `${JSON.stringify(unsupportedRegistry, null, 2)}\n`;
     fs.writeFileSync(migrationRegistryPath, unsupportedRegistryText);
     const unsupportedFeatureResult = invokeInstalled(["session", "list", "--json"], migrationRepository);
@@ -999,7 +1048,7 @@ async function main() {
     const unsupportedFeatureOwnership = {
       registry_bytes_unchanged: fs.readFileSync(migrationRegistryPath, "utf8") === unsupportedRegistryText,
       optional_payload_unchanged:
-        JSON.stringify(JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8")).runtime_sessions) ===
+        JSON.stringify(JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8")).retentions) ===
         JSON.stringify([{ fixture: "preserve", payload: { nested: ["optional", 1, true] } }]),
       worktree_exists: fs.existsSync(migrationSession.worktree),
       branch_ref_unchanged:
@@ -1050,6 +1099,14 @@ async function main() {
       fail("installed doctor did not expose protected-execution readiness");
     }
     if (doctorResult.stderr.trim().length > 0) fail("doctor --json wrote decorative output to stderr");
+    if (managedCreateAdmitted && protectedExecutionDoctor.sandbox.ready !== true) {
+      fail("profile-selected managed create was admitted although protected-execution readiness is unavailable");
+    }
+    console.log(
+      managedCreateAdmitted
+        ? "profile-selected managed create admitted by managed-execution readiness; builtin:minimal pinned with its wildcard ceiling."
+        : "profile-selected managed create failed closed with SANDBOX_CAPABILITY_UNAVAILABLE; ownership unchanged.",
+    );
     const certificationEnvironmentBlocks = [];
     const runtimeMaterializationBlocks = [];
     const boundedProductionDefects = [];
@@ -1463,21 +1520,6 @@ async function main() {
       initialList.history_included !== false
     ) {
       fail("default session list did not expose bounded active-session metadata");
-    }
-
-    const createHelp = parseInstalledJson(
-      invokeInstalled(["session", "create", "--help", "--json"], lifecycleRepository),
-      "session create help",
-    );
-    if (
-      createHelp.ok !== true ||
-      createHelp.help_for !== "session create" ||
-      createHelp.required_options?.length !== 0 ||
-      createHelp.optional_options?.join(",") !==
-        "--branch,--worktree,--worktree-root,--base,--label,--profile,--profile-parameter,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file,--enforce-claims" ||
-      createHelp.defaults?.["--base"] !== "HEAD"
-    ) {
-      fail("installed session create help did not expose the optional/defaulted contract");
     }
 
     const lifecycleHelp = [

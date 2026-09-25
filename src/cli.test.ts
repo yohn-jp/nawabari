@@ -34,6 +34,7 @@ import type {
   SessionDiscardResult,
   SessionDiscardPreview,
   SessionRecord,
+  SessionManagedRuntimeState,
   UpdateClaimsOptions,
   WorkingSetExpansionOptions,
   WorkingSetExpansionResult,
@@ -494,6 +495,72 @@ test("session exec routes through the canonical protected launcher and never fal
   });
 });
 
+test("managed run, exec, and shell dispatch to the protected lifecycle before any legacy runner", async () => {
+  const invocations = [
+    ["--json", "session", "run", "--session", sampleSession.session_id, "--", "printf", "managed"],
+    ["--json", "session", "exec", "--session", sampleSession.session_id, "--", "printf", "managed"],
+    ["--json", "session", "shell", "--session", sampleSession.session_id, "--", "bash"],
+    ["--json", "session", "run", "--", "printf", "current-session"],
+  ];
+  const managedTargets: string[] = [];
+  for (const arguments_ of invocations) {
+    const output = capture();
+    let legacyRunnerCalls = 0;
+    const managedBackend = backendForTests({
+      getSessionManagedRuntime: async (_context, sessionId, executionId) => {
+        managedTargets.push(sessionId);
+        return success({
+          runtime_epoch: 7,
+          registry_revision: 11,
+          claim_set_generation: 3,
+          admission: {
+            kind: "session-admission" as const,
+            schema_version: 1 as const,
+            session_id: sessionId,
+            admission: "open" as const,
+            runtime_epoch: 7,
+          },
+          profile: { digest: "a".repeat(64) } as unknown as NonNullable<SessionManagedRuntimeState["profile"]>,
+          runtime_environment_identity: {
+            session_id: sessionId,
+            execution_id: executionId ?? "unused",
+            session_root: "/private/session-home",
+            execution_root: "/private/execution",
+            owner_uid: 1000,
+            owner_gid: 1000,
+          },
+        } satisfies SessionManagedRuntimeState);
+      },
+      listClaims: async () => success({ claims: [], claim_set_generation: 3 }),
+      persistSessionExecution: async () =>
+        failure(new DomainError("REGISTRY_DURABILITY_UNCERTAIN", "unexpected persistence")),
+      readSessionRuntimeEpoch: () => 7,
+    });
+    const exitCode = await runCli(arguments_, {
+      cwd: sampleSession.worktree,
+      backend: managedBackend,
+      io: output.io,
+      sandboxProbe: readySandboxProbe({ hasCgroupsV2: () => false }),
+      sandboxRunner: async () => {
+        legacyRunnerCalls += 1;
+        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      },
+    });
+
+    assert.equal(exitCode, 4, arguments_.join(" "));
+    assert.equal(legacyRunnerCalls, 0, arguments_.join(" "));
+    const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string };
+    assert.equal(response.ok, false, arguments_.join(" "));
+    assert.equal(response.code, "SANDBOX_CAPABILITY_UNAVAILABLE", arguments_.join(" "));
+  }
+  assert.deepEqual(managedTargets, [
+    sampleSession.session_id,
+    sampleSession.session_id,
+    sampleSession.session_id,
+    sampleSession.session_id,
+  ]);
+});
+
 function makeTgrepRgProviderFixture(): {
   readonly projection: SessionRuntimeProjection;
   readonly cleanup: () => void;
@@ -677,6 +744,7 @@ test("command-specific help is projected from one spec and marks session create 
   const response = JSON.parse(output.stdout[0] ?? "") as {
     command: string;
     help_for: string;
+    usage: string;
     required_options: string[];
     optional_options: string[];
     defaults: Record<string, string>;
@@ -684,6 +752,7 @@ test("command-specific help is projected from one spec and marks session create 
   };
   assert.equal(response.command, "help");
   assert.equal(response.help_for, "session create");
+  assert.match(response.usage, /\[--profile <id> --profile-parameter <json>\]/u);
   assert.deepEqual(response.required_options, []);
   assert.deepEqual(response.optional_options, [
     "--branch",
@@ -765,6 +834,8 @@ test("canonical command registry resolves aliases without duplicating option def
     "session exec",
     "session shell",
     "session list",
+    "session enter",
+    "session processes",
     "session claim",
     "resource claim",
     "session update",
@@ -1059,6 +1130,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session exec",
       "session shell",
       "session list",
+      "session enter",
+      "session processes",
       "session claim",
       "resource claim",
       "session update",

@@ -6,6 +6,10 @@ import type {
 } from "../session-lifecycle-classification.js";
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
+import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
+import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
+import type { SessionHookMaterial } from "./session-git-hooks.js";
+import type { SessionRuntimeEnvironmentIdentity } from "./session-environment.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -36,6 +40,29 @@ export type SessionContext = {
   cwd: string;
 };
 
+export type SessionManagedRuntimeState = Readonly<{
+  readonly runtime_epoch: number;
+  readonly registry_revision: number;
+  readonly claim_set_generation: number;
+  readonly admission: Readonly<{
+    readonly kind: "session-admission";
+    readonly schema_version: 1;
+    readonly session_id: string;
+    readonly admission: "open" | "closed";
+    readonly runtime_epoch: number;
+  }> | null;
+  readonly profile: PinnedWorktreeProfile | null;
+  /** Ephemeral approved material from the caller-owned authority; never persisted. */
+  readonly hook_material?: SessionHookMaterial | null;
+  readonly runtime_environment_identity?: SessionRuntimeEnvironmentIdentity;
+}>;
+
+export type WorktreeProfileSessionCreateOptions = {
+  selection: { profile: string };
+  parameters?: JsonObject;
+  provenance?: { catalog?: { path?: string; blob_oid?: string } };
+};
+
 export type SessionCreateOptions = {
   branch: string | null;
   worktree: string | null;
@@ -55,11 +82,7 @@ export type SessionCreateOptions = {
   /** Optional repository identity used by the transport-neutral working-set contract. */
   working_set_repository?: RepositoryIdentity | null;
   /** Optional immutable worktree runtime profile selected during bootstrap. */
-  profile?: {
-    selection: { profile: string };
-    parameters?: JsonObject;
-    provenance?: { catalog?: { path?: string; blob_oid?: string } };
-  } | null;
+  profile?: WorktreeProfileSessionCreateOptions | null;
 };
 
 export type WorkingSetExpansionOptions = {
@@ -896,6 +919,32 @@ export interface SessionBackend {
     sessionId: string | null,
   ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation: number }>>;
   migrate?(context: SessionContext): Promise<DomainResult<RegistryMigrationResult>>;
+  listSessionExecutions?(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<DomainResult<readonly PersistedSessionExecutionRecord[]>>;
+  persistSessionExecution?(
+    context: SessionContext,
+    record: PersistedSessionExecutionRecord,
+  ): Promise<DomainResult<PersistedSessionExecutionRecord>>;
+  transitionSessionExecution?(
+    context: SessionContext,
+    executionId: string,
+    input: SessionExecutionStateInput,
+  ): Promise<DomainResult<PersistedSessionExecutionRecord>>;
+  closeSessionLaunchAdmission?(
+    context: SessionContext,
+    sessionId: string,
+    expectedEpoch: number,
+  ): Promise<DomainResult<{ runtimeEpoch: number }>>;
+  getSessionManagedRuntime?(
+    context: SessionContext,
+    sessionId: string,
+    executionId?: string,
+  ): Promise<DomainResult<SessionManagedRuntimeState>>;
+  readSessionRuntimeEpoch?(context: SessionContext, sessionId: string): number;
+  /** The single managed cgroup root retained by the backend for readiness and launch. */
+  getManagedCgroupRoot?(): DomainResult<string>;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {

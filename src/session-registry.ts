@@ -34,7 +34,17 @@ import {
   materializeAuxiliaryStateProjection,
   resolveAuxiliaryStateTrackedPathEvidence,
 } from "./domain/auxiliary-state-projection.js";
-import type { JsonObject } from "./domain/errors.js";
+import { DomainError } from "./domain/errors.js";
+import {
+  materializeSessionGitConfig,
+  resolveSessionHookSet,
+  runGovernedHook,
+  type GovernedHookEvent,
+  type SessionGitConfig,
+  type SessionHookMaterial,
+} from "./domain/session-git-hooks.js";
+import { spawnSync } from "node:child_process";
+import { compileWorkingSetRuntimeProjection } from "./domain/working-set-runtime-projection.js";
 import {
   composeEffectiveWorkingSet,
   evaluateWorkingSetExpansion,
@@ -48,34 +58,18 @@ import { isPostRenameFailure, writeJsonAtomicallySync } from "./registry/atomic.
 import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
 import {
   REGISTRY_FEATURES,
-  MAX_RUNTIME_RECORDS,
   SUPPORTED_REGISTRY_FEATURES,
+  MAX_RUNTIME_RECORDS,
   emptyRuntimeRecords,
   parseRuntimeRecords,
+  parseSessionAdmissionRecord,
   toPersistedRuntimeRecords,
   type ParsedRuntimeRecords,
   type RegistryFeature,
+  type SessionAdmissionRecord,
   type RuntimeRecord,
   type RuntimeRecords,
 } from "./registry/runtime-records.js";
-import {
-  resolveWorktreeProfile,
-  substituteProfileParameters,
-  validateWorktreeProfileCatalog,
-} from "./domain/worktree-profile-catalog.js";
-import {
-  builtinWorktreeProfileRevision,
-  pinWorktreeProfile,
-  type PinnedWorktreeProfile,
-} from "./domain/worktree-profile-pinning.js";
-import {
-  getBuiltinWorktreeProfile,
-  getBuiltinWorktreeProfileStatusForResolution,
-  resolveBuiltinWorktreeProfile,
-  type BuiltinWorktreeProfileId,
-} from "./domain/worktree-profile-builtins.js";
-import { DomainError } from "./domain/errors.js";
-import type { SandboxProbe } from "./domain/sandbox.js";
 import {
   assertCanonicalClaimResource,
   canonicalClaimId,
@@ -127,7 +121,42 @@ import {
   type RepositoryEvidenceOptions,
   type RepositoryEvidenceSnapshot,
 } from "./repository-evidence.js";
-import type { SandboxGitIdentity } from "./domain/sandbox.js";
+import type { SandboxGitIdentity, SandboxProbe } from "./domain/sandbox.js";
+import {
+  loadWorktreeProfileCatalog,
+  resolveWorktreeProfile,
+  substituteProfileParameters,
+} from "./domain/worktree-profile-catalog.js";
+import {
+  getBuiltinWorktreeProfile,
+  getBuiltinWorktreeProfileStatusForResolution,
+  resolveBuiltinWorktreeProfile,
+  type BuiltinWorktreeProfileId,
+} from "./domain/worktree-profile-builtins.js";
+import {
+  builtinWorktreeProfileRevision,
+  parsePinnedProfileRecord,
+  pinWorktreeProfile,
+  type PinnedWorktreeProfile,
+} from "./domain/worktree-profile-pinning.js";
+import { resolveWorktreeProfileRuntime } from "./domain/worktree-profile-runtime.js";
+import { resolveProfileRuntimeScope } from "./domain/worktree-profile-scope.js";
+import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
+import type { WorktreeProfileSessionCreateOptions } from "./domain/session.js";
+import {
+  parseSessionExecutionRecord,
+  recordExecutionState,
+  toPersistedSessionExecutionRecord,
+  type PersistedSessionExecutionRecord,
+  type SessionExecutionStateInput,
+} from "./domain/session-execution-record.js";
+import type { SessionDrainFinalization, SessionDrainExecution } from "./domain/session-execution-control.js";
+import type { SessionRuntimeEnvironmentIdentity } from "./domain/session-environment.js";
+import { CGROUPS_V2_CONTRACT_ID, deriveCgroupScopeName, type CgroupFileSystem } from "./domain/cgroups-v2.js";
+import {
+  observeOwnedExecution,
+  type SessionExecutionRecord as OwnedExecutionRecord,
+} from "./domain/session-process-observation.js";
 import {
   classifySessionLifecycle,
   lifecycleTransition,
@@ -290,14 +319,11 @@ export interface ProvisionSessionOptions {
   readonly candidateWorkingSet?: unknown;
   /** Optional repository identity for the transport-neutral working-set contract. */
   readonly workingSetRepository?: RepositoryIdentity;
+  /** Optional upper runtime profile pinned with the new session. */
+  readonly profile?: WorktreeProfileSessionCreateOptions | null;
   readonly defaultBranchName?: string;
   readonly protectedBranchNames?: readonly string[];
   readonly protectedWorktreePaths?: readonly string[];
-  readonly profile?: {
-    readonly selection: { readonly profile: string };
-    readonly parameters?: JsonObject;
-    readonly provenance?: { readonly catalog?: { readonly path?: string; readonly blob_oid?: string } };
-  };
 }
 
 export interface WorkingSetExpansionOptions {
@@ -523,6 +549,8 @@ export interface IntegrationProof {
 export interface GarbageCollectOptions {
   readonly apply?: boolean;
   readonly staleAfterMs?: number;
+  /** Canonical owned-execution observation filesystem; injectable for controlled runtimes. */
+  readonly cgroupFilesystem?: CgroupFileSystem;
 }
 
 /** Why a session was surfaced by garbage-collection inspection. */
@@ -842,6 +870,24 @@ export interface VerifiedExecutionContext extends PhysicalExecutionContext {
   readonly session: SessionRecord;
 }
 
+type GovernedGitFreshnessFence = Readonly<{
+  readonly sessionId: string;
+  readonly repositoryId: string;
+  readonly worktreeId: string;
+  readonly worktreePath: string;
+  readonly branchId: string;
+  readonly headId: string;
+  readonly registryRevision: number;
+  readonly claimSetGeneration: number;
+  readonly runtimeEpoch: number;
+  readonly resources: OperationAuthorizationDecision["resources"];
+}>;
+
+type PreparedSessionGitMutation = Readonly<{
+  readonly config: SessionGitConfig | undefined;
+  readonly fence: GovernedGitFreshnessFence | undefined;
+}>;
+
 export const GOVERNED_GIT_OPERATION_SCHEMA_VERSION = 1 as const;
 
 export interface CommitOptions {
@@ -959,6 +1005,8 @@ export interface SessionRegistryOptions {
   readonly protectedWorktreePaths?: readonly string[];
   readonly worktreeRoot?: string;
   readonly staleAfterMs?: number;
+  /** Canonical owned-execution observation filesystem; injectable for controlled runtimes. */
+  readonly cgroupFilesystem?: CgroupFileSystem;
   /**
    * Generic sandbox capability evidence. It is not managed-execution readiness
    * and never authorizes a profile requiring process tracking.
@@ -969,7 +1017,19 @@ export interface SessionRegistryOptions {
    * managed runtime. When absent, profiles requiring process tracking fail closed.
    */
   readonly managedExecutionReadiness?: ManagedExecutionReadiness;
+  /** Caller-approved hook material authority; never persisted or inferred from the host. */
+  readonly hookMaterialAuthority?: SessionHookMaterialAuthority;
 }
+
+/** Identity supplied when requesting hook material for a pinned session runtime. */
+export interface SessionHookMaterialRequest {
+  readonly sessionId: string;
+  readonly pinnedProfile: PinnedWorktreeProfile;
+}
+
+export type SessionHookMaterialAuthority = (
+  request: SessionHookMaterialRequest,
+) => Readonly<{ available: true; material: SessionHookMaterial }> | Readonly<{ available: false }>;
 
 /** Read-only evidence handed to the managed-execution readiness authority. */
 export interface ManagedExecutionReadinessRequest {
@@ -1055,40 +1115,6 @@ export interface PersistedRegistryV2 {
 
 export type PersistedRegistry = PersistedRegistryV1 | PersistedRegistryV2;
 
-function loadPinnedProfileCatalog(
-  repository: RepositoryContext,
-  revision: string,
-  git: GitCommandRunner,
-): ReturnType<typeof validateWorktreeProfileCatalog> {
-  let text: string;
-  try {
-    text = git.run(["show", `${revision}:nawabari.profiles.json`], repository.worktreePath);
-  } catch (cause: unknown) {
-    return {
-      ok: false,
-      error: new DomainError("RUNTIME_PROFILE_MISSING", "The pinned repository catalog could not be read.", {
-        path: "nawabari.profiles.json",
-        revision,
-        cause: cause instanceof Error ? cause.message : String(cause),
-      }),
-    };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text) as unknown;
-  } catch (cause: unknown) {
-    return {
-      ok: false,
-      error: new DomainError("RUNTIME_PROFILE_INVALID", "The pinned repository catalog contains invalid JSON.", {
-        path: "nawabari.profiles.json",
-        revision,
-        cause: cause instanceof Error ? cause.message : String(cause),
-      }),
-    };
-  }
-  return validateWorktreeProfileCatalog(parsed);
-}
-
 interface RegistryState {
   readonly registrySchemaVersion: typeof LEGACY_REGISTRY_SCHEMA_VERSION | RegistrySchemaVersion;
   readonly registryRevision: number;
@@ -1121,6 +1147,7 @@ const MAX_ID_GENERATION_ATTEMPTS = 8;
 export class SessionRegistry {
   readonly repository: RepositoryContext;
   readonly paths: RegistryPaths;
+  readonly hookMaterialAuthority: SessionHookMaterialAuthority | undefined;
 
   private readonly git: GitCommandRunner;
   private readonly gitIdentity: SandboxGitIdentity | undefined;
@@ -1133,6 +1160,7 @@ export class SessionRegistry {
   private readonly worktreeRoot: string;
   private readonly worktreeRootIsDefault: boolean;
   private readonly staleAfterMs: number;
+  private readonly cgroupFilesystem?: CgroupFileSystem;
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
   private readonly lock: RepositoryLock;
@@ -1162,9 +1190,11 @@ export class SessionRegistry {
       this.worktreeRoot = resolveManagedWorktreeRoot(configuredWorktreeRoot);
     }
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+    this.cgroupFilesystem = options.cgroupFilesystem;
     this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
     this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
     this.managedExecutionReadiness = options.managedExecutionReadiness;
+    this.hookMaterialAuthority = options.hookMaterialAuthority;
 
     if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0) {
       throw new RangeError("lockTimeoutMs must be a non-negative safe integer");
@@ -1212,6 +1242,79 @@ export class SessionRegistry {
     return record === undefined ? undefined : cloneSessionRecord(record);
   }
 
+  get runtimeEpoch(): number {
+    return this.readStateUnsafe().runtimeEpoch;
+  }
+
+  readSessionRuntimeEpoch(sessionId: string): number {
+    assertSessionId(sessionId);
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      if (!state.sessions.some((session) => session.sessionId === sessionId)) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      return state.runtimeEpoch;
+    });
+  }
+
+  getSessionLaunchAdmission(sessionId: string): SessionAdmissionRecord | undefined {
+    assertSessionId(sessionId);
+    const record = (this.readStateUnsafe().runtimeRecords.records.runtime_sessions ?? []).find((candidate) => {
+      const parsed = parseSessionAdmissionRecord(candidate);
+      return parsed.session_id === sessionId;
+    });
+    return record === undefined ? undefined : parseSessionAdmissionRecord(record);
+  }
+
+  getSessionManagedRuntime(sessionId: string, executionId?: string) {
+    assertSessionId(sessionId);
+    const state = this.readStateUnsafe();
+    if (!state.sessions.some((session) => session.sessionId === sessionId)) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    const admissionRecord = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    const pinnedRecord = (state.runtimeRecords.records.pinned_profiles ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    const profile = pinnedRecord === undefined ? null : parsePinnedProfileRecord(pinnedRecord);
+    const supplied =
+      profile?.resolved.git.hooks === "governed"
+        ? this.hookMaterialAuthority?.({ sessionId, pinnedProfile: profile })
+        : undefined;
+    return Object.freeze({
+      runtime_epoch: state.runtimeEpoch,
+      registry_revision: state.registryRevision,
+      claim_set_generation: state.claimSetGeneration,
+      admission: admissionRecord === undefined ? null : parseSessionAdmissionRecord(admissionRecord),
+      profile,
+      hook_material: supplied?.available === true ? supplied.material : null,
+      ...(executionId === undefined
+        ? {}
+        : { runtime_environment_identity: this.sessionRuntimeEnvironmentIdentity(sessionId, executionId) }),
+    });
+  }
+
+  private sessionRuntimeEnvironmentIdentity(sessionId: string, executionId: string): SessionRuntimeEnvironmentIdentity {
+    const sessionName = deriveCgroupScopeName({ session_id: sessionId, execution_id: "session-home" });
+    const executionName = deriveCgroupScopeName({ session_id: sessionId, execution_id: executionId });
+    if (typeof process.getuid !== "function" || typeof process.getgid !== "function") {
+      throw new SessionRegistryError("OPERATION_REJECTED", "The session runtime directory owner cannot be observed", {
+        sessionId,
+        executionId,
+      });
+    }
+    return Object.freeze({
+      session_id: sessionId,
+      execution_id: executionId,
+      session_root: path.join(this.paths.directory, "runtime", "sessions", sessionName, "home"),
+      execution_root: path.join(this.paths.directory, "runtime", "executions", executionName),
+      owner_uid: process.getuid(),
+      owner_gid: process.getgid(),
+    });
+  }
+
   /** Return the single authoritative claim set, optionally scoped to a session. */
   listClaims(sessionId?: string | null): readonly ResourceClaim[] {
     const claims = this.readStateUnsafe().claims;
@@ -1231,6 +1334,180 @@ export class SessionRegistry {
       claims: state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim),
       claimSetGeneration: state.claimSetGeneration,
     };
+  }
+
+  /** Read the durable execution ledger for one explicit session. */
+  listSessionExecutions(sessionId: string): readonly PersistedSessionExecutionRecord[] {
+    assertSessionId(sessionId);
+    const records = this.readStateUnsafe().runtimeRecords.records.executions ?? [];
+    return records
+      .map((candidate, index) => {
+        const parsed = parseSessionExecutionRecord(candidate);
+        if (!parsed.ok)
+          throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid execution record at index ${index}`);
+        if (parsed.value.session_id !== sessionId) return null;
+        return toPersistedSessionExecutionRecord(parsed.value);
+      })
+      .filter((record): record is PersistedSessionExecutionRecord => record !== null);
+  }
+
+  /** Persist a new execution reservation, advancing only registry_revision. */
+  persistSessionExecution(record: PersistedSessionExecutionRecord): PersistedSessionExecutionRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const parsed = parseSessionExecutionRecord(record);
+      if (!parsed.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", "Invalid execution record");
+      if (parsed.value.state !== "starting") {
+        throw new SessionRegistryError("OPERATION_REJECTED", "New execution records must start in the starting state", {
+          executionId: parsed.value.execution_id,
+        });
+      }
+      const session = state.sessions.find((candidate) => candidate.sessionId === parsed.value.session_id);
+      if (session === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${parsed.value.session_id}`);
+      }
+      if (session.state !== "active") {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Execution reservation requires an active session", {
+          sessionId: parsed.value.session_id,
+          state: session.state,
+        });
+      }
+      const admission = this.getSessionLaunchAdmission(parsed.value.session_id);
+      if (
+        admission === undefined ||
+        admission.admission !== "open" ||
+        admission.runtime_epoch !== state.runtimeEpoch ||
+        parsed.value.runtime_epoch !== state.runtimeEpoch
+      ) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Session launch admission is not open at the current epoch",
+          {
+            sessionId: parsed.value.session_id,
+            runtimeEpoch: state.runtimeEpoch,
+            admission: admission?.admission ?? "untracked",
+          },
+        );
+      }
+      const executions = state.runtimeRecords.records.executions ?? [];
+      const existing = executions.find((candidate) => {
+        const current = parseSessionExecutionRecord(candidate);
+        return current.ok && current.value.execution_id === parsed.value.execution_id;
+      });
+      if (existing !== undefined) {
+        const current = parseSessionExecutionRecord(existing);
+        if (
+          current.ok &&
+          JSON.stringify(toPersistedSessionExecutionRecord(current.value)) ===
+            JSON.stringify(toPersistedSessionExecutionRecord(parsed.value))
+        ) {
+          return toPersistedSessionExecutionRecord(current.value);
+        }
+        throw new SessionRegistryError("OPERATION_REJECTED", "Execution ID already exists with conflicting identity", {
+          executionId: parsed.value.execution_id,
+        });
+      }
+      const nextRecords = withExecutions(state.runtimeRecords, [
+        ...executions,
+        toPersistedSessionExecutionRecord(parsed.value),
+      ]);
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        nextRecords,
+      );
+      return toPersistedSessionExecutionRecord(parsed.value);
+    });
+  }
+
+  /** Apply the producer-owned execution transition matrix under the registry lock. */
+  transitionSessionExecution(
+    executionId: string,
+    input: SessionExecutionStateInput,
+    expectedRecord?: PersistedSessionExecutionRecord,
+  ): PersistedSessionExecutionRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const executions = state.runtimeRecords.records.executions ?? [];
+      const index = executions.findIndex((candidate) => {
+        const parsed = parseSessionExecutionRecord(candidate);
+        return parsed.ok && parsed.value.execution_id === executionId;
+      });
+      if (index < 0)
+        throw new SessionRegistryError("OPERATION_REJECTED", "Execution ID was not found", { executionId });
+      const current = parseSessionExecutionRecord(executions[index]);
+      if (!current.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", "Invalid execution record");
+      const next = recordExecutionState(current.value, input);
+      if (!next.ok) {
+        const domainDetails = next.error.details;
+        const details: RegistryErrorDetails = {
+          ...(typeof domainDetails?.field === "string" ? { field: domainDetails.field } : {}),
+          ...(typeof domainDetails?.from === "string" ? { from: domainDetails.from } : {}),
+          ...(typeof domainDetails?.to === "string" ? { to: domainDetails.to } : {}),
+        };
+        throw new SessionRegistryError("OPERATION_REJECTED", next.error.message, details);
+      }
+      const persisted = toPersistedSessionExecutionRecord(next.value);
+      if (expectedRecord !== undefined && JSON.stringify(persisted) !== JSON.stringify(expectedRecord)) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Execution transition does not match the requested record",
+          {
+            executionId,
+          },
+        );
+      }
+      const updated = [...executions];
+      updated[index] = persisted;
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        withExecutions(state.runtimeRecords, updated),
+      );
+      return persisted;
+    });
+  }
+
+  /** Close launch admission and advance runtime_epoch atomically. */
+  closeSessionLaunchAdmission(sessionId: string, expectedEpoch: number): { runtimeEpoch: number } {
+    return this.withLock(() => {
+      assertSessionId(sessionId);
+      const state = this.readStateUnsafe();
+      if (!state.sessions.some((session) => session.sessionId === sessionId)) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch !== state.runtimeEpoch) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Runtime epoch is stale", {
+          sessionId,
+          expectedEpoch,
+          runtimeEpoch: state.runtimeEpoch,
+        });
+      }
+      const admission = this.getSessionLaunchAdmission(sessionId);
+      if (admission === undefined) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Session launch admission is untracked", { sessionId });
+      }
+      const nextEpoch = nextRuntimeEpoch(state);
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        nextEpoch,
+        withSessionAdmission(state.runtimeRecords, {
+          ...admission,
+          admission: "closed",
+          runtime_epoch: nextEpoch,
+        }),
+      );
+      return { runtimeEpoch: nextEpoch };
+    });
   }
 
   /**
@@ -1492,21 +1769,33 @@ export class SessionRegistry {
   }
 
   /** Add claims atomically. Repeating an equivalent operation is idempotent. */
-  claimResources(options: ClaimResourcesOptions): ClaimResourcesResult {
+  claimResources(options: ClaimResourcesOptions, finalization?: SessionDrainFinalization): ClaimResourcesResult {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const admission = this.assertDrainFinalizationUnsafe(state, finalization, sessionId, "release-claims");
       const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
       const requested = this.canonicalClaimInputs(options.claims, owner);
       const result = this.addClaimsUnsafe(state, owner, requested);
       const claimSetGeneration = nextClaimSetGeneration(state, result.claims);
+      const runtimeEpoch = finalization === undefined ? state.runtimeEpoch : nextRuntimeEpoch(state);
+      const runtimeRecords =
+        finalization === undefined || admission === undefined
+          ? state.runtimeRecords
+          : withSessionAdmission(state.runtimeRecords, {
+              ...admission,
+              admission: "open",
+              runtime_epoch: runtimeEpoch,
+            });
       this.writeUnsafe(
         result.sessions,
         result.claims,
         claimSetGeneration,
-        claimSetGeneration === state.claimSetGeneration ? state.registryRevision : nextRegistryRevision(state),
-        state.runtimeEpoch,
-        state.runtimeRecords,
+        claimSetGeneration === state.claimSetGeneration && finalization === undefined
+          ? state.registryRevision
+          : nextRegistryRevision(state),
+        runtimeEpoch,
+        runtimeRecords,
       );
       return {
         session: cloneSessionRecord(owner.record),
@@ -1519,11 +1808,12 @@ export class SessionRegistry {
     });
   }
 
-  updateClaims(options: UpdateClaimsOptions): ClaimResourcesResult {
+  updateClaims(options: UpdateClaimsOptions, finalization?: SessionDrainFinalization): ClaimResourcesResult {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const admission = this.assertDrainFinalizationUnsafe(state, finalization, sessionId, "release-claims");
       const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
       const requested = this.canonicalClaimInputs(options.claims, owner, true);
       const current = state.claims.filter((claim) => claim.sessionId === sessionId);
@@ -1550,13 +1840,24 @@ export class SessionRegistry {
         ...materialized,
       ]);
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+      const runtimeEpoch = finalization === undefined ? state.runtimeEpoch : nextRuntimeEpoch(state);
+      const runtimeRecords =
+        finalization === undefined || admission === undefined
+          ? state.runtimeRecords
+          : withSessionAdmission(state.runtimeRecords, {
+              ...admission,
+              admission: "open",
+              runtime_epoch: runtimeEpoch,
+            });
       this.writeUnsafe(
         state.sessions,
         nextClaims,
         claimSetGeneration,
-        claimSetGeneration === state.claimSetGeneration ? state.registryRevision : nextRegistryRevision(state),
-        state.runtimeEpoch,
-        state.runtimeRecords,
+        claimSetGeneration === state.claimSetGeneration && finalization === undefined
+          ? state.registryRevision
+          : nextRegistryRevision(state),
+        runtimeEpoch,
+        runtimeRecords,
       );
       return {
         session: cloneSessionRecord(owner.record),
@@ -1575,11 +1876,12 @@ export class SessionRegistry {
    * the repository lock is held. A mode change replaces the old claim and
    * creates the new claim in the same persisted complete set.
    */
-  applyClaimDeltas(options: ClaimDeltasOptions): ClaimDeltasResult {
+  applyClaimDeltas(options: ClaimDeltasOptions, finalization?: SessionDrainFinalization): ClaimDeltasResult {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const admission = this.assertDrainFinalizationUnsafe(state, finalization, sessionId, "release-claims");
       const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
       const deltas = this.canonicalClaimDeltas(options.deltas, owner);
       const current = state.claims.filter((claim) => claim.sessionId === sessionId);
@@ -1637,14 +1939,23 @@ export class SessionRegistry {
       this.assertCompleteClaimSet(nextSessionClaims, owner, externalClaims, state.sessions);
       const nextClaims = sortResourceClaims([...externalClaims, ...nextSessionClaims]);
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
-      if (claimSetGeneration !== state.claimSetGeneration) {
+      if (claimSetGeneration !== state.claimSetGeneration || finalization !== undefined) {
+        const runtimeEpoch = finalization === undefined ? state.runtimeEpoch : nextRuntimeEpoch(state);
+        const runtimeRecords =
+          finalization === undefined || admission === undefined
+            ? state.runtimeRecords
+            : withSessionAdmission(state.runtimeRecords, {
+                ...admission,
+                admission: "open",
+                runtime_epoch: runtimeEpoch,
+              });
         this.writeUnsafe(
           state.sessions,
           nextClaims,
           claimSetGeneration,
           nextRegistryRevision(state),
-          state.runtimeEpoch,
-          state.runtimeRecords,
+          runtimeEpoch,
+          runtimeRecords,
         );
       }
 
@@ -1671,7 +1982,11 @@ export class SessionRegistry {
     });
   }
 
-  releaseClaims(sessionIdOrOptions: string | ReleaseClaimsOptions, claimIds?: readonly string[]): ReleaseClaimsResult {
+  releaseClaims(
+    sessionIdOrOptions: string | ReleaseClaimsOptions,
+    claimIds?: readonly string[],
+    finalization?: SessionDrainFinalization,
+  ): ReleaseClaimsResult {
     const options: ReleaseClaimsOptions =
       typeof sessionIdOrOptions === "string" ? { sessionId: sessionIdOrOptions, claimIds } : sessionIdOrOptions;
 
@@ -1697,13 +2012,16 @@ export class SessionRegistry {
           "Release selector families are mutually exclusive: resources, claim IDs, or all",
         );
       }
-      const result = this.applyClaimDeltas({
-        sessionId: options.sessionId ?? options.session_id,
-        deltas: selectedResources.map((resource) => ({ kind: "release", resource })),
-        expectedClaimSetGeneration: options.expectedClaimSetGeneration,
-        expected_claim_set_generation: options.expected_claim_set_generation,
-        force: options.force,
-      });
+      const result = this.applyClaimDeltas(
+        {
+          sessionId: options.sessionId ?? options.session_id,
+          deltas: selectedResources.map((resource) => ({ kind: "release", resource })),
+          expectedClaimSetGeneration: options.expectedClaimSetGeneration,
+          expected_claim_set_generation: options.expected_claim_set_generation,
+          force: options.force,
+        },
+        finalization,
+      );
       return {
         sessionId: result.session.sessionId,
         released: result.released.map(cloneResourceClaim),
@@ -1717,6 +2035,7 @@ export class SessionRegistry {
       const state = this.readStateUnsafe();
       this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const admission = this.assertDrainFinalizationUnsafe(state, finalization, sessionId, "release-claims");
       const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
       if (record === undefined) {
         throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
@@ -1758,14 +2077,23 @@ export class SessionRegistry {
       const remaining = sessionClaims.filter((claim) => !wanted.has(claim.claimId));
       const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId || !wanted.has(claim.claimId));
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
-      if (claimSetGeneration !== state.claimSetGeneration) {
+      if (claimSetGeneration !== state.claimSetGeneration || finalization !== undefined) {
+        const runtimeEpoch = finalization === undefined ? state.runtimeEpoch : nextRuntimeEpoch(state);
+        const runtimeRecords =
+          finalization === undefined || admission === undefined
+            ? state.runtimeRecords
+            : withSessionAdmission(state.runtimeRecords, {
+                ...admission,
+                admission: "open",
+                runtime_epoch: runtimeEpoch,
+              });
         this.writeUnsafe(
           state.sessions,
           nextClaims,
           claimSetGeneration,
           nextRegistryRevision(state),
-          state.runtimeEpoch,
-          state.runtimeRecords,
+          runtimeEpoch,
+          runtimeRecords,
         );
       }
       return {
@@ -1843,6 +2171,7 @@ export class SessionRegistry {
         this.assertManagedExecutionReady(pinnedProfile);
       }
       const workingSet = this.composeProvisionedWorkingSet(options, resources);
+      if (pinnedProfile !== undefined) this.assertManagedProfileReady(pinnedProfile, workingSet, options.initialClaims);
       const timestamp = toTimestamp(this.clock());
       const record = freezeSessionRecord({
         schemaVersion: SESSION_RECORD_SCHEMA_VERSION,
@@ -1921,34 +2250,23 @@ export class SessionRegistry {
               );
         this.assertCompleteClaimSet(initialClaims, owner, state.claims, [...state.sessions, record]);
         const nextClaims = sortResourceClaims([...state.claims, ...initialClaims]);
+        const nextEpoch = nextRuntimeEpoch(state);
         const runtimeRecords =
           pinnedProfile === undefined
             ? state.runtimeRecords
-            : {
-                requiredFeatures: Object.freeze([
-                  ...new Set<RegistryFeature>([...state.runtimeRecords.requiredFeatures, "pinned-profiles.v1"]),
-                ]),
-                records: Object.freeze({
-                  ...state.runtimeRecords.records,
-                  pinned_profiles: (() => {
-                    const pinnedProfiles = state.runtimeRecords.records.pinned_profiles ?? [];
-                    if (pinnedProfiles.length >= MAX_RUNTIME_RECORDS) {
-                      throw new SessionRegistryError(
-                        "REGISTRY_CORRUPT",
-                        "Registry pinned_profiles exceeds its bounded record count",
-                        { field: "pinned_profiles", maximum: MAX_RUNTIME_RECORDS },
-                      );
-                    }
-                    return Object.freeze([...pinnedProfiles, pinnedProfile as unknown as RuntimeRecord]);
-                  })(),
-                }),
-              };
+            : withSessionAdmission(withPinnedProfile(state.runtimeRecords, sessionId, pinnedProfile), {
+                kind: "session-admission",
+                schema_version: 1,
+                session_id: sessionId,
+                admission: "open",
+                runtime_epoch: nextEpoch,
+              });
         this.writeUnsafe(
           [...state.sessions, record],
           nextClaims,
           nextClaimSetGeneration(state, nextClaims),
           nextRegistryRevision(state),
-          nextRuntimeEpoch(state),
+          nextEpoch,
           runtimeRecords,
         );
         return cloneSessionRecord(record);
@@ -1961,37 +2279,46 @@ export class SessionRegistry {
     });
   }
 
-  /**
-   * Fail closed before any ownership mutation unless the explicit managed-execution
-   * authority affirms readiness. Generic sandbox evidence is never consulted here.
-   */
-  private assertManagedExecutionReady(pinnedProfile: PinnedWorktreeProfile): void {
-    const authority = this.managedExecutionReadiness;
-    const ready =
-      authority !== undefined &&
-      authority({
-        processTracking: "required",
-        profile: Object.freeze({
-          id: pinnedProfile.resolved.id,
-          version: pinnedProfile.resolved.version,
-          digest: pinnedProfile.digest,
-        }),
-      }).ready === true;
-    if (!ready) {
-      throw new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "Managed execution capability is unavailable.", {
-        process_tracking: "required",
-        managed_execution_authority: authority === undefined ? "absent" : "not_ready",
-      });
-    }
-  }
-
   private resolvePinnedProfile(
-    request: ProvisionSessionOptions["profile"],
+    request: WorktreeProfileSessionCreateOptions | null | undefined,
     baseRevision: string,
   ): PinnedWorktreeProfile | undefined {
-    if (request === undefined) return undefined;
-    const selection = request.selection.profile;
+    if (request == null) return undefined;
+    let selection = request.selection.profile;
     const builtinPrefix = "builtin:";
+    const repositoryPrefix = "repository:";
+    if (
+      !selection.startsWith(builtinPrefix) &&
+      !selection.startsWith(repositoryPrefix) &&
+      request.provenance?.catalog === undefined
+    ) {
+      if (selection.length === 0 || selection.includes(":")) {
+        throw new DomainError("RUNTIME_PROFILE_INVALID", "Worktree profile selection is not canonical.");
+      }
+      const builtinCandidate = getBuiltinWorktreeProfile(selection);
+      const catalogCandidate = loadWorktreeProfileCatalog(
+        this.repository,
+        baseRevision,
+        "nawabari.profiles.json",
+        this.git,
+      );
+      let repositoryCandidate: ReturnType<typeof resolveWorktreeProfile> | undefined;
+      if (catalogCandidate.ok) {
+        repositoryCandidate = resolveWorktreeProfile({ profile: selection }, catalogCandidate.value);
+      } else if (catalogCandidate.error.code !== "RUNTIME_PROFILE_MISSING") {
+        throw catalogCandidate.error;
+      }
+      if (builtinCandidate.ok && repositoryCandidate?.ok === true) {
+        throw new DomainError(
+          "RUNTIME_PROFILE_AMBIGUOUS",
+          "Unqualified worktree profile selection matches both repository and built-in profiles.",
+          { profile_id: selection },
+        );
+      }
+      if (builtinCandidate.ok) selection = `${builtinPrefix}${selection}`;
+      else if (repositoryCandidate?.ok === true) selection = `${repositoryPrefix}${selection}`;
+      else if (repositoryCandidate !== undefined && !repositoryCandidate.ok) throw repositoryCandidate.error;
+    }
     if (selection.startsWith(builtinPrefix)) {
       const builtinId = selection.slice(builtinPrefix.length);
       if (builtinId.length === 0 || builtinId.includes(":")) {
@@ -2023,18 +2350,17 @@ export class SessionRegistry {
       });
     }
 
-    const repositoryPrefix = "repository:";
     const repositorySelection = selection.startsWith(repositoryPrefix)
       ? selection.slice(repositoryPrefix.length)
       : selection;
     if (repositorySelection.length === 0 || repositorySelection.includes(":")) {
       throw new DomainError("RUNTIME_PROFILE_INVALID", "Repository profile selection is not canonical.");
     }
-
     const catalogPath = request.provenance?.catalog?.path ?? "nawabari.profiles.json";
-    if (catalogPath !== "nawabari.profiles.json")
+    if (catalogPath !== "nawabari.profiles.json") {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Profile catalog path is not authoritative");
-    const catalog = loadPinnedProfileCatalog(this.repository, baseRevision, this.git);
+    }
+    const catalog = loadWorktreeProfileCatalog(this.repository, baseRevision, catalogPath, this.git);
     if (!catalog.ok) throw catalog.error;
     const resolved = resolveWorktreeProfile({ profile: repositorySelection }, catalog.value);
     if (!resolved.ok) throw resolved.error;
@@ -2053,14 +2379,77 @@ export class SessionRegistry {
       );
     }
     const requestedBlob = request.provenance?.catalog?.blob_oid;
-    if (requestedBlob !== undefined && requestedBlob !== blobOid)
+    if (requestedBlob !== undefined && requestedBlob !== blobOid) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Profile catalog provenance does not match the pinned base");
+    }
     return pinWorktreeProfile(parameterized.value, {
       repository: { id: this.repository.repositoryId, revision: baseRevision },
       base: { revision: baseRevision },
       catalog: { kind: "repository", path: catalogPath, blob_oid: blobOid },
       selection: { profile: repositorySelection, parameters: request.parameters ?? {} },
     });
+  }
+
+  private assertManagedProfileReady(
+    pin: PinnedWorktreeProfile,
+    workingSet: EffectiveWorkingSet | undefined,
+    initialClaims: readonly ResourceClaimInput[] | undefined,
+  ): void {
+    const runtimeLayout = discoverSandboxRuntimeLayout();
+    const runtime = resolveWorktreeProfileRuntime(pin.resolved, runtimeLayout);
+    if (!runtime.ok) throw runtime.error;
+
+    const compiledWorkingSet = workingSet === undefined ? undefined : compileWorkingSetRuntimeProjection(workingSet);
+    if (compiledWorkingSet !== undefined && !compiledWorkingSet.ok) throw compiledWorkingSet.error;
+    const scope = resolveProfileRuntimeScope(
+      pin.resolved,
+      {
+        repositoryId: this.repository.repositoryId,
+        ...(compiledWorkingSet === undefined ? {} : { workingSet: compiledWorkingSet.value, externalArtifact: true }),
+        ...(initialClaims === undefined || initialClaims.length === 0
+          ? {}
+          : {
+              claims: initialClaims.map((claim) => ({
+                resource: claim.resource,
+                repositoryId: this.repository.repositoryId,
+                mode: claim.mode,
+              })),
+            }),
+      },
+      undefined,
+    );
+    if (!scope.ok) throw scope.error;
+    if (scope.value.status !== "ready") {
+      const diagnostic = scope.value.diagnostics[0];
+      throw new DomainError("RUNTIME_PROFILE_REQUIREMENT_MISSING", "Managed profile filesystem scope is unavailable.", {
+        profile_id: pin.resolved.id,
+        diagnostic: diagnostic === undefined ? "scope did not resolve" : { ...diagnostic },
+      });
+    }
+  }
+
+  /**
+   * Fail closed before any ownership mutation unless the explicit managed-execution
+   * authority affirms readiness. Generic sandbox evidence is never consulted here.
+   */
+  private assertManagedExecutionReady(pinnedProfile: PinnedWorktreeProfile): void {
+    const authority = this.managedExecutionReadiness;
+    const ready =
+      authority !== undefined &&
+      authority({
+        processTracking: "required",
+        profile: Object.freeze({
+          id: pinnedProfile.resolved.id,
+          version: pinnedProfile.resolved.version,
+          digest: pinnedProfile.digest,
+        }),
+      }).ready === true;
+    if (!ready) {
+      throw new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "Managed execution capability is unavailable.", {
+        process_tracking: "required",
+        managed_execution_authority: authority === undefined ? "absent" : "not_ready",
+      });
+    }
   }
 
   /**
@@ -2720,9 +3109,16 @@ export class SessionRegistry {
     // lock hostage while it backtracks.
     const messagePattern = options.messagePattern ?? options.message_pattern ?? null;
     assertFinalCommitMessage(options.message, messagePattern);
+    const prepared = this.prepareSessionGitMutation(
+      "pre-commit",
+      operationSessionId(options.sessionId, options.session_id),
+      options.resources ?? options.paths ?? [],
+      options.allClaimed === true || options.all_claimed === true,
+    );
 
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
+      this.assertSessionGitMutationFresh(prepared.fence, sessionId);
       const allClaimed = options.allClaimed === true || options.all_claimed === true;
       const explicitResources = options.resources ?? options.paths;
       if (allClaimed && explicitResources !== undefined && explicitResources.length > 0) {
@@ -2735,7 +3131,9 @@ export class SessionRegistry {
         ? this.resolveAllClaimedResourcesUnsafe("commit", sessionId)
         : operationResources(explicitResources);
       const authorization = this.requireMutationAuthorization("commit", requestedResources, sessionId);
-      const initial = this.verifyGovernedExecutionContext(sessionId);
+      this.assertSessionGitAuthorizationFresh(prepared.fence, authorization);
+      const initial =
+        this.assertSessionGitMutationFresh(prepared.fence, sessionId) ?? this.verifyGovernedExecutionContext(sessionId);
 
       const before = observeGitMutationPaths(this.git, initial.worktreePath);
       assertNoUnexpectedMutationPaths(
@@ -2784,7 +3182,7 @@ export class SessionRegistry {
       try {
         runMutationGit(
           this.git,
-          commitGitArguments(this.git, initial.worktreePath, this.gitIdentity, options.message),
+          commitGitArguments(this.git, initial.worktreePath, this.gitIdentity, options.message, prepared.config),
           initial.worktreePath,
           "commit",
           "COMMIT_FAILED",
@@ -2926,8 +3324,15 @@ export class SessionRegistry {
 
   /** Push the currently owned branch to an explicit remote/branch target. */
   push(options: PushOptions): PushResult {
+    const prepared = this.prepareSessionGitMutation(
+      "pre-push",
+      operationSessionId(options.sessionId, options.session_id),
+      options.resources ?? [],
+      options.allClaimed === true || options.all_claimed === true,
+    );
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
+      this.assertSessionGitMutationFresh(prepared.fence, sessionId);
       const allClaimed = options.allClaimed === true || options.all_claimed === true;
       if (allClaimed && options.resources !== undefined && options.resources.length > 0) {
         throw new SessionRegistryError("INVALID_RESOURCE", "--all-claimed cannot be combined with explicit resources", {
@@ -2938,8 +3343,10 @@ export class SessionRegistry {
       const requestedResources = allClaimed
         ? this.resolveAllClaimedResourcesUnsafe("push", sessionId)
         : operationResources(options.resources);
-      this.requireMutationAuthorization("push", requestedResources, sessionId);
-      const initial = this.verifyGovernedExecutionContext(sessionId);
+      const authorization = this.requireMutationAuthorization("push", requestedResources, sessionId);
+      this.assertSessionGitAuthorizationFresh(prepared.fence, authorization);
+      const initial =
+        this.assertSessionGitMutationFresh(prepared.fence, sessionId) ?? this.verifyGovernedExecutionContext(sessionId);
       const remote = explicitRemote(options.remote);
       const branch = explicitRemoteBranch(options.branch, options.remoteBranch ?? options.remote_branch);
       const force = options.force === true;
@@ -3005,6 +3412,7 @@ export class SessionRegistry {
       const targetRef = `refs/heads/${branch}`;
       const leaseValue = inspection.observedRemoteSha ?? "";
       const pushArguments = [
+        ...(prepared.config === undefined ? [] : ["-c", "core.hooksPath=/dev/null"]),
         "push",
         // Exact-generation CAS is required for every push mutation. The
         // force authorization check above remains independent: force is only
@@ -3065,6 +3473,134 @@ export class SessionRegistry {
 
   pushSession(options: PushOptions): PushResult {
     return this.push(options);
+  }
+
+  /** Resolve the pinned #618 material and run the approved event before taking the mutation lock. */
+  private prepareSessionGitMutation(
+    event: GovernedHookEvent,
+    requestedSessionId: string | null | undefined,
+    resources: readonly string[],
+    allClaimed: boolean,
+  ): PreparedSessionGitMutation {
+    const sessionId = requestedSessionId ?? this.resolveCurrentSession().sessionId;
+    const runtime = this.getSessionManagedRuntime(sessionId);
+    if (runtime.profile === null) return { config: undefined, fence: undefined };
+    const profile = runtime.profile.resolved;
+    const hooks = resolveSessionHookSet(profile, runtime.hook_material);
+    if (!hooks.ok) throw hooks.error;
+    const session = this.get(sessionId);
+    if (session === undefined)
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`);
+    const config = materializeSessionGitConfig(profile, {
+      repository_local_name: readLocalGitIdentityValue(this.git, "user.name", session.worktreePath),
+      repository_local_email: readLocalGitIdentityValue(this.git, "user.email", session.worktreePath),
+      host_global_name: this.gitIdentity?.host_global_name ?? null,
+      host_global_email: this.gitIdentity?.host_global_email ?? null,
+    });
+    if (!config.ok) throw config.error;
+    let fence: GovernedGitFreshnessFence | undefined;
+    if (hooks.value.mode === "governed") {
+      const mutation = event === "pre-commit" ? "commit" : "push";
+      if (allClaimed && resources.length > 0) {
+        throw new SessionRegistryError("INVALID_RESOURCE", "--all-claimed cannot be combined with explicit resources");
+      }
+      const selectedResources = this.withLock(() => {
+        const selected = allClaimed ? this.resolveAllClaimedResourcesUnsafe(mutation, sessionId) : resources;
+        const authorization = this.requireMutationAuthorization(mutation, selected, sessionId);
+        const execution = this.verifyGovernedExecutionContext(sessionId);
+        const state = this.readStateUnsafe();
+        const pinnedRecord = (state.runtimeRecords.records.pinned_profiles ?? []).find(
+          (candidate) => candidate.session_id === sessionId,
+        );
+        if (pinnedRecord === undefined || parsePinnedProfileRecord(pinnedRecord).digest !== runtime.profile?.digest) {
+          throw new SessionRegistryError("STALE_REGISTRY", "Governed hook profile changed before approval", {
+            sessionId,
+          });
+        }
+        fence = Object.freeze({
+          sessionId: execution.session.sessionId,
+          repositoryId: execution.repositoryId,
+          worktreeId: execution.worktreeId,
+          worktreePath: execution.worktreePath,
+          branchId: execution.branchId,
+          headId: execution.headId,
+          registryRevision: state.registryRevision,
+          claimSetGeneration: state.claimSetGeneration,
+          runtimeEpoch: state.runtimeEpoch,
+          resources: authorization.resources,
+        });
+        return authorization.resources.map((resource) => resource.resource);
+      });
+      const material = runtime.hook_material;
+      if (material === null)
+        throw new SessionRegistryError("OPERATION_REJECTED", "Approved hook material is unavailable");
+      const executed = runGovernedHook(event, {
+        hook_set: hooks.value,
+        session_id: sessionId,
+        cwd: session.worktreePath,
+        argv: selectedResources,
+        runner: (command, argv, options) => {
+          if (command !== material.target) throw new Error("Governed hook target changed");
+          return spawnSync(material.source, [...argv], { ...options, encoding: "utf8" });
+        },
+      });
+      if (!executed.ok) throw executed.error;
+    }
+    return { config: config.value, fence };
+  }
+
+  private assertSessionGitMutationFresh(
+    fence: GovernedGitFreshnessFence | undefined,
+    sessionId: string | null,
+  ): VerifiedExecutionContext | undefined {
+    if (fence === undefined) return undefined;
+    const execution = this.verifyGovernedExecutionContext(sessionId);
+    const state = this.readStateUnsafe();
+    if (
+      state.registryRevision !== fence.registryRevision ||
+      state.claimSetGeneration !== fence.claimSetGeneration ||
+      state.runtimeEpoch !== fence.runtimeEpoch
+    ) {
+      throw new SessionRegistryError(
+        "STALE_REGISTRY",
+        "Governed hook approval is stale after registry authority changed",
+        {
+          sessionId: fence.sessionId,
+        },
+      );
+    }
+    if (
+      execution.session.sessionId !== fence.sessionId ||
+      execution.repositoryId !== fence.repositoryId ||
+      execution.worktreeId !== fence.worktreeId ||
+      execution.worktreePath !== fence.worktreePath ||
+      execution.branchId !== fence.branchId ||
+      execution.headId !== fence.headId
+    ) {
+      throw new SessionRegistryError(
+        "GIT_STATE_AMBIGUOUS",
+        "Governed hook approval is stale after Git authority changed",
+        {
+          sessionId: fence.sessionId,
+        },
+      );
+    }
+    return execution;
+  }
+
+  private assertSessionGitAuthorizationFresh(
+    fence: GovernedGitFreshnessFence | undefined,
+    authorization: OperationAuthorizationDecision,
+  ): void {
+    if (fence !== undefined && JSON.stringify(authorization.resources) !== JSON.stringify(fence.resources)) {
+      throw new SessionRegistryError(
+        "STALE_REGISTRY",
+        "Governed hook approval is stale after resource authority changed",
+        {
+          sessionId: fence.sessionId,
+        },
+      );
+    }
   }
 
   /**
@@ -3738,13 +4274,17 @@ export class SessionRegistry {
   }
 
   /** Close one session only after its ownership and recoverability are proven safe. */
-  close(sessionIdOrOptions?: string | null | CloseSessionOptions): CloseSessionResult {
+  close(
+    sessionIdOrOptions?: string | null | CloseSessionOptions,
+    finalization?: SessionDrainFinalization,
+  ): CloseSessionResult {
     return this.withLock(() => {
       const sessionId = isCloseSessionOptions(sessionIdOrOptions)
         ? (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id)
         : sessionIdOrOptions;
       const selectedSessionId = sessionId ?? this.resolveCurrentSession().sessionId;
       assertSessionId(selectedSessionId);
+      this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, selectedSessionId, "close");
       const evidence = closeIntegrationEvidence(sessionIdOrOptions ?? null);
       return this.coordinateCleanupUnsafe("close", selectedSessionId, evidence);
     });
@@ -3755,7 +4295,10 @@ export class SessionRegistry {
   }
 
   /** Explicitly discard exactly one selected session; never resolves the current owner implicitly. */
-  discard(sessionIdOrOptions: string | DiscardSessionOptions): DiscardSessionResult {
+  discard(
+    sessionIdOrOptions: string | DiscardSessionOptions,
+    finalization?: SessionDrainFinalization,
+  ): DiscardSessionResult {
     return this.withLock(() => {
       const requestedSessionId =
         typeof sessionIdOrOptions === "string"
@@ -3768,6 +4311,7 @@ export class SessionRegistry {
         );
       }
       assertSessionId(requestedSessionId);
+      this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, requestedSessionId, "discard");
       return this.coordinateCleanupUnsafe("discard", requestedSessionId);
     });
   }
@@ -3961,7 +4505,7 @@ export class SessionRegistry {
             records,
             claims,
             claimSetGeneration,
-            nextRegistryRevision(state),
+            nextRegistryRevision(this.readStateUnsafe()),
             state.runtimeEpoch,
             state.runtimeRecords,
           );
@@ -4363,6 +4907,144 @@ export class SessionRegistry {
       return requested;
     }
     return this.resolveOwnerSession(records).sessionId;
+  }
+
+  private assertDrainFinalizationUnsafe(
+    state: RegistryState,
+    finalization: SessionDrainFinalization | undefined,
+    sessionId: string,
+    operation: SessionDrainFinalization["operation"],
+  ): SessionAdmissionRecord | undefined {
+    const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    if (finalization === undefined) {
+      if (admissionValue !== undefined) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Managed session mutation requires a drain finalization", {
+          sessionId,
+          operation,
+        });
+      }
+      return undefined;
+    }
+    if (
+      finalization.contract_id !== "nawabari.session-execution-control.v1" ||
+      finalization.schema_version !== 1 ||
+      finalization.status !== "ready" ||
+      finalization.next_action !== "finalize-lifecycle" ||
+      finalization.admission !== "closed" ||
+      finalization.operation !== operation ||
+      finalization.session_id !== sessionId ||
+      typeof finalization.admission_epoch !== "number" ||
+      !Number.isSafeInteger(finalization.admission_epoch) ||
+      finalization.admission_epoch < 1
+    ) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Runtime drain finalization does not match the mutation", {
+        sessionId,
+        operation,
+      });
+    }
+    if (admissionValue === undefined) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Session launch admission is untracked", { sessionId });
+    }
+    const admission = parseSessionAdmissionRecord(admissionValue);
+    if (admission.admission !== "closed" || admission.runtime_epoch !== finalization.admission_epoch) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Runtime drain admission fence is stale", {
+        sessionId,
+        admissionEpoch: finalization.admission_epoch,
+        currentAdmissionEpoch: admission.runtime_epoch,
+        admission: admission.admission,
+      });
+    }
+    const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+    if (session === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    if (operation === "release-claims" && session.state !== "active") {
+      throw new SessionRegistryError(
+        "SESSION_NOT_ACTIVE",
+        "Session cannot reopen launch admission after claim release",
+        {
+          sessionId,
+          state: session.state,
+        },
+      );
+    }
+    this.assertOwnedExecutionsEmptyUnsafe(state, sessionId);
+    return admission;
+  }
+
+  private assertOwnedExecutionsEmptyUnsafe(state: RegistryState, sessionId: string): void {
+    const executionValues = state.runtimeRecords.records.executions ?? [];
+    const owned = executionValues.flatMap((value) => {
+      const parsed = parseSessionExecutionRecord(value);
+      if (!parsed.ok) throw parsed.error;
+      return parsed.value.session_id === sessionId ? [parsed.value] : [];
+    });
+    if (owned.length === 0) {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "No owned execution records are available to prove kernel quiescence",
+        { sessionId, observation: "unknown" },
+      );
+    }
+    let currentBootId: string;
+    try {
+      currentBootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      if (currentBootId.length === 0 || currentBootId.length > 256 || currentBootId.includes("\0")) {
+        throw new Error("invalid boot identity");
+      }
+    } catch (error: unknown) {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "Current kernel boot identity is unavailable during drain finalization",
+        { sessionId, reason: error instanceof Error ? error.message.slice(0, 200) : "unknown" },
+      );
+    }
+    for (const record of owned) {
+      const name = deriveCgroupScopeName(record.cgroup_identity);
+      const root = record.cgroup_root;
+      const lease: OwnedExecutionRecord = {
+        schema_version: 1,
+        session_id: record.session_id,
+        execution_id: record.execution_id,
+        boot_id: record.boot_id,
+        state: record.state === "attached" || record.state === "running" ? "active" : "terminal",
+        cgroups:
+          root === null || root === undefined
+            ? null
+            : {
+                contract_id: CGROUPS_V2_CONTRACT_ID,
+                root,
+                parent: `${root}/nawabari`,
+                path: `${root}/nawabari/${name}`,
+                name,
+                boot_id: record.boot_id,
+                identity: record.cgroup_identity,
+              },
+      };
+      const observed = observeOwnedExecution(lease, {
+        current_boot_id: currentBootId,
+        ...(this.cgroupFilesystem === undefined ? {} : { filesystem: this.cgroupFilesystem }),
+      });
+      if (
+        !observed.ok ||
+        observed.value.state !== "empty" ||
+        observed.value.cgroups === null ||
+        observed.value.cgroups.population.state !== "empty"
+      ) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Owned execution scope is not proven empty at finalization",
+          {
+            sessionId,
+            executionId: record.execution_id,
+            observation: observed.ok ? observed.value.state : "unknown",
+            population: observed.ok ? (observed.value.cgroups?.population.state ?? "unknown") : "unknown",
+          },
+        );
+      }
+    }
   }
 
   private claimOwner(records: readonly SessionRecord[], sessionId: string, requestedRepositoryId?: string): ClaimOwner {
@@ -4830,7 +5512,7 @@ export class SessionRegistry {
         closingRecords,
         nextClaims,
         claimSetGeneration,
-        nextRegistryRevision(state),
+        nextRegistryRevision(this.readStateUnsafe()),
         state.runtimeEpoch,
         state.runtimeRecords,
       );
@@ -4983,7 +5665,7 @@ export class SessionRegistry {
         closingRecords,
         nextClaims,
         claimSetGeneration,
-        nextRegistryRevision(state),
+        nextRegistryRevision(this.readStateUnsafe()),
         state.runtimeEpoch,
         state.runtimeRecords,
       );
@@ -5816,7 +6498,8 @@ export class SessionRegistry {
     if (!Number.isSafeInteger(runtimeEpoch) || runtimeEpoch < 0) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Runtime epoch must be a non-negative safe integer");
     }
-    const optionalRecords = toPersistedRuntimeRecords(runtimeRecords);
+    const currentRuntimeRecords = rebaseOpenSessionAdmissions(runtimeRecords, runtimeEpoch);
+    const optionalRecords = toPersistedRuntimeRecords(currentRuntimeRecords);
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
       repository_id: this.repository.repositoryId,
@@ -5826,7 +6509,7 @@ export class SessionRegistry {
       claim_set_generation: claimSetGeneration,
       registry_revision: registryRevision,
       runtime_epoch: runtimeEpoch,
-      required_features: [...runtimeRecords.requiredFeatures],
+      required_features: [...currentRuntimeRecords.requiredFeatures],
       ...optionalRecords,
     };
 
@@ -6948,7 +7631,16 @@ function commitGitArguments(
   cwd: string,
   gitIdentity: SandboxGitIdentity | undefined,
   message: string,
+  sessionConfig?: SessionGitConfig,
 ): readonly string[] {
+  if (sessionConfig !== undefined) {
+    const identityArguments: string[] = [];
+    for (const [key, value] of Object.entries(sessionConfig.config)) {
+      if (key === "core.hooksPath") continue;
+      identityArguments.push("-c", `${key}=${value}`);
+    }
+    return ["-c", "core.hooksPath=/dev/null", ...identityArguments, "commit", "-m", message];
+  }
   const identityArguments: string[] = [];
   if (gitIdentity !== undefined) {
     const localName = readLocalGitIdentityValue(git, "user.name", cwd);
@@ -8436,6 +9128,43 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
 
   const records = value.sessions.map((candidate, index) => parseSessionRecord(candidate, index, expectedRepositoryId));
   validateRecords(records, expectedRepositoryId);
+  const sessionIds = new Set(records.map((record) => record.sessionId));
+  for (const candidate of runtimeRecords.records.pinned_profiles ?? []) {
+    const owner = candidate.session_id;
+    if (owner !== undefined && (typeof owner !== "string" || !sessionIds.has(owner))) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "A pinned profile has an invalid session owner", {
+        sessionId: typeof owner === "string" ? owner : "<invalid>",
+      });
+    }
+  }
+  for (const candidate of runtimeRecords.records.runtime_sessions ?? []) {
+    const admission = parseSessionAdmissionRecord(candidate);
+    if (
+      !sessionIds.has(admission.session_id) ||
+      admission.runtime_epoch > runtimeEpoch ||
+      (admission.admission === "open" && admission.runtime_epoch !== runtimeEpoch)
+    ) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "A runtime admission record has an invalid owner or epoch", {
+        sessionId: admission.session_id,
+        runtimeEpoch,
+        admissionEpoch: admission.runtime_epoch,
+      });
+    }
+  }
+  const executionIds = new Set<string>();
+  for (const [index, candidate] of (runtimeRecords.records.executions ?? []).entries()) {
+    const execution = parseSessionExecutionRecord(candidate);
+    if (
+      !execution.ok ||
+      !sessionIds.has(execution.value.session_id) ||
+      executionIds.has(execution.value.execution_id)
+    ) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid execution owner or duplicate at index ${index}`, {
+        index,
+      });
+    }
+    executionIds.add(execution.value.execution_id);
+  }
   const hasClaimsSchema = Object.hasOwn(value, "claims_schema_version");
   const hasClaims = Object.hasOwn(value, "claims");
   if (hasClaimsSchema !== hasClaims) {
@@ -8538,6 +9267,87 @@ function nextRuntimeEpoch(state: RegistryState): number {
     throw new SessionRegistryError("OPERATION_REJECTED", "Runtime epoch exhausted");
   }
   return state.runtimeEpoch + 1;
+}
+
+function withExecutions(
+  runtimeRecords: ParsedRuntimeRecords,
+  executions: readonly RuntimeRecord[],
+): ParsedRuntimeRecords {
+  return Object.freeze({
+    requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "executions.v1"),
+    records: Object.freeze({ ...runtimeRecords.records, executions: Object.freeze([...executions]) }),
+  });
+}
+
+function withSessionAdmission(
+  runtimeRecords: ParsedRuntimeRecords,
+  admission: SessionAdmissionRecord,
+): ParsedRuntimeRecords {
+  const existing = runtimeRecords.records.runtime_sessions ?? [];
+  const found = existing.some(
+    (candidate) => parseSessionAdmissionRecord(candidate).session_id === admission.session_id,
+  );
+  const runtimeSessions = found
+    ? existing.map((candidate) =>
+        parseSessionAdmissionRecord(candidate).session_id === admission.session_id ? admission : candidate,
+      )
+    : [...existing, admission];
+  return Object.freeze({
+    requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "runtime-sessions.v1"),
+    records: Object.freeze({ ...runtimeRecords.records, runtime_sessions: Object.freeze(runtimeSessions) }),
+  });
+}
+
+function withPinnedProfile(
+  runtimeRecords: ParsedRuntimeRecords,
+  sessionId: string,
+  profile: PinnedWorktreeProfile,
+): ParsedRuntimeRecords {
+  const existing = runtimeRecords.records.pinned_profiles ?? [];
+  if (existing.length >= MAX_RUNTIME_RECORDS) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry pinned_profiles exceeds its bounded record count", {
+      field: "pinned_profiles",
+      maximum: MAX_RUNTIME_RECORDS,
+    });
+  }
+  if (existing.some((candidate) => candidate.session_id === sessionId)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry already contains a profile pin for this session", {
+      sessionId,
+    });
+  }
+  const pinned = Object.freeze({ ...profile, session_id: sessionId }) as unknown as RuntimeRecord;
+  const profiles = Object.freeze([...existing, pinned]);
+  return Object.freeze({
+    requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "pinned-profiles.v1"),
+    records: Object.freeze({ ...runtimeRecords.records, pinned_profiles: profiles }),
+  });
+}
+
+function requiredRuntimeFeatures(
+  current: readonly RegistryFeature[],
+  added: RegistryFeature,
+): readonly RegistryFeature[] {
+  const features = new Set([...current, added]);
+  return Object.freeze(REGISTRY_FEATURES.filter((feature) => features.has(feature)));
+}
+
+function rebaseOpenSessionAdmissions(runtimeRecords: ParsedRuntimeRecords, runtimeEpoch: number): ParsedRuntimeRecords {
+  const admissions = runtimeRecords.records.runtime_sessions;
+  if (admissions === undefined) return runtimeRecords;
+  return Object.freeze({
+    ...runtimeRecords,
+    records: Object.freeze({
+      ...runtimeRecords.records,
+      runtime_sessions: Object.freeze(
+        admissions.map((candidate) => {
+          const admission = parseSessionAdmissionRecord(candidate);
+          return admission.admission === "open" && admission.runtime_epoch !== runtimeEpoch
+            ? Object.freeze({ ...admission, runtime_epoch: runtimeEpoch })
+            : admission;
+        }),
+      ),
+    }),
+  });
 }
 
 function migrationReadError(error: unknown): SessionRegistryError {

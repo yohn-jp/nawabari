@@ -10,6 +10,7 @@ import {
   resolveBuiltinWorktreeProfile,
   serializeBuiltinWorktreeProfiles,
 } from "./worktree-profile-builtins.js";
+import { resolveProfileRuntimeScope } from "./worktree-profile-scope.js";
 
 test("built-ins are a validated catalog with deterministic identities", () => {
   assert.deepEqual(BUILTIN_WORKTREE_PROFILE_IDS, ["minimal", "standard-shell"]);
@@ -62,6 +63,29 @@ test("built-ins resolve through the canonical catalog and reject unknown paramet
   const unknownParameter = resolveBuiltinWorktreeProfile({ profile: "minimal" }, { "unknown.field": true });
   assert.equal(unknownParameter.ok, false);
   if (!unknownParameter.ok) assert.equal(unknownParameter.error.code, "RUNTIME_PROFILE_INVALID");
+});
+
+test("minimal wildcard ceilings compile to a finite runtime scope without granting the ceiling", () => {
+  const minimal = resolveBuiltinWorktreeProfile({ profile: "minimal" });
+  assert.equal(minimal.ok, true);
+  if (!minimal.ok) return;
+  assert.deepEqual(minimal.value.filesystem.readOnly, ["**"]);
+
+  const scope = resolveProfileRuntimeScope(minimal.value, { repositoryId: "repo" }, undefined);
+  assert.equal(scope.ok, true);
+  if (!scope.ok) return;
+  assert.equal(scope.value.status, "ready");
+  assert.deepEqual(scope.value.scope.readOnly, []);
+  assert.deepEqual(scope.value.scope.write, []);
+  assert.deepEqual(scope.value.scope.deny, [".git/**"]);
+
+  const selectorsAsEvidence = resolveProfileRuntimeScope(
+    minimal.value,
+    { repositoryId: "repo" },
+    { paths: ["**"], requests: [{ path: "**", operation: "READONLY" }] },
+  );
+  assert.equal(selectorsAsEvidence.ok, false);
+  if (!selectorsAsEvidence.ok) assert.equal(selectorsAsEvidence.error.code, "RUNTIME_PROJECTION_INVALID");
 });
 
 test("built-in serialization has one stable catalog document", () => {

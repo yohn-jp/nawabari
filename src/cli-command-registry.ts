@@ -152,6 +152,7 @@ const REGISTRY_DATA = [
     notes: [
       "All create options are optional. Use status --json to discover managed_worktree_root.",
       "--worktree and --worktree-root cannot be combined.",
+      "--profile-parameter requires --profile; ambiguous unqualified profile ids are rejected.",
       "Initial claims are provisioned atomically with the session; each --resource must be immediately followed by its own --mode, and zero pairs remains backward compatible.",
       "Resource-claim enforcement is disabled by default; pass --enforce-claims to require claims for commit/push authorization on this session. Worktree and branch ownership, and claim conflicts against other sessions, remain enforced regardless.",
       "Providing one bounded working-set artifact requires the other; both are validated before worktree ownership is established.",
@@ -333,6 +334,25 @@ const REGISTRY_DATA = [
     notes: [
       `Default output excludes closed records; --all and --history include closed history. Both views are bounded by --limit (default ${DEFAULT_SESSION_LIST_LIMIT}, maximum ${MAX_SESSION_LIST_LIMIT}) and --offset (default 0).`,
     ],
+  },
+  {
+    name: "session enter",
+    summary: "Enter an active session through the protected runtime",
+    usage: `${CLI_NAME} session enter --session <id> [--runtime-policy <strict|compatibility>]`,
+    options: [
+      option("--session", "Select the active owned session", { value: "<id>" }),
+      option("--runtime-policy", "Select strict or explicit compatibility runtime visibility", {
+        value: "<strict|compatibility>",
+        values: ["strict", "compatibility"],
+        default: "strict",
+      }),
+    ],
+  },
+  {
+    name: "session processes",
+    summary: "List durable executions owned by a session",
+    usage: `${CLI_NAME} session processes --session <id>`,
+    options: [option("--session", "Select the session", { value: "<id>" })],
   },
   {
     name: "session claim",

@@ -8,6 +8,62 @@ import { DomainError, failure, success, type DomainResult, type JsonObject } fro
 export const CGROUPS_V2_CONTRACT_ID = "nawabari.cgroups-v2.v1" as const;
 export const CGROUPS_V2_ROOT = "/sys/fs/cgroup" as const;
 
+export function isCanonicalManagedCgroupRoot(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= 4_096 &&
+    !value.includes("\0") &&
+    path.normalize(value) === value &&
+    scopeWithin(CGROUPS_V2_ROOT, value)
+  );
+}
+
+/** Resolve the controller-owning parent of this process's delegated subgroup. */
+export function resolveManagedCgroupRoot(
+  options: {
+    readonly root?: string;
+    readonly membership?: string;
+    readonly filesystem?: CgroupFileSystem;
+  } = {},
+): DomainResult<string> {
+  if (process.platform !== "linux") {
+    return capabilityError("The unified cgroups v2 hierarchy requires Linux.", {});
+  }
+  let candidate = options.root;
+  if (candidate === undefined) {
+    let raw: string;
+    try {
+      raw = options.membership ?? fs.readFileSync("/proc/self/cgroup", "utf8");
+    } catch (error: unknown) {
+      return capabilityError("The current unified cgroup membership is unavailable.", {
+        reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+      });
+    }
+    const lines = raw.trim().split(/\r?\n/u);
+    const unified = lines.length === 1 ? /^0::(\/[\x20-\x7e]*)$/u.exec(lines[0] ?? "")?.[1] : undefined;
+    if (
+      unified === undefined ||
+      unified.length > 4_096 ||
+      unified === "/" ||
+      unified.split("/").some((segment) => segment === "." || segment === "..")
+    ) {
+      return capabilityError("The current unified cgroup membership is invalid.", {});
+    }
+    candidate = path.dirname(path.join(CGROUPS_V2_ROOT, unified));
+  }
+  if (!isCanonicalManagedCgroupRoot(candidate)) {
+    return capabilityError("The delegated cgroup root is unavailable.", {});
+  }
+  const filesystem = options.filesystem ?? nativeFileSystem;
+  const checked = validateRoot(candidate, filesystem);
+  if (!checked.ok) return checked;
+  if (checked.value !== candidate || !scopeWithin(CGROUPS_V2_ROOT, checked.value)) {
+    return capabilityError("The delegated cgroup root is not canonical.", { root: candidate });
+  }
+  const controllers = requiredControllers(checked.value, filesystem);
+  return controllers.ok ? success(checked.value) : controllers;
+}
+
 const CONTROLLERS = ["cpu", "memory", "pids"] as const;
 const MAX_MEMORY_LIMIT = 1_024 * 1_024 * 1_024 * 1_024;
 const MAX_PIDS_LIMIT = 1_000_000;
@@ -36,7 +92,25 @@ export type CgroupScope = {
   readonly path: string;
   readonly name: string;
   readonly identity: CgroupExecutionIdentity;
+  /** Boot identity captured by a caller when the scope is leased. */
+  readonly boot_id?: string;
   readonly limits: CgroupLimitProfile;
+};
+
+export type CgroupPopulationState = "empty" | "populated" | "unknown";
+
+/**
+ * Occupancy evidence is deliberately separate from cgroup.procs.  The
+ * cgroup.events `populated` bit includes descendant cgroups, while the
+ * process list is only a bounded enumeration of the current scope.  A
+ * missing or malformed kernel file is unknown and is never treated as an
+ * empty scope.
+ */
+export type CgroupPopulation = {
+  readonly state: CgroupPopulationState;
+  readonly populated: boolean | null;
+  readonly processes: readonly number[] | null;
+  readonly events: Readonly<{ readonly populated: 0 | 1 | null }>;
 };
 
 export type CgroupAccounting = {
@@ -63,6 +137,8 @@ export type CgroupScopeOptions = {
   readonly limits?: CgroupLimitProfile;
   /** Injectable filesystem boundary for hermetic tests and controlled runtimes. */
   readonly filesystem?: CgroupFileSystem;
+  /** Boot identity associated with the caller's execution lease. */
+  readonly boot_id?: string;
 };
 
 export type CgroupFileSystem = {
@@ -85,8 +161,8 @@ const nativeFileSystem: CgroupFileSystem = {
 
 const scopeFilesystems = new WeakMap<CgroupScope, CgroupFileSystem>();
 
-function filesystemFor(scope: CgroupScope): CgroupFileSystem {
-  return scopeFilesystems.get(scope) ?? nativeFileSystem;
+function filesystemFor(scope: CgroupScope, override?: CgroupFileSystem): CgroupFileSystem {
+  return override ?? scopeFilesystems.get(scope) ?? nativeFileSystem;
 }
 
 function cgroupError(
@@ -220,6 +296,12 @@ function parseCounter(text: string | null, key?: string): number | null {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+function parsePopulation(text: string | null): 0 | 1 | null {
+  if (text === null) return null;
+  const value = parseCounter(text, "populated");
+  return value === 0 || value === 1 ? value : null;
+}
+
 function requiredControllers(root: string, filesystem: CgroupFileSystem): DomainResult<null> {
   const available = readBounded(path.join(root, "cgroup.controllers"), filesystem);
   if (available === null) return capabilityError("Cannot read cgroups v2 controllers.", { root });
@@ -274,6 +356,12 @@ function verifiesScopeIdentity(scope: CgroupScope): boolean {
 }
 
 function reconcileExistingScope(scopePath: string, name: string, filesystem: CgroupFileSystem): DomainResult<null> {
+  const populated = parsePopulation(readBounded(path.join(scopePath, "cgroup.events"), filesystem));
+  if (populated === null) {
+    return cgroupError("SANDBOX_CGROUP_SETUP_FAILED", "The existing cgroups v2 scope population could not be proven.", {
+      scope: name,
+    });
+  }
   const processesText = readBounded(path.join(scopePath, "cgroup.procs"), filesystem);
   if (processesText === null) {
     return cgroupError("SANDBOX_CGROUP_SETUP_FAILED", "The existing cgroups v2 scope could not be inspected.", {
@@ -281,7 +369,12 @@ function reconcileExistingScope(scopePath: string, name: string, filesystem: Cgr
     });
   }
   const processes = parseProcessIds(processesText);
-  if (processes.length > 0) {
+  if (processes === null) {
+    return cgroupError("SANDBOX_CGROUP_SETUP_FAILED", "The existing cgroups v2 scope could not be enumerated.", {
+      scope: name,
+    });
+  }
+  if (populated === 1 || processes.length > 0) {
     return cgroupError("SANDBOX_CGROUP_SCOPE_CONFLICT", "The deterministic cgroups v2 scope is still occupied.", {
       scope: name,
       process_count: processes.length,
@@ -307,10 +400,10 @@ function reconcileExistingScope(scopePath: string, name: string, filesystem: Cgr
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       const replacementProcesses = readBounded(path.join(scopePath, "cgroup.procs"), filesystem);
       const replacement = parseProcessIds(replacementProcesses);
-      if (replacement.length > 0) {
+      if (replacement === null || replacement.length > 0) {
         return cgroupError("SANDBOX_CGROUP_SCOPE_CONFLICT", "The deterministic cgroups v2 scope is still occupied.", {
           scope: name,
-          process_count: replacement.length,
+          process_count: replacement === null ? null : replacement.length,
         });
       }
     }
@@ -388,6 +481,7 @@ export function createCgroupScope(
     path: scopePath,
     name,
     identity,
+    ...(options.boot_id === undefined ? {} : { boot_id: options.boot_id }),
     limits: limits.value,
   } satisfies CgroupScope;
   scopeFilesystems.set(scope, filesystem);
@@ -415,12 +509,36 @@ function applyCgroupLimits(
   }
 }
 
-function parseProcessIds(text: string | null): number[] {
-  if (text === null) return [];
-  return text
-    .split(/\r?\n/u)
-    .map((entry) => Number(entry.trim()))
-    .filter((pid) => Number.isSafeInteger(pid) && pid > 0);
+function parseProcessIds(text: string | null): number[] | null {
+  if (text === null) return null;
+  const lines = text.split(/\r?\n/u).filter((entry) => entry.trim().length > 0);
+  const processes = lines.map((entry) => Number(entry.trim()));
+  if (processes.some((pid) => !Number.isSafeInteger(pid) || pid < 1)) return null;
+  return processes;
+}
+
+/**
+ * Read occupancy from both kernel evidence files.  `cgroup.events` observes
+ * the complete subtree; `cgroup.procs` is retained as an independently
+ * bounded enumeration.  Any disagreement or read/parse failure fails closed.
+ */
+export function readCgroupPopulation(scope: CgroupScope, filesystemOverride?: CgroupFileSystem): CgroupPopulation {
+  const filesystem = filesystemFor(scope, filesystemOverride);
+  const eventsText = readBounded(path.join(scope.path, "cgroup.events"), filesystem);
+  const populated = parsePopulation(eventsText);
+  const processes = parseProcessIds(readBounded(path.join(scope.path, "cgroup.procs"), filesystem));
+  const state: CgroupPopulationState =
+    populated === null || processes === null
+      ? "unknown"
+      : populated === 1 || processes.length > 0
+        ? "populated"
+        : "empty";
+  return {
+    state,
+    populated: populated === null ? null : populated === 1,
+    processes,
+    events: { populated },
+  };
 }
 
 /** Attach only a positive process id to the exact scope created for this identity. */
@@ -445,8 +563,8 @@ export function attachProcessToCgroup(scope: CgroupScope, pid: number): DomainRe
 }
 
 /** Read bounded counters only; malformed/unavailable kernel files become null evidence. */
-export function readCgroupAccounting(scope: CgroupScope): CgroupAccounting {
-  const filesystem = filesystemFor(scope);
+export function readCgroupAccounting(scope: CgroupScope, filesystemOverride?: CgroupFileSystem): CgroupAccounting {
+  const filesystem = filesystemFor(scope, filesystemOverride);
   const cpu = readBounded(path.join(scope.path, "cpu.stat"), filesystem);
   const memory = readBounded(path.join(scope.path, "memory.current"), filesystem);
   const memoryPeak = readBounded(path.join(scope.path, "memory.peak"), filesystem);
@@ -475,30 +593,60 @@ export function readCgroupAccounting(scope: CgroupScope): CgroupAccounting {
   };
 }
 
-/** Remove only an identity-verified, empty scope. Populated scopes are killed first through cgroup.kill. */
-export function cleanupCgroupScope(scope: CgroupScope): DomainResult<{ readonly removed: boolean }> {
+function terminateCgroupScopeContents(
+  scope: CgroupScope,
+  operation: "cleanup" | "termination",
+  filesystemOverride?: CgroupFileSystem,
+): DomainResult<{ readonly after_population: CgroupPopulation }> {
   if (!verifiesScopeIdentity(scope)) {
-    return cleanupError("The cgroups v2 scope identity could not be verified for cleanup.", { scope: scope.name });
+    return cleanupError(`The cgroups v2 scope identity could not be verified for ${operation}.`, { scope: scope.name });
   }
-  const filesystem = filesystemFor(scope);
-  const processes = parseProcessIds(readBounded(path.join(scope.path, "cgroup.procs"), filesystem));
-  if (processes.length > 0) {
+  const filesystem = filesystemFor(scope, filesystemOverride);
+  let population = readCgroupPopulation(scope, filesystem);
+  if (population.state === "unknown" || population.processes === null) {
+    return cleanupError("The cgroups v2 scope occupancy could not be proven.", {
+      scope: scope.name,
+      populated: population.populated,
+    });
+  }
+  if (population.state === "populated") {
     try {
       filesystem.writeFileSync(path.join(scope.path, "cgroup.kill"), "1");
     } catch (error: unknown) {
       return cleanupError("The occupied cgroups v2 scope could not be safely terminated.", {
         scope: scope.name,
-        process_count: processes.length,
+        process_count: population.processes.length,
         reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
       });
     }
-    if (parseProcessIds(readBounded(path.join(scope.path, "cgroup.procs"), filesystem)).length > 0) {
-      return cleanupError("The cgroups v2 scope remained occupied after cleanup.", { scope: scope.name });
+    const afterKill = readCgroupPopulation(scope, filesystem);
+    if (afterKill.state !== "empty") {
+      return cleanupError(`The cgroups v2 scope remained occupied after ${operation}.`, { scope: scope.name });
     }
+    population = afterKill;
   }
+  return success({ after_population: population });
+}
+
+/** Kill an occupied, identity-verified scope and prove it empty without removing it. */
+export function terminateCgroupScope(
+  scope: CgroupScope,
+  filesystemOverride?: CgroupFileSystem,
+): DomainResult<{ readonly after_population: CgroupPopulation }> {
+  return terminateCgroupScopeContents(scope, "termination", filesystemOverride);
+}
+
+/** Remove only an identity-verified, empty scope. Populated scopes are killed first through cgroup.kill. */
+export function cleanupCgroupScope(
+  scope: CgroupScope,
+  filesystemOverride?: CgroupFileSystem,
+): DomainResult<{ readonly removed: boolean; readonly after_population: CgroupPopulation }> {
+  const terminated = terminateCgroupScopeContents(scope, "cleanup", filesystemOverride);
+  if (!terminated.ok) return terminated;
+  const filesystem = filesystemFor(scope, filesystemOverride);
   try {
     filesystem.rmdirSync(scope.path);
-    return success({ removed: true });
+    return success({ removed: true, after_population: terminated.value.after_population });
   } catch (error: unknown) {
     return cleanupError("The cgroups v2 scope could not be removed.", {
       scope: scope.name,

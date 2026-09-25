@@ -51,6 +51,8 @@ import {
   STRICT_RUNTIME_POLICY,
   type RuntimePolicyMode,
 } from "./domain/runtime-projection.js";
+import { enterProtectedSession } from "./domain/session-protected-launch.js";
+import { launchManagedSessionCommand, listSessionProcesses } from "./domain/session-console.js";
 import { validateWorktreeProfileCatalog, type WorktreeProfileCatalog } from "./domain/worktree-profile-catalog.js";
 import { defaultGit, resolveRepositoryContext } from "./git.js";
 import {
@@ -1180,6 +1182,9 @@ function parseClaimReplacementPairs(
   if (requirePairs && pairs.length === 0) {
     return failure(usageError("MISSING_ARGUMENT", "--resource requires a value.", { option: "--resource" }));
   }
+  if (profileParameter !== null && profile === null) {
+    return failure(usageError("INVALID_ARGUMENT", "--profile-parameter requires --profile.", { option: "--profile" }));
+  }
   const concurrency = finalizeClaimConcurrency(concurrencyState, requireConcurrencyIntent);
   if (!concurrency.ok) return concurrency;
   return {
@@ -1498,6 +1503,50 @@ async function executeProtectedSessionCommand(
       : { ok: true as const, value: command };
   if (!executable.ok) return executable;
 
+  let managedSessionId = parsed.value.session_id;
+  if (managedSessionId === null) {
+    const current = await dependencies.backend.resolveCurrentSession(context);
+    if (!current.ok) return current;
+    managedSessionId = current.value.session_id;
+  }
+  const managed = await launchManagedSessionCommand(context, dependencies.backend, {
+    session_id: managedSessionId,
+    command: { command: executable.value, args: arguments_.slice(delimiter + 2) },
+    ...(interactive ? { stdio: ["inherit", "inherit", "inherit"] as const } : {}),
+    ...(parsed.value.runtime_policy === null
+      ? {}
+      : {
+          runtime_policy:
+            parsed.value.runtime_policy === "compatibility"
+              ? EXPLICIT_COMPATIBILITY_RUNTIME_POLICY
+              : STRICT_RUNTIME_POLICY,
+        }),
+    ...(dependencies.sandboxProbe === undefined ? {} : { sandbox_probe: dependencies.sandboxProbe }),
+    ...(dependencies.sandboxRuntimeLayout === undefined
+      ? {}
+      : { sandbox_runtime_layout: dependencies.sandboxRuntimeLayout }),
+  });
+  if (!managed.ok) return managed;
+  if (managed.value !== null) {
+    if (managed.value.supervisor.status !== "completed" || managed.value.result === undefined) {
+      return failure(
+        new DomainError("SANDBOX_EXECUTION_FAILED", "The managed protected command did not complete.", {
+          session_id: parsed.value.session_id,
+          execution_id: managed.value.execution.execution_id,
+          status: managed.value.supervisor.status,
+        }),
+      );
+    }
+    return {
+      ok: true,
+      value: {
+        ...(managed.value.result as unknown as JsonObject),
+        execution: managed.value.execution as unknown as JsonObject,
+        supervisor: managed.value.supervisor as unknown as JsonObject,
+      },
+    };
+  }
+
   const request = await resolveSandboxExecutionRequest(
     dependencies.backend,
     context,
@@ -1569,6 +1618,53 @@ async function executeCommand(
     // of creating a second launch path.
     if (canonicalCommandForName(`session ${subcommand}`)?.name === "session run") {
       return executeProtectedSessionCommand(rest, dependencies, context);
+    }
+    if (subcommand === "enter") {
+      const parsed = parseTargetedOptions(rest, dispatcherAllowedOptions("session enter"));
+      if (!parsed.ok) return parsed;
+      if (parsed.value.session_id === null || dependencies.backend.persistSessionExecution === undefined) {
+        return failure(usageError("MISSING_ARGUMENT", "session enter requires --session and execution persistence."));
+      }
+      const result = await enterProtectedSession(context, dependencies.backend, {
+        session_id: parsed.value.session_id,
+        ...(parsed.value.runtime_policy === null
+          ? {}
+          : {
+              runtime_policy:
+                parsed.value.runtime_policy === "compatibility"
+                  ? EXPLICIT_COMPATIBILITY_RUNTIME_POLICY
+                  : STRICT_RUNTIME_POLICY,
+            }),
+        ...(dependencies.sandboxProbe === undefined ? {} : { sandbox_probe: dependencies.sandboxProbe }),
+        ...(dependencies.sandboxRuntimeLayout === undefined
+          ? {}
+          : { sandbox_runtime_layout: dependencies.sandboxRuntimeLayout }),
+        ...(dependencies.sandboxRunner === undefined ? {} : { sandbox_runner: dependencies.sandboxRunner }),
+        persist_execution: async (record) => {
+          const persisted = await dependencies.backend.persistSessionExecution!(context, record);
+          if (!persisted.ok) throw persisted.error;
+        },
+      });
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (subcommand === "processes") {
+      const parsed = parseTargetedOptions(rest, dispatcherAllowedOptions("session processes"));
+      if (!parsed.ok) return parsed;
+      const sessionId = parsed.value.session_id;
+      if (sessionId === null || dependencies.backend.listSessionExecutions === undefined) {
+        return failure(
+          usageError("MISSING_ARGUMENT", "session processes requires --session and execution persistence."),
+        );
+      }
+      const result = await listSessionProcesses(context, dependencies.backend, {
+        session_id: sessionId,
+        read_executions: (id) =>
+          dependencies.backend.listSessionExecutions!(context, id).then((value) => {
+            if (!value.ok) throw value.error;
+            return value.value;
+          }),
+      });
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "claim") {
       const parsed = parseSingleClaimPair(rest);

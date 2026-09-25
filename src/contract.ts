@@ -27,6 +27,10 @@ import {
   SANDBOX_OPTIONAL_CAPABILITIES,
   SANDBOX_REQUIRED_CAPABILITIES,
 } from "./domain/sandbox.js";
+import { SESSION_CONSOLE_CONTRACT_ID, SESSION_CONSOLE_SCHEMA_VERSION } from "./domain/session-console.js";
+import { SESSION_EXECUTION_CONTROL_CONTRACT_ID } from "./domain/session-execution-control.js";
+import { SESSION_EXECUTION_RECORD_CONTRACT_ID } from "./domain/session-execution-record.js";
+import { SESSION_PROCESS_OBSERVATION_CONTRACT_ID } from "./domain/session-process-observation.js";
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
 import {
   DISCARD_PREVIEW_SCHEMA_VERSION,
@@ -129,6 +133,34 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
   failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["protected-execution"],
   failure_code_policy: {
     source: "implementation-owned protected-execution vocabulary",
+    missing_or_extra: "deterministic conformance failure",
+    internal_exceptions: [],
+  },
+});
+
+const SESSION_CONSOLE_CAPABILITY = Object.freeze({
+  id: "session-console",
+  contract_id: SESSION_CONSOLE_CONTRACT_ID,
+  schema_version: SESSION_CONSOLE_SCHEMA_VERSION,
+  commands: ["session enter", "session processes"],
+  result_schema: "session-console.v1",
+  result_schema_version: SESSION_CONSOLE_SCHEMA_VERSION,
+  result_schemas: [
+    {
+      schema: "session-console.v1",
+      version: SESSION_CONSOLE_SCHEMA_VERSION,
+      commands: ["session enter", "session processes"],
+    },
+  ],
+  identities: ["session_id", "execution_id", "session_closed", "execution", "processes"],
+  producer_contract_ids: {
+    execution_record: SESSION_EXECUTION_RECORD_CONTRACT_ID,
+    process_observation: SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
+    execution_control: SESSION_EXECUTION_CONTROL_CONTRACT_ID,
+  },
+  failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-console"],
+  failure_code_policy: {
+    source: "implementation-owned session-console vocabulary",
     missing_or_extra: "deterministic conformance failure",
     internal_exceptions: [],
   },
@@ -336,6 +368,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     },
   },
   PROTECTED_EXECUTION_CAPABILITY,
+  SESSION_CONSOLE_CAPABILITY,
   {
     id: "session-lifecycle",
     commands: ["session create", "session id", "session show", "session list", "status", "session close"],
@@ -862,6 +895,10 @@ export function machineContract(packageVersion: string): JsonObject {
         ? {
             contract_id: capability.contract_id,
             contract_version: capability.contract_version,
+            registry_schema_version: capability.registry_schema_version,
+            registry_feature_gate_version: capability.registry_feature_gate_version,
+            registry_features: [...capability.registry_features],
+            supported_registry_features: [...capability.supported_registry_features],
             claim_schema_version: capability.claim_schema_version,
             result_schema_version: capability.result_schema_version,
             command_aliases: registryAliasReferences(capability.command_aliases),
@@ -915,6 +952,13 @@ export function machineContract(packageVersion: string): JsonObject {
             ambient_fallback: capability.ambient_fallback,
             readiness: jsonClone(capability.readiness),
             runtime: jsonClone(capability.runtime),
+          }
+        : {}),
+      ...(capability.id === "session-console"
+        ? {
+            contract_id: capability.contract_id,
+            schema_version: capability.schema_version,
+            producer_contract_ids: jsonClone(capability.producer_contract_ids),
           }
         : {}),
       ...(capability.id === "auxiliary-state-projection"
