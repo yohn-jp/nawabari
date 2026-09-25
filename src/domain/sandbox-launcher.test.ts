@@ -24,6 +24,7 @@ import {
   type RuntimePolicy,
   validateSessionRuntimeProjection,
 } from "./runtime-projection.js";
+import { LANDLOCK_ACCESS_FS, LANDLOCK_TRAMPOLINE } from "./landlock.js";
 import { compileWorkingSetRuntimeProjection } from "./working-set-runtime-projection.js";
 
 test("the seccomp baseline is versioned, deterministic, and uses bounded EPERM denials", () => {
@@ -645,6 +646,100 @@ test("bounded working-set execution fails closed when Landlock cannot establish 
     const compiled = compileSandboxInvocation({ ...request, runtime_projection: bounded }, { command: "true" });
     assert.equal(compiled.ok, false);
     if (!compiled.ok) assert.equal(compiled.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("bounded Landlock scopes /tmp scratch access away from a worktree mounted under /tmp", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("bounded bubblewrap profile is Linux-only");
+    return;
+  }
+  const nodeExecutable = fs.realpathSync.native(process.execPath);
+  if (!["/nix/store/", "/usr/", "/run/current-system/"].some((root) => nodeExecutable.startsWith(root))) {
+    t.skip("the test Node executable is outside the fixed runtime profile");
+    return;
+  }
+
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const workingSet = compileWorkingSetRuntimeProjection({
+      version: 1,
+      kind: "effective-working-set",
+      revision: 1,
+      id: "ews-bounded-tmp-test",
+      repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+      base: { branch: "main", revision: "a".repeat(40) },
+      scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+      provenance: {
+        executionScope: {
+          kind: "implementation-execution-scope",
+          version: 1,
+          digest: "a".repeat(64),
+          identity: "execution",
+        },
+        candidateWorkingSet: {
+          kind: "candidate-working-set",
+          version: 1,
+          digest: "b".repeat(64),
+          identity: "candidate",
+        },
+        repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+        base: { branch: "main", revision: "a".repeat(40) },
+      },
+    });
+    assert.equal(workingSet.ok, true, workingSet.ok ? "" : JSON.stringify(workingSet.error));
+    if (!workingSet.ok) return;
+    const runtimeProjection = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "bounded-tmp-test", version: "1" },
+      requirements: [],
+      filesystem: [
+        { source: nodeExecutable, target: nodeExecutable, access_mode: "read-only", provenance: "runtime-profile" },
+      ],
+      executables: [],
+      working_set: workingSet.value,
+    });
+    assert.equal(runtimeProjection.ok, true, runtimeProjection.ok ? "" : JSON.stringify(runtimeProjection.error));
+    if (!runtimeProjection.ok) return;
+
+    const compiled = compileSandboxInvocation(
+      {
+        ...request,
+        landlock_executable: nodeExecutable,
+        landlock_abi: 3,
+        landlock_state: "available",
+        landlock_required: true,
+        runtime_projection: runtimeProjection.value,
+      },
+      { command: "true" },
+    );
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+
+    assert.equal(compiled.value.env.TMPDIR, "/tmp/nawabari-tmp");
+    const scratchDirectoryIndex = compiled.value.args.findIndex(
+      (value, index, args) => value === "--dir" && args[index + 1] === "/tmp/nawabari-tmp",
+    );
+    assert.notEqual(scratchDirectoryIndex, -1);
+    const trampolineIndex = compiled.value.args.indexOf(LANDLOCK_TRAMPOLINE);
+    assert.notEqual(trampolineIndex, -1);
+    const rules = JSON.parse(compiled.value.args[trampolineIndex + 1]);
+    const tempParent = rules.find((rule: { path: string }) => rule.path === "/tmp");
+    const tempScratch = rules.find((rule: { path: string }) => rule.path === "/tmp/nawabari-tmp");
+    const worktreeFile = rules.find((rule: { path: string }) => rule.path === path.join(worktree, "README.md"));
+    assert.ok(tempParent);
+    assert.ok(tempScratch);
+    assert.ok(worktreeFile);
+    assert.equal(tempParent.allowed_access & LANDLOCK_ACCESS_FS.write_file, 0);
+    assert.notEqual(tempScratch.allowed_access & LANDLOCK_ACCESS_FS.write_file, 0);
+    assert.equal(worktreeFile.allowed_access & LANDLOCK_ACCESS_FS.write_file, 0);
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);

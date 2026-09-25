@@ -80,6 +80,8 @@ worktree=$(printf '%s' "$created" | jq -r .worktree)
 
 The initial-claim grammar is `--resource <path-or-glob> --mode <read|write|exclusive-write>` and the pair may be repeated. Each resource is paired with its own mode. The parser also permits zero pairs for backward compatibility, but the canonical routine path declares at least one initial claim. Initial claims are committed atomically with the new session, worktree, and branch. A conflict returns a machine-readable failure such as `RESOURCE_CLAIM_CONFLICT` and does not leave a partially established session or claim set.
 
+Resource-claim enforcement is disabled by default for a new session: `commit`/`push` authorization does not require the session to hold a resource claim for its own session-owned operations. Pass `--enforce-claims` to `session create` to opt that session into the previous claim-authorization behavior, including `MISSING_RESOURCE_CLAIM`/`INSUFFICIENT_CLAIM_MODE` denials and existing claim-mode compatibility rules. Worktree ownership, branch ownership, and `RESOURCE_CLAIM_CONFLICT` protection against another session's active claim remain enforced either way.
+
 The packed auxiliary-state declaration above is the bounded `copy` form: a `repository-local` source is copied to a `managed-worktree` target with `durability: durable`. It is an explicit, repeatable, allowlisted capability. It does not discover ignored state, project process-local sockets/PID files/logs, shadow Git-tracked paths, or expose arbitrary host filesystem paths. Auxiliary-state projection is separate from `SessionRuntimeProjection`: the former copies declared repository-local durable state for a managed worktree; the latter describes explicit runtime material and filesystem visibility for protected execution. Auxiliary state does not change the runtime projection.
 
 The create operation is atomic, but a caller must treat an uncertain result carefully. If JSON reports `REGISTRY_DURABILITY_UNCERTAIN`, re-read the reported session and claims before retrying. If the exact original declaration is already present, follow `bootstrap_retry.next_action: inspect-established-session` and inspect that `session_id`; if another declaration owns the worktree or branch, follow `bootstrap_retry.next_action: inspect-blocking-session`. Nawabari never silently adopts an existing owner. A retry is appropriate only after the authoritative state proves that the requested bootstrap was not established.
@@ -257,6 +259,8 @@ nawabari commit --help --json
 JSON mode emits one bounded document on stdout. Consumers should use machine-readable fields and stable codes rather than parse human-oriented text.
 
 The command surface includes Session lifecycle, Resource Claims, authorization/evidence, governed Git commit/push, reconciliation/discovery, and protected execution. Use `--help --json` and `capabilities --json` for the authoritative inventory. Human-readable guidance and agent integrations use these same command and action identifiers; there is no separate human or agent workflow.
+
+`src/cli-command-registry.ts` is the single canonical authority for that surface: every command/option name is a `CommandId`/`OptionId` literal type derived directly from the registry data (not hand-typed), and `--help`, `capabilities`, and the executable dispatcher's own accepted-flag parsing all read that same data. There is no second command or option table to keep in sync.
 
 ## Stable package exports
 
