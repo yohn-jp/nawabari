@@ -11,6 +11,7 @@ import {
   deriveCgroupScopeName,
   readCgroupAccounting,
   readCgroupPopulation,
+  resolveManagedCgroupRoot,
   terminateCgroupScope,
   type CgroupFileSystem,
 } from "./cgroups-v2.js";
@@ -72,6 +73,26 @@ test("cgroups v2 scope names bind session and execution identity", () => {
   assert.equal(first, same);
   assert.notEqual(first, different);
   assert.match(first, /^nawabari-[0-9a-f]{48}$/u);
+});
+
+test("managed root resolution binds the current delegated parent and rejects escaped membership", () => {
+  const root = "/sys/fs/cgroup/user.slice/delegated.scope";
+  const filesystem: CgroupFileSystem = {
+    statSync: (file) => ({
+      isDirectory: () => file === root,
+      isFile: () => file === `${root}/cgroup.controllers`,
+    }),
+    realpathSync: (file) => file,
+    readFileSync: () => "cpu memory pids\n",
+    writeFileSync: () => undefined,
+    mkdirSync: () => undefined,
+    rmdirSync: () => undefined,
+  };
+  const resolved = resolveManagedCgroupRoot({ membership: "0::/user.slice/delegated.scope/runner\n", filesystem });
+  assert.equal(resolved.ok, true, resolved.ok ? "" : resolved.error.message);
+  if (resolved.ok) assert.equal(resolved.value, root);
+  assert.equal(resolveManagedCgroupRoot({ membership: "0::/user.slice/../escape/runner\n", filesystem }).ok, false);
+  assert.equal(resolveManagedCgroupRoot({ root: "/sys/fs/cgroup/../escape", filesystem }).ok, false);
 });
 
 test("cgroups v2 limits, bounded accounting, attach, and cleanup remain identity-bound", () => {

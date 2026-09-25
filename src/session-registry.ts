@@ -152,12 +152,7 @@ import {
 } from "./domain/session-execution-record.js";
 import type { SessionDrainFinalization, SessionDrainExecution } from "./domain/session-execution-control.js";
 import type { SessionRuntimeEnvironmentIdentity } from "./domain/session-environment.js";
-import {
-  CGROUPS_V2_CONTRACT_ID,
-  CGROUPS_V2_ROOT,
-  deriveCgroupScopeName,
-  type CgroupFileSystem,
-} from "./domain/cgroups-v2.js";
+import { CGROUPS_V2_CONTRACT_ID, deriveCgroupScopeName, type CgroupFileSystem } from "./domain/cgroups-v2.js";
 import {
   observeOwnedExecution,
   type SessionExecutionRecord as OwnedExecutionRecord,
@@ -5015,21 +5010,25 @@ export class SessionRegistry {
     }
     for (const record of owned) {
       const name = deriveCgroupScopeName(record.cgroup_identity);
+      const root = record.cgroup_root;
       const lease: OwnedExecutionRecord = {
         schema_version: 1,
         session_id: record.session_id,
         execution_id: record.execution_id,
         boot_id: record.boot_id,
         state: record.state === "attached" || record.state === "running" ? "active" : "terminal",
-        cgroups: {
-          contract_id: CGROUPS_V2_CONTRACT_ID,
-          root: CGROUPS_V2_ROOT,
-          parent: `${CGROUPS_V2_ROOT}/nawabari`,
-          path: `${CGROUPS_V2_ROOT}/nawabari/${name}`,
-          name,
-          boot_id: record.boot_id,
-          identity: record.cgroup_identity,
-        },
+        cgroups:
+          root === null || root === undefined
+            ? null
+            : {
+                contract_id: CGROUPS_V2_CONTRACT_ID,
+                root,
+                parent: `${root}/nawabari`,
+                path: `${root}/nawabari/${name}`,
+                name,
+                boot_id: record.boot_id,
+                identity: record.cgroup_identity,
+              },
       };
       const observed = observeOwnedExecution(lease, {
         current_boot_id: currentBootId,

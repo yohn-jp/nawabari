@@ -943,6 +943,8 @@ export interface SessionBackend {
     executionId?: string,
   ): Promise<DomainResult<SessionManagedRuntimeState>>;
   readSessionRuntimeEpoch?(context: SessionContext, sessionId: string): number;
+  /** The single managed cgroup root retained by the backend for readiness and launch. */
+  getManagedCgroupRoot?(): DomainResult<string>;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {

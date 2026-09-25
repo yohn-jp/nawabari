@@ -102,11 +102,11 @@ import {
 } from "./session-process-observation.js";
 import {
   CGROUPS_V2_CONTRACT_ID,
-  CGROUPS_V2_ROOT,
   cleanupCgroupScope,
   createCgroupScope,
   deriveCgroupScopeName,
   readCgroupPopulation,
+  resolveManagedCgroupRoot,
   type CgroupFileSystem,
 } from "./cgroups-v2.js";
 import {
@@ -125,6 +125,8 @@ export interface LocalSessionBackendOptions {
   readonly sandboxProbe?: SandboxProbe;
   /** Explicit managed-execution readiness authority; absence fails closed for required process tracking. */
   readonly managedExecutionReadiness?: ManagedExecutionReadiness;
+  /** Explicit delegated subtree accepted by the canonical cgroups-v2 authority. */
+  readonly cgroupRoot?: string;
   readonly hookMaterialAuthority?: SessionHookMaterialAuthority;
   readonly registry?: Omit<
     SessionRegistryOptions,
@@ -232,6 +234,7 @@ export class LocalSessionBackend implements SessionBackend {
   private readonly gitIdentity: SandboxGitIdentity | undefined;
   private readonly sandboxProbe: SandboxProbe | undefined;
   private readonly managedExecutionReadiness: ManagedExecutionReadiness | undefined;
+  private readonly managedCgroupRoot: DomainResult<string>;
   private readonly hookMaterialAuthority: SessionHookMaterialAuthority | undefined;
   private readonly registryOptions: Omit<
     SessionRegistryOptions,
@@ -243,13 +246,24 @@ export class LocalSessionBackend implements SessionBackend {
     this.gitIdentity = options.gitIdentity;
     this.sandboxProbe = options.sandboxProbe;
     this.registryOptions = options.registry ?? {};
+    this.managedCgroupRoot = resolveManagedCgroupRoot({
+      ...(options.cgroupRoot === undefined ? {} : { root: options.cgroupRoot }),
+      ...(this.registryOptions.cgroupFilesystem === undefined
+        ? {}
+        : { filesystem: this.registryOptions.cgroupFilesystem }),
+    });
     this.hookMaterialAuthority = options.hookMaterialAuthority;
     this.managedExecutionReadiness =
       options.managedExecutionReadiness ??
       createLocalManagedExecutionReadiness(
         this.sandboxProbe ?? this.registryOptions.sandboxProbe,
         this.registryOptions.cgroupFilesystem,
+        this.managedCgroupRoot,
       );
+  }
+
+  public getManagedCgroupRoot(): DomainResult<string> {
+    return this.managedCgroupRoot;
   }
 
   public async listSessionExecutions(
@@ -899,15 +913,18 @@ export class LocalSessionBackend implements SessionBackend {
 function createLocalManagedExecutionReadiness(
   probe: SandboxProbe | undefined,
   filesystem: CgroupFileSystem | undefined,
+  root: DomainResult<string>,
 ): ManagedExecutionReadiness {
   return () => {
     try {
       const doctor = sandboxDoctorReport(probe ?? defaultSandboxProbe, discoverSandboxRuntimeLayout());
       if (!doctor.ready) return { ready: false };
 
+      if (!root.ok) return { ready: false };
+
       const created = createCgroupScope(
         { session_id: "nawabari-managed-readiness", execution_id: `readiness-${crypto.randomUUID()}` },
-        filesystem === undefined ? {} : { filesystem },
+        { root: root.value, ...(filesystem === undefined ? {} : { filesystem }) },
       );
       if (!created.ok) return { ready: false };
 
@@ -1098,21 +1115,25 @@ async function mutateClaimsWithRuntimeDrain<T>(
 
 function ownedExecutionRecord(record: SessionExecutionRecord): OwnedSessionExecutionRecord {
   const name = deriveCgroupScopeName(record.cgroup_identity);
+  const root = record.cgroup_root;
   return {
     schema_version: 1,
     session_id: record.session_id,
     execution_id: record.execution_id,
     boot_id: record.boot_id,
     state: record.state === "attached" || record.state === "running" ? "active" : "terminal",
-    cgroups: {
-      contract_id: CGROUPS_V2_CONTRACT_ID,
-      root: CGROUPS_V2_ROOT,
-      parent: `${CGROUPS_V2_ROOT}/nawabari`,
-      path: `${CGROUPS_V2_ROOT}/nawabari/${name}`,
-      name,
-      boot_id: record.boot_id,
-      identity: { session_id: record.session_id, execution_id: record.execution_id },
-    },
+    cgroups:
+      root === null || root === undefined
+        ? null
+        : {
+            contract_id: CGROUPS_V2_CONTRACT_ID,
+            root,
+            parent: `${root}/nawabari`,
+            path: `${root}/nawabari/${name}`,
+            name,
+            boot_id: record.boot_id,
+            identity: { session_id: record.session_id, execution_id: record.execution_id },
+          },
   };
 }
 
@@ -1155,7 +1176,8 @@ function sameSessionExecutionIdentity(current: SessionExecutionRecord, next: Ses
     current.runtime_epoch === next.runtime_epoch &&
     current.boot_id === next.boot_id &&
     current.created_at === next.created_at &&
-    JSON.stringify(current.cgroup_identity) === JSON.stringify(next.cgroup_identity)
+    JSON.stringify(current.cgroup_identity) === JSON.stringify(next.cgroup_identity) &&
+    current.cgroup_root === next.cgroup_root
   );
 }
 

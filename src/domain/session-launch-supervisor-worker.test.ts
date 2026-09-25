@@ -13,6 +13,7 @@ import {
   cleanupCgroupScope,
   createCgroupScope,
   readCgroupPopulation,
+  resolveManagedCgroupRoot,
   type CgroupScope,
 } from "./cgroups-v2.js";
 import { decideExecutionAdmission } from "./session-admission-decision.js";
@@ -205,6 +206,8 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
   if (process.platform !== "linux") {
     throw new Error("BLOCKED: the cgroups v2 descendant conformance requires supported Linux");
   }
+  const root = resolveManagedCgroupRoot();
+  if (!root.ok) throw new Error(`BLOCKED: supported cgroups v2 capability unavailable (${root.error.message})`);
   const { supervisor: supervisorEntrypoint } = await ensureFreshCompiledPackage();
   const compiledSupervisor = (await import(pathToFileURL(supervisorEntrypoint).href)) as CompiledSupervisorModule;
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-451-descendant-"));
@@ -251,6 +254,7 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
       result_timeout_ms: 5_000,
       cgroup: {
         required: true,
+        root: root.value,
         create_scope: (identity, options) => {
           const created = createCgroupScope(identity, {
             root: options?.root,
