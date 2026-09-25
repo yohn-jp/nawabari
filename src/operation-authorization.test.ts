@@ -80,7 +80,7 @@ test("one registry authority authorizes every operation class against concrete c
   const worktreePath = `${repositoryPath}-authorized`;
   try {
     const registry = new SessionRegistry({ cwd: repositoryPath });
-    const session = registry.provision({ worktreePath, branchName: "feature/authorized" });
+    const session = registry.provision({ worktreePath, branchName: "feature/authorized", claimEnforcement: true });
     registry.claimResources({
       sessionId: session.sessionId,
       claims: [
@@ -137,7 +137,11 @@ test("authorization fails closed for missing/stale sessions, context mismatch, a
   const secondWorktree = `${repositoryPath}-second`;
   try {
     const registry = new SessionRegistry({ cwd: repositoryPath });
-    const first = registry.provision({ worktreePath: firstWorktree, branchName: "feature/first" });
+    const first = registry.provision({
+      worktreePath: firstWorktree,
+      branchName: "feature/first",
+      claimEnforcement: true,
+    });
     const second = registry.provision({ worktreePath: secondWorktree, branchName: "feature/second" });
     const current = new SessionRegistry({ cwd: firstWorktree });
 
