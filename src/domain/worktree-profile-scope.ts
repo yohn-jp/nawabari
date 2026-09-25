@@ -117,7 +117,7 @@ function error(
   return failure(new DomainError(code, message));
 }
 
-function finiteSelectors(
+function boundedSelectors(
   ceiling: WorktreeRuntimeFilesystemCeiling,
   operation: "readOnly" | "write" | "create" | "delete",
 ): readonly string[] | undefined {
@@ -125,10 +125,11 @@ function finiteSelectors(
   if (!Array.isArray(selectors) || selectors.length > MAX_PATHS) return undefined;
   const normalized = selectors.map(normalizeSelector);
   if (normalized.some((selector) => selector === undefined)) return undefined;
-  // Existing bounded runtime can enforce a concrete file, but cannot safely
-  // turn a profile-wide directory grant into a finite runtime projection.
-  if (normalized.some((selector) => selector?.includes("*") || selector?.includes("?"))) return undefined;
   return Object.freeze([...normalized] as string[]);
+}
+
+function wildcardSelector(selector: string): boolean {
+  return selector.includes("*") || selector.includes("?");
 }
 
 function unsupported(
@@ -268,14 +269,12 @@ export function resolveProfileRuntimeScope(
   const profile = profileResult.value;
   const boundary = boundaryFor(profile);
   const ceiling = profile.filesystem;
-  const readOnly = finiteSelectors(ceiling, "readOnly");
-  const write = finiteSelectors(ceiling, "write");
-  const create = finiteSelectors(ceiling, "create");
-  const remove = finiteSelectors(ceiling, "delete");
+  const readOnly = boundedSelectors(ceiling, "readOnly");
+  const write = boundedSelectors(ceiling, "write");
+  const create = boundedSelectors(ceiling, "create");
+  const remove = boundedSelectors(ceiling, "delete");
   if (readOnly === undefined || write === undefined) {
-    return success(
-      unsupported(profile, boundary, [], "profile READONLY/WRITE grants must resolve to finite concrete paths"),
-    );
+    return success(unsupported(profile, boundary, [], "profile READONLY/WRITE ceilings must be bounded selectors"));
   }
   if (create === undefined || remove === undefined || create.length > 0 || remove.length > 0) {
     return success(
@@ -334,17 +333,18 @@ export function resolveProfileRuntimeScope(
   const claimsResult = validateClaims(session.claims);
   if (!claimsResult.ok) return claimsResult;
   const claims = claimsResult.value;
+  // Profile READONLY/WRITE selectors are authorization ceilings. A wildcard
+  // ceiling may authorize finite caller-supplied path evidence, but it is
+  // never projected as a runtime grant or path request itself; only concrete
+  // profile selectors become implicit baseline requests. Without finite
+  // evidence the projection stays empty and never widens to the ceiling.
   const defaults: ProfileRuntimeScopePathRequest[] = [
-    ...readOnly.map((path) => ({ path, operation: "READONLY" as const })),
-    ...write.map((path) => ({ path, operation: "WRITE" as const })),
+    ...readOnly.filter((path) => !wildcardSelector(path)).map((path) => ({ path, operation: "READONLY" as const })),
+    ...write.filter((path) => !wildcardSelector(path)).map((path) => ({ path, operation: "WRITE" as const })),
   ];
   const requestsResult = pathRequests(pathEvidenceInput, defaults);
   if (!requestsResult.ok) return requestsResult;
   const requests = requestsResult.value;
-  if (requests.length === 0)
-    return success(
-      unsupported(profile, boundary, [], "profile scope requires finite explicit path evidence", "pathEvidence"),
-    );
   for (const required of defaults) {
     if (!requests.some((request) => request.path === required.path && request.operation === required.operation)) {
       return success(
