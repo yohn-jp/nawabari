@@ -9,7 +9,14 @@ import { test } from "node:test";
 import { SessionRegistryError } from "./errors.js";
 import { resolveRepositoryContext } from "./git.js";
 import { RepositoryLock } from "./registry/lock.js";
-import { SessionRegistry, toPersistedSessionRecord, type PersistedRegistry } from "./session-registry.js";
+import { DomainError } from "./domain/errors.js";
+import { sandboxDoctorReport, type SandboxProbe } from "./domain/sandbox.js";
+import {
+  SessionRegistry,
+  toPersistedSessionRecord,
+  type ManagedExecutionReadinessRequest,
+  type PersistedRegistry,
+} from "./session-registry.js";
 import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
 
 test("round-trips session metadata through common Git state", () => {
@@ -42,7 +49,10 @@ test("round-trips session metadata through common Git state", () => {
     assert.equal(mainRegistry.get(mainSession.sessionId)?.label, "same human label");
 
     const persisted = readJson(mainRegistry.paths.registry) as PersistedRegistry;
-    assert.equal(persisted.schema_version, 1);
+    assert.equal(persisted.schema_version, 2);
+    assert.equal(persisted.registry_revision, 2);
+    assert.equal(persisted.runtime_epoch, 2);
+    assert.deepEqual(persisted.required_features, []);
     assert.equal(persisted.repository_id, mainRegistry.repository.repositoryId);
     assert.equal(persisted.sessions.length, 2);
     assert.equal(persisted.sessions[0].session_id, mainSession.sessionId);
@@ -348,6 +358,55 @@ test("fails closed when persisted records contain duplicate ownership", () => {
   }
 });
 
+test("migrates a legacy registry without changing session ownership or claim mode", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    const claim = registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "README.md", mode: "write" }],
+    }).claims[0];
+    assert.ok(claim);
+
+    const legacy = readJson(registry.paths.registry) as Record<string, unknown>;
+    legacy.schema_version = 1;
+    delete legacy.registry_revision;
+    delete legacy.runtime_epoch;
+    delete legacy.required_features;
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
+
+    const result = registry.migrate();
+    assert.equal(result.migrated, true);
+    const migrated = readJson(registry.paths.registry) as PersistedRegistry;
+    assert.equal(migrated.schema_version, 2);
+    assert.equal(migrated.claims_schema_version, 2);
+    assert.equal(migrated.sessions[0]?.session_id, session.sessionId);
+    assert.equal((migrated.claims?.[0] as { mode?: string } | undefined)?.mode, "write");
+    assert.equal(registry.listClaims()[0]?.sessionId, session.sessionId);
+    assert.equal(registry.listClaims()[0]?.mode, "write");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("does not rewrite a registry containing an unsupported feature", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    registry.create();
+    const unsupported = readJson(registry.paths.registry) as Record<string, unknown>;
+    unsupported.required_features = ["future.v1"];
+    fs.writeFileSync(registry.paths.registry, `${JSON.stringify(unsupported)}\n`);
+    const before = fs.readFileSync(registry.paths.registry, "utf8");
+
+    assertRegistryError(() => registry.create(), "REGISTRY_FEATURE_UNSUPPORTED");
+    assert.equal(fs.readFileSync(registry.paths.registry, "utf8"), before);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("toPersistedSessionRecord validates against the caller's expected repository", () => {
   const fixture = createRepositoryFixture();
   try {
@@ -516,6 +575,7 @@ test("an unexpected post-rename directory-sync failure is reported durability-un
     // The rename already committed the document; the failure only means
     // directory durability could not be proven, not that nothing happened.
     assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).list().length, 1);
+    assert.equal(fs.existsSync(registry.paths.registry), true);
   } finally {
     fixture.cleanup();
   }
@@ -547,7 +607,185 @@ test("an unexpected pre-rename write failure never produces a successful mutatio
       "REGISTRY_IO_FAILURE",
     );
     assert.deepEqual(registry.list(), []);
+    assert.equal(fs.existsSync(registry.paths.registry), false);
   } finally {
+    fixture.cleanup();
+  }
+});
+
+const READY_SANDBOX_PROBE: SandboxProbe = Object.freeze({
+  platform: () => "linux" as NodeJS.Platform,
+  uid: () => 1000,
+  gid: () => 1000,
+  hasBubblewrap: () => true,
+  hasNamespaceSupport: () => true,
+  hasCgroupsV2: () => true,
+  hasLandlock: () => true,
+  hasSeccomp: () => true,
+  hasCapabilities: () => true,
+});
+
+function ownershipSnapshot(registry: SessionRegistry, repositoryPath: string, branch: string, worktree: string) {
+  return {
+    registry: fs.existsSync(registry.paths.registry) ? fs.readFileSync(registry.paths.registry, "utf8") : null,
+    branch: runGit(["branch", "--list", branch], repositoryPath),
+    worktrees: runGit(["worktree", "list", "--porcelain"], repositoryPath),
+    worktreeExists: fs.existsSync(worktree),
+  };
+}
+
+test("required process tracking fails closed without a managed readiness authority despite a ready sandbox", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-mr`);
+  const branchName = "feature/managed-readiness-absent";
+  try {
+    assert.equal(sandboxDoctorReport(READY_SANDBOX_PROBE).ready, true);
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, sandboxProbe: READY_SANDBOX_PROBE });
+    const before = ownershipSnapshot(registry, fixture.repositoryPath, branchName, worktreePath);
+    assert.throws(
+      () => registry.provision({ branchName, worktreePath, profile: { selection: { profile: "builtin:minimal" } } }),
+      (error: unknown) =>
+        error instanceof DomainError &&
+        error.code === "SANDBOX_CAPABILITY_UNAVAILABLE" &&
+        error.exitCode === 4 &&
+        error.details?.managed_execution_authority === "absent",
+    );
+    assert.deepEqual(ownershipSnapshot(registry, fixture.repositoryPath, branchName, worktreePath), before);
+    assert.equal(before.registry, null);
+    assert.equal(before.branch, "");
+    assert.equal(before.worktreeExists, false);
+  } finally {
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("managed readiness preflight runs before ownership mutation and a negative answer changes nothing", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-mr`);
+  const branchName = "feature/managed-readiness-negative";
+  const seed = new SessionRegistry({ cwd: fixture.repositoryPath }).create({ label: "seed" });
+  try {
+    const requests: ManagedExecutionReadinessRequest[] = [];
+    let observedDuringPreflight: ReturnType<typeof ownershipSnapshot> | undefined;
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      sandboxProbe: READY_SANDBOX_PROBE,
+      managedExecutionReadiness: (request) => {
+        requests.push(request);
+        observedDuringPreflight = ownershipSnapshot(registry, fixture.repositoryPath, branchName, worktreePath);
+        return { ready: false };
+      },
+    });
+    const before = ownershipSnapshot(registry, fixture.repositoryPath, branchName, worktreePath);
+    assert.throws(
+      () => registry.provision({ branchName, worktreePath, profile: { selection: { profile: "builtin:minimal" } } }),
+      (error: unknown) =>
+        error instanceof DomainError &&
+        error.code === "SANDBOX_CAPABILITY_UNAVAILABLE" &&
+        error.details?.managed_execution_authority === "not_ready",
+    );
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]?.processTracking, "required");
+    assert.equal(requests[0]?.profile.id, "minimal");
+    assert.match(requests[0]?.profile.digest ?? "", /^[0-9a-f]{64}$/u);
+    assert.deepEqual(observedDuringPreflight, before);
+    assert.deepEqual(ownershipSnapshot(registry, fixture.repositoryPath, branchName, worktreePath), before);
+    assert.deepEqual(
+      registry.list().map((record) => record.sessionId),
+      [seed.sessionId],
+    );
+  } finally {
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("missing profile material fails with its typed error before managed readiness is consulted", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-mr`);
+  const branchName = "feature/managed-readiness-material";
+  try {
+    let consulted = false;
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      managedExecutionReadiness: () => {
+        consulted = true;
+        return { ready: true };
+      },
+    });
+    assert.throws(
+      () =>
+        registry.provision({
+          branchName,
+          worktreePath,
+          profile: { selection: { profile: "builtin:standard-shell" } },
+        }),
+      (error: unknown) => error instanceof DomainError && error.code === "RUNTIME_MATERIALIZATION_MISSING",
+    );
+    assert.equal(consulted, false);
+    assert.equal(fs.existsSync(registry.paths.registry), false);
+    assert.equal(runGit(["branch", "--list", branchName], fixture.repositoryPath), "");
+  } finally {
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("an explicit managed readiness authority authorizes bootstrap without changing the pinned profile", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-mr`);
+  const branchName = "feature/managed-readiness-ready";
+  try {
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      managedExecutionReadiness: () => ({ ready: true }),
+    });
+    const session = registry.provision({
+      branchName,
+      worktreePath,
+      profile: { selection: { profile: "builtin:minimal" } },
+    });
+    assert.equal(session.branchName, branchName);
+    const persisted = readJson(registry.paths.registry) as {
+      pinned_profiles?: readonly { resolved?: { id?: string; execution?: { processTracking?: string } } }[];
+    };
+    assert.equal(persisted.pinned_profiles?.length, 1);
+    assert.equal(persisted.pinned_profiles?.[0]?.resolved?.id, "minimal");
+    assert.equal(persisted.pinned_profiles?.[0]?.resolved?.execution?.processTracking, "required");
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
+    } catch {
+      // Directory cleanup below remains safe when Git never created the worktree.
+    }
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
+test("omitted-profile provisioning does not consult managed readiness", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-mr`);
+  try {
+    let consulted = false;
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      managedExecutionReadiness: () => {
+        consulted = true;
+        return { ready: false };
+      },
+    });
+    const session = registry.provision({ branchName: "feature/omitted-profile", worktreePath });
+    assert.equal(session.branchName, "feature/omitted-profile");
+    assert.equal(consulted, false);
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
+    } catch {
+      // Directory cleanup below remains safe when Git never created the worktree.
+    }
+    fs.rmSync(worktreePath, { recursive: true, force: true });
     fixture.cleanup();
   }
 });

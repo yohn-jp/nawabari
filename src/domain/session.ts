@@ -54,6 +54,12 @@ export type SessionCreateOptions = {
   candidate_working_set?: unknown | null;
   /** Optional repository identity used by the transport-neutral working-set contract. */
   working_set_repository?: RepositoryIdentity | null;
+  /** Optional immutable worktree runtime profile selected during bootstrap. */
+  profile?: {
+    selection: { profile: string };
+    parameters?: JsonObject;
+    provenance?: { catalog?: { path?: string; blob_oid?: string } };
+  } | null;
 };
 
 export type WorkingSetExpansionOptions = {

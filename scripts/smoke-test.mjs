@@ -60,7 +60,11 @@ const PACKAGE_ENTRY_POINT_CHECK_SCRIPT = [
   "assert.equal(typeof state.nawabariTransitionDecision, 'function');",
   "assert.equal(typeof state.availableNawabariCommands, 'function');",
   "assert.equal(typeof state.getNawabariSessionStateSnapshot, 'function');",
+  "assert.equal(typeof state.inspectWorktreeProfile, 'function');",
+  "assert.equal(typeof state.serializeWorktreeProfileInspection, 'function');",
   "assert.equal(state.NAWABARI_STATE_API_SCHEMA_VERSION, 1);",
+  "assert.equal(state.WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION, 1);",
+  "assert.equal(state.WORKTREE_PROFILE_INSPECTION_SERIALIZATION_KEY, 'worktree-profile-inspection');",
   "assert.equal(Array.isArray(state.NAWABARI_LIFECYCLE_STATES), true);",
   "",
   "const snapshot = state.classifyNawabariState({ sessionState: 'active', physicalState: 'healthy' });",
@@ -69,6 +73,59 @@ const PACKAGE_ENTRY_POINT_CHECK_SCRIPT = [
   "assert.equal(closeDecision.allowed, true);",
   "assert.equal(closeDecision.target, 'close-ready');",
   "assert.equal(state.availableNawabariCommands(snapshot).includes('close'), true);",
+  "",
+  "const pinnedProfileEnvelope = JSON.parse(JSON.stringify({",
+  "  'pinned-worktree-profile': {",
+  "    schema_version: 1,",
+  "    resolved: {",
+  "      contract_id: 'nawabari.worktree-runtime-profile.v1', schema_version: 1, id: 'standard', version: '1',",
+  "      materialSelection: { profiles: ['development'] },",
+  "      filesystem: { readOnly: ['src/**'], write: [], create: [], delete: [], deny: ['.git/**'], immutable: ['.git/**'] },",
+  "      tools: [",
+  "        { entrypoint: 'git', provider: { id: 'git-provider', requirement_id: 'git-package' } },",
+  "        { entrypoint: 'node', provider: { id: 'node-provider', requirement_id: 'node-runtime' } },",
+  "      ],",
+  "      shell: { entrypoint: 'node' },",
+  "      environment: { home: 'session', xdg: { config: 'session', cache: 'session', data: 'session', state: 'session' }, tmp: 'execution' },",
+  "      git: { config: 'session-private', globalConfig: 'excluded', credentialHelpers: 'disabled', hooks: 'disabled' },",
+  "      execution: { policy: { mode: 'strict', host_visibility: 'default-deny', compatibility: 'disabled', unrestricted_host_fallback: 'forbidden' }, processTracking: 'optional' },",
+  "    },",
+  "    provenance: {",
+  "      repository: { id: 'repo', revision: '0123456789012345678901234567890123456789' },",
+  "      base: { revision: '0123456789012345678901234567890123456789' },",
+  "      catalog: { kind: 'repository', path: 'nawabari.profiles.json', blob_oid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' },",
+  "      selection: { profile: 'standard', parameters: {} },",
+  "    },",
+  "    digest: '36ee69ae5be7427ec31e20aa78a5565a8d474fc3454bc36d1a6bb78da7f99f9a',",
+  "  },",
+  "}));",
+  "const pinnedProfile = pinnedProfileEnvelope['pinned-worktree-profile'];",
+  "const originalPinnedProfile = structuredClone(pinnedProfile);",
+  "const currentCatalog = {",
+  "  status: 'available', digest: pinnedProfile.provenance.catalog.blob_oid,",
+  "  catalog: { profiles: [{ ...pinnedProfile.resolved, extends: [] }] },",
+  "};",
+  "const availableRuntime = { status: 'available', materializer: 'provided', providers: [{ id: 'node-provider', requirement_id: 'node-runtime' }] };",
+  "const sameInspection = state.inspectWorktreeProfile(pinnedProfile, currentCatalog, availableRuntime);",
+  "assert.equal(sameInspection.schema_version, 1);",
+  "assert.deepEqual(sameInspection.declared.catalog, { kind: 'repository', path: 'nawabari.profiles.json', digest: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' });",
+  "assert.equal(sameInspection.pinned.profile.id, 'standard');",
+  "assert.equal(sameInspection.pinned.digest, '36ee69ae5be7427ec31e20aa78a5565a8d474fc3454bc36d1a6bb78da7f99f9a');",
+  "assert.equal(sameInspection.current.drift, 'same');",
+  "assert.deepEqual(sameInspection.runtime.tools.map((tool) => [tool.entrypoint, tool.availability]), [['git', 'missing'], ['node', 'available']]);",
+  "const changedInspection = state.inspectWorktreeProfile(pinnedProfile, { ...currentCatalog, digest: '0123456789012345678901234567890123456789' }, { status: 'missing', materializer: null, providers: [] });",
+  "assert.equal(changedInspection.current.drift, 'changed');",
+  "assert.equal(changedInspection.pinned.profile.id, 'standard');",
+  "assert.equal(changedInspection.pinned.digest, originalPinnedProfile.digest);",
+  "assert.equal(changedInspection.runtime.status, 'missing');",
+  "assert.deepEqual(changedInspection.runtime.tools.map((tool) => tool.availability), ['missing', 'missing']);",
+  "const unknownInspection = state.inspectWorktreeProfile(pinnedProfile, { status: 'unknown' }, { status: 'unknown', materializer: null, providers: [] });",
+  "assert.equal(unknownInspection.current.drift, 'unknown');",
+  "assert.deepEqual(unknownInspection.current.catalog, { status: 'unknown' });",
+  "assert.deepEqual(unknownInspection.runtime.tools.map((tool) => tool.availability), ['unknown', 'unknown']);",
+  "const serializedInspection = JSON.parse(state.serializeWorktreeProfileInspection(sameInspection));",
+  "assert.deepEqual(Object.keys(serializedInspection), ['worktree-profile-inspection']);",
+  "assert.deepEqual(pinnedProfile, originalPinnedProfile);",
   "",
   "assert.equal(typeof contract.machineContract, 'function');",
   "assert.equal(typeof contract.nawabariMachineContract, 'function');",
@@ -652,6 +709,331 @@ async function main() {
         });
       });
 
+    console.log("checking installed profile catalog and selection contracts...");
+    const profileRepository = path.join(installDirectory, "profile-repository");
+    const profileCatalogPath = path.join(profileRepository, "nawabari.profiles.json");
+    run("git", ["init", "-b", "main", profileRepository], { env: gitEnvironment });
+    run("git", ["config", "user.email", "nawabari-smoke@example.invalid"], {
+      cwd: profileRepository,
+      env: gitEnvironment,
+    });
+    run("git", ["config", "user.name", "Nawabari Smoke"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["config", "commit.gpgsign", "false"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["config", "core.hooksPath", "/dev/null"], { cwd: profileRepository, env: gitEnvironment });
+    fs.writeFileSync(path.join(profileRepository, "README.md"), "profile smoke fixture\n");
+    run("git", ["add", "README.md"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "initial profile fixture"], { cwd: profileRepository, env: gitEnvironment });
+
+    const absentCatalogList = invokeInstalled(["--json", "profile", "list"], profileRepository);
+    const absentCatalog = parseInstalledJson(absentCatalogList, "built-in profiles without a repository catalog");
+    if (
+      absentCatalogList.status !== 0 ||
+      absentCatalog.contract_id !== "nawabari.worktree-profile-cli.v1" ||
+      absentCatalog.schema_version !== 1 ||
+      absentCatalog.command !== "profile list" ||
+      absentCatalog.profiles?.map((profile) => profile.reference).join(",") !== "builtin:minimal,builtin:standard-shell"
+    ) {
+      fail("installed profile list did not expose the built-ins and required CLI schema when the catalog is absent");
+    }
+
+    const builtinShowResult = invokeInstalled(
+      ["--json", "profile", "show", "--profile", "builtin:minimal"],
+      profileRepository,
+    );
+    const builtinShow = parseInstalledJson(builtinShowResult, "built-in profile show");
+    if (builtinShowResult.status !== 0 || builtinShow.source?.reference !== "builtin:minimal" || !builtinShow.ready) {
+      fail("installed profile show did not resolve the explicit built-in namespace");
+    }
+    const repositoryProfile = { ...builtinShow.profile, id: "minimal", extends: [] };
+    delete repositoryProfile.contract_id;
+    delete repositoryProfile.schema_version;
+    const validCatalogText = `${JSON.stringify({ profiles: [repositoryProfile] }, null, 2)}\n`;
+    fs.writeFileSync(profileCatalogPath, validCatalogText);
+    run("git", ["add", "nawabari.profiles.json"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "add colliding repository profile"], {
+      cwd: profileRepository,
+      env: gitEnvironment,
+    });
+
+    const namespacedListResult = invokeInstalled(["--json", "profile", "list"], profileRepository);
+    const namespacedList = parseInstalledJson(namespacedListResult, "namespaced profile list");
+    if (
+      namespacedListResult.status !== 0 ||
+      namespacedList.profiles?.map((profile) => profile.reference).join(",") !==
+        "builtin:minimal,builtin:standard-shell,repository:minimal" ||
+      namespacedList.profiles?.some((profile) => profile.collision !== (profile.id === "minimal"))
+    ) {
+      fail("installed profile list did not preserve built-in/repository namespaces and their collision");
+    }
+
+    const repositoryShowResult = invokeInstalled(
+      ["--json", "profile", "show", "--profile", "repository:minimal"],
+      profileRepository,
+    );
+    const repositoryShow = parseInstalledJson(repositoryShowResult, "repository profile show");
+    if (
+      repositoryShowResult.status !== 0 ||
+      repositoryShow.source?.namespace !== "repository" ||
+      repositoryShow.source?.reference !== "repository:minimal"
+    ) {
+      fail("installed profile show did not resolve the explicit repository namespace");
+    }
+    const ambiguousShowResult = invokeInstalled(
+      ["--json", "profile", "show", "--profile", "minimal"],
+      profileRepository,
+    );
+    const ambiguousShow = parseInstalledJson(ambiguousShowResult, "ambiguous profile show");
+    if (ambiguousShowResult.status !== 3 || ambiguousShow.code !== "RUNTIME_PROFILE_AMBIGUOUS") {
+      fail("installed profile show did not reject an unqualified builtin/repository collision");
+    }
+
+    const missingMaterialBefore = {
+      registry: fs.existsSync(path.join(profileRepository, ".git", "nawabari", "session-registry.json")),
+      branches: run("git", ["branch", "--list", "feature/packed-profile-missing-material"], {
+        cwd: profileRepository,
+        env: gitEnvironment,
+      }).stdout,
+      worktrees: run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment })
+        .stdout,
+    };
+    const missingMaterialResult = invokeInstalled(
+      [
+        "session",
+        "create",
+        "--branch",
+        "feature/packed-profile-missing-material",
+        "--profile",
+        "builtin:standard-shell",
+        "--json",
+      ],
+      profileRepository,
+    );
+    const missingMaterial = parseInstalledJson(missingMaterialResult, "selected missing profile material");
+    if (missingMaterialResult.status !== 4 || missingMaterial.code !== "RUNTIME_MATERIALIZATION_MISSING") {
+      fail("installed selected missing profile material did not fail with its typed unavailable result");
+    }
+    if (
+      fs.existsSync(path.join(profileRepository, ".git", "nawabari", "session-registry.json")) !==
+        missingMaterialBefore.registry ||
+      run("git", ["branch", "--list", "feature/packed-profile-missing-material"], {
+        cwd: profileRepository,
+        env: gitEnvironment,
+      }).stdout !== missingMaterialBefore.branches ||
+      run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment }).stdout !==
+        missingMaterialBefore.worktrees
+    ) {
+      fail("selected missing profile material left registry, branch, or worktree ownership state");
+    }
+
+    fs.writeFileSync(profileCatalogPath, "{invalid\n");
+    run("git", ["add", "nawabari.profiles.json"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "add malformed profile catalog"], {
+      cwd: profileRepository,
+      env: gitEnvironment,
+    });
+    const malformedListResult = invokeInstalled(["--json", "profile", "list"], profileRepository);
+    const malformedList = parseInstalledJson(malformedListResult, "malformed present profile catalog");
+    if (malformedListResult.status !== 3 || malformedList.code !== "RUNTIME_PROFILE_INVALID") {
+      fail("installed profile list treated a malformed present catalog as absent");
+    }
+    const omittedProfileResult = invokeInstalled(
+      ["session", "create", "--branch", "feature/packed-profile-omitted", "--json"],
+      profileRepository,
+    );
+    const omittedProfile = parseInstalledJson(omittedProfileResult, "omitted profile create with malformed catalog");
+    if (
+      omittedProfileResult.status !== 0 ||
+      omittedProfile.ok !== true ||
+      typeof omittedProfile.session_id !== "string"
+    ) {
+      fail("omitted-profile create did not preserve bootstrap compatibility with a malformed catalog");
+    }
+    const profileRegistryPath = path.join(profileRepository, ".git", "nawabari", "session-registry.json");
+    const omittedRegistry = JSON.parse(fs.readFileSync(profileRegistryPath, "utf8"));
+    if (
+      omittedRegistry.required_features?.includes("pinned-profiles.v1") ||
+      omittedRegistry.pinned_profiles !== undefined
+    ) {
+      fail("omitted-profile create unexpectedly persisted pinned profile authority");
+    }
+    const omittedCloseResult = invokeInstalled(
+      ["session", "close", "--session", omittedProfile.session_id, "--json"],
+      profileRepository,
+    );
+    const omittedClose = parseInstalledJson(omittedCloseResult, "omitted profile cleanup");
+    if (omittedCloseResult.status !== 0 || omittedClose.ok !== true) {
+      fail("omitted-profile compatibility session could not be cleaned up");
+    }
+    fs.writeFileSync(profileCatalogPath, validCatalogText);
+    run("git", ["add", "nawabari.profiles.json"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "restore valid profile catalog"], {
+      cwd: profileRepository,
+      env: gitEnvironment,
+    });
+
+    const managedCreateBefore = {
+      registry: fs.readFileSync(profileRegistryPath, "utf8"),
+      branches: run("git", ["branch", "--list", "feature/packed-profile-managed-unavailable"], {
+        cwd: profileRepository,
+        env: gitEnvironment,
+      }).stdout,
+      worktrees: run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment })
+        .stdout,
+    };
+    const managedCreateResult = invokeInstalled(
+      [
+        "session",
+        "create",
+        "--branch",
+        "feature/packed-profile-managed-unavailable",
+        "--profile",
+        "builtin:minimal",
+        "--json",
+      ],
+      profileRepository,
+    );
+    const managedCreate = parseInstalledJson(managedCreateResult, "selected managed profile create");
+    const managedCreateAfter = {
+      registry: fs.readFileSync(profileRegistryPath, "utf8"),
+      branches: run("git", ["branch", "--list", "feature/packed-profile-managed-unavailable"], {
+        cwd: profileRepository,
+        env: gitEnvironment,
+      }).stdout,
+      worktrees: run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment })
+        .stdout,
+    };
+    const managedCreateTypedUnavailable =
+      managedCreateResult.status === 4 && managedCreate.code === "SANDBOX_CAPABILITY_UNAVAILABLE";
+    const managedCreateOwnershipUnchanged =
+      managedCreateAfter.registry === managedCreateBefore.registry &&
+      managedCreateAfter.branches === managedCreateBefore.branches &&
+      managedCreateAfter.worktrees === managedCreateBefore.worktrees;
+    const managedCreateConformanceFailure =
+      managedCreateTypedUnavailable && managedCreateOwnershipUnchanged
+        ? null
+        : {
+            expected: { status: 4, code: "SANDBOX_CAPABILITY_UNAVAILABLE", ownership_unchanged: true },
+            actual: {
+              status: managedCreateResult.status,
+              result: managedCreate,
+              ownership_unchanged: managedCreateOwnershipUnchanged,
+              registry_unchanged: managedCreateAfter.registry === managedCreateBefore.registry,
+              branch_present: managedCreateAfter.branches.trim().length > 0,
+              worktree_list_changed: managedCreateAfter.worktrees !== managedCreateBefore.worktrees,
+            },
+          };
+
+    console.log("checking installed legacy registry migration and unsupported feature preservation...");
+    const migrationRepository = path.join(installDirectory, "migration-repository");
+    run("git", ["init", "-b", "main", migrationRepository], { env: gitEnvironment });
+    run("git", ["config", "user.email", "nawabari-smoke@example.invalid"], {
+      cwd: migrationRepository,
+      env: gitEnvironment,
+    });
+    run("git", ["config", "user.name", "Nawabari Smoke"], { cwd: migrationRepository, env: gitEnvironment });
+    run("git", ["config", "commit.gpgsign", "false"], { cwd: migrationRepository, env: gitEnvironment });
+    fs.writeFileSync(path.join(migrationRepository, "README.md"), "migration smoke fixture\n");
+    run("git", ["add", "README.md"], { cwd: migrationRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "initial migration fixture"], { cwd: migrationRepository, env: gitEnvironment });
+    const migrationCreateResult = invokeInstalled(
+      [
+        "session",
+        "create",
+        "--branch",
+        "feature/packed-legacy-migration",
+        "--resource",
+        "README.md",
+        "--mode",
+        "write",
+        "--json",
+      ],
+      migrationRepository,
+    );
+    const migrationSession = parseInstalledJson(migrationCreateResult, "legacy migration owner create");
+    if (migrationCreateResult.status !== 0 || migrationSession.ok !== true) {
+      fail("could not establish an installed registry ownership fixture for migration");
+    }
+    const migrationRegistryPath = path.join(migrationRepository, ".git", "nawabari", "session-registry.json");
+    const legacyRegistry = JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8"));
+    legacyRegistry.schema_version = 1;
+    legacyRegistry.claims_schema_version = 1;
+    legacyRegistry.claims = legacyRegistry.claims.map((claim) => ({ ...claim, schema_version: 1 }));
+    fs.writeFileSync(migrationRegistryPath, `${JSON.stringify(legacyRegistry, null, 2)}\n`);
+    const migrationResult = invokeInstalled(["migrate", "--json"], migrationRepository);
+    const migration = parseInstalledJson(migrationResult, "legacy registry migration");
+    if (migrationResult.status !== 0 || migration.migrated !== true) {
+      fail("installed migrate did not read and upgrade the bounded legacy registry fixture");
+    }
+    const migratedRegistry = JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8"));
+    if (
+      migratedRegistry.schema_version !== 2 ||
+      migratedRegistry.claims_schema_version !== 2 ||
+      migratedRegistry.sessions?.some((session) => session.session_id === migrationSession.session_id) !== true ||
+      migratedRegistry.claims?.some(
+        (claim) => claim.session_id === migrationSession.session_id && claim.resource === "README.md",
+      ) !== true ||
+      fs.existsSync(migrationSession.worktree) !== true
+    ) {
+      fail("legacy registry migration did not preserve its active owner, claim, and worktree");
+    }
+
+    const migratedBranch = run("git", ["rev-parse", "refs/heads/feature/packed-legacy-migration"], {
+      cwd: migrationRepository,
+      env: gitEnvironment,
+    }).stdout.trim();
+    const migratedWorktrees = run("git", ["worktree", "list", "--porcelain"], {
+      cwd: migrationRepository,
+      env: gitEnvironment,
+    }).stdout;
+    const supportedRegistryText = fs.readFileSync(migrationRegistryPath, "utf8");
+    const unsupportedRegistry = JSON.parse(supportedRegistryText);
+    unsupportedRegistry.required_features = ["runtime-sessions.v1"];
+    unsupportedRegistry.runtime_sessions = [{ fixture: "preserve", payload: { nested: ["optional", 1, true] } }];
+    const unsupportedRegistryText = `${JSON.stringify(unsupportedRegistry, null, 2)}\n`;
+    fs.writeFileSync(migrationRegistryPath, unsupportedRegistryText);
+    const unsupportedFeatureResult = invokeInstalled(["session", "list", "--json"], migrationRepository);
+    const unsupportedFeature = parseInstalledJson(unsupportedFeatureResult, "unsupported required registry feature");
+    if (unsupportedFeatureResult.status !== 3 || unsupportedFeature.code !== "REGISTRY_FEATURE_UNSUPPORTED") {
+      fail("installed registry reader did not reject an unsupported required feature");
+    }
+    const unsupportedFeatureOwnership = {
+      registry_bytes_unchanged: fs.readFileSync(migrationRegistryPath, "utf8") === unsupportedRegistryText,
+      optional_payload_unchanged:
+        JSON.stringify(JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8")).runtime_sessions) ===
+        JSON.stringify([{ fixture: "preserve", payload: { nested: ["optional", 1, true] } }]),
+      worktree_exists: fs.existsSync(migrationSession.worktree),
+      branch_ref_unchanged:
+        run("git", ["rev-parse", "refs/heads/feature/packed-legacy-migration"], {
+          cwd: migrationRepository,
+          env: gitEnvironment,
+        }).stdout.trim() === migratedBranch,
+      worktree_ownership_unchanged:
+        run("git", ["worktree", "list", "--porcelain"], {
+          cwd: migrationRepository,
+          env: gitEnvironment,
+        }).stdout === migratedWorktrees,
+      branch_ref: run("git", ["rev-parse", "refs/heads/feature/packed-legacy-migration"], {
+        cwd: migrationRepository,
+        env: gitEnvironment,
+      }).stdout.trim(),
+    };
+    if (
+      !unsupportedFeatureOwnership.registry_bytes_unchanged ||
+      !unsupportedFeatureOwnership.optional_payload_unchanged ||
+      !unsupportedFeatureOwnership.worktree_exists ||
+      !unsupportedFeatureOwnership.branch_ref_unchanged ||
+      !unsupportedFeatureOwnership.worktree_ownership_unchanged
+    ) {
+      fail(
+        `unsupported registry feature rejection rewrote payload or disturbed current ownership: ${JSON.stringify(unsupportedFeatureOwnership)}`,
+      );
+    }
+    fs.writeFileSync(migrationRegistryPath, supportedRegistryText);
+
+    if (managedCreateConformanceFailure !== null) {
+      fail(`profile-selected managed create certification failed: ${JSON.stringify(managedCreateConformanceFailure)}`);
+    }
+
     const doctorResult = invokeInstalled(["doctor", "--json"], lifecycleRepository);
     if (doctorResult.status !== 0) fail(`doctor --json exited ${doctorResult.status}, expected 0`);
     const protectedExecutionDoctor = parseInstalledJson(doctorResult, "protected-execution readiness");
@@ -1092,7 +1474,7 @@ async function main() {
       createHelp.help_for !== "session create" ||
       createHelp.required_options?.length !== 0 ||
       createHelp.optional_options?.join(",") !==
-        "--branch,--worktree,--worktree-root,--base,--label,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file,--enforce-claims" ||
+        "--branch,--worktree,--worktree-root,--base,--label,--profile,--profile-parameter,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file,--enforce-claims" ||
       createHelp.defaults?.["--base"] !== "HEAD"
     ) {
       fail("installed session create help did not expose the optional/defaulted contract");

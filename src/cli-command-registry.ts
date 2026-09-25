@@ -97,6 +97,7 @@ const REGISTRY_DATA = [
     usage:
       `${CLI_NAME} session create [--branch <name>] [--worktree <path>|--worktree-root <path>] ` +
       `[--base <ref>] [--label <text>] ` +
+      `[--profile <id> --profile-parameter <json>] ` +
       `[--execution-scope-file <path> --candidate-working-set-file <path>] ` +
       `[--resource <path-or-glob> --mode <read|write|exclusive-write> ...] [--enforce-claims]`,
     options: [
@@ -119,6 +120,8 @@ const REGISTRY_DATA = [
       ),
       option("--base", "Commit-resolving base ref for the new worktree", { value: "<ref>", default: "HEAD" }),
       option("--label", "Optional display label; never used as an identity", { value: "<text>", default: "omitted" }),
+      option("--profile", "Explicit worktree runtime profile selection", { value: "<id>" }),
+      option("--profile-parameter", "Typed JSON object of profile parameters; requires --profile", { value: "<json>" }),
       option(
         "--resource",
         "Initial repository-relative resource claim; repeatable, each paired with the --mode immediately after it",
@@ -161,6 +164,21 @@ const REGISTRY_DATA = [
     summary: "Resolve the current session identity",
     usage: `${CLI_NAME} session id`,
     options: [],
+  },
+  {
+    name: "profile list",
+    summary: "List built-in worktree runtime profiles",
+    usage: `${CLI_NAME} profile list`,
+    options: [],
+    notes: [
+      "Built-in and repository profile namespaces remain distinct; collisions are reported rather than overwritten.",
+    ],
+  },
+  {
+    name: "profile show",
+    summary: "Show one worktree runtime profile",
+    usage: `${CLI_NAME} profile show --profile <id>`,
+    options: [option("--profile", "Profile id or explicit namespace:id reference", { value: "<id>", required: true })],
   },
   {
     name: "session show",
