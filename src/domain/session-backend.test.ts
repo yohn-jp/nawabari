@@ -18,6 +18,22 @@ import {
 import type { SandboxProbe } from "./sandbox.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import { resolveBuiltinWorktreeProfile } from "./worktree-profile-builtins.js";
+import type { SessionHookMaterialAuthority } from "../session-registry.js";
+
+test("local session backend passes the same explicit hook material authority to every registry", () => {
+  const repositoryPath = createRepository();
+  try {
+    const authority: SessionHookMaterialAuthority = () => ({ available: false });
+    const backend = new LocalSessionBackend({ hookMaterialAuthority: authority });
+    const first = backend["registryFor"]({ cwd: repositoryPath });
+    const second = backend["registryFor"]({ cwd: repositoryPath });
+    assert.equal(first.hookMaterialAuthority, authority);
+    assert.equal(second.hookMaterialAuthority, authority);
+    assert.equal(new LocalSessionBackend()["registryFor"]({ cwd: repositoryPath }).hookMaterialAuthority, undefined);
+  } finally {
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
 
 test("local session backend binds default managed readiness to protected sandbox and cgroup scope authority", async () => {
   const repositoryPath = createRepository();

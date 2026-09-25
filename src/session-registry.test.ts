@@ -24,8 +24,37 @@ import {
   toPersistedSessionRecord,
   type ManagedExecutionReadinessRequest,
   type PersistedRegistry,
+  type SessionHookMaterialAuthority,
 } from "./session-registry.js";
 import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
+
+test("hook material authority is explicit and never serialized into registry state", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const material = Object.freeze({
+      kind: "tracked-blob" as const,
+      path: "hooks/pre-commit",
+      source: "/approved/hooks/pre-commit",
+      target: "/nawabari/git/hooks/pre-commit",
+      digest: "a".repeat(64),
+    });
+    const authority: SessionHookMaterialAuthority = () => ({ available: true, material });
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath, hookMaterialAuthority: authority });
+    assert.equal(registry.hookMaterialAuthority, authority);
+    registry.create();
+    const persisted = fs.readFileSync(registry.paths.registry, "utf8");
+    assert.equal(persisted.includes("hookMaterialAuthority"), false);
+    assert.equal(persisted.includes(material.source), false);
+    assert.equal(persisted.includes(material.digest), false);
+
+    fs.mkdirSync(path.join(fixture.repositoryPath, ".git", "hooks"), { recursive: true });
+    fs.writeFileSync(path.join(fixture.repositoryPath, ".git", "hooks", "pre-commit"), "ambient hook");
+    const absent = new SessionRegistry({ cwd: fixture.repositoryPath });
+    assert.equal(absent.hookMaterialAuthority, undefined);
+  } finally {
+    fixture.cleanup();
+  }
+});
 
 test("round-trips session metadata through common Git state", () => {
   const fixture = createRepositoryFixture();
