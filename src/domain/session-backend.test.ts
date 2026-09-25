@@ -17,9 +17,11 @@ import {
 } from "./session-execution-record.js";
 import type { SandboxProbe } from "./sandbox.js";
 import { LocalSessionBackend } from "./session-backend.js";
+import { resolveBuiltinWorktreeProfile } from "./worktree-profile-builtins.js";
 
 test("local session backend binds default managed readiness to protected sandbox and cgroup scope authority", async () => {
   const repositoryPath = createRepository();
+  const profile = installBoundedManagedProfile(repositoryPath);
   const worktreePath = `${repositoryPath}-domain-managed-readiness`;
   const readySandbox: SandboxProbe = {
     platform: () => "linux",
@@ -38,7 +40,7 @@ test("local session backend binds default managed readiness to protected sandbox
     label: null,
     base: null,
     ...boundedReadinessArtifacts(repositoryPath),
-    profile: { selection: { profile: "builtin:minimal" } },
+    profile: { selection: { profile } },
   };
   const unusableCgroups = readinessCgroupFixture({ failDelegation: true });
   const usableCgroups = readinessCgroupFixture();
@@ -120,6 +122,7 @@ test("local managed readiness fails closed on cgroup observation or cleanup unce
 
 test("local session backend preserves an explicitly injected managed readiness authority", async () => {
   const repositoryPath = createRepository();
+  const profile = installBoundedManagedProfile(repositoryPath);
   const worktreePath = `${repositoryPath}-domain-managed-readiness-injected`;
   const unusableCgroups = readinessCgroupFixture({ failDelegation: true });
   let readinessCalls = 0;
@@ -138,7 +141,7 @@ test("local session backend preserves an explicitly injected managed readiness a
         label: null,
         base: null,
         ...boundedReadinessArtifacts(repositoryPath),
-        profile: { selection: { profile: "builtin:minimal" } },
+        profile: { selection: { profile } },
       },
     );
     assert.equal(result.ok, true);
@@ -1192,6 +1195,39 @@ function createRepository(): string {
   runGit(["add", "README.md"], repositoryPath);
   runGit(["commit", "-m", "initial"], repositoryPath);
   return repositoryPath;
+}
+
+function installBoundedManagedProfile(repositoryPath: string): string {
+  const builtin = resolveBuiltinWorktreeProfile({ profile: "minimal" });
+  assert.equal(builtin.ok, true);
+  if (!builtin.ok) throw builtin.error;
+  const profileId = "repository:managed-readiness-test";
+  fs.writeFileSync(
+    path.join(repositoryPath, "nawabari.profiles.json"),
+    `${JSON.stringify(
+      {
+        profiles: [
+          {
+            ...builtin.value,
+            id: "managed-readiness-test",
+            extends: [],
+            filesystem: {
+              ...builtin.value.filesystem,
+              readOnly: ["README.md"],
+              write: [],
+              create: [],
+              delete: [],
+            },
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  runGit(["add", "nawabari.profiles.json"], repositoryPath);
+  runGit(["commit", "-m", "test: add bounded managed profile"], repositoryPath);
+  return profileId;
 }
 
 function boundedReadinessArtifacts(repositoryPath: string) {
