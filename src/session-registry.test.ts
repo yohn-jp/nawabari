@@ -18,6 +18,7 @@ import { resolveRepositoryContext } from "./git.js";
 import { RepositoryLock } from "./registry/lock.js";
 import { DomainError } from "./domain/errors.js";
 import { sandboxDoctorReport, type SandboxProbe } from "./domain/sandbox.js";
+import { resolveBuiltinWorktreeProfile } from "./domain/worktree-profile-builtins.js";
 import {
   SessionRegistry,
   toPersistedSessionRecord,
@@ -1190,6 +1191,7 @@ test("an explicit managed readiness authority authorizes bootstrap without chang
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-mr`);
   const branchName = "feature/managed-readiness-ready";
   try {
+    const profile = installBoundedManagedProfile(fixture.repositoryPath);
     const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
     const revision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
     const identity = { repositoryHost: "local", repositoryId: repository.repositoryId };
@@ -1229,14 +1231,14 @@ test("an explicit managed readiness authority authorizes bootstrap without chang
           },
         ],
       },
-      profile: { selection: { profile: "builtin:minimal" } },
+      profile: { selection: { profile } },
     });
     assert.equal(session.branchName, branchName);
     const persisted = readJson(registry.paths.registry) as {
       pinned_profiles?: readonly { resolved?: { id?: string; execution?: { processTracking?: string } } }[];
     };
     assert.equal(persisted.pinned_profiles?.length, 1);
-    assert.equal(persisted.pinned_profiles?.[0]?.resolved?.id, "minimal");
+    assert.equal(persisted.pinned_profiles?.[0]?.resolved?.id, "managed-readiness-test");
     assert.equal(persisted.pinned_profiles?.[0]?.resolved?.execution?.processTracking, "required");
   } finally {
     try {
@@ -1305,6 +1307,38 @@ function createRepositoryFixture(): RepositoryFixture {
       fs.rmSync(repositoryPath, { recursive: true, force: true });
     },
   };
+}
+
+function installBoundedManagedProfile(repositoryPath: string): string {
+  const builtin = resolveBuiltinWorktreeProfile({ profile: "minimal" });
+  assert.equal(builtin.ok, true);
+  if (!builtin.ok) throw builtin.error;
+  fs.writeFileSync(
+    path.join(repositoryPath, "nawabari.profiles.json"),
+    `${JSON.stringify(
+      {
+        profiles: [
+          {
+            ...builtin.value,
+            id: "managed-readiness-test",
+            extends: [],
+            filesystem: {
+              ...builtin.value.filesystem,
+              readOnly: ["README.md"],
+              write: [],
+              create: [],
+              delete: [],
+            },
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  runGit(["add", "nawabari.profiles.json"], repositoryPath);
+  runGit(["commit", "-m", "test: add bounded managed profile"], repositoryPath);
+  return "repository:managed-readiness-test";
 }
 
 function makeDirectory(prefix: string): string {
