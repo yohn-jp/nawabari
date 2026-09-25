@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -98,8 +99,22 @@ import {
   type OwnedExecutionObservation,
   type SessionExecutionRecord as OwnedSessionExecutionRecord,
 } from "./session-process-observation.js";
-import { CGROUPS_V2_CONTRACT_ID, CGROUPS_V2_ROOT, deriveCgroupScopeName, type CgroupFileSystem } from "./cgroups-v2.js";
-import type { SandboxGitIdentity, SandboxProbe } from "./sandbox.js";
+import {
+  CGROUPS_V2_CONTRACT_ID,
+  CGROUPS_V2_ROOT,
+  cleanupCgroupScope,
+  createCgroupScope,
+  deriveCgroupScopeName,
+  readCgroupPopulation,
+  type CgroupFileSystem,
+} from "./cgroups-v2.js";
+import {
+  defaultSandboxProbe,
+  discoverSandboxRuntimeLayout,
+  sandboxDoctorReport,
+  type SandboxGitIdentity,
+  type SandboxProbe,
+} from "./sandbox.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
@@ -221,8 +236,13 @@ export class LocalSessionBackend implements SessionBackend {
     this.git = options.git;
     this.gitIdentity = options.gitIdentity;
     this.sandboxProbe = options.sandboxProbe;
-    this.managedExecutionReadiness = options.managedExecutionReadiness;
     this.registryOptions = options.registry ?? {};
+    this.managedExecutionReadiness =
+      options.managedExecutionReadiness ??
+      createLocalManagedExecutionReadiness(
+        this.sandboxProbe ?? this.registryOptions.sandboxProbe,
+        this.registryOptions.cgroupFilesystem,
+      );
   }
 
   public async listSessionExecutions(
@@ -866,6 +886,48 @@ export class LocalSessionBackend implements SessionBackend {
       managedExecutionReadiness: this.managedExecutionReadiness,
     });
   }
+}
+
+function createLocalManagedExecutionReadiness(
+  probe: SandboxProbe | undefined,
+  filesystem: CgroupFileSystem | undefined,
+): ManagedExecutionReadiness {
+  return () => {
+    try {
+      const doctor = sandboxDoctorReport(probe ?? defaultSandboxProbe, discoverSandboxRuntimeLayout());
+      if (!doctor.ready) return { ready: false };
+
+      const created = createCgroupScope(
+        { session_id: "nawabari-managed-readiness", execution_id: `readiness-${crypto.randomUUID()}` },
+        filesystem === undefined ? {} : { filesystem },
+      );
+      if (!created.ok) return { ready: false };
+
+      let population: ReturnType<typeof readCgroupPopulation> | undefined;
+      try {
+        population = readCgroupPopulation(created.value, filesystem);
+      } catch {
+        // The scope is still cleaned below, but uncertain observation is not readiness.
+      }
+
+      let cleaned: ReturnType<typeof cleanupCgroupScope> | undefined;
+      try {
+        cleaned = cleanupCgroupScope(created.value, filesystem);
+      } catch {
+        return { ready: false };
+      }
+
+      return {
+        ready:
+          population?.state === "empty" &&
+          cleaned?.ok === true &&
+          cleaned.value.removed &&
+          cleaned.value.after_population.state === "empty",
+      };
+    } catch {
+      return { ready: false };
+    }
+  };
 }
 
 export function createLocalSessionBackend(options: LocalSessionBackendOptions = {}): SessionBackend {

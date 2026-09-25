@@ -132,7 +132,7 @@ import {
 } from "./domain/worktree-profile-pinning.js";
 import { resolveWorktreeProfileRuntime } from "./domain/worktree-profile-runtime.js";
 import { resolveProfileRuntimeScope } from "./domain/worktree-profile-scope.js";
-import { defaultSandboxProbe, discoverSandboxRuntimeLayout, sandboxDoctorReport } from "./domain/sandbox.js";
+import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
 import type { WorktreeProfileSessionCreateOptions } from "./domain/session.js";
 import {
   parseSessionExecutionRecord,
@@ -2354,26 +2354,6 @@ export class SessionRegistry {
     initialClaims: readonly ResourceClaimInput[] | undefined,
   ): void {
     const runtimeLayout = discoverSandboxRuntimeLayout();
-    const doctor = sandboxDoctorReport(defaultSandboxProbe, runtimeLayout);
-    if (!doctor.ready) {
-      throw new DomainError(
-        doctor.platform_supported ? "SANDBOX_CAPABILITY_UNAVAILABLE" : "SANDBOX_UNSUPPORTED_PLATFORM",
-        "Managed profile bootstrap requires the supported protected execution controller.",
-        {
-          profile_id: pin.resolved.id,
-          platform: doctor.platform,
-          platform_supported: doctor.platform_supported,
-          missing_required: doctor.missing_required,
-        },
-      );
-    }
-    if (!defaultSandboxProbe.hasCgroupsV2()) {
-      throw new DomainError(
-        "SANDBOX_CAPABILITY_UNAVAILABLE",
-        "Managed profile bootstrap requires cgroups v2 for durable execution ownership and quiescence.",
-        { profile_id: pin.resolved.id, capability: "cgroups_v2" },
-      );
-    }
     const runtime = resolveWorktreeProfileRuntime(pin.resolved, runtimeLayout);
     if (!runtime.ok) throw runtime.error;
 
