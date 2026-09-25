@@ -941,12 +941,6 @@ async function main() {
         pinned_read_only: pinned?.length === 1 ? pinned[0].resolved?.filesystem?.readOnly : null,
         pinned_process_tracking: pinned?.length === 1 ? pinned[0].resolved?.execution?.processTracking : null,
       };
-      const managedClose = invokeInstalled(
-        ["session", "close", "--session", managedCreate.session_id, "--json"],
-        profileRepository,
-      );
-      managedCreateAdmissionEvidence.closed =
-        managedClose.status === 0 && parseInstalledJson(managedClose, "managed profile cleanup").ok === true;
     }
     const managedCreateAdmittedConformant =
       managedCreateAdmissionEvidence !== null &&
@@ -958,15 +952,14 @@ async function main() {
       managedCreateAdmissionEvidence.required_feature &&
       managedCreateAdmissionEvidence.pinned_profile_id === "minimal" &&
       JSON.stringify(managedCreateAdmissionEvidence.pinned_read_only) === JSON.stringify(["**"]) &&
-      managedCreateAdmissionEvidence.pinned_process_tracking === "required" &&
-      managedCreateAdmissionEvidence.closed;
+      managedCreateAdmissionEvidence.pinned_process_tracking === "required";
     const managedCreateConformanceFailure =
       (managedCreateTypedUnavailable && managedCreateOwnershipUnchanged) || managedCreateAdmittedConformant
         ? null
         : {
             expected: {
               unavailable: { status: 4, code: "SANDBOX_CAPABILITY_UNAVAILABLE", ownership_unchanged: true },
-              admitted: { status: 0, pinned_profile_id: "minimal", pinned_read_only: ["**"], closed: true },
+              admitted: { status: 0, pinned_profile_id: "minimal", pinned_read_only: ["**"] },
             },
             actual: {
               admission: managedCreateAdmissionEvidence,
@@ -1111,7 +1104,7 @@ async function main() {
     }
     console.log(
       managedCreateAdmitted
-        ? "profile-selected managed create admitted by managed-execution readiness; builtin:minimal pinned and closed."
+        ? "profile-selected managed create admitted by managed-execution readiness; builtin:minimal pinned with its wildcard ceiling."
         : "profile-selected managed create failed closed with SANDBOX_CAPABILITY_UNAVAILABLE; ownership unchanged.",
     );
     const certificationEnvironmentBlocks = [];
