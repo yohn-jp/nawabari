@@ -24,6 +24,26 @@ jobs:
     permissions:
       contents: read
 
+  linux-system-e2e:
+    needs: changes
+    if: needs.changes.outputs.release_docs_only != 'true'
+    name: Linux system E2E
+    uses: yohn-jp/.github/.github/workflows/linux-system-e2e.yml@main
+    with:
+      pre-command: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y bubblewrap
+        if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        sudo cp "$(command -v node)" /usr/bin/node
+        echo "NAWABARI_TEST_FHS_NODE_INTERPRETER=/usr/bin/node" >> "$GITHUB_ENV"
+      command: pnpm run verify
+      timeout-minutes: 40
+    permissions:
+      contents: read
+
   changes:
     name: detect release-docs-only change
     runs-on: ubuntu-latest
