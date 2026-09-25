@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 import { runCli } from "../cli.js";
 import { SessionRegistry } from "../session-registry.js";
+import type { CgroupFileSystem } from "./cgroups-v2.js";
 import { withDirectoryFsyncFailure } from "../testing/fs-fault-injection.js";
 import {
   recordExecutionState,
@@ -16,7 +17,7 @@ import {
 import type { SandboxProbe } from "./sandbox.js";
 import { LocalSessionBackend } from "./session-backend.js";
 
-test("local session backend propagates only the explicit managed readiness authority", async () => {
+test("local session backend binds default managed readiness to protected sandbox and cgroup scope authority", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-domain-managed-readiness`;
   const readySandbox: SandboxProbe = {
@@ -37,27 +38,109 @@ test("local session backend propagates only the explicit managed readiness autho
     base: null,
     profile: { selection: { profile: "builtin:minimal" } },
   };
+  const unusableCgroups = readinessCgroupFixture({ failDelegation: true });
+  const usableCgroups = readinessCgroupFixture();
   try {
     const registryPath = new SessionRegistry({ cwd: repositoryPath }).paths.registry;
-    const unavailable = await new LocalSessionBackend({ sandboxProbe: readySandbox }).createSession(
-      { cwd: repositoryPath },
-      options,
-    );
+    const unavailable = await new LocalSessionBackend({
+      sandboxProbe: readySandbox,
+      registry: { cgroupFilesystem: unusableCgroups.filesystem },
+    }).createSession({ cwd: repositoryPath }, options);
     assert.equal(unavailable.ok, false);
     if (!unavailable.ok) {
       assert.equal(unavailable.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
       assert.equal(unavailable.error.exitCode, 4);
     }
+    assert.equal(unusableCgroups.scopeCreateCount, 0);
     assert.equal(fs.existsSync(registryPath), false);
     assert.equal(runGit(["branch", "--list", options.branch], repositoryPath), "");
     assert.equal(fs.existsSync(worktreePath), false);
 
     const authorized = await new LocalSessionBackend({
       sandboxProbe: readySandbox,
-      managedExecutionReadiness: () => ({ ready: true }),
+      registry: { cgroupFilesystem: usableCgroups.filesystem },
     }).createSession({ cwd: repositoryPath }, options);
     assert.equal(authorized.ok, true);
     if (authorized.ok) assert.equal(authorized.value.branch, options.branch);
+    assert.equal(usableCgroups.scopeCreateCount, 1);
+    assert.equal(usableCgroups.scopeCleanupCount, 1);
+    assert.equal(usableCgroups.activeScopeCount, 0);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("local managed readiness fails closed on cgroup observation or cleanup uncertainty", async () => {
+  for (const failure of ["observation", "cleanup"] as const) {
+    const repositoryPath = createRepository();
+    const worktreePath = `${repositoryPath}-domain-managed-readiness-${failure}`;
+    const cgroups = readinessCgroupFixture({
+      ...(failure === "observation" ? { failObservation: true } : { failCleanup: true }),
+    });
+    const branch = `feature/domain-managed-readiness-${failure}`;
+    try {
+      const result = await new LocalSessionBackend({
+        sandboxProbe: {
+          platform: () => "linux",
+          uid: () => 1000,
+          gid: () => 1000,
+          hasBubblewrap: () => true,
+          hasNamespaceSupport: () => true,
+          hasCgroupsV2: () => true,
+          hasLandlock: () => true,
+          hasSeccomp: () => true,
+          hasCapabilities: () => true,
+        },
+        registry: { cgroupFilesystem: cgroups.filesystem },
+      }).createSession(
+        { cwd: repositoryPath },
+        {
+          branch,
+          worktree: worktreePath,
+          label: null,
+          base: null,
+          profile: { selection: { profile: "builtin:minimal" } },
+        },
+      );
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+      assert.equal(cgroups.scopeCreateCount, 1);
+      assert.equal(fs.existsSync(new SessionRegistry({ cwd: repositoryPath }).paths.registry), false);
+      assert.equal(runGit(["branch", "--list", branch], repositoryPath), "");
+      assert.equal(fs.existsSync(worktreePath), false);
+    } finally {
+      removeWorktree(repositoryPath, worktreePath);
+      fs.rmSync(repositoryPath, { recursive: true, force: true });
+    }
+  }
+});
+
+test("local session backend preserves an explicitly injected managed readiness authority", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-domain-managed-readiness-injected`;
+  const unusableCgroups = readinessCgroupFixture({ failDelegation: true });
+  let readinessCalls = 0;
+  try {
+    const result = await new LocalSessionBackend({
+      managedExecutionReadiness: () => {
+        readinessCalls += 1;
+        return { ready: true };
+      },
+      registry: { cgroupFilesystem: unusableCgroups.filesystem },
+    }).createSession(
+      { cwd: repositoryPath },
+      {
+        branch: "feature/domain-managed-readiness-injected",
+        worktree: worktreePath,
+        label: null,
+        base: null,
+        profile: { selection: { profile: "builtin:minimal" } },
+      },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(readinessCalls, 1);
+    assert.equal(unusableCgroups.scopeCreateCount, 0);
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });
@@ -1106,6 +1189,86 @@ function createRepository(): string {
   runGit(["add", "README.md"], repositoryPath);
   runGit(["commit", "-m", "initial"], repositoryPath);
   return repositoryPath;
+}
+
+function readinessCgroupFixture(
+  options: {
+    readonly failDelegation?: boolean;
+    readonly failObservation?: boolean;
+    readonly failCleanup?: boolean;
+  } = {},
+): {
+  readonly filesystem: CgroupFileSystem;
+  readonly scopeCreateCount: number;
+  readonly scopeCleanupCount: number;
+  readonly activeScopeCount: number;
+} {
+  const root = "/sys/fs/cgroup";
+  const directories = new Set([root]);
+  const files = new Map<string, string>([[path.join(root, "cgroup.controllers"), "cpu memory pids\n"]]);
+  const scopes = new Set<string>();
+  let scopeCreateCount = 0;
+  let scopeCleanupCount = 0;
+  const filesystem: CgroupFileSystem = {
+    statSync: (file) => ({
+      isDirectory: () => directories.has(file),
+      isFile: () => files.has(file),
+    }),
+    realpathSync: (file) => {
+      if (!directories.has(file)) throw new Error(`missing directory: ${file}`);
+      return file;
+    },
+    readFileSync: (file) => {
+      if (options.failObservation && scopes.has(path.dirname(file)) && path.basename(file) === "cgroup.events") {
+        throw new Error("cgroup population observation unavailable");
+      }
+      const value = files.get(file);
+      if (value === undefined) throw new Error(`missing file: ${file}`);
+      return value;
+    },
+    writeFileSync: (file, value) => {
+      if (options.failDelegation && path.basename(file) === "cgroup.subtree_control") {
+        throw new Error("cgroup delegation unavailable");
+      }
+      files.set(file, value);
+    },
+    mkdirSync: (file) => {
+      if (directories.has(file)) throw Object.assign(new Error(`already exists: ${file}`), { code: "EEXIST" });
+      if (!directories.has(path.dirname(file))) throw new Error(`missing parent: ${file}`);
+      directories.add(file);
+      if (path.basename(file) === "nawabari") {
+        files.set(path.join(file, "cgroup.subtree_control"), "");
+      } else if (path.basename(file).startsWith("nawabari-")) {
+        scopeCreateCount += 1;
+        scopes.add(file);
+        files.set(path.join(file, "cgroup.events"), "populated 0\n");
+        files.set(path.join(file, "cgroup.procs"), "");
+      }
+    },
+    rmdirSync: (file) => {
+      if (scopes.has(file)) {
+        scopeCleanupCount += 1;
+        if (options.failCleanup) throw new Error("cgroup scope cleanup unavailable");
+        scopes.delete(file);
+        for (const candidate of files.keys()) {
+          if (candidate.startsWith(`${file}${path.sep}`)) files.delete(candidate);
+        }
+      }
+      directories.delete(file);
+    },
+  };
+  return {
+    filesystem,
+    get scopeCreateCount() {
+      return scopeCreateCount;
+    },
+    get scopeCleanupCount() {
+      return scopeCleanupCount;
+    },
+    get activeScopeCount() {
+      return [...scopes].filter((scope) => directories.has(scope)).length;
+    },
+  };
 }
 
 function removeWorktree(repositoryPath: string, worktreePath: string): void {
