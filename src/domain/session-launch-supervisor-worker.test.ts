@@ -207,12 +207,14 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
   }
   const { supervisor: supervisorEntrypoint } = await ensureFreshCompiledPackage();
   const compiledSupervisor = (await import(pathToFileURL(supervisorEntrypoint).href)) as CompiledSupervisorModule;
-  const marker = path.join(os.tmpdir(), `nawabari-451-descendant-${process.pid}-${Date.now()}.txt`);
-  const release = path.join(os.tmpdir(), `nawabari-451-descendant-release-${process.pid}-${Date.now()}.txt`);
-  const seccompFd = fs.openSync("/dev/null", "r");
+  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-451-descendant-"));
+  const marker = path.join(tempDirectory, "marker.txt");
+  const release = path.join(tempDirectory, "release.txt");
+  let seccompFd: number | null = null;
   let scopeCreated = false;
   let runPromise: Promise<CompiledSupervisorResult> | null = null;
   try {
+    seccompFd = fs.openSync("/dev/null", "r");
     let runScope: CgroupScope | null = null;
     runPromise = compiledSupervisor.runSessionLaunchSupervisor({
       admission: reservation,
@@ -310,9 +312,8 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
     if (outcome.ok) assert.equal(outcome.value.status, "completed");
   } finally {
     fs.writeFileSync(release, "release");
-    fs.rmSync(marker, { force: true });
     if (runPromise !== null) await runPromise.catch(() => undefined);
-    fs.rmSync(release, { force: true });
-    fs.closeSync(seccompFd);
+    if (seccompFd !== null) fs.closeSync(seccompFd);
+    fs.rmSync(tempDirectory, { recursive: true, force: true });
   }
 });
