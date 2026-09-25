@@ -366,18 +366,40 @@ function provider(value: unknown, field: string): DomainResult<RuntimeExecutable
 }
 
 function currentDigest(source: string, field: string, requireExecutable: boolean): DomainResult<string> {
+  let descriptor: number | undefined;
   try {
-    const stat = fs.lstatSync(source);
-    if (stat.isSymbolicLink()) return invalid(field, "material must not be a symbolic link", source);
+    descriptor = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(descriptor);
+    if (fs.readlinkSync(`/proc/self/fd/${descriptor}`) !== source) {
+      return invalid(field, "material resolves through a symlink", source);
+    }
     if (!stat.isFile()) return invalid(field, "material must be a regular file", source);
     if (stat.size > MAX_HOOK_BYTES) return invalid(field, "material exceeds the bounded hook size", source);
     if (requireExecutable && (stat.mode & 0o111) === 0) {
       return invalid(field, "material must be executable", source);
     }
-    if (fs.realpathSync.native(source) !== source) return invalid(field, "material resolves through a symlink", source);
-    return success(createHash("sha256").update(fs.readFileSync(source)).digest("hex"));
+    const bytes = Buffer.allocUnsafe(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(descriptor, bytes, offset, bytes.length - offset, offset);
+      if (count === 0) return invalid(field, "material changed while being read", source);
+      offset += count;
+    }
+    const after = fs.fstatSync(descriptor);
+    if (
+      after.dev !== stat.dev ||
+      after.ino !== stat.ino ||
+      after.size !== stat.size ||
+      after.mtimeMs !== stat.mtimeMs ||
+      after.ctimeMs !== stat.ctimeMs
+    ) {
+      return invalid(field, "material changed while being read", source);
+    }
+    return success(createHash("sha256").update(bytes).digest("hex"));
   } catch {
     return invalid(field, "material is missing or unreadable", source);
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
   }
 }
 

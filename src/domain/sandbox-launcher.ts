@@ -23,6 +23,11 @@ import {
 } from "./sandbox-seccomp.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import {
+  materializeSessionGitConfig,
+  resolveSessionHookSet,
+  SESSION_GIT_DISABLED_HOOKS_PATH,
+} from "./session-git-hooks.js";
+import {
   SESSION_RUNTIME_LOGICAL_CACHE_HOME,
   SESSION_RUNTIME_LOGICAL_CONFIG_HOME,
   SESSION_RUNTIME_LOGICAL_DATA_HOME,
@@ -1129,8 +1134,12 @@ function readRepoLocalGitIdentityValue(key: "user.name" | "user.email", worktree
   }
 }
 
-/** Write exactly one key into the session-private Git config file. */
-function writeProjectedGitIdentityValue(configPath: string, key: "user.name" | "user.email", value: string): void {
+/** Write exactly one canonical key into the session-private Git config file. */
+function writeSessionGitConfigValue(
+  configPath: string,
+  key: "core.hooksPath" | "user.name" | "user.email",
+  value: string,
+): void {
   execFileSync("git", ["config", "--file", configPath, key, value], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -1139,21 +1148,41 @@ function writeProjectedGitIdentityValue(configPath: string, key: "user.name" | "
 }
 
 /**
- * Project the minimum Git author identity a commit needs: `user.name` and
- * `user.email`. Repository-local identity on the authoritative host worktree
- * takes precedence, per key, over the host's projected global identity; the
- * host's full global/system config, credentials, hooks, and aliases are
- * never imported. Absent identity is left unset so commit semantics fail
- * closed exactly as an unconfigured Git would.
+ * Project the canonical private Git config and explicit hook set. The generic
+ * launch path has no upper profile and always uses the inert hooks path.
  */
-function projectGitIdentity(request: SandboxExecutionRequest, topology: ValidatedTopology): void {
-  const resolvedName =
-    readRepoLocalGitIdentityValue("user.name", topology.worktree) ?? request.git_identity.host_global_name;
-  const resolvedEmail =
-    readRepoLocalGitIdentityValue("user.email", topology.worktree) ?? request.git_identity.host_global_email;
+function projectGitConfig(request: SandboxExecutionRequest, topology: ValidatedTopology): DomainResult<null> {
   const configPath = path.join(topology.git_metadata, "config");
-  if (resolvedName !== null) writeProjectedGitIdentityValue(configPath, "user.name", resolvedName);
-  if (resolvedEmail !== null) writeProjectedGitIdentityValue(configPath, "user.email", resolvedEmail);
+  if (request.git_profile === undefined) {
+    writeSessionGitConfigValue(configPath, "core.hooksPath", SESSION_GIT_DISABLED_HOOKS_PATH);
+    const name = readRepoLocalGitIdentityValue("user.name", topology.worktree) ?? request.git_identity.host_global_name;
+    const email =
+      readRepoLocalGitIdentityValue("user.email", topology.worktree) ?? request.git_identity.host_global_email;
+    if (name !== null) writeSessionGitConfigValue(configPath, "user.name", name);
+    if (email !== null) writeSessionGitConfigValue(configPath, "user.email", email);
+    return success(null);
+  }
+  const hooks = resolveSessionHookSet(request.git_profile, request.hook_material);
+  if (!hooks.ok) return hooks;
+  if (hooks.value.mode === "governed") {
+    const directory = path.join(topology.git_metadata, "hooks");
+    fs.rmSync(directory, { recursive: true, force: true });
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    for (const hook of hooks.value.hooks) {
+      fs.symlinkSync(hook.command, path.join(directory, hook.event));
+    }
+  }
+  const config = materializeSessionGitConfig(request.git_profile, {
+    repository_local_name: readRepoLocalGitIdentityValue("user.name", topology.worktree),
+    repository_local_email: readRepoLocalGitIdentityValue("user.email", topology.worktree),
+    host_global_name: request.git_identity.host_global_name,
+    host_global_email: request.git_identity.host_global_email,
+  });
+  if (!config.ok) return config;
+  for (const [key, value] of Object.entries(config.value.config)) {
+    writeSessionGitConfigValue(configPath, key as "core.hooksPath" | "user.name" | "user.email", value);
+  }
+  return success(null);
 }
 
 function prepareGitMetadata(request: SandboxExecutionRequest, topology: ValidatedTopology): DomainResult<null> {
@@ -1194,7 +1223,8 @@ function prepareGitMetadata(request: SandboxExecutionRequest, topology: Validate
     if (!fs.existsSync(path.join(topology.git_metadata, "HEAD"))) {
       fs.writeFileSync(path.join(topology.git_metadata, "HEAD"), "ref: refs/heads/main\n", { mode: 0o600 });
     }
-    projectGitIdentity(request, topology);
+    const projected = projectGitConfig(request, topology);
+    if (!projected.ok) return projected;
     return success(null);
   } catch (error: unknown) {
     return topologyError("Session-private Git metadata could not be prepared.", {
@@ -1470,6 +1500,22 @@ export function compileSandboxInvocation(
   }
   for (const projection of executableProjection.value) {
     addExecutableProjectionBind(args, projection, seenDirectories);
+  }
+  if (request.git_profile?.git.hooks === "governed") {
+    const hooks = resolveSessionHookSet(request.git_profile, request.hook_material);
+    if (!hooks.ok) return hooks;
+    const material = hooks.value.hooks[0]?.material;
+    if (material === undefined || material.target.startsWith("/nawabari/git/")) {
+      return topologyError("Governed hook material has an invalid sandbox target.", { session_id: request.session_id });
+    }
+    const projected = executableProjection.value.find((entry) => entry.target === material.target);
+    if (projected !== undefined && projected.source !== material.source) {
+      return topologyError("Governed hook material differs from the projected executable.", {
+        session_id: request.session_id,
+        target: material.target,
+      });
+    }
+    if (projected === undefined) addReadOnlyBind(args, material.source, material.target, seenDirectories);
   }
 
   for (const parent of destinationParents(worktreeDestination)) {

@@ -35,7 +35,15 @@ import {
   resolveAuxiliaryStateTrackedPathEvidence,
 } from "./domain/auxiliary-state-projection.js";
 import { DomainError } from "./domain/errors.js";
-import type { SessionHookMaterial } from "./domain/session-git-hooks.js";
+import {
+  materializeSessionGitConfig,
+  resolveSessionHookSet,
+  runGovernedHook,
+  type GovernedHookEvent,
+  type SessionGitConfig,
+  type SessionHookMaterial,
+} from "./domain/session-git-hooks.js";
+import { spawnSync } from "node:child_process";
 import { compileWorkingSetRuntimeProjection } from "./domain/working-set-runtime-projection.js";
 import {
   composeEffectiveWorkingSet,
@@ -1257,12 +1265,18 @@ export class SessionRegistry {
     const pinnedRecord = (state.runtimeRecords.records.pinned_profiles ?? []).find(
       (candidate) => candidate.session_id === sessionId,
     );
+    const profile = pinnedRecord === undefined ? null : parsePinnedProfileRecord(pinnedRecord);
+    const supplied =
+      profile?.resolved.git.hooks === "governed"
+        ? this.hookMaterialAuthority?.({ sessionId, pinnedProfile: profile })
+        : undefined;
     return Object.freeze({
       runtime_epoch: state.runtimeEpoch,
       registry_revision: state.registryRevision,
       claim_set_generation: state.claimSetGeneration,
       admission: admissionRecord === undefined ? null : parseSessionAdmissionRecord(admissionRecord),
-      profile: pinnedRecord === undefined ? null : parsePinnedProfileRecord(pinnedRecord),
+      profile,
+      hook_material: supplied?.available === true ? supplied.material : null,
       ...(executionId === undefined
         ? {}
         : { runtime_environment_identity: this.sessionRuntimeEnvironmentIdentity(sessionId, executionId) }),
@@ -3089,6 +3103,12 @@ export class SessionRegistry {
     // lock hostage while it backtracks.
     const messagePattern = options.messagePattern ?? options.message_pattern ?? null;
     assertFinalCommitMessage(options.message, messagePattern);
+    const gitConfig = this.prepareSessionGitMutation(
+      "pre-commit",
+      operationSessionId(options.sessionId, options.session_id),
+      options.resources ?? options.paths ?? [],
+      options.allClaimed === true || options.all_claimed === true,
+    );
 
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
@@ -3153,7 +3173,7 @@ export class SessionRegistry {
       try {
         runMutationGit(
           this.git,
-          commitGitArguments(this.git, initial.worktreePath, this.gitIdentity, options.message),
+          commitGitArguments(this.git, initial.worktreePath, this.gitIdentity, options.message, gitConfig),
           initial.worktreePath,
           "commit",
           "COMMIT_FAILED",
@@ -3295,6 +3315,12 @@ export class SessionRegistry {
 
   /** Push the currently owned branch to an explicit remote/branch target. */
   push(options: PushOptions): PushResult {
+    const gitConfig = this.prepareSessionGitMutation(
+      "pre-push",
+      operationSessionId(options.sessionId, options.session_id),
+      options.resources ?? [],
+      options.allClaimed === true || options.all_claimed === true,
+    );
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
       const allClaimed = options.allClaimed === true || options.all_claimed === true;
@@ -3374,6 +3400,7 @@ export class SessionRegistry {
       const targetRef = `refs/heads/${branch}`;
       const leaseValue = inspection.observedRemoteSha ?? "";
       const pushArguments = [
+        ...(gitConfig === undefined ? [] : ["-c", "core.hooksPath=/dev/null"]),
         "push",
         // Exact-generation CAS is required for every push mutation. The
         // force authorization check above remains independent: force is only
@@ -3434,6 +3461,57 @@ export class SessionRegistry {
 
   pushSession(options: PushOptions): PushResult {
     return this.push(options);
+  }
+
+  /** Resolve the pinned #618 material and run the approved event before taking the mutation lock. */
+  private prepareSessionGitMutation(
+    event: GovernedHookEvent,
+    requestedSessionId: string | null | undefined,
+    resources: readonly string[],
+    allClaimed: boolean,
+  ): SessionGitConfig | undefined {
+    const sessionId = requestedSessionId ?? this.resolveCurrentSession().sessionId;
+    const runtime = this.getSessionManagedRuntime(sessionId);
+    if (runtime.profile === null) return undefined;
+    const profile = runtime.profile.resolved;
+    const hooks = resolveSessionHookSet(profile, runtime.hook_material);
+    if (!hooks.ok) throw hooks.error;
+    const session = this.get(sessionId);
+    if (session === undefined)
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`);
+    const config = materializeSessionGitConfig(profile, {
+      repository_local_name: readLocalGitIdentityValue(this.git, "user.name", session.worktreePath),
+      repository_local_email: readLocalGitIdentityValue(this.git, "user.email", session.worktreePath),
+      host_global_name: this.gitIdentity?.host_global_name ?? null,
+      host_global_email: this.gitIdentity?.host_global_email ?? null,
+    });
+    if (!config.ok) throw config.error;
+    if (hooks.value.mode === "governed") {
+      const mutation = event === "pre-commit" ? "commit" : "push";
+      if (allClaimed && resources.length > 0) {
+        throw new SessionRegistryError("INVALID_RESOURCE", "--all-claimed cannot be combined with explicit resources");
+      }
+      const selectedResources = this.withLock(() => {
+        const selected = allClaimed ? this.resolveAllClaimedResourcesUnsafe(mutation, sessionId) : resources;
+        this.requireMutationAuthorization(mutation, selected, sessionId);
+        return selected;
+      });
+      const material = runtime.hook_material;
+      if (material === null)
+        throw new SessionRegistryError("OPERATION_REJECTED", "Approved hook material is unavailable");
+      const executed = runGovernedHook(event, {
+        hook_set: hooks.value,
+        session_id: sessionId,
+        cwd: session.worktreePath,
+        argv: selectedResources,
+        runner: (command, argv, options) => {
+          if (command !== material.target) throw new Error("Governed hook target changed");
+          return spawnSync(material.source, [...argv], { ...options, encoding: "utf8" });
+        },
+      });
+      if (!executed.ok) throw executed.error;
+    }
+    return config.value;
   }
 
   /**
@@ -7460,7 +7538,16 @@ function commitGitArguments(
   cwd: string,
   gitIdentity: SandboxGitIdentity | undefined,
   message: string,
+  sessionConfig?: SessionGitConfig,
 ): readonly string[] {
+  if (sessionConfig !== undefined) {
+    const identityArguments: string[] = [];
+    for (const [key, value] of Object.entries(sessionConfig.config)) {
+      if (key === "core.hooksPath") continue;
+      identityArguments.push("-c", `${key}=${value}`);
+    }
+    return ["-c", "core.hooksPath=/dev/null", ...identityArguments, "commit", "-m", message];
+  }
   const identityArguments: string[] = [];
   if (gitIdentity !== undefined) {
     const localName = readLocalGitIdentityValue(git, "user.name", cwd);

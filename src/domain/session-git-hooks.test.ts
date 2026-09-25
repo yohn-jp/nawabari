@@ -136,6 +136,22 @@ test("changed or mismatched provider bytes are rejected before hook admission", 
   }
 });
 
+test("hook material rejects a symlinked parent path before admitting opened bytes", () => {
+  const fixture = executableFixture();
+  const alias = path.join(fixture.root, "alias");
+  try {
+    fs.symlinkSync(path.dirname(fixture.source), alias);
+    const result = resolveSessionHookSet(profile(), {
+      ...providerMaterial(fixture),
+      source: path.join(alias, path.basename(fixture.source)),
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "RUNTIME_PROFILE_INVALID");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("tracked blob paths are repository-relative and cannot escape", () => {
   const fixture = executableFixture();
   try {

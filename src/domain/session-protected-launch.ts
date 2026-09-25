@@ -37,6 +37,7 @@ import {
 } from "./sandbox-launcher.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import { validateWorktreeRuntimeProfile, type ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
+import { resolveSessionHookSet } from "./session-git-hooks.js";
 import type { SessionBackend, SessionContext } from "./session.js";
 import { enterSessionConsole, type SessionConsoleEnterOptions } from "./session-console.js";
 
@@ -191,6 +192,11 @@ function validateInputIdentities(input: SessionProtectedLaunchInput): DomainResu
   if (!stdio.ok) return stdio;
   const profile = validateWorktreeRuntimeProfile(input.profile);
   if (!profile.ok) return failure(profile.error);
+  if (input.request.git_profile !== undefined && !sameJson(input.request.git_profile, profile.value)) {
+    return compositionFailure("INVALID_ARGUMENT", "The protected Git profile differs from the pinned upper profile.");
+  }
+  const hooks = resolveSessionHookSet(profile.value, input.request.hook_material);
+  if (!hooks.ok) return hooks;
   const manifest = validateSessionRuntimeDirectoryManifest(input.compiled_environment.manifest);
   if (!manifest.ok) return failure(manifest.error);
   if (manifest.value.profile.id !== profile.value.id || manifest.value.profile.version !== profile.value.version) {
@@ -335,6 +341,7 @@ export async function launchProtectedSessionExecution(
 
   const request: SandboxExecutionRequest = {
     ...input.request,
+    git_profile: identities.value.profile,
     compiled_session_environment: identities.value.environment,
   };
   let invocation: DomainResult<SandboxInvocation>;
