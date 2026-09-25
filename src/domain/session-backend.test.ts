@@ -1199,7 +1199,6 @@ function createRepository(): string {
 
 function installBoundedManagedProfile(repositoryPath: string): string {
   const builtin = resolveBuiltinWorktreeProfile({ profile: "minimal" });
-  assert.equal(builtin.ok, true);
   if (!builtin.ok) throw builtin.error;
   const profileId = "repository:managed-readiness-test";
   fs.writeFileSync(
