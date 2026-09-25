@@ -344,10 +344,6 @@ export function resolveProfileRuntimeScope(
   const requestsResult = pathRequests(pathEvidenceInput, defaults);
   if (!requestsResult.ok) return requestsResult;
   const requests = requestsResult.value;
-  if (requests.length === 0)
-    return success(
-      unsupported(profile, boundary, [], "profile scope requires finite explicit path evidence", "pathEvidence"),
-    );
   for (const required of defaults) {
     if (!requests.some((request) => request.path === required.path && request.operation === required.operation)) {
       return success(
