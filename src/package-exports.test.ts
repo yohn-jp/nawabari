@@ -3,6 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  inspectWorktreeProfile,
+  serializeWorktreeProfileInspection,
+  WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION,
+  WORKTREE_PROFILE_INSPECTION_SERIALIZATION_KEY,
+} from "./public-state.js";
 
 const packageJson = JSON.parse(
   fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../package.json"), "utf8"),
@@ -44,4 +50,11 @@ test("package.json has no wildcard/root export that would reopen deep internal i
     assert.doesNotMatch(key, /\*/u, `subpath "${key}" must not be a wildcard`);
   }
   assert.equal("." in exportsField, false, "no root export is declared");
+});
+
+test("public state export exposes the versioned read-only worktree profile inspection projection", () => {
+  assert.equal(typeof inspectWorktreeProfile, "function");
+  assert.equal(typeof serializeWorktreeProfileInspection, "function");
+  assert.equal(WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION, 1);
+  assert.equal(WORKTREE_PROFILE_INSPECTION_SERIALIZATION_KEY, "worktree-profile-inspection");
 });

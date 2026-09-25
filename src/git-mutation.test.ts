@@ -22,7 +22,7 @@ interface Fixture {
   cleanup(): void;
 }
 
-function createFixture(withRemote = false): Fixture {
+function createFixture(withRemote = false, claimEnforcement = false): Fixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-mutation-"));
   const worktree = `${root}-worktree`;
   let remote: string | undefined;
@@ -41,7 +41,11 @@ function createFixture(withRemote = false): Fixture {
     runGit(["push", "origin", "main:main"], root);
   }
   const registry = new SessionRegistry({ cwd: root });
-  const session = registry.provision({ worktreePath: worktree, branchName: "feature/mutation" });
+  const session = registry.provision({
+    worktreePath: worktree,
+    branchName: "feature/mutation",
+    ...(claimEnforcement ? { claimEnforcement: true } : {}),
+  });
   return {
     root,
     worktree,
@@ -144,7 +148,7 @@ test("commit --all-claimed resolves exact claims through concrete Git evidence i
 });
 
 test("commit --all-claimed preserves insufficient claim-mode denial and unexpected-path protection", () => {
-  const fixture = createFixture();
+  const fixture = createFixture(false, true);
   try {
     fs.writeFileSync(path.join(fixture.worktree, "unexpected.txt"), "unexpected\n");
     fixture.registry.claimResources({
@@ -307,7 +311,7 @@ test("push --all-claimed keeps exact claim semantics and fails closed for a non-
 });
 
 test("commit denies missing claims and does not mutate the worktree", () => {
-  const fixture = createFixture();
+  const fixture = createFixture(false, true);
   try {
     fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "denied\n");
     const before = runGit(["rev-parse", "HEAD"], fixture.worktree);
@@ -322,6 +326,30 @@ test("commit denies missing claims and does not mutate the worktree", () => {
     );
     assert.equal(runGit(["rev-parse", "HEAD"], fixture.worktree), before);
     assert.equal(runGit(["diff", "--cached", "--name-only"], fixture.worktree), "");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a default claim-less session commits and pushes without holding any resource claim", () => {
+  const fixture = createFixture(true);
+  try {
+    assert.equal(fixture.session.claimEnforcement, undefined);
+    fs.appendFileSync(path.join(fixture.worktree, "file.txt"), "claim-less\n");
+    const result = fixture.current.commit({
+      sessionId: fixture.session.sessionId,
+      message: "claim-less commit",
+      resources: ["file.txt"],
+    });
+    assert.deepEqual(result.resources, ["file.txt"]);
+    const pushed = fixture.current.push({
+      sessionId: fixture.session.sessionId,
+      resources: ["file.txt"],
+      remote: "origin",
+      branch: fixture.session.branchName,
+      createUpstream: true,
+    });
+    assert.equal(pushed.target, `origin/${fixture.session.branchName}`);
   } finally {
     fixture.cleanup();
   }

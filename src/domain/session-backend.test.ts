@@ -13,7 +13,56 @@ import {
   reserveExecution,
   toPersistedSessionExecutionRecord,
 } from "./session-execution-record.js";
+import type { SandboxProbe } from "./sandbox.js";
 import { LocalSessionBackend } from "./session-backend.js";
+
+test("local session backend propagates only the explicit managed readiness authority", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-domain-managed-readiness`;
+  const readySandbox: SandboxProbe = {
+    platform: () => "linux",
+    uid: () => 1000,
+    gid: () => 1000,
+    hasBubblewrap: () => true,
+    hasNamespaceSupport: () => true,
+    hasCgroupsV2: () => true,
+    hasLandlock: () => true,
+    hasSeccomp: () => true,
+    hasCapabilities: () => true,
+  };
+  const options = {
+    branch: "feature/domain-managed-readiness",
+    worktree: worktreePath,
+    label: null,
+    base: null,
+    profile: { selection: { profile: "builtin:minimal" } },
+  };
+  try {
+    const registryPath = new SessionRegistry({ cwd: repositoryPath }).paths.registry;
+    const unavailable = await new LocalSessionBackend({ sandboxProbe: readySandbox }).createSession(
+      { cwd: repositoryPath },
+      options,
+    );
+    assert.equal(unavailable.ok, false);
+    if (!unavailable.ok) {
+      assert.equal(unavailable.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+      assert.equal(unavailable.error.exitCode, 4);
+    }
+    assert.equal(fs.existsSync(registryPath), false);
+    assert.equal(runGit(["branch", "--list", options.branch], repositoryPath), "");
+    assert.equal(fs.existsSync(worktreePath), false);
+
+    const authorized = await new LocalSessionBackend({
+      sandboxProbe: readySandbox,
+      managedExecutionReadiness: () => ({ ready: true }),
+    }).createSession({ cwd: repositoryPath }, options);
+    assert.equal(authorized.ok, true);
+    if (authorized.ok) assert.equal(authorized.value.branch, options.branch);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
 
 test("local session backend provisions through the domain contract", async () => {
   const repositoryPath = createRepository();

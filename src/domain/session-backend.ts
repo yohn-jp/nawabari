@@ -5,6 +5,7 @@ import {
   type GarbageCollectResult as RegistryGarbageCollectResult,
   type ResourceClaim as RegistryResourceClaim,
   type SessionRecord as RegistrySessionRecord,
+  type ManagedExecutionReadiness,
   type SessionRegistryOptions,
 } from "../session-registry.js";
 import type { SessionLifecycleAction as RegistrySessionLifecycleAction } from "../session-lifecycle-actions.js";
@@ -69,7 +70,6 @@ import {
   type StatusResult,
   type UpdateClaimsOptions,
 } from "./session.js";
-import type { SandboxGitIdentity } from "./sandbox.js";
 import {
   parseSessionExecutionRecord,
   recordExecutionState,
@@ -99,12 +99,17 @@ import {
   type SessionExecutionRecord as OwnedSessionExecutionRecord,
 } from "./session-process-observation.js";
 import { CGROUPS_V2_CONTRACT_ID, CGROUPS_V2_ROOT, deriveCgroupScopeName, type CgroupFileSystem } from "./cgroups-v2.js";
+import type { SandboxGitIdentity, SandboxProbe } from "./sandbox.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
   /** Minimal host Git identity projected into governed commit operations. */
   readonly gitIdentity?: SandboxGitIdentity;
-  readonly registry?: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
+  /** Generic sandbox evidence; never managed-execution readiness. */
+  readonly sandboxProbe?: SandboxProbe;
+  /** Explicit managed-execution readiness authority; absence fails closed for required process tracking. */
+  readonly managedExecutionReadiness?: ManagedExecutionReadiness;
+  readonly registry?: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness">;
 }
 
 export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
@@ -205,11 +210,18 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
 export class LocalSessionBackend implements SessionBackend {
   private readonly git: SessionRegistryOptions["git"];
   private readonly gitIdentity: SandboxGitIdentity | undefined;
-  private readonly registryOptions: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
+  private readonly sandboxProbe: SandboxProbe | undefined;
+  private readonly managedExecutionReadiness: ManagedExecutionReadiness | undefined;
+  private readonly registryOptions: Omit<
+    SessionRegistryOptions,
+    "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness"
+  >;
 
   public constructor(options: LocalSessionBackendOptions = {}) {
     this.git = options.git;
     this.gitIdentity = options.gitIdentity;
+    this.sandboxProbe = options.sandboxProbe;
+    this.managedExecutionReadiness = options.managedExecutionReadiness;
     this.registryOptions = options.registry ?? {};
   }
 
@@ -337,6 +349,7 @@ export class LocalSessionBackend implements SessionBackend {
         ...(options.claims === null || options.claims === undefined
           ? {}
           : { initialClaims: options.claims.map(toRegistryClaimInput) }),
+        ...(options.claim_enforcement === true ? { claimEnforcement: true } : {}),
         ...(options.auxiliary_state === null || options.auxiliary_state === undefined
           ? {}
           : { auxiliaryState: options.auxiliary_state }),
@@ -849,6 +862,8 @@ export class LocalSessionBackend implements SessionBackend {
       cwd: context.cwd,
       git: this.git,
       gitIdentity: this.gitIdentity,
+      sandboxProbe: this.sandboxProbe,
+      managedExecutionReadiness: this.managedExecutionReadiness,
     });
   }
 }
@@ -1092,6 +1107,7 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
     ...(record.workingSet === undefined
       ? {}
       : { working_set: record.workingSet as unknown as import("./errors.js").JsonObject }),
+    ...(record.claimEnforcement === undefined ? {} : { claim_enforcement: record.claimEnforcement }),
   };
 }
 

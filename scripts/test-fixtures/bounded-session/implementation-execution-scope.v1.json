@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "kind": "implementation-execution-scope",
+  "authorization": {
+    "version": 1,
+    "kind": "implementation-authorization",
+    "contractVersion": 1,
+    "implementation": {
+      "repositoryHost": "github.com",
+      "repositoryId": "1329799765",
+      "repository": "yohn-jp/nawabari",
+      "number": 378
+    },
+    "governedBodyDigest": "dacdce2410e1e64f47a56a836350e60324c377a31e9f9bf07de689c8da113af5"
+  },
+  "repository": {
+    "repositoryHost": "github.com",
+    "repositoryId": "1329799765",
+    "repository": "yohn-jp/nawabari"
+  },
+  "base": {
+    "branch": "main",
+    "revision": "__BASE_REVISION__"
+  },
+  "scope": {
+    "readOnly": [
+      "bounded-session/visible-read.txt",
+      "bounded-session/mutable.txt",
+      "bounded-session/expanded-read.txt",
+      "bounded-session/verification-only.txt",
+      "bounded-session/recovery-only.txt"
+    ],
+    "write": ["bounded-session/mutable.txt"],
+    "create": [],
+    "delete": [],
+    "deny": []
+  }
+}

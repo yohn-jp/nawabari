@@ -31,6 +31,8 @@ export type SessionRecord = {
   discarded_head?: string;
   /** Established bounded execution visibility for governed sessions. */
   working_set?: JsonObject;
+  /** Present and true only when this session opted into resource-claim enforcement; absent means disabled. */
+  claim_enforcement?: boolean;
 };
 
 export type SessionContext = {
@@ -66,6 +68,8 @@ export type SessionCreateOptions = {
   base?: string | null;
   /** Explicit initial claims to commit with the provisioned session. */
   claims?: ResourceClaimInput[] | null;
+  /** Explicit opt-in to resource-claim enforcement for this session; omitted or false leaves enforcement disabled. */
+  claim_enforcement?: boolean | null;
   /** Repository-local auxiliary-state declarations materialized before bootstrap succeeds. */
   auxiliary_state?: readonly unknown[] | null;
   /** Bounded external execution-scope artifact for governed bootstrap. */
