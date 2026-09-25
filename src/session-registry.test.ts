@@ -60,7 +60,12 @@ test("expands a governed working set atomically with revision CAS and claim chec
   try {
     const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
     const revision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
-    const identity = { repositoryHost: "local", repositoryId: repository.repositoryId };
+    const identity = {
+      repositoryHost: "github.com",
+      repositoryId: "1329799765",
+      repository: "yohn-jp/nawabari",
+    };
+    assert.notEqual(identity.repositoryId, repository.repositoryId);
     const executionScope = {
       version: 1,
       kind: "implementation-execution-scope",
@@ -104,23 +109,59 @@ test("expands a governed working set atomically with revision CAS and claim chec
       candidateWorkingSet,
       initialClaims: [{ resource: "src/new.ts", mode: "write" }],
     });
-    const expanded = registry.expandWorkingSet({
+    const expandedRead = registry.expandWorkingSet({
       sessionId: session.sessionId,
       repository: identity,
       currentRevision: 1,
       executionScope,
-      entries: [{ path: "src/new.ts", operation: "WRITE", reason: "legitimate mutation context" }],
+      entries: [{ path: "src/new.ts", operation: "READONLY", reason: "legitimate read context" }],
     });
-    assert.equal(expanded.status, "granted");
-    assert.equal(expanded.revision, 2);
-    assert.deepEqual(expanded.workingSet.scope.write, ["src/new.ts"]);
+    assert.equal(expandedRead.status, "granted");
+    assert.equal(expandedRead.revision, 2);
+    assert.ok(expandedRead.workingSet.scope.readOnly.includes("src/new.ts"));
+
+    const deniedMutation = registry.expandWorkingSet({
+      sessionId: session.sessionId,
+      repository: identity,
+      currentRevision: 2,
+      executionScope,
+      entries: [{ path: "src/other.ts", operation: "WRITE", reason: "outside authorized write scope" }],
+    });
+    assert.equal(deniedMutation.status, "denied");
+    assert.equal(deniedMutation.outcomes[0]?.status, "denied");
+    assert.equal(deniedMutation.revision, 2);
+    assert.equal(registry.get(session.sessionId)?.workingSet?.revision, 2);
+
+    assertRegistryError(
+      () =>
+        registry.expandWorkingSet({
+          sessionId: session.sessionId,
+          repository: { ...identity, repositoryId: "987654321" },
+          currentRevision: 2,
+          executionScope,
+          entries: [{ path: "src/new.ts", operation: "READONLY", reason: "foreign repository" }],
+        }),
+      "REPOSITORY_MISMATCH",
+    );
+    assert.equal(registry.get(session.sessionId)?.workingSet?.revision, 2);
+
+    const expandedMutation = registry.expandWorkingSet({
+      sessionId: session.sessionId,
+      repository: identity,
+      currentRevision: 2,
+      executionScope,
+      entries: [{ path: "src/new.ts", operation: "WRITE", reason: "authorized mutation context" }],
+    });
+    assert.equal(expandedMutation.status, "granted");
+    assert.equal(expandedMutation.revision, 3);
+    assert.deepEqual(expandedMutation.workingSet.scope.write, ["src/new.ts"]);
 
     assertRegistryError(
       () =>
         registry.expandWorkingSet({
           sessionId: session.sessionId,
           repository: identity,
-          currentRevision: 1,
+          currentRevision: 2,
           executionScope,
           entries: [{ path: "src/other.ts", operation: "READONLY", reason: "stale" }],
         }),
@@ -129,13 +170,13 @@ test("expands a governed working set atomically with revision CAS and claim chec
     const denied = registry.expandWorkingSet({
       sessionId: session.sessionId,
       repository: identity,
-      currentRevision: 2,
+      currentRevision: 3,
       executionScope,
       entries: [{ path: "src/secret.ts", operation: "READONLY", reason: "denied" }],
     });
     assert.equal(denied.status, "denied");
-    assert.equal(denied.revision, 2);
-    assert.equal(registry.get(session.sessionId)?.workingSet?.revision, 2);
+    assert.equal(denied.revision, 3);
+    assert.equal(registry.get(session.sessionId)?.workingSet?.revision, 3);
   } finally {
     try {
       runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
@@ -160,6 +201,40 @@ test("keeps human labels separate from session identity", () => {
     assert.notEqual(first.sessionId, second.sessionId);
     assert.equal(first.label, second.label);
     assert.equal(registry.list().length, 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("resource-claim enforcement defaults to disabled and persists an explicit opt-in across registry instances", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const claimLessWorktree = `${fixture.repositoryPath}-claim-less`;
+    const enforcedWorktree = `${fixture.repositoryPath}-claim-enforced`;
+    try {
+      const claimLess = registry.provision({ worktreePath: claimLessWorktree, branchName: "feature/claim-less" });
+      assert.equal(claimLess.claimEnforcement, undefined);
+
+      const enforced = registry.provision({
+        worktreePath: enforcedWorktree,
+        branchName: "feature/claim-enforced",
+        claimEnforcement: true,
+      });
+      assert.equal(enforced.claimEnforcement, true);
+
+      const reopened = new SessionRegistry({ cwd: fixture.repositoryPath });
+      assert.equal(reopened.get(claimLess.sessionId)?.claimEnforcement, undefined);
+      assert.equal(reopened.get(enforced.sessionId)?.claimEnforcement, true);
+    } finally {
+      for (const worktreePath of [claimLessWorktree, enforcedWorktree]) {
+        try {
+          runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
+        } catch {
+          fs.rmSync(worktreePath, { recursive: true, force: true });
+        }
+      }
+    }
   } finally {
     fixture.cleanup();
   }

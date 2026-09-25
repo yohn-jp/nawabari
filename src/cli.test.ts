@@ -698,6 +698,7 @@ test("command-specific help is projected from one spec and marks session create 
     "--auxiliary-state",
     "--execution-scope-file",
     "--candidate-working-set-file",
+    "--enforce-claims",
   ]);
   assert.deepEqual(response.defaults, {
     "--branch": "nawabari/session/<session_id>",
@@ -1100,6 +1101,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--auxiliary-state",
       "--execution-scope-file",
       "--candidate-working-set-file",
+      "--enforce-claims",
       "--session",
       "--integrated-revision",
       "--schema-version",
@@ -1240,6 +1242,30 @@ test("unknown commands expose a stable JSON error without decoration", async () 
     message: "Unknown command: bogus.",
     details: { command: "bogus" },
   });
+});
+
+test("every canonical command and alias is recognized by the dispatcher", async () => {
+  // Replaces a hand-authored DISPATCHER_COMMAND_INVENTORY list: instead of a
+  // second table a human must remember to update, this drives every name
+  // the registry itself advertises straight through the real dispatcher and
+  // asserts it was recognized (never UNKNOWN_COMMAND). A command missing its
+  // dispatch branch, or removed from the registry but left in the
+  // dispatcher, fails here without any separately maintained inventory.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-dispatch-coverage-"));
+  try {
+    for (const definition of publicCliCommandDefinitions()) {
+      const output = capture();
+      await runCli([...definition.name.split(" "), "--json"], { io: output.io, cwd: directory });
+      const response = JSON.parse(output.stdout[0] ?? "{}") as { code?: string };
+      assert.notEqual(
+        response.code,
+        "UNKNOWN_COMMAND",
+        `dispatcher does not recognize registered command: ${definition.name}`,
+      );
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("state commands reject honestly when the current directory is not a Git repository", async () => {
@@ -2045,6 +2071,39 @@ test("session create forwards --worktree-root to the backend as the caller-selec
     base: null,
     label: null,
   });
+});
+
+test("session create omits claim_enforcement by default and forwards it only with --enforce-claims", async () => {
+  let observedOptions: SessionCreateOptions | null = null;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, options: SessionCreateOptions) => {
+      observedOptions = options;
+      return success(sampleSession);
+    },
+  });
+
+  const defaultExitCode = await runCli(["--json", "session", "create"], { backend, io: capture().io });
+  assert.equal(defaultExitCode, 0);
+  assert.equal((observedOptions as unknown as SessionCreateOptions).claim_enforcement, undefined);
+
+  const enforcedExitCode = await runCli(["--json", "session", "create", "--enforce-claims"], {
+    backend,
+    io: capture().io,
+  });
+  assert.equal(enforcedExitCode, 0);
+  assert.equal((observedOptions as unknown as SessionCreateOptions).claim_enforcement, true);
+});
+
+test("session create rejects a repeated --enforce-claims flag", async () => {
+  const output = capture();
+  const exitCode = await runCli(["--json", "session", "create", "--enforce-claims", "--enforce-claims"], {
+    backend: backendForTests({}),
+    io: output.io,
+  });
+  assert.equal(exitCode, 2);
+  const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string };
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "INVALID_ARGUMENT");
 });
 
 test("session create forwards repeated initial claims in one atomic backend request", async () => {

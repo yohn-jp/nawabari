@@ -200,6 +200,7 @@ export class LocalSessionBackend implements SessionBackend {
         ...(options.claims === null || options.claims === undefined
           ? {}
           : { initialClaims: options.claims.map(toRegistryClaimInput) }),
+        ...(options.claim_enforcement === true ? { claimEnforcement: true } : {}),
         ...(options.auxiliary_state === null || options.auxiliary_state === undefined
           ? {}
           : { auxiliaryState: options.auxiliary_state }),
@@ -656,6 +657,7 @@ function toDomainRecord(record: RegistrySessionRecord): SessionRecord {
     ...(record.workingSet === undefined
       ? {}
       : { working_set: record.workingSet as unknown as import("./errors.js").JsonObject }),
+    ...(record.claimEnforcement === undefined ? {} : { claim_enforcement: record.claimEnforcement }),
   };
 }
 

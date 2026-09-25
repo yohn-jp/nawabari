@@ -14,8 +14,6 @@ permissions:
 
 jobs:
   validate-issue:
-    # Organization reusable workflows track the canonical main branch while
-    # validation still executes against this repository's .github/inari snapshot.
     uses: yohn-jp/.github/.github/workflows/issue-governance.yml@main
     permissions:
       contents: read
