@@ -30,12 +30,7 @@ import {
   type SessionExecutionIdentityReader,
   type SessionExecutionRecord,
 } from "./session-execution-record.js";
-import {
-  CGROUPS_V2_CONTRACT_ID,
-  deriveCgroupScopeName,
-  resolveManagedCgroupRoot,
-  type CgroupFileSystem,
-} from "./cgroups-v2.js";
+import { CGROUPS_V2_CONTRACT_ID, deriveCgroupScopeName, type CgroupFileSystem } from "./cgroups-v2.js";
 import {
   observeOwnedExecution,
   SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
@@ -364,10 +359,8 @@ export async function launchManagedSessionCommand(
       ),
     );
   }
-  const cgroupRoot =
-    "getManagedCgroupRoot" in backend && typeof backend.getManagedCgroupRoot === "function"
-      ? (backend.getManagedCgroupRoot() as DomainResult<string>)
-      : resolveManagedCgroupRoot();
+  if (backend.getManagedCgroupRoot === undefined) return managedRuntimeUnavailable(input.session_id);
+  const cgroupRoot = backend.getManagedCgroupRoot();
   if (!cgroupRoot.ok) return cgroupRoot;
 
   const session = await backend.getSession(context, input.session_id);

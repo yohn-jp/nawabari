@@ -334,6 +334,79 @@ test("managed command path fails closed before launch when cgroups are unavailab
   assert.equal(persisted, 0);
 });
 
+function cgroupAuthorityBackend(
+  getManagedCgroupRoot: SessionBackend["getManagedCgroupRoot"],
+  counters: { persisted: number },
+): SessionBackend {
+  return {
+    ...backend(),
+    getSessionManagedRuntime: async (_context: SessionContext, sessionId: string, executionId?: string) =>
+      success({
+        runtime_epoch: 7,
+        registry_revision: 11,
+        claim_set_generation: 3,
+        admission: {
+          kind: "session-admission" as const,
+          schema_version: 1 as const,
+          session_id: sessionId,
+          admission: "open" as const,
+          runtime_epoch: 7,
+        },
+        profile: { digest: "a".repeat(64) },
+        runtime_environment_identity: {
+          session_id: sessionId,
+          execution_id: executionId ?? "unused",
+          session_root: "/private/session-home",
+          execution_root: "/private/execution",
+          owner_uid: 1000,
+          owner_gid: 1000,
+        },
+      }),
+    listClaims: async () => success({ claims: [], claim_set_generation: 3 }),
+    persistSessionExecution: async () => {
+      counters.persisted += 1;
+      return failure(new DomainError("REGISTRY_DURABILITY_UNCERTAIN", "unexpected persistence"));
+    },
+    readSessionRuntimeEpoch: () => 7,
+    ...(getManagedCgroupRoot === undefined ? {} : { getManagedCgroupRoot }),
+  } as unknown as SessionBackend;
+}
+
+test("managed command path fails closed before launch without backend cgroup-root authority", async () => {
+  const counters = { persisted: 0 };
+  const result = await launchManagedSessionCommand(context, cgroupAuthorityBackend(undefined, counters), {
+    session_id: session.session_id,
+    command: { command: "/nawabari/bin/node", args: ["-e", "process.exit(0)"] },
+    sandbox_probe: { hasCgroupsV2: () => true } as unknown as import("./sandbox.js").SandboxProbe,
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "BACKEND_UNAVAILABLE");
+  assert.equal(counters.persisted, 0);
+});
+
+test("managed command path consumes the backend-retained cgroup root without re-resolving", async () => {
+  const counters = { persisted: 0 };
+  const retained = failure(new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "retained backend cgroup root"));
+  let authorityCalls = 0;
+  const result = await launchManagedSessionCommand(
+    context,
+    cgroupAuthorityBackend(() => {
+      authorityCalls += 1;
+      return retained;
+    }, counters),
+    {
+      session_id: session.session_id,
+      command: { command: "/nawabari/bin/node", args: ["-e", "process.exit(0)"] },
+      sandbox_probe: { hasCgroupsV2: () => true } as unknown as import("./sandbox.js").SandboxProbe,
+    },
+  );
+
+  assert.equal(result, retained);
+  assert.equal(authorityCalls, 1);
+  assert.equal(counters.persisted, 0);
+});
+
 test("managed interactive entry reaches the protected capability gate without using the legacy runner", async () => {
   let runnerCalls = 0;
   let persisted = 0;

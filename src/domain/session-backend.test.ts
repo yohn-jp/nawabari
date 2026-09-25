@@ -93,6 +93,17 @@ test("local session backend binds default managed readiness to protected sandbox
   }
 });
 
+test("local backend exposes the single cgroup root retained for managed readiness", () => {
+  const cgroups = readinessCgroupFixture();
+  const backend = new LocalSessionBackend({
+    cgroupRoot: cgroups.root,
+    registry: { cgroupFilesystem: cgroups.filesystem },
+  });
+  const first = backend.getManagedCgroupRoot();
+  assert.equal(first.ok, true);
+  assert.equal(backend.getManagedCgroupRoot(), first);
+});
+
 test("local managed readiness fails closed on cgroup observation or cleanup uncertainty", async () => {
   for (const failure of ["observation", "cleanup"] as const) {
     const repositoryPath = createRepository();
