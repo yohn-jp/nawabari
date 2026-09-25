@@ -1417,6 +1417,43 @@ test("an explicit managed readiness authority authorizes bootstrap without chang
   }
 });
 
+test("builtin:minimal wildcard ceilings reach the managed readiness boundary", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-mr`);
+  const branchName = "feature/managed-readiness-builtin-minimal";
+  try {
+    let consulted = 0;
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      managedExecutionReadiness: () => {
+        consulted += 1;
+        return { ready: true };
+      },
+    });
+    const session = registry.provision({
+      branchName,
+      worktreePath,
+      profile: { selection: { profile: "builtin:minimal" } },
+    });
+    assert.equal(session.branchName, branchName);
+    assert.equal(consulted, 1);
+    const persisted = readJson(registry.paths.registry) as {
+      pinned_profiles?: readonly { resolved?: { id?: string; filesystem?: { readOnly?: readonly string[] } } }[];
+    };
+    assert.equal(persisted.pinned_profiles?.length, 1);
+    assert.equal(persisted.pinned_profiles?.[0]?.resolved?.id, "minimal");
+    assert.deepEqual(persisted.pinned_profiles?.[0]?.resolved?.filesystem?.readOnly, ["**"]);
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
+    } catch {
+      // Directory cleanup below remains safe when Git never created the worktree.
+    }
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
 test("omitted-profile provisioning does not consult managed readiness", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-mr`);

@@ -2401,7 +2401,6 @@ export class SessionRegistry {
 
     const compiledWorkingSet = workingSet === undefined ? undefined : compileWorkingSetRuntimeProjection(workingSet);
     if (compiledWorkingSet !== undefined && !compiledWorkingSet.ok) throw compiledWorkingSet.error;
-    const filesystem = pin.resolved.filesystem;
     const scope = resolveProfileRuntimeScope(
       pin.resolved,
       {
@@ -2417,13 +2416,7 @@ export class SessionRegistry {
               })),
             }),
       },
-      {
-        paths: [...new Set([...filesystem.readOnly, ...filesystem.write])],
-        requests: [
-          ...filesystem.readOnly.map((path) => ({ path, operation: "READONLY" as const })),
-          ...filesystem.write.map((path) => ({ path, operation: "WRITE" as const })),
-        ],
-      },
+      undefined,
     );
     if (!scope.ok) throw scope.error;
     if (scope.value.status !== "ready") {
