@@ -38,7 +38,7 @@ nawabari capabilities --json
 Request a new Nawabari session
 
 ```
-nawabari session create [--branch <name>] [--worktree <path>|--worktree-root <path>] [--base <ref>] [--label <text>] [--execution-scope-file <path> --candidate-working-set-file <path>] [--resource <path-or-glob> --mode <read|write|exclusive-write> ...] [--enforce-claims]
+nawabari session create [--branch <name>] [--worktree <path>|--worktree-root <path>] [--base <ref>] [--label <text>] [--profile <id> --profile-parameter <json>] [--execution-scope-file <path> --candidate-working-set-file <path>] [--resource <path-or-glob> --mode <read|write|exclusive-write> ...] [--enforce-claims]
 ```
 
 Aliases: none.
@@ -54,6 +54,28 @@ nawabari session id
 
 Aliases: none.
 Complete option contract: `nawabari session id --help --json`.
+
+### `profile list`
+
+List built-in worktree runtime profiles
+
+```
+nawabari profile list
+```
+
+Aliases: none.
+Complete option contract: `nawabari profile list --help --json`.
+
+### `profile show`
+
+Show one worktree runtime profile
+
+```
+nawabari profile show --profile <id>
+```
+
+Aliases: none.
+Complete option contract: `nawabari profile show --help --json`.
 
 ### `session show`
 
