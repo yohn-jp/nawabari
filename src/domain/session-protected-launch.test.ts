@@ -255,6 +255,29 @@ test("invalid protected stdio topology fails before starting durability or mater
   }
 });
 
+test("governed protected launch requires approved material before durability or compilation", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-protected-hook-"));
+  try {
+    const { input } = makeInput(root);
+    const governed = validateWorktreeRuntimeProfile({
+      ...profileInput(),
+      git: { config: "session-private", globalConfig: "excluded", credentialHelpers: "disabled", hooks: "governed" },
+    });
+    assert.equal(governed.ok, true);
+    if (!governed.ok) return;
+    const events: string[] = [];
+    const result = await launchProtectedSessionExecution(
+      { ...input, profile: governed.value },
+      dependencies(events, []),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "RUNTIME_PROFILE_INVALID");
+    assert.deepEqual(events, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("admission denial returns the existing no-start shape before materialization or persistence", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-protected-launch-"));
   try {

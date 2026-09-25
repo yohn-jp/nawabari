@@ -43,6 +43,8 @@ import {
   type RuntimeResolutionFhsOptions,
 } from "./runtime-resolution.js";
 import type { ResolvedRuntimeProfile, RuntimeProfileSelection } from "./runtime-profile.js";
+import type { ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
+import type { SessionHookMaterial } from "./session-git-hooks.js";
 import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
 
 /**
@@ -195,6 +197,9 @@ export type SandboxExecutionRequest = {
   identity: SandboxIdentity;
   /** Minimum host Git author identity projected for commit semantics; never a full config file. */
   git_identity: SandboxGitIdentity;
+  /** Explicit upper profile and ephemeral #618 material for managed protected Git. */
+  git_profile?: ResolvedWorktreeRuntimeProfile;
+  hook_material?: SessionHookMaterial | null;
   filesystem: SandboxFilesystemTopology;
   required_capabilities: SandboxCapabilityId[];
   seccomp_profile: ReturnType<typeof sandboxSeccompProfileMetadata>;

@@ -503,6 +503,8 @@ export async function launchManagedSessionCommand(
   if (!compiled.ok) return compiled;
   const protectedRequest: SandboxExecutionRequest = {
     ...request.value,
+    git_profile: profile,
+    hook_material: live.hook_material,
     runtime_resolution: {
       policy: runtime.value.policy,
       profile: runtime.value.profile,

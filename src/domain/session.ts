@@ -8,6 +8,7 @@ import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
 import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
 import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
+import type { SessionHookMaterial } from "./session-git-hooks.js";
 import type { SessionRuntimeEnvironmentIdentity } from "./session-environment.js";
 
 export type { OperationName } from "../operation-authorization.js";
@@ -51,6 +52,8 @@ export type SessionManagedRuntimeState = Readonly<{
     readonly runtime_epoch: number;
   }> | null;
   readonly profile: PinnedWorktreeProfile | null;
+  /** Ephemeral approved material from the caller-owned authority; never persisted. */
+  readonly hook_material?: SessionHookMaterial | null;
   readonly runtime_environment_identity?: SessionRuntimeEnvironmentIdentity;
 }>;
 
