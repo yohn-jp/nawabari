@@ -75,7 +75,7 @@ import {
   type BuiltinWorktreeProfileId,
 } from "./domain/worktree-profile-builtins.js";
 import { DomainError } from "./domain/errors.js";
-import { sandboxDoctorReport, type SandboxProbe } from "./domain/sandbox.js";
+import type { SandboxProbe } from "./domain/sandbox.js";
 import {
   assertCanonicalClaimResource,
   canonicalClaimId,
@@ -959,9 +959,30 @@ export interface SessionRegistryOptions {
   readonly protectedWorktreePaths?: readonly string[];
   readonly worktreeRoot?: string;
   readonly staleAfterMs?: number;
-  /** Capability authority used to gate profiles requiring managed execution. */
+  /**
+   * Generic sandbox capability evidence. It is not managed-execution readiness
+   * and never authorizes a profile requiring process tracking.
+   */
   readonly sandboxProbe?: SandboxProbe;
+  /**
+   * Explicit managed-execution readiness authority supplied by a caller-owned
+   * managed runtime. When absent, profiles requiring process tracking fail closed.
+   */
+  readonly managedExecutionReadiness?: ManagedExecutionReadiness;
 }
+
+/** Read-only evidence handed to the managed-execution readiness authority. */
+export interface ManagedExecutionReadinessRequest {
+  readonly processTracking: "required";
+  readonly profile: Readonly<{ id: string; version: string; digest: string }>;
+}
+
+export interface ManagedExecutionReadinessResult {
+  readonly ready: boolean;
+}
+
+/** Preflight seam: whether a caller-owned managed runtime can track the session's processes. */
+export type ManagedExecutionReadiness = (request: ManagedExecutionReadinessRequest) => ManagedExecutionReadinessResult;
 
 export interface RegistryPaths {
   readonly directory: string;
@@ -1115,7 +1136,7 @@ export class SessionRegistry {
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
   private readonly lock: RepositoryLock;
-  private readonly sandboxProbe: SandboxProbe | undefined;
+  private readonly managedExecutionReadiness: ManagedExecutionReadiness | undefined;
 
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
@@ -1143,7 +1164,7 @@ export class SessionRegistry {
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
     this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
-    this.sandboxProbe = options.sandboxProbe;
+    this.managedExecutionReadiness = options.managedExecutionReadiness;
 
     if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0) {
       throw new RangeError("lockTimeoutMs must be a non-negative safe integer");
@@ -1819,14 +1840,7 @@ export class SessionRegistry {
       const resources = this.resolveProvisioningResources(options, sessionId);
       const pinnedProfile = this.resolvePinnedProfile(options.profile, resources.baseRevision);
       if (pinnedProfile?.resolved.execution.processTracking === "required") {
-        const doctor = sandboxDoctorReport(this.sandboxProbe);
-        if (!doctor.ready) {
-          throw new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "Managed execution capability is unavailable.", {
-            platform: doctor.platform,
-            platform_supported: doctor.platform_supported,
-            missing_required: doctor.missing_required,
-          });
-        }
+        this.assertManagedExecutionReady(pinnedProfile);
       }
       const workingSet = this.composeProvisionedWorkingSet(options, resources);
       const timestamp = toTimestamp(this.clock());
@@ -1945,6 +1959,30 @@ export class SessionRegistry {
         throw classifyProvisioningFailure(error, this.git, this.repository.worktreePath, resources);
       }
     });
+  }
+
+  /**
+   * Fail closed before any ownership mutation unless the explicit managed-execution
+   * authority affirms readiness. Generic sandbox evidence is never consulted here.
+   */
+  private assertManagedExecutionReady(pinnedProfile: PinnedWorktreeProfile): void {
+    const authority = this.managedExecutionReadiness;
+    const ready =
+      authority !== undefined &&
+      authority({
+        processTracking: "required",
+        profile: Object.freeze({
+          id: pinnedProfile.resolved.id,
+          version: pinnedProfile.resolved.version,
+          digest: pinnedProfile.digest,
+        }),
+      }).ready === true;
+    if (!ready) {
+      throw new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "Managed execution capability is unavailable.", {
+        process_tracking: "required",
+        managed_execution_authority: authority === undefined ? "absent" : "not_ready",
+      });
+    }
   }
 
   private resolvePinnedProfile(
