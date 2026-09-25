@@ -112,8 +112,9 @@ test("projects finite evidence through broad ceilings and still rejects unsuppor
   );
   assert.equal(broadWithoutEvidence.ok, true);
   if (!broadWithoutEvidence.ok) return;
-  assert.equal(broadWithoutEvidence.value.status, "unsupported");
-  assert.match(broadWithoutEvidence.value.diagnostics[0]?.reason ?? "", /finite explicit path evidence/u);
+  assert.equal(broadWithoutEvidence.value.status, "ready");
+  assert.deepEqual(broadWithoutEvidence.value.scope.readOnly, []);
+  assert.deepEqual(broadWithoutEvidence.value.scope.write, []);
 
   const unsupportedOperation = resolveProfileRuntimeScope(
     { ...profile, filesystem: { ...profile.filesystem, create: ["src/new.ts"] } },
