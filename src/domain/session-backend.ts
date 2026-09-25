@@ -4,6 +4,7 @@ import {
   type GarbageCollectResult as RegistryGarbageCollectResult,
   type ResourceClaim as RegistryResourceClaim,
   type SessionRecord as RegistrySessionRecord,
+  type ManagedExecutionReadiness,
   type SessionRegistryOptions,
 } from "../session-registry.js";
 import type { SessionLifecycleAction as RegistrySessionLifecycleAction } from "../session-lifecycle-actions.js";
@@ -73,8 +74,11 @@ export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
   /** Minimal host Git identity projected into governed commit operations. */
   readonly gitIdentity?: SandboxGitIdentity;
+  /** Generic sandbox evidence; never managed-execution readiness. */
   readonly sandboxProbe?: SandboxProbe;
-  readonly registry?: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
+  /** Explicit managed-execution readiness authority; absence fails closed for required process tracking. */
+  readonly managedExecutionReadiness?: ManagedExecutionReadiness;
+  readonly registry?: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness">;
 }
 
 export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
@@ -176,12 +180,17 @@ export class LocalSessionBackend implements SessionBackend {
   private readonly git: SessionRegistryOptions["git"];
   private readonly gitIdentity: SandboxGitIdentity | undefined;
   private readonly sandboxProbe: SandboxProbe | undefined;
-  private readonly registryOptions: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity">;
+  private readonly managedExecutionReadiness: ManagedExecutionReadiness | undefined;
+  private readonly registryOptions: Omit<
+    SessionRegistryOptions,
+    "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness"
+  >;
 
   public constructor(options: LocalSessionBackendOptions = {}) {
     this.git = options.git;
     this.gitIdentity = options.gitIdentity;
     this.sandboxProbe = options.sandboxProbe;
+    this.managedExecutionReadiness = options.managedExecutionReadiness;
     this.registryOptions = options.registry ?? {};
   }
 
@@ -631,6 +640,7 @@ export class LocalSessionBackend implements SessionBackend {
       git: this.git,
       gitIdentity: this.gitIdentity,
       sandboxProbe: this.sandboxProbe,
+      managedExecutionReadiness: this.managedExecutionReadiness,
     });
   }
 }
