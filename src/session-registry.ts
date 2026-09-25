@@ -875,6 +875,24 @@ export interface VerifiedExecutionContext extends PhysicalExecutionContext {
   readonly session: SessionRecord;
 }
 
+type GovernedGitFreshnessFence = Readonly<{
+  readonly sessionId: string;
+  readonly repositoryId: string;
+  readonly worktreeId: string;
+  readonly worktreePath: string;
+  readonly branchId: string;
+  readonly headId: string;
+  readonly registryRevision: number;
+  readonly claimSetGeneration: number;
+  readonly runtimeEpoch: number;
+  readonly resources: OperationAuthorizationDecision["resources"];
+}>;
+
+type PreparedSessionGitMutation = Readonly<{
+  readonly config: SessionGitConfig | undefined;
+  readonly fence: GovernedGitFreshnessFence | undefined;
+}>;
+
 export const GOVERNED_GIT_OPERATION_SCHEMA_VERSION = 1 as const;
 
 export interface CommitOptions {
@@ -3103,7 +3121,7 @@ export class SessionRegistry {
     // lock hostage while it backtracks.
     const messagePattern = options.messagePattern ?? options.message_pattern ?? null;
     assertFinalCommitMessage(options.message, messagePattern);
-    const gitConfig = this.prepareSessionGitMutation(
+    const prepared = this.prepareSessionGitMutation(
       "pre-commit",
       operationSessionId(options.sessionId, options.session_id),
       options.resources ?? options.paths ?? [],
@@ -3112,6 +3130,7 @@ export class SessionRegistry {
 
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
+      this.assertSessionGitMutationFresh(prepared.fence, sessionId);
       const allClaimed = options.allClaimed === true || options.all_claimed === true;
       const explicitResources = options.resources ?? options.paths;
       if (allClaimed && explicitResources !== undefined && explicitResources.length > 0) {
@@ -3124,7 +3143,9 @@ export class SessionRegistry {
         ? this.resolveAllClaimedResourcesUnsafe("commit", sessionId)
         : operationResources(explicitResources);
       const authorization = this.requireMutationAuthorization("commit", requestedResources, sessionId);
-      const initial = this.verifyGovernedExecutionContext(sessionId);
+      this.assertSessionGitAuthorizationFresh(prepared.fence, authorization);
+      const initial =
+        this.assertSessionGitMutationFresh(prepared.fence, sessionId) ?? this.verifyGovernedExecutionContext(sessionId);
 
       const before = observeGitMutationPaths(this.git, initial.worktreePath);
       assertNoUnexpectedMutationPaths(
@@ -3173,7 +3194,7 @@ export class SessionRegistry {
       try {
         runMutationGit(
           this.git,
-          commitGitArguments(this.git, initial.worktreePath, this.gitIdentity, options.message, gitConfig),
+          commitGitArguments(this.git, initial.worktreePath, this.gitIdentity, options.message, prepared.config),
           initial.worktreePath,
           "commit",
           "COMMIT_FAILED",
@@ -3315,7 +3336,7 @@ export class SessionRegistry {
 
   /** Push the currently owned branch to an explicit remote/branch target. */
   push(options: PushOptions): PushResult {
-    const gitConfig = this.prepareSessionGitMutation(
+    const prepared = this.prepareSessionGitMutation(
       "pre-push",
       operationSessionId(options.sessionId, options.session_id),
       options.resources ?? [],
@@ -3323,6 +3344,7 @@ export class SessionRegistry {
     );
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
+      this.assertSessionGitMutationFresh(prepared.fence, sessionId);
       const allClaimed = options.allClaimed === true || options.all_claimed === true;
       if (allClaimed && options.resources !== undefined && options.resources.length > 0) {
         throw new SessionRegistryError("INVALID_RESOURCE", "--all-claimed cannot be combined with explicit resources", {
@@ -3333,8 +3355,10 @@ export class SessionRegistry {
       const requestedResources = allClaimed
         ? this.resolveAllClaimedResourcesUnsafe("push", sessionId)
         : operationResources(options.resources);
-      this.requireMutationAuthorization("push", requestedResources, sessionId);
-      const initial = this.verifyGovernedExecutionContext(sessionId);
+      const authorization = this.requireMutationAuthorization("push", requestedResources, sessionId);
+      this.assertSessionGitAuthorizationFresh(prepared.fence, authorization);
+      const initial =
+        this.assertSessionGitMutationFresh(prepared.fence, sessionId) ?? this.verifyGovernedExecutionContext(sessionId);
       const remote = explicitRemote(options.remote);
       const branch = explicitRemoteBranch(options.branch, options.remoteBranch ?? options.remote_branch);
       const force = options.force === true;
@@ -3400,7 +3424,7 @@ export class SessionRegistry {
       const targetRef = `refs/heads/${branch}`;
       const leaseValue = inspection.observedRemoteSha ?? "";
       const pushArguments = [
-        ...(gitConfig === undefined ? [] : ["-c", "core.hooksPath=/dev/null"]),
+        ...(prepared.config === undefined ? [] : ["-c", "core.hooksPath=/dev/null"]),
         "push",
         // Exact-generation CAS is required for every push mutation. The
         // force authorization check above remains independent: force is only
@@ -3469,10 +3493,10 @@ export class SessionRegistry {
     requestedSessionId: string | null | undefined,
     resources: readonly string[],
     allClaimed: boolean,
-  ): SessionGitConfig | undefined {
+  ): PreparedSessionGitMutation {
     const sessionId = requestedSessionId ?? this.resolveCurrentSession().sessionId;
     const runtime = this.getSessionManagedRuntime(sessionId);
-    if (runtime.profile === null) return undefined;
+    if (runtime.profile === null) return { config: undefined, fence: undefined };
     const profile = runtime.profile.resolved;
     const hooks = resolveSessionHookSet(profile, runtime.hook_material);
     if (!hooks.ok) throw hooks.error;
@@ -3486,6 +3510,7 @@ export class SessionRegistry {
       host_global_email: this.gitIdentity?.host_global_email ?? null,
     });
     if (!config.ok) throw config.error;
+    let fence: GovernedGitFreshnessFence | undefined;
     if (hooks.value.mode === "governed") {
       const mutation = event === "pre-commit" ? "commit" : "push";
       if (allClaimed && resources.length > 0) {
@@ -3493,8 +3518,30 @@ export class SessionRegistry {
       }
       const selectedResources = this.withLock(() => {
         const selected = allClaimed ? this.resolveAllClaimedResourcesUnsafe(mutation, sessionId) : resources;
-        this.requireMutationAuthorization(mutation, selected, sessionId);
-        return selected;
+        const authorization = this.requireMutationAuthorization(mutation, selected, sessionId);
+        const execution = this.verifyGovernedExecutionContext(sessionId);
+        const state = this.readStateUnsafe();
+        const pinnedRecord = (state.runtimeRecords.records.pinned_profiles ?? []).find(
+          (candidate) => candidate.session_id === sessionId,
+        );
+        if (pinnedRecord === undefined || parsePinnedProfileRecord(pinnedRecord).digest !== runtime.profile?.digest) {
+          throw new SessionRegistryError("STALE_REGISTRY", "Governed hook profile changed before approval", {
+            sessionId,
+          });
+        }
+        fence = Object.freeze({
+          sessionId: execution.session.sessionId,
+          repositoryId: execution.repositoryId,
+          worktreeId: execution.worktreeId,
+          worktreePath: execution.worktreePath,
+          branchId: execution.branchId,
+          headId: execution.headId,
+          registryRevision: state.registryRevision,
+          claimSetGeneration: state.claimSetGeneration,
+          runtimeEpoch: state.runtimeEpoch,
+          resources: authorization.resources,
+        });
+        return authorization.resources.map((resource) => resource.resource);
       });
       const material = runtime.hook_material;
       if (material === null)
@@ -3511,7 +3558,61 @@ export class SessionRegistry {
       });
       if (!executed.ok) throw executed.error;
     }
-    return config.value;
+    return { config: config.value, fence };
+  }
+
+  private assertSessionGitMutationFresh(
+    fence: GovernedGitFreshnessFence | undefined,
+    sessionId: string | null,
+  ): VerifiedExecutionContext | undefined {
+    if (fence === undefined) return undefined;
+    const execution = this.verifyGovernedExecutionContext(sessionId);
+    const state = this.readStateUnsafe();
+    if (
+      state.registryRevision !== fence.registryRevision ||
+      state.claimSetGeneration !== fence.claimSetGeneration ||
+      state.runtimeEpoch !== fence.runtimeEpoch
+    ) {
+      throw new SessionRegistryError(
+        "STALE_REGISTRY",
+        "Governed hook approval is stale after registry authority changed",
+        {
+          sessionId: fence.sessionId,
+        },
+      );
+    }
+    if (
+      execution.session.sessionId !== fence.sessionId ||
+      execution.repositoryId !== fence.repositoryId ||
+      execution.worktreeId !== fence.worktreeId ||
+      execution.worktreePath !== fence.worktreePath ||
+      execution.branchId !== fence.branchId ||
+      execution.headId !== fence.headId
+    ) {
+      throw new SessionRegistryError(
+        "GIT_STATE_AMBIGUOUS",
+        "Governed hook approval is stale after Git authority changed",
+        {
+          sessionId: fence.sessionId,
+        },
+      );
+    }
+    return execution;
+  }
+
+  private assertSessionGitAuthorizationFresh(
+    fence: GovernedGitFreshnessFence | undefined,
+    authorization: OperationAuthorizationDecision,
+  ): void {
+    if (fence !== undefined && JSON.stringify(authorization.resources) !== JSON.stringify(fence.resources)) {
+      throw new SessionRegistryError(
+        "STALE_REGISTRY",
+        "Governed hook approval is stale after resource authority changed",
+        {
+          sessionId: fence.sessionId,
+        },
+      );
+    }
   }
 
   /**

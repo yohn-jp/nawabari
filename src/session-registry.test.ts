@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,11 +15,12 @@ import {
 } from "./domain/session-execution-record.js";
 import { SESSION_EXECUTION_CONTROL_CONTRACT_ID } from "./domain/session-execution-control.js";
 import type { CgroupFileSystem } from "./domain/cgroups-v2.js";
-import { resolveRepositoryContext } from "./git.js";
+import { defaultGit, resolveRepositoryContext } from "./git.js";
 import { RepositoryLock } from "./registry/lock.js";
 import { DomainError } from "./domain/errors.js";
 import { sandboxDoctorReport, type SandboxProbe } from "./domain/sandbox.js";
 import { resolveBuiltinWorktreeProfile } from "./domain/worktree-profile-builtins.js";
+import { pinWorktreeProfile } from "./domain/worktree-profile-pinning.js";
 import {
   SessionRegistry,
   toPersistedSessionRecord,
@@ -51,6 +53,139 @@ test("hook material authority is explicit and never serialized into registry sta
     fs.writeFileSync(path.join(fixture.repositoryPath, ".git", "hooks", "pre-commit"), "ambient hook");
     const absent = new SessionRegistry({ cwd: fixture.repositoryPath });
     assert.equal(absent.hookMaterialAuthority, undefined);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+function governedGitFenceFixture(field: "registry_revision" | "claim_set_generation" | "none") {
+  const fixture = createRepositoryFixture();
+  const hookRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-git-fence-hook-"));
+  const source = path.join(hookRoot, "hook.mjs");
+  const marker = path.join(hookRoot, "ran");
+  let pushAttempts = 0;
+  const git = {
+    run(args: readonly string[], cwd: string): string {
+      if (args.includes("push")) pushAttempts += 1;
+      return defaultGit.run(args, cwd);
+    },
+    runRaw: defaultGit.runRaw,
+  };
+  const builtin = resolveBuiltinWorktreeProfile({ profile: "minimal" });
+  if (!builtin.ok) throw builtin.error;
+  const profile = {
+    ...builtin.value,
+    id: "governed-git-fence-test",
+    tools: [
+      ...builtin.value.tools,
+      { entrypoint: "nawabari-hook", provider: { id: "hook", requirement_id: "hook-runtime" } },
+    ],
+    git: { ...builtin.value.git, hooks: "governed" as const },
+  };
+  fs.writeFileSync(
+    path.join(fixture.linkedWorktreePath, "nawabari.profiles.json"),
+    JSON.stringify({ profiles: [profile] }),
+  );
+  runGit(["add", "nawabari.profiles.json"], fixture.linkedWorktreePath);
+  runGit(["commit", "-m", "test: add governed profile"], fixture.linkedWorktreePath);
+  const revision = runGit(["rev-parse", "HEAD"], fixture.linkedWorktreePath);
+  const blob = runGit(["rev-parse", "HEAD:nawabari.profiles.json"], fixture.linkedWorktreePath);
+  const registry = new SessionRegistry({
+    cwd: fixture.linkedWorktreePath,
+    git,
+    hookMaterialAuthority: () => ({
+      available: true,
+      material: {
+        kind: "provider",
+        provider: { id: "hook", requirement_id: "hook-runtime" },
+        source,
+        target: "/nawabari/bin/nawabari-hook",
+        digest: createHash("sha256").update(fs.readFileSync(source)).digest("hex"),
+      },
+    }),
+  });
+  const session = registry.create();
+  const pin = pinWorktreeProfile(profile, {
+    repository: { id: registry.repository.repositoryId, revision },
+    base: { revision },
+    catalog: { kind: "repository", path: "nawabari.profiles.json", blob_oid: blob },
+    selection: { profile: profile.id, parameters: {} },
+  });
+  const persisted = readJson(registry.paths.registry) as PersistedRegistry;
+  writeRegistry(registry, {
+    ...persisted,
+    required_features: ["pinned-profiles.v1"],
+    pinned_profiles: [{ ...pin, session_id: session.sessionId }],
+  } as unknown as PersistedRegistry);
+  fs.writeFileSync(
+    source,
+    `#!${process.execPath}\nimport fs from "node:fs";\n${field === "none" ? "" : `const file = ${JSON.stringify(registry.paths.registry)};\nconst state = JSON.parse(fs.readFileSync(file, "utf8"));\nstate.${field} += 1;\nfs.writeFileSync(file, JSON.stringify(state));\n`}fs.writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
+    { mode: 0o700 },
+  );
+  return {
+    registry,
+    session,
+    worktree: fixture.linkedWorktreePath,
+    marker,
+    pushAttempts: () => pushAttempts,
+    cleanup: () => {
+      fixture.cleanup();
+      fs.rmSync(hookRoot, { recursive: true, force: true });
+    },
+  };
+}
+
+test("a governed commit proceeds when hook approval authority stays fresh", () => {
+  const fixture = governedGitFenceFixture("none");
+  try {
+    const before = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    fs.writeFileSync(path.join(fixture.worktree, "README.md"), "changed\n");
+    const result = fixture.registry.commit({
+      sessionId: fixture.session.sessionId,
+      resources: ["README.md"],
+      message: "test",
+    });
+    assert.equal(fs.readFileSync(fixture.marker, "utf8"), "ran");
+    assert.notEqual(result.commitSha, before);
+    assert.equal(runGit(["rev-parse", "HEAD"], fixture.worktree), result.commitSha);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("commit rejects registry authority drift after an approved hook without staging", () => {
+  const fixture = governedGitFenceFixture("registry_revision");
+  try {
+    const before = runGit(["rev-parse", "HEAD"], fixture.worktree);
+    fs.writeFileSync(path.join(fixture.worktree, "README.md"), "changed\n");
+    assert.throws(
+      () =>
+        fixture.registry.commit({ sessionId: fixture.session.sessionId, resources: ["README.md"], message: "test" }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "STALE_REGISTRY",
+    );
+    assert.equal(fs.readFileSync(fixture.marker, "utf8"), "ran");
+    assert.equal(runGit(["diff", "--cached", "--name-only"], fixture.worktree), "");
+    assert.equal(runGit(["rev-parse", "HEAD"], fixture.worktree), before);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("push rejects claim authority drift after an approved hook before inspecting the target", () => {
+  const fixture = governedGitFenceFixture("claim_set_generation");
+  try {
+    assert.throws(
+      () =>
+        fixture.registry.push({
+          sessionId: fixture.session.sessionId,
+          resources: ["README.md"],
+          remote: "origin",
+          branch: "feature/linked",
+        }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "STALE_REGISTRY",
+    );
+    assert.equal(fs.readFileSync(fixture.marker, "utf8"), "ran");
+    assert.equal(fixture.pushAttempts(), 0);
   } finally {
     fixture.cleanup();
   }
