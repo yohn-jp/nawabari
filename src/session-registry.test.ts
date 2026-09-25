@@ -1311,7 +1311,6 @@ function createRepositoryFixture(): RepositoryFixture {
 
 function installBoundedManagedProfile(repositoryPath: string): string {
   const builtin = resolveBuiltinWorktreeProfile({ profile: "minimal" });
-  assert.equal(builtin.ok, true);
   if (!builtin.ok) throw builtin.error;
   fs.writeFileSync(
     path.join(repositoryPath, "nawabari.profiles.json"),
