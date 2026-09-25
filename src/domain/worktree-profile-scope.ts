@@ -125,10 +125,13 @@ function finiteSelectors(
   if (!Array.isArray(selectors) || selectors.length > MAX_PATHS) return undefined;
   const normalized = selectors.map(normalizeSelector);
   if (normalized.some((selector) => selector === undefined)) return undefined;
-  // Existing bounded runtime can enforce a concrete file, but cannot safely
-  // turn a profile-wide directory grant into a finite runtime projection.
-  if (normalized.some((selector) => selector?.includes("*") || selector?.includes("?"))) return undefined;
-  return Object.freeze([...normalized] as string[]);
+  // Profile selectors are authorization ceilings. Wildcard ceilings may
+  // authorize finite caller-supplied path evidence, but they are never
+  // projected as runtime grants themselves. Only concrete profile baselines
+  // become implicit path requests.
+  return Object.freeze(
+    normalized.filter((selector) => !selector?.includes("*") && !selector?.includes("?")) as string[],
+  );
 }
 
 function unsupported(
