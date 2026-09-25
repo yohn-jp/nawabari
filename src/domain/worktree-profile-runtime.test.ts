@@ -246,11 +246,20 @@ test("declared material is selected by provider id and exact requirement identit
   const fixture = candidateFixture();
   const executable = path.join(fixture.root, "declared-node");
   try {
-    fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    const stat = fs.statSync(executable, { bigint: true });
+    const fd = fs.openSync(executable, "w+", 0o755);
+    let stat: fs.BigIntStats;
+    let bytes: Buffer;
+    try {
+      fs.writeFileSync(fd, "#!/bin/sh\nexit 0\n");
+      stat = fs.fstatSync(fd, { bigint: true });
+      bytes = Buffer.alloc(Number(stat.size));
+      fs.readSync(fd, bytes, 0, bytes.length, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
     const evidence = {
       source: executable,
-      digest: createHash("sha256").update(fs.readFileSync(executable)).digest("hex"),
+      digest: createHash("sha256").update(bytes).digest("hex"),
       identity: { dev: stat.dev.toString(10), ino: stat.ino.toString(10) },
     };
     const result = resolveWorktreeProfileRuntime(
