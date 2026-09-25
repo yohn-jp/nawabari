@@ -21,8 +21,15 @@ const requirement: RuntimeRequirement = Object.freeze({
 });
 
 function snapshot(source: string): Record<string, unknown> {
-  const stat = fs.statSync(source, { bigint: true });
-  const bytes = fs.readFileSync(source);
+  const fd = fs.openSync(source, "r");
+  let stat: fs.BigIntStats;
+  let bytes: Buffer;
+  try {
+    stat = fs.fstatSync(fd, { bigint: true });
+    bytes = fs.readFileSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   return {
     source,
     digest: createHash("sha256").update(bytes).digest("hex"),
