@@ -35,6 +35,7 @@ import {
   resolveAuxiliaryStateTrackedPathEvidence,
 } from "./domain/auxiliary-state-projection.js";
 import { DomainError } from "./domain/errors.js";
+import type { SessionHookMaterial } from "./domain/session-git-hooks.js";
 import { compileWorkingSetRuntimeProjection } from "./domain/working-set-runtime-projection.js";
 import {
   composeEffectiveWorkingSet,
@@ -995,7 +996,19 @@ export interface SessionRegistryOptions {
    * managed runtime. When absent, profiles requiring process tracking fail closed.
    */
   readonly managedExecutionReadiness?: ManagedExecutionReadiness;
+  /** Caller-approved hook material authority; never persisted or inferred from the host. */
+  readonly hookMaterialAuthority?: SessionHookMaterialAuthority;
 }
+
+/** Identity supplied when requesting hook material for a pinned session runtime. */
+export interface SessionHookMaterialRequest {
+  readonly sessionId: string;
+  readonly pinnedProfile: PinnedWorktreeProfile;
+}
+
+export type SessionHookMaterialAuthority = (
+  request: SessionHookMaterialRequest,
+) => Readonly<{ available: true; material: SessionHookMaterial }> | Readonly<{ available: false }>;
 
 /** Read-only evidence handed to the managed-execution readiness authority. */
 export interface ManagedExecutionReadinessRequest {
@@ -1113,6 +1126,7 @@ const MAX_ID_GENERATION_ATTEMPTS = 8;
 export class SessionRegistry {
   readonly repository: RepositoryContext;
   readonly paths: RegistryPaths;
+  readonly hookMaterialAuthority: SessionHookMaterialAuthority | undefined;
 
   private readonly git: GitCommandRunner;
   private readonly gitIdentity: SandboxGitIdentity | undefined;
@@ -1159,6 +1173,7 @@ export class SessionRegistry {
     this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
     this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
     this.managedExecutionReadiness = options.managedExecutionReadiness;
+    this.hookMaterialAuthority = options.hookMaterialAuthority;
 
     if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0) {
       throw new RangeError("lockTimeoutMs must be a non-negative safe integer");

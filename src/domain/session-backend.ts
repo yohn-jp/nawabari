@@ -7,6 +7,7 @@ import {
   type ResourceClaim as RegistryResourceClaim,
   type SessionRecord as RegistrySessionRecord,
   type ManagedExecutionReadiness,
+  type SessionHookMaterialAuthority,
   type SessionRegistryOptions,
 } from "../session-registry.js";
 import type { SessionLifecycleAction as RegistrySessionLifecycleAction } from "../session-lifecycle-actions.js";
@@ -124,7 +125,11 @@ export interface LocalSessionBackendOptions {
   readonly sandboxProbe?: SandboxProbe;
   /** Explicit managed-execution readiness authority; absence fails closed for required process tracking. */
   readonly managedExecutionReadiness?: ManagedExecutionReadiness;
-  readonly registry?: Omit<SessionRegistryOptions, "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness">;
+  readonly hookMaterialAuthority?: SessionHookMaterialAuthority;
+  readonly registry?: Omit<
+    SessionRegistryOptions,
+    "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority"
+  >;
 }
 
 export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
@@ -227,9 +232,10 @@ export class LocalSessionBackend implements SessionBackend {
   private readonly gitIdentity: SandboxGitIdentity | undefined;
   private readonly sandboxProbe: SandboxProbe | undefined;
   private readonly managedExecutionReadiness: ManagedExecutionReadiness | undefined;
+  private readonly hookMaterialAuthority: SessionHookMaterialAuthority | undefined;
   private readonly registryOptions: Omit<
     SessionRegistryOptions,
-    "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness"
+    "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority"
   >;
 
   public constructor(options: LocalSessionBackendOptions = {}) {
@@ -237,6 +243,7 @@ export class LocalSessionBackend implements SessionBackend {
     this.gitIdentity = options.gitIdentity;
     this.sandboxProbe = options.sandboxProbe;
     this.registryOptions = options.registry ?? {};
+    this.hookMaterialAuthority = options.hookMaterialAuthority;
     this.managedExecutionReadiness =
       options.managedExecutionReadiness ??
       createLocalManagedExecutionReadiness(
@@ -884,6 +891,7 @@ export class LocalSessionBackend implements SessionBackend {
       gitIdentity: this.gitIdentity,
       sandboxProbe: this.sandboxProbe,
       managedExecutionReadiness: this.managedExecutionReadiness,
+      hookMaterialAuthority: this.hookMaterialAuthority,
     });
   }
 }
