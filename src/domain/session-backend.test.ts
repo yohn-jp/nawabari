@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { runCli } from "../cli.js";
+import { resolveRepositoryContext } from "../git.js";
 import { SessionRegistry } from "../session-registry.js";
 import type { CgroupFileSystem } from "./cgroups-v2.js";
 import { withDirectoryFsyncFailure } from "../testing/fs-fault-injection.js";
@@ -36,6 +37,7 @@ test("local session backend binds default managed readiness to protected sandbox
     worktree: worktreePath,
     label: null,
     base: null,
+    ...boundedReadinessArtifacts(repositoryPath),
     profile: { selection: { profile: "builtin:minimal" } },
   };
   const unusableCgroups = readinessCgroupFixture({ failDelegation: true });
@@ -135,6 +137,7 @@ test("local session backend preserves an explicitly injected managed readiness a
         worktree: worktreePath,
         label: null,
         base: null,
+        ...boundedReadinessArtifacts(repositoryPath),
         profile: { selection: { profile: "builtin:minimal" } },
       },
     );
@@ -1189,6 +1192,43 @@ function createRepository(): string {
   runGit(["add", "README.md"], repositoryPath);
   runGit(["commit", "-m", "initial"], repositoryPath);
   return repositoryPath;
+}
+
+function boundedReadinessArtifacts(repositoryPath: string) {
+  const repository = resolveRepositoryContext({ cwd: repositoryPath });
+  const revision = runGit(["rev-parse", "HEAD"], repositoryPath);
+  const identity = { repositoryHost: "local", repositoryId: repository.repositoryId };
+  return {
+    execution_scope: {
+      version: 1,
+      kind: "implementation-execution-scope",
+      authorization: {
+        version: 1,
+        kind: "implementation-authorization",
+        contractVersion: 1,
+        implementation: { ...identity, number: 607 },
+        governedBodyDigest: "b".repeat(64),
+      },
+      repository: identity,
+      base: { branch: "main", revision },
+      scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+    },
+    candidate_working_set: {
+      kind: "candidate-working-set",
+      schemaVersion: 1,
+      workingSetId: "candidate-607-managed-readiness",
+      repository: { ...identity, repository: "local/nawabari" },
+      revision,
+      entries: [
+        {
+          state: "required",
+          target: { kind: "file", locator: "README.md" },
+          reason: { id: "test:managed-readiness", summary: "bounded bootstrap fixture" },
+          evidence: [{ artifact: "test", reference: "README.md" }],
+        },
+      ],
+    },
+  };
 }
 
 function readinessCgroupFixture(

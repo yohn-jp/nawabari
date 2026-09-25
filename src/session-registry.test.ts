@@ -1190,6 +1190,9 @@ test("an explicit managed readiness authority authorizes bootstrap without chang
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), `${path.basename(fixture.repositoryPath)}-mr`);
   const branchName = "feature/managed-readiness-ready";
   try {
+    const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
+    const revision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+    const identity = { repositoryHost: "local", repositoryId: repository.repositoryId };
     const registry = new SessionRegistry({
       cwd: fixture.repositoryPath,
       managedExecutionReadiness: () => ({ ready: true }),
@@ -1197,6 +1200,35 @@ test("an explicit managed readiness authority authorizes bootstrap without chang
     const session = registry.provision({
       branchName,
       worktreePath,
+      executionScope: {
+        version: 1,
+        kind: "implementation-execution-scope",
+        authorization: {
+          version: 1,
+          kind: "implementation-authorization",
+          contractVersion: 1,
+          implementation: { ...identity, number: 607 },
+          governedBodyDigest: "b".repeat(64),
+        },
+        repository: identity,
+        base: { branch: "main", revision },
+        scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+      },
+      candidateWorkingSet: {
+        kind: "candidate-working-set",
+        schemaVersion: 1,
+        workingSetId: "candidate-607-managed-readiness",
+        repository: { ...identity, repository: "local/nawabari" },
+        revision,
+        entries: [
+          {
+            state: "required",
+            target: { kind: "file", locator: "README.md" },
+            reason: { id: "test:managed-readiness", summary: "bounded bootstrap fixture" },
+            evidence: [{ artifact: "test", reference: "README.md" }],
+          },
+        ],
+      },
       profile: { selection: { profile: "builtin:minimal" } },
     });
     assert.equal(session.branchName, branchName);
