@@ -24,6 +24,10 @@ import type {
   ResourceHandoffResult as RegistryResourceHandoffResult,
 } from "../resource-handoff.js";
 import type { ResourceHandoffFenceController } from "../resource-handoff.js";
+import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
+import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
+import type { SessionHookMaterial } from "./session-git-hooks.js";
+import type { SessionRuntimeEnvironmentIdentity } from "./session-environment.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -46,10 +50,35 @@ export type SessionRecord = {
   discarded_head?: string;
   /** Established bounded execution visibility for governed sessions. */
   working_set?: JsonObject;
+  /** Present and true only when this session opted into resource-claim enforcement; absent means disabled. */
+  claim_enforcement?: boolean;
 };
 
 export type SessionContext = {
   cwd: string;
+};
+
+export type SessionManagedRuntimeState = Readonly<{
+  readonly runtime_epoch: number;
+  readonly registry_revision: number;
+  readonly claim_set_generation: number;
+  readonly admission: Readonly<{
+    readonly kind: "session-admission";
+    readonly schema_version: 1;
+    readonly session_id: string;
+    readonly admission: "open" | "closed";
+    readonly runtime_epoch: number;
+  }> | null;
+  readonly profile: PinnedWorktreeProfile | null;
+  /** Ephemeral approved material from the caller-owned authority; never persisted. */
+  readonly hook_material?: SessionHookMaterial | null;
+  readonly runtime_environment_identity?: SessionRuntimeEnvironmentIdentity;
+}>;
+
+export type WorktreeProfileSessionCreateOptions = {
+  selection: { profile: string };
+  parameters?: JsonObject;
+  provenance?: { catalog?: { path?: string; blob_oid?: string } };
 };
 
 export type SessionCreateOptions = {
@@ -60,6 +89,8 @@ export type SessionCreateOptions = {
   base?: string | null;
   /** Explicit initial claims to commit with the provisioned session. */
   claims?: ResourceClaimInput[] | null;
+  /** Explicit opt-in to resource-claim enforcement for this session; omitted or false leaves enforcement disabled. */
+  claim_enforcement?: boolean | null;
   /** Repository-local auxiliary-state declarations materialized before bootstrap succeeds. */
   auxiliary_state?: readonly unknown[] | null;
   /** Bounded external execution-scope artifact for governed bootstrap. */
@@ -68,6 +99,8 @@ export type SessionCreateOptions = {
   candidate_working_set?: unknown | null;
   /** Optional repository identity used by the transport-neutral working-set contract. */
   working_set_repository?: RepositoryIdentity | null;
+  /** Optional immutable worktree runtime profile selected during bootstrap. */
+  profile?: WorktreeProfileSessionCreateOptions | null;
 };
 
 export type WorkingSetExpansionOptions = {
@@ -932,6 +965,32 @@ export interface SessionBackend {
     request: CoordinationTransactionRequest,
   ): Promise<DomainResult<CoordinationTransactionResult>>;
   migrate?(context: SessionContext): Promise<DomainResult<RegistryMigrationResult>>;
+  listSessionExecutions?(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<DomainResult<readonly PersistedSessionExecutionRecord[]>>;
+  persistSessionExecution?(
+    context: SessionContext,
+    record: PersistedSessionExecutionRecord,
+  ): Promise<DomainResult<PersistedSessionExecutionRecord>>;
+  transitionSessionExecution?(
+    context: SessionContext,
+    executionId: string,
+    input: SessionExecutionStateInput,
+  ): Promise<DomainResult<PersistedSessionExecutionRecord>>;
+  closeSessionLaunchAdmission?(
+    context: SessionContext,
+    sessionId: string,
+    expectedEpoch: number,
+  ): Promise<DomainResult<{ runtimeEpoch: number }>>;
+  getSessionManagedRuntime?(
+    context: SessionContext,
+    sessionId: string,
+    executionId?: string,
+  ): Promise<DomainResult<SessionManagedRuntimeState>>;
+  readSessionRuntimeEpoch?(context: SessionContext, sessionId: string): number;
+  /** The single managed cgroup root retained by the backend for readiness and launch. */
+  getManagedCgroupRoot?(): DomainResult<string>;
 }
 
 const UNAVAILABLE_CAPABILITIES: BackendCapabilities = {

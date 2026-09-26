@@ -10,6 +10,9 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { resolveSandboxExecutionRequest } from "../dist/domain/sandbox.js";
+import { STRICT_RUNTIME_POLICY } from "../dist/domain/runtime-projection.js";
+import { createLocalSessionBackend } from "../dist/domain/session-backend.js";
 import { seedOfflineRuntimeDependencyOverrides } from "./seed-offline-runtime-dependencies.mjs";
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -57,7 +60,11 @@ const PACKAGE_ENTRY_POINT_CHECK_SCRIPT = [
   "assert.equal(typeof state.nawabariTransitionDecision, 'function');",
   "assert.equal(typeof state.availableNawabariCommands, 'function');",
   "assert.equal(typeof state.getNawabariSessionStateSnapshot, 'function');",
+  "assert.equal(typeof state.inspectWorktreeProfile, 'function');",
+  "assert.equal(typeof state.serializeWorktreeProfileInspection, 'function');",
   "assert.equal(state.NAWABARI_STATE_API_SCHEMA_VERSION, 1);",
+  "assert.equal(state.WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION, 1);",
+  "assert.equal(state.WORKTREE_PROFILE_INSPECTION_SERIALIZATION_KEY, 'worktree-profile-inspection');",
   "assert.equal(Array.isArray(state.NAWABARI_LIFECYCLE_STATES), true);",
   "",
   "const snapshot = state.classifyNawabariState({ sessionState: 'active', physicalState: 'healthy' });",
@@ -67,8 +74,70 @@ const PACKAGE_ENTRY_POINT_CHECK_SCRIPT = [
   "assert.equal(closeDecision.target, 'close-ready');",
   "assert.equal(state.availableNawabariCommands(snapshot).includes('close'), true);",
   "",
+  "const pinnedProfileEnvelope = JSON.parse(JSON.stringify({",
+  "  'pinned-worktree-profile': {",
+  "    schema_version: 1,",
+  "    resolved: {",
+  "      contract_id: 'nawabari.worktree-runtime-profile.v1', schema_version: 1, id: 'standard', version: '1',",
+  "      materialSelection: { profiles: ['development'] },",
+  "      filesystem: { readOnly: ['src/**'], write: [], create: [], delete: [], deny: ['.git/**'], immutable: ['.git/**'] },",
+  "      tools: [",
+  "        { entrypoint: 'git', provider: { id: 'git-provider', requirement_id: 'git-package' } },",
+  "        { entrypoint: 'node', provider: { id: 'node-provider', requirement_id: 'node-runtime' } },",
+  "      ],",
+  "      shell: { entrypoint: 'node' },",
+  "      environment: { home: 'session', xdg: { config: 'session', cache: 'session', data: 'session', state: 'session' }, tmp: 'execution' },",
+  "      git: { config: 'session-private', globalConfig: 'excluded', credentialHelpers: 'disabled', hooks: 'disabled' },",
+  "      execution: { policy: { mode: 'strict', host_visibility: 'default-deny', compatibility: 'disabled', unrestricted_host_fallback: 'forbidden' }, processTracking: 'optional' },",
+  "    },",
+  "    provenance: {",
+  "      repository: { id: 'repo', revision: '0123456789012345678901234567890123456789' },",
+  "      base: { revision: '0123456789012345678901234567890123456789' },",
+  "      catalog: { kind: 'repository', path: 'nawabari.profiles.json', blob_oid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' },",
+  "      selection: { profile: 'standard', parameters: {} },",
+  "    },",
+  "    digest: '36ee69ae5be7427ec31e20aa78a5565a8d474fc3454bc36d1a6bb78da7f99f9a',",
+  "  },",
+  "}));",
+  "const pinnedProfile = pinnedProfileEnvelope['pinned-worktree-profile'];",
+  "const originalPinnedProfile = structuredClone(pinnedProfile);",
+  "const currentCatalog = {",
+  "  status: 'available', digest: pinnedProfile.provenance.catalog.blob_oid,",
+  "  catalog: { profiles: [{ ...pinnedProfile.resolved, extends: [] }] },",
+  "};",
+  "const availableRuntime = { status: 'available', materializer: 'provided', providers: [{ id: 'node-provider', requirement_id: 'node-runtime' }] };",
+  "const sameInspection = state.inspectWorktreeProfile(pinnedProfile, currentCatalog, availableRuntime);",
+  "assert.equal(sameInspection.schema_version, 1);",
+  "assert.deepEqual(sameInspection.declared.catalog, { kind: 'repository', path: 'nawabari.profiles.json', digest: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' });",
+  "assert.equal(sameInspection.pinned.profile.id, 'standard');",
+  "assert.equal(sameInspection.pinned.digest, '36ee69ae5be7427ec31e20aa78a5565a8d474fc3454bc36d1a6bb78da7f99f9a');",
+  "assert.equal(sameInspection.current.drift, 'same');",
+  "assert.deepEqual(sameInspection.runtime.tools.map((tool) => [tool.entrypoint, tool.availability]), [['git', 'missing'], ['node', 'available']]);",
+  "const changedInspection = state.inspectWorktreeProfile(pinnedProfile, { ...currentCatalog, digest: '0123456789012345678901234567890123456789' }, { status: 'missing', materializer: null, providers: [] });",
+  "assert.equal(changedInspection.current.drift, 'changed');",
+  "assert.equal(changedInspection.pinned.profile.id, 'standard');",
+  "assert.equal(changedInspection.pinned.digest, originalPinnedProfile.digest);",
+  "assert.equal(changedInspection.runtime.status, 'missing');",
+  "assert.deepEqual(changedInspection.runtime.tools.map((tool) => tool.availability), ['missing', 'missing']);",
+  "const unknownInspection = state.inspectWorktreeProfile(pinnedProfile, { status: 'unknown' }, { status: 'unknown', materializer: null, providers: [] });",
+  "assert.equal(unknownInspection.current.drift, 'unknown');",
+  "assert.deepEqual(unknownInspection.current.catalog, { status: 'unknown' });",
+  "assert.deepEqual(unknownInspection.runtime.tools.map((tool) => tool.availability), ['unknown', 'unknown']);",
+  "const serializedInspection = JSON.parse(state.serializeWorktreeProfileInspection(sameInspection));",
+  "assert.deepEqual(Object.keys(serializedInspection), ['worktree-profile-inspection']);",
+  "assert.deepEqual(pinnedProfile, originalPinnedProfile);",
+  "",
   "assert.equal(typeof contract.machineContract, 'function');",
   "assert.equal(typeof contract.nawabariMachineContract, 'function');",
+  "assert.equal(typeof contract.executeVerification, 'function');",
+  "assert.equal(typeof contract.runVerification, 'function');",
+  "assert.equal(typeof contract.nawabariVerificationContract, 'function');",
+  "const verificationContract = contract.nawabariVerificationContract();",
+  "assert.equal(verificationContract.contract_id, 'nawabari.verification-profile.v1');",
+  "assert.equal(verificationContract.write_policy, 'deny');",
+  "assert.equal(verificationContract.mutates_working_set, false);",
+  "assert.equal(verificationContract.mutates_session_registry, false);",
+  "assert.equal(verificationContract.read_visibility.includes('repository'), true);",
   "const machineContract = contract.nawabariMachineContract();",
   "assert.equal(machineContract.contract_id, 'nawabari.standalone-execution.v1');",
   "assert.equal(typeof machineContract.package_version, 'string');",
@@ -162,6 +231,42 @@ function ageSessionRecord(registryPath, sessionId, updatedAt) {
   session.created_at = updatedAt;
   session.updated_at = updatedAt;
   fs.writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
+}
+
+function materializeBoundedSessionFixture(installDirectory, fixtureName, baseRevision) {
+  const fixturePath = path.join(repoRoot, "scripts", "test-fixtures", "bounded-session", fixtureName);
+  const fixture = fs.readFileSync(fixturePath, "utf8").replaceAll("__BASE_REVISION__", baseRevision);
+  if (fixture.includes("__BASE_REVISION__")) fail(`bounded-session fixture ${fixtureName} has an unresolved revision`);
+  const outputPath = path.join(installDirectory, `bounded-session-${fixtureName}`);
+  fs.writeFileSync(outputPath, fixture);
+  return outputPath;
+}
+
+function runPackedVerification(installDirectory, input) {
+  const scriptPath = path.join(installDirectory, "run-packed-verification.mjs");
+  const inputPath = path.join(installDirectory, "packed-verification-input.json");
+  fs.writeFileSync(
+    scriptPath,
+    [
+      "import fs from 'node:fs';",
+      "import { runVerification, nawabariVerificationContract } from 'nawabari/contract';",
+      "const input = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));",
+      "const contract = nawabariVerificationContract();",
+      "const result = await runVerification(input.profile, input.request);",
+      "process.stdout.write(JSON.stringify({ contract, result }));",
+    ].join("\n"),
+  );
+  fs.writeFileSync(inputPath, JSON.stringify(input));
+  const result = spawnSync(process.execPath, [scriptPath, inputPath], {
+    cwd: installDirectory,
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  if (result.error) fail(`packed verification API failed to start: ${result.error.message}`);
+  if (result.status !== 0) {
+    fail(`packed verification API process failed (${result.status}): ${result.stdout}\n${result.stderr}`);
+  }
+  return parseInstalledJson(result, "packed verification API");
 }
 
 function parseInstalledJson(result, label) {
@@ -529,7 +634,19 @@ async function main() {
     run("git", ["config", "commit.gpgsign", "false"], { cwd: lifecycleRepository, env: gitEnvironment });
     run("git", ["config", "core.hooksPath", "/dev/null"], { cwd: lifecycleRepository, env: gitEnvironment });
     fs.writeFileSync(path.join(lifecycleRepository, "README.md"), "smoke fixture\n");
-    run("git", ["add", "README.md"], { cwd: lifecycleRepository, env: gitEnvironment });
+    const boundedFixtureRoot = path.join(lifecycleRepository, "bounded-session");
+    fs.mkdirSync(boundedFixtureRoot);
+    for (const [name, contents] of Object.entries({
+      "visible-read.txt": "visible bounded-session input\n",
+      "mutable.txt": "initial bounded-session mutation target\n",
+      "expanded-read.txt": "explicitly expanded bounded-session input\n",
+      "verification-only.txt": "repository-wide verifier input outside the agent set\n",
+      "recovery-only.txt": "bounded-session recovery fixture\n",
+      "private.txt": "out-of-set secret fixture\n",
+    })) {
+      fs.writeFileSync(path.join(boundedFixtureRoot, name), contents);
+    }
+    run("git", ["add", "README.md", "bounded-session"], { cwd: lifecycleRepository, env: gitEnvironment });
     run("git", ["commit", "-m", "initial"], { cwd: lifecycleRepository, env: gitEnvironment });
     fs.mkdirSync(path.join(lifecycleRepository, ".codegraph", "ignored"), { recursive: true });
     fs.writeFileSync(path.join(lifecycleRepository, ".codegraph", ".gitignore"), "ignored/\n*.pid\n");
@@ -551,6 +668,23 @@ async function main() {
       if (result.error) fail(`${args.join(" ")} failed to start: ${result.error.message}`);
       return result;
     };
+
+    const createHelp = parseInstalledJson(
+      invokeInstalled(["session", "create", "--help", "--json"], lifecycleRepository),
+      "session create help",
+    );
+    if (
+      createHelp.ok !== true ||
+      createHelp.help_for !== "session create" ||
+      createHelp.required_options?.length !== 0 ||
+      createHelp.optional_options?.join(",") !==
+        "--branch,--worktree,--worktree-root,--base,--label,--profile,--profile-parameter,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file,--enforce-claims" ||
+      !createHelp.usage?.includes("[--profile <id> --profile-parameter <json>]") ||
+      createHelp.defaults?.["--base"] !== "HEAD"
+    ) {
+      fail("installed session create help did not expose the optional/defaulted contract");
+    }
+
     const invokeInstalledAsync = (args, cwd) =>
       new Promise((resolve, reject) => {
         const child = spawn(installedBinary, args, {
@@ -592,6 +726,363 @@ async function main() {
         });
       });
 
+    console.log("checking installed profile catalog and selection contracts...");
+    const profileRepository = path.join(installDirectory, "profile-repository");
+    const profileCatalogPath = path.join(profileRepository, "nawabari.profiles.json");
+    run("git", ["init", "-b", "main", profileRepository], { env: gitEnvironment });
+    run("git", ["config", "user.email", "nawabari-smoke@example.invalid"], {
+      cwd: profileRepository,
+      env: gitEnvironment,
+    });
+    run("git", ["config", "user.name", "Nawabari Smoke"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["config", "commit.gpgsign", "false"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["config", "core.hooksPath", "/dev/null"], { cwd: profileRepository, env: gitEnvironment });
+    fs.writeFileSync(path.join(profileRepository, "README.md"), "profile smoke fixture\n");
+    run("git", ["add", "README.md"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "initial profile fixture"], { cwd: profileRepository, env: gitEnvironment });
+
+    const absentCatalogList = invokeInstalled(["--json", "profile", "list"], profileRepository);
+    const absentCatalog = parseInstalledJson(absentCatalogList, "built-in profiles without a repository catalog");
+    if (
+      absentCatalogList.status !== 0 ||
+      absentCatalog.contract_id !== "nawabari.worktree-profile-cli.v1" ||
+      absentCatalog.schema_version !== 1 ||
+      absentCatalog.command !== "profile list" ||
+      absentCatalog.profiles?.map((profile) => profile.reference).join(",") !== "builtin:minimal,builtin:standard-shell"
+    ) {
+      fail("installed profile list did not expose the built-ins and required CLI schema when the catalog is absent");
+    }
+
+    const builtinShowResult = invokeInstalled(
+      ["--json", "profile", "show", "--profile", "builtin:minimal"],
+      profileRepository,
+    );
+    const builtinShow = parseInstalledJson(builtinShowResult, "built-in profile show");
+    if (builtinShowResult.status !== 0 || builtinShow.source?.reference !== "builtin:minimal" || !builtinShow.ready) {
+      fail("installed profile show did not resolve the explicit built-in namespace");
+    }
+    const repositoryProfile = { ...builtinShow.profile, id: "minimal", extends: [] };
+    delete repositoryProfile.contract_id;
+    delete repositoryProfile.schema_version;
+    const validCatalogText = `${JSON.stringify({ profiles: [repositoryProfile] }, null, 2)}\n`;
+    fs.writeFileSync(profileCatalogPath, validCatalogText);
+    run("git", ["add", "nawabari.profiles.json"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "add colliding repository profile"], {
+      cwd: profileRepository,
+      env: gitEnvironment,
+    });
+
+    const namespacedListResult = invokeInstalled(["--json", "profile", "list"], profileRepository);
+    const namespacedList = parseInstalledJson(namespacedListResult, "namespaced profile list");
+    if (
+      namespacedListResult.status !== 0 ||
+      namespacedList.profiles?.map((profile) => profile.reference).join(",") !==
+        "builtin:minimal,builtin:standard-shell,repository:minimal" ||
+      namespacedList.profiles?.some((profile) => profile.collision !== (profile.id === "minimal"))
+    ) {
+      fail("installed profile list did not preserve built-in/repository namespaces and their collision");
+    }
+
+    const repositoryShowResult = invokeInstalled(
+      ["--json", "profile", "show", "--profile", "repository:minimal"],
+      profileRepository,
+    );
+    const repositoryShow = parseInstalledJson(repositoryShowResult, "repository profile show");
+    if (
+      repositoryShowResult.status !== 0 ||
+      repositoryShow.source?.namespace !== "repository" ||
+      repositoryShow.source?.reference !== "repository:minimal"
+    ) {
+      fail("installed profile show did not resolve the explicit repository namespace");
+    }
+    const ambiguousShowResult = invokeInstalled(
+      ["--json", "profile", "show", "--profile", "minimal"],
+      profileRepository,
+    );
+    const ambiguousShow = parseInstalledJson(ambiguousShowResult, "ambiguous profile show");
+    if (ambiguousShowResult.status !== 3 || ambiguousShow.code !== "RUNTIME_PROFILE_AMBIGUOUS") {
+      fail("installed profile show did not reject an unqualified builtin/repository collision");
+    }
+
+    const missingMaterialBefore = {
+      registry: fs.existsSync(path.join(profileRepository, ".git", "nawabari", "session-registry.json")),
+      branches: run("git", ["branch", "--list", "feature/packed-profile-missing-material"], {
+        cwd: profileRepository,
+        env: gitEnvironment,
+      }).stdout,
+      worktrees: run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment })
+        .stdout,
+    };
+    const missingMaterialResult = invokeInstalled(
+      [
+        "session",
+        "create",
+        "--branch",
+        "feature/packed-profile-missing-material",
+        "--profile",
+        "builtin:standard-shell",
+        "--json",
+      ],
+      profileRepository,
+    );
+    const missingMaterial = parseInstalledJson(missingMaterialResult, "selected missing profile material");
+    if (missingMaterialResult.status !== 4 || missingMaterial.code !== "RUNTIME_MATERIALIZATION_MISSING") {
+      fail("installed selected missing profile material did not fail with its typed unavailable result");
+    }
+    if (
+      fs.existsSync(path.join(profileRepository, ".git", "nawabari", "session-registry.json")) !==
+        missingMaterialBefore.registry ||
+      run("git", ["branch", "--list", "feature/packed-profile-missing-material"], {
+        cwd: profileRepository,
+        env: gitEnvironment,
+      }).stdout !== missingMaterialBefore.branches ||
+      run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment }).stdout !==
+        missingMaterialBefore.worktrees
+    ) {
+      fail("selected missing profile material left registry, branch, or worktree ownership state");
+    }
+
+    fs.writeFileSync(profileCatalogPath, "{invalid\n");
+    run("git", ["add", "nawabari.profiles.json"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "add malformed profile catalog"], {
+      cwd: profileRepository,
+      env: gitEnvironment,
+    });
+    const malformedListResult = invokeInstalled(["--json", "profile", "list"], profileRepository);
+    const malformedList = parseInstalledJson(malformedListResult, "malformed present profile catalog");
+    if (malformedListResult.status !== 3 || malformedList.code !== "RUNTIME_PROFILE_INVALID") {
+      fail("installed profile list treated a malformed present catalog as absent");
+    }
+    const omittedProfileResult = invokeInstalled(
+      ["session", "create", "--branch", "feature/packed-profile-omitted", "--json"],
+      profileRepository,
+    );
+    const omittedProfile = parseInstalledJson(omittedProfileResult, "omitted profile create with malformed catalog");
+    if (
+      omittedProfileResult.status !== 0 ||
+      omittedProfile.ok !== true ||
+      typeof omittedProfile.session_id !== "string"
+    ) {
+      fail("omitted-profile create did not preserve bootstrap compatibility with a malformed catalog");
+    }
+    const profileRegistryPath = path.join(profileRepository, ".git", "nawabari", "session-registry.json");
+    const omittedRegistry = JSON.parse(fs.readFileSync(profileRegistryPath, "utf8"));
+    if (
+      omittedRegistry.required_features?.includes("pinned-profiles.v1") ||
+      omittedRegistry.pinned_profiles !== undefined
+    ) {
+      fail("omitted-profile create unexpectedly persisted pinned profile authority");
+    }
+    const omittedCloseResult = invokeInstalled(
+      ["session", "close", "--session", omittedProfile.session_id, "--json"],
+      profileRepository,
+    );
+    const omittedClose = parseInstalledJson(omittedCloseResult, "omitted profile cleanup");
+    if (omittedCloseResult.status !== 0 || omittedClose.ok !== true) {
+      fail("omitted-profile compatibility session could not be cleaned up");
+    }
+    fs.writeFileSync(profileCatalogPath, validCatalogText);
+    run("git", ["add", "nawabari.profiles.json"], { cwd: profileRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "restore valid profile catalog"], {
+      cwd: profileRepository,
+      env: gitEnvironment,
+    });
+
+    const managedCreateBefore = {
+      registry: fs.readFileSync(profileRegistryPath, "utf8"),
+      branches: run("git", ["branch", "--list", "feature/packed-profile-managed"], {
+        cwd: profileRepository,
+        env: gitEnvironment,
+      }).stdout,
+      worktrees: run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment })
+        .stdout,
+    };
+    const managedCreateResult = invokeInstalled(
+      ["session", "create", "--branch", "feature/packed-profile-managed", "--profile", "builtin:minimal", "--json"],
+      profileRepository,
+    );
+    const managedCreate = parseInstalledJson(managedCreateResult, "selected managed profile create");
+    const managedCreateAfter = {
+      registry: fs.readFileSync(profileRegistryPath, "utf8"),
+      branches: run("git", ["branch", "--list", "feature/packed-profile-managed"], {
+        cwd: profileRepository,
+        env: gitEnvironment,
+      }).stdout,
+      worktrees: run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment })
+        .stdout,
+    };
+    const managedCreateTypedUnavailable =
+      managedCreateResult.status === 4 && managedCreate.code === "SANDBOX_CAPABILITY_UNAVAILABLE";
+    const managedCreateOwnershipUnchanged =
+      managedCreateAfter.registry === managedCreateBefore.registry &&
+      managedCreateAfter.branches === managedCreateBefore.branches &&
+      managedCreateAfter.worktrees === managedCreateBefore.worktrees;
+    // The managed-execution readiness authority decides admission: without
+    // it the selected profile fails closed before any ownership mutation; on
+    // a supported host with delegated cgroups v2 it admits the session and
+    // must pin the exact built-in profile, wildcard ceiling included.
+    const managedCreateAdmitted = managedCreateResult.status === 0 && managedCreate.ok === true;
+    let managedCreateAdmissionEvidence = null;
+    if (managedCreateAdmitted) {
+      const admittedRegistry = JSON.parse(managedCreateAfter.registry);
+      const pinned = admittedRegistry.pinned_profiles?.filter(
+        (record) => record.session_id === managedCreate.session_id,
+      );
+      managedCreateAdmissionEvidence = {
+        command: managedCreate.command,
+        branch: managedCreate.branch,
+        branch_present: managedCreateAfter.branches.trim().length > 0,
+        worktree_present: typeof managedCreate.worktree === "string" && fs.existsSync(managedCreate.worktree),
+        worktree_listed:
+          typeof managedCreate.worktree === "string" &&
+          managedCreateAfter.worktrees.includes(`worktree ${managedCreate.worktree}\n`),
+        required_feature: admittedRegistry.required_features?.includes("pinned-profiles.v1") === true,
+        pinned_profile_id: pinned?.length === 1 ? pinned[0].resolved?.id : null,
+        pinned_read_only: pinned?.length === 1 ? pinned[0].resolved?.filesystem?.readOnly : null,
+        pinned_process_tracking: pinned?.length === 1 ? pinned[0].resolved?.execution?.processTracking : null,
+      };
+    }
+    const managedCreateAdmittedConformant =
+      managedCreateAdmissionEvidence !== null &&
+      managedCreateAdmissionEvidence.command === "session create" &&
+      managedCreateAdmissionEvidence.branch === "feature/packed-profile-managed" &&
+      managedCreateAdmissionEvidence.branch_present &&
+      managedCreateAdmissionEvidence.worktree_present &&
+      managedCreateAdmissionEvidence.worktree_listed &&
+      managedCreateAdmissionEvidence.required_feature &&
+      managedCreateAdmissionEvidence.pinned_profile_id === "minimal" &&
+      JSON.stringify(managedCreateAdmissionEvidence.pinned_read_only) === JSON.stringify(["**"]) &&
+      managedCreateAdmissionEvidence.pinned_process_tracking === "required";
+    const managedCreateConformanceFailure =
+      (managedCreateTypedUnavailable && managedCreateOwnershipUnchanged) || managedCreateAdmittedConformant
+        ? null
+        : {
+            expected: {
+              unavailable: { status: 4, code: "SANDBOX_CAPABILITY_UNAVAILABLE", ownership_unchanged: true },
+              admitted: { status: 0, pinned_profile_id: "minimal", pinned_read_only: ["**"] },
+            },
+            actual: {
+              admission: managedCreateAdmissionEvidence,
+              status: managedCreateResult.status,
+              result: managedCreate,
+              ownership_unchanged: managedCreateOwnershipUnchanged,
+              registry_unchanged: managedCreateAfter.registry === managedCreateBefore.registry,
+              branch_present: managedCreateAfter.branches.trim().length > 0,
+              worktree_list_changed: managedCreateAfter.worktrees !== managedCreateBefore.worktrees,
+            },
+          };
+
+    console.log("checking installed legacy registry migration and unsupported feature preservation...");
+    const migrationRepository = path.join(installDirectory, "migration-repository");
+    run("git", ["init", "-b", "main", migrationRepository], { env: gitEnvironment });
+    run("git", ["config", "user.email", "nawabari-smoke@example.invalid"], {
+      cwd: migrationRepository,
+      env: gitEnvironment,
+    });
+    run("git", ["config", "user.name", "Nawabari Smoke"], { cwd: migrationRepository, env: gitEnvironment });
+    run("git", ["config", "commit.gpgsign", "false"], { cwd: migrationRepository, env: gitEnvironment });
+    fs.writeFileSync(path.join(migrationRepository, "README.md"), "migration smoke fixture\n");
+    run("git", ["add", "README.md"], { cwd: migrationRepository, env: gitEnvironment });
+    run("git", ["commit", "-m", "initial migration fixture"], { cwd: migrationRepository, env: gitEnvironment });
+    const migrationCreateResult = invokeInstalled(
+      [
+        "session",
+        "create",
+        "--branch",
+        "feature/packed-legacy-migration",
+        "--resource",
+        "README.md",
+        "--mode",
+        "write",
+        "--json",
+      ],
+      migrationRepository,
+    );
+    const migrationSession = parseInstalledJson(migrationCreateResult, "legacy migration owner create");
+    if (migrationCreateResult.status !== 0 || migrationSession.ok !== true) {
+      fail("could not establish an installed registry ownership fixture for migration");
+    }
+    const migrationRegistryPath = path.join(migrationRepository, ".git", "nawabari", "session-registry.json");
+    const legacyRegistry = JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8"));
+    legacyRegistry.schema_version = 1;
+    legacyRegistry.claims_schema_version = 2;
+    legacyRegistry.claims = legacyRegistry.claims.map((claim) => ({ ...claim, schema_version: 2 }));
+    fs.writeFileSync(migrationRegistryPath, `${JSON.stringify(legacyRegistry, null, 2)}\n`);
+    const migrationResult = invokeInstalled(["migrate", "--json"], migrationRepository);
+    const migration = parseInstalledJson(migrationResult, "legacy registry migration");
+    if (migrationResult.status !== 0 || migration.migrated !== true) {
+      fail("installed migrate did not read and upgrade the bounded legacy registry fixture");
+    }
+    const migratedRegistry = JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8"));
+    if (
+      migratedRegistry.schema_version !== 2 ||
+      migratedRegistry.claims_schema_version !== 3 ||
+      migratedRegistry.sessions?.some((session) => session.session_id === migrationSession.session_id) !== true ||
+      migratedRegistry.claims?.some(
+        (claim) => claim.session_id === migrationSession.session_id && claim.resource === "README.md",
+      ) !== true ||
+      fs.existsSync(migrationSession.worktree) !== true
+    ) {
+      fail("legacy registry migration did not preserve its active owner, claim, and worktree");
+    }
+
+    const migratedBranch = run("git", ["rev-parse", "refs/heads/feature/packed-legacy-migration"], {
+      cwd: migrationRepository,
+      env: gitEnvironment,
+    }).stdout.trim();
+    const migratedWorktrees = run("git", ["worktree", "list", "--porcelain"], {
+      cwd: migrationRepository,
+      env: gitEnvironment,
+    }).stdout;
+    const supportedRegistryText = fs.readFileSync(migrationRegistryPath, "utf8");
+    const unsupportedRegistry = JSON.parse(supportedRegistryText);
+    unsupportedRegistry.required_features = ["retentions.v1"];
+    unsupportedRegistry.retentions = [{ fixture: "preserve", payload: { nested: ["optional", 1, true] } }];
+    const unsupportedRegistryText = `${JSON.stringify(unsupportedRegistry, null, 2)}\n`;
+    fs.writeFileSync(migrationRegistryPath, unsupportedRegistryText);
+    const unsupportedFeatureResult = invokeInstalled(["session", "list", "--json"], migrationRepository);
+    const unsupportedFeature = parseInstalledJson(unsupportedFeatureResult, "unsupported required registry feature");
+    if (unsupportedFeatureResult.status !== 3 || unsupportedFeature.code !== "REGISTRY_FEATURE_UNSUPPORTED") {
+      fail("installed registry reader did not reject an unsupported required feature");
+    }
+    const unsupportedFeatureOwnership = {
+      registry_bytes_unchanged: fs.readFileSync(migrationRegistryPath, "utf8") === unsupportedRegistryText,
+      optional_payload_unchanged:
+        JSON.stringify(JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8")).retentions) ===
+        JSON.stringify([{ fixture: "preserve", payload: { nested: ["optional", 1, true] } }]),
+      worktree_exists: fs.existsSync(migrationSession.worktree),
+      branch_ref_unchanged:
+        run("git", ["rev-parse", "refs/heads/feature/packed-legacy-migration"], {
+          cwd: migrationRepository,
+          env: gitEnvironment,
+        }).stdout.trim() === migratedBranch,
+      worktree_ownership_unchanged:
+        run("git", ["worktree", "list", "--porcelain"], {
+          cwd: migrationRepository,
+          env: gitEnvironment,
+        }).stdout === migratedWorktrees,
+      branch_ref: run("git", ["rev-parse", "refs/heads/feature/packed-legacy-migration"], {
+        cwd: migrationRepository,
+        env: gitEnvironment,
+      }).stdout.trim(),
+    };
+    if (
+      !unsupportedFeatureOwnership.registry_bytes_unchanged ||
+      !unsupportedFeatureOwnership.optional_payload_unchanged ||
+      !unsupportedFeatureOwnership.worktree_exists ||
+      !unsupportedFeatureOwnership.branch_ref_unchanged ||
+      !unsupportedFeatureOwnership.worktree_ownership_unchanged
+    ) {
+      fail(
+        `unsupported registry feature rejection rewrote payload or disturbed current ownership: ${JSON.stringify(unsupportedFeatureOwnership)}`,
+      );
+    }
+    fs.writeFileSync(migrationRegistryPath, supportedRegistryText);
+
+    if (managedCreateConformanceFailure !== null) {
+      fail(`profile-selected managed create certification failed: ${JSON.stringify(managedCreateConformanceFailure)}`);
+    }
+
     const doctorResult = invokeInstalled(["doctor", "--json"], lifecycleRepository);
     if (doctorResult.status !== 0) fail(`doctor --json exited ${doctorResult.status}, expected 0`);
     const protectedExecutionDoctor = parseInstalledJson(doctorResult, "protected-execution readiness");
@@ -608,6 +1099,34 @@ async function main() {
       fail("installed doctor did not expose protected-execution readiness");
     }
     if (doctorResult.stderr.trim().length > 0) fail("doctor --json wrote decorative output to stderr");
+    if (managedCreateAdmitted && protectedExecutionDoctor.sandbox.ready !== true) {
+      fail("profile-selected managed create was admitted although protected-execution readiness is unavailable");
+    }
+    console.log(
+      managedCreateAdmitted
+        ? "profile-selected managed create admitted by managed-execution readiness; builtin:minimal pinned with its wildcard ceiling."
+        : "profile-selected managed create failed closed with SANDBOX_CAPABILITY_UNAVAILABLE; ownership unchanged.",
+    );
+    const certificationEnvironmentBlocks = [];
+    const runtimeMaterializationBlocks = [];
+    const boundedProductionDefects = [];
+    const recordEnvironmentBlock = (label, code, details) => {
+      const message = `${label}: ${code}`;
+      if (code === "RUNTIME_MATERIALIZATION_MISSING") {
+        runtimeMaterializationBlocks.push(message);
+        console.error(
+          `RUNTIME_MATERIALIZATION_MISSING: ${message}${details === undefined ? "" : `; ${JSON.stringify(details)}`}`,
+        );
+      } else {
+        certificationEnvironmentBlocks.push(message);
+        console.error(`ENVIRONMENT_BLOCKED: ${message}${details === undefined ? "" : `; ${JSON.stringify(details)}`}`);
+      }
+    };
+    const recordCertificationDefect = (command, expected, actual) => {
+      const defect = { command, expected, actual };
+      boundedProductionDefects.push(defect);
+      console.error(`PRODUCTION_DEFECT: ${command}\n  expected: ${expected}\n  actual: ${JSON.stringify(actual)}`);
+    };
 
     console.log("running the installed Nawabari session lifecycle...");
     const protectedGuardResult = invokeInstalled(["guard", "--json"], lifecycleRepository);
@@ -666,6 +1185,7 @@ async function main() {
           auxiliaryDeclaration,
           "--mode",
           "write",
+          "--enforce-claims",
           "--json",
         ],
         lifecycleRepository,
@@ -893,33 +1413,48 @@ async function main() {
         lifecycleWorktree,
       );
       const protectedRunJson = parseInstalledJson(protectedRun, "packed protected session run");
-      if (
-        protectedRun.status !== 0 ||
-        protectedRunJson.ok !== true ||
-        protectedRunJson.exit_code !== 0 ||
-        protectedRunJson.signal !== null ||
-        protectedRunJson.stderr !== ""
-      ) {
-        fail("packed protected session run did not return a successful bounded result");
+      const protectedRunUnavailable =
+        protectedRun.status === 4 &&
+        ["SANDBOX_CAPABILITY_UNAVAILABLE", "SANDBOX_UNSUPPORTED_PLATFORM", "RUNTIME_MATERIALIZATION_MISSING"].includes(
+          protectedRunJson.code,
+        );
+      if (protectedRunUnavailable) {
+        recordEnvironmentBlock(`nawabari session run --session ${created.session_id} --json`, protectedRunJson.code, {
+          requirement_id: protectedRunJson.details?.requirement_id,
+          reason: protectedRunJson.details?.reason,
+          installable: protectedRunJson.details?.installable,
+        });
+      } else {
+        if (
+          protectedRun.status !== 0 ||
+          protectedRunJson.ok !== true ||
+          protectedRunJson.exit_code !== 0 ||
+          protectedRunJson.signal !== null ||
+          protectedRunJson.stderr !== ""
+        ) {
+          fail(
+            `packed protected session run did not return a successful bounded result; command=nawabari session run --session ${created.session_id} --json; exit=${protectedRun.status}; actual=${JSON.stringify(protectedRunJson)}`,
+          );
+        }
+        let protectedEvidence;
+        try {
+          protectedEvidence = JSON.parse(protectedRunJson.stdout);
+        } catch {
+          fail("packed protected session run did not return JSON execution evidence");
+        }
+        if (
+          protectedEvidence.cwd !== fs.realpathSync.native(lifecycleWorktree) ||
+          protectedEvidence.session_id !== created.session_id ||
+          protectedEvidence.argv?.length !== 1 ||
+          protectedEvidence.argv[0] !== protectedArgument
+        ) {
+          fail("packed protected session run did not preserve authoritative cwd, session identity, and argv");
+        }
+        if (fs.existsSync(path.join(lifecycleWorktree, "packed-ambient-marker"))) {
+          fail("packed protected session run interpolated command argv through a shell");
+        }
+        console.log("protected-execution integration passed.");
       }
-      let protectedEvidence;
-      try {
-        protectedEvidence = JSON.parse(protectedRunJson.stdout);
-      } catch {
-        fail("packed protected session run did not return JSON execution evidence");
-      }
-      if (
-        protectedEvidence.cwd !== fs.realpathSync.native(lifecycleWorktree) ||
-        protectedEvidence.session_id !== created.session_id ||
-        protectedEvidence.argv?.length !== 1 ||
-        protectedEvidence.argv[0] !== protectedArgument
-      ) {
-        fail("packed protected session run did not preserve authoritative cwd, session identity, and argv");
-      }
-      if (fs.existsSync(path.join(lifecycleWorktree, "packed-ambient-marker"))) {
-        fail("packed protected session run interpolated command argv through a shell");
-      }
-      console.log("protected-execution integration passed.");
     } else {
       // Package smoke owns the installed contract. A successful protected run
       // is a separate integration contract because hosted runners may not
@@ -952,15 +1487,11 @@ async function main() {
       ) {
         fail("installed protected session run did not fail closed when the sandbox capability was unavailable");
       }
-      if (requireProtectedExecution) {
-        fail(
-          `protected-execution integration requires an available sandbox; missing: ${
-            protectedExecutionDoctor.sandbox?.missing_required?.join(", ") || "unknown capability"
-          }`,
-        );
-      }
-      console.log(
-        `protected-execution integration not run (${expectedUnavailableCode}); fail-closed rejection verified.`,
+      certificationEnvironmentBlocks.push(
+        `protected execution unavailable; missing ${protectedExecutionDoctor.sandbox?.missing_required?.join(", ") || "unknown capability"}`,
+      );
+      console.error(
+        `ENVIRONMENT_BLOCKED: protected-execution integration returned ${expectedUnavailableCode}; fail-closed rejection verified but bounded runtime enforcement remains untested.`,
       );
     }
 
@@ -989,21 +1520,6 @@ async function main() {
       initialList.history_included !== false
     ) {
       fail("default session list did not expose bounded active-session metadata");
-    }
-
-    const createHelp = parseInstalledJson(
-      invokeInstalled(["session", "create", "--help", "--json"], lifecycleRepository),
-      "session create help",
-    );
-    if (
-      createHelp.ok !== true ||
-      createHelp.help_for !== "session create" ||
-      createHelp.required_options?.length !== 0 ||
-      createHelp.optional_options?.join(",") !==
-        "--branch,--worktree,--worktree-root,--base,--label,--resource,--mode,--auxiliary-state,--execution-scope-file,--candidate-working-set-file" ||
-      createHelp.defaults?.["--base"] !== "HEAD"
-    ) {
-      fail("installed session create help did not expose the optional/defaulted contract");
     }
 
     const lifecycleHelp = [
@@ -1228,20 +1744,29 @@ async function main() {
       "weak resource claim",
     );
     if (weakClaim.ok !== true) fail("installed weak resource claim could not be created");
-    const insufficient = parseInstalledJson(
-      invokeInstalled(
-        ["authorize", "--session", created.session_id, "--operation", "commit", "--resource", weakResource, "--json"],
-        lifecycleWorktree,
-      ),
-      "insufficient claim mode",
-    );
+    const insufficientArgs = [
+      "authorize",
+      "--session",
+      created.session_id,
+      "--operation",
+      "commit",
+      "--resource",
+      weakResource,
+      "--json",
+    ];
+    const insufficientResult = invokeInstalled(insufficientArgs, lifecycleWorktree);
+    const insufficient = parseInstalledJson(insufficientResult, "insufficient claim mode");
     if (
       insufficient.code !== "INSUFFICIENT_CLAIM_MODE" ||
       insufficient.details?.resource !== weakResource ||
       insufficient.details?.required_access !== "exclusive-write" ||
       JSON.stringify(insufficient.details?.granted_modes) !== JSON.stringify(["write"])
     ) {
-      fail("installed authorization did not distinguish insufficient claim mode");
+      recordCertificationDefect(
+        `nawabari ${insufficientArgs.join(" ")}`,
+        "return INSUFFICIENT_CLAIM_MODE for the write claim with required_access=exclusive-write",
+        { exitCode: insufficientResult.status, response: insufficient },
+      );
     }
 
     // #174: prove that the exact typed recovery action emitted by an
@@ -2647,6 +3172,652 @@ async function main() {
       if (closedConcurrent.status !== 0) fail(`concurrent session ${session.session_id} did not close safely`);
     }
 
+    const recordBoundedDefect = recordCertificationDefect;
+    const baseRevision = run("git", ["rev-parse", "HEAD"], {
+      cwd: lifecycleRepository,
+      env: gitEnvironment,
+    }).stdout.trim();
+    const executionScopeFile = materializeBoundedSessionFixture(
+      installDirectory,
+      "implementation-execution-scope.v1.json",
+      baseRevision,
+    );
+    const candidateFiles = {
+      compatible: materializeBoundedSessionFixture(installDirectory, "candidate-working-set.v1.json", baseRevision),
+      repositoryMismatch: materializeBoundedSessionFixture(
+        installDirectory,
+        "candidate-working-set-repository-mismatch.v1.json",
+        baseRevision,
+      ),
+      revisionMismatch: materializeBoundedSessionFixture(
+        installDirectory,
+        "candidate-working-set-revision-mismatch.v1.json",
+        baseRevision,
+      ),
+      requiredUnauthorized: materializeBoundedSessionFixture(
+        installDirectory,
+        "candidate-working-set-required-unauthorized.v1.json",
+        baseRevision,
+      ),
+    };
+    const executionScope = JSON.parse(fs.readFileSync(executionScopeFile, "utf8"));
+    const boundedRepositoryId = executionScope.repository.repositoryId;
+    const createBoundedSession = (branch, worktree, candidateWorkingSetFile) => {
+      const args = [
+        "session",
+        "create",
+        "--branch",
+        branch,
+        "--worktree",
+        worktree,
+        "--base",
+        "main",
+        "--execution-scope-file",
+        executionScopeFile,
+        "--candidate-working-set-file",
+        candidateWorkingSetFile,
+        "--json",
+      ];
+      return { args, result: invokeInstalled(args, lifecycleRepository) };
+    };
+    const expectBoundedBootstrapFailure = (label, branch, candidateFile, expectedCode) => {
+      const worktree = path.join(installDirectory, `${label}-worktree`);
+      const { args, result } = createBoundedSession(branch, worktree, candidateFile);
+      const response = parseInstalledJson(result, label);
+      if (
+        result.status !== 3 ||
+        response.ok !== false ||
+        response.details?.working_set_code !== expectedCode ||
+        fs.existsSync(worktree)
+      ) {
+        recordBoundedDefect(`nawabari ${args.join(" ")}`, `fail closed with ${expectedCode} before provisioning`, {
+          exitCode: result.status,
+          response,
+          worktreeCreated: fs.existsSync(worktree),
+        });
+        if (response.ok === true && typeof response.session_id === "string") {
+          invokeInstalled(["session", "close", "--session", response.session_id, "--json"], lifecycleRepository);
+        }
+      }
+    };
+
+    expectBoundedBootstrapFailure(
+      "bounded-repository-mismatch",
+      "feature/bounded-repository-mismatch",
+      candidateFiles.repositoryMismatch,
+      "REPOSITORY_MISMATCH",
+    );
+    expectBoundedBootstrapFailure(
+      "bounded-revision-mismatch",
+      "feature/bounded-revision-mismatch",
+      candidateFiles.revisionMismatch,
+      "BASE_MISMATCH",
+    );
+    expectBoundedBootstrapFailure(
+      "bounded-required-unauthorized",
+      "feature/bounded-required-unauthorized",
+      candidateFiles.requiredUnauthorized,
+      "REQUIRED_CONTEXT_UNAUTHORIZED",
+    );
+
+    const boundedWorktree = path.join(installDirectory, "bounded-compatible-worktree");
+    const boundedCreate = createBoundedSession(
+      "feature/bounded-compatible",
+      boundedWorktree,
+      candidateFiles.compatible,
+    );
+    const boundedSession = parseInstalledJson(boundedCreate.result, "compatible bounded-session bootstrap");
+    let boundedSessionId;
+    if (
+      boundedCreate.result.status !== 0 ||
+      boundedSession.ok !== true ||
+      boundedSession.state !== "active" ||
+      boundedSession.working_set?.revision !== 1 ||
+      boundedSession.working_set?.base?.revision !== baseRevision
+    ) {
+      recordBoundedDefect(`nawabari ${boundedCreate.args.join(" ")}`, "create an active revision-1 bounded session", {
+        exitCode: boundedCreate.result.status,
+        response: boundedSession,
+      });
+    } else {
+      boundedSessionId = boundedSession.session_id;
+    }
+
+    if (typeof boundedSessionId === "string") {
+      const initialShowArgs = ["session", "show", "--session", boundedSessionId, "--json"];
+      const initialShowResult = invokeInstalled(initialShowArgs, lifecycleRepository);
+      const initialShow = parseInstalledJson(initialShowResult, "bounded-session initial show");
+      if (
+        initialShowResult.status !== 0 ||
+        initialShow.ok !== true ||
+        initialShow.working_set?.revision !== 1 ||
+        initialShow.working_set?.scope?.readOnly?.includes("bounded-session/private.txt")
+      ) {
+        recordBoundedDefect(`nawabari ${initialShowArgs.join(" ")}`, "report revision 1 without out-of-set paths", {
+          exitCode: initialShowResult.status,
+          response: initialShow,
+        });
+      }
+
+      const privatePath = path.join(boundedWorktree, "bounded-session", "private.txt");
+      let boundedSessionDiscarded = false;
+      if (protectedExecutionDoctor.sandbox?.ready === true) {
+        const readScript =
+          "const fs=require('node:fs');try{process.stdout.write('READ_ALLOWED:'+fs.readFileSync(process.argv[1],'utf8'))}" +
+          "catch(error){process.stdout.write('DENIED:'+error.code)}";
+        const readArgs = [
+          "session",
+          "run",
+          "--session",
+          boundedSessionId,
+          "--json",
+          "--",
+          "node",
+          "-e",
+          readScript,
+          privatePath,
+        ];
+        const readResult = invokeInstalled(readArgs, boundedWorktree);
+        const readResponse = parseInstalledJson(readResult, "bounded-session out-of-set read");
+        if (
+          [
+            "SANDBOX_CAPABILITY_UNAVAILABLE",
+            "SANDBOX_UNSUPPORTED_PLATFORM",
+            "RUNTIME_MATERIALIZATION_MISSING",
+          ].includes(readResponse.code)
+        ) {
+          recordEnvironmentBlock("bounded-session out-of-set read", readResponse.code);
+        } else if (
+          readResult.status !== 0 ||
+          readResponse.ok !== true ||
+          readResponse.exit_code !== 0 ||
+          !/^DENIED:(?:EACCES|EPERM)$/u.test(readResponse.stdout)
+        ) {
+          recordBoundedDefect(`nawabari ${readArgs.join(" ")}`, "deny reading bounded-session/private.txt", {
+            exitCode: readResult.status,
+            response: readResponse,
+          });
+        }
+
+        const writeScript =
+          "const fs=require('node:fs');try{fs.writeFileSync(process.argv[1],'unauthorized mutation\\n');" +
+          "process.stdout.write('WRITE_ALLOWED')}catch(error){process.stdout.write('DENIED:'+error.code)}";
+        const writeArgs = [
+          "session",
+          "run",
+          "--session",
+          boundedSessionId,
+          "--json",
+          "--",
+          "node",
+          "-e",
+          writeScript,
+          privatePath,
+        ];
+        const writeResult = invokeInstalled(writeArgs, boundedWorktree);
+        const writeResponse = parseInstalledJson(writeResult, "bounded-session out-of-set mutation");
+        if (
+          [
+            "SANDBOX_CAPABILITY_UNAVAILABLE",
+            "SANDBOX_UNSUPPORTED_PLATFORM",
+            "RUNTIME_MATERIALIZATION_MISSING",
+          ].includes(writeResponse.code)
+        ) {
+          recordEnvironmentBlock("bounded-session out-of-set mutation", writeResponse.code);
+        } else if (
+          writeResult.status !== 0 ||
+          writeResponse.ok !== true ||
+          writeResponse.exit_code !== 0 ||
+          !/^DENIED:(?:EACCES|EPERM)$/u.test(writeResponse.stdout) ||
+          fs.readFileSync(privatePath, "utf8") !== "out-of-set secret fixture\n"
+        ) {
+          recordBoundedDefect(
+            `nawabari ${writeArgs.join(" ")}`,
+            "deny and leave bounded-session/private.txt unchanged",
+            {
+              exitCode: writeResult.status,
+              response: writeResponse,
+              fileContents: fs.readFileSync(privatePath, "utf8"),
+            },
+          );
+        }
+      } else {
+        certificationEnvironmentBlocks.push(
+          `protected execution unavailable; missing ${protectedExecutionDoctor.sandbox?.missing_required?.join(", ") || "unknown capability"}`,
+        );
+      }
+
+      const expandReadArgs = [
+        "session",
+        "scope",
+        "expand",
+        "--session",
+        boundedSessionId,
+        "--repository",
+        boundedRepositoryId,
+        "--repository-host",
+        "github.com",
+        "--revision",
+        "1",
+        "--execution-scope-file",
+        executionScopeFile,
+        "--path",
+        "bounded-session/expanded-read.txt",
+        "--operation",
+        "READONLY",
+        "--reason",
+        "packed bounded-session explicit read expansion",
+        "--json",
+      ];
+      const expandReadResult = invokeInstalled(expandReadArgs, lifecycleRepository);
+      const expandRead = parseInstalledJson(expandReadResult, "bounded-session READONLY expansion");
+      const readExpansionGranted =
+        expandReadResult.status === 0 &&
+        expandRead.ok === true &&
+        expandRead.status === "granted" &&
+        expandRead.previous_revision === 1 &&
+        expandRead.revision === 2 &&
+        expandRead.working_set?.revision === 2;
+      if (!readExpansionGranted) {
+        recordBoundedDefect(`nawabari ${expandReadArgs.join(" ")}`, "grant READONLY and advance revision 1 to 2", {
+          exitCode: expandReadResult.status,
+          workingSetRepositoryId: boundedRepositoryId,
+          sessionRepositoryId: boundedSession.repository,
+          response: expandRead,
+        });
+      }
+      const afterReadExpansion = parseInstalledJson(
+        invokeInstalled(["session", "show", "--session", boundedSessionId, "--json"], lifecycleRepository),
+        "bounded-session state after READONLY expansion",
+      );
+      if (afterReadExpansion.working_set?.revision !== (readExpansionGranted ? 2 : 1)) {
+        recordBoundedDefect(
+          "nawabari session show --session <bounded-session> --json",
+          "persist only a complete expansion",
+          {
+            response: afterReadExpansion,
+          },
+        );
+      }
+      if (readExpansionGranted && protectedExecutionDoctor.sandbox?.ready === true) {
+        const expandedReadScript =
+          "const fs=require('node:fs');process.stdout.write(fs.readFileSync(process.argv[1],'utf8'))";
+        const expandedReadArgs = [
+          "session",
+          "run",
+          "--session",
+          boundedSessionId,
+          "--json",
+          "--",
+          "node",
+          "-e",
+          expandedReadScript,
+          path.join(boundedWorktree, "bounded-session", "expanded-read.txt"),
+        ];
+        const expandedReadResult = invokeInstalled(expandedReadArgs, boundedWorktree);
+        const expandedRead = parseInstalledJson(expandedReadResult, "bounded-session expanded read");
+        if (
+          [
+            "SANDBOX_CAPABILITY_UNAVAILABLE",
+            "SANDBOX_UNSUPPORTED_PLATFORM",
+            "RUNTIME_MATERIALIZATION_MISSING",
+          ].includes(expandedRead.code)
+        ) {
+          recordEnvironmentBlock("bounded-session expanded read", expandedRead.code);
+        } else if (
+          expandedReadResult.status !== 0 ||
+          expandedRead.ok !== true ||
+          expandedRead.exit_code !== 0 ||
+          expandedRead.stdout !== "explicitly expanded bounded-session input\n"
+        ) {
+          recordBoundedDefect(
+            `nawabari ${expandedReadArgs.join(" ")}`,
+            "allow the agent to read the explicitly expanded file",
+            { exitCode: expandedReadResult.status, response: expandedRead },
+          );
+        }
+      }
+
+      const currentRevision = afterReadExpansion.working_set?.revision ?? 1;
+      const expandMutationArgs = [
+        "session",
+        "scope",
+        "expand",
+        "--session",
+        boundedSessionId,
+        "--repository",
+        boundedRepositoryId,
+        "--repository-host",
+        "github.com",
+        "--revision",
+        String(currentRevision),
+        "--execution-scope-file",
+        executionScopeFile,
+        "--path",
+        "bounded-session/expanded-read.txt",
+        "--operation",
+        "WRITE",
+        "--reason",
+        "packed bounded-session unauthorized mutation expansion",
+        "--json",
+      ];
+      const expandMutationResult = invokeInstalled(expandMutationArgs, lifecycleRepository);
+      const expandMutation = parseInstalledJson(
+        expandMutationResult,
+        "bounded-session unauthorized mutation expansion",
+      );
+      const mutationExpansionDenied =
+        expandMutationResult.status === 0 &&
+        expandMutation.ok === true &&
+        expandMutation.status === "denied" &&
+        expandMutation.revision === currentRevision;
+      if (!mutationExpansionDenied) {
+        recordBoundedDefect(
+          `nawabari ${expandMutationArgs.join(" ")}`,
+          "deny mutation outside the Inari WRITE maximum without advancing revision",
+          {
+            exitCode: expandMutationResult.status,
+            workingSetRepositoryId: boundedRepositoryId,
+            sessionRepositoryId: boundedSession.repository,
+            response: expandMutation,
+          },
+        );
+      }
+      const afterMutationExpansion = parseInstalledJson(
+        invokeInstalled(["session", "show", "--session", boundedSessionId, "--json"], lifecycleRepository),
+        "bounded-session state after denied mutation expansion",
+      );
+      if (afterMutationExpansion.working_set?.revision !== currentRevision) {
+        recordBoundedDefect(
+          "nawabari session show --session <bounded-session> --json",
+          "preserve revision after denied expansion",
+          {
+            response: afterMutationExpansion,
+          },
+        );
+      }
+
+      const beforeVerification = parseInstalledJson(
+        invokeInstalled(["session", "show", "--session", boundedSessionId, "--json"], lifecycleRepository),
+        "bounded-session state before verification API",
+      );
+      const agentWorkingSet = beforeVerification.working_set;
+      const runtimeRequest = await resolveSandboxExecutionRequest(
+        createLocalSessionBackend(),
+        { cwd: boundedWorktree },
+        {
+          session_id: boundedSessionId,
+          enforce: true,
+          runtime_policy: STRICT_RUNTIME_POLICY,
+        },
+      );
+      const verificationOnlyPath = path.join(boundedWorktree, "bounded-session", "verification-only.txt");
+      const mutationTargetPath = path.join(boundedWorktree, "bounded-session", "mutable.txt");
+      const verificationScript =
+        "const fs=require('node:fs');const value=fs.readFileSync(process.argv[1],'utf8');" +
+        "let writeError=null;try{fs.writeFileSync(process.argv[2],'verification must not mutate\\n')}" +
+        "catch(error){writeError=error.code}process.stdout.write(JSON.stringify({value,writeError}))";
+      const verificationContractProfile = {
+        contract_id: "nawabari.verification-profile.v1",
+        schema_version: 1,
+        profile_id: "packed-bounded-session-verification",
+        profile_version: "1",
+        executable: "node",
+        argv: ["-e", verificationScript, verificationOnlyPath, mutationTargetPath],
+        cwd: boundedWorktree,
+        read_visibility: "repository",
+        declared_read: [],
+        write_policy: "deny",
+        timeout_ms: 30_000,
+        max_output_bytes: 16_384,
+      };
+      const packedVerification = runtimeRequest.ok
+        ? runPackedVerification(installDirectory, {
+            profile: verificationContractProfile,
+            request: runtimeRequest.value,
+          })
+        : null;
+      const packedVerificationContract = packedVerification?.contract;
+      if (
+        packedVerificationContract !== undefined &&
+        (packedVerificationContract.contract_id !== "nawabari.verification-profile.v1" ||
+          packedVerificationContract.write_policy !== "deny" ||
+          packedVerificationContract.mutates_working_set !== false ||
+          packedVerificationContract.mutates_session_registry !== false ||
+          !packedVerificationContract.read_visibility?.includes("repository"))
+      ) {
+        recordBoundedDefect(
+          "nawabari/contract.nawabariVerificationContract()",
+          "discover repository-readable, default-deny verification isolated from working-set and registry mutation",
+          packedVerificationContract,
+        );
+      }
+      const verificationResult = packedVerification?.result;
+      if (!runtimeRequest.ok) {
+        const error = runtimeRequest.error;
+        if (error.code === "RUNTIME_MATERIALIZATION_MISSING") {
+          recordEnvironmentBlock("canonical protected verification runtime", error.code, error.details);
+        } else if (["SANDBOX_CAPABILITY_UNAVAILABLE", "SANDBOX_UNSUPPORTED_PLATFORM"].includes(error.code)) {
+          recordEnvironmentBlock("canonical protected verification execution", error.code, error.details);
+        } else {
+          recordBoundedDefect(
+            "resolveSandboxExecutionRequest()",
+            "resolve the canonical protected runtime for the active bounded session",
+            { code: error.code, details: error.details },
+          );
+        }
+      }
+      if (verificationResult?.ok === true && verificationResult.value?.working_set_mutated !== false) {
+        recordBoundedDefect(
+          "nawabari/contract.runVerification()",
+          "report that verification does not mutate the agent working set",
+          verificationResult.value,
+        );
+      }
+      if (agentWorkingSet === undefined || beforeVerification.ok !== true) {
+        recordBoundedDefect(
+          "nawabari session show --session <bounded-session> --json",
+          "provide the authoritative agent Effective Working Set snapshot to the verifier caller",
+          beforeVerification,
+        );
+      }
+      if (verificationResult?.ok === true && verificationResult.value?.status === "passed") {
+        let verifierEvidence;
+        try {
+          verifierEvidence = JSON.parse(verificationResult.value.stdout.text);
+        } catch {
+          verifierEvidence = null;
+        }
+        if (
+          verificationResult.value.working_set_mutated !== false ||
+          verifierEvidence?.value !== "repository-wide verifier input outside the agent set\n" ||
+          !["EACCES", "EPERM"].includes(verifierEvidence?.writeError) ||
+          fs.readFileSync(mutationTargetPath, "utf8") !== "initial bounded-session mutation target\n"
+        ) {
+          recordBoundedDefect(
+            "nawabari/contract.runVerification()",
+            "read the authorized broader repository input, deny verification writes, and leave the agent target unchanged",
+            {
+              result: verificationResult,
+              verifierEvidence,
+              mutationTarget: fs.readFileSync(mutationTargetPath, "utf8"),
+            },
+          );
+        } else {
+          console.log("packed verification API broader-read/default-deny certification passed.");
+        }
+      } else if (
+        runtimeRequest.ok &&
+        verificationResult?.ok === true &&
+        verificationResult.value?.status === "unavailable"
+      ) {
+        const diagnostic = verificationResult.value.stderr?.text ?? "";
+        if (/was not materialized/iu.test(diagnostic)) {
+          recordEnvironmentBlock("packed verification API protected runtime", "RUNTIME_MATERIALIZATION_MISSING", {
+            diagnostic,
+          });
+        } else {
+          recordEnvironmentBlock("packed verification API protected execution", "PROTECTED_EXECUTION_UNAVAILABLE", {
+            diagnostic,
+            missing: protectedExecutionDoctor.sandbox.missing_required,
+          });
+        }
+      } else if (runtimeRequest.ok) {
+        const verificationError = verificationResult?.error;
+        if (verificationError?.code === "RUNTIME_MATERIALIZATION_MISSING") {
+          recordEnvironmentBlock(
+            "packed verification API protected runtime",
+            verificationError.code,
+            verificationError.details,
+          );
+        } else if (
+          ["SANDBOX_CAPABILITY_UNAVAILABLE", "SANDBOX_UNSUPPORTED_PLATFORM"].includes(verificationError?.code)
+        ) {
+          recordEnvironmentBlock("packed verification API protected execution", verificationError.code);
+        } else {
+          recordBoundedDefect(
+            "nawabari/contract.runVerification()",
+            "accept the caller's authoritative bounded sandbox request and produce an isolated verification result",
+            verificationResult,
+          );
+        }
+      }
+      const afterVerification = parseInstalledJson(
+        invokeInstalled(["session", "show", "--session", boundedSessionId, "--json"], lifecycleRepository),
+        "bounded-session state after verification API",
+      );
+      if (
+        afterVerification.working_set?.revision !== agentWorkingSet?.revision ||
+        JSON.stringify(afterVerification.working_set) !== JSON.stringify(agentWorkingSet)
+      ) {
+        recordBoundedDefect(
+          "nawabari/contract.runVerification()",
+          "leave the agent Effective Working Set and revision unchanged",
+          { before: agentWorkingSet, after: afterVerification.working_set },
+        );
+      }
+
+      if (fs.readFileSync(privatePath, "utf8") !== "out-of-set secret fixture\n") {
+        const discardArgs = ["session", "discard", "--session", boundedSessionId, "--json"];
+        const discardResult = invokeInstalled(discardArgs, lifecycleRepository);
+        const discarded = parseInstalledJson(discardResult, "bounded-session public discard cleanup");
+        boundedSessionDiscarded =
+          discardResult.status === 0 &&
+          discarded.ok === true &&
+          discarded.session?.state === "closed" &&
+          !fs.existsSync(boundedWorktree);
+        if (!boundedSessionDiscarded) {
+          recordBoundedDefect(
+            `nawabari ${discardArgs.join(" ")}`,
+            "clean up the injected out-of-set mutation through Nawabari public lifecycle authority",
+            { exitCode: discardResult.status, response: discarded, worktreeExists: fs.existsSync(boundedWorktree) },
+          );
+        }
+      }
+      if (!boundedSessionDiscarded) {
+        const boundedCloseArgs = ["session", "close", "--session", boundedSessionId, "--json"];
+        const boundedCloseResult = invokeInstalled(boundedCloseArgs, boundedWorktree);
+        const boundedClose = parseInstalledJson(boundedCloseResult, "bounded-session close");
+        if (
+          boundedCloseResult.status !== 0 ||
+          boundedClose.ok !== true ||
+          boundedClose.session?.state !== "closed" ||
+          boundedClose.worktree_removed !== true ||
+          fs.existsSync(boundedWorktree)
+        ) {
+          recordBoundedDefect(
+            `nawabari ${boundedCloseArgs.join(" ")}`,
+            "close and remove the compatible bounded session cleanly",
+            {
+              exitCode: boundedCloseResult.status,
+              response: boundedClose,
+              worktreeExists: fs.existsSync(boundedWorktree),
+            },
+          );
+        }
+      }
+
+      const boundedRecoveryWorktree = path.join(installDirectory, "bounded-recovery-worktree");
+      const recoveryCreate = createBoundedSession(
+        "feature/bounded-recovery",
+        boundedRecoveryWorktree,
+        candidateFiles.compatible,
+      );
+      const boundedRecovery = parseInstalledJson(recoveryCreate.result, "bounded-session recovery bootstrap");
+      if (recoveryCreate.result.status !== 0 || boundedRecovery.ok !== true) {
+        recordBoundedDefect(
+          `nawabari ${recoveryCreate.args.join(" ")}`,
+          "create a bounded session that can exercise public recovery",
+          { exitCode: recoveryCreate.result.status, response: boundedRecovery },
+        );
+      } else {
+        fs.rmSync(boundedRecoveryWorktree, { recursive: true, force: true });
+        const inspectArgs = [
+          "session",
+          "inspect",
+          "--session",
+          boundedRecovery.session_id,
+          "--schema-version",
+          "2",
+          "--json",
+        ];
+        const inspectResult = invokeInstalled(inspectArgs, lifecycleRepository);
+        const recoveryInspect = parseInstalledJson(inspectResult, "bounded-session injected-fault inspect");
+        if (
+          inspectResult.status !== 0 ||
+          recoveryInspect.physical_state !== "prunable-missing" ||
+          recoveryInspect.next_action?.action_id !== "reconcile-physical-state" ||
+          recoveryInspect.next_action?.command !== "doctor"
+        ) {
+          recordBoundedDefect(
+            `nawabari ${inspectArgs.join(" ")}`,
+            "identify the injected missing worktree and project the canonical public reconciliation action",
+            { exitCode: inspectResult.status, response: recoveryInspect },
+          );
+        }
+        const reconcileArgs = ["session", "reconcile", "--session", boundedRecovery.session_id, "--apply", "--json"];
+        const reconcileResult = invokeInstalled(reconcileArgs, lifecycleRepository);
+        const recovered = parseInstalledJson(reconcileResult, "bounded-session public recovery");
+        if (
+          reconcileResult.status !== 0 ||
+          recovered.ok !== true ||
+          recovered.outcome !== "completed" ||
+          recovered.session?.state !== "closed" ||
+          recovered.physical_state !== "prunable-missing" ||
+          recovered.branch_removed !== true ||
+          recovered.session?.working_set?.revision !== 1
+        ) {
+          recordBoundedDefect(
+            `nawabari ${reconcileArgs.join(" ")}`,
+            "reconcile the recoverable bounded-session fault without changing its working-set revision",
+            { exitCode: reconcileResult.status, response: recovered },
+          );
+        }
+        const recoveredClaims = parseInstalledJson(
+          invokeInstalled(
+            ["session", "claims", "--session", boundedRecovery.session_id, "--json"],
+            lifecycleRepository,
+          ),
+          "bounded-session claims after public recovery",
+        );
+        if (recoveredClaims.ok !== true || recoveredClaims.claims?.length !== 0) {
+          recordBoundedDefect(
+            `nawabari session claims --session ${boundedRecovery.session_id} --json`,
+            "release bounded-session ownership through public recovery",
+            recoveredClaims,
+          );
+        }
+      }
+
+      const verificationStatus =
+        verificationResult?.ok === true
+          ? verificationResult.value.status
+          : (verificationResult?.error?.code ?? (runtimeRequest.ok ? "invalid" : runtimeRequest.error.code));
+      console.log(
+        `bounded-session evidence: bootstrap and negative cases exercised; READ expansion ${readExpansionGranted ? "granted 1->2" : "blocked"}; mutation expansion ${mutationExpansionDenied ? "denied without revision advance" : "blocked"}; verification ${verificationStatus}; public recovery exercised`,
+      );
+    }
+
     const prunableWorktree = path.join(installDirectory, "prunable-worktree");
     const prunableSession = parseInstalledJson(
       invokeInstalled(
@@ -2758,6 +3929,23 @@ async function main() {
       fail("status did not fail closed for a corrupt installed registry");
     }
 
+    if (certificationEnvironmentBlocks.length > 0) {
+      console.error(`ENVIRONMENT_BLOCKED: ${certificationEnvironmentBlocks.join("; ")}`);
+    }
+    if (runtimeMaterializationBlocks.length > 0) {
+      console.error(`RUNTIME_MATERIALIZATION_MISSING: ${runtimeMaterializationBlocks.join("; ")}`);
+    }
+    if (boundedProductionDefects.length > 0) {
+      console.error(`PRODUCTION_DEFECT: ${JSON.stringify(boundedProductionDefects, null, 2)}`);
+    }
+    if (
+      certificationEnvironmentBlocks.length > 0 ||
+      runtimeMaterializationBlocks.length > 0 ||
+      boundedProductionDefects.length > 0
+    ) {
+      const strictPrefix = requireProtectedExecution ? "required protected-execution and " : "";
+      throw new Error(`${strictPrefix}packed bounded-session certification did not satisfy all acceptance criteria`);
+    }
     console.log("smoke test passed.");
   } finally {
     fs.rmSync(installDirectory, { recursive: true, force: true });
