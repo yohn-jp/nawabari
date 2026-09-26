@@ -154,6 +154,14 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
     authority: "sandboxDoctorReport",
     fields: ["platform", "platform_supported", "capabilities", "ready", "missing_required", "network_mode", "runtime"],
   },
+  managed_execution_readiness: {
+    command: "doctor",
+    report_field: "managed_execution",
+    authority: "LocalSessionBackend",
+    process_tracking: "required",
+    blocker_code: "SANDBOX_CAPABILITY_UNAVAILABLE",
+    sandbox_ready_is_sufficient: false,
+  },
   runtime: {
     default_policy: "strict",
     default_profile: "development",
@@ -1070,6 +1078,7 @@ export function machineContract(packageVersion: string): JsonObject {
             fail_closed: capability.fail_closed,
             ambient_fallback: capability.ambient_fallback,
             readiness: jsonClone(capability.readiness),
+            managed_execution_readiness: jsonClone(capability.managed_execution_readiness),
             runtime: jsonClone(capability.runtime),
           }
         : {}),

@@ -245,6 +245,14 @@ test("session lifecycle publishes the profile namespace, pinning, and public ins
   assert.equal(cli.schema_version, 1);
   assert.deepEqual(cli.serialization_keys, ["cli", "contract"]);
   assert.deepEqual(cli.namespaces, ["builtin", "repository"]);
+  assert.deepEqual((cli.readiness as JsonRecord).fields, [
+    "definition",
+    "resolution",
+    "material",
+    "sandbox",
+    "managed_execution",
+    "bootstrap",
+  ]);
 
   const pinning = profile.pinning as JsonRecord;
   assert.deepEqual(pinning.catalog_sources, ["repository", "builtin"]);
@@ -347,6 +355,10 @@ test("protected-execution capability publishes the sandbox contract and canonica
   const readiness = capability.readiness as JsonRecord;
   assert.equal(readiness.command, "doctor");
   assert.equal(readiness.report_field, "sandbox");
+  const managed = capability.managed_execution_readiness as JsonRecord;
+  assert.equal(managed.report_field, "managed_execution");
+  assert.equal(managed.authority, "LocalSessionBackend");
+  assert.equal(managed.sandbox_ready_is_sufficient, false);
 
   for (const command of ["session run", "session exec", "session shell"] as const) {
     const output: string[] = [];

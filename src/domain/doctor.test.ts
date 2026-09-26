@@ -105,6 +105,31 @@ test("doctor exposes canonical protected-execution readiness from the injected s
   }
 });
 
+test("doctor reports sandbox-ready and managed-not-ready as separate authority results", async () => {
+  const directory = temporaryRepository();
+  try {
+    const result = await runDoctor(
+      directory,
+      sandboxProbe({ hasCgroupsV2: () => true, hasLandlock: () => true }),
+      undefined,
+      undefined,
+      () => ({ ready: false }),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.sandbox.ready, true);
+    assert.deepEqual(result.value.managed_execution, {
+      process_tracking: "required",
+      ready: false,
+      blocker_code: "SANDBOX_CAPABILITY_UNAVAILABLE",
+      sandbox_ready_is_sufficient: false,
+    });
+    assert.deepEqual(summarizeDoctorReport(result.value).managed_execution, result.value.managed_execution);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("doctor preserves the unsupported runtime contract below the package baseline", async () => {
   const directory = temporaryRepository();
   try {

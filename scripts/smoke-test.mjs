@@ -571,7 +571,7 @@ async function main() {
     // transition vocabularies advertised by the public contract, plus
     // headroom for incremental growth — this remains a fixed budget, not an
     // unbounded one.
-    if (capabilitiesResult.stdout.length > 41_000) fail("capabilities --json exceeded its fixed discovery budget");
+    if (capabilitiesResult.stdout.length > 42_000) fail("capabilities --json exceeded its fixed discovery budget");
 
     const helpJsonResult = spawnSync(installedBinary, ["--help", "--json"], {
       cwd: installDirectory,
@@ -890,6 +890,29 @@ async function main() {
       env: gitEnvironment,
     });
 
+    const managedInspectionBefore = {
+      registry: fs.readFileSync(profileRegistryPath, "utf8"),
+      branches: run("git", ["branch", "--list", "feature/packed-profile-managed"], {
+        cwd: profileRepository,
+        env: gitEnvironment,
+      }).stdout,
+      worktrees: run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment })
+        .stdout,
+    };
+    const managedShowResult = invokeInstalled(
+      ["profile", "show", "--profile", "builtin:minimal", "--json"],
+      profileRepository,
+    );
+    const managedShow = parseInstalledJson(managedShowResult, "managed profile readiness before create");
+    if (
+      managedShowResult.status !== 0 ||
+      managedShow.ready !== true ||
+      managedShow.readiness?.material?.ready !== true ||
+      managedShow.readiness?.managed_execution?.process_tracking !== "required" ||
+      typeof managedShow.readiness?.managed_execution?.ready !== "boolean" ||
+      managedShow.readiness?.bootstrap?.ready !== managedShow.readiness.managed_execution.ready
+    )
+      fail("installed profile show did not project distinct managed bootstrap readiness");
     const managedCreateBefore = {
       registry: fs.readFileSync(profileRegistryPath, "utf8"),
       branches: run("git", ["branch", "--list", "feature/packed-profile-managed"], {
@@ -899,6 +922,9 @@ async function main() {
       worktrees: run("git", ["worktree", "list", "--porcelain"], { cwd: profileRepository, env: gitEnvironment })
         .stdout,
     };
+    if (JSON.stringify(managedCreateBefore) !== JSON.stringify(managedInspectionBefore)) {
+      fail("managed readiness inspection changed registry, branch, or worktree state");
+    }
     const managedCreateResult = invokeInstalled(
       ["session", "create", "--branch", "feature/packed-profile-managed", "--profile", "builtin:minimal", "--json"],
       profileRepository,
@@ -924,6 +950,12 @@ async function main() {
     // a supported host with delegated cgroups v2 it admits the session and
     // must pin the exact built-in profile, wildcard ceiling included.
     const managedCreateAdmitted = managedCreateResult.status === 0 && managedCreate.ok === true;
+    if (managedShow.readiness.bootstrap.ready !== managedCreateAdmitted) {
+      fail("pre-create managed readiness did not predict selected-profile admission");
+    }
+    if (!managedCreateAdmitted && managedShow.readiness.bootstrap.blocker_code !== managedCreate.code) {
+      fail("pre-create managed readiness did not predict the typed create blocker");
+    }
     let managedCreateAdmissionEvidence = null;
     if (managedCreateAdmitted) {
       const admittedRegistry = JSON.parse(managedCreateAfter.registry);
@@ -1100,6 +1132,13 @@ async function main() {
     ) {
       fail("installed doctor did not expose protected-execution readiness");
     }
+    if (
+      protectedExecutionDoctor.managed_execution?.process_tracking !== "required" ||
+      typeof protectedExecutionDoctor.managed_execution?.ready !== "boolean" ||
+      protectedExecutionDoctor.managed_execution?.sandbox_ready_is_sufficient !== false ||
+      protectedExecutionDoctor.managed_execution?.ready !== managedShow.readiness.managed_execution.ready
+    )
+      fail("installed doctor did not expose the canonical managed-execution readiness separately");
     if (doctorResult.stderr.trim().length > 0) fail("doctor --json wrote decorative output to stderr");
     if (managedCreateAdmitted && protectedExecutionDoctor.sandbox.ready !== true) {
       fail("profile-selected managed create was admitted although protected-execution readiness is unavailable");

@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { runCli } from "../cli.js";
 import { resolveRepositoryContext } from "../git.js";
 import { SessionRegistry } from "../session-registry.js";
-import type { CgroupFileSystem } from "./cgroups-v2.js";
+import { resolveManagedCgroupRoot, type CgroupFileSystem } from "./cgroups-v2.js";
 import { withDirectoryFsyncFailure } from "../testing/fs-fault-injection.js";
 import {
   recordExecutionState,
@@ -24,7 +24,7 @@ import {
 } from "./runtime-projection.js";
 import type { FileOperationOptions } from "./session.js";
 import type { WorktreeFileOperation } from "./worktree-file-operation.js";
-import { LocalSessionBackend } from "./session-backend.js";
+import { LocalSessionBackend, probeLocalManagedExecutionReadiness } from "./session-backend.js";
 import { DomainError, failure } from "./errors.js";
 import { resolveBuiltinWorktreeProfile } from "./worktree-profile-builtins.js";
 import type { SessionHookMaterialAuthority } from "../session-registry.js";
@@ -153,6 +153,28 @@ test("local backend exposes the single cgroup root retained for managed readines
   const first = backend.getManagedCgroupRoot();
   assert.equal(first.ok, true);
   assert.equal(backend.getManagedCgroupRoot(), first);
+});
+
+test("public managed probe reuses the admission scope authority and removes its scope", () => {
+  const readySandbox: SandboxProbe = {
+    platform: () => "linux",
+    uid: () => 1000,
+    gid: () => 1000,
+    hasBubblewrap: () => true,
+    hasNamespaceSupport: () => true,
+    hasCgroupsV2: () => true,
+    hasLandlock: () => true,
+    hasSeccomp: () => true,
+    hasCapabilities: () => true,
+  };
+  for (const failDelegation of [true, false]) {
+    const cgroups = readinessCgroupFixture({ failDelegation });
+    const root = resolveManagedCgroupRoot({ root: cgroups.root, filesystem: cgroups.filesystem });
+    const readiness = probeLocalManagedExecutionReadiness(readySandbox, cgroups.filesystem, root);
+    assert.equal(readiness.ready, !failDelegation);
+    assert.equal(cgroups.activeScopeCount, 0);
+    assert.equal(cgroups.scopeCreateCount, cgroups.scopeCleanupCount);
+  }
 });
 
 test("local managed readiness fails closed on cgroup observation or cleanup uncertainty", async () => {
