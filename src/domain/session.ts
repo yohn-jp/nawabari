@@ -6,6 +6,24 @@ import type {
 } from "../session-lifecycle-classification.js";
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
+import type {
+  CoordinationPreviewOptions as RegistryCoordinationPreviewOptions,
+  CoordinationPreviewResult as RegistryCoordinationPreviewResult,
+} from "../coordination-preview.js";
+import type {
+  CoordinationContractInput,
+  ResourceCoordinationSnapshot,
+  ResourceCoordinationSnapshotBounds,
+} from "../resource-coordination-snapshot.js";
+import type {
+  CoordinationTransactionRequest as RegistryCoordinationTransactionRequest,
+  CoordinationTransactionResult as RegistryCoordinationTransactionResult,
+} from "../coordination-transactions.js";
+import type {
+  HandoffResourcesOptions,
+  ResourceHandoffResult as RegistryResourceHandoffResult,
+} from "../resource-handoff.js";
+import type { ResourceHandoffFenceController } from "../resource-handoff.js";
 import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
 import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
 import type { SessionHookMaterial } from "./session-git-hooks.js";
@@ -120,6 +138,17 @@ export type ResourceClaim = {
   created_at: string;
   updated_at: string;
 };
+
+export type CoordinationPreviewOptions = RegistryCoordinationPreviewOptions;
+export type CoordinationPreviewResult = RegistryCoordinationPreviewResult;
+export type CoordinationTransactionRequest = RegistryCoordinationTransactionRequest;
+export type CoordinationTransactionResult = RegistryCoordinationTransactionResult;
+export type ResourceCoordinationSnapshotContract = CoordinationContractInput;
+export type ResourceCoordinationSnapshotResult = ResourceCoordinationSnapshot;
+export type ResourceCoordinationSnapshotOptions = ResourceCoordinationSnapshotBounds;
+export type ResourceHandoffOptions = HandoffResourcesOptions;
+export type ResourceHandoffExecutionController = ResourceHandoffFenceController;
+export type ResourceHandoffResult = RegistryResourceHandoffResult;
 
 export type ResourceClaimInput = {
   resource: string;
@@ -918,6 +947,23 @@ export interface SessionBackend {
     context: SessionContext,
     sessionId: string | null,
   ): Promise<DomainResult<{ claims: ResourceClaim[]; claim_set_generation: number }>>;
+  coordinationPreview?(
+    context: SessionContext,
+    options: CoordinationPreviewOptions,
+  ): Promise<DomainResult<CoordinationPreviewResult>>;
+  resourceCoordinationSnapshot?(
+    context: SessionContext,
+    contract: ResourceCoordinationSnapshotContract,
+    bounds?: ResourceCoordinationSnapshotOptions,
+  ): Promise<DomainResult<ResourceCoordinationSnapshotResult>>;
+  handoffResources?(
+    context: SessionContext,
+    options: ResourceHandoffOptions,
+  ): Promise<DomainResult<ResourceHandoffResult>>;
+  applyCoordinationTransaction?(
+    context: SessionContext,
+    request: CoordinationTransactionRequest,
+  ): Promise<DomainResult<CoordinationTransactionResult>>;
   migrate?(context: SessionContext): Promise<DomainResult<RegistryMigrationResult>>;
   listSessionExecutions?(
     context: SessionContext,

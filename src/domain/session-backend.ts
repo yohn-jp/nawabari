@@ -71,6 +71,15 @@ import {
   type RegistryMigrationResult,
   type StatusResult,
   type UpdateClaimsOptions,
+  type CoordinationPreviewOptions,
+  type CoordinationPreviewResult,
+  type ResourceCoordinationSnapshotContract,
+  type ResourceCoordinationSnapshotOptions,
+  type ResourceCoordinationSnapshotResult,
+  type ResourceHandoffOptions,
+  type ResourceHandoffResult,
+  type CoordinationTransactionRequest,
+  type CoordinationTransactionResult,
 } from "./session.js";
 import {
   parseSessionExecutionRecord,
@@ -116,6 +125,8 @@ import {
   type SandboxGitIdentity,
   type SandboxProbe,
 } from "./sandbox.js";
+import type { ResourceHandoffFenceController } from "../resource-handoff.js";
+import { createManagedResourceHandoffExecution } from "../resource-handoff-execution.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
@@ -132,6 +143,8 @@ export interface LocalSessionBackendOptions {
     SessionRegistryOptions,
     "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority"
   >;
+  /** Explicit override for the managed-runtime handoff fence (tests/custom composition). */
+  readonly resourceHandoffExecution?: ResourceHandoffFenceController;
 }
 
 export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
@@ -240,12 +253,14 @@ export class LocalSessionBackend implements SessionBackend {
     SessionRegistryOptions,
     "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority"
   >;
+  private readonly resourceHandoffExecution: ResourceHandoffFenceController | undefined;
 
   public constructor(options: LocalSessionBackendOptions = {}) {
     this.git = options.git;
     this.gitIdentity = options.gitIdentity;
     this.sandboxProbe = options.sandboxProbe;
     this.registryOptions = options.registry ?? {};
+    this.resourceHandoffExecution = options.resourceHandoffExecution;
     this.managedCgroupRoot = resolveManagedCgroupRoot({
       ...(options.cgroupRoot === undefined ? {} : { root: options.cgroupRoot }),
       ...(this.registryOptions.cgroupFilesystem === undefined
@@ -878,6 +893,53 @@ export class LocalSessionBackend implements SessionBackend {
         claims: snapshot.claims.map(toDomainClaim),
         claim_set_generation: snapshot.claimSetGeneration,
       });
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async coordinationPreview(
+    context: SessionContext,
+    options: CoordinationPreviewOptions,
+  ): Promise<DomainResult<CoordinationPreviewResult>> {
+    try {
+      return success(this.registryFor(context).coordinationPreview(options));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async resourceCoordinationSnapshot(
+    context: SessionContext,
+    contract: ResourceCoordinationSnapshotContract,
+    bounds?: ResourceCoordinationSnapshotOptions,
+  ): Promise<DomainResult<ResourceCoordinationSnapshotResult>> {
+    try {
+      return success(this.registryFor(context).resourceCoordinationSnapshot(contract, bounds));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async handoffResources(
+    context: SessionContext,
+    options: ResourceHandoffOptions,
+  ): Promise<DomainResult<ResourceHandoffResult>> {
+    try {
+      const registry = this.registryFor(context);
+      const execution = this.resourceHandoffExecution ?? createManagedResourceHandoffExecution(registry);
+      return success(await registry.handoffResources(options, execution));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async applyCoordinationTransaction(
+    context: SessionContext,
+    request: CoordinationTransactionRequest,
+  ): Promise<DomainResult<CoordinationTransactionResult>> {
+    try {
+      return success(this.registryFor(context).applyCoordinationTransaction(request));
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }

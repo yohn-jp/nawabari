@@ -82,6 +82,7 @@ import {
   type CommandId,
   type OptionId,
 } from "./cli-command-registry.js";
+import { parseCoordinationPreviewArguments, parseResourceHandoffArguments } from "./resource-coordination-cli.js";
 
 export {
   CLI_COMMAND_REGISTRY,
@@ -142,7 +143,9 @@ function helpSpecFor(commandArguments: readonly string[]): CliCommandDefinition 
   const key =
     commandArguments[0] === "resource"
       ? `resource ${commandArguments[1] ?? "list"}`
-      : commandArguments.slice(0, 2).join(" ");
+      : commandArguments[0] === "session" && commandArguments[1] === "coordination"
+        ? commandArguments.slice(0, 3).join(" ")
+        : commandArguments.slice(0, 2).join(" ");
   return resolveCliCommandDefinition(key) ?? resolveCliCommandDefinition(commandArguments[0]) ?? ROOT_HELP_SPEC;
 }
 
@@ -156,7 +159,7 @@ function helpPayload(spec: CliCommandDefinition): JsonObject {
     const unique = (values: string[]): string[] => values.filter((value, index) => values.indexOf(value) === index);
     const sessionListOnlyOptions = new Set(["--all", "--history"]);
     const sessionTargetingCommands = CLI_COMMAND_REGISTRY.filter(
-      (command) => command.name.startsWith("session ") && command.usage.includes("<session"),
+      (command) => command.name.startsWith("session ") && command.usage.includes("|--session"),
     ).map((command) => command.name.slice("session ".length));
     const optionsFor = (name: string): string[] =>
       optionNames(publicCommands.find((command) => command.name === name)?.options ?? []);
@@ -1610,6 +1613,29 @@ async function executeCommand(
     if (subcommand === undefined) {
       return failure(usageError("MISSING_ARGUMENT", "session requires a subcommand."));
     }
+    if (subcommand === "coordination") {
+      if (rest[0] !== "preview") {
+        return failure(
+          new DomainError("UNKNOWN_COMMAND", `Unknown session coordination subcommand: ${rest[0] ?? "<missing>"}.`),
+        );
+      }
+      const parsed = parseCoordinationPreviewArguments(rest.slice(1));
+      if (!parsed.ok) return parsed;
+      if (dependencies.backend.coordinationPreview === undefined) {
+        return failure(new DomainError("BACKEND_UNAVAILABLE", "Coordination preview is not available."));
+      }
+      const result = await dependencies.backend.coordinationPreview(context, parsed.value);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
+    if (subcommand === "handoff") {
+      const parsed = parseResourceHandoffArguments(rest);
+      if (!parsed.ok) return parsed;
+      if (dependencies.backend.handoffResources === undefined) {
+        return failure(new DomainError("BACKEND_UNAVAILABLE", "Resource handoff is not available."));
+      }
+      const result = await dependencies.backend.handoffResources(context, parsed.value);
+      return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+    }
     if (canonicalCommandForName(`session ${subcommand}`)?.name === "session shell") {
       return executeProtectedSessionCommand(rest, dependencies, context, true);
     }
@@ -2248,7 +2274,10 @@ async function executeCommand(
 }
 
 function commandName(commandArguments: string[]): string {
-  if (commandArguments[0] === "session") return commandArguments.slice(0, 2).join(" ");
+  if (commandArguments[0] === "session") {
+    if (commandArguments[1] === "coordination") return commandArguments.slice(0, 3).join(" ");
+    return commandArguments.slice(0, 2).join(" ");
+  }
   if (commandArguments[0] === "profile") return commandArguments.slice(0, 2).join(" ");
   if (commandArguments[0] === "resource") {
     return commandArguments[1] === undefined ? "resource list" : commandArguments.slice(0, 2).join(" ");

@@ -40,7 +40,7 @@ function workingSet(): WorkingSetRuntimeProjection {
 
 function claim(resource: string, mode: ResourceClaim["mode"]): ResourceClaim {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     claimId: "claim-1",
     sessionId: "session-1",
     repositoryId: "repo",

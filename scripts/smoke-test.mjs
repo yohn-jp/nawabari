@@ -1005,8 +1005,8 @@ async function main() {
     const migrationRegistryPath = path.join(migrationRepository, ".git", "nawabari", "session-registry.json");
     const legacyRegistry = JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8"));
     legacyRegistry.schema_version = 1;
-    legacyRegistry.claims_schema_version = 1;
-    legacyRegistry.claims = legacyRegistry.claims.map((claim) => ({ ...claim, schema_version: 1 }));
+    legacyRegistry.claims_schema_version = 2;
+    legacyRegistry.claims = legacyRegistry.claims.map((claim) => ({ ...claim, schema_version: 2 }));
     fs.writeFileSync(migrationRegistryPath, `${JSON.stringify(legacyRegistry, null, 2)}\n`);
     const migrationResult = invokeInstalled(["migrate", "--json"], migrationRepository);
     const migration = parseInstalledJson(migrationResult, "legacy registry migration");
@@ -1016,7 +1016,7 @@ async function main() {
     const migratedRegistry = JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8"));
     if (
       migratedRegistry.schema_version !== 2 ||
-      migratedRegistry.claims_schema_version !== 2 ||
+      migratedRegistry.claims_schema_version !== 3 ||
       migratedRegistry.sessions?.some((session) => session.session_id === migrationSession.session_id) !== true ||
       migratedRegistry.claims?.some(
         (claim) => claim.session_id === migrationSession.session_id && claim.resource === "README.md",
@@ -3816,6 +3816,222 @@ async function main() {
       console.log(
         `bounded-session evidence: bootstrap and negative cases exercised; READ expansion ${readExpansionGranted ? "granted 1->2" : "blocked"}; mutation expansion ${mutationExpansionDenied ? "denied without revision advance" : "blocked"}; verification ${verificationStatus}; public recovery exercised`,
       );
+    }
+
+    // Resource handoff through the default installed backend is fenced by the
+    // #403 managed runtime authority. A supported delegated-cgroups-v2 host
+    // must transfer the claim after a managed execution leaves an empty owned
+    // scope; any other host must retain the source claim, never fabricating
+    // quiescence.
+    console.log("checking installed managed-runtime resource handoff...");
+    const handoffResource = "bounded-session/mutable.txt";
+    const handoffSourceWorktree = path.join(installDirectory, "handoff-source-worktree");
+    const handoffDestinationWorktree = path.join(installDirectory, "handoff-destination-worktree");
+    // The source must be admitted by the #403 managed launch-admission
+    // authority (pinned profile + session admission record); only then does
+    // `session run` persist an owned execution record the fence can observe.
+    // Hosts without managed readiness reject the profile-selected create, and
+    // the handoff is then exercised on an untracked source that must never
+    // be reported quiescent.
+    const handoffSourceArgs = [
+      "session",
+      "create",
+      "--branch",
+      "feature/handoff-source",
+      "--worktree",
+      handoffSourceWorktree,
+      "--profile",
+      "builtin:minimal",
+      "--resource",
+      handoffResource,
+      "--mode",
+      "read",
+      "--json",
+    ];
+    const handoffManagedSourceResult = invokeInstalled(handoffSourceArgs, lifecycleRepository);
+    const handoffManagedSource = parseInstalledJson(handoffManagedSourceResult, "handoff managed source bootstrap");
+    const handoffSourceManaged = handoffManagedSourceResult.status === 0 && handoffManagedSource.ok === true;
+    // Managed readiness is the same host fact that decided the earlier
+    // profile-selected create: an admitting host must admit this source too,
+    // and a typed fail-closed rejection is conformant only where that create
+    // was also rejected.
+    const handoffSourceTypedUnavailable =
+      handoffManagedSourceResult.status === 4 && handoffManagedSource.code === "SANDBOX_CAPABILITY_UNAVAILABLE";
+    if (!handoffSourceManaged && (managedCreateAdmitted || !handoffSourceTypedUnavailable)) {
+      recordBoundedDefect(
+        `nawabari ${handoffSourceArgs.join(" ")}`,
+        managedCreateAdmitted
+          ? "admit the managed handoff source on a managed-execution-ready host"
+          : "fail closed with SANDBOX_CAPABILITY_UNAVAILABLE",
+        { exitCode: handoffManagedSourceResult.status, response: handoffManagedSource },
+      );
+    }
+    const handoffSource = handoffSourceManaged
+      ? handoffManagedSource
+      : parseInstalledJson(
+          invokeInstalled(
+            [
+              "session",
+              "create",
+              "--branch",
+              "feature/handoff-source",
+              "--worktree",
+              handoffSourceWorktree,
+              "--resource",
+              handoffResource,
+              "--mode",
+              "read",
+              "--json",
+            ],
+            lifecycleRepository,
+          ),
+          "handoff untracked source bootstrap",
+        );
+    const handoffDestinationCreate = createBoundedSession(
+      "feature/handoff-destination",
+      handoffDestinationWorktree,
+      candidateFiles.compatible,
+    );
+    const handoffDestination = parseInstalledJson(handoffDestinationCreate.result, "handoff destination bootstrap");
+    if (handoffSource.ok !== true || handoffDestination.ok !== true) {
+      recordBoundedDefect("nawabari session create (handoff fixtures)", "create active source and destination", {
+        source: handoffSource,
+        destination: handoffDestination,
+      });
+    } else {
+      // The source claim is acquired at bootstrap: once a managed session is
+      // admitted, #403 gates later claim mutation on drained executions.
+      const handoffClaimArgs = ["session", "claims", "--session", handoffSource.session_id, "--json"];
+      const handoffClaim = parseInstalledJson(
+        invokeInstalled(handoffClaimArgs, lifecycleRepository),
+        "handoff source bootstrap claims",
+      );
+      if (
+        handoffClaim.ok !== true ||
+        handoffClaim.claims?.some((claim) => claim.resource === handoffResource && claim.mode === "read") !== true
+      ) {
+        recordBoundedDefect(
+          `nawabari ${handoffClaimArgs.join(" ")}`,
+          "hold the bootstrap handoff source claim",
+          handoffClaim,
+        );
+      } else {
+        const handoffRunArgs = [
+          "session",
+          "run",
+          "--session",
+          handoffSource.session_id,
+          "--json",
+          "--",
+          "node",
+          "-e",
+          "process.stdout.write('handoff-execution')",
+        ];
+        const handoffRunResult = invokeInstalled(handoffRunArgs, handoffSourceWorktree);
+        const handoffRun = parseInstalledJson(handoffRunResult, "handoff source managed run");
+        const handoffRunUnavailable = [
+          "SANDBOX_CAPABILITY_UNAVAILABLE",
+          "SANDBOX_UNSUPPORTED_PLATFORM",
+          "RUNTIME_MATERIALIZATION_MISSING",
+        ].includes(handoffRun.code);
+        // Only a managed run persists owned execution evidence for the fence.
+        const handoffRunCompleted =
+          handoffSourceManaged &&
+          handoffRunResult.status === 0 &&
+          handoffRun.ok === true &&
+          handoffRun.exit_code === 0 &&
+          typeof handoffRun.execution?.execution_id === "string";
+        if (handoffSourceManaged && handoffRunUnavailable) {
+          recordEnvironmentBlock("managed-runtime resource handoff execution", handoffRun.code);
+        } else if (handoffSourceManaged && !handoffRunCompleted) {
+          recordBoundedDefect(`nawabari ${handoffRunArgs.join(" ")}`, "complete one managed source execution", {
+            exitCode: handoffRunResult.status,
+            response: handoffRun,
+          });
+        }
+        const handoffGeneration = parseInstalledJson(
+          invokeInstalled(handoffClaimArgs, lifecycleRepository),
+          "handoff source claims before handoff",
+        ).claim_set_generation;
+        const handoffArgs = [
+          "session",
+          "handoff",
+          "--from",
+          handoffSource.session_id,
+          "--to",
+          handoffDestination.session_id,
+          "--resource",
+          handoffResource,
+          "--mode",
+          "read",
+          "--if-generation",
+          String(handoffGeneration),
+          "--operation-id",
+          "packed-managed-handoff",
+          "--json",
+        ];
+        const handoffResult = invokeInstalled(handoffArgs, lifecycleRepository);
+        const handoff = parseInstalledJson(handoffResult, "managed-runtime resource handoff");
+        const sourceClaimsAfter = parseInstalledJson(
+          invokeInstalled(["session", "claims", "--session", handoffSource.session_id, "--json"], lifecycleRepository),
+          "handoff source claims",
+        );
+        const destinationClaimsAfter = parseInstalledJson(
+          invokeInstalled(
+            ["session", "claims", "--session", handoffDestination.session_id, "--json"],
+            lifecycleRepository,
+          ),
+          "handoff destination claims",
+        );
+        const sourceHolds = sourceClaimsAfter.claims?.some((claim) => claim.resource === handoffResource) === true;
+        const destinationHolds =
+          destinationClaimsAfter.claims?.some(
+            (claim) => claim.resource === handoffResource && claim.mode === "read",
+          ) === true;
+        if (handoffRunCompleted) {
+          if (
+            handoffResult.status !== 0 ||
+            handoff.status !== "transferred" ||
+            typeof handoff.fenceEpoch !== "number" ||
+            sourceHolds ||
+            !destinationHolds
+          ) {
+            recordBoundedDefect(
+              `nawabari ${handoffArgs.join(" ")}`,
+              "close source admission, prove owned scopes empty, and transfer the claim atomically",
+              { exitCode: handoffResult.status, response: handoff, sourceHolds, destinationHolds },
+            );
+          } else {
+            console.log("managed-runtime resource handoff transferred after empty owned-scope proof.");
+          }
+        } else if (handoff.status === "transferred" || handoff.sourceRetained !== true || !sourceHolds) {
+          recordBoundedDefect(
+            `nawabari ${handoffArgs.join(" ")}`,
+            "retain the source claim without managed execution evidence",
+            { exitCode: handoffResult.status, response: handoff, sourceHolds, destinationHolds },
+          );
+        } else if (!handoffSourceManaged) {
+          console.log(
+            "managed-runtime resource handoff failed closed on an untracked source; managed readiness unavailable, source claim retained.",
+          );
+        }
+      }
+    }
+    for (const [session, worktree] of [
+      [handoffSource, handoffSourceWorktree],
+      [handoffDestination, handoffDestinationWorktree],
+    ]) {
+      if (session.ok !== true) continue;
+      const closeArgs = ["session", "close", "--session", session.session_id, "--json"];
+      const closeResult = invokeInstalled(closeArgs, lifecycleRepository);
+      const closed = parseInstalledJson(closeResult, "handoff fixture close");
+      if (closeResult.status !== 0 || closed.ok !== true || fs.existsSync(worktree)) {
+        recordBoundedDefect(`nawabari ${closeArgs.join(" ")}`, "close the handoff fixture session cleanly", {
+          exitCode: closeResult.status,
+          response: closed,
+          worktreeExists: fs.existsSync(worktree),
+        });
+      }
     }
 
     const prunableWorktree = path.join(installDirectory, "prunable-worktree");

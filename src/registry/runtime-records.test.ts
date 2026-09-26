@@ -20,7 +20,12 @@ test("registry optional areas are a finite feature-gated contract", () => {
     "recent-events.v1",
     "file-operations.v1",
   ]);
-  assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, ["pinned-profiles.v1", "runtime-sessions.v1", "executions.v1"]);
+  assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, [
+    "pinned-profiles.v1",
+    "runtime-sessions.v1",
+    "executions.v1",
+    "recent-events.v1",
+  ]);
   assert.deepEqual(parseRuntimeRecords({}), { requiredFeatures: [], records: {} });
 });
 
@@ -119,6 +124,61 @@ test("runtime admission records reject unknown shape, invalid epochs, and duplic
     () =>
       parseRuntimeRecords(
         { required_features: ["runtime-sessions.v1"], runtime_sessions: [admission, admission] },
+        SUPPORTED_REGISTRY_FEATURES,
+      ),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+});
+
+test("recent-event records accept only the frozen resource-handoff shape", () => {
+  const parsed = parseRuntimeRecords(
+    {
+      required_features: ["recent-events.v1"],
+      recent_events: [
+        {
+          kind: "resource-handoff",
+          schema_version: 1,
+          operation_id: "handoff-1",
+          from_session_id: "session-a",
+          to_session_id: "session-b",
+          resource: "README.md",
+          mode: "write",
+          claim_set_generation: 2,
+        },
+      ],
+    },
+    SUPPORTED_REGISTRY_FEATURES,
+  );
+  assert.equal(parsed.records.recent_events?.[0]?.kind, "resource-handoff");
+  assert.throws(
+    () =>
+      parseRuntimeRecords(
+        {
+          required_features: ["recent-events.v1"],
+          recent_events: [{ kind: "unknown", schema_version: 1 }],
+        },
+        SUPPORTED_REGISTRY_FEATURES,
+      ),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+  assert.throws(
+    () =>
+      parseRuntimeRecords(
+        {
+          required_features: ["recent-events.v1"],
+          recent_events: [
+            {
+              kind: "resource-handoff",
+              schema_version: 2,
+              operation_id: "handoff-1",
+              from_session_id: "session-a",
+              to_session_id: "session-b",
+              resource: "README.md",
+              mode: "write",
+              claim_set_generation: 2,
+            },
+          ],
+        },
         SUPPORTED_REGISTRY_FEATURES,
       ),
     (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",

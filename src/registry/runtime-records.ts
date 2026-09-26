@@ -1,6 +1,7 @@
 import type { JsonObject, JsonValue } from "../domain/errors.js";
 import { SessionRegistryError } from "../errors.js";
 import { parsePinnedProfileRecord } from "../domain/worktree-profile-pinning.js";
+import { isResourceClaimMode, type ResourceClaimMode } from "../resource-claims.js";
 
 /**
  * Optional registry areas are deliberately a closed, versioned vocabulary.
@@ -18,11 +19,15 @@ export const REGISTRY_FEATURES = Object.freeze([
 
 export type RegistryFeature = (typeof REGISTRY_FEATURES)[number];
 
-/** Optional record authorities implemented by the runtime registry owner. */
+/**
+ * Optional record authorities implemented by the runtime registry owner. The
+ * resource-coordination integration owns exactly the handoff receipt area.
+ */
 export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([
   "pinned-profiles.v1",
   "runtime-sessions.v1",
   "executions.v1",
+  "recent-events.v1",
 ] as const);
 
 export const MAX_RUNTIME_RECORDS = 256 as const;
@@ -46,6 +51,17 @@ export interface RuntimeRecords {
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
   readonly file_operations?: readonly RuntimeRecord[];
+}
+
+export interface ResourceHandoffRecentEvent extends JsonObject {
+  readonly kind: "resource-handoff";
+  readonly schema_version: 1;
+  readonly operation_id: string;
+  readonly from_session_id: string;
+  readonly to_session_id: string;
+  readonly resource: string;
+  readonly mode: ResourceClaimMode;
+  readonly claim_set_generation: number;
 }
 
 export interface ParsedRuntimeRecords {
@@ -181,7 +197,9 @@ function parseRecordList(value: unknown, field: string): readonly RuntimeRecord[
       ? parseSessionAdmissionRecord(candidate, index)
       : field === "pinned_profiles"
         ? parsePinnedProfileRuntimeRecord(candidate, index)
-        : parseRuntimeRecord(candidate, field, index),
+        : field === "recent_events"
+          ? parseResourceHandoffRecentEvent(candidate, field, index)
+          : parseRuntimeRecord(candidate, field, index),
   );
   if (field === "runtime_sessions") {
     const owners = new Set<string>();
@@ -276,6 +294,58 @@ export function parseSessionAdmissionRecord(value: unknown, index = 0): SessionA
     admission: value.admission,
     runtime_epoch: value.runtime_epoch,
   });
+}
+
+function parseResourceHandoffRecentEvent(value: unknown, field: string, index: number): ResourceHandoffRecentEvent {
+  if (!isRecord(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry ${field}[${index}] must be an object`, {
+      field,
+      index,
+    });
+  }
+  const expected = [
+    "kind",
+    "schema_version",
+    "operation_id",
+    "from_session_id",
+    "to_session_id",
+    "resource",
+    "mode",
+    "claim_set_generation",
+  ];
+  if (Object.keys(value).length !== expected.length || expected.some((key) => !Object.hasOwn(value, key))) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry ${field}[${index}] is not a supported recent event`, {
+      field,
+      index,
+    });
+  }
+  if (
+    value.kind !== "resource-handoff" ||
+    value.schema_version !== 1 ||
+    !boundedText(value.operation_id) ||
+    !boundedText(value.from_session_id) ||
+    !boundedText(value.to_session_id) ||
+    !boundedText(value.resource) ||
+    !isResourceClaimMode(value.mode) ||
+    !Number.isSafeInteger(value.claim_set_generation) ||
+    (value.claim_set_generation as number) < 0
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry ${field}[${index}] is invalid`, { field, index });
+  }
+  return Object.freeze({
+    kind: "resource-handoff",
+    schema_version: 1,
+    operation_id: value.operation_id,
+    from_session_id: value.from_session_id,
+    to_session_id: value.to_session_id,
+    resource: value.resource,
+    mode: value.mode,
+    claim_set_generation: value.claim_set_generation as number,
+  });
+}
+
+function boundedText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 4096 && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function parseRuntimeRecord(value: unknown, field: string, index: number): RuntimeRecord {
