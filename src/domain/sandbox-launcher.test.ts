@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -24,7 +25,10 @@ import {
   type RuntimePolicy,
   validateSessionRuntimeProjection,
 } from "./runtime-projection.js";
+import { LANDLOCK_ACCESS_FS, LANDLOCK_TRAMPOLINE } from "./landlock.js";
 import { compileWorkingSetRuntimeProjection } from "./working-set-runtime-projection.js";
+import { validateWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
+import type { FilesystemEnforcementIntegrationResult } from "./filesystem-enforcement-integration.js";
 
 test("the seccomp baseline is versioned, deterministic, and uses bounded EPERM denials", () => {
   const first = compileSandboxSeccompProfile("x64");
@@ -184,6 +188,15 @@ function validatedProjection(
   return result.value;
 }
 
+function filesystemEnforcementBundle(worktree: string): FilesystemEnforcementIntegrationResult {
+  return {
+    policy_token: {} as never,
+    enforcement: { worktree, landlock_required_abi: 1 } as never,
+    mount_arguments: [],
+    landlock_rules: [],
+  } as FilesystemEnforcementIntegrationResult;
+}
+
 test("compileSandboxInvocation emits fixed namespace/topology argv and terminates before command argv", async () => {
   const repository = createRepository();
   const worktree = `${repository}-owned`;
@@ -293,6 +306,118 @@ test("explicit projections compile deterministic RO/RW mounts without legacy hos
     fixture.cleanup();
     removeWorktree(repository, worktree);
     fs.rmSync(materialRoot, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("filesystem enforcement rejects a runtime projection alias sourced from the worktree", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const projection = validatedProjection([
+      { source: worktree, target: "/runtime/worktree", access_mode: "read-only", provenance: "package" },
+    ]);
+    const compiled = compileSandboxInvocation(
+      {
+        ...request,
+        landlock_abi: 1,
+        landlock_executable: request.sandbox_executable,
+        runtime_projection: projection,
+      },
+      { command: "true" },
+      { filesystem_enforcement: filesystemEnforcementBundle(worktree) },
+    );
+    assert.equal(compiled.ok, false);
+    if (!compiled.ok) assert.equal(compiled.error.code, "SANDBOX_TOPOLOGY_INVALID");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("filesystem enforcement rejects an executable projection alias sourced from the worktree", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const executable = path.join(worktree, "bin", "node");
+    fs.mkdirSync(path.dirname(executable), { recursive: true });
+    fs.writeFileSync(executable, "#!/bin/sh\n", { mode: 0o755 });
+    const projectionResult = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "node-runtime", version: "1" },
+      requirements: [{ id: "node-runtime", kind: "runtime", name: "node", version: ">=24" }],
+      filesystem: [
+        {
+          source: worktree,
+          target: "/runtime/worktree",
+          access_mode: "read-only",
+          provenance: "runtime-profile",
+        },
+      ],
+      executables: [
+        {
+          name: "node",
+          target: "/runtime/worktree/bin/node",
+          provider: { id: "node-provider", requirement_id: "node-runtime" },
+          provenance: "runtime-profile",
+        },
+      ],
+    });
+    assert.equal(projectionResult.ok, true, projectionResult.ok ? "" : JSON.stringify(projectionResult.error));
+    if (!projectionResult.ok) return;
+    const compiled = compileSandboxInvocation(
+      {
+        ...request,
+        landlock_abi: 1,
+        landlock_executable: request.sandbox_executable,
+        runtime_projection: projectionResult.value,
+      },
+      { command: "true" },
+      { filesystem_enforcement: filesystemEnforcementBundle(worktree) },
+    );
+    assert.equal(compiled.ok, false);
+    if (!compiled.ok) assert.equal(compiled.error.code, "SANDBOX_TOPOLOGY_INVALID");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("filesystem enforcement rejects an ancestor projection source containing the worktree", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const projection = validatedProjection([
+      {
+        source: path.dirname(worktree),
+        target: "/runtime/worktree-ancestor",
+        access_mode: "read-only",
+        provenance: "package",
+      },
+    ]);
+    const compiled = compileSandboxInvocation(
+      {
+        ...request,
+        landlock_abi: 1,
+        landlock_executable: request.sandbox_executable,
+        runtime_projection: projection,
+      },
+      { command: "true" },
+      { filesystem_enforcement: filesystemEnforcementBundle(worktree) },
+    );
+    assert.equal(compiled.ok, false);
+    if (!compiled.ok) assert.equal(compiled.error.code, "SANDBOX_TOPOLOGY_INVALID");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
   }
 });
@@ -645,6 +770,100 @@ test("bounded working-set execution fails closed when Landlock cannot establish 
     const compiled = compileSandboxInvocation({ ...request, runtime_projection: bounded }, { command: "true" });
     assert.equal(compiled.ok, false);
     if (!compiled.ok) assert.equal(compiled.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("bounded Landlock scopes /tmp scratch access away from a worktree mounted under /tmp", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("bounded bubblewrap profile is Linux-only");
+    return;
+  }
+  const nodeExecutable = fs.realpathSync.native(process.execPath);
+  if (!["/nix/store/", "/usr/", "/run/current-system/"].some((root) => nodeExecutable.startsWith(root))) {
+    t.skip("the test Node executable is outside the fixed runtime profile");
+    return;
+  }
+
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const workingSet = compileWorkingSetRuntimeProjection({
+      version: 1,
+      kind: "effective-working-set",
+      revision: 1,
+      id: "ews-bounded-tmp-test",
+      repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+      base: { branch: "main", revision: "a".repeat(40) },
+      scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+      provenance: {
+        executionScope: {
+          kind: "implementation-execution-scope",
+          version: 1,
+          digest: "a".repeat(64),
+          identity: "execution",
+        },
+        candidateWorkingSet: {
+          kind: "candidate-working-set",
+          version: 1,
+          digest: "b".repeat(64),
+          identity: "candidate",
+        },
+        repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+        base: { branch: "main", revision: "a".repeat(40) },
+      },
+    });
+    assert.equal(workingSet.ok, true, workingSet.ok ? "" : JSON.stringify(workingSet.error));
+    if (!workingSet.ok) return;
+    const runtimeProjection = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "bounded-tmp-test", version: "1" },
+      requirements: [],
+      filesystem: [
+        { source: nodeExecutable, target: nodeExecutable, access_mode: "read-only", provenance: "runtime-profile" },
+      ],
+      executables: [],
+      working_set: workingSet.value,
+    });
+    assert.equal(runtimeProjection.ok, true, runtimeProjection.ok ? "" : JSON.stringify(runtimeProjection.error));
+    if (!runtimeProjection.ok) return;
+
+    const compiled = compileSandboxInvocation(
+      {
+        ...request,
+        landlock_executable: nodeExecutable,
+        landlock_abi: 3,
+        landlock_state: "available",
+        landlock_required: true,
+        runtime_projection: runtimeProjection.value,
+      },
+      { command: "true" },
+    );
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+
+    assert.equal(compiled.value.env.TMPDIR, "/tmp/nawabari-tmp");
+    const scratchDirectoryIndex = compiled.value.args.findIndex(
+      (value, index, args) => value === "--dir" && args[index + 1] === "/tmp/nawabari-tmp",
+    );
+    assert.notEqual(scratchDirectoryIndex, -1);
+    const trampolineIndex = compiled.value.args.indexOf(LANDLOCK_TRAMPOLINE);
+    assert.notEqual(trampolineIndex, -1);
+    const rules = JSON.parse(compiled.value.args[trampolineIndex + 1]);
+    const tempParent = rules.find((rule: { path: string }) => rule.path === "/tmp");
+    const tempScratch = rules.find((rule: { path: string }) => rule.path === "/tmp/nawabari-tmp");
+    const worktreeFile = rules.find((rule: { path: string }) => rule.path === path.join(worktree, "README.md"));
+    assert.ok(tempParent);
+    assert.ok(tempScratch);
+    assert.ok(worktreeFile);
+    assert.equal(tempParent.allowed_access & LANDLOCK_ACCESS_FS.write_file, 0);
+    assert.notEqual(tempScratch.allowed_access & LANDLOCK_ACCESS_FS.write_file, 0);
+    assert.equal(worktreeFile.allowed_access & LANDLOCK_ACCESS_FS.write_file, 0);
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
@@ -1284,7 +1503,81 @@ test("the session-private Git config projects the host global identity when no r
     // alias, hook, or other global setting is imported alongside them.
     assert.doesNotMatch(config, /credential/iu);
     assert.doesNotMatch(config, /alias/iu);
-    assert.doesNotMatch(config, /hooksPath/iu);
+    assert.equal(
+      execFileSync(
+        "git",
+        ["config", "--file", path.join(request.filesystem.git_metadata, "config"), "--get", "core.hooksPath"],
+        {
+          encoding: "utf8",
+        },
+      ).trim(),
+      "/dev/null",
+    );
+  } finally {
+    fixture.cleanup();
+    removeWorktree(repository, worktree);
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("governed private Git hooks require approved material and bind only its verified executable", async () => {
+  const repository = createRepository();
+  const worktree = `${repository}-owned`;
+  const fixture = createControlledSandboxFixture();
+  try {
+    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const profile = validateWorktreeRuntimeProfile({
+      id: "governed-test",
+      version: "1",
+      materialSelection: { profiles: ["base"], operations: [] },
+      filesystem: { readOnly: [], write: [], create: [], delete: [], deny: [], immutable: [] },
+      tools: [{ entrypoint: "nawabari-hook", provider: { id: "hook", requirement_id: "hook-runtime" } }],
+      shell: { entrypoint: "nawabari-hook" },
+      environment: {
+        home: "session",
+        xdg: { config: "session", cache: "session", data: "session", state: "session" },
+        tmp: "execution",
+      },
+      git: { config: "session-private", globalConfig: "excluded", credentialHelpers: "disabled", hooks: "governed" },
+      execution: { policy: STRICT_RUNTIME_POLICY, processTracking: "required" },
+    });
+    assert.equal(profile.ok, true);
+    if (!profile.ok) return;
+    const missing = compileSandboxInvocation({ ...request, git_profile: profile.value }, { command: "true" });
+    assert.equal(missing.ok, false);
+    const material = {
+      kind: "provider" as const,
+      provider: { id: "hook", requirement_id: "hook-runtime" },
+      source: fixture.executable,
+      target: "/nawabari/bin/nawabari-hook",
+      digest: createHash("sha256").update(fs.readFileSync(fixture.executable)).digest("hex"),
+    };
+    const governed = compileSandboxInvocation(
+      { ...request, git_profile: profile.value, hook_material: material },
+      { command: "true" },
+    );
+    assert.equal(governed.ok, true, governed.ok ? "" : governed.error.message);
+    if (!governed.ok) return;
+    assert.ok(
+      governed.value.args.some(
+        (arg, index) =>
+          arg === "--ro-bind" &&
+          governed.value.args[index + 1] === material.source &&
+          governed.value.args[index + 2] === material.target,
+      ),
+    );
+    const configPath = path.join(request.filesystem.git_metadata, "config");
+    assert.equal(
+      execFileSync("git", ["config", "--file", configPath, "--get", "core.hooksPath"], { encoding: "utf8" }).trim(),
+      "/nawabari/git/hooks",
+    );
+    assert.equal(fs.readlinkSync(path.join(request.filesystem.git_metadata, "hooks", "pre-commit")), material.target);
+    fs.appendFileSync(material.source, "changed\n");
+    const stale = compileSandboxInvocation(
+      { ...request, git_profile: profile.value, hook_material: material },
+      { command: "true" },
+    );
+    assert.equal(stale.ok, false);
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);

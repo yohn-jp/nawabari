@@ -146,7 +146,7 @@ function session(sessionId: string): SessionRecord {
 
 function claim(claimId: string, resource: string, sessionId: string): ResourceClaim {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     claimId,
     sessionId,
     repositoryId: "repo-1",

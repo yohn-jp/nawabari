@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,8 @@ import { withDirectoryFsyncFailure } from "./testing/fs-fault-injection.js";
 import {
   canonicalizeClaimResource,
   canonicalizeConcretePath,
+  canonicalClaimId,
+  canonicalizeClaimInput,
   classifyResourceClaimTransition,
   claimsConflict,
   createResourceClaim,
@@ -23,6 +26,38 @@ import {
   type ResourceClaimTransition,
 } from "./resource-claims.js";
 import { SessionRegistry, type PersistedRegistry } from "./session-registry.js";
+
+test("canonical claim ids preserve the no-sharing digest input and delimit sharing fields", () => {
+  const sessionId = "session";
+  const mode = "write" as const;
+  const resource = "src/file.ts";
+  const digest = (input: string) => createHash("sha256").update(input).digest("hex");
+
+  assert.equal(
+    canonicalClaimId(sessionId, resource, mode),
+    `claim-${digest(`${sessionId}\u0000${mode}\u0000${resource}`)}`,
+  );
+  assert.equal(
+    canonicalClaimId(sessionId, resource, mode, { kind: "isolated-worktree", groupId: "group" }),
+    `claim-${digest(`${sessionId}\u0000${mode}\u0000${resource}\u0000isolated-worktree\u0000group`)}`,
+  );
+});
+
+test("rejects malformed coordinated write bindings as invalid claims", () => {
+  const owner = {
+    sessionId: "session",
+    repositoryId: "/repo/.git",
+    worktreePath: "/repo",
+    state: "active",
+  };
+
+  for (const sharing of [null, "invalid"]) {
+    assertRegistryError(
+      () => canonicalizeClaimInput({ resource: "README.md", mode: "write", sharing } as never, owner),
+      "INVALID_CLAIM",
+    );
+  }
+});
 
 test("defines every overlapping mode combination in the compatibility matrix", () => {
   assert.deepEqual(RESOURCE_CLAIM_COMPATIBILITY_MATRIX, {
@@ -290,10 +325,10 @@ test("migrates a v0.1.0 registry to the canonical claim section", () => {
     assert.deepEqual(migration, {
       migrated: true,
       registrySchemaVersion: 1,
-      claimSchemaVersion: 2,
+      claimSchemaVersion: 3,
     });
     const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as PersistedRegistry;
-    assert.equal(persisted.claims_schema_version, 2);
+    assert.equal(persisted.claims_schema_version, 3);
     assert.deepEqual(persisted.claims, []);
     assert.equal(registry.get(session.sessionId)?.sessionId, session.sessionId);
   } finally {
@@ -301,7 +336,7 @@ test("migrates a v0.1.0 registry to the canonical claim section", () => {
   }
 });
 
-test("requires explicit migration before interpreting v1 claim semantics", () => {
+test("reads and migrates schema2 claims while preserving legacy identity", () => {
   const fixture = createRepositoryFixture();
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
@@ -309,25 +344,30 @@ test("requires explicit migration before interpreting v1 claim semantics", () =>
     registry.claimResources({ sessionId: session.sessionId, claims: [{ resource: "README.md", mode: "read" }] });
     const legacy = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
       claims_schema_version: number;
-      claims: Array<{ schema_version: number }>;
+      claims: Array<{ schema_version: number; claim_id: string }>;
     };
-    legacy.claims_schema_version = 1;
-    for (const claim of legacy.claims) claim.schema_version = 1;
+    const legacyClaimId = legacy.claims[0]?.claim_id;
+    assert.equal(typeof legacyClaimId, "string");
+    legacy.claims_schema_version = 2;
+    for (const claim of legacy.claims) claim.schema_version = 2;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
-    assertRegistryError(() => registry.listClaims(), "UNSUPPORTED_CLAIM_SCHEMA_VERSION");
+    const readable = registry.listClaims();
+    assert.equal(readable[0]?.mode, "read");
+    assert.equal(readable[0]?.claimId, legacyClaimId);
     assert.deepEqual(registry.migrate(), {
       migrated: true,
       registrySchemaVersion: 1,
-      claimSchemaVersion: 2,
+      claimSchemaVersion: 3,
     });
     assert.equal(registry.listClaims()[0]?.mode, "read");
     const migrated = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as {
       claims_schema_version: number;
-      claims: Array<{ schema_version: number }>;
+      claims: Array<{ schema_version: number; claim_id: string }>;
     };
-    assert.equal(migrated.claims_schema_version, 2);
-    assert.equal(migrated.claims[0]?.schema_version, 2);
+    assert.equal(migrated.claims_schema_version, 3);
+    assert.equal(migrated.claims[0]?.schema_version, 3);
+    assert.equal(migrated.claims[0]?.claim_id, legacyClaimId);
   } finally {
     fixture.cleanup();
   }
@@ -343,8 +383,8 @@ test("migration rejects ambiguous legacy claims without rewriting them", () => {
       claims_schema_version: number;
       claims: Array<Record<string, unknown>>;
     };
-    legacy.claims_schema_version = 1;
-    legacy.claims[0] = { ...legacy.claims[0], schema_version: 1, resource: "../escape" };
+    legacy.claims_schema_version = 2;
+    legacy.claims[0] = { ...legacy.claims[0], schema_version: 2, resource: "../escape" };
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     assert.throws(
@@ -362,8 +402,8 @@ test("migration rejects ambiguous legacy claims without rewriting them", () => {
       claims_schema_version: number;
       claims: Array<{ schema_version: number; resource: string }>;
     };
-    assert.equal(stillLegacy.claims_schema_version, 1);
-    assert.equal(stillLegacy.claims[0]?.schema_version, 1);
+    assert.equal(stillLegacy.claims_schema_version, 2);
+    assert.equal(stillLegacy.claims[0]?.schema_version, 2);
     assert.equal(stillLegacy.claims[0]?.resource, "../escape");
   } finally {
     fixture.cleanup();
@@ -387,15 +427,15 @@ test("migration rejects v1 overlaps that are incompatible under legacy semantics
       claims_schema_version: number;
       claims: Array<{ schema_version: number }>;
     };
-    legacy.claims_schema_version = 1;
-    for (const claim of legacy.claims) claim.schema_version = 1;
+    legacy.claims_schema_version = 2;
+    for (const claim of legacy.claims) claim.schema_version = 2;
     fs.writeFileSync(firstRegistry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     assertRegistryError(() => firstRegistry.migrate(), "RESOURCE_CLAIM_CONFLICT");
     const stillLegacy = JSON.parse(fs.readFileSync(firstRegistry.paths.registry, "utf8")) as {
       claims_schema_version: number;
     };
-    assert.equal(stillLegacy.claims_schema_version, 1);
+    assert.equal(stillLegacy.claims_schema_version, 2);
   } finally {
     fixture.cleanup();
   }
@@ -411,8 +451,8 @@ test("migration retry converges after a post-rename durability-uncertain failure
       claims_schema_version: number;
       claims: Array<{ schema_version: number }>;
     };
-    legacy.claims_schema_version = 1;
-    for (const claim of legacy.claims) claim.schema_version = 1;
+    legacy.claims_schema_version = 2;
+    for (const claim of legacy.claims) claim.schema_version = 2;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     assertRegistryError(
@@ -423,9 +463,9 @@ test("migration retry converges after a post-rename durability-uncertain failure
     assert.deepEqual(retried, {
       migrated: false,
       registrySchemaVersion: 1,
-      claimSchemaVersion: 2,
+      claimSchemaVersion: 3,
     });
-    assert.equal(registry.listClaims()[0]?.schemaVersion, 2);
+    assert.equal(registry.listClaims()[0]?.schemaVersion, 3);
   } finally {
     fixture.cleanup();
   }

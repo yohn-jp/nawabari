@@ -6,6 +6,7 @@ import {
   validateWorkingSetRuntimeProjection,
   type WorkingSetRuntimeProjection,
 } from "./domain/working-set-runtime-projection.js";
+import { validateFilesystemPolicyToken, type FilesystemPolicyToken } from "./domain/filesystem-policy-revision.js";
 import { validateSessionRuntimeProjection, type SessionRuntimeProjection } from "./domain/runtime-projection.js";
 import { runSandboxedCommand, type SandboxCommand, type SandboxExecutionResult } from "./domain/sandbox-launcher.js";
 import type { SandboxExecutionRequest } from "./domain/sandbox.js";
@@ -105,6 +106,11 @@ export type VerificationExecutorDependencies = Readonly<{
     command: SandboxCommand,
     options: { readonly timeout_ms: number; readonly max_output_bytes: number },
   ) => Promise<DomainResult<SandboxExecutionResult>>;
+}>;
+
+export type VerificationFilesystemPolicyFence = Readonly<{
+  readonly policy_token: FilesystemPolicyToken;
+  readonly expected_policy_token: FilesystemPolicyToken;
 }>;
 
 function invalid(field: string, reason: string): DomainResult<never> {
@@ -342,7 +348,15 @@ export async function executeVerification(
   profileInput: unknown,
   request: SandboxExecutionRequest,
   dependencies: VerificationExecutorDependencies = {},
+  filesystemPolicyFence?: VerificationFilesystemPolicyFence,
 ): Promise<DomainResult<VerificationResult>> {
+  if (filesystemPolicyFence !== undefined) {
+    const token = validateFilesystemPolicyToken(
+      filesystemPolicyFence.policy_token,
+      filesystemPolicyFence.expected_policy_token,
+    );
+    if (!token.ok) return token;
+  }
   const profile = validateVerificationProfile(profileInput);
   if (!profile.ok) return profile;
   if (profile.value.cwd !== request.worktree && !isWithin(request.worktree, profile.value.cwd)) {

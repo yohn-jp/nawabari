@@ -168,7 +168,21 @@ function main() {
       // fallback.
       smokeArgs.push("--require-protected-execution");
     }
-    run(process.execPath, smokeArgs, { stdio: "inherit" });
+    const installedConsumerEvidence = {
+      source_revision: sourceRevision(),
+      artifact_sha256: artifact.sha256,
+    };
+    try {
+      run(process.execPath, smokeArgs, { stdio: "inherit" });
+      console.log(
+        `installed consumer evidence: ${JSON.stringify({ ...installedConsumerEvidence, outcome: "passed" })}`,
+      );
+    } catch (error) {
+      console.log(
+        `installed consumer evidence: ${JSON.stringify({ ...installedConsumerEvidence, outcome: "failed" })}`,
+      );
+      throw error;
+    }
     if (requireProtectedExecution) {
       const reportPath = path.resolve(
         evidenceOutput ?? path.join(repoRoot, "test-artifacts", "packed-standalone-protected-execution.json"),

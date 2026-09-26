@@ -34,6 +34,7 @@ import type {
   SessionDiscardResult,
   SessionDiscardPreview,
   SessionRecord,
+  SessionManagedRuntimeState,
   UpdateClaimsOptions,
   WorkingSetExpansionOptions,
   WorkingSetExpansionResult,
@@ -546,6 +547,72 @@ test("session exec routes through the canonical protected launcher and never fal
   });
 });
 
+test("managed run, exec, and shell dispatch to the protected lifecycle before any legacy runner", async () => {
+  const invocations = [
+    ["--json", "session", "run", "--session", sampleSession.session_id, "--", "printf", "managed"],
+    ["--json", "session", "exec", "--session", sampleSession.session_id, "--", "printf", "managed"],
+    ["--json", "session", "shell", "--session", sampleSession.session_id, "--", "bash"],
+    ["--json", "session", "run", "--", "printf", "current-session"],
+  ];
+  const managedTargets: string[] = [];
+  for (const arguments_ of invocations) {
+    const output = capture();
+    let legacyRunnerCalls = 0;
+    const managedBackend = backendForTests({
+      getSessionManagedRuntime: async (_context, sessionId, executionId) => {
+        managedTargets.push(sessionId);
+        return success({
+          runtime_epoch: 7,
+          registry_revision: 11,
+          claim_set_generation: 3,
+          admission: {
+            kind: "session-admission" as const,
+            schema_version: 1 as const,
+            session_id: sessionId,
+            admission: "open" as const,
+            runtime_epoch: 7,
+          },
+          profile: { digest: "a".repeat(64) } as unknown as NonNullable<SessionManagedRuntimeState["profile"]>,
+          runtime_environment_identity: {
+            session_id: sessionId,
+            execution_id: executionId ?? "unused",
+            session_root: "/private/session-home",
+            execution_root: "/private/execution",
+            owner_uid: 1000,
+            owner_gid: 1000,
+          },
+        } satisfies SessionManagedRuntimeState);
+      },
+      listClaims: async () => success({ claims: [], claim_set_generation: 3 }),
+      persistSessionExecution: async () =>
+        failure(new DomainError("REGISTRY_DURABILITY_UNCERTAIN", "unexpected persistence")),
+      readSessionRuntimeEpoch: () => 7,
+    });
+    const exitCode = await runCli(arguments_, {
+      cwd: sampleSession.worktree,
+      backend: managedBackend,
+      io: output.io,
+      sandboxProbe: readySandboxProbe({ hasCgroupsV2: () => false }),
+      sandboxRunner: async () => {
+        legacyRunnerCalls += 1;
+        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      },
+    });
+
+    assert.equal(exitCode, 4, arguments_.join(" "));
+    assert.equal(legacyRunnerCalls, 0, arguments_.join(" "));
+    const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string };
+    assert.equal(response.ok, false, arguments_.join(" "));
+    assert.equal(response.code, "SANDBOX_CAPABILITY_UNAVAILABLE", arguments_.join(" "));
+  }
+  assert.deepEqual(managedTargets, [
+    sampleSession.session_id,
+    sampleSession.session_id,
+    sampleSession.session_id,
+    sampleSession.session_id,
+  ]);
+});
+
 function makeTgrepRgProviderFixture(): {
   readonly projection: SessionRuntimeProjection;
   readonly cleanup: () => void;
@@ -729,6 +796,7 @@ test("command-specific help is projected from one spec and marks session create 
   const response = JSON.parse(output.stdout[0] ?? "") as {
     command: string;
     help_for: string;
+    usage: string;
     required_options: string[];
     optional_options: string[];
     defaults: Record<string, string>;
@@ -736,6 +804,7 @@ test("command-specific help is projected from one spec and marks session create 
   };
   assert.equal(response.command, "help");
   assert.equal(response.help_for, "session create");
+  assert.match(response.usage, /\[--profile <id> --profile-parameter <json>\]/u);
   assert.deepEqual(response.required_options, []);
   assert.deepEqual(response.optional_options, [
     "--branch",
@@ -743,11 +812,14 @@ test("command-specific help is projected from one spec and marks session create 
     "--worktree-root",
     "--base",
     "--label",
+    "--profile",
+    "--profile-parameter",
     "--resource",
     "--mode",
     "--auxiliary-state",
     "--execution-scope-file",
     "--candidate-working-set-file",
+    "--enforce-claims",
   ]);
   assert.deepEqual(response.defaults, {
     "--branch": "nawabari/session/<session_id>",
@@ -804,6 +876,8 @@ test("canonical command registry resolves aliases without duplicating option def
   assert.deepEqual(publicNames, [
     "session create",
     "session id",
+    "profile list",
+    "profile show",
     "session show",
     "session inspect",
     "session scope expand",
@@ -813,7 +887,11 @@ test("canonical command registry resolves aliases without duplicating option def
     "session shell",
     "session action",
     "ui",
+    "session coordination preview",
+    "session handoff",
     "session list",
+    "session enter",
+    "session processes",
     "session claim",
     "resource claim",
     "session update",
@@ -829,6 +907,9 @@ test("canonical command registry resolves aliases without duplicating option def
     "resource release",
     "session close",
     "session discard",
+    "session file create",
+    "session file delete",
+    "session file rename",
     "authorize",
     "checkpoint",
     "evidence snapshot",
@@ -1098,6 +1179,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
     commands: [
       "session create",
       "session id",
+      "profile list",
+      "profile show",
       "session show",
       "session inspect",
       "session scope expand",
@@ -1107,7 +1190,11 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session shell",
       "session action",
       "ui",
+      "session coordination preview",
+      "session handoff",
       "session list",
+      "session enter",
+      "session processes",
       "session claim",
       "resource claim",
       "session update",
@@ -1123,6 +1210,9 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "resource release",
       "session close",
       "session discard",
+      "session file create",
+      "session file delete",
+      "session file rename",
       "authorize",
       "checkpoint",
       "evidence snapshot",
@@ -1143,11 +1233,14 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--worktree-root",
       "--base",
       "--label",
+      "--profile",
+      "--profile-parameter",
       "--resource",
       "--mode",
       "--auxiliary-state",
       "--execution-scope-file",
       "--candidate-working-set-file",
+      "--enforce-claims",
       "--session",
       "--integrated-revision",
       "--schema-version",
@@ -1166,15 +1259,31 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--confirm",
       "--preview",
       "--operation-id",
+      "--left",
+      "--right",
+      "--patch",
+      "--allow-read-path",
+      "--max-content-bytes",
+      "--max-diff-bytes",
+      "--max-diff-hunks",
+      "--max-retries",
+      "--from",
+      "--to",
+      "--if-generation",
       "--limit",
       "--offset",
-      "--if-generation",
       "--force",
       "--upsert-resource",
       "--release-resource",
       "--claim-id",
       "--fetch-remote",
       "--fetch-branch",
+      "--expect-absent",
+      "--payload-file",
+      "--payload-stdin",
+      "--expected-digest",
+      "--expected-identity",
+      "--to-path",
     ],
     authorization_options: ["--session", "--operation", "--resource"],
     checkpoint_options: ["--session"],
@@ -1292,6 +1401,119 @@ test("unknown commands expose a stable JSON error without decoration", async () 
     message: "Unknown command: bogus.",
     details: { command: "bogus" },
   });
+});
+
+test("every canonical command and alias is recognized by the dispatcher", async () => {
+  // Replaces a hand-authored DISPATCHER_COMMAND_INVENTORY list: instead of a
+  // second table a human must remember to update, this drives every name
+  // the registry itself advertises straight through the real dispatcher and
+  // asserts it was recognized (never UNKNOWN_COMMAND). A command missing its
+  // dispatch branch, or removed from the registry but left in the
+  // dispatcher, fails here without any separately maintained inventory.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-dispatch-coverage-"));
+  try {
+    for (const definition of publicCliCommandDefinitions()) {
+      const output = capture();
+      await runCli([...definition.name.split(" "), "--json"], { io: output.io, cwd: directory });
+      const response = JSON.parse(output.stdout[0] ?? "{}") as { code?: string };
+      assert.notEqual(
+        response.code,
+        "UNKNOWN_COMMAND",
+        `dispatcher does not recognize registered command: ${definition.name}`,
+      );
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("default CLI session handoff composes the managed runtime adapter without injection", async () => {
+  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-cli-handoff-"));
+  const git = (args: readonly string[]) =>
+    execFileSync("git", args, { cwd: repositoryPath, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  try {
+    git(["init", "-b", "main"]);
+    git(["config", "user.name", "Nawabari Tests"]);
+    git(["config", "user.email", "tests@example.invalid"]);
+    fs.writeFileSync(path.join(repositoryPath, "README.md"), "handoff\n");
+    git(["add", "README.md"]);
+    git(["commit", "-m", "initial"]);
+    const { SessionRegistry } = await import("./session-registry.js");
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const revision = git(["rev-parse", "HEAD"]);
+    const identity = { repositoryHost: "local", repositoryId: registry.repository.repositoryId };
+    const executionScope = {
+      version: 1,
+      kind: "implementation-execution-scope",
+      authorization: {
+        version: 1,
+        kind: "implementation-authorization",
+        contractVersion: 1,
+        implementation: { ...identity, number: 626 },
+        governedBodyDigest: "d".repeat(64),
+      },
+      repository: identity,
+      base: { branch: "main", revision },
+      scope: { readOnly: ["README.md"], write: ["README.md"], create: [], delete: [], deny: [] },
+    };
+    const candidateWorkingSet = {
+      kind: "candidate-working-set",
+      schemaVersion: 1,
+      workingSetId: "candidate-cli-626",
+      repository: { ...identity, repository: "local/nawabari" },
+      revision,
+      entries: [
+        {
+          state: "required",
+          target: { kind: "file", locator: "README.md" },
+          reason: { id: "test:cli-handoff", summary: "cli handoff" },
+          evidence: [],
+        },
+      ],
+    };
+    const source = registry.provision({
+      branchName: "feature/cli-handoff-source",
+      executionScope,
+      candidateWorkingSet,
+      initialClaims: [{ resource: "README.md", mode: "write" }],
+    });
+    const destination = registry.provision({
+      branchName: "feature/cli-handoff-destination",
+      executionScope,
+      candidateWorkingSet,
+    });
+    const before = fs.readFileSync(registry.paths.registry, "utf8");
+    const output = capture();
+    const exitCode = await runCli(
+      [
+        "session",
+        "handoff",
+        "--from",
+        source.sessionId,
+        "--to",
+        destination.sessionId,
+        "--resource",
+        "README.md",
+        "--mode",
+        "write",
+        "--if-generation",
+        String(registry.listClaimsSnapshot().claimSetGeneration),
+        "--json",
+      ],
+      { io: output.io, cwd: repositoryPath },
+    );
+    const response = JSON.parse(output.stdout[0] ?? "{}") as Record<string, unknown>;
+    // The untracked source admission cannot be fenced by the real adapter, so
+    // the default path fails closed instead of requiring caller injection or
+    // fabricating quiescence.
+    assert.equal(exitCode, 0, JSON.stringify(response));
+    assert.equal(response.status, "unresolved");
+    assert.equal(response.code, "PHYSICAL_OBSERVATION_UNAVAILABLE");
+    assert.equal(response.sourceRetained, true);
+    assert.equal(fs.readFileSync(registry.paths.registry, "utf8"), before);
+  } finally {
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
 });
 
 test("state commands reject honestly when the current directory is not a Git repository", async () => {
@@ -2207,6 +2429,39 @@ test("session create forwards --worktree-root to the backend as the caller-selec
     base: null,
     label: null,
   });
+});
+
+test("session create omits claim_enforcement by default and forwards it only with --enforce-claims", async () => {
+  let observedOptions: SessionCreateOptions | null = null;
+  const backend = backendForTests({
+    createSession: async (_context: SessionContext, options: SessionCreateOptions) => {
+      observedOptions = options;
+      return success(sampleSession);
+    },
+  });
+
+  const defaultExitCode = await runCli(["--json", "session", "create"], { backend, io: capture().io });
+  assert.equal(defaultExitCode, 0);
+  assert.equal((observedOptions as unknown as SessionCreateOptions).claim_enforcement, undefined);
+
+  const enforcedExitCode = await runCli(["--json", "session", "create", "--enforce-claims"], {
+    backend,
+    io: capture().io,
+  });
+  assert.equal(enforcedExitCode, 0);
+  assert.equal((observedOptions as unknown as SessionCreateOptions).claim_enforcement, true);
+});
+
+test("session create rejects a repeated --enforce-claims flag", async () => {
+  const output = capture();
+  const exitCode = await runCli(["--json", "session", "create", "--enforce-claims", "--enforce-claims"], {
+    backend: backendForTests({}),
+    io: output.io,
+  });
+  assert.equal(exitCode, 2);
+  const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string };
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "INVALID_ARGUMENT");
 });
 
 test("session create forwards repeated initial claims in one atomic backend request", async () => {
