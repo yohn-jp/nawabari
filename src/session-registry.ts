@@ -235,6 +235,7 @@ import {
 import {
   executeWorktreeFileOperation,
   prepareWorktreeFileOperation,
+  WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES,
   type WorktreeFileOperation,
   type WorktreeFileOperationExecutionOptions,
   type WorktreeFileOperationResult,
@@ -7797,25 +7798,44 @@ function observeFileOperationObservation(
 
 function observeFilePath(root: string, relative: string): FileOperationPathFact {
   const target = path.join(root, relative);
-  let stats: fs.Stats;
+  let descriptor: number;
   try {
-    stats = fs.lstatSync(target);
+    descriptor = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch (error: unknown) {
     if (isNodeError(error) && error.code === "ENOENT") return { present: false };
     throw error;
   }
-  if (!stats.isFile() || stats.nlink !== 1) return { present: true };
-  const contents = fs.readFileSync(target);
-  return {
-    present: true,
-    identity: {
-      dev: String(stats.dev),
-      ino: String(stats.ino),
-      size: stats.size,
-      digest: createHash("sha256").update(contents).digest("hex"),
-    },
-    payloadDigest: createHash("sha256").update(contents).digest("hex"),
-  };
+  try {
+    const stats = fs.fstatSync(descriptor, { bigint: true });
+    if (!stats.isFile() || stats.nlink !== 1n) return { present: true };
+    if (stats.size > BigInt(WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES))
+      throw new Error("File observation exceeds bound");
+    const contents = Buffer.alloc(Number(stats.size));
+    let offset = 0;
+    while (offset < contents.length) {
+      const count = fs.readSync(descriptor, contents, offset, contents.length - offset, offset);
+      if (count === 0) throw new Error("File changed during observation");
+      offset += count;
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      after.dev !== stats.dev ||
+      after.ino !== stats.ino ||
+      after.size !== stats.size ||
+      after.mtimeNs !== stats.mtimeNs ||
+      after.ctimeNs !== stats.ctimeNs ||
+      after.nlink !== stats.nlink
+    )
+      throw new Error("File changed during observation");
+    const digest = createHash("sha256").update(contents).digest("hex");
+    return {
+      present: true,
+      identity: { dev: String(stats.dev), ino: String(stats.ino), size: Number(stats.size), digest },
+      payloadDigest: digest,
+    };
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 function unresolvedObservation(
