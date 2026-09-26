@@ -72,6 +72,7 @@ import {
   type RuntimeRecords,
   type ResourceHandoffRecentEvent,
 } from "./registry/runtime-records.js";
+import { appendRuntimeEvent, type SessionRuntimeHistoryEvent } from "./session-runtime-history.js";
 import {
   buildResourceOverlapGraph,
   createResourceIntent,
@@ -1210,6 +1211,7 @@ export interface PersistedRegistryV2 {
   readonly executions?: readonly RuntimeRecord[];
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
+  readonly session_history?: readonly RuntimeRecord[];
   readonly file_operations?: readonly PersistedFileOperationRecord[];
 }
 
@@ -1265,6 +1267,8 @@ export class SessionRegistry {
   private readonly lockMetadataGraceMs: number;
   private readonly lock: RepositoryLock;
   private readonly managedExecutionReadiness: ManagedExecutionReadiness | undefined;
+  /** Last authoritative registry read within this instance; never used to authorize a mutation. */
+  private lastReadState: RegistryState | undefined;
 
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
@@ -6930,7 +6934,7 @@ export class SessionRegistry {
       contents = fs.readFileSync(this.paths.registry, "utf8");
     } catch (error: unknown) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        return {
+        return (this.lastReadState = {
           registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
           registryRevision: 0,
           runtimeEpoch: 0,
@@ -6939,7 +6943,7 @@ export class SessionRegistry {
           claims: [],
           claimSetGeneration: 0,
           legacyClaimsAbsent: false,
-        };
+        });
       }
       throw new SessionRegistryError(
         "REGISTRY_IO_FAILURE",
@@ -6965,12 +6969,12 @@ export class SessionRegistry {
       );
     }
 
-    return parseRegistry(
+    return (this.lastReadState = parseRegistry(
       parsed,
       this.repository.repositoryId,
       allowLegacyClaimSchema,
       (left, right, generation, records) => this.coordinationFacts(left, right, generation, records),
-    );
+    ));
   }
 
   private readUnsafe(): readonly SessionRecord[] {
@@ -7161,7 +7165,30 @@ export class SessionRegistry {
     if (!Number.isSafeInteger(runtimeEpoch) || runtimeEpoch < 0) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Runtime epoch must be a non-negative safe integer");
     }
-    const currentRuntimeRecords = rebaseOpenSessionAdmissions(runtimeRecords, runtimeEpoch);
+    const previous = this.lastReadState;
+    if (previous === undefined)
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry mutation requires a prior authoritative read");
+    const historyEvents = registryHistoryChanges(
+      previous,
+      records,
+      runtimeRecords,
+      registryRevision,
+      this.clock().toISOString(),
+    );
+    const priorHistory = previous.runtimeRecords.records.session_history;
+    const historyInput: ParsedRuntimeRecords =
+      priorHistory !== undefined &&
+      (priorHistory.at(-1)?.sequence as number) >
+        ((runtimeRecords.records.session_history?.at(-1)?.sequence as number | undefined) ?? 0)
+        ? {
+            requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "session-history.v1"),
+            records: { ...runtimeRecords.records, session_history: priorHistory },
+          }
+        : runtimeRecords;
+    const currentRuntimeRecords = rebaseOpenSessionAdmissions(
+      appendRuntimeEvent(historyInput, historyEvents),
+      runtimeEpoch,
+    );
     const optionalRecords = toPersistedRuntimeRecords(currentRuntimeRecords);
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
@@ -7202,6 +7229,17 @@ export class SessionRegistry {
         error,
       );
     }
+    this.lastReadState = {
+      ...previous,
+      registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
+      registryRevision,
+      runtimeEpoch,
+      runtimeRecords: currentRuntimeRecords,
+      sessions: records,
+      claims,
+      claimSetGeneration,
+      legacyClaimsAbsent: false,
+    };
   }
 
   private reserveFileOperationUnsafe(
@@ -8381,6 +8419,68 @@ function claimTransitionRecoveryAction(
     mode,
     claimSetGeneration,
   });
+}
+
+function registryHistoryChanges(
+  previous: RegistryState,
+  sessions: readonly SessionRecord[],
+  runtimeRecords: ParsedRuntimeRecords,
+  revision: number,
+  observed_at: string,
+): Omit<SessionRuntimeHistoryEvent, "event_id" | "sequence" | "schema_version">[] {
+  if (revision <= previous.registryRevision) return [];
+  const changes: Omit<SessionRuntimeHistoryEvent, "event_id" | "sequence" | "schema_version">[] = [];
+  const base = {
+    source: "session-registry" as const,
+    before_revision: previous.registryRevision,
+    after_revision: revision,
+    observed_at,
+  };
+  const beforeSessions = new Map(previous.sessions.map((session) => [session.sessionId, session]));
+  for (const session of [...sessions].sort((a, b) => compareCodePointStrings(a.sessionId, b.sessionId))) {
+    const old = beforeSessions.get(session.sessionId);
+    if (old?.state !== session.state)
+      changes.push({
+        ...base,
+        kind: "lifecycle",
+        session_id: session.sessionId,
+        execution_id: null,
+        operation: `${old?.state ?? "absent"}->${session.state}`,
+      });
+  }
+  const afterSessionIds = new Set(sessions.map((session) => session.sessionId));
+  for (const old of [...previous.sessions].sort((a, b) => compareCodePointStrings(a.sessionId, b.sessionId))) {
+    if (!afterSessionIds.has(old.sessionId))
+      changes.push({
+        ...base,
+        kind: "lifecycle",
+        session_id: old.sessionId,
+        execution_id: null,
+        operation: `${old.state}->absent`,
+      });
+  }
+  const beforeExecutions = new Map(
+    (previous.runtimeRecords.records.executions ?? []).map((record) => [record.execution_id, record]),
+  );
+  for (const execution of [...(runtimeRecords.records.executions ?? [])].sort((a, b) =>
+    compareCodePointStrings(String(a.execution_id), String(b.execution_id)),
+  )) {
+    const old = beforeExecutions.get(execution.execution_id);
+    if (
+      old?.state !== execution.state &&
+      typeof execution.session_id === "string" &&
+      typeof execution.execution_id === "string"
+    ) {
+      changes.push({
+        ...base,
+        kind: "execution",
+        session_id: execution.session_id,
+        execution_id: execution.execution_id,
+        operation: `${String(old?.state ?? "absent")}->${String(execution.state)}`,
+      });
+    }
+  }
+  return changes;
 }
 
 function transitionSessionState(record: SessionRecord, state: SessionState, clock: () => Date): SessionRecord {
@@ -10475,6 +10575,7 @@ function parseRegistry(
       "executions",
       "retentions",
       "recent_events",
+      "session_history",
       "file_operations",
     ],
   );

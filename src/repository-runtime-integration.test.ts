@@ -31,6 +31,20 @@ test("repository runtime snapshot and reconciliation compose with public lifecyc
         },
       ],
     },
+    coordination: {
+      status: "available",
+      observed_at: timestamp,
+      value: { contract_id: "nawabari.repository-coordination-observation.v1", schema_version: 1, rows: [] },
+    },
+    profiles: {
+      status: "available",
+      observed_at: timestamp,
+      value: {
+        contract_id: "nawabari.repository-profile-observation.v1",
+        schema_version: 1,
+        sessions: [{ session_id: "s1", status: "current", profile_id: null, reason: null }],
+      },
+    },
     processes: {
       status: "available",
       observed_at: timestamp,
@@ -44,9 +58,11 @@ test("repository runtime snapshot and reconciliation compose with public lifecyc
       status: "available",
       observed_at: timestamp,
       value: {
-        contract_id: "nawabari.repository-filesystem-observation.v1",
-        schema_version: 1,
-        sessions: [{ session_id: "s1", status: "clean", owner: "proven", reason: null }],
+        contract_id: "nawabari.repository-filesystem-observation.v2",
+        schema_version: 2,
+        sessions: [
+          { session_id: "s1", policy_status: "clean", runtime_status: "clean", owner: "proven", reason: null },
+        ],
         unmanaged_worktrees: [],
       },
     },
@@ -54,8 +70,8 @@ test("repository runtime snapshot and reconciliation compose with public lifecyc
       status: "available",
       observed_at: timestamp,
       value: {
-        contract_id: "nawabari.repository-lifecycle-observation.v1",
-        schema_version: 1,
+        contract_id: "nawabari.repository-lifecycle-observation.v2",
+        schema_version: 2,
         sessions: [
           {
             session_id: "s1",
@@ -74,9 +90,12 @@ test("repository runtime snapshot and reconciliation compose with public lifecyc
   if (!snapshot.ok) return;
   const reconciliation = reconcileSessionRuntimeEvidence(snapshot.value);
   assert.equal(reconciliation.ok, true);
-  if (reconciliation.ok) assert.equal(reconciliation.value.findings[0]?.code, "managed-present");
+  if (reconciliation.ok) {
+    assert.equal(reconciliation.value.complete, true);
+    assert.equal(reconciliation.value.findings[0]?.code, "managed-present");
+  }
   assert.equal(
-    classifyNawabariState({ sessionState: "active", physicalState: "present", phase: "current", blockers: [] }).state,
+    classifyNawabariState({ sessionState: "active", physicalState: "healthy", phase: "current", blockers: [] }).state,
     "active",
   );
 });

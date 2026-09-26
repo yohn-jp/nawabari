@@ -28,6 +28,7 @@ import {
   toPersistedSessionRecord,
   type ManagedExecutionReadinessRequest,
   type PersistedRegistry,
+  type PersistedRegistryV2,
   type SessionHookMaterialAuthority,
 } from "./session-registry.js";
 import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
@@ -116,7 +117,10 @@ function governedGitFenceFixture(field: "registry_revision" | "claim_set_generat
   const persisted = readJson(registry.paths.registry) as PersistedRegistry;
   writeRegistry(registry, {
     ...persisted,
-    required_features: ["pinned-profiles.v1"],
+    required_features: [
+      ...((persisted as { required_features?: string[] }).required_features ?? []),
+      "pinned-profiles.v1",
+    ],
     pinned_profiles: [{ ...pin, session_id: session.sessionId }],
   } as unknown as PersistedRegistry);
   fs.writeFileSync(
@@ -193,6 +197,36 @@ test("push rejects claim authority drift after an approved hook before inspectin
   }
 });
 
+test("registry history is persisted with the same session mutation and survives reload", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({
+      cwd: fixture.repositoryPath,
+      clock: () => new Date("2026-01-02T03:04:05.006Z"),
+    });
+    const session = registry.create();
+    const persisted = readJson(registry.paths.registry) as PersistedRegistryV2;
+    assert.equal(persisted.session_history?.length, 1);
+    assert.deepEqual(persisted.session_history?.[0], {
+      kind: "lifecycle",
+      schema_version: 1,
+      event_id: "history:1",
+      sequence: 1,
+      session_id: session.sessionId,
+      execution_id: null,
+      source: "session-registry",
+      operation: `absent->${session.state}`,
+      before_revision: 0,
+      after_revision: 1,
+      observed_at: session.createdAt,
+    });
+    const reloaded = new SessionRegistry({ cwd: fixture.repositoryPath }).readRepositoryView();
+    assert.deepEqual(reloaded.runtimeRecords.records.session_history, persisted.session_history);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("round-trips session metadata through common Git state", () => {
   const fixture = createRepositoryFixture();
   try {
@@ -226,7 +260,7 @@ test("round-trips session metadata through common Git state", () => {
     assert.equal(persisted.schema_version, 2);
     assert.equal(persisted.registry_revision, 2);
     assert.equal(persisted.runtime_epoch, 2);
-    assert.deepEqual(persisted.required_features, []);
+    assert.deepEqual(persisted.required_features, ["session-history.v1"]);
     assert.equal(persisted.repository_id, mainRegistry.repository.repositoryId);
     assert.equal(persisted.sessions.length, 2);
     assert.equal(persisted.sessions[0].session_id, mainSession.sessionId);
@@ -611,6 +645,7 @@ test("migrates a legacy registry without changing session ownership or claim mod
     delete legacy.runtime_epoch;
     delete legacy.required_features;
     delete legacy.runtime_sessions;
+    delete legacy.session_history;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     const result = registry.migrate();
@@ -719,7 +754,7 @@ test("managed close, discard, and claim release reject direct calls without drai
     const epoch = Number(base.runtime_epoch);
     writeRegistry(registry, {
       ...base,
-      required_features: ["runtime-sessions.v1"],
+      required_features: [...(base.required_features as string[]), "runtime-sessions.v1"],
       runtime_sessions: [
         {
           kind: "session-admission",
@@ -755,7 +790,7 @@ test("managed file operations reject direct calls without ready drain finalizati
     writeRegistry(registry, {
       ...base,
       runtime_epoch: admissionEpoch,
-      required_features: ["runtime-sessions.v1", "executions.v1"],
+      required_features: [...(base.required_features as string[]), "runtime-sessions.v1", "executions.v1"],
       runtime_sessions: [
         {
           kind: "session-admission",
@@ -841,7 +876,7 @@ test("epoch writes preserve closed gates and reject stale execution reservations
     const epoch = Number(base.runtime_epoch);
     writeRegistry(registry, {
       ...base,
-      required_features: ["runtime-sessions.v1", "executions.v1"],
+      required_features: [...(base.required_features as string[]), "runtime-sessions.v1", "executions.v1"],
       runtime_sessions: [
         {
           kind: "session-admission",
@@ -910,7 +945,7 @@ test("managed finalization treats a tracked admission with no execution records 
     writeRegistry(registry, {
       ...base,
       runtime_epoch: admissionEpoch,
-      required_features: ["runtime-sessions.v1"],
+      required_features: [...(base.required_features as string[]), "runtime-sessions.v1"],
       runtime_sessions: [
         {
           kind: "session-admission",
@@ -956,7 +991,7 @@ test("managed finalization rejects a stale locked admission epoch", () => {
     writeRegistry(registry, {
       ...base,
       runtime_epoch: currentAdmissionEpoch,
-      required_features: ["runtime-sessions.v1"],
+      required_features: [...(base.required_features as string[]), "runtime-sessions.v1"],
       runtime_sessions: [
         {
           kind: "session-admission",
@@ -1021,7 +1056,7 @@ test("managed finalization reobserves owned cgroup occupancy under the registry 
     writeRegistry(registry, {
       ...base,
       runtime_epoch: admissionEpoch,
-      required_features: ["runtime-sessions.v1", "executions.v1"],
+      required_features: [...(base.required_features as string[]), "runtime-sessions.v1", "executions.v1"],
       runtime_sessions: [
         {
           kind: "session-admission",
@@ -1084,7 +1119,7 @@ test("claim release reopens managed admission only after locked empty-scope proo
     const epoch = Number(base.runtime_epoch);
     writeRegistry(registry, {
       ...base,
-      required_features: ["runtime-sessions.v1", "executions.v1"],
+      required_features: [...(base.required_features as string[]), "runtime-sessions.v1", "executions.v1"],
       runtime_sessions: [
         {
           kind: "session-admission",

@@ -96,7 +96,7 @@ function createHandoffFixture(
     `${JSON.stringify(
       {
         ...base,
-        required_features: ["runtime-sessions.v1", "executions.v1"],
+        required_features: [...(base.required_features as string[]), "runtime-sessions.v1", "executions.v1"],
         runtime_sessions: [
           {
             kind: "session-admission",

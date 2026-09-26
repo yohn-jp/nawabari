@@ -174,7 +174,7 @@ test("resource handoff persists one atomic retry receipt and retries idempotentl
     };
     assert.equal(persisted.registry_revision, before.registry_revision + 1);
     assert.equal(persisted.runtime_epoch, before.runtime_epoch);
-    assert.deepEqual(persisted.required_features, ["recent-events.v1"]);
+    assert.deepEqual(persisted.required_features, ["session-history.v1", "recent-events.v1"]);
     assert.deepEqual(persisted.recent_events[0], {
       kind: "resource-handoff",
       schema_version: 1,

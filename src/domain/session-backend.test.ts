@@ -315,7 +315,7 @@ test("same-ID execution transitions persist through the backend and survive rest
       registry.paths.registry,
       `${JSON.stringify({
         ...persisted,
-        required_features: ["runtime-sessions.v1", "executions.v1"],
+        required_features: [...(persisted.required_features as string[]), "runtime-sessions.v1", "executions.v1"],
         runtime_sessions: [
           {
             kind: "session-admission",
@@ -1335,7 +1335,7 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
     registry.paths.registry,
     `${JSON.stringify({
       ...persisted,
-      required_features: ["runtime-sessions.v1", "executions.v1"],
+      required_features: [...(persisted.required_features as string[]), "runtime-sessions.v1", "executions.v1"],
       runtime_sessions: [
         {
           kind: "session-admission",

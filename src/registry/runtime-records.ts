@@ -20,6 +20,7 @@ export const REGISTRY_FEATURES = Object.freeze([
   "retentions.v1",
   "recent-events.v1",
   "file-operations.v1",
+  "session-history.v1",
 ] as const);
 
 export type RegistryFeature = (typeof REGISTRY_FEATURES)[number];
@@ -34,6 +35,7 @@ export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([
   "executions.v1",
   "recent-events.v1",
   "file-operations.v1",
+  "session-history.v1",
 ] as const);
 
 export const MAX_RUNTIME_RECORDS = 256 as const;
@@ -57,6 +59,7 @@ export interface RuntimeRecords {
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
   readonly file_operations?: readonly PersistedFileOperationRecord[];
+  readonly session_history?: readonly RuntimeRecord[];
 }
 
 export interface ResourceHandoffRecentEvent extends JsonObject {
@@ -87,6 +90,7 @@ const FEATURE_DEFINITIONS: readonly Readonly<{
   { feature: "retentions.v1", field: "retentions" },
   { feature: "recent-events.v1", field: "recent_events" },
   { feature: "file-operations.v1", field: "file_operations" },
+  { feature: "session-history.v1", field: "session_history" },
 ]);
 
 const FEATURE_BY_FIELD = new Map(FEATURE_DEFINITIONS.map((definition) => [definition.field, definition.feature]));
@@ -264,8 +268,20 @@ function parseRecordList(value: unknown, field: string): readonly RuntimeRecord[
         ? parsePinnedProfileRuntimeRecord(candidate, index)
         : field === "recent_events"
           ? parseResourceHandoffRecentEvent(candidate, field, index)
-          : parseRuntimeRecord(candidate, field, index),
+          : field === "session_history"
+            ? parseSessionHistoryEvent(candidate, index)
+            : parseRuntimeRecord(candidate, field, index),
   );
+  if (field === "session_history") {
+    let previous = 0;
+    for (const record of records) {
+      const sequence = (record as RuntimeRecord).sequence as number;
+      if (sequence <= previous || (previous !== 0 && sequence !== previous + 1)) {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry history is not contiguous and ordered");
+      }
+      previous = sequence;
+    }
+  }
   if (field === "runtime_sessions") {
     const owners = new Set<string>();
     for (const record of records as SessionAdmissionRecord[]) {
@@ -407,6 +423,47 @@ function parseResourceHandoffRecentEvent(value: unknown, field: string, index: n
     mode: value.mode,
     claim_set_generation: value.claim_set_generation as number,
   });
+}
+
+function parseSessionHistoryEvent(value: unknown, index: number): RuntimeRecord {
+  const fields = [
+    "kind",
+    "schema_version",
+    "event_id",
+    "sequence",
+    "session_id",
+    "execution_id",
+    "source",
+    "operation",
+    "before_revision",
+    "after_revision",
+    "observed_at",
+  ];
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== fields.length ||
+    fields.some((field) => !Object.hasOwn(value, field)) ||
+    (value.kind !== "lifecycle" && value.kind !== "execution") ||
+    value.schema_version !== 1 ||
+    !Number.isSafeInteger(value.sequence) ||
+    (value.sequence as number) < 1 ||
+    value.event_id !== `history:${value.sequence}` ||
+    !boundedText(value.session_id) ||
+    (value.execution_id !== null && !boundedText(value.execution_id)) ||
+    value.source !== "session-registry" ||
+    !boundedText(value.operation) ||
+    !Number.isSafeInteger(value.before_revision) ||
+    (value.before_revision as number) < 0 ||
+    !Number.isSafeInteger(value.after_revision) ||
+    (value.after_revision as number) <= (value.before_revision as number) ||
+    typeof value.observed_at !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value.observed_at) ||
+    !Number.isFinite(Date.parse(value.observed_at)) ||
+    new Date(value.observed_at).toISOString() !== value.observed_at
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry session_history[${index}] is invalid`);
+  }
+  return cloneRecord(value);
 }
 
 function boundedText(value: unknown): value is string {

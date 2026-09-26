@@ -7,6 +7,7 @@ import {
   type RepositoryRuntimeProcessObservation,
 } from "./repository-runtime-observations.js";
 import type { RepositoryRuntimeSnapshot } from "./repository-runtime-snapshot.js";
+import type { SessionRuntimeHistory } from "./session-runtime-history.js";
 import {
   projectFileSessionMatrix,
   type FileSessionMatrixRow,
@@ -48,6 +49,7 @@ export interface AgentRuntimeStatus {
   readonly blocker: SessionAttentionBlocker | null;
   readonly truncated: boolean;
   readonly cursor: string | null;
+  readonly history?: SessionRuntimeHistory;
 }
 
 export interface SessionAttentionBlocker {
@@ -234,6 +236,7 @@ export function projectAgentRuntimeStatus(
             }),
       truncated,
       cursor,
+      ...(snapshot.history?.[sessionId] === undefined ? {} : { history: snapshot.history[sessionId] }),
     }),
   );
 }

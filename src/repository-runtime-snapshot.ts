@@ -1,6 +1,7 @@
 import { DomainError, failure, success, type DomainResult, type JsonObject, type JsonValue } from "./domain/errors.js";
 import { compareCodePointStrings, type ResourceClaim } from "./resource-claims.js";
 import type { RepositoryRegistryView, SessionRecord } from "./session-registry.js";
+import { projectSessionRuntimeHistory, type SessionRuntimeHistory } from "./session-runtime-history.js";
 
 export const REPOSITORY_RUNTIME_SNAPSHOT_CONTRACT_ID = "nawabari.repository-runtime-snapshot.v1" as const;
 export const REPOSITORY_RUNTIME_SNAPSHOT_SCHEMA_VERSION = 1 as const;
@@ -42,6 +43,8 @@ export type RepositoryRuntimeSnapshot = Readonly<{
   incomplete_reasons: readonly string[];
   sessions: readonly SessionRecord[];
   claims: readonly ResourceClaim[];
+  /** Bounded non-authorizing history; pre-feature records have unknown earlier coverage. */
+  history?: Readonly<Record<string, SessionRuntimeHistory>>;
   observations: Readonly<{
     coordination: RepositoryRuntimeObservation<JsonValue>;
     profiles: RepositoryRuntimeObservation<JsonValue>;
@@ -89,6 +92,11 @@ export function getNawabariRepositoryRuntimeSnapshot(
   if (sessions.length > MAX_SESSIONS) incompleteReasons.push("sessions truncated at 1024");
   if (claims.length > MAX_CLAIMS) incompleteReasons.push("claims truncated at 4096");
 
+  const historyIds = new Set(sessions.slice(0, MAX_SESSIONS).map((session) => session.sessionId));
+  for (const record of input.registry.runtimeRecords.records.session_history ?? []) {
+    if (typeof record.session_id === "string") historyIds.add(record.session_id);
+  }
+
   const snapshot: RepositoryRuntimeSnapshot = Object.freeze({
     contract_id: REPOSITORY_RUNTIME_SNAPSHOT_CONTRACT_ID,
     schema_version: REPOSITORY_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
@@ -104,6 +112,13 @@ export function getNawabariRepositoryRuntimeSnapshot(
     incomplete_reasons: Object.freeze(incompleteReasons),
     sessions: Object.freeze(sessions.slice(0, MAX_SESSIONS).map(cloneSessionProjection)),
     claims: Object.freeze(claims.slice(0, MAX_CLAIMS).map(cloneClaimProjection)),
+    history: Object.freeze(
+      Object.fromEntries(
+        [...historyIds]
+          .sort(compareCodePointStrings)
+          .map((sessionId) => [sessionId, projectSessionRuntimeHistory(input.registry.runtimeRecords, sessionId)]),
+      ),
+    ),
     observations: Object.freeze({
       coordination: observations.coordination as RepositoryRuntimeObservation<JsonValue>,
       profiles: observations.profiles as RepositoryRuntimeObservation<JsonValue>,

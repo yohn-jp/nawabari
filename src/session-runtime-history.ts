@@ -1,0 +1,66 @@
+import type { ParsedRuntimeRecords, RuntimeRecord } from "./registry/runtime-records.js";
+import { MAX_RUNTIME_RECORDS } from "./registry/runtime-records.js";
+
+/** Presentation evidence only. Neither these records nor their absence grants authority. */
+export interface SessionRuntimeHistoryEvent {
+  readonly kind: "lifecycle" | "execution";
+  readonly schema_version: 1;
+  readonly event_id: string;
+  readonly sequence: number;
+  readonly session_id: string;
+  readonly execution_id: string | null;
+  readonly source: "session-registry";
+  readonly operation: string;
+  readonly before_revision: number;
+  readonly after_revision: number;
+  readonly observed_at: string;
+}
+
+export interface SessionRuntimeHistory {
+  readonly events: readonly SessionRuntimeHistoryEvent[];
+  readonly bound: number;
+  readonly retained_from: number | null;
+  readonly retained_through: number | null;
+  readonly truncated: boolean;
+  readonly coverage: "since-first-recorded-event";
+}
+
+/** Only history entries are evicted; other registry records are never touched. */
+export function appendRuntimeEvent(
+  state: ParsedRuntimeRecords,
+  events: readonly Omit<SessionRuntimeHistoryEvent, "event_id" | "sequence" | "schema_version">[],
+  bound: number = MAX_RUNTIME_RECORDS,
+): ParsedRuntimeRecords {
+  if (!Number.isSafeInteger(bound) || bound < 1 || bound > MAX_RUNTIME_RECORDS)
+    throw new RangeError("Invalid history bound");
+  if (events.length === 0) return state;
+  const existing = (state.records.session_history ?? []) as unknown as SessionRuntimeHistoryEvent[];
+  let sequence = existing.at(-1)?.sequence ?? 0;
+  const appended = events.map((event) => {
+    if (!Number.isSafeInteger(++sequence)) throw new RangeError("History sequence exhausted");
+    return Object.freeze({ ...event, schema_version: 1 as const, sequence, event_id: `history:${sequence}` });
+  });
+  return Object.freeze({
+    requiredFeatures: Object.freeze([...new Set([...state.requiredFeatures, "session-history.v1" as const])]),
+    records: Object.freeze({
+      ...state.records,
+      session_history: Object.freeze([...existing, ...appended].slice(-bound)) as unknown as readonly RuntimeRecord[],
+    }),
+  });
+}
+
+export function projectSessionRuntimeHistory(records: ParsedRuntimeRecords, sessionId: string): SessionRuntimeHistory {
+  const retained = (records.records.session_history ?? []) as unknown as SessionRuntimeHistoryEvent[];
+  const first = retained[0]?.sequence ?? null;
+  const last = retained.at(-1)?.sequence ?? null;
+  return Object.freeze({
+    events: Object.freeze(
+      retained.filter((event) => event.session_id === sessionId).map((event) => Object.freeze({ ...event })),
+    ),
+    bound: MAX_RUNTIME_RECORDS,
+    retained_from: first,
+    retained_through: last,
+    truncated: first !== null && first > 1,
+    coverage: "since-first-recorded-event",
+  });
+}
