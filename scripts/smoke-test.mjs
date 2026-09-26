@@ -3827,12 +3827,46 @@ async function main() {
     const handoffResource = "bounded-session/mutable.txt";
     const handoffSourceWorktree = path.join(installDirectory, "handoff-source-worktree");
     const handoffDestinationWorktree = path.join(installDirectory, "handoff-destination-worktree");
-    const handoffSourceCreate = createBoundedSession(
+    // The source must be admitted by the #403 managed launch-admission
+    // authority (pinned profile + session admission record); only then does
+    // `session run` persist an owned execution record the fence can observe.
+    // Hosts without managed readiness reject the profile-selected create, and
+    // the handoff is then exercised on an untracked source that must never
+    // be reported quiescent.
+    const handoffSourceArgs = [
+      "session",
+      "create",
+      "--branch",
       "feature/handoff-source",
+      "--worktree",
       handoffSourceWorktree,
-      candidateFiles.compatible,
-    );
-    const handoffSource = parseInstalledJson(handoffSourceCreate.result, "handoff source bootstrap");
+      "--profile",
+      "builtin:minimal",
+      "--json",
+    ];
+    const handoffManagedSourceResult = invokeInstalled(handoffSourceArgs, lifecycleRepository);
+    const handoffManagedSource = parseInstalledJson(handoffManagedSourceResult, "handoff managed source bootstrap");
+    const handoffSourceManaged = handoffManagedSourceResult.status === 0 && handoffManagedSource.ok === true;
+    if (!handoffSourceManaged) {
+      if (handoffManagedSourceResult.status === 4 && handoffManagedSource.code === "SANDBOX_CAPABILITY_UNAVAILABLE") {
+        recordEnvironmentBlock("managed-runtime resource handoff source admission", handoffManagedSource.code);
+      } else {
+        recordBoundedDefect(
+          `nawabari ${handoffSourceArgs.join(" ")}`,
+          "admit a managed handoff source or fail closed with SANDBOX_CAPABILITY_UNAVAILABLE",
+          { exitCode: handoffManagedSourceResult.status, response: handoffManagedSource },
+        );
+      }
+    }
+    const handoffSource = handoffSourceManaged
+      ? handoffManagedSource
+      : parseInstalledJson(
+          invokeInstalled(
+            ["session", "create", "--branch", "feature/handoff-source", "--worktree", handoffSourceWorktree, "--json"],
+            lifecycleRepository,
+          ),
+          "handoff untracked source bootstrap",
+        );
     const handoffDestinationCreate = createBoundedSession(
       "feature/handoff-destination",
       handoffDestinationWorktree,
@@ -3881,11 +3915,16 @@ async function main() {
           "SANDBOX_UNSUPPORTED_PLATFORM",
           "RUNTIME_MATERIALIZATION_MISSING",
         ].includes(handoffRun.code);
+        // Only a managed run persists owned execution evidence for the fence.
         const handoffRunCompleted =
-          handoffRunResult.status === 0 && handoffRun.ok === true && handoffRun.exit_code === 0;
+          handoffSourceManaged &&
+          handoffRunResult.status === 0 &&
+          handoffRun.ok === true &&
+          handoffRun.exit_code === 0 &&
+          typeof handoffRun.execution?.execution_id === "string";
         if (handoffRunUnavailable) {
           recordEnvironmentBlock("managed-runtime resource handoff execution", handoffRun.code);
-        } else if (!handoffRunCompleted) {
+        } else if (handoffSourceManaged && !handoffRunCompleted) {
           recordBoundedDefect(`nawabari ${handoffRunArgs.join(" ")}`, "complete one managed source execution", {
             exitCode: handoffRunResult.status,
             response: handoffRun,
