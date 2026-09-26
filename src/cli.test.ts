@@ -2457,6 +2457,30 @@ test("session scope expand forwards an explicit revisioned path request", async 
   }
 });
 
+test("session scope expand resolves its canonical text and JSON help", async () => {
+  const human = capture();
+  assert.equal(await runCli(["session", "scope", "expand", "--help"], { io: human.io }), 0);
+  assert.match(human.stdout.join("\n"), /session scope expand <session-id>/u);
+  assert.match(human.stdout.join("\n"), /--revision <n>/u);
+
+  const json = capture();
+  assert.equal(
+    await runCli(["session", "scope", "expand", "--session", sampleSession.session_id, "--help", "--json"], {
+      io: json.io,
+    }),
+    0,
+  );
+  const response = JSON.parse(json.stdout[0] ?? "");
+  const canonical = resolveCliCommandDefinition("session scope expand");
+  assert.equal(response.help_for, "session scope expand");
+  assert.equal(response.usage, canonical?.usage);
+  assert.deepEqual(response.notes, canonical?.notes);
+  assert.deepEqual(
+    response.options.map((option: { name: string }) => option.name),
+    canonical?.options.map((option) => option.name),
+  );
+});
+
 test("session create rejects --worktree combined with --worktree-root before touching the backend", async () => {
   let backendCalled = false;
   const backend = backendForTests({

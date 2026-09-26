@@ -136,12 +136,16 @@ const REGISTRY_DATA = [
         "JSON repository-local auxiliary-state declaration to materialize in the managed worktree; repeatable",
         { value: "<json>", repeatable: true },
       ),
-      option("--execution-scope-file", "Bounded JSON execution-scope artifact file for governed bootstrap", {
-        value: "<path>",
-      }),
+      option(
+        "--execution-scope-file",
+        "Version 1 implementation-execution-scope JSON; see README Working-set artifacts",
+        {
+          value: "<path>",
+        },
+      ),
       option(
         "--candidate-working-set-file",
-        "Bounded JSON candidate-working-set artifact file for governed bootstrap",
+        "Schema version 1 candidate-working-set JSON; see README Working-set artifacts",
         { value: "<path>" },
       ),
       option(
@@ -156,6 +160,7 @@ const REGISTRY_DATA = [
       "Initial claims are provisioned atomically with the session; each --resource must be immediately followed by its own --mode, and zero pairs remains backward compatible.",
       "Resource-claim enforcement is disabled by default; pass --enforce-claims to require claims for commit/push authorization on this session. Worktree and branch ownership, and claim conflicts against other sessions, remain enforced regardless.",
       "Providing one bounded working-set artifact requires the other; both are validated before worktree ownership is established.",
+      "Both JSON artifact formats and field semantics are documented in README Working-set artifacts; session show --json exposes working_set.revision for expansion.",
       "A claim conflict returns blocking-owner evidence. A durability-uncertain result is retry-safe only after re-reading the reported registry state; an existing owner is never silently adopted.",
       "Without an override, Nawabari creates the safe managed root <repository-parent>/.nawabari/worktrees on first use. Existing absolute worktree paths directly under the repository parent remain accepted for compatibility.",
     ],
@@ -256,6 +261,7 @@ const REGISTRY_DATA = [
       "The current working-set revision is a mandatory CAS token; stale requests are rejected without mutation.",
       "READONLY is evaluated independently. Mutation classes also require the existing session claim authority.",
       "The execution-scope artifact must match the session's established provenance; it cannot widen Inari maximum authority.",
+      "Inspect session show --json working_set.revision and history; use the same bootstrap execution-scope JSON. See README Working-set artifacts.",
     ],
   },
   {
