@@ -485,6 +485,7 @@ async function main() {
       }
     }
     const protectedExecution = capabilities.capabilities?.find((capability) => capability.id === "protected-execution");
+    const protectedIdentityKeys = ["session_id", "repository", "worktree", "branch", "network_mode"];
     if (
       protectedExecution?.contract_id !== "nawabari.sandbox-execution.v1" ||
       protectedExecution?.schema_version !== 1 ||
@@ -492,7 +493,8 @@ async function main() {
       protectedExecution?.fail_closed !== true ||
       protectedExecution?.ambient_fallback !== false ||
       protectedExecution?.commands?.join(",") !== "session run,session exec,session shell" ||
-      protectedExecution?.command_aliases?.[0]?.alias !== "session exec"
+      protectedExecution?.command_aliases?.[0]?.alias !== "session exec" ||
+      JSON.stringify(protectedExecution?.identities) !== JSON.stringify(protectedIdentityKeys)
     ) {
       fail("installed capabilities did not expose the protected-execution contract");
     }
@@ -1450,6 +1452,21 @@ async function main() {
         ) {
           fail("packed protected session run did not preserve authoritative cwd, session identity, and argv");
         }
+        const expectedProtectedIdentity = {
+          session_id: created.session_id,
+          repository: created.repository,
+          worktree: created.worktree,
+          branch: created.branch,
+          network_mode: protectedExecution.network_mode,
+        };
+        if (
+          protectedIdentityKeys.some((key) => protectedRunJson[key] !== expectedProtectedIdentity[key]) ||
+          protectedIdentityKeys.some((key) => !Object.hasOwn(protectedRunJson, key))
+        ) {
+          fail(
+            `packed protected session run did not project the advertised canonical identity tuple; expected=${JSON.stringify(expectedProtectedIdentity)}; actual=${JSON.stringify(protectedRunJson)}`,
+          );
+        }
         if (fs.existsSync(path.join(lifecycleWorktree, "packed-ambient-marker"))) {
           fail("packed protected session run interpolated command argv through a shell");
         }
@@ -1483,7 +1500,8 @@ async function main() {
         unavailableRun.status !== 4 ||
         unavailableRunJson.ok !== false ||
         unavailableRunJson.code !== expectedUnavailableCode ||
-        unavailableRun.stderr.trim().length > 0
+        unavailableRun.stderr.trim().length > 0 ||
+        protectedIdentityKeys.some((key) => Object.hasOwn(unavailableRunJson, key))
       ) {
         fail("installed protected session run did not fail closed when the sandbox capability was unavailable");
       }
@@ -3916,6 +3934,58 @@ async function main() {
           handoffClaim,
         );
       } else {
+        if (handoffSourceManaged) {
+          const managedNonzeroArgs = [
+            "session",
+            "exec",
+            "--session",
+            handoffManagedSource.session_id,
+            "--json",
+            "--",
+            "node",
+            "-e",
+            "process.exit(23)",
+          ];
+          const managedNonzeroResult = invokeInstalled(managedNonzeroArgs, handoffSourceWorktree);
+          const managedNonzero = parseInstalledJson(managedNonzeroResult, "packed managed non-zero protected exec");
+          const managedNonzeroUnavailable = [
+            "SANDBOX_CAPABILITY_UNAVAILABLE",
+            "SANDBOX_UNSUPPORTED_PLATFORM",
+            "RUNTIME_MATERIALIZATION_MISSING",
+          ].includes(managedNonzero.code);
+          if (managedNonzeroUnavailable) {
+            if (protectedIdentityKeys.some((key) => Object.hasOwn(managedNonzero, key))) {
+              fail("typed pre-launch managed failure emitted false protected identity evidence");
+            }
+            recordEnvironmentBlock("managed protected non-zero session exec", managedNonzero.code);
+          } else {
+            if (
+              managedNonzeroResult.status !== 23 ||
+              managedNonzero.ok !== true ||
+              managedNonzero.exit_code !== 23 ||
+              managedNonzero.signal !== null
+            ) {
+              fail(
+                `packed managed session exec did not preserve child exit 23; exit=${managedNonzeroResult.status}; actual=${JSON.stringify(managedNonzero)}`,
+              );
+            }
+            const expectedManagedNonzeroIdentity = {
+              session_id: handoffManagedSource.session_id,
+              repository: handoffManagedSource.repository,
+              worktree: handoffManagedSource.worktree,
+              branch: handoffManagedSource.branch,
+              network_mode: protectedExecution.network_mode,
+            };
+            if (
+              protectedIdentityKeys.some((key) => managedNonzero[key] !== expectedManagedNonzeroIdentity[key]) ||
+              protectedIdentityKeys.some((key) => !Object.hasOwn(managedNonzero, key))
+            ) {
+              fail(
+                `packed managed session exec did not preserve the advertised identity tuple on child exit 23; expected=${JSON.stringify(expectedManagedNonzeroIdentity)}; actual=${JSON.stringify(managedNonzero)}`,
+              );
+            }
+          }
+        }
         const handoffRunArgs = [
           "session",
           "run",
@@ -3941,6 +4011,23 @@ async function main() {
           handoffRun.ok === true &&
           handoffRun.exit_code === 0 &&
           typeof handoffRun.execution?.execution_id === "string";
+        if (handoffRunCompleted) {
+          const expectedManagedIdentity = {
+            session_id: handoffManagedSource.session_id,
+            repository: handoffManagedSource.repository,
+            worktree: handoffManagedSource.worktree,
+            branch: handoffManagedSource.branch,
+            network_mode: protectedExecution.network_mode,
+          };
+          if (
+            protectedIdentityKeys.some((key) => handoffRun[key] !== expectedManagedIdentity[key]) ||
+            protectedIdentityKeys.some((key) => !Object.hasOwn(handoffRun, key))
+          ) {
+            fail(
+              `packed managed protected session run did not project the advertised canonical identity tuple; expected=${JSON.stringify(expectedManagedIdentity)}; actual=${JSON.stringify(handoffRun)}`,
+            );
+          }
+        }
         if (handoffSourceManaged && handoffRunUnavailable) {
           recordEnvironmentBlock("managed-runtime resource handoff execution", handoffRun.code);
         } else if (handoffSourceManaged && !handoffRunCompleted) {

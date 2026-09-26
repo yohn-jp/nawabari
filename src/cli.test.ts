@@ -13,6 +13,7 @@ import {
   validateCliRegistryParity,
   type CliDependencies,
 } from "./cli.js";
+import { machineContract } from "./contract.js";
 import { DomainError, failure, success } from "./domain/errors.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import type {
@@ -297,56 +298,94 @@ test("bounded session run carries the persisted working-set boundary into the pr
   assert.deepEqual(observedWorkingSet?.scope.readOnly, ["README.md"]);
 });
 
-test("session run resolves the existing session authority and preserves command argv after --", async () => {
-  const output = capture();
-  let observedCommand: string[] = [];
-  const exitCode = await runCli(
-    ["--json", "session", "run", "--session", sampleSession.session_id, "--", "printf", "--json"],
-    {
-      cwd: sampleSession.worktree,
-      backend: backendForTests(),
-      io: output.io,
-      sandboxProbe: {
-        platform: () => "linux",
-        uid: () => 1000,
-        gid: () => 1000,
-        hasBubblewrap: () => true,
-        hasNamespaceSupport: () => true,
-        hasCgroupsV2: () => false,
-        hasLandlock: () => false,
-        hasSeccomp: () => true,
-        hasCapabilities: () => true,
-      },
-      sandboxRuntimeLayout: strictRuntimeLayout(),
-      sandboxRunner: async (request, command) => {
-        assert.equal(request.worktree, sampleSession.worktree);
-        observedCommand = [command.command, ...(command.args ?? [])];
-        return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
-      },
-    },
-  );
+test("session run and exec project the advertised protected identities from the resolved request", async () => {
+  const capabilities = machineContract("test").capabilities as unknown as
+    Array<{ id: string; identities?: string[] }> | undefined;
+  const protectedCapability = capabilities?.find((capability) => capability.id === "protected-execution");
+  assert.deepEqual(protectedCapability?.identities, ["session_id", "repository", "worktree", "branch", "network_mode"]);
 
-  assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
-  assert.deepEqual(observedCommand, ["printf", "--json"]);
-  assert.deepEqual(JSON.parse(output.stdout[0] ?? ""), {
-    ok: true,
-    command: "session run",
-    exit_code: 0,
-    signal: null,
-    stdout: "ok",
-    stderr: "",
-    duration_ms: 1,
-    runtime_resolution: {
-      policy: {
-        mode: "strict",
-        host_visibility: "default-deny",
-        compatibility: "disabled",
-        unrestricted_host_fallback: "forbidden",
+  for (const [subcommand, childExitCode] of [
+    ["run", 0],
+    ["exec", 23],
+  ] as const) {
+    const output = capture();
+    let observedCommand: string[] = [];
+    let observedIdentity: Record<string, unknown> | undefined;
+    let observedRuntimeResolution: unknown;
+    const exitCode = await runCli(
+      [
+        "--json",
+        "session",
+        subcommand,
+        "--session",
+        sampleSession.session_id,
+        "--runtime-policy",
+        "compatibility",
+        "--",
+        "printf",
+        "--json",
+      ],
+      {
+        cwd: sampleSession.worktree,
+        backend: backendForTests(),
+        io: output.io,
+        sandboxProbe: {
+          platform: () => "linux",
+          uid: () => 1000,
+          gid: () => 1000,
+          hasBubblewrap: () => true,
+          hasNamespaceSupport: () => true,
+          hasCgroupsV2: () => false,
+          hasLandlock: () => false,
+          hasSeccomp: () => true,
+          hasCapabilities: () => true,
+        },
+        sandboxRuntimeLayout: strictRuntimeLayout(),
+        sandboxRunner: async (request, command) => {
+          assert.equal(request.worktree, sampleSession.worktree);
+          observedIdentity = {
+            session_id: request.session_id,
+            repository: request.repository,
+            worktree: request.worktree,
+            branch: request.branch,
+            network_mode: request.network_mode,
+          };
+          observedRuntimeResolution = request.runtime_resolution;
+          observedCommand = [command.command, ...(command.args ?? [])];
+          return success({ exit_code: childExitCode, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+        },
       },
-      profile: { id: "development", version: "1" },
-      materializer: "fhs",
-    },
-  });
+    );
+
+    assert.equal(exitCode, childExitCode, output.stderr.join("\n") || output.stdout.join("\n"));
+    assert.deepEqual(observedCommand, ["printf", "--json"]);
+    const response = JSON.parse(output.stdout[0] ?? "") as Record<string, unknown>;
+    assert.deepEqual(response, {
+      ok: true,
+      command: `session ${subcommand}`,
+      exit_code: childExitCode,
+      signal: null,
+      stdout: "ok",
+      stderr: "",
+      duration_ms: 1,
+      session_id: sampleSession.session_id,
+      repository: sampleSession.repository,
+      worktree: sampleSession.worktree,
+      branch: sampleSession.branch,
+      network_mode: "inherited",
+      runtime_resolution: observedRuntimeResolution,
+    });
+    const projectedResponse: Record<string, unknown> = response;
+    const advertisedKeys: string[] = protectedCapability?.identities ?? [];
+    assert.deepEqual(
+      Object.keys(response).filter((key) => advertisedKeys.includes(key)),
+      advertisedKeys,
+    );
+    assert.deepEqual(
+      Object.fromEntries(advertisedKeys.map((key): [string, unknown] => [key, projectedResponse[key]])),
+      observedIdentity,
+    );
+  }
 });
 
 test("session run does not interpret a child --json argument as a Nawabari global option", async () => {
@@ -547,6 +586,30 @@ test("session exec routes through the canonical protected launcher and never fal
   });
 });
 
+test("typed pre-launch protected failure does not emit successful identity evidence", async () => {
+  const output = capture();
+  let runnerCalls = 0;
+  const exitCode = await runCli(["--json", "session", "exec", "--session", sampleSession.session_id, "--", "worker"], {
+    cwd: sampleSession.worktree,
+    backend: backendForTests(),
+    io: output.io,
+    sandboxProbe: readySandboxProbe({ hasBubblewrap: () => false }),
+    sandboxRunner: async () => {
+      runnerCalls += 1;
+      return success({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
+    },
+  });
+
+  assert.equal(exitCode, 4);
+  assert.equal(runnerCalls, 0);
+  const response = JSON.parse(output.stdout[0] ?? "") as Record<string, unknown>;
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+  for (const identity of ["session_id", "repository", "worktree", "branch", "network_mode"]) {
+    assert.equal(Object.hasOwn(response, identity), false, identity);
+  }
+});
+
 test("managed run, exec, and shell dispatch to the protected lifecycle before any legacy runner", async () => {
   const invocations = [
     ["--json", "session", "run", "--session", sampleSession.session_id, "--", "printf", "managed"],
@@ -601,9 +664,12 @@ test("managed run, exec, and shell dispatch to the protected lifecycle before an
 
     assert.equal(exitCode, 4, arguments_.join(" "));
     assert.equal(legacyRunnerCalls, 0, arguments_.join(" "));
-    const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string };
+    const response = JSON.parse(output.stdout[0] ?? "") as { ok: boolean; code: string } & Record<string, unknown>;
     assert.equal(response.ok, false, arguments_.join(" "));
     assert.equal(response.code, "SANDBOX_CAPABILITY_UNAVAILABLE", arguments_.join(" "));
+    for (const identity of ["session_id", "repository", "worktree", "branch", "network_mode"]) {
+      assert.equal(Object.hasOwn(response, identity), false, `${arguments_.join(" ")}: ${identity}`);
+    }
   }
   assert.deepEqual(managedTargets, [
     sampleSession.session_id,
@@ -743,6 +809,11 @@ test("session run returns a rejected exit status for a signaled child and never 
     stdout: "",
     stderr: "",
     duration_ms: 1,
+    session_id: sampleSession.session_id,
+    repository: sampleSession.repository,
+    worktree: sampleSession.worktree,
+    branch: sampleSession.branch,
+    network_mode: "inherited",
     runtime_resolution: {
       policy: {
         mode: "strict",
