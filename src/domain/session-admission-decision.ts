@@ -30,6 +30,7 @@ export type ExecutionAdmissionSnapshot = {
  * reserving `starting`; every field is compared before a launch is admitted.
  */
 export type ExecutionAdmissionFacts = {
+  readonly purpose?: "bootstrap";
   readonly session_id: string;
   readonly execution_id: string;
   readonly current: ExecutionAdmissionSnapshot;
@@ -49,6 +50,7 @@ export type ExecutionAdmissionDenialReason =
   | "epoch-changed";
 
 export type ExecutionAdmissionReservation = {
+  readonly purpose?: "bootstrap";
   readonly contract_id: typeof SESSION_ADMISSION_CONTRACT_ID;
   readonly schema_version: typeof SESSION_ADMISSION_SCHEMA_VERSION;
   readonly session_id: string;
@@ -179,13 +181,20 @@ export function decideExecutionAdmission(facts: ExecutionAdmissionFacts): Domain
   const expected = validateSnapshot(facts.expected, "expected");
   if (!expected.ok) return expected;
 
+  if (facts.purpose !== undefined && facts.purpose !== "bootstrap") {
+    return invalid("The execution admission purpose is invalid.", {});
+  }
   const normalized: ExecutionAdmissionFacts = {
+    ...(facts.purpose === undefined ? {} : { purpose: facts.purpose }),
     session_id: session.value,
     execution_id: execution.value,
     current: current.value,
     expected: expected.value,
   };
-  if (current.value.lifecycle !== "active" || !current.value.launch_permitted) {
+  if (
+    !current.value.launch_permitted ||
+    (facts.purpose === "bootstrap" ? current.value.lifecycle !== "new" : current.value.lifecycle !== "active")
+  ) {
     return success(denial(normalized, "lifecycle-not-permitted"));
   }
   if (current.value.epoch < expected.value.epoch) {
@@ -223,6 +232,7 @@ export function decideExecutionAdmission(facts: ExecutionAdmissionFacts): Domain
     admitted: true,
     status: "starting",
     reservation: {
+      ...(facts.purpose === undefined ? {} : { purpose: facts.purpose }),
       contract_id: SESSION_ADMISSION_CONTRACT_ID,
       schema_version: SESSION_ADMISSION_SCHEMA_VERSION,
       session_id: session.value,
@@ -243,10 +253,11 @@ export function validateExecutionAdmissionReservation(
   reservation: ExecutionAdmissionReservation,
 ): DomainResult<ExecutionAdmissionReservation> {
   const decision = decideExecutionAdmission({
+    ...(reservation.purpose === undefined ? {} : { purpose: reservation.purpose }),
     session_id: reservation.session_id,
     execution_id: reservation.execution_id,
     current: {
-      lifecycle: "active",
+      lifecycle: reservation.purpose === "bootstrap" ? "new" : "active",
       launch_permitted: true,
       profile_token: reservation.profile_token,
       profile_revision: reservation.profile_revision,
@@ -256,7 +267,7 @@ export function validateExecutionAdmissionReservation(
       epoch: reservation.epoch,
     },
     expected: {
-      lifecycle: "active",
+      lifecycle: reservation.purpose === "bootstrap" ? "new" : "active",
       launch_permitted: true,
       profile_token: reservation.profile_token,
       profile_revision: reservation.profile_revision,

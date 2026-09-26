@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { executeBootstrapAction, runBootstrapActions } from "./session-bootstrap.js";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -430,7 +431,51 @@ export class LocalSessionBackend implements SessionBackend {
           : { workingSetRepository: options.working_set_repository }),
         ...(options.profile === null || options.profile === undefined ? {} : { profile: options.profile }),
       });
-      return success(toDomainRecord(record));
+      const session = toDomainRecord(record);
+      if (record.state !== "new") return success(session);
+      const pinned = registry.getSessionManagedRuntime(record.sessionId).profile;
+      if (pinned === null || !("path" in pinned.provenance.catalog) || !pinned.resolved.bootstrap?.length) {
+        return failure(
+          new DomainError("REGISTRY_CORRUPT", "Pending bootstrap authority is missing", {
+            session_id: record.sessionId,
+          }),
+        );
+      }
+      const bootstrapped = await runBootstrapActions(
+        pinned.resolved.bootstrap,
+        async (action) => {
+          const executionId = `bootstrap:${record.sessionId}:${action.id}`;
+          return executeBootstrapAction(context, this, session, action, {
+            verify: () => toDomainRecord(registry.verifyBootstrapSession(record.sessionId)),
+            persist: (execution) =>
+              execution.execution_id === executionId && execution.state === "starting"
+                ? Promise.resolve().then(() =>
+                    success(registry.persistBootstrapExecution(record.sessionId, action.id, execution)),
+                  )
+                : this.persistSessionExecution(context, execution),
+          });
+        },
+        record.sessionId,
+      );
+      if (!bootstrapped.ok) return bootstrapped;
+      try {
+        return success(
+          toDomainRecord(
+            registry.activateBootstrapSession(
+              record.sessionId,
+              pinned.resolved.bootstrap.map((action) => action.id),
+            ),
+          ),
+        );
+      } catch (error: unknown) {
+        return failure(
+          new DomainError("REGISTRY_DURABILITY_UNCERTAIN", "Bootstrap readiness could not be confirmed", {
+            session_id: record.sessionId,
+            action_id: pinned.resolved.bootstrap.at(-1)?.id ?? "unknown",
+            cause: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+          }),
+        );
+      }
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }

@@ -1651,6 +1651,13 @@ export class SessionRegistry {
 
   /** Persist a new execution reservation, advancing only registry_revision. */
   persistSessionExecution(record: PersistedSessionExecutionRecord): PersistedSessionExecutionRecord {
+    return this.persistExecutionRecord(record);
+  }
+
+  private persistExecutionRecord(
+    record: PersistedSessionExecutionRecord,
+    bootstrapSessionId?: string,
+  ): PersistedSessionExecutionRecord {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       const parsed = parseSessionExecutionRecord(record);
@@ -1664,7 +1671,7 @@ export class SessionRegistry {
       if (session === undefined) {
         throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${parsed.value.session_id}`);
       }
-      if (session.state !== "active") {
+      if (session.state !== "active" && !(session.state === "new" && bootstrapSessionId === session.sessionId)) {
         throw new SessionRegistryError("OPERATION_REJECTED", "Execution reservation requires an active session", {
           sessionId: parsed.value.session_id,
           state: session.state,
@@ -1693,6 +1700,12 @@ export class SessionRegistry {
         return current.ok && current.value.execution_id === parsed.value.execution_id;
       });
       if (existing !== undefined) {
+        if (bootstrapSessionId !== undefined) {
+          throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap action was already attempted", {
+            sessionId: bootstrapSessionId,
+            executionId: parsed.value.execution_id,
+          });
+        }
         const current = parseSessionExecutionRecord(existing);
         if (
           current.ok &&
@@ -2484,7 +2497,12 @@ export class SessionRegistry {
         worktreePath: resources.worktreePath,
         branchId: resources.branchId,
         branchName: resources.branchName,
-        state: "active",
+        state:
+          pinnedProfile !== undefined &&
+          "path" in pinnedProfile.provenance.catalog &&
+          (pinnedProfile.resolved.bootstrap?.length ?? 0) > 0
+            ? "new"
+            : "active",
         createdAt: timestamp,
         updatedAt: timestamp,
         baseRevision: resources.baseRevision,
@@ -2787,6 +2805,109 @@ export class SessionRegistry {
     } catch {
       return false;
     }
+  }
+
+  /** Inspect pending bootstrap ownership without granting normal session operations. */
+  verifyBootstrapSession(sessionId: string): SessionRecord {
+    assertSessionId(sessionId);
+    const record = this.readUnsafe().find((candidate) => candidate.sessionId === sessionId);
+    if (record?.state !== "new") {
+      throw new SessionRegistryError("SESSION_NOT_ACTIVE", "Bootstrap requires an owned pending session", {
+        sessionId,
+      });
+    }
+    const pin = this.getSessionManagedRuntime(sessionId).profile;
+    if (pin === null || !("path" in pin.provenance.catalog) || !pin.resolved.bootstrap?.length) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap requires repository profile actions", {
+        sessionId,
+      });
+    }
+    const physical = verifyPhysicalExecutionContext({
+      repository: this.repository,
+      worktreePath: record.worktreePath,
+      branchName: record.branchName,
+      git: this.git,
+    });
+    if (physical.worktreeId !== record.worktreeId || physical.branchId !== record.branchId) {
+      throw new SessionRegistryError("OWNERSHIP_MISMATCH", "Bootstrap worktree ownership changed", { sessionId });
+    }
+    return cloneSessionRecord(record);
+  }
+
+  /** Only the bootstrap integration may reserve an action; its identity is durable before launch. */
+  persistBootstrapExecution(
+    sessionId: string,
+    actionId: string,
+    record: PersistedSessionExecutionRecord,
+  ): PersistedSessionExecutionRecord {
+    this.verifyBootstrapSession(sessionId);
+    const pin = this.getSessionManagedRuntime(sessionId).profile;
+    if (
+      !pin?.resolved.bootstrap?.some((action) => action.id === actionId) ||
+      record.session_id !== sessionId ||
+      record.execution_id !== `bootstrap:${sessionId}:${actionId}`
+    ) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap action identity is not pinned", {
+        sessionId,
+        actionId,
+      });
+    }
+    return this.persistExecutionRecord(record, sessionId);
+  }
+
+  /** Final readiness commit; never called after rejected or uncertain action execution. */
+  activateBootstrapSession(sessionId: string, completedActionIds: readonly string[]): SessionRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const index = state.sessions.findIndex((candidate) => candidate.sessionId === sessionId);
+      const record = state.sessions[index];
+      if (record?.state !== "new") {
+        throw new SessionRegistryError("SESSION_NOT_ACTIVE", "Bootstrap session is no longer pending", { sessionId });
+      }
+      const pin = this.getSessionManagedRuntime(sessionId).profile;
+      if (pin === null || !("path" in pin.provenance.catalog) || !pin.resolved.bootstrap?.length) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap profile authority is missing", { sessionId });
+      }
+      if (
+        JSON.stringify(completedActionIds) !== JSON.stringify(pin.resolved.bootstrap.map((action) => action.id)) ||
+        !completedActionIds.every((id) =>
+          state.runtimeRecords.records.executions?.some((item) => {
+            const parsed = parseSessionExecutionRecord(item);
+            return (
+              parsed.ok &&
+              parsed.value.session_id === sessionId &&
+              parsed.value.execution_id === `bootstrap:${sessionId}:${id}` &&
+              parsed.value.state === "exited"
+            );
+          }),
+        )
+      ) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap actions have not completed", { sessionId });
+      }
+      const physical = verifyPhysicalExecutionContext({
+        repository: this.repository,
+        worktreePath: record.worktreePath,
+        branchName: record.branchName,
+        git: this.git,
+      });
+      if (physical.worktreeId !== record.worktreeId || physical.branchId !== record.branchId) {
+        throw new SessionRegistryError("OWNERSHIP_MISMATCH", "Bootstrap ownership changed before readiness", {
+          sessionId,
+        });
+      }
+      const updated = transitionSessionState(record, "active", this.clock);
+      const sessions = [...state.sessions];
+      sessions[index] = updated;
+      this.writeUnsafe(
+        sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        state.runtimeRecords,
+      );
+      return cloneSessionRecord(updated);
+    });
   }
 
   provisionSession(options: ProvisionSessionOptions = {}): SessionRecord {

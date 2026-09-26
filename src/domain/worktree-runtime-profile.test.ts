@@ -80,6 +80,39 @@ test("validates and canonically orders the bounded profile sections", () => {
   assert.equal(Object.isFrozen(result.value.filesystem.write), true);
 });
 
+test("bootstrap actions are ordered and restricted to declared tools and bounded argv", () => {
+  const input = profileInput();
+  const plain = validateWorktreeRuntimeProfile(input);
+  assert.equal(plain.ok, true);
+  if (plain.ok) assert.equal(plain.value.bootstrap, undefined);
+  input.bootstrap = [
+    { id: "first", tool: "node", argv: ["--version"] },
+    { id: "second", tool: "bash", argv: ["--version"] },
+  ];
+  const parsed = validateWorktreeRuntimeProfile(input);
+  assert.equal(parsed.ok, true);
+  if (parsed.ok)
+    assert.deepEqual(
+      parsed.value.bootstrap?.map((action) => action.id),
+      ["first", "second"],
+    );
+  for (const bootstrap of [
+    [{ id: "first", tool: "python", argv: [] }],
+    [{ id: "first", tool: "/usr/bin/node", argv: [] }],
+    [{ id: "first", tool: "node", argv: ["/etc/passwd"] }],
+    [{ id: "first", tool: "node", argv: ["$(touch bad)"] }],
+    [{ id: "first", tool: "bash", argv: ["-c", "echo unsafe"] }],
+    [{ id: "first", tool: "node", argv: ["--input=/etc/passwd"] }],
+    [{ id: "first", tool: "node", argv: "--version" }],
+    [
+      { id: "first", tool: "node", argv: [] },
+      { id: "first", tool: "node", argv: [] },
+    ],
+    Array.from({ length: 17 }, (_, index) => ({ id: `action-${index}`, tool: "node", argv: [] })),
+  ])
+    assertInvalid({ ...input, bootstrap });
+});
+
 test("keeps filesystem operations independent and preserves deny/immutable precedence data", () => {
   const input = profileInput();
   const filesystem = input.filesystem as Record<string, unknown>;

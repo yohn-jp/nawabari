@@ -41,6 +41,12 @@ export type WorktreeRuntimeToolReference = Readonly<{
   readonly provider: RuntimeExecutableProvider;
 }>;
 
+export type WorktreeBootstrapAction = Readonly<{
+  readonly id: string;
+  readonly tool: string;
+  readonly argv: readonly string[];
+}>;
+
 export type WorktreeRuntimeShellReference = Readonly<{
   /** Must name one of the declared tool entrypoints. */
   readonly entrypoint: string;
@@ -79,6 +85,7 @@ export type WorktreeRuntimeProfile = Readonly<{
   readonly materialSelection: RuntimeProfileSelection;
   readonly filesystem: WorktreeRuntimeFilesystemCeiling;
   readonly tools: readonly WorktreeRuntimeToolReference[];
+  readonly bootstrap?: readonly WorktreeBootstrapAction[];
   readonly shell: WorktreeRuntimeShellReference;
   readonly environment: WorktreeRuntimeEnvironment;
   readonly git: WorktreeRuntimeGitPolicy;
@@ -162,6 +169,46 @@ function entrypoint(value: unknown, field: string): DomainResult<string> {
     return invalid(field, "expected a projected executable entrypoint name");
   }
   return success(value);
+}
+
+function bootstrapActions(
+  value: unknown,
+  declared: readonly WorktreeRuntimeToolReference[],
+): DomainResult<readonly WorktreeBootstrapAction[] | undefined> {
+  if (value === undefined) return success(undefined);
+  if (!Array.isArray(value) || value.length > 16) return invalid("bootstrap", "expected at most 16 actions");
+  const result: WorktreeBootstrapAction[] = [];
+  for (const [index, item] of value.entries()) {
+    const field = `bootstrap[${index}]`;
+    if (!isRecord(item)) return invalid(field, "expected an action object");
+    const keys = assertKeys(item, ["id", "tool", "argv"], field);
+    if (!keys.ok) return keys;
+    const id = stableIdentifier(item.id, `${field}.id`);
+    if (!id.ok || id.value.length > 128) return invalid(`${field}.id`, "expected a bounded stable action id");
+    if (result.some((action) => action.id === id.value)) return ambiguous(`${field}.id`, "duplicate action id");
+    const tool = entrypoint(item.tool, `${field}.tool`);
+    if (!tool.ok) return tool;
+    if (!declared.some((candidate) => candidate.entrypoint === tool.value)) {
+      return invalid(`${field}.tool`, "tool is not declared by the profile");
+    }
+    if (!Array.isArray(item.argv) || item.argv.length > 32) return invalid(`${field}.argv`, "expected bounded argv");
+    const argv: string[] = [];
+    for (const [argumentIndex, argument] of item.argv.entries()) {
+      const text = boundedText(argument, `${field}.argv[${argumentIndex}]`);
+      if (!text.ok) return text;
+      if (
+        /(?:^|=)\//u.test(text.value) ||
+        /(?:^|[=/])\.\.\//u.test(text.value) ||
+        /^[A-Za-z]:[\\/]/u.test(text.value) ||
+        /^(?:-[a-z]*[ce][a-z]*|--(?:command|eval|execute)(?:=.*)?)$/u.test(text.value) ||
+        /[`;$<>]|\$\(|\$\{|&&|\|\||[\r\n]/u.test(text.value)
+      )
+        return invalid(`${field}.argv[${argumentIndex}]`, "host paths and shell snippets are forbidden");
+      argv.push(text.value);
+    }
+    result.push(Object.freeze({ id: id.value, tool: tool.value, argv: Object.freeze(argv) }));
+  }
+  return success(Object.freeze(result));
 }
 
 function selector(value: unknown, field: string): DomainResult<string> {
@@ -457,6 +504,7 @@ export function validateWorktreeRuntimeProfile(input: unknown): DomainResult<Res
       "materialSelection",
       "filesystem",
       "tools",
+      "bootstrap",
       "shell",
       "environment",
       "git",
@@ -482,6 +530,8 @@ export function validateWorktreeRuntimeProfile(input: unknown): DomainResult<Res
   if (!selectedFilesystem.ok) return selectedFilesystem;
   const selectedTools = tools(input.tools);
   if (!selectedTools.ok) return selectedTools;
+  const selectedBootstrap = bootstrapActions(input.bootstrap, selectedTools.value);
+  if (!selectedBootstrap.ok) return selectedBootstrap;
   const selectedShell = shell(input.shell, selectedTools.value);
   if (!selectedShell.ok) return selectedShell;
   const selectedEnvironment = environment(input.environment);
@@ -500,6 +550,7 @@ export function validateWorktreeRuntimeProfile(input: unknown): DomainResult<Res
       materialSelection: selectedMaterial.value,
       filesystem: selectedFilesystem.value,
       tools: selectedTools.value,
+      ...(selectedBootstrap.value === undefined ? {} : { bootstrap: selectedBootstrap.value }),
       shell: selectedShell.value,
       environment: selectedEnvironment.value,
       git: selectedGit.value,
@@ -530,7 +581,18 @@ export const WORKTREE_RUNTIME_PROFILE_DESCRIPTOR: JsonObject = Object.freeze({
   contract_id: WORKTREE_RUNTIME_PROFILE_CONTRACT_ID,
   schema_version: WORKTREE_RUNTIME_PROFILE_SCHEMA_VERSION,
   serialization_key: WORKTREE_RUNTIME_PROFILE_SERIALIZATION_KEY,
-  fields: ["id", "version", "materialSelection", "filesystem", "tools", "shell", "environment", "git", "execution"],
+  fields: [
+    "id",
+    "version",
+    "materialSelection",
+    "filesystem",
+    "tools",
+    "bootstrap",
+    "shell",
+    "environment",
+    "git",
+    "execution",
+  ],
   filesystem_operations: [...WORKTREE_RUNTIME_FILESYSTEM_OPERATIONS],
   filesystem_precedence: ["DENY", "immutable", "operation-specific allow"],
   authorities: {

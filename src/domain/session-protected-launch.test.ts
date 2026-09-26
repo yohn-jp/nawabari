@@ -226,6 +226,33 @@ test("protected launch persists every gate in order and records actual worker ow
   }
 });
 
+test("protected launch admits a new session only for the explicit bootstrap purpose", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-bootstrap-launch-"));
+  try {
+    const { input } = makeInput(root);
+    const pending = { ...input.admission.current, lifecycle: "new" as const };
+    const ordinary = { ...input, admission: { ...input.admission, current: pending, expected: pending } };
+    const events: string[] = [];
+    const denied = await launchProtectedSessionExecution(ordinary, dependencies(events, []));
+    assert.equal(denied.ok, true);
+    if (denied.ok) assert.equal(denied.value.supervisor.started, false);
+    assert.deepEqual(events, []);
+
+    const admitted = await launchProtectedSessionExecution(
+      {
+        ...input,
+        admission: { ...ordinary.admission, purpose: "bootstrap" },
+      },
+      dependencies(events, []),
+    );
+    assert.equal(admitted.ok, true, admitted.ok ? "" : admitted.error.message);
+    if (admitted.ok) assert.equal(admitted.value.supervisor.status, "completed");
+    assert.deepEqual(events, ["starting", "materialize", "compile", "supervisor", "attached", "attached", "exited"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("protected launch propagates caller-selected interactive stdio", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-protected-launch-"));
   try {
