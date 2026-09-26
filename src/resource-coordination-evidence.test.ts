@@ -33,6 +33,192 @@ test("keeps revision and dirty worktree content as separate bounded origins", ()
   }
 });
 
+test("derives regular worktree mode and bytes from one opened descriptor", () => {
+  const fixture = createFixture();
+  const candidate = path.join(fixture.root, "tracked.txt");
+  const originalOpen = fs.openSync;
+  const originalFstat = fs.fstatSync;
+  const originalRead = fs.readSync;
+  const originalClose = fs.closeSync;
+  let openedFd: number | undefined;
+  const statFds: number[] = [];
+  const readFds: number[] = [];
+  const closedFds: number[] = [];
+  try {
+    fs.chmodSync(candidate, 0o644);
+    fs.openSync = ((file, flags, mode) => {
+      const fd = originalOpen(file, flags, mode);
+      if (file === candidate) {
+        openedFd = fd;
+        assert.notEqual((flags as number) & fs.constants.O_NOFOLLOW, 0);
+        assert.notEqual((flags as number) & fs.constants.O_NONBLOCK, 0);
+      }
+      return fd;
+    }) as typeof fs.openSync;
+    fs.fstatSync = ((fd) => {
+      statFds.push(fd);
+      return originalFstat(fd);
+    }) as typeof fs.fstatSync;
+    fs.readSync = ((fd, buffer, offset, length, position) => {
+      readFds.push(fd);
+      return originalRead(fd, buffer, offset, length, position);
+    }) as typeof fs.readSync;
+    fs.closeSync = (fd) => {
+      closedFds.push(fd);
+      originalClose(fd);
+    };
+
+    const blob = readCoordinationBlobState(defaultGit, fixture.root, fixture.head, "tracked.txt", {
+      includeContent: true,
+      operatorAuthorized: true,
+    });
+    assert.equal(blob.worktree.state, "regular");
+    assert.equal(blob.worktree.mode, "100644");
+    assert.equal(Buffer.from(blob.worktree.content?.bytes ?? "", "base64").toString(), "base\n");
+    const closedFd = openedFd;
+    assert.ok(closedFd !== undefined);
+    assert.deepEqual(statFds, [closedFd, closedFd]);
+    assert.deepEqual(readFds, [closedFd]);
+    assert.deepEqual(closedFds, [closedFd]);
+    assert.throws(() => originalFstat(closedFd), { code: "EBADF" });
+  } finally {
+    fs.openSync = originalOpen;
+    fs.fstatSync = originalFstat;
+    fs.readSync = originalRead;
+    fs.closeSync = originalClose;
+    fixture.cleanup();
+  }
+});
+
+test("classifies a symlink introduced before opening without following it", () => {
+  const fixture = createFixture();
+  const candidate = path.join(fixture.root, "tracked.txt");
+  const secret = path.join(fixture.root, "secret.txt");
+  try {
+    fs.writeFileSync(secret, "secret\n");
+    const git: GitCommandRunner = {
+      ...defaultGit,
+      runRaw(args, cwd) {
+        const output = (defaultGit.runRaw ?? defaultGit.run)(args, cwd);
+        if (args[0] === "ls-tree") {
+          fs.rmSync(candidate);
+          fs.symlinkSync(secret, candidate);
+        }
+        return output;
+      },
+    };
+    const blob = readCoordinationBlobState(git, fixture.root, fixture.head, "tracked.txt", {
+      includeContent: true,
+      operatorAuthorized: true,
+    });
+    assert.equal(blob.worktree.state, "symlink");
+    assert.equal(blob.worktree.mode, "120000");
+    assert.equal(blob.worktree.type, "symlink");
+    assert.equal(blob.worktree.content, null);
+    assert.equal(JSON.stringify(blob).includes("secret"), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("keeps missing, denied, directory, special, and too-large dispositions", () => {
+  const fixture = createFixture();
+  const candidate = path.join(fixture.root, "tracked.txt");
+  const originalOpen = fs.openSync;
+  try {
+    fs.rmSync(candidate);
+    assert.equal(readAuthorizedWorktree(fixture, "tracked.txt").state, "missing");
+
+    fs.mkdirSync(candidate);
+    const directory = readAuthorizedWorktree(fixture, "tracked.txt");
+    assert.equal(directory.state, "directory");
+    assert.equal(directory.mode, "040000");
+    fs.rmdirSync(candidate);
+
+    execFileSync("mkfifo", [candidate]);
+    const special = readAuthorizedWorktree(fixture, "tracked.txt");
+    assert.equal(special.state, "special");
+    assert.equal(special.mode, "000000");
+    fs.rmSync(candidate);
+
+    fs.writeFileSync(candidate, "oversized\n");
+    const tooLarge = readCoordinationBlobState(defaultGit, fixture.root, fixture.head, "tracked.txt", {
+      maxContentBytes: 4,
+      includeContent: true,
+      operatorAuthorized: true,
+    }).worktree;
+    assert.equal(tooLarge.state, "too-large");
+    assert.equal(tooLarge.byteLength, 10);
+    assert.equal(tooLarge.content, null);
+
+    fs.openSync = ((file, flags, mode) => {
+      if (file === candidate) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return originalOpen(file, flags, mode);
+    }) as typeof fs.openSync;
+    assert.equal(readAuthorizedWorktree(fixture, "tracked.txt").state, "read-denied");
+  } finally {
+    fs.openSync = originalOpen;
+    fixture.cleanup();
+  }
+});
+
+test("rejects a file changed during descriptor reading as unavailable", () => {
+  const fixture = createFixture();
+  const candidate = path.join(fixture.root, "tracked.txt");
+  const originalRead = fs.readSync;
+  let mutated = false;
+  try {
+    fs.readSync = ((fd, buffer, offset, length, position) => {
+      const count = originalRead(fd, buffer, offset, length, position);
+      if (!mutated) {
+        mutated = true;
+        fs.appendFileSync(candidate, "changed\n");
+      }
+      return count;
+    }) as typeof fs.readSync;
+
+    const blob = readCoordinationBlobState(defaultGit, fixture.root, fixture.head, "tracked.txt", {
+      includeContent: true,
+      operatorAuthorized: true,
+    });
+    assert.equal(mutated, true);
+    assert.equal(blob.worktree.state, "unavailable");
+    assert.equal(blob.worktree.content, null);
+    assert.equal(blob.complete, false);
+  } finally {
+    fs.readSync = originalRead;
+    fixture.cleanup();
+  }
+});
+
+test("closes the descriptor when reading fails", () => {
+  const fixture = createFixture();
+  const originalOpen = fs.openSync;
+  const originalRead = fs.readSync;
+  let openedFd: number | undefined;
+  try {
+    fs.openSync = ((file, flags, mode) => {
+      const fd = originalOpen(file, flags, mode);
+      if (file === path.join(fixture.root, "tracked.txt")) openedFd = fd;
+      return fd;
+    }) as typeof fs.openSync;
+    fs.readSync = (() => {
+      throw Object.assign(new Error("read failed"), { code: "EIO" });
+    }) as typeof fs.readSync;
+
+    const side = readAuthorizedWorktree(fixture, "tracked.txt");
+    assert.equal(side.state, "unavailable");
+    assert.equal(side.content, null);
+    const closedFd = openedFd;
+    assert.ok(closedFd !== undefined);
+    assert.throws(() => fs.fstatSync(closedFd), { code: "EBADF" });
+  } finally {
+    fs.openSync = originalOpen;
+    fs.readSync = originalRead;
+    fixture.cleanup();
+  }
+});
+
 test("distinguishes untracked and missing paths while observing uncommitted changes", () => {
   const fixture = createFixture(true);
   try {
@@ -234,6 +420,13 @@ interface Fixture {
   readonly first: { readonly sessionId: string };
   readonly second: { readonly sessionId: string };
   cleanup(): void;
+}
+
+function readAuthorizedWorktree(fixture: Fixture, resource: string) {
+  return readCoordinationBlobState(defaultGit, fixture.root, fixture.head, resource, {
+    includeContent: true,
+    operatorAuthorized: true,
+  }).worktree;
 }
 
 function createFixture(withLinked = false): Fixture {

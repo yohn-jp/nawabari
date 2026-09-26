@@ -787,34 +787,67 @@ function readRevisionSide(
 
 function readWorktreeSide(worktree: string, resource: string, maxContentBytes: number): CoordinationBlobSide {
   const candidate = path.resolve(worktree, ...resource.split("/"));
-  let stat: fs.Stats;
+  let fd: number;
   try {
-    stat = fs.lstatSync(candidate);
+    fd = fs.openSync(candidate, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch (error: unknown) {
     if (isNodeError(error) && error.code === "ENOENT") return emptySide("worktree-file", "missing");
     if (isNodeError(error) && (error.code === "EACCES" || error.code === "EPERM")) {
       return emptySide("worktree-file", "read-denied");
     }
+    if (isNodeError(error) && error.code === "ELOOP")
+      return emptySide("worktree-file", "symlink", { mode: "120000", type: "symlink" });
     return emptySide("worktree-file", "unavailable");
   }
-  if (stat.isSymbolicLink()) return emptySide("worktree-file", "symlink", { mode: "120000", type: "symlink" });
-  if (stat.isDirectory()) return emptySide("worktree-file", "directory", { mode: "040000", type: "tree" });
-  if (!stat.isFile()) return emptySide("worktree-file", "special", { mode: "000000", type: "special" });
-  const mode = (stat.mode & 0o111) === 0 ? "100644" : "100755";
-  if (stat.size > maxContentBytes) {
-    return Object.freeze({
-      ...emptySide("worktree-file", "too-large", { mode, type: "blob" }),
-      byteLength: stat.size,
-    });
-  }
+  let mode: string | null = null;
+  let side: CoordinationBlobSide;
   try {
-    return contentSide("worktree-file", fs.readFileSync(candidate), mode, "blob", maxContentBytes);
+    const before = fs.fstatSync(fd);
+    if (before.isDirectory()) {
+      side = emptySide("worktree-file", "directory", { mode: "040000", type: "tree" });
+    } else if (!before.isFile()) {
+      side = emptySide("worktree-file", "special", { mode: "000000", type: "special" });
+    } else {
+      mode = (before.mode & 0o111) === 0 ? "100644" : "100755";
+      if (before.size > maxContentBytes) {
+        side = Object.freeze({
+          ...emptySide("worktree-file", "too-large", { mode, type: "blob" }),
+          byteLength: before.size,
+        });
+      } else {
+        const bytes = Buffer.allocUnsafe(before.size);
+        let offset = 0;
+        while (offset < bytes.length) {
+          const count = fs.readSync(fd, bytes, offset, bytes.length - offset, null);
+          if (count === 0) break;
+          offset += count;
+        }
+        const after = fs.fstatSync(fd);
+        side =
+          offset !== bytes.length ||
+          before.dev !== after.dev ||
+          before.ino !== after.ino ||
+          before.mode !== after.mode ||
+          before.size !== after.size ||
+          before.mtimeMs !== after.mtimeMs ||
+          before.ctimeMs !== after.ctimeMs
+            ? emptySide("worktree-file", "unavailable", { mode, type: "blob" })
+            : contentSide("worktree-file", bytes, mode, "blob", maxContentBytes);
+      }
+    }
   } catch (error: unknown) {
     if (isNodeError(error) && (error.code === "EACCES" || error.code === "EPERM")) {
-      return emptySide("worktree-file", "read-denied", { mode, type: "blob" });
+      side = emptySide("worktree-file", "read-denied", mode === null ? undefined : { mode, type: "blob" });
+    } else {
+      side = emptySide("worktree-file", "unavailable", mode === null ? undefined : { mode, type: "blob" });
     }
-    return emptySide("worktree-file", "unavailable", { mode, type: "blob" });
   }
+  try {
+    fs.closeSync(fd);
+  } catch {
+    return emptySide("worktree-file", "unavailable", mode === null ? undefined : { mode, type: "blob" });
+  }
+  return side;
 }
 
 function contentSide(
