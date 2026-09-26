@@ -312,6 +312,10 @@ export async function launchManagedSessionCommand(
     supervisor: SessionLaunchSupervisorResult;
     execution: SessionExecutionRecord;
     effective_revision: number;
+    request_identity: Pick<
+      SandboxExecutionRequest,
+      "session_id" | "repository" | "worktree" | "branch" | "network_mode"
+    >;
     result?: SandboxExecutionResult;
   }> | null>
 > {
@@ -565,7 +569,17 @@ export async function launchManagedSessionCommand(
     const cleaned = cleanupSessionRuntimeDirectories(compiled.value.manifest);
     if (!cleaned.ok) return cleaned;
   }
-  return success({ ...launched.value, effective_revision: live.registry_revision });
+  return success({
+    ...launched.value,
+    effective_revision: live.registry_revision,
+    request_identity: {
+      session_id: protectedRequest.session_id,
+      repository: protectedRequest.repository,
+      worktree: protectedRequest.worktree,
+      branch: protectedRequest.branch,
+      network_mode: protectedRequest.network_mode,
+    },
+  });
 }
 
 function cgroupObservationRecord(record: SessionExecutionRecord): Parameters<typeof observeOwnedExecution>[0] {

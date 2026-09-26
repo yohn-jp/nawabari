@@ -1658,6 +1658,7 @@ async function executeProtectedSessionCommand(
       ok: true,
       value: {
         ...(managed.value.result as unknown as JsonObject),
+        ...managed.value.request_identity,
         execution: managed.value.execution as unknown as JsonObject,
         supervisor: managed.value.supervisor as unknown as JsonObject,
       },
@@ -1697,6 +1698,11 @@ async function executeProtectedSessionCommand(
     ok: true,
     value: {
       ...(result.value as unknown as JsonObject),
+      session_id: request.value.session_id,
+      repository: request.value.repository,
+      worktree: request.value.worktree,
+      branch: request.value.branch,
+      network_mode: request.value.network_mode,
       ...(result.value.runtime_resolution === undefined && request.value.runtime_resolution === undefined
         ? {}
         : { runtime_resolution: result.value.runtime_resolution ?? request.value.runtime_resolution }),
