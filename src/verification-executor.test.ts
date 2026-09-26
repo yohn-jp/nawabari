@@ -8,6 +8,7 @@ import {
   validateVerificationProfile,
 } from "./verification-executor.js";
 import { success, type DomainResult } from "./domain/errors.js";
+import { createFilesystemPolicyToken } from "./domain/filesystem-policy-revision.js";
 import type { SandboxExecutionRequest } from "./domain/sandbox.js";
 import type { SandboxExecutionResult } from "./domain/sandbox-launcher.js";
 
@@ -62,6 +63,19 @@ const request = {
   worktree: "/repo/worktree",
   runtime_projection: runtimeProjection,
 } as unknown as SandboxExecutionRequest;
+
+function policyToken(registryRevision: number) {
+  const result = createFilesystemPolicyToken({
+    registry_revision: registryRevision,
+    session_runtime_epoch: 4,
+    claim_set_generation: 2,
+    working_set_revision: 1,
+    profile_digest: "b".repeat(64),
+    session_id: "019123e4-7abc-7def-8123-456789abcdef",
+  });
+  if (!result.ok) throw result.error;
+  return result.value;
+}
 
 test("verification profile is versioned, fixed-argv, and default-deny", () => {
   const parsed = validateVerificationProfile(profile);
@@ -150,4 +164,22 @@ test("verification requires protected execution and rejects worktree escape", as
     },
   });
   assert.equal(escaped.ok, false);
+});
+
+test("stale verification policy tokens fail before protected execution", async () => {
+  let executed = false;
+  const result = await executeVerification(
+    profile,
+    request,
+    {
+      execute: async () => {
+        executed = true;
+        throw new Error("must not execute");
+      },
+    },
+    { policy_token: policyToken(1), expected_policy_token: policyToken(2) },
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "STALE_REGISTRY");
+  assert.equal(executed, false);
 });

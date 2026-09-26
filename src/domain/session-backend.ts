@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { executeBootstrapAction, runBootstrapActions } from "./session-bootstrap.js";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -62,6 +63,9 @@ import {
   type SessionListResult,
   type SessionListOptions,
   type SessionRecord,
+  type FileOperationOptions,
+  type FileOperationRecordsResult,
+  type FileOperationResult,
   type SessionStatusRecord,
   type IntegrationProof as DomainIntegrationProof,
   boundedSessionListing,
@@ -221,6 +225,13 @@ const REGISTRY_ERROR_CODE_MAP: Readonly<Record<RegistryErrorCode, ErrorCode>> = 
   RESOURCE_CLAIM_CONFLICT: "RESOURCE_CLAIM_CONFLICT",
   CLAIM_NOT_FOUND: "CLAIM_NOT_FOUND",
   SESSION_NOT_ACTIVE: "SESSION_NOT_ACTIVE",
+  FILE_OPERATION_INVALID: "FILE_OPERATION_INVALID",
+  FILE_OPERATION_ID_CONFLICT: "FILE_OPERATION_ID_CONFLICT",
+  FILE_OPERATION_INVALID_TRANSITION: "FILE_OPERATION_INVALID_TRANSITION",
+  FILE_OPERATION_LIMIT: "FILE_OPERATION_LIMIT",
+  FILE_OPERATION_AUTHORITY_DENIED: "FILE_OPERATION_AUTHORITY_DENIED",
+  FILE_OPERATION_UNSUPPORTED_SCHEMA: "FILE_OPERATION_UNSUPPORTED_SCHEMA",
+  FILE_OPERATION_CORRUPT: "FILE_OPERATION_CORRUPT",
   UNSUPPORTED_CLAIM_SCHEMA_VERSION: "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
   INVALID_COMMIT_MESSAGE: "INVALID_COMMIT_MESSAGE",
   COMMIT_EMPTY_DIFF: "COMMIT_EMPTY_DIFF",
@@ -420,7 +431,51 @@ export class LocalSessionBackend implements SessionBackend {
           : { workingSetRepository: options.working_set_repository }),
         ...(options.profile === null || options.profile === undefined ? {} : { profile: options.profile }),
       });
-      return success(toDomainRecord(record));
+      const session = toDomainRecord(record);
+      if (record.state !== "new") return success(session);
+      const pinned = registry.getSessionManagedRuntime(record.sessionId).profile;
+      if (pinned === null || !("path" in pinned.provenance.catalog) || !pinned.resolved.bootstrap?.length) {
+        return failure(
+          new DomainError("REGISTRY_CORRUPT", "Pending bootstrap authority is missing", {
+            session_id: record.sessionId,
+          }),
+        );
+      }
+      const bootstrapped = await runBootstrapActions(
+        pinned.resolved.bootstrap,
+        async (action) => {
+          const executionId = `bootstrap:${record.sessionId}:${action.id}`;
+          return executeBootstrapAction(context, this, session, action, {
+            verify: () => toDomainRecord(registry.verifyBootstrapSession(record.sessionId)),
+            persist: (execution) =>
+              execution.execution_id === executionId && execution.state === "starting"
+                ? Promise.resolve().then(() =>
+                    success(registry.persistBootstrapExecution(record.sessionId, action.id, execution)),
+                  )
+                : this.persistSessionExecution(context, execution),
+          });
+        },
+        record.sessionId,
+      );
+      if (!bootstrapped.ok) return bootstrapped;
+      try {
+        return success(
+          toDomainRecord(
+            registry.activateBootstrapSession(
+              record.sessionId,
+              pinned.resolved.bootstrap.map((action) => action.id),
+            ),
+          ),
+        );
+      } catch (error: unknown) {
+        return failure(
+          new DomainError("REGISTRY_DURABILITY_UNCERTAIN", "Bootstrap readiness could not be confirmed", {
+            session_id: record.sessionId,
+            action_id: pinned.resolved.bootstrap.at(-1)?.id ?? "unknown",
+            cause: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+          }),
+        );
+      }
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -443,6 +498,63 @@ export class LocalSessionBackend implements SessionBackend {
         );
       }
       return success(toDomainRecord(record));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async fileOperation(
+    context: SessionContext,
+    options: FileOperationOptions,
+  ): Promise<DomainResult<FileOperationResult>> {
+    try {
+      const registry = this.registryFor(context);
+      const sessionId = options.operation.session_id;
+      let admission: ReturnType<SessionRegistry["getSessionLaunchAdmission"]>;
+      try {
+        admission = registry.getSessionLaunchAdmission(sessionId);
+      } catch {
+        // The registry rejects the operation with its canonical error below.
+        admission = undefined;
+      }
+      if (admission === undefined) {
+        return success(registry.executeFileOperation(options.operation, options.execution_options));
+      }
+      const drained = await releaseSessionClaimsWithRuntimeDrain(
+        runtimeLifecycleAdapter(
+          registry,
+          ({ fence }) =>
+            registryMutation(() => registry.executeFileOperation(options.operation, options.execution_options, fence)),
+          this.registryOptions.cgroupFilesystem,
+        ),
+        sessionId,
+        registry.runtimeEpoch,
+      );
+      if (!drained.ok) return drained;
+      if (drained.value.status !== "completed" || drained.value.value === undefined) {
+        return failure(
+          new DomainError("OPERATION_REJECTED", "Managed file operation is blocked until owned executions drain.", {
+            session_id: sessionId,
+            status: drained.value.status,
+          }),
+        );
+      }
+      return drained.value.value;
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async fileOperations(
+    context: SessionContext,
+    sessionId?: string | null,
+  ): Promise<DomainResult<FileOperationRecordsResult>> {
+    try {
+      return success(
+        this.registryFor(context)
+          .fileOperations(sessionId)
+          .map((record) => ({ ...record })),
+      );
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }

@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { decideExecutionAdmission, type ExecutionAdmissionFacts } from "./session-admission-decision.js";
+import {
+  decideExecutionAdmission,
+  validateExecutionAdmissionReservation,
+  type ExecutionAdmissionFacts,
+} from "./session-admission-decision.js";
 
 const snapshot = {
   lifecycle: "active" as const,
@@ -43,6 +47,23 @@ test("admission compares lifecycle, profile/filesystem identity, generation, and
     generation: 11,
     epoch: 19,
   });
+});
+
+test("bootstrap admission is explicit, bound to new, and ordinary admission stays active-only", () => {
+  const pending = { ...snapshot, lifecycle: "new" as const };
+  const ordinary = decideExecutionAdmission({ ...facts(), current: pending, expected: pending });
+  assert.equal(ordinary.ok, true);
+  if (ordinary.ok) assert.equal(ordinary.value.admitted, false);
+
+  const admitted = decideExecutionAdmission({ ...facts(), purpose: "bootstrap", current: pending, expected: pending });
+  assert.equal(admitted.ok, true);
+  if (!admitted.ok || !admitted.value.admitted) return;
+  assert.equal(admitted.value.reservation.purpose, "bootstrap");
+  assert.equal(validateExecutionAdmissionReservation(admitted.value.reservation).ok, true);
+
+  const active = decideExecutionAdmission({ ...facts(), purpose: "bootstrap" });
+  assert.equal(active.ok, true);
+  if (active.ok) assert.equal(active.value.admitted, false);
 });
 
 for (const [name, override, reason] of [

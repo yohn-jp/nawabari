@@ -28,6 +28,13 @@ import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from
 import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
 import type { SessionHookMaterial } from "./session-git-hooks.js";
 import type { SessionRuntimeEnvironmentIdentity } from "./session-environment.js";
+import type { FileOperationRecord } from "../registry/file-operation-record.js";
+import type { EffectiveFilesystemPolicyInputs } from "./filesystem-policy.js";
+import type {
+  WorktreeFileOperation,
+  WorktreeFileOperationExecutionOptions,
+  WorktreeFileOperationResult,
+} from "./worktree-file-operation.js";
 
 export type { OperationName } from "../operation-authorization.js";
 
@@ -80,6 +87,19 @@ export type WorktreeProfileSessionCreateOptions = {
   parameters?: JsonObject;
   provenance?: { catalog?: { path?: string; blob_oid?: string } };
 };
+
+export type FileOperationExecutionOptions = WorktreeFileOperationExecutionOptions & {
+  readonly policy?: EffectiveFilesystemPolicyInputs | (() => EffectiveFilesystemPolicyInputs);
+};
+
+export type FileOperationOptions = {
+  readonly operation: WorktreeFileOperation;
+  readonly execution_options?: FileOperationExecutionOptions;
+};
+
+export type FileOperationResult = WorktreeFileOperationResult;
+
+export type FileOperationRecordsResult = FileOperationRecord[];
 
 export type SessionCreateOptions = {
   branch: string | null;
@@ -908,6 +928,11 @@ export interface SessionBackend {
   createSession(context: SessionContext, options: SessionCreateOptions): Promise<DomainResult<SessionRecord>>;
   resolveCurrentSession(context: SessionContext): Promise<DomainResult<SessionRecord>>;
   getSession(context: SessionContext, sessionId: string): Promise<DomainResult<SessionRecord>>;
+  fileOperation?(context: SessionContext, options: FileOperationOptions): Promise<DomainResult<FileOperationResult>>;
+  fileOperations?(
+    context: SessionContext,
+    sessionId?: string | null,
+  ): Promise<DomainResult<FileOperationRecordsResult>>;
   expandWorkingSet?(
     context: SessionContext,
     options: WorkingSetExpansionOptions,

@@ -33,6 +33,11 @@ import { SESSION_EXECUTION_RECORD_CONTRACT_ID } from "./domain/session-execution
 import { SESSION_PROCESS_OBSERVATION_CONTRACT_ID } from "./domain/session-process-observation.js";
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
 import {
+  WORKTREE_FILE_OPERATION_CLI_COMMANDS,
+  WORKTREE_FILE_OPERATION_CLI_CONTRACT_ID,
+  WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+} from "./worktree-file-operation-cli.js";
+import {
   DISCARD_PREVIEW_SCHEMA_VERSION,
   REGISTRY_FEATURES,
   REGISTRY_SCHEMA_VERSION,
@@ -187,6 +192,29 @@ const SESSION_CONSOLE_CAPABILITY = Object.freeze({
   failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-console"],
   failure_code_policy: {
     source: "implementation-owned session-console vocabulary",
+    missing_or_extra: "deterministic conformance failure",
+    internal_exceptions: [],
+  },
+});
+
+const FILE_OPERATION_CAPABILITY = Object.freeze({
+  id: "file-operation",
+  contract_id: WORKTREE_FILE_OPERATION_CLI_CONTRACT_ID,
+  schema_version: WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+  commands: [...WORKTREE_FILE_OPERATION_CLI_COMMANDS],
+  result_schema: "nawabari.worktree-file-operation-cli.v1",
+  result_schema_version: WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+  result_schemas: [
+    {
+      schema: "nawabari.worktree-file-operation-cli.v1",
+      version: WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+      commands: [...WORKTREE_FILE_OPERATION_CLI_COMMANDS],
+    },
+  ],
+  identities: ["operation_id", "operation", "state", "previous_generation", "next_generation", "identity"],
+  failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["file-operation"],
+  failure_code_policy: {
+    source: "implementation-owned file-operation vocabulary",
     missing_or_extra: "deterministic conformance failure",
     internal_exceptions: [],
   },
@@ -395,6 +423,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
   },
   PROTECTED_EXECUTION_CAPABILITY,
   SESSION_CONSOLE_CAPABILITY,
+  FILE_OPERATION_CAPABILITY,
   {
     id: "session-lifecycle",
     commands: ["session create", "session id", "session show", "session list", "status", "session close"],
@@ -1006,6 +1035,12 @@ export function machineContract(packageVersion: string): JsonObject {
             contract_id: capability.contract_id,
             schema_version: capability.schema_version,
             producer_contract_ids: jsonClone(capability.producer_contract_ids),
+          }
+        : {}),
+      ...(capability.id === "file-operation"
+        ? {
+            contract_id: capability.contract_id,
+            schema_version: capability.schema_version,
           }
         : {}),
       ...(capability.id === "auxiliary-state-projection"

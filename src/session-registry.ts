@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -111,6 +112,25 @@ import {
   type ResourceHandoffSnapshot,
 } from "./resource-handoff.js";
 import {
+  FILE_OPERATION_REQUIRED_FEATURE,
+  createFileOperationRegistryState,
+  fileOperationRequestDigest,
+  parseFileOperationRegistry,
+  reconcileFileOperationReceiptAuthority,
+  reconcileFileOperationReceipt,
+  recordFileOperationApplyAttempt,
+  reserveFileOperation,
+  serializeFileOperationRegistry,
+  type FileIdentity,
+  type FileOperationObservation,
+  type FileOperationPathFact,
+  type FileOperationPathObservation,
+  type FileOperationRecord,
+  type FileOperationRegistryState,
+  type FileOperationRequest,
+  type PersistedFileOperationRecord,
+} from "./registry/file-operation-record.js";
+import {
   assertCanonicalClaimResource,
   canonicalClaimId,
   canonicalizeClaimInput,
@@ -200,6 +220,26 @@ import {
   observeOwnedExecution,
   type SessionExecutionRecord as OwnedExecutionRecord,
 } from "./domain/session-process-observation.js";
+import {
+  compileEffectiveFilesystemPolicy,
+  decideEffectivePathAccess,
+  type EffectiveFilesystemPolicy,
+  type EffectiveFilesystemPolicyInputs,
+} from "./domain/filesystem-policy.js";
+import {
+  createFilesystemPolicyToken,
+  serializeFilesystemPolicyToken,
+  validateFilesystemPolicyToken,
+  type FilesystemPolicyToken,
+} from "./domain/filesystem-policy-revision.js";
+import {
+  executeWorktreeFileOperation,
+  prepareWorktreeFileOperation,
+  WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES,
+  type WorktreeFileOperation,
+  type WorktreeFileOperationExecutionOptions,
+  type WorktreeFileOperationResult,
+} from "./domain/worktree-file-operation.js";
 import {
   classifySessionLifecycle,
   lifecycleTransition,
@@ -892,6 +932,11 @@ export interface GuardDecision {
   readonly details: RegistryErrorDetails;
 }
 
+export interface FileOperationExecutionOptions extends WorktreeFileOperationExecutionOptions {
+  /** Current policy facts supplied by the accepted filesystem-authority path. */
+  readonly policy?: EffectiveFilesystemPolicyInputs | (() => EffectiveFilesystemPolicyInputs);
+}
+
 export type {
   CheckpointEvidence,
   CheckpointOptions,
@@ -1154,7 +1199,7 @@ export interface PersistedRegistryV2 {
   readonly executions?: readonly RuntimeRecord[];
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
-  readonly file_operations?: readonly RuntimeRecord[];
+  readonly file_operations?: readonly PersistedFileOperationRecord[];
 }
 
 export type PersistedRegistry = PersistedRegistryV1 | PersistedRegistryV2;
@@ -1364,6 +1409,126 @@ export class SessionRegistry {
     });
   }
 
+  /** Return durable F10 file-operation receipts, optionally scoped by session. */
+  fileOperations(sessionId?: string | null): readonly FileOperationRecord[] {
+    if (sessionId !== undefined && sessionId !== null) assertSessionId(sessionId);
+    const state = this.readStateUnsafe();
+    const receipts = fileOperationStateFromRuntimeRecords(state.runtimeRecords).fileOperations;
+    return receipts
+      .filter((record) => sessionId === undefined || sessionId === null || record.sessionId === sessionId)
+      .map(cloneFileOperationRecord);
+  }
+
+  /** Reserve, fence, execute, and reconcile one typed worktree file operation. */
+  executeFileOperation(
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions = { landlock_helper: null, runtime_projection: null },
+    finalization?: SessionDrainFinalization,
+  ): WorktreeFileOperationResult {
+    const reservation = this.withLock(() => {
+      // A managed session requires a ready drain finalization whose closed
+      // admission and proven-empty owned scopes are re-read under the lock.
+      this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, operation.session_id, "release-claims");
+      return this.reserveFileOperationUnsafe(operation, executionOptions);
+    });
+    try {
+      return this.executeReservedFileOperation(operation, executionOptions, reservation);
+    } finally {
+      if (finalization !== undefined) this.reopenFileOperationAdmission(finalization);
+    }
+  }
+
+  private executeReservedFileOperation(
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
+    reservation: FileOperationReservationContext,
+  ): WorktreeFileOperationResult {
+    if (reservation.replay) {
+      if (reservation.record.stage === "completed") return replayedFileOperationResult(reservation.record);
+      throw uncertainFileOperation(operation.operation_id, "The durable receipt requires reconciliation.");
+    }
+
+    let currentBeforeIo: FileOperationAuthorityContext;
+    try {
+      currentBeforeIo = this.fileOperationAuthority(operation, executionOptions);
+    } catch (error: unknown) {
+      this.finalizeFileOperationUnresolved(operation.operation_id);
+      throw uncertainFileOperation(
+        operation.operation_id,
+        error instanceof Error ? error.message : "Current file-operation authority could not be rebuilt.",
+      );
+    }
+    const beforeIoFence = validateFilesystemPolicyToken(reservation.token, currentBeforeIo.token);
+    if (!beforeIoFence.ok) {
+      this.finalizeFileOperationUnresolved(operation.operation_id);
+      throw uncertainFileOperation(operation.operation_id, "The file-operation authority changed before physical I/O.");
+    }
+
+    let prepared: ReturnType<typeof prepareWorktreeFileOperation>;
+    try {
+      prepared = prepareWorktreeFileOperation(reservation.operation);
+    } catch (error: unknown) {
+      this.finalizeFileOperationUnresolved(operation.operation_id);
+      throw uncertainFileOperation(
+        operation.operation_id,
+        error instanceof Error ? error.message : "The file operation could not be prepared.",
+      );
+    }
+    if (!prepared.ok) {
+      this.finalizeFileOperationUnresolved(operation.operation_id);
+      throw uncertainFileOperation(operation.operation_id, prepared.error.message);
+    }
+
+    let physical: ReturnType<typeof executeWorktreeFileOperation>;
+    try {
+      physical = executeWorktreeFileOperation(prepared.value, executionOptions);
+    } catch (error: unknown) {
+      this.finalizeFileOperation(
+        operation.operation_id,
+        reservation.token,
+        reservation.operation,
+        executionOptions,
+        observeFileOperationWithoutResult(reservation.record, prepared.value.request),
+      );
+      throw uncertainFileOperation(
+        operation.operation_id,
+        error instanceof Error ? error.message : "The physical file operation failed.",
+      );
+    }
+    if (!physical.ok) {
+      this.finalizeFileOperation(
+        operation.operation_id,
+        reservation.token,
+        reservation.operation,
+        executionOptions,
+        observeFileOperationWithoutResult(reservation.record, prepared.value.request),
+      );
+      throw uncertainFileOperation(operation.operation_id, physical.error.message);
+    }
+
+    const observation = observeFileOperationEffect(reservation.record, physical.value, prepared.value.request);
+    try {
+      const currentAfterIo = this.fileOperationAuthority(operation, executionOptions);
+      validateFilesystemPolicyToken(reservation.token, currentAfterIo.token);
+    } catch {
+      // The final locked authority read is the completion decision.
+    }
+    const reconciled = this.finalizeFileOperation(
+      operation.operation_id,
+      reservation.token,
+      reservation.operation,
+      executionOptions,
+      observation,
+    );
+    if (reconciled.disposition !== "completed") {
+      throw uncertainFileOperation(
+        operation.operation_id,
+        "The file-operation result could not be durably reconciled.",
+      );
+    }
+    return physical.value;
+  }
+
   /** Return the single authoritative claim set, optionally scoped to a session. */
   listClaims(sessionId?: string | null): readonly ResourceClaim[] {
     const claims = this.readStateUnsafe().claims;
@@ -1504,6 +1669,13 @@ export class SessionRegistry {
 
   /** Persist a new execution reservation, advancing only registry_revision. */
   persistSessionExecution(record: PersistedSessionExecutionRecord): PersistedSessionExecutionRecord {
+    return this.persistExecutionRecord(record);
+  }
+
+  private persistExecutionRecord(
+    record: PersistedSessionExecutionRecord,
+    bootstrapSessionId?: string,
+  ): PersistedSessionExecutionRecord {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       const parsed = parseSessionExecutionRecord(record);
@@ -1517,7 +1689,7 @@ export class SessionRegistry {
       if (session === undefined) {
         throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${parsed.value.session_id}`);
       }
-      if (session.state !== "active") {
+      if (session.state !== "active" && !(session.state === "new" && bootstrapSessionId === session.sessionId)) {
         throw new SessionRegistryError("OPERATION_REJECTED", "Execution reservation requires an active session", {
           sessionId: parsed.value.session_id,
           state: session.state,
@@ -1546,6 +1718,12 @@ export class SessionRegistry {
         return current.ok && current.value.execution_id === parsed.value.execution_id;
       });
       if (existing !== undefined) {
+        if (bootstrapSessionId !== undefined) {
+          throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap action was already attempted", {
+            sessionId: bootstrapSessionId,
+            executionId: parsed.value.execution_id,
+          });
+        }
         const current = parseSessionExecutionRecord(existing);
         if (
           current.ok &&
@@ -2337,7 +2515,12 @@ export class SessionRegistry {
         worktreePath: resources.worktreePath,
         branchId: resources.branchId,
         branchName: resources.branchName,
-        state: "active",
+        state:
+          pinnedProfile !== undefined &&
+          "path" in pinnedProfile.provenance.catalog &&
+          (pinnedProfile.resolved.bootstrap?.length ?? 0) > 0
+            ? "new"
+            : "active",
         createdAt: timestamp,
         updatedAt: timestamp,
         baseRevision: resources.baseRevision,
@@ -2640,6 +2823,109 @@ export class SessionRegistry {
     } catch {
       return false;
     }
+  }
+
+  /** Inspect pending bootstrap ownership without granting normal session operations. */
+  verifyBootstrapSession(sessionId: string): SessionRecord {
+    assertSessionId(sessionId);
+    const record = this.readUnsafe().find((candidate) => candidate.sessionId === sessionId);
+    if (record?.state !== "new") {
+      throw new SessionRegistryError("SESSION_NOT_ACTIVE", "Bootstrap requires an owned pending session", {
+        sessionId,
+      });
+    }
+    const pin = this.getSessionManagedRuntime(sessionId).profile;
+    if (pin === null || !("path" in pin.provenance.catalog) || !pin.resolved.bootstrap?.length) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap requires repository profile actions", {
+        sessionId,
+      });
+    }
+    const physical = verifyPhysicalExecutionContext({
+      repository: this.repository,
+      worktreePath: record.worktreePath,
+      branchName: record.branchName,
+      git: this.git,
+    });
+    if (physical.worktreeId !== record.worktreeId || physical.branchId !== record.branchId) {
+      throw new SessionRegistryError("OWNERSHIP_MISMATCH", "Bootstrap worktree ownership changed", { sessionId });
+    }
+    return cloneSessionRecord(record);
+  }
+
+  /** Only the bootstrap integration may reserve an action; its identity is durable before launch. */
+  persistBootstrapExecution(
+    sessionId: string,
+    actionId: string,
+    record: PersistedSessionExecutionRecord,
+  ): PersistedSessionExecutionRecord {
+    this.verifyBootstrapSession(sessionId);
+    const pin = this.getSessionManagedRuntime(sessionId).profile;
+    if (
+      !pin?.resolved.bootstrap?.some((action) => action.id === actionId) ||
+      record.session_id !== sessionId ||
+      record.execution_id !== `bootstrap:${sessionId}:${actionId}`
+    ) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap action identity is not pinned", {
+        sessionId,
+        actionId,
+      });
+    }
+    return this.persistExecutionRecord(record, sessionId);
+  }
+
+  /** Final readiness commit; never called after rejected or uncertain action execution. */
+  activateBootstrapSession(sessionId: string, completedActionIds: readonly string[]): SessionRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const index = state.sessions.findIndex((candidate) => candidate.sessionId === sessionId);
+      const record = state.sessions[index];
+      if (record?.state !== "new") {
+        throw new SessionRegistryError("SESSION_NOT_ACTIVE", "Bootstrap session is no longer pending", { sessionId });
+      }
+      const pin = this.getSessionManagedRuntime(sessionId).profile;
+      if (pin === null || !("path" in pin.provenance.catalog) || !pin.resolved.bootstrap?.length) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap profile authority is missing", { sessionId });
+      }
+      if (
+        JSON.stringify(completedActionIds) !== JSON.stringify(pin.resolved.bootstrap.map((action) => action.id)) ||
+        !completedActionIds.every((id) =>
+          state.runtimeRecords.records.executions?.some((item) => {
+            const parsed = parseSessionExecutionRecord(item);
+            return (
+              parsed.ok &&
+              parsed.value.session_id === sessionId &&
+              parsed.value.execution_id === `bootstrap:${sessionId}:${id}` &&
+              parsed.value.state === "exited"
+            );
+          }),
+        )
+      ) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap actions have not completed", { sessionId });
+      }
+      const physical = verifyPhysicalExecutionContext({
+        repository: this.repository,
+        worktreePath: record.worktreePath,
+        branchName: record.branchName,
+        git: this.git,
+      });
+      if (physical.worktreeId !== record.worktreeId || physical.branchId !== record.branchId) {
+        throw new SessionRegistryError("OWNERSHIP_MISMATCH", "Bootstrap ownership changed before readiness", {
+          sessionId,
+        });
+      }
+      const updated = transitionSessionState(record, "active", this.clock);
+      const sessions = [...state.sessions];
+      sessions[index] = updated;
+      this.writeUnsafe(
+        sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        state.runtimeRecords,
+      );
+      return cloneSessionRecord(updated);
+    });
   }
 
   provisionSession(options: ProvisionSessionOptions = {}): SessionRecord {
@@ -6893,6 +7179,147 @@ export class SessionRegistry {
     }
   }
 
+  private reserveFileOperationUnsafe(
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
+  ): FileOperationReservationContext {
+    const state = this.readStateUnsafe();
+    return reserveFileOperationUnsafe(this, state, operation, executionOptions, (runtimeRecords, revision) => {
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        revision,
+        state.runtimeEpoch,
+        runtimeRecords,
+      );
+    });
+  }
+
+  private finalizeFileOperationUnresolved(operationId: string): void {
+    this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
+      const record = fileOperations.fileOperations.find((candidate) => candidate.operationId === operationId);
+      if (record === undefined) {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", "File-operation receipt disappeared during reconciliation", {
+          operationId,
+        });
+      }
+      const reconciliation = reconcileFileOperationReceipt(record, {
+        authorityToken: record.authorityToken,
+        fenceEpoch: record.fenceEpoch,
+        source: null,
+        destination: null,
+        effectObserved: false,
+        executionCompleted: false,
+      });
+      if (reconciliation.record === record) return;
+      const index = fileOperations.fileOperations.findIndex((candidate) => candidate.operationId === operationId);
+      fileOperations.fileOperations[index] = reconciliation.record;
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        runtimeRecordsWithFileOperations(state.runtimeRecords, fileOperations),
+      );
+    });
+  }
+
+  private finalizeFileOperation(
+    operationId: string,
+    token: FilesystemPolicyToken,
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
+    observation: FileOperationObservation,
+  ): ReturnType<typeof reconcileFileOperationReceiptAuthority> {
+    let finalPolicyInput: CollectedFileOperationPolicyInput | undefined;
+    try {
+      finalPolicyInput = { value: resolveFileOperationPolicyInput(executionOptions) };
+    } catch {
+      // An unavailable external policy observation is unresolved below.
+    }
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
+      const record = fileOperations.fileOperations.find((candidate) => candidate.operationId === operationId);
+      if (record === undefined) {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", "File-operation receipt disappeared during reconciliation", {
+          operationId,
+        });
+      }
+      let authorityCurrent = false;
+      if (finalPolicyInput !== undefined) {
+        try {
+          const current = currentFileOperationAuthority(this, state, operation, executionOptions, finalPolicyInput);
+          authorityCurrent = validateFilesystemPolicyToken(token, current.token).ok;
+        } catch {
+          authorityCurrent = false;
+        }
+      }
+      const reconciliation = reconcileFileOperationReceiptAuthority(record, observation, authorityCurrent);
+      if (reconciliation.record === record) return reconciliation;
+      const replacementIndex = fileOperations.fileOperations.findIndex(
+        (candidate) => candidate.operationId === reconciliation.record.operationId,
+      );
+      fileOperations.fileOperations[replacementIndex] = reconciliation.record;
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        runtimeRecordsWithFileOperations(state.runtimeRecords, fileOperations),
+      );
+      return reconciliation;
+    });
+  }
+
+  /**
+   * Reopen launch admission after the fenced file operation finished its final
+   * reconciliation. Any concurrent admission change leaves the session closed.
+   */
+  private reopenFileOperationAdmission(finalization: SessionDrainFinalization): void {
+    try {
+      this.withLock(() => {
+        const state = this.readStateUnsafe();
+        const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+          (candidate) => candidate.session_id === finalization.session_id,
+        );
+        if (admissionValue === undefined) return;
+        const admission = parseSessionAdmissionRecord(admissionValue);
+        const session = state.sessions.find((candidate) => candidate.sessionId === finalization.session_id);
+        if (
+          admission.admission !== "closed" ||
+          admission.runtime_epoch !== finalization.admission_epoch ||
+          session?.state !== "active"
+        ) {
+          return;
+        }
+        const runtimeEpoch = nextRuntimeEpoch(state);
+        this.writeUnsafe(
+          state.sessions,
+          state.claims,
+          state.claimSetGeneration,
+          nextRegistryRevision(state),
+          runtimeEpoch,
+          withSessionAdmission(state.runtimeRecords, { ...admission, admission: "open", runtime_epoch: runtimeEpoch }),
+        );
+      });
+    } catch {
+      // The file-operation receipt is authoritative; admission stays closed.
+    }
+  }
+
+  private fileOperationAuthority(
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
+  ): FileOperationAuthorityContext {
+    return currentFileOperationAuthority(this, this.readStateUnsafe(), operation, executionOptions);
+  }
+
   private mutate<T>(
     mutation: (records: readonly SessionRecord[]) => MutationResult<T>,
     advanceRuntimeEpoch = false,
@@ -6946,6 +7373,519 @@ export class SessionRegistry {
     }
     return result;
   }
+}
+
+interface FileOperationReservationContext {
+  readonly record: FileOperationRecord;
+  readonly token: FilesystemPolicyToken;
+  readonly operation: WorktreeFileOperation;
+  readonly replay: boolean;
+}
+
+interface FileOperationAuthorityContext {
+  readonly policy: EffectiveFilesystemPolicy;
+  readonly token: FilesystemPolicyToken;
+}
+
+interface CollectedFileOperationPolicyInput {
+  readonly value: EffectiveFilesystemPolicyInputs;
+}
+
+function fileOperationStateFromRuntimeRecords(runtimeRecords: ParsedRuntimeRecords): FileOperationRegistryState {
+  const persisted = runtimeRecords.records.file_operations;
+  if (persisted === undefined) return createFileOperationRegistryState();
+  try {
+    return parseFileOperationRegistry({ schema_version: 1, file_operations: persisted });
+  } catch (error: unknown) {
+    throw fileOperationRegistryError(error);
+  }
+}
+
+function runtimeRecordsWithFileOperations(
+  runtimeRecords: ParsedRuntimeRecords,
+  fileOperations: FileOperationRegistryState,
+): ParsedRuntimeRecords {
+  const serialized = serializeFileOperationRegistry(fileOperations).file_operations;
+  const requiredFeatures = runtimeRecords.requiredFeatures.includes(FILE_OPERATION_REQUIRED_FEATURE)
+    ? runtimeRecords.requiredFeatures
+    : [...runtimeRecords.requiredFeatures, FILE_OPERATION_REQUIRED_FEATURE];
+  return Object.freeze({
+    requiredFeatures: Object.freeze([...requiredFeatures]),
+    records: Object.freeze({ ...runtimeRecords.records, file_operations: Object.freeze([...serialized]) }),
+  });
+}
+
+function fileOperationRegistryError(error: unknown): SessionRegistryError {
+  if (error instanceof SessionRegistryError) return error;
+  const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+  const fileOperationCodes = new Set([
+    "FILE_OPERATION_INVALID",
+    "FILE_OPERATION_ID_CONFLICT",
+    "FILE_OPERATION_INVALID_TRANSITION",
+    "FILE_OPERATION_LIMIT",
+    "FILE_OPERATION_AUTHORITY_DENIED",
+    "FILE_OPERATION_UNSUPPORTED_SCHEMA",
+    "FILE_OPERATION_CORRUPT",
+  ]);
+  const registryCode: RegistryErrorCode = fileOperationCodes.has(String(code))
+    ? (String(code) as RegistryErrorCode)
+    : code === "FILE_OPERATION_UNSUPPORTED_SCHEMA"
+      ? "UNSUPPORTED_SCHEMA_VERSION"
+      : "REGISTRY_CORRUPT";
+  const details =
+    typeof error === "object" && error !== null && "details" in error && isRecordValue(error.details)
+      ? (error.details as RegistryErrorDetails)
+      : {};
+  return new SessionRegistryError(
+    registryCode,
+    error instanceof Error ? error.message : "File-operation registry state is invalid",
+    details,
+    error,
+  );
+}
+
+function cloneFileOperationRecord(record: FileOperationRecord): FileOperationRecord {
+  return JSON.parse(JSON.stringify(record)) as FileOperationRecord;
+}
+
+function reserveFileOperationUnsafe(
+  registry: SessionRegistry,
+  state: RegistryState,
+  operation: WorktreeFileOperation,
+  executionOptions: FileOperationExecutionOptions,
+  persist: (runtimeRecords: ParsedRuntimeRecords, registryRevision: number) => void,
+): FileOperationReservationContext {
+  const session = state.sessions.find((candidate) => candidate.sessionId === operation.session_id);
+  if (session === undefined) {
+    throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${operation.session_id}`, {
+      sessionId: operation.session_id,
+    });
+  }
+  if (session.state !== "active") {
+    throw new SessionRegistryError(
+      "SESSION_NOT_ACTIVE",
+      `Session cannot execute a file operation while ${session.state}`,
+      {
+        sessionId: operation.session_id,
+      },
+    );
+  }
+  if (operation.requested_generation !== state.claimSetGeneration) {
+    throw new SessionRegistryError("STALE_CLAIM_SET", "File-operation requested_generation is stale", {
+      requestedGeneration: operation.requested_generation,
+      claimSetGeneration: state.claimSetGeneration,
+    });
+  }
+
+  const authority = currentFileOperationAuthority(registry, state, operation, executionOptions);
+  const currentPolicy = authority.policy;
+  const rebuilt = rebuildFileOperation(registry, state, session, operation, currentPolicy);
+  const postReservationRevision = nextRegistryRevision(state);
+  const tokenResult = createFilesystemPolicyToken({
+    registry_revision: postReservationRevision,
+    session_runtime_epoch: state.runtimeEpoch,
+    claim_set_generation: state.claimSetGeneration,
+    working_set_revision: currentPolicy.provenance.working_set_revision,
+    profile_digest: effectiveFilesystemProfileBoundaryDigest(currentPolicy),
+    session_id: operation.session_id,
+  });
+  if (!tokenResult.ok) throw sessionRegistryOperationError(tokenResult.error.message, tokenResult.error.details);
+  const token = tokenResult.value;
+  const authorityToken = fileOperationAuthorityToken(token);
+  let request = fileOperationRequest(rebuilt, authorityToken);
+  const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
+  const existing = fileOperations.fileOperations.find((candidate) => candidate.operationId === request.operationId);
+  if (existing !== undefined) {
+    const existingRequest = fileOperationRequest(rebuilt, existing.authorityToken);
+    if (fileOperationRequestDigest(existingRequest) !== existing.requestDigest) {
+      throw new SessionRegistryError("FILE_OPERATION_ID_CONFLICT", "operation_id is already bound to another request", {
+        operationId: request.operationId,
+      });
+    }
+    request = existingRequest;
+    if (existing.stage !== "prepared") return { record: existing, token, operation: rebuilt, replay: true };
+  }
+  let record: FileOperationRecord;
+  try {
+    record = reserveFileOperation(fileOperations, request, new Date().toISOString());
+  } catch (error: unknown) {
+    throw fileOperationRegistryError(error);
+  }
+  let applied: FileOperationRecord;
+  try {
+    applied = recordFileOperationApplyAttempt(
+      fileOperations,
+      request.operationId,
+      request.authorityToken,
+      new Date().toISOString(),
+    );
+  } catch (error: unknown) {
+    throw fileOperationRegistryError(error);
+  }
+  const nextRuntimeRecords = runtimeRecordsWithFileOperations(state.runtimeRecords, fileOperations);
+  persist(nextRuntimeRecords, postReservationRevision);
+  return { record: applied, token, operation: rebuilt, replay: false };
+}
+
+function currentFileOperationAuthority(
+  registry: SessionRegistry,
+  state: RegistryState,
+  operation: WorktreeFileOperation,
+  executionOptions: FileOperationExecutionOptions,
+  policyInput?: CollectedFileOperationPolicyInput,
+): FileOperationAuthorityContext {
+  const session = state.sessions.find((candidate) => candidate.sessionId === operation.session_id);
+  if (session === undefined) {
+    throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${operation.session_id}`, {
+      sessionId: operation.session_id,
+    });
+  }
+  const policy = compileFileOperationPolicy(registry, state, session, operation, executionOptions, policyInput);
+  const decision = decideEffectivePathAccess({
+    policy,
+    operation: effectiveOperation(operation),
+    path: operation.path,
+    ...(operation.to_path === undefined ? {} : { destination: operation.to_path }),
+  });
+  if (decision.status !== "allow") {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "The file operation is outside the current filesystem policy",
+      {
+        operationId: operation.operation_id,
+        status: decision.status,
+        reason: decision.reason,
+      },
+    );
+  }
+  const workingSetRevision = policy.provenance.working_set_revision;
+  if (!Number.isSafeInteger(workingSetRevision) || (workingSetRevision as number) < 1) {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "Current filesystem policy has no positive working-set revision",
+      {
+        operationId: operation.operation_id,
+        field: "policy.provenance.working_set_revision",
+      },
+    );
+  }
+  const tokenResult = createFilesystemPolicyToken({
+    registry_revision: state.registryRevision,
+    session_runtime_epoch: state.runtimeEpoch,
+    claim_set_generation: state.claimSetGeneration,
+    working_set_revision: workingSetRevision as number,
+    profile_digest: effectiveFilesystemProfileBoundaryDigest(policy),
+    session_id: operation.session_id,
+  });
+  if (!tokenResult.ok) throw sessionRegistryOperationError(tokenResult.error.message, tokenResult.error.details);
+  return { policy, token: tokenResult.value };
+}
+
+function compileFileOperationPolicy(
+  registry: SessionRegistry,
+  state: RegistryState,
+  session: SessionRecord,
+  _operation: WorktreeFileOperation,
+  executionOptions: FileOperationExecutionOptions,
+  policyInput?: CollectedFileOperationPolicyInput,
+): EffectiveFilesystemPolicy {
+  const supplied = policyInput === undefined ? resolveFileOperationPolicyInput(executionOptions) : policyInput.value;
+  const suppliedWorkingSet = supplied.working_set ?? supplied.workingSet;
+  const workingSet = suppliedWorkingSet ?? session.workingSet;
+  const workingSetRecord = isRecordValue(workingSet) ? workingSet : undefined;
+  const repository =
+    workingSetRecord?.repository ??
+    supplied.repository ??
+    ({ repositoryHost: "local", repositoryId: registry.repository.repositoryId } as const);
+  const base =
+    workingSetRecord?.base ??
+    supplied.base ??
+    (session.baseRevision === undefined ? undefined : { branch: session.branchName, revision: session.baseRevision });
+  const result = compileEffectiveFilesystemPolicy({
+    ...supplied,
+    ...(workingSet === undefined ? { working_set: undefined } : { working_set: workingSet }),
+    claims: state.claims.filter((claim) => claim.sessionId === session.sessionId),
+    claim_set_generation: state.claimSetGeneration,
+    runtime_epoch: state.runtimeEpoch,
+    repository,
+    ...(base === undefined ? {} : { base }),
+    worktree_path: session.worktreePath,
+  });
+  if (!result.ok) throw sessionRegistryOperationError(result.error.message, result.error.details);
+  return result.value;
+}
+
+function resolveFileOperationPolicyInput(
+  executionOptions: FileOperationExecutionOptions,
+): EffectiveFilesystemPolicyInputs {
+  const supplied =
+    typeof executionOptions.policy === "function" ? executionOptions.policy() : (executionOptions.policy ?? {});
+  if (!isRecordValue(supplied)) {
+    throw new SessionRegistryError("OPERATION_REJECTED", "Filesystem policy input must be an object");
+  }
+  return supplied as EffectiveFilesystemPolicyInputs;
+}
+
+function rebuildFileOperation(
+  _registry: SessionRegistry,
+  state: RegistryState,
+  session: SessionRecord,
+  operation: WorktreeFileOperation,
+  policy: EffectiveFilesystemPolicy,
+): WorktreeFileOperation {
+  const claims = state.claims
+    .filter((claim) => claim.sessionId === session.sessionId)
+    .map((claim) => ({ resource: claim.resource, mode: claim.mode }));
+  return {
+    ...operation,
+    worktree_root: session.worktreePath,
+    scope: {
+      create:
+        operation.operation === "DELETE"
+          ? []
+          : [operation.operation === "RENAME" ? (operation.to_path ?? operation.path) : operation.path],
+      delete: operation.operation === "CREATE" ? [] : [operation.path],
+      deny: [],
+    },
+    claims,
+  };
+}
+
+function fileOperationRequest(operation: WorktreeFileOperation, authorityToken: string): FileOperationRequest {
+  const expectedIdentity: FileIdentity | null =
+    operation.expected_identity ?? (operation.expected_digest === null ? null : { digest: operation.expected_digest });
+  const payloadDigest =
+    operation.operation === "CREATE" && operation.payload_ref !== undefined
+      ? createHash("sha256").update(Buffer.from(operation.payload_ref.data, "base64")).digest("hex")
+      : null;
+  return {
+    operationId: operation.operation_id,
+    sessionId: operation.session_id,
+    operation: operation.operation.toLowerCase() as "create" | "delete" | "rename",
+    source: operation.operation === "CREATE" ? null : operation.path,
+    destination:
+      operation.operation === "CREATE"
+        ? operation.path
+        : operation.operation === "RENAME"
+          ? (operation.to_path ?? null)
+          : null,
+    expectedIdentity,
+    payloadDigest,
+    authorityToken,
+    fenceEpoch: operation.requested_generation,
+  };
+}
+
+function effectiveOperation(operation: WorktreeFileOperation): "CREATE" | "DELETE" | "RENAME" {
+  return operation.operation;
+}
+
+function effectiveFilesystemProfileBoundaryDigest(policy: EffectiveFilesystemPolicy): string {
+  const boundary = {
+    status: policy.profile.status,
+    identity: policy.profile.identity,
+    digest: policy.profile.digest,
+    revision: policy.profile.revision,
+    epoch: policy.profile.epoch,
+    scope: policy.profile.scope,
+  };
+  return createHash("sha256").update(stableCanonicalJson(boundary), "utf8").digest("hex");
+}
+
+function stableCanonicalJson(value: unknown): string {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value))
+      throw new SessionRegistryError("OPERATION_REJECTED", "Filesystem policy contains non-finite data");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(stableCanonicalJson).join(",")}]`;
+  if (isRecordValue(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableCanonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  throw new SessionRegistryError("OPERATION_REJECTED", "Filesystem policy contains non-JSON data");
+}
+
+function fileOperationAuthorityToken(token: FilesystemPolicyToken): string {
+  const serialized = serializeFilesystemPolicyToken(token);
+  if (!serialized.ok) throw sessionRegistryOperationError(serialized.error.message, serialized.error.details);
+  return `filesystem-policy:${createHash("sha256").update(serialized.value, "utf8").digest("hex")}`;
+}
+
+function observeFileOperationEffect(
+  record: FileOperationRecord,
+  result: WorktreeFileOperationResult,
+  operation: WorktreeFileOperation,
+): FileOperationObservation {
+  return observeFileOperationObservation(record, operation, result.identity as unknown as FileIdentity, true);
+}
+
+function observeFileOperationWithoutResult(
+  record: FileOperationRecord,
+  operation: WorktreeFileOperation,
+): FileOperationObservation {
+  try {
+    const destinationPath =
+      operation.operation === "DELETE"
+        ? null
+        : operation.operation === "RENAME"
+          ? (operation.to_path ?? operation.path)
+          : operation.path;
+    const destinationAfter =
+      destinationPath === null ? null : observeFilePath(operation.worktree_root, destinationPath);
+    return observeFileOperationObservation(
+      record,
+      operation,
+      destinationAfter?.identity === undefined ? undefined : destinationAfter.identity,
+      false,
+    );
+  } catch {
+    return unresolvedObservation(record);
+  }
+}
+
+function observeFileOperationObservation(
+  record: FileOperationRecord,
+  operation: WorktreeFileOperation,
+  resultIdentity: FileIdentity | undefined,
+  executionCompleted: boolean,
+): FileOperationObservation {
+  try {
+    const sourceAfter =
+      operation.operation === "CREATE" ? null : observeFilePath(operation.worktree_root, operation.path);
+    const destinationAfter =
+      operation.operation === "DELETE"
+        ? null
+        : observeFilePath(
+            operation.worktree_root,
+            operation.operation === "RENAME" ? (operation.to_path ?? operation.path) : operation.path,
+          );
+    const expected = record.expectedIdentity;
+    const source: FileOperationPathObservation | null =
+      operation.operation === "CREATE"
+        ? null
+        : {
+            before: { present: true, ...(expected === null ? {} : { identity: expected }) },
+            present: sourceAfter?.present ?? false,
+            ...(sourceAfter?.identity === undefined ? {} : { identity: sourceAfter.identity }),
+            ...(sourceAfter?.payloadDigest === undefined ? {} : { payloadDigest: sourceAfter.payloadDigest }),
+          };
+    const destination: FileOperationPathObservation | null =
+      operation.operation === "DELETE"
+        ? null
+        : {
+            ...(operation.operation === "RENAME" ? { before: { present: false } } : { before: { present: false } }),
+            present: destinationAfter?.present ?? false,
+            ...(destinationAfter?.payloadDigest === undefined ? {} : { payloadDigest: destinationAfter.payloadDigest }),
+            ...(destinationAfter?.present && resultIdentity !== undefined ? { identity: resultIdentity } : {}),
+          };
+    return {
+      operationId: record.operationId,
+      authorityToken: record.authorityToken,
+      fenceEpoch: record.fenceEpoch,
+      source,
+      destination,
+      effectObserved: true,
+      executionCompleted,
+    };
+  } catch (error: unknown) {
+    return unresolvedObservation(record);
+  }
+}
+
+function observeFilePath(root: string, relative: string): FileOperationPathFact {
+  const target = path.join(root, relative);
+  let descriptor: number;
+  try {
+    descriptor = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  } catch (error: unknown) {
+    if (isNodeError(error) && error.code === "ENOENT") return { present: false };
+    throw error;
+  }
+  try {
+    const stats = fs.fstatSync(descriptor, { bigint: true });
+    if (!stats.isFile() || stats.nlink !== 1n) return { present: true };
+    if (stats.size > BigInt(WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES))
+      throw new Error("File observation exceeds bound");
+    const contents = Buffer.alloc(Number(stats.size));
+    let offset = 0;
+    while (offset < contents.length) {
+      const count = fs.readSync(descriptor, contents, offset, contents.length - offset, offset);
+      if (count === 0) throw new Error("File changed during observation");
+      offset += count;
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      after.dev !== stats.dev ||
+      after.ino !== stats.ino ||
+      after.size !== stats.size ||
+      after.mtimeNs !== stats.mtimeNs ||
+      after.ctimeNs !== stats.ctimeNs ||
+      after.nlink !== stats.nlink
+    )
+      throw new Error("File changed during observation");
+    const digest = createHash("sha256").update(contents).digest("hex");
+    return {
+      present: true,
+      identity: { dev: String(stats.dev), ino: String(stats.ino), size: Number(stats.size), digest },
+      payloadDigest: digest,
+    };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function unresolvedObservation(
+  record: FileOperationRecord,
+  observed?: FileOperationObservation,
+): FileOperationObservation {
+  return {
+    operationId: record.operationId,
+    authorityToken: record.authorityToken,
+    fenceEpoch: record.fenceEpoch,
+    source: observed?.source ?? null,
+    destination: observed?.destination ?? null,
+    effectObserved: observed?.effectObserved === true,
+    executionCompleted: false,
+  };
+}
+
+function replayedFileOperationResult(record: FileOperationRecord): WorktreeFileOperationResult {
+  return {
+    contract_id: "nawabari.worktree-file-operation.v1",
+    schema_version: 1,
+    operation_id: record.operationId,
+    operation: record.operation.toUpperCase() as WorktreeFileOperationResult["operation"],
+    state: "applied",
+  } as WorktreeFileOperationResult;
+}
+
+function uncertainFileOperation(operationId: string, reason: string): SessionRegistryError {
+  return new SessionRegistryError(
+    "OPERATION_REJECTED",
+    "The file operation state is uncertain; reconciliation is required.",
+    {
+      operation_id: operationId,
+      operation_code: "FILE_OPERATION_STATE_UNCERTAIN",
+      state_uncertain: true,
+      reason,
+    },
+  );
+}
+
+function sessionRegistryOperationError(message: string, details: unknown): SessionRegistryError {
+  return new SessionRegistryError(
+    "OPERATION_REJECTED",
+    message,
+    isRecordValue(details) ? (details as RegistryErrorDetails) : {},
+  );
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 interface CreationResources {
