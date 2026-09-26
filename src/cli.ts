@@ -43,6 +43,21 @@ import { isResourceClaimMode } from "./resource-claims.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { defaultCliIO, renderFailure, renderSuccess, type CliIO, type CliMode } from "./presentation.js";
+import {
+  repositoryScreenModelFromRuntimeSnapshot,
+  runRepositoryTerminal,
+  type RepositoryTerminalInput,
+  type RepositoryTerminalOutput,
+} from "./ui/repository-terminal.js";
+import type { RepositoryScreenModel } from "./ui/repository-screen.js";
+import type {
+  SessionActionConfirmation,
+  SessionActionId,
+  SessionActionIdentity,
+  SessionActionToken,
+} from "./ui/session-actions.js";
+import { parseSessionDiscardPreview } from "./ui/session-actions.js";
+import type { SessionDiscardPreview } from "./domain/session.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
 import {
   resolveSandboxExecutionRequest,
@@ -282,6 +297,14 @@ export type CliDependencies = {
   backend?: SessionBackend;
   cwd?: string;
   io?: CliIO;
+  repositoryTerminal?: {
+    readonly stdin: RepositoryTerminalInput;
+    readonly stdout: RepositoryTerminalOutput;
+    readonly stderr?: RepositoryTerminalOutput;
+    readonly viewport?: import("./ui/repository-screen.js").RepositoryScreenViewport;
+    readonly isTTY?: boolean;
+    readonly signal?: AbortSignal;
+  };
   version?: string;
   sandboxRunner?: (
     request: import("./domain/sandbox.js").SandboxExecutionRequest,
@@ -348,6 +371,11 @@ type ParsedOptions = {
   schema_version: SessionDiagnosticSchemaVersion | null;
   summary: boolean;
   unresolved: boolean;
+  action_id: string | null;
+  action_token: SessionActionToken | null;
+  action_preview: SessionDiscardPreview | null;
+  operation_id: string | null;
+  confirm: boolean;
 };
 
 function usageError(
@@ -412,6 +440,66 @@ function optionParts(argument: string): { name: string; inlineValue: string | nu
   return { name: argument.slice(0, separator), inlineValue: argument.slice(separator + 1) };
 }
 
+const MAX_CLI_JSON_BYTES = 1024 * 1024;
+const MAX_CLI_JSON_DEPTH = 32;
+const MAX_CLI_JSON_TEXT_CODE_POINTS = 4_096;
+
+function boundedJsonInput(value: string, option: string): DomainResult<unknown> {
+  if (new TextEncoder().encode(value).byteLength > MAX_CLI_JSON_BYTES) {
+    return failure(usageError("INVALID_ARGUMENT", `${option} exceeds the 1 MiB JSON input limit.`, { option }));
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch (error: unknown) {
+    return failure(
+      usageError("INVALID_ARGUMENT", `${option} requires valid JSON.`, {
+        option,
+        reason: error instanceof Error ? error.message : "invalid JSON",
+      }),
+    );
+  }
+
+  const validate = (candidate: unknown, depth: number, field: string): DomainResult<null> => {
+    if (depth > MAX_CLI_JSON_DEPTH) {
+      return failure(
+        usageError("INVALID_ARGUMENT", `${option} exceeds the maximum JSON depth of 32.`, { option, field }),
+      );
+    }
+    if (typeof candidate === "string") {
+      if ([...candidate].length > MAX_CLI_JSON_TEXT_CODE_POINTS || /\p{Cc}|\p{Cf}/u.test(candidate)) {
+        return failure(
+          usageError("INVALID_ARGUMENT", `${option} contains an oversized or control-corrupted text field.`, {
+            option,
+            field,
+          }),
+        );
+      }
+      return { ok: true, value: null };
+    }
+    if (candidate === null || typeof candidate === "boolean" || typeof candidate === "number")
+      return { ok: true, value: null };
+    if (Array.isArray(candidate)) {
+      for (const [index, child] of candidate.entries()) {
+        const checked = validate(child, depth + 1, `${field}[${index}]`);
+        if (!checked.ok) return checked;
+      }
+      return { ok: true, value: null };
+    }
+    if (typeof candidate === "object") {
+      for (const [key, child] of Object.entries(candidate)) {
+        const checkedKey = validate(key, depth + 1, `${field}.${key}`);
+        if (!checkedKey.ok) return checkedKey;
+        const checked = validate(child, depth + 1, `${field}.${key}`);
+        if (!checked.ok) return checked;
+      }
+    }
+    return { ok: true, value: null };
+  };
+  const checked = validate(parsed, 0, option);
+  return checked.ok ? { ok: true, value: parsed } : checked;
+}
+
 function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): DomainResult<ParsedOptions> {
   const options: ParsedOptions = {
     session_id: null,
@@ -460,6 +548,11 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     schema_version: null,
     summary: false,
     unresolved: false,
+    action_id: null,
+    action_token: null,
+    action_preview: null,
+    operation_id: null,
+    confirm: false,
   };
   let dryRun = false;
 
@@ -478,9 +571,10 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       name === "--all" ||
       name === "--history" ||
       name === "--patch" ||
-      name === "--preview" ||
+      (name === "--preview" && !allowed.has("--token")) ||
       name === "--summary" ||
-      name === "--unresolved"
+      name === "--unresolved" ||
+      name === "--confirm"
     ) {
       if (inlineValue !== null) {
         return failure(usageError("INVALID_ARGUMENT", `${name} does not accept a value.`, { option: name }));
@@ -495,7 +589,8 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       else if (name === "--patch") options.patch = true;
       else if (name === "--preview") options.preview = true;
       else if (name === "--summary") options.summary = true;
-      else options.unresolved = true;
+      else if (name === "--unresolved") options.unresolved = true;
+      else options.confirm = true;
       continue;
     }
 
@@ -506,7 +601,18 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     if (inlineValue === null) index += 1;
 
     if (name === "--session") options.session_id = value;
-    else if (name === "--runtime-policy") {
+    else if (name === "--action") options.action_id = value;
+    else if (name === "--operation-id") options.operation_id = value;
+    else if (name === "--token" || (name === "--preview" && allowed.has("--token"))) {
+      const parsed = boundedJsonInput(value, name);
+      if (!parsed.ok) return parsed;
+      if (name === "--token") options.action_token = parsed.value as SessionActionToken;
+      else {
+        const preview = parseSessionDiscardPreview(parsed.value);
+        if (!preview.ok) return preview;
+        options.action_preview = preview.value;
+      }
+    } else if (name === "--runtime-policy") {
       if (options.runtime_policy !== null) {
         return failure(usageError("INVALID_ARGUMENT", "--runtime-policy may be supplied only once.", { option: name }));
       }
@@ -1601,10 +1707,121 @@ async function executeProtectedSessionCommand(
 async function executeCommand(
   commandArguments: string[],
   dependencies: Required<Pick<CliDependencies, "backend" | "cwd">> &
-    Pick<CliDependencies, "sandboxRunner" | "sandboxProbe" | "sandboxRuntimeLayout" | "sandboxRuntimeProjection">,
+    Pick<
+      CliDependencies,
+      | "sandboxRunner"
+      | "sandboxProbe"
+      | "sandboxRuntimeLayout"
+      | "sandboxRuntimeProjection"
+      | "repositoryTerminal"
+      | "io"
+    > & { readonly json: boolean },
 ): Promise<DomainResult<JsonObject>> {
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
+
+  if (command === "ui") {
+    const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
+    if (!parsed.ok) return parsed;
+    if (dependencies.backend.repositoryRuntimeSnapshot === undefined) {
+      return failure(
+        new DomainError("BACKEND_UNAVAILABLE", "Repository runtime snapshot capability is not available.", {
+          operation: "repository.ui",
+        }),
+      );
+    }
+    const callbackOutput = (writer: (line: string) => void): RepositoryTerminalOutput =>
+      ({
+        isTTY: false,
+        write(value: string): boolean {
+          writer(value);
+          return true;
+        },
+      }) as unknown as RepositoryTerminalOutput;
+    const terminal =
+      dependencies.repositoryTerminal ??
+      ({
+        stdin: process.stdin as unknown as RepositoryTerminalInput,
+        stdout:
+          dependencies.io === undefined
+            ? (process.stdout as unknown as RepositoryTerminalOutput)
+            : callbackOutput(dependencies.io.stdout),
+        stderr:
+          dependencies.io === undefined
+            ? (process.stderr as unknown as RepositoryTerminalOutput)
+            : callbackOutput(dependencies.io.stderr),
+      } as const);
+    const terminalResult = await runRepositoryTerminal({
+      ...terminal,
+      json: dependencies.json,
+      ...(dependencies.backend.sessionActions === undefined
+        ? {}
+        : { sessionActions: dependencies.backend.sessionActions(context) }),
+      readSnapshot: async () => {
+        const model = await repositoryRuntimeUiModel({ backend: dependencies.backend, cwd: dependencies.cwd });
+        if (!model.ok) throw model.error;
+        return model.value;
+      },
+    });
+    return { ok: true, value: terminalResult as unknown as JsonObject };
+  }
+
+  if (command === "session" && subcommand === "action") {
+    const parsed = parseOptions(rest, dispatcherAllowedOptions("session action"));
+    if (!parsed.ok) return parsed;
+    if (parsed.value.session_id === null || parsed.value.action_id === null || parsed.value.action_token === null) {
+      return failure(
+        usageError("MISSING_ARGUMENT", "session action requires --session, --action, and --token.", {
+          required: ["--session", "--action", "--token"],
+        }),
+      );
+    }
+    const actionIds: readonly SessionActionId[] = [
+      "retain-session",
+      "supply-exact-integrated-revision",
+      "retry-close-with-bounded-integration-fetch",
+      "discard-session",
+      "reconcile-physical-state",
+    ];
+    if (!actionIds.includes(parsed.value.action_id as SessionActionId)) {
+      return failure(
+        usageError("INVALID_ARGUMENT", "session action received an unknown typed action ID.", {
+          action_id: parsed.value.action_id,
+          values: [...actionIds],
+        }),
+      );
+    }
+    if (dependencies.backend.sessionActions === undefined) {
+      return failure(
+        new DomainError("BACKEND_UNAVAILABLE", "Typed session action capability is not available.", {
+          operation: "session.action",
+        }),
+      );
+    }
+    const session = await dependencies.backend.getSession(context, parsed.value.session_id);
+    if (!session.ok) return session;
+    const identity: SessionActionIdentity = {
+      session_id: session.value.session_id,
+      repository: session.value.repository,
+      worktree: session.value.worktree,
+    };
+    const confirmation: SessionActionConfirmation = parsed.value.confirm
+      ? {
+          confirmed: true,
+          ...(parsed.value.operation_id === null ? {} : { operation_id: parsed.value.operation_id }),
+          ...(parsed.value.action_preview === null ? {} : { preview: parsed.value.action_preview }),
+        }
+      : { confirmed: false };
+    const result = await dependencies.backend
+      .sessionActions(context)
+      .dispatchSessionAction(
+        parsed.value.action_id as SessionActionId,
+        identity,
+        parsed.value.action_token,
+        confirmation,
+      );
+    return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
+  }
 
   if (command === "profile") {
     const parsed = parseWorktreeProfileCliArguments(
@@ -2643,6 +2860,9 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     const result = await executeCommand(parsed.value.commandArguments, {
       backend,
       cwd,
+      io,
+      json: mode === "json",
+      repositoryTerminal: dependencies.repositoryTerminal,
       sandboxRunner: dependencies.sandboxRunner,
       sandboxProbe: dependencies.sandboxProbe,
       sandboxRuntimeLayout: runtimeLayout,
@@ -2655,7 +2875,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     const childExitCode = result.value.exit_code;
     const childSignal = result.value.signal;
     const interactive = command === "session shell";
-    if (!interactive) io.stdout(renderSuccess(mode, command, result.value));
+    if (!interactive && command !== "ui") io.stdout(renderSuccess(mode, command, result.value));
     if (
       (command === "session run" || command === "session exec" || interactive) &&
       (childSignal !== null || (typeof childExitCode === "number" && childExitCode !== 0))
@@ -2669,4 +2889,19 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   } catch {
     return emitFailure(mode, command, new DomainError("INTERNAL_ERROR", "An unexpected internal error occurred."), io);
   }
+}
+
+/** Read the canonical repository projection for CLI/TUI callers. */
+export async function repositoryRuntimeUiModel(
+  dependencies: Required<Pick<CliDependencies, "backend" | "cwd">>,
+): Promise<DomainResult<RepositoryScreenModel>> {
+  if (dependencies.backend.repositoryRuntimeSnapshot === undefined) {
+    return failure(
+      new DomainError("BACKEND_UNAVAILABLE", "Repository runtime snapshot capability is not available.", {
+        operation: "repository.ui",
+      }),
+    );
+  }
+  const snapshot = await dependencies.backend.repositoryRuntimeSnapshot(sessionContext(dependencies.cwd));
+  return snapshot.ok ? repositoryScreenModelFromRuntimeSnapshot(snapshot.value) : snapshot;
 }

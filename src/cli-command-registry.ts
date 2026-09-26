@@ -313,6 +313,44 @@ const REGISTRY_DATA = [
     ],
   },
   {
+    name: "session action",
+    summary: "Dispatch one typed, currently authorized lifecycle action",
+    usage: `${CLI_NAME} session action --session <id> --action <action-id> --token <json> [--confirm --preview <json>] [--operation-id <id>]`,
+    options: [
+      option("--session", "Explicit session identity; never inferred", { value: "<id>", required: true }),
+      option("--action", "Typed action ID from the current diagnostic next_actions", {
+        value: "<action-id>",
+        required: true,
+        values: [
+          "retain-session",
+          "supply-exact-integrated-revision",
+          "retry-close-with-bounded-integration-fetch",
+          "discard-session",
+          "reconcile-physical-state",
+        ],
+      }),
+      option("--token", "JSON action token returned by the current UI snapshot", { value: "<json>", required: true }),
+      option("--confirm", "Explicit intent for actions that require confirmation"),
+      option("--preview", "JSON authoritative destructive preview reviewed by the caller", { value: "<json>" }),
+      option("--operation-id", "Stable caller operation key for retry coalescing", { value: "<id>" }),
+    ],
+    notes: [
+      "The dispatcher re-reads canonical lifecycle and claim evidence immediately before dispatch; stale tokens fail closed.",
+      "The action command field is descriptive metadata only and is never executed as a shell command.",
+      "Destructive discard requires --confirm and the matching authoritative --preview.",
+    ],
+  },
+  {
+    name: "ui",
+    summary: "Open the read-only repository runtime UI",
+    usage: `${CLI_NAME} ui`,
+    options: [],
+    notes: [
+      "The UI reads one canonical repository runtime snapshot at startup and on refresh; it never mutates registry, Git, or filesystem state.",
+      "Non-interactive callers receive one bounded projection and may combine this command with --json.",
+    ],
+  },
+  {
     name: "session coordination preview",
     summary: "Preview bounded coordination between two sessions",
     usage:
