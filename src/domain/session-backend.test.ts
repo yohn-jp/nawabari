@@ -17,8 +17,51 @@ import {
 } from "./session-execution-record.js";
 import type { SandboxProbe } from "./sandbox.js";
 import { LocalSessionBackend } from "./session-backend.js";
+import { DomainError, failure } from "./errors.js";
 import { resolveBuiltinWorktreeProfile } from "./worktree-profile-builtins.js";
 import type { SessionHookMaterialAuthority } from "../session-registry.js";
+
+test("failed protected bootstrap keeps durable ownership pending and normal guard denied", async () => {
+  const repositoryPath = createRepository();
+  const profile = installBoundedManagedProfile(repositoryPath, [
+    { id: "initialize", tool: "git", argv: ["--version"] },
+  ]);
+  const worktreePath = `${repositoryPath}-pending-bootstrap`;
+  try {
+    class RejectedBootstrapBackend extends LocalSessionBackend {
+      override getManagedCgroupRoot() {
+        return failure(new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "No protected execution root"));
+      }
+    }
+    const backend = new RejectedBootstrapBackend({ managedExecutionReadiness: () => ({ ready: true }) });
+    const result = await backend.createSession(
+      { cwd: repositoryPath },
+      {
+        branch: "feature/pending-bootstrap",
+        worktree: worktreePath,
+        label: null,
+        base: null,
+        ...boundedReadinessArtifacts(repositoryPath),
+        profile: { selection: { profile } },
+      },
+    );
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.error.details?.session_id !== undefined, true);
+    assert.equal(result.error.details?.action_id, "initialize");
+    const sessionId = result.error.details?.session_id as string;
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    assert.equal(registry.get(sessionId)?.state, "new");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(registry.getSessionManagedRuntime(sessionId).profile?.resolved.bootstrap?.[0]?.id, "initialize");
+    assert.equal(registry.getSessionLaunchAdmission(sessionId)?.admission, "open");
+    assert.equal(registry.guard({ sessionId }).allowed, false);
+    assert.throws(() => registry.activateBootstrapSession(sessionId, ["initialize"]));
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
 
 test("local session backend passes the same explicit hook material authority to every registry", () => {
   const repositoryPath = createRepository();
@@ -1227,7 +1270,10 @@ function createRepository(): string {
   return repositoryPath;
 }
 
-function installBoundedManagedProfile(repositoryPath: string): string {
+function installBoundedManagedProfile(
+  repositoryPath: string,
+  bootstrap?: readonly { id: string; tool: string; argv: readonly string[] }[],
+): string {
   const builtin = resolveBuiltinWorktreeProfile({ profile: "minimal" });
   if (!builtin.ok) throw builtin.error;
   const profileId = "repository:managed-readiness-test";
@@ -1240,6 +1286,7 @@ function installBoundedManagedProfile(repositoryPath: string): string {
             ...builtin.value,
             id: "managed-readiness-test",
             extends: [],
+            ...(bootstrap === undefined ? {} : { bootstrap }),
             filesystem: {
               ...builtin.value.filesystem,
               readOnly: ["README.md"],
