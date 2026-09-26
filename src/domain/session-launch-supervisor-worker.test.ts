@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -212,6 +213,25 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
     t.skip(`supported cgroups v2 capability unavailable (${root.error.message})`);
     return;
   }
+  const probe = createCgroupScope(
+    { session_id: "descendant-conformance-probe", execution_id: randomUUID() },
+    { root: root.value },
+  );
+  if (!probe.ok) {
+    const reason = probe.error.details?.reason;
+    if (
+      probe.error.code === "SANDBOX_CAPABILITY_UNAVAILABLE" ||
+      (probe.error.code === "SANDBOX_CGROUP_SETUP_FAILED" &&
+        typeof reason === "string" &&
+        /\b(?:EACCES|EPERM|EROFS)\b/u.test(reason))
+    ) {
+      t.skip(`cgroups v2 scope creation unavailable (${probe.error.message})`);
+      return;
+    }
+    throw probe.error;
+  }
+  const cleaned = cleanupCgroupScope(probe.value);
+  assert.equal(cleaned.ok, true, cleaned.ok ? "" : cleaned.error.message);
   const { supervisor: supervisorEntrypoint } = await ensureFreshCompiledPackage();
   const compiledSupervisor = (await import(pathToFileURL(supervisorEntrypoint).href)) as CompiledSupervisorModule;
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-451-descendant-"));
