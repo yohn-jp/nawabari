@@ -366,11 +366,12 @@ test("RENAME checks source identity and destination CREATE authority without rep
     );
     assert.equal(rename.ok, true);
     assert.equal(fs.readFileSync(path.join(root, "renamed", "target.txt"), "utf8"), "rename-me");
-    assert.equal(fs.existsSync(source), false);
 
     const occupied = path.join(root, "docs", "occupied.txt");
     fs.writeFileSync(occupied, "keep");
-    fs.writeFileSync(source, "source-again");
+    // Exclusive creation proves the successful rename removed the source
+    // without a separate check-then-create filesystem race.
+    fs.writeFileSync(source, "source-again", { flag: "wx" });
     const occupiedIdentity = fixtureIdentity(source);
     const rejected = mutateWorktreeFile(
       request(root, "RENAME", "docs/source.txt", digest("source-again"), {

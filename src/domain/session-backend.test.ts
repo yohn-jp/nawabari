@@ -1391,17 +1391,22 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
       const request = JSON.parse(packet) as Record<string, string>;
       const target = path.join(request.root, request.path);
       fs.writeFileSync(target, Buffer.from(request.payload_base64 ?? "", "base64"));
-      const stat = fs.lstatSync(target);
-      const contents = fs.readFileSync(target);
-      return JSON.stringify({
-        ok: true,
-        identity: {
-          dev: String(stat.dev),
-          ino: String(stat.ino),
-          size: stat.size,
-          digest: createHash("sha256").update(contents).digest("hex"),
-        },
-      });
+      const descriptor = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const stat = fs.fstatSync(descriptor);
+        const contents = fs.readFileSync(descriptor);
+        return JSON.stringify({
+          ok: true,
+          identity: {
+            dev: String(stat.dev),
+            ino: String(stat.ino),
+            size: stat.size,
+            digest: createHash("sha256").update(contents).digest("hex"),
+          },
+        });
+      } finally {
+        fs.closeSync(descriptor);
+      }
     },
     policy: {
       profile: {
