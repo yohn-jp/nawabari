@@ -1290,6 +1290,11 @@ export class SessionRegistry {
     return this.readStateUnsafe().runtimeEpoch;
   }
 
+  /** Configured cgroups v2 filesystem used for owned-execution observation. */
+  get cgroupObservationFilesystem(): CgroupFileSystem | undefined {
+    return this.cgroupFilesystem;
+  }
+
   readSessionRuntimeEpoch(sessionId: string): number {
     assertSessionId(sessionId);
     return this.withLock(() => {
@@ -5148,10 +5153,7 @@ export class SessionRegistry {
     }
     let currentBootId: string;
     try {
-      currentBootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-      if (currentBootId.length === 0 || currentBootId.length > 256 || currentBootId.includes("\0")) {
-        throw new Error("invalid boot identity");
-      }
+      currentBootId = readCurrentKernelBootId();
     } catch (error: unknown) {
       throw new SessionRegistryError(
         "OPERATION_REJECTED",
@@ -5160,28 +5162,7 @@ export class SessionRegistry {
       );
     }
     for (const record of owned) {
-      const name = deriveCgroupScopeName(record.cgroup_identity);
-      const root = record.cgroup_root;
-      const lease: OwnedExecutionRecord = {
-        schema_version: 1,
-        session_id: record.session_id,
-        execution_id: record.execution_id,
-        boot_id: record.boot_id,
-        state: record.state === "attached" || record.state === "running" ? "active" : "terminal",
-        cgroups:
-          root === null || root === undefined
-            ? null
-            : {
-                contract_id: CGROUPS_V2_CONTRACT_ID,
-                root,
-                parent: `${root}/nawabari`,
-                path: `${root}/nawabari/${name}`,
-                name,
-                boot_id: record.boot_id,
-                identity: record.cgroup_identity,
-              },
-      };
-      const observed = observeOwnedExecution(lease, {
+      const observed = observeOwnedExecution(ownedExecutionObservationRecord(record), {
         current_boot_id: currentBootId,
         ...(this.cgroupFilesystem === undefined ? {} : { filesystem: this.cgroupFilesystem }),
       });
@@ -9399,6 +9380,45 @@ function lstatIfPresent(candidate: string): fs.Stats | undefined {
       error,
     );
   }
+}
+
+/** Read the live kernel boot identity used to bind owned-execution observations. */
+export function readCurrentKernelBootId(): string {
+  const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  if (bootId.length === 0 || bootId.length > 256 || bootId.includes("\0")) {
+    throw new Error("invalid boot identity");
+  }
+  return bootId;
+}
+
+/** Project one durable execution record onto its canonical owned cgroup lease. */
+export function ownedExecutionObservationRecord(
+  record: Pick<
+    PersistedSessionExecutionRecord,
+    "session_id" | "execution_id" | "boot_id" | "state" | "cgroup_identity" | "cgroup_root"
+  >,
+): OwnedExecutionRecord {
+  const name = deriveCgroupScopeName(record.cgroup_identity);
+  const root = record.cgroup_root;
+  return {
+    schema_version: 1,
+    session_id: record.session_id,
+    execution_id: record.execution_id,
+    boot_id: record.boot_id,
+    state: record.state === "attached" || record.state === "running" ? "active" : "terminal",
+    cgroups:
+      root === null || root === undefined
+        ? null
+        : {
+            contract_id: CGROUPS_V2_CONTRACT_ID,
+            root,
+            parent: `${root}/nawabari`,
+            path: `${root}/nawabari/${name}`,
+            name,
+            boot_id: record.boot_id,
+            identity: record.cgroup_identity,
+          },
+  };
 }
 
 export function toPersistedSessionRecord(

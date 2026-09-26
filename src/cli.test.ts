@@ -1356,6 +1356,95 @@ test("every canonical command and alias is recognized by the dispatcher", async 
   }
 });
 
+test("default CLI session handoff composes the managed runtime adapter without injection", async () => {
+  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-cli-handoff-"));
+  const git = (args: readonly string[]) =>
+    execFileSync("git", args, { cwd: repositoryPath, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  try {
+    git(["init", "-b", "main"]);
+    git(["config", "user.name", "Nawabari Tests"]);
+    git(["config", "user.email", "tests@example.invalid"]);
+    fs.writeFileSync(path.join(repositoryPath, "README.md"), "handoff\n");
+    git(["add", "README.md"]);
+    git(["commit", "-m", "initial"]);
+    const { SessionRegistry } = await import("./session-registry.js");
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const revision = git(["rev-parse", "HEAD"]);
+    const identity = { repositoryHost: "local", repositoryId: registry.repository.repositoryId };
+    const executionScope = {
+      version: 1,
+      kind: "implementation-execution-scope",
+      authorization: {
+        version: 1,
+        kind: "implementation-authorization",
+        contractVersion: 1,
+        implementation: { ...identity, number: 626 },
+        governedBodyDigest: "d".repeat(64),
+      },
+      repository: identity,
+      base: { branch: "main", revision },
+      scope: { readOnly: ["README.md"], write: ["README.md"], create: [], delete: [], deny: [] },
+    };
+    const candidateWorkingSet = {
+      kind: "candidate-working-set",
+      schemaVersion: 1,
+      workingSetId: "candidate-cli-626",
+      repository: { ...identity, repository: "local/nawabari" },
+      revision,
+      entries: [
+        {
+          state: "required",
+          target: { kind: "file", locator: "README.md" },
+          reason: { id: "test:cli-handoff", summary: "cli handoff" },
+          evidence: [],
+        },
+      ],
+    };
+    const source = registry.provision({
+      branchName: "feature/cli-handoff-source",
+      executionScope,
+      candidateWorkingSet,
+      initialClaims: [{ resource: "README.md", mode: "write" }],
+    });
+    const destination = registry.provision({
+      branchName: "feature/cli-handoff-destination",
+      executionScope,
+      candidateWorkingSet,
+    });
+    const before = fs.readFileSync(registry.paths.registry, "utf8");
+    const output = capture();
+    const exitCode = await runCli(
+      [
+        "session",
+        "handoff",
+        "--from",
+        source.sessionId,
+        "--to",
+        destination.sessionId,
+        "--resource",
+        "README.md",
+        "--mode",
+        "write",
+        "--if-generation",
+        String(registry.listClaimsSnapshot().claimSetGeneration),
+        "--json",
+      ],
+      { io: output.io, cwd: repositoryPath },
+    );
+    const response = JSON.parse(output.stdout[0] ?? "{}") as Record<string, unknown>;
+    // The untracked source admission cannot be fenced by the real adapter, so
+    // the default path fails closed instead of requiring caller injection or
+    // fabricating quiescence.
+    assert.equal(exitCode, 0, JSON.stringify(response));
+    assert.equal(response.status, "unresolved");
+    assert.equal(response.code, "PHYSICAL_OBSERVATION_UNAVAILABLE");
+    assert.equal(response.sourceRetained, true);
+    assert.equal(fs.readFileSync(registry.paths.registry, "utf8"), before);
+  } finally {
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("state commands reject honestly when the current directory is not a Git repository", async () => {
   const output = capture();
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-not-a-repository-"));
