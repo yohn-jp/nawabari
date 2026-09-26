@@ -111,6 +111,7 @@ import {
   type ResourceHandoffResult,
   type ResourceHandoffSnapshot,
 } from "./resource-handoff.js";
+import {
   FILE_OPERATION_REQUIRED_FEATURE,
   createFileOperationRegistryState,
   fileOperationRequestDigest,
@@ -1405,6 +1406,8 @@ export class SessionRegistry {
       owner_uid: process.getuid(),
       owner_gid: process.getgid(),
     });
+  }
+
   /** Return durable F10 file-operation receipts, optionally scoped by session. */
   fileOperations(sessionId?: string | null): readonly FileOperationRecord[] {
     if (sessionId !== undefined && sessionId !== null) assertSessionId(sessionId);

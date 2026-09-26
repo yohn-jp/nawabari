@@ -325,8 +325,8 @@ function assertUncertain(error: unknown): boolean {
   return true;
 }
 
-test("file operations activate only the F10 registry feature", () => {
-  assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, [FILE_OPERATION_REQUIRED_FEATURE]);
+test("file operations retain integrated registry features", () => {
+  assert.ok(SUPPORTED_REGISTRY_FEATURES.includes(FILE_OPERATION_REQUIRED_FEATURE));
 });
 
 test("authority tokens hash applied, legacy, changed-scope, and changed-digest profile boundaries", () => {

@@ -193,6 +193,11 @@ const SESSION_CONSOLE_CAPABILITY = Object.freeze({
   failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-console"],
   failure_code_policy: {
     source: "implementation-owned session-console vocabulary",
+    missing_or_extra: "deterministic conformance failure",
+    internal_exceptions: [],
+  },
+});
+
 const FILE_OPERATION_CAPABILITY = Object.freeze({
   id: "file-operation",
   contract_id: WORKTREE_FILE_OPERATION_CLI_CONTRACT_ID,
@@ -1031,6 +1036,8 @@ export function machineContract(packageVersion: string): JsonObject {
             contract_id: capability.contract_id,
             schema_version: capability.schema_version,
             producer_contract_ids: jsonClone(capability.producer_contract_ids),
+          }
+        : {}),
       ...(capability.id === "file-operation"
         ? {
             contract_id: capability.contract_id,
