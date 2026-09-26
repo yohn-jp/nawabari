@@ -21,7 +21,8 @@ const event = (session_id: string, revision: number) => ({
 
 test("history persists with stable identities, provenance, bounded retention and explicit retained window", () => {
   let state = emptyRuntimeRecords();
-  for (let i = 0; i < MAX_RUNTIME_RECORDS + 3; i++) state = appendRuntimeEvent(state, [event(i % 2 ? "s2" : "s1", i)]);
+  for (let i = 0; i < MAX_RUNTIME_RECORDS + 3; i++)
+    state = appendRuntimeEvent(state, [event(i % 2 ? "s2" : "s1", i)]);
   const persisted = toPersistedRuntimeRecords(state);
   assert.equal(persisted.recent_events?.length, MAX_RUNTIME_RECORDS);
   const reloaded = parseRuntimeRecords({ required_features: state.requiredFeatures, ...persisted });
