@@ -15,6 +15,7 @@ import {
 } from "./domain/session-execution-record.js";
 import { SESSION_EXECUTION_CONTROL_CONTRACT_ID } from "./domain/session-execution-control.js";
 import type { CgroupFileSystem } from "./domain/cgroups-v2.js";
+import type { WorktreeFileOperation } from "./domain/worktree-file-operation.js";
 import { defaultGit, resolveRepositoryContext } from "./git.js";
 import { RepositoryLock } from "./registry/lock.js";
 import { canonicalClaimId } from "./resource-claims.js";
@@ -739,6 +740,88 @@ test("managed close, discard, and claim release reject direct calls without drai
     );
     assert.equal(managed.get(session.sessionId)?.state, "active");
     assert.equal(managed.listClaims(session.sessionId).length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("managed file operations reject direct calls without ready drain finalization before physical I/O", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.create();
+    const base = readJson(registry.paths.registry) as Record<string, unknown>;
+    const admissionEpoch = Number(base.runtime_epoch) + 1;
+    writeRegistry(registry, {
+      ...base,
+      runtime_epoch: admissionEpoch,
+      required_features: ["runtime-sessions.v1", "executions.v1"],
+      runtime_sessions: [
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: session.sessionId,
+          admission: "closed",
+          runtime_epoch: admissionEpoch,
+        },
+      ],
+      executions: [],
+    } as unknown as PersistedRegistry);
+
+    const helperCalls = { value: 0 };
+    const operation: WorktreeFileOperation = {
+      contract_id: "nawabari.worktree-file-operation.v1",
+      schema_version: 1,
+      session_id: session.sessionId,
+      operation_id: "managed-direct-file-operation",
+      operation: "CREATE",
+      worktree_root: fixture.repositoryPath,
+      path: "managed.txt",
+      expected_digest: null,
+      requested_generation: registry.claimSetGeneration(),
+      scope: { create: ["managed.txt"], delete: [], deny: [] },
+      claims: [],
+      payload_ref: { encoding: "base64", data: Buffer.from("managed").toString("base64") },
+    };
+    const executionOptions = {
+      landlock_helper: null,
+      runtime_projection: null,
+      run_helper: () => {
+        helperCalls.value += 1;
+        return "{}";
+      },
+    };
+    const managed = new SessionRegistry({ cwd: fixture.repositoryPath });
+    assert.throws(
+      () => managed.executeFileOperation(operation, executionOptions),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        error.message.includes("Managed session mutation requires a drain finalization"),
+    );
+    const finalization = {
+      contract_id: SESSION_EXECUTION_CONTROL_CONTRACT_ID,
+      schema_version: 1 as const,
+      session_id: session.sessionId,
+      fence_id: "file-operation-fence",
+      operation: "release-claims" as const,
+      expected_epoch: admissionEpoch - 1,
+      admission_epoch: admissionEpoch,
+      admission: "closed" as const,
+      status: "ready" as const,
+      next_action: "finalize-lifecycle" as const,
+    };
+    assert.throws(
+      () => managed.executeFileOperation(operation, executionOptions, finalization),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        error.message.includes("No owned execution records are available"),
+    );
+    assert.equal(helperCalls.value, 0);
+    assert.equal(fs.existsSync(path.join(fixture.repositoryPath, "managed.txt")), false);
+    assert.deepEqual(managed.fileOperations(session.sessionId), []);
+    assert.equal(managed.getSessionLaunchAdmission(session.sessionId)?.admission, "closed");
   } finally {
     fixture.cleanup();
   }
