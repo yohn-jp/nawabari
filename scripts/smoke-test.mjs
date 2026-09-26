@@ -3845,7 +3845,7 @@ async function main() {
       "--resource",
       handoffResource,
       "--mode",
-      "write",
+      "read",
       "--json",
     ];
     const handoffManagedSourceResult = invokeInstalled(handoffSourceArgs, lifecycleRepository);
@@ -3880,7 +3880,7 @@ async function main() {
               "--resource",
               handoffResource,
               "--mode",
-              "write",
+              "read",
               "--json",
             ],
             lifecycleRepository,
@@ -3908,7 +3908,7 @@ async function main() {
       );
       if (
         handoffClaim.ok !== true ||
-        handoffClaim.claims?.some((claim) => claim.resource === handoffResource && claim.mode === "write") !== true
+        handoffClaim.claims?.some((claim) => claim.resource === handoffResource && claim.mode === "read") !== true
       ) {
         recordBoundedDefect(
           `nawabari ${handoffClaimArgs.join(" ")}`,
@@ -3963,7 +3963,7 @@ async function main() {
           "--resource",
           handoffResource,
           "--mode",
-          "write",
+          "read",
           "--if-generation",
           String(handoffGeneration),
           "--operation-id",
@@ -3986,7 +3986,7 @@ async function main() {
         const sourceHolds = sourceClaimsAfter.claims?.some((claim) => claim.resource === handoffResource) === true;
         const destinationHolds =
           destinationClaimsAfter.claims?.some(
-            (claim) => claim.resource === handoffResource && claim.mode === "write",
+            (claim) => claim.resource === handoffResource && claim.mode === "read",
           ) === true;
         if (handoffRunCompleted) {
           if (
