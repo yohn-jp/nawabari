@@ -331,6 +331,20 @@ The command surface includes Session lifecycle, Resource Claims, authorization/e
 
 `src/cli-command-registry.ts` is the single canonical authority for that surface: every command/option name is a `CommandId`/`OptionId` literal type derived directly from the registry data (not hand-typed), and `--help`, `capabilities`, and the executable dispatcher's own accepted-flag parsing all read that same data. There is no second command or option table to keep in sync.
 
+### Optional machine-local Control Server
+
+```bash
+nawabari server [--port <port>]
+```
+
+`nawabari server` runs one foreground Control Server and built-in Web UI at `http://127.0.0.1:47471/` (default port `47471`; `--port` selects another; an occupied port fails instead of choosing another endpoint). The listener binds IPv4 loopback `127.0.0.1` only and the bind address is not configurable. Stop it with Ctrl-C or `SIGTERM`.
+
+One listener serves every locally known Nawabari repository. Repository discovery uses a machine-local locator catalog (`$XDG_STATE_HOME/nawabari/control-repositories.json`, default `~/.local/state/nawabari/`) that holds only repository identity (common Git directory) and worktree path; `session create` and `server` record the current repository when it already has a Nawabari registry. The catalog is discovery metadata, not authority: each request reopens that repository's own backend, and each repository's registry, lifecycle, claims, runtime and filesystem authority stay independent.
+
+The HTTP v1 API is `GET /api/v1/health`, `GET /api/v1/repositories`, `GET /api/v1/repositories/:repositoryKey/snapshot`, `GET /api/v1/repositories/:repositoryKey/sessions/:sessionId`, and `POST /api/v1/repositories/:repositoryKey/sessions/:sessionId/actions`. Reads re-project the canonical `RepositoryRuntimeSnapshot`; actions accept only the typed `session action` contract (`action_id`, `token`, `confirmation`) and delegate to the repository's `SessionActionDispatcher`, so stale evidence fails closed (HTTP 409) and `discard-session` still needs the authoritative preview plus explicit confirmation. No route executes command text.
+
+Every API request needs the `x-nawabari-control-token` header. The token is random per start, bootstrapped only into the same-origin root document, and never printed, logged, persisted, or put in URLs. Requests with an unexpected `Host` or a foreign `Origin` are rejected, no CORS headers are sent, and actions accept bounded `application/json` bodies only. The Web UI polls every 3 seconds and has a manual refresh; it offers only the actions listed by the current canonical diagnostic. The server is optional: every other command, including `nawabari ui`, keeps calling the backend directly.
+
 ## Stable package exports
 
 Node consumers can use public projections without spawning the CLI:

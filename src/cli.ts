@@ -58,6 +58,14 @@ import type {
 } from "./ui/session-actions.js";
 import { parseSessionDiscardPreview } from "./ui/session-actions.js";
 import type { SessionDiscardPreview } from "./domain/session.js";
+import {
+  CONTROL_SERVER_HOST,
+  CONTROL_SERVER_SCHEMA,
+  DEFAULT_CONTROL_SERVER_PORT,
+  startControlServer,
+  type ControlServer,
+} from "./control-server.js";
+import { defaultControlRepositoryCatalogPath, registerRepositoryLocator } from "./control-repositories.js";
 import { MACHINE_CONTRACT_ID, MACHINE_CONTRACT_SCHEMA_VERSION, machineContract } from "./contract.js";
 import {
   resolveSandboxExecutionRequest,
@@ -314,6 +322,12 @@ export type CliDependencies = {
     readonly isTTY?: boolean;
     readonly signal?: AbortSignal;
   };
+  /** Optional Control Server composition; test/integration seam. */
+  controlServer?: {
+    readonly catalogPath?: string;
+    readonly signal?: AbortSignal;
+    readonly onListening?: (server: ControlServer) => void;
+  };
   version?: string;
   sandboxRunner?: (
     request: import("./domain/sandbox.js").SandboxExecutionRequest,
@@ -385,6 +399,7 @@ type ParsedOptions = {
   action_preview: SessionDiscardPreview | null;
   operation_id: string | null;
   confirm: boolean;
+  port: string | null;
 };
 
 function usageError(
@@ -562,6 +577,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     action_preview: null,
     operation_id: null,
     confirm: false,
+    port: null,
   };
   let dryRun = false;
 
@@ -699,6 +715,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       options.schema_version = value === "1" ? 1 : 2;
     } else if (name === "--fetch-remote") options.fetch_remote = value;
     else if (name === "--fetch-branch") options.fetch_branch = value;
+    else if (name === "--port") options.port = value;
   }
 
   if (options.apply && dryRun) {
@@ -1730,6 +1747,7 @@ async function executeCommand(
       | "sandboxRuntimeProjection"
       | "repositoryTerminal"
       | "io"
+      | "controlServer"
     > & { readonly json: boolean },
 ): Promise<DomainResult<JsonObject>> {
   const [command, subcommand, ...rest] = commandArguments;
@@ -1779,6 +1797,54 @@ async function executeCommand(
       },
     });
     return { ok: true, value: terminalResult as unknown as JsonObject };
+  }
+
+  if (command === "server") {
+    const parsed = parseOptions(
+      [subcommand, ...rest].filter((argument): argument is string => argument !== undefined),
+      dispatcherAllowedOptions("server"),
+    );
+    if (!parsed.ok) return parsed;
+    const portText = parsed.value.port ?? String(DEFAULT_CONTROL_SERVER_PORT);
+    const port = /^\d{1,5}$/u.test(portText) ? Number(portText) : Number.NaN;
+    if (!(port >= 1 && port <= 65_535)) {
+      return failure(
+        usageError("INVALID_ARGUMENT", "--port must be an integer between 1 and 65535.", {
+          option: "--port",
+          value: portText,
+        }),
+      );
+    }
+    const catalogPath = dependencies.controlServer?.catalogPath ?? defaultControlRepositoryCatalogPath();
+    // Discovery metadata only: the current repository is recorded when it is
+    // already Nawabari-managed; other known repositories stay visible.
+    registerRepositoryLocator(catalogPath, dependencies.cwd);
+    const started = await startControlServer({ port, backend: dependencies.backend, catalogPath });
+    if (!started.ok) return started;
+    const endpoint: JsonObject = {
+      schema: CONTROL_SERVER_SCHEMA,
+      status: "listening",
+      url: started.value.url,
+      host: CONTROL_SERVER_HOST,
+      port: started.value.port,
+    };
+    (dependencies.io ?? defaultCliIO()).stdout(renderSuccess(dependencies.json ? "json" : "human", "server", endpoint));
+    dependencies.controlServer?.onListening?.(started.value);
+    await new Promise<void>((resolve) => {
+      const signal = dependencies.controlServer?.signal;
+      const stop = () => {
+        process.off("SIGINT", stop);
+        process.off("SIGTERM", stop);
+        signal?.removeEventListener("abort", stop);
+        resolve();
+      };
+      if (signal?.aborted) return stop();
+      signal?.addEventListener("abort", stop, { once: true });
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    });
+    await started.value.close();
+    return { ok: true, value: { ...endpoint, status: "stopped" } };
   }
 
   if (command === "session" && subcommand === "action") {
@@ -2880,6 +2946,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       io,
       json: mode === "json",
       repositoryTerminal: dependencies.repositoryTerminal,
+      controlServer: dependencies.controlServer,
       sandboxRunner: dependencies.sandboxRunner,
       sandboxProbe: dependencies.sandboxProbe,
       sandboxRuntimeLayout: runtimeLayout,
@@ -2892,7 +2959,12 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
     const childExitCode = result.value.exit_code;
     const childSignal = result.value.signal;
     const interactive = command === "session shell";
-    if (!interactive && command !== "ui") io.stdout(renderSuccess(mode, command, result.value));
+    if (!interactive && command !== "ui" && command !== "server") io.stdout(renderSuccess(mode, command, result.value));
+    if (command === "session create" && dependencies.backend === undefined) {
+      // Best-effort discovery locator for the optional Control Server; the
+      // CLI result never depends on it.
+      registerRepositoryLocator(dependencies.controlServer?.catalogPath ?? defaultControlRepositoryCatalogPath(), cwd);
+    }
     if (
       (command === "session run" || command === "session exec" || interactive) &&
       (childSignal !== null || (typeof childExitCode === "number" && childExitCode !== 0))
