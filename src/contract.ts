@@ -36,7 +36,6 @@ import {
   WORKTREE_FILE_OPERATION_CLI_COMMANDS,
   WORKTREE_FILE_OPERATION_CLI_CONTRACT_ID,
   WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
-  WORKTREE_FILE_OPERATION_CLI_ERROR_VOCABULARY,
 } from "./worktree-file-operation-cli.js";
 import {
   DISCARD_PREVIEW_SCHEMA_VERSION,
@@ -213,9 +212,9 @@ const FILE_OPERATION_CAPABILITY = Object.freeze({
     },
   ],
   identities: ["operation_id", "operation", "state", "previous_generation", "next_generation", "identity"],
-  failure_codes: [...WORKTREE_FILE_OPERATION_CLI_ERROR_VOCABULARY],
+  failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["file-operation"],
   failure_code_policy: {
-    source: "accepted worktree-file-operation CLI vocabulary",
+    source: "implementation-owned file-operation vocabulary",
     missing_or_extra: "deterministic conformance failure",
     internal_exceptions: [],
   },

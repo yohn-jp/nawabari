@@ -1219,7 +1219,6 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--fetch-remote",
       "--fetch-branch",
       "--preview",
-      "--operation-id",
       "--expect-absent",
       "--payload-file",
       "--payload-stdin",
