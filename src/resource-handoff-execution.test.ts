@@ -237,6 +237,11 @@ test("default LocalSessionBackend handoff transfers only after fully observed em
     if (!retry.ok) return;
     assert.equal(retry.value.status, "idempotent");
     assert.equal(retry.value.idempotent, true);
+
+    // The fenced source still drains and closes through the #403 lifecycle.
+    const closed = await backend.closeSession({ cwd: fixture.repositoryPath }, { session_id: fixture.sourceId });
+    assert.equal(closed.ok, true, closed.ok ? "" : JSON.stringify(closed.error));
+    assert.equal(fixture.registry.get(fixture.sourceId)?.state, "closed");
   } finally {
     fixture.cleanup();
   }

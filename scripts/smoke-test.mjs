@@ -3842,6 +3842,10 @@ async function main() {
       handoffSourceWorktree,
       "--profile",
       "builtin:minimal",
+      "--resource",
+      handoffResource,
+      "--mode",
+      "write",
       "--json",
     ];
     const handoffManagedSourceResult = invokeInstalled(handoffSourceArgs, lifecycleRepository);
@@ -3866,7 +3870,19 @@ async function main() {
       ? handoffManagedSource
       : parseInstalledJson(
           invokeInstalled(
-            ["session", "create", "--branch", "feature/handoff-source", "--worktree", handoffSourceWorktree, "--json"],
+            [
+              "session",
+              "create",
+              "--branch",
+              "feature/handoff-source",
+              "--worktree",
+              handoffSourceWorktree,
+              "--resource",
+              handoffResource,
+              "--mode",
+              "write",
+              "--json",
+            ],
             lifecycleRepository,
           ),
           "handoff untracked source bootstrap",
@@ -3883,23 +3899,22 @@ async function main() {
         destination: handoffDestination,
       });
     } else {
-      const handoffClaimArgs = [
-        "session",
-        "claim",
-        "--session",
-        handoffSource.session_id,
-        "--resource",
-        handoffResource,
-        "--mode",
-        "write",
-        "--json",
-      ];
+      // The source claim is acquired at bootstrap: once a managed session is
+      // admitted, #403 gates later claim mutation on drained executions.
+      const handoffClaimArgs = ["session", "claims", "--session", handoffSource.session_id, "--json"];
       const handoffClaim = parseInstalledJson(
-        invokeInstalled(handoffClaimArgs, handoffSourceWorktree),
-        "handoff source claim",
+        invokeInstalled(handoffClaimArgs, lifecycleRepository),
+        "handoff source bootstrap claims",
       );
-      if (handoffClaim.ok !== true || typeof handoffClaim.claim_set_generation !== "number") {
-        recordBoundedDefect(`nawabari ${handoffClaimArgs.join(" ")}`, "acquire the handoff source claim", handoffClaim);
+      if (
+        handoffClaim.ok !== true ||
+        handoffClaim.claims?.some((claim) => claim.resource === handoffResource && claim.mode === "write") !== true
+      ) {
+        recordBoundedDefect(
+          `nawabari ${handoffClaimArgs.join(" ")}`,
+          "hold the bootstrap handoff source claim",
+          handoffClaim,
+        );
       } else {
         const handoffRunArgs = [
           "session",
@@ -3934,6 +3949,10 @@ async function main() {
             response: handoffRun,
           });
         }
+        const handoffGeneration = parseInstalledJson(
+          invokeInstalled(handoffClaimArgs, lifecycleRepository),
+          "handoff source claims before handoff",
+        ).claim_set_generation;
         const handoffArgs = [
           "session",
           "handoff",
@@ -3946,7 +3965,7 @@ async function main() {
           "--mode",
           "write",
           "--if-generation",
-          String(handoffClaim.claim_set_generation),
+          String(handoffGeneration),
           "--operation-id",
           "packed-managed-handoff",
           "--json",
