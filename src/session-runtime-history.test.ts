@@ -29,7 +29,7 @@ test("history persists with stable identities, provenance, bounded retention and
   assert.equal(projected.retained_from, 4);
   assert.equal(projected.retained_through, MAX_RUNTIME_RECORDS + 3);
   assert.equal(projected.truncated, true);
-  assert.equal(projected.coverage, "since-first-recorded-event");
+  assert.equal(projected.coverage, "prior-history-unknown");
   assert.equal(projected.events[0]?.event_id, "history:5");
   assert.equal(projected.events[0]?.source, "session-registry");
   assert.equal(
@@ -95,6 +95,29 @@ test("history rejects malformed events; other evidence never competes for its bo
     retained_from: null,
     retained_through: null,
     truncated: false,
-    coverage: "since-first-recorded-event",
+    coverage: "prior-history-unknown",
   });
+});
+
+
+test("history reports complete coverage only when the retained session timeline starts at creation", () => {
+  let state = emptyRuntimeRecords();
+  state = appendRuntimeEvent(state, [
+    {
+      kind: "lifecycle",
+      session_id: "s1",
+      execution_id: null,
+      source: "session-registry",
+      operation: "absent->active",
+      before_revision: 0,
+      after_revision: 1,
+      observed_at: "2026-01-01T00:00:00.000Z",
+    },
+  ]);
+  state = appendRuntimeEvent(state, [event("s1", 1)]);
+  assert.equal(projectSessionRuntimeHistory(state, "s1").coverage, "from-session-creation");
+
+  let upgraded = emptyRuntimeRecords();
+  upgraded = appendRuntimeEvent(upgraded, [event("existing", 7)]);
+  assert.equal(projectSessionRuntimeHistory(upgraded, "existing").coverage, "prior-history-unknown");
 });
