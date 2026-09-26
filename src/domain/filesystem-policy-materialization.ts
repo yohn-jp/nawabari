@@ -317,9 +317,13 @@ function inspectEntry(
   let descriptor: number | undefined;
   let parentDescriptor: number | undefined;
   try {
-    canonical = fs.realpathSync.native(candidate);
     const expected = path.resolve(candidate);
     const canonicalWorktree = path.resolve(worktree);
+    const flags = fs.constants.O_RDONLY | noFollowFlag() | (kind === "directory" ? fs.constants.O_DIRECTORY : 0);
+    descriptor = fs.openSync(candidate, flags);
+    const descriptorStat = fs.fstatSync(descriptor, { bigint: true });
+    // /proc/self/fd resolves the opened object, not a second pathname lookup.
+    canonical = fs.realpathSync.native(`/proc/self/fd/${descriptor}`);
     const relativeCanonical = path.relative(canonicalWorktree, canonical);
     if (canonical !== expected || relativeCanonical === ".." || relativeCanonical.startsWith(`..${path.sep}`)) {
       return {
@@ -333,11 +337,11 @@ function inspectEntry(
         }),
       };
     }
-    const flags = fs.constants.O_RDONLY | noFollowFlag() | (kind === "directory" ? fs.constants.O_DIRECTORY : 0);
-    descriptor = fs.openSync(candidate, flags);
-    const descriptorStat = fs.fstatSync(descriptor, { bigint: true });
     const entryIdentity = identity(entry);
-    if (!sameIdentity(entryIdentity, identity(descriptorStat))) {
+    if (
+      !sameIdentity(entryIdentity, identity(descriptorStat)) ||
+      (kind === "file" ? !descriptorStat.isFile() : !descriptorStat.isDirectory())
+    ) {
       return {
         ok: false,
         destination: "unsupported",
@@ -352,7 +356,12 @@ function inspectEntry(
     const parentPath = path.dirname(candidate);
     parentDescriptor = fs.openSync(parentPath, fs.constants.O_RDONLY | noFollowFlag() | fs.constants.O_DIRECTORY);
     const parentStat = fs.fstatSync(parentDescriptor, { bigint: true });
-    if (!parentStat.isDirectory()) throw new Error("parent is not a directory");
+    if (
+      !parentStat.isDirectory() ||
+      fs.realpathSync.native(`/proc/self/fd/${parentDescriptor}`) !== path.resolve(parentPath)
+    ) {
+      throw new Error("parent is not a canonical directory");
+    }
     return {
       ok: true,
       value: Object.freeze({
@@ -360,7 +369,7 @@ function inspectEntry(
         relativePath: path.relative(canonicalWorktree, candidate).split(path.sep).join("/"),
         absolutePath: candidate,
         kind,
-        identity: entryIdentity,
+        identity: identity(descriptorStat),
         parent: Object.freeze({ path: parentPath, identity: identity(parentStat) }),
       }),
     };

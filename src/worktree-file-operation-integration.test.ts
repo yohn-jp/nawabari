@@ -289,14 +289,28 @@ function executionOptions(
 }
 
 function fileIdentity(file: string): { dev: string; ino: string; size: number; digest: string } {
-  const stat = fs.lstatSync(file);
-  const contents = fs.readFileSync(file);
-  return {
-    dev: String(stat.dev),
-    ino: String(stat.ino),
-    size: stat.size,
-    digest: createHash("sha256").update(contents).digest("hex"),
-  };
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile()) throw new Error("Expected a regular file");
+    const contents = fs.readFileSync(descriptor);
+    const after = fs.fstatSync(descriptor);
+    if (
+      stat.size !== contents.length ||
+      stat.size !== after.size ||
+      stat.mtimeMs !== after.mtimeMs ||
+      stat.ctimeMs !== after.ctimeMs
+    )
+      throw new Error("File changed during identity observation");
+    return {
+      dev: String(stat.dev),
+      ino: String(stat.ino),
+      size: stat.size,
+      digest: createHash("sha256").update(contents).digest("hex"),
+    };
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 function successfulHelper(calls: { value: number }): (packet: string) => string {

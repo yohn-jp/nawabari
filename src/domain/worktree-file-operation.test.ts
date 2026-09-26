@@ -114,6 +114,31 @@ function digest(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+function fixtureIdentity(file: string): WorktreeFileIdentity {
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const before = fs.fstatSync(descriptor);
+    if (!before.isFile()) throw new Error("Expected a regular file");
+    const contents = fs.readFileSync(descriptor);
+    const after = fs.fstatSync(descriptor);
+    if (
+      before.size !== contents.length ||
+      before.size !== after.size ||
+      before.mtimeMs !== after.mtimeMs ||
+      before.ctimeMs !== after.ctimeMs
+    )
+      throw new Error("File changed during identity observation");
+    return {
+      dev: String(before.dev),
+      ino: String(before.ino),
+      size: before.size,
+      digest: crypto.createHash("sha256").update(contents).digest("hex"),
+    };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 function request(
   root: string,
   operation: "CREATE" | "DELETE" | "RENAME",
@@ -268,12 +293,7 @@ test("DELETE requires expected identity and refuses a second deletion", () => {
   const root = fixture();
   try {
     fs.writeFileSync(path.join(root, "docs", "remove.txt"), "remove-me");
-    const expected: WorktreeFileIdentity = {
-      dev: String(fs.statSync(path.join(root, "docs", "remove.txt")).dev),
-      ino: String(fs.statSync(path.join(root, "docs", "remove.txt")).ino),
-      size: Buffer.byteLength("remove-me"),
-      digest: digest("remove-me"),
-    };
+    const expected = fixtureIdentity(path.join(root, "docs", "remove.txt"));
     const first = mutateWorktreeFile(
       request(root, "DELETE", "docs/remove.txt", expected.digest, { expected_identity: expected }),
       helperOptions(),
@@ -302,13 +322,7 @@ test("DELETE and RENAME reject files with unknown hardlink identity", () => {
     const alias = path.join(root, "docs", "hardlinked-alias.txt");
     fs.writeFileSync(source, content);
     fs.linkSync(source, alias);
-    const stat = fs.statSync(source);
-    const expected = {
-      dev: String(stat.dev),
-      ino: String(stat.ino),
-      size: Buffer.byteLength(content),
-      digest: digest(content),
-    } satisfies WorktreeFileIdentity;
+    const expected = fixtureIdentity(source);
 
     const deletion = mutateWorktreeFile(
       request(root, "DELETE", "docs/hardlinked.txt", expected.digest, { expected_identity: expected }),
@@ -342,13 +356,7 @@ test("RENAME checks source identity and destination CREATE authority without rep
   try {
     fs.writeFileSync(path.join(root, "docs", "source.txt"), "rename-me");
     const source = path.join(root, "docs", "source.txt");
-    const stat = fs.statSync(source);
-    const expected: WorktreeFileIdentity = {
-      dev: String(stat.dev),
-      ino: String(stat.ino),
-      size: 9,
-      digest: digest("rename-me"),
-    };
+    const expected = fixtureIdentity(source);
     const rename = mutateWorktreeFile(
       request(root, "RENAME", "docs/source.txt", expected.digest, {
         to_path: "renamed/target.txt",
@@ -363,17 +371,12 @@ test("RENAME checks source identity and destination CREATE authority without rep
     const occupied = path.join(root, "docs", "occupied.txt");
     fs.writeFileSync(occupied, "keep");
     fs.writeFileSync(source, "source-again");
-    const occupiedStat = fs.statSync(source);
+    const occupiedIdentity = fixtureIdentity(source);
     const rejected = mutateWorktreeFile(
       request(root, "RENAME", "docs/source.txt", digest("source-again"), {
         operation_id: "operation-rename-occupied",
         to_path: "docs/occupied.txt",
-        expected_identity: {
-          dev: String(occupiedStat.dev),
-          ino: String(occupiedStat.ino),
-          size: 12,
-          digest: digest("source-again"),
-        },
+        expected_identity: occupiedIdentity,
       }),
       helperOptions(),
     );
