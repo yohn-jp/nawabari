@@ -126,6 +126,7 @@ import {
   type SandboxProbe,
 } from "./sandbox.js";
 import type { ResourceHandoffFenceController } from "../resource-handoff.js";
+import { createManagedResourceHandoffExecution } from "../resource-handoff-execution.js";
 
 export interface LocalSessionBackendOptions {
   readonly git?: SessionRegistryOptions["git"];
@@ -142,6 +143,7 @@ export interface LocalSessionBackendOptions {
     SessionRegistryOptions,
     "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority"
   >;
+  /** Explicit override for the managed-runtime handoff fence (tests/custom composition). */
   readonly resourceHandoffExecution?: ResourceHandoffFenceController;
 }
 
@@ -923,15 +925,10 @@ export class LocalSessionBackend implements SessionBackend {
     context: SessionContext,
     options: ResourceHandoffOptions,
   ): Promise<DomainResult<ResourceHandoffResult>> {
-    if (this.resourceHandoffExecution === undefined) {
-      return failure(
-        new DomainError("OPERATION_REJECTED", "Resource handoff requires configured execution-control evidence.", {
-          operation_code: "PHYSICAL_OBSERVATION_UNAVAILABLE",
-        }),
-      );
-    }
     try {
-      return success(await this.registryFor(context).handoffResources(options, this.resourceHandoffExecution));
+      const registry = this.registryFor(context);
+      const execution = this.resourceHandoffExecution ?? createManagedResourceHandoffExecution(registry);
+      return success(await registry.handoffResources(options, execution));
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }

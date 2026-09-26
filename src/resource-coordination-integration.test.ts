@@ -55,25 +55,32 @@ test("SessionRegistry composes coordination graph, transaction, preview, and sna
   }
 });
 
-test("LocalSessionBackend handoff absence is fail-closed before registry mutation", async () => {
+test("default LocalSessionBackend handoff uses managed runtime evidence and fails closed without admission", async () => {
   const repositoryPath = createRepository();
   try {
     const { LocalSessionBackend } = await import("./domain/session-backend.js");
-    const backend = new LocalSessionBackend();
-    const result = await backend.handoffResources(
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const { source, destination } = provisionHandoffSessions(registry, repositoryPath, 626);
+    const before = fs.readFileSync(registry.paths.registry, "utf8");
+    const result = await new LocalSessionBackend().handoffResources(
       { cwd: repositoryPath },
       {
-        from_session_id: "source-session",
-        to_session_id: "destination-session",
+        from_session_id: source.sessionId,
+        to_session_id: destination.sessionId,
         resource: "README.md",
         mode: "write",
-        if_generation: 0,
+        if_generation: registry.listClaimsSnapshot().claimSetGeneration,
+        operation_id: "handoff-626-untracked",
       },
     );
-    assert.equal(result.ok, false);
-    if (result.ok) return;
-    assert.equal(result.error.code, "OPERATION_REJECTED");
-    assert.deepEqual(result.error.details, { operation_code: "PHYSICAL_OBSERVATION_UNAVAILABLE" });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    // No caller-injected controller: the untracked source admission cannot be
+    // fenced, so the real adapter never fabricates quiescence.
+    assert.equal(result.value.status, "unresolved");
+    assert.equal(result.value.code, "PHYSICAL_OBSERVATION_UNAVAILABLE");
+    assert.equal(result.value.sourceRetained, true);
+    assert.equal(fs.readFileSync(registry.paths.registry, "utf8"), before);
   } finally {
     fs.rmSync(repositoryPath, { recursive: true, force: true });
   }
@@ -290,6 +297,52 @@ test("resource handoff rejects a destination conflict without changing claims or
     fs.rmSync(repositoryPath, { recursive: true, force: true });
   }
 });
+
+function provisionHandoffSessions(registry: SessionRegistry, repositoryPath: string, issue: number) {
+  const revision = runGit(["rev-parse", "HEAD"], repositoryPath);
+  const identity = { repositoryHost: "local", repositoryId: registry.repository.repositoryId };
+  const executionScope = {
+    version: 1,
+    kind: "implementation-execution-scope",
+    authorization: {
+      version: 1,
+      kind: "implementation-authorization",
+      contractVersion: 1,
+      implementation: { ...identity, number: issue },
+      governedBodyDigest: "b".repeat(64),
+    },
+    repository: identity,
+    base: { branch: "main", revision },
+    scope: { readOnly: ["README.md"], write: ["README.md"], create: [], delete: [], deny: [] },
+  };
+  const candidateWorkingSet = {
+    kind: "candidate-working-set",
+    schemaVersion: 1,
+    workingSetId: `candidate-${issue}`,
+    repository: { ...identity, repository: "local/nawabari" },
+    revision,
+    entries: [
+      {
+        state: "required",
+        target: { kind: "file", locator: "README.md" },
+        reason: { id: "test:handoff", summary: "bounded handoff" },
+        evidence: [],
+      },
+    ],
+  };
+  const source = registry.provision({
+    branchName: `feature/handoff-source-${issue}`,
+    executionScope,
+    candidateWorkingSet,
+    initialClaims: [{ resource: "README.md", mode: "write" }],
+  });
+  const destination = registry.provision({
+    branchName: `feature/handoff-destination-${issue}`,
+    executionScope,
+    candidateWorkingSet,
+  });
+  return { source, destination };
+}
 
 function createRepository(): string {
   const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-coordination-"));
