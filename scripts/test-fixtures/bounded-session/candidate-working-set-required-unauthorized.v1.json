@@ -1,0 +1,22 @@
+{
+  "kind": "candidate-working-set",
+  "schemaVersion": 1,
+  "workingSetId": "yohn-jp/nawabari-378-required-unauthorized-v1",
+  "repository": {
+    "repositoryHost": "github.com",
+    "repositoryId": "1329799765",
+    "repository": "yohn-jp/nawabari"
+  },
+  "revision": "__BASE_REVISION__",
+  "entries": [
+    {
+      "state": "required",
+      "target": { "kind": "file", "locator": "bounded-session/private.txt" },
+      "reason": {
+        "id": "required-outside-authorization",
+        "summary": "Required candidate path is outside READONLY authority"
+      },
+      "evidence": [{ "artifact": "implementation-378", "reference": "acceptance/required-unauthorized" }]
+    }
+  ]
+}

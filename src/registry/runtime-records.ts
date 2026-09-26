@@ -1,5 +1,6 @@
 import type { JsonObject, JsonValue } from "../domain/errors.js";
 import { SessionRegistryError } from "../errors.js";
+import { parsePinnedProfileRecord } from "../domain/worktree-profile-pinning.js";
 import { isResourceClaimMode, type ResourceClaimMode } from "../resource-claims.js";
 
 /**
@@ -18,14 +19,30 @@ export const REGISTRY_FEATURES = Object.freeze([
 
 export type RegistryFeature = (typeof REGISTRY_FEATURES)[number];
 
-/** The resource-coordination integration owns exactly the handoff receipt area. */
-export const SUPPORTED_REGISTRY_FEATURES = Object.freeze(["recent-events.v1"] as const);
+/**
+ * Optional record authorities implemented by the runtime registry owner. The
+ * resource-coordination integration owns exactly the handoff receipt area.
+ */
+export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([
+  "pinned-profiles.v1",
+  "runtime-sessions.v1",
+  "executions.v1",
+  "recent-events.v1",
+] as const);
 
 export const MAX_RUNTIME_RECORDS = 256 as const;
 export const MAX_RUNTIME_RECORD_KEYS = 32 as const;
 export const MAX_UNSUPPORTED_REGISTRY_FEATURES = 8 as const;
 
 export type RuntimeRecord = Readonly<JsonObject>;
+
+export type SessionAdmissionRecord = Readonly<{
+  readonly kind: "session-admission";
+  readonly schema_version: 1;
+  readonly session_id: string;
+  readonly admission: "open" | "closed";
+  readonly runtime_epoch: number;
+}>;
 
 export interface RuntimeRecords {
   readonly pinned_profiles?: readonly RuntimeRecord[];
@@ -175,13 +192,108 @@ function parseRecordList(value: unknown, field: string): readonly RuntimeRecord[
       maximum: MAX_RUNTIME_RECORDS,
     });
   }
-  return Object.freeze(
-    value.map((candidate, index) =>
-      field === "recent_events"
-        ? parseResourceHandoffRecentEvent(candidate, field, index)
-        : parseRuntimeRecord(candidate, field, index),
-    ),
+  const records = value.map((candidate, index) =>
+    field === "runtime_sessions"
+      ? parseSessionAdmissionRecord(candidate, index)
+      : field === "pinned_profiles"
+        ? parsePinnedProfileRuntimeRecord(candidate, index)
+        : field === "recent_events"
+          ? parseResourceHandoffRecentEvent(candidate, field, index)
+          : parseRuntimeRecord(candidate, field, index),
   );
+  if (field === "runtime_sessions") {
+    const owners = new Set<string>();
+    for (const record of records as SessionAdmissionRecord[]) {
+      if (owners.has(record.session_id)) {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry runtime_sessions contains a duplicate session", {
+          sessionId: record.session_id,
+        });
+      }
+      owners.add(record.session_id);
+    }
+  }
+  if (field === "pinned_profiles") {
+    const owners = new Set<string>();
+    for (const record of records) {
+      const owner = record.session_id;
+      if (typeof owner !== "string") continue;
+      if (owners.has(owner)) {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry pinned_profiles contains a duplicate session", {
+          sessionId: owner,
+        });
+      }
+      owners.add(owner);
+    }
+  }
+  return Object.freeze(records);
+}
+
+function parsePinnedProfileRuntimeRecord(value: unknown, index: number): RuntimeRecord {
+  if (!isRecord(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry pinned_profiles[${index}] must be an object`, {
+      field: "pinned_profiles",
+      index,
+    });
+  }
+  if (
+    Object.hasOwn(value, "session_id") &&
+    (typeof value.session_id !== "string" ||
+      value.session_id.length === 0 ||
+      value.session_id.length > 256 ||
+      value.session_id.includes("\0"))
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry pinned_profiles[${index}] has an invalid owner`, {
+      field: "pinned_profiles",
+      index,
+    });
+  }
+  try {
+    parsePinnedProfileRecord(value);
+  } catch (error: unknown) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry pinned_profiles[${index}] is invalid`, {
+      field: "pinned_profiles",
+      index,
+      cause: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return parseRuntimeRecord(value, "pinned_profiles", index);
+}
+
+export function parseSessionAdmissionRecord(value: unknown, index = 0): SessionAdmissionRecord {
+  if (!isRecord(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry runtime_sessions[${index}] must be an object`, {
+      field: "runtime_sessions",
+      index,
+    });
+  }
+  const keys = Object.keys(value).sort();
+  const expected = ["admission", "kind", "runtime_epoch", "schema_version", "session_id"];
+  if (
+    keys.length !== expected.length ||
+    keys.some((key, keyIndex) => key !== expected[keyIndex]) ||
+    value.kind !== "session-admission" ||
+    value.schema_version !== 1 ||
+    typeof value.session_id !== "string" ||
+    value.session_id.length === 0 ||
+    value.session_id.length > 256 ||
+    value.session_id.includes("\0") ||
+    (value.admission !== "open" && value.admission !== "closed") ||
+    typeof value.runtime_epoch !== "number" ||
+    !Number.isSafeInteger(value.runtime_epoch) ||
+    value.runtime_epoch < 0
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry runtime_sessions[${index}] is invalid`, {
+      field: "runtime_sessions",
+      index,
+    });
+  }
+  return Object.freeze({
+    kind: "session-admission",
+    schema_version: 1,
+    session_id: value.session_id,
+    admission: value.admission,
+    runtime_epoch: value.runtime_epoch,
+  });
 }
 
 function parseResourceHandoffRecentEvent(value: unknown, field: string, index: number): ResourceHandoffRecentEvent {

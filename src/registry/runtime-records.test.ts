@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { SessionRegistryError } from "../errors.js";
+import { BUILTIN_WORKTREE_PROFILE_IDS, resolveBuiltinWorktreeProfile } from "../domain/worktree-profile-builtins.js";
+import { builtinWorktreeProfileRevision, pinWorktreeProfile } from "../domain/worktree-profile-pinning.js";
 import {
   REGISTRY_FEATURES,
   SUPPORTED_REGISTRY_FEATURES,
@@ -18,7 +20,12 @@ test("registry optional areas are a finite feature-gated contract", () => {
     "recent-events.v1",
     "file-operations.v1",
   ]);
-  assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, ["recent-events.v1"]);
+  assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, [
+    "pinned-profiles.v1",
+    "runtime-sessions.v1",
+    "executions.v1",
+    "recent-events.v1",
+  ]);
   assert.deepEqual(parseRuntimeRecords({}), { requiredFeatures: [], records: {} });
 });
 
@@ -37,21 +44,88 @@ test("unsupported features expose bounded names without returning their payload"
 });
 
 test("supported feature records require matching presence and round-trip as bounded JSON", () => {
+  const profileId = BUILTIN_WORKTREE_PROFILE_IDS[0];
+  assert.ok(profileId);
+  const resolved = resolveBuiltinWorktreeProfile({ profile: profileId }, {});
+  assert.ok(resolved.ok);
+  const pinnedProfile = {
+    ...pinWorktreeProfile(resolved.value, {
+      repository: { id: "repo", revision: "a".repeat(40) },
+      base: { revision: "a".repeat(40) },
+      catalog: { kind: "builtin", id: profileId, revision: builtinWorktreeProfileRevision(profileId) },
+      selection: { profile: profileId, parameters: {} },
+    }),
+    session_id: "session-1",
+  };
   const parsed = parseRuntimeRecords(
     {
-      required_features: ["executions.v1"],
+      required_features: ["pinned-profiles.v1", "executions.v1", "runtime-sessions.v1"],
+      pinned_profiles: [pinnedProfile],
       executions: [{ execution_id: "exec-1", state: "starting" }],
+      runtime_sessions: [
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: "session-1",
+          admission: "open",
+          runtime_epoch: 0,
+        },
+      ],
     },
-    ["executions.v1"],
+    SUPPORTED_REGISTRY_FEATURES,
   );
   assert.deepEqual(toPersistedRuntimeRecords(parsed), {
+    pinned_profiles: [pinnedProfile],
     executions: [{ execution_id: "exec-1", state: "starting" }],
+    runtime_sessions: [
+      {
+        kind: "session-admission",
+        schema_version: 1,
+        session_id: "session-1",
+        admission: "open",
+        runtime_epoch: 0,
+      },
+    ],
   });
 });
 
 test("feature presence without a matching gate fails closed", () => {
   assert.throws(
     () => parseRuntimeRecords({ executions: [] }, ["executions.v1"]),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+});
+
+test("runtime admission records reject unknown shape, invalid epochs, and duplicate owners", () => {
+  const admission = {
+    kind: "session-admission",
+    schema_version: 1,
+    session_id: "session-1",
+    admission: "open",
+    runtime_epoch: 0,
+  };
+  for (const invalid of [
+    { ...admission, extra: true },
+    { ...admission, kind: "future-admission" },
+    { ...admission, schema_version: 2 },
+    { ...admission, runtime_epoch: -1 },
+    { ...admission, runtime_epoch: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    assert.throws(
+      () =>
+        parseRuntimeRecords(
+          { required_features: ["runtime-sessions.v1"], runtime_sessions: [invalid] },
+          SUPPORTED_REGISTRY_FEATURES,
+        ),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+    );
+  }
+  assert.throws(
+    () =>
+      parseRuntimeRecords(
+        { required_features: ["runtime-sessions.v1"], runtime_sessions: [admission, admission] },
+        SUPPORTED_REGISTRY_FEATURES,
+      ),
     (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
   );
 });
