@@ -3847,16 +3847,20 @@ async function main() {
     const handoffManagedSourceResult = invokeInstalled(handoffSourceArgs, lifecycleRepository);
     const handoffManagedSource = parseInstalledJson(handoffManagedSourceResult, "handoff managed source bootstrap");
     const handoffSourceManaged = handoffManagedSourceResult.status === 0 && handoffManagedSource.ok === true;
-    if (!handoffSourceManaged) {
-      if (handoffManagedSourceResult.status === 4 && handoffManagedSource.code === "SANDBOX_CAPABILITY_UNAVAILABLE") {
-        recordEnvironmentBlock("managed-runtime resource handoff source admission", handoffManagedSource.code);
-      } else {
-        recordBoundedDefect(
-          `nawabari ${handoffSourceArgs.join(" ")}`,
-          "admit a managed handoff source or fail closed with SANDBOX_CAPABILITY_UNAVAILABLE",
-          { exitCode: handoffManagedSourceResult.status, response: handoffManagedSource },
-        );
-      }
+    // Managed readiness is the same host fact that decided the earlier
+    // profile-selected create: an admitting host must admit this source too,
+    // and a typed fail-closed rejection is conformant only where that create
+    // was also rejected.
+    const handoffSourceTypedUnavailable =
+      handoffManagedSourceResult.status === 4 && handoffManagedSource.code === "SANDBOX_CAPABILITY_UNAVAILABLE";
+    if (!handoffSourceManaged && (managedCreateAdmitted || !handoffSourceTypedUnavailable)) {
+      recordBoundedDefect(
+        `nawabari ${handoffSourceArgs.join(" ")}`,
+        managedCreateAdmitted
+          ? "admit the managed handoff source on a managed-execution-ready host"
+          : "fail closed with SANDBOX_CAPABILITY_UNAVAILABLE",
+        { exitCode: handoffManagedSourceResult.status, response: handoffManagedSource },
+      );
     }
     const handoffSource = handoffSourceManaged
       ? handoffManagedSource
@@ -3922,7 +3926,7 @@ async function main() {
           handoffRun.ok === true &&
           handoffRun.exit_code === 0 &&
           typeof handoffRun.execution?.execution_id === "string";
-        if (handoffRunUnavailable) {
+        if (handoffSourceManaged && handoffRunUnavailable) {
           recordEnvironmentBlock("managed-runtime resource handoff execution", handoffRun.code);
         } else if (handoffSourceManaged && !handoffRunCompleted) {
           recordBoundedDefect(`nawabari ${handoffRunArgs.join(" ")}`, "complete one managed source execution", {
@@ -3986,6 +3990,10 @@ async function main() {
             `nawabari ${handoffArgs.join(" ")}`,
             "retain the source claim without managed execution evidence",
             { exitCode: handoffResult.status, response: handoff, sourceHolds, destinationHolds },
+          );
+        } else if (!handoffSourceManaged) {
+          console.log(
+            "managed-runtime resource handoff failed closed on an untracked source; managed readiness unavailable, source claim retained.",
           );
         }
       }
