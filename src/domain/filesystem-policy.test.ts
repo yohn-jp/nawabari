@@ -12,7 +12,7 @@ import {
   serializeEffectiveFilesystemPolicy,
   validateEffectiveFilesystemPolicy,
 } from "./filesystem-policy.js";
-import { canonicalClaimId } from "../resource-claims.js";
+import { RESOURCE_CLAIM_SCHEMA_VERSION, canonicalClaimId } from "../resource-claims.js";
 
 const PROFILE_DIGEST = "a".repeat(64);
 const SESSION_ID = "0190f1e0-0000-7000-8000-000000000001";
@@ -20,7 +20,7 @@ const WORKTREE_PATH = "/tmp/nawabari-policy-worktree";
 
 function claim(resource: string, mode: "read" | "write" | "exclusive-write") {
   return {
-    schemaVersion: 2,
+    schemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
     claimId: canonicalClaimId(SESSION_ID, resource, mode),
     sessionId: SESSION_ID,
     repositoryId: "1329799765",
