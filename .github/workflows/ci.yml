@@ -315,6 +315,28 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install protected-execution prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap rustc cargo
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo cp "$(command -v node)" /usr/bin/node
+          echo "NAWABARI_TEST_FHS_NODE_INTERPRETER=/usr/bin/node" >> "$GITHUB_ENV"
+          pnpm_spec="$(node -p "require('./package.json').packageManager.split('+')[0]")"
+          sudo "$(command -v npm)" install --global --prefix /usr/local "$pnpm_spec"
+          uv_wheel="$RUNNER_TEMP/uv-0.12.19-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+          curl -fsSLo "$uv_wheel" "https://files.pythonhosted.org/packages/py3/u/uv/$(basename "$uv_wheel")"
+          echo "a63d18a0aa38ee9f21a5406afbbaeb41303bcd954be9d6b7c1b95ac275e53958  $uv_wheel" | sha256sum -c -
+          sudo unzip -o -j "$uv_wheel" "uv-0.12.19.data/scripts/uv" -d /usr/local/bin
+          sudo chmod 0755 /usr/local/bin/uv
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          determinate: false
+
       - name: Build and validate the exact release tarball
         run: pnpm run build && node scripts/run-package-suite.mjs --keep-tarball
 
