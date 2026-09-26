@@ -1422,9 +1422,26 @@ export class SessionRegistry {
   executeFileOperation(
     operation: WorktreeFileOperation,
     executionOptions: FileOperationExecutionOptions = { landlock_helper: null, runtime_projection: null },
+    finalization?: SessionDrainFinalization,
   ): WorktreeFileOperationResult {
-    const reservation = this.withLock(() => this.reserveFileOperationUnsafe(operation, executionOptions));
+    const reservation = this.withLock(() => {
+      // A managed session requires a ready drain finalization whose closed
+      // admission and proven-empty owned scopes are re-read under the lock.
+      this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, operation.session_id, "release-claims");
+      return this.reserveFileOperationUnsafe(operation, executionOptions);
+    });
+    try {
+      return this.executeReservedFileOperation(operation, executionOptions, reservation);
+    } finally {
+      if (finalization !== undefined) this.reopenFileOperationAdmission(finalization);
+    }
+  }
 
+  private executeReservedFileOperation(
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
+    reservation: FileOperationReservationContext,
+  ): WorktreeFileOperationResult {
     if (reservation.replay) {
       if (reservation.record.stage === "completed") return replayedFileOperationResult(reservation.record);
       throw uncertainFileOperation(operation.operation_id, "The durable receipt requires reconciliation.");
@@ -7257,6 +7274,42 @@ export class SessionRegistry {
       );
       return reconciliation;
     });
+  }
+
+  /**
+   * Reopen launch admission after the fenced file operation finished its final
+   * reconciliation. Any concurrent admission change leaves the session closed.
+   */
+  private reopenFileOperationAdmission(finalization: SessionDrainFinalization): void {
+    try {
+      this.withLock(() => {
+        const state = this.readStateUnsafe();
+        const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+          (candidate) => candidate.session_id === finalization.session_id,
+        );
+        if (admissionValue === undefined) return;
+        const admission = parseSessionAdmissionRecord(admissionValue);
+        const session = state.sessions.find((candidate) => candidate.sessionId === finalization.session_id);
+        if (
+          admission.admission !== "closed" ||
+          admission.runtime_epoch !== finalization.admission_epoch ||
+          session?.state !== "active"
+        ) {
+          return;
+        }
+        const runtimeEpoch = nextRuntimeEpoch(state);
+        this.writeUnsafe(
+          state.sessions,
+          state.claims,
+          state.claimSetGeneration,
+          nextRegistryRevision(state),
+          runtimeEpoch,
+          withSessionAdmission(state.runtimeRecords, { ...admission, admission: "open", runtime_epoch: runtimeEpoch }),
+        );
+      });
+    } catch {
+      // The file-operation receipt is authoritative; admission stays closed.
+    }
   }
 
   private fileOperationAuthority(

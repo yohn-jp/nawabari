@@ -508,8 +508,38 @@ export class LocalSessionBackend implements SessionBackend {
     options: FileOperationOptions,
   ): Promise<DomainResult<FileOperationResult>> {
     try {
-      const result = this.registryFor(context).executeFileOperation(options.operation, options.execution_options);
-      return success(result);
+      const registry = this.registryFor(context);
+      const sessionId = options.operation.session_id;
+      let admission: ReturnType<SessionRegistry["getSessionLaunchAdmission"]>;
+      try {
+        admission = registry.getSessionLaunchAdmission(sessionId);
+      } catch {
+        // The registry rejects the operation with its canonical error below.
+        admission = undefined;
+      }
+      if (admission === undefined) {
+        return success(registry.executeFileOperation(options.operation, options.execution_options));
+      }
+      const drained = await releaseSessionClaimsWithRuntimeDrain(
+        runtimeLifecycleAdapter(
+          registry,
+          ({ fence }) =>
+            registryMutation(() => registry.executeFileOperation(options.operation, options.execution_options, fence)),
+          this.registryOptions.cgroupFilesystem,
+        ),
+        sessionId,
+        registry.runtimeEpoch,
+      );
+      if (!drained.ok) return drained;
+      if (drained.value.status !== "completed" || drained.value.value === undefined) {
+        return failure(
+          new DomainError("OPERATION_REJECTED", "Managed file operation is blocked until owned executions drain.", {
+            session_id: sessionId,
+            status: drained.value.status,
+          }),
+        );
+      }
+      return drained.value.value;
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }

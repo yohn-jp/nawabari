@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +17,13 @@ import {
   toPersistedSessionExecutionRecord,
 } from "./session-execution-record.js";
 import type { SandboxProbe } from "./sandbox.js";
+import {
+  SESSION_RUNTIME_PROJECTION_CONTRACT_ID,
+  SESSION_RUNTIME_PROJECTION_SCHEMA_VERSION,
+  STRICT_RUNTIME_POLICY,
+} from "./runtime-projection.js";
+import type { FileOperationOptions } from "./session.js";
+import type { WorktreeFileOperation } from "./worktree-file-operation.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import { DomainError, failure } from "./errors.js";
 import { resolveBuiltinWorktreeProfile } from "./worktree-profile-builtins.js";
@@ -1253,6 +1261,266 @@ test("the local backend exposes close and gc as stable automation results", asyn
   } finally {
     removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+type ManagedFileOperationScope = "empty" | "populated" | "unknown" | "none";
+
+function managedFileOperationFixture(scope: ManagedFileOperationScope) {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-managed-file-operation`;
+  fs.mkdirSync(path.join(repositoryPath, "docs"));
+  fs.writeFileSync(path.join(repositoryPath, "docs", ".keep"), "fixture\n");
+  runGit(["add", "docs/.keep"], repositoryPath);
+  runGit(["commit", "-m", "docs"], repositoryPath);
+  const registry = new SessionRegistry({ cwd: repositoryPath });
+  const repositoryIdentity = { repositoryHost: "local", repositoryId: registry.repository.repositoryId };
+  const baseRevision = runGit(["rev-parse", "HEAD"], repositoryPath);
+  const paths = ["docs/managed.txt"];
+  const session = registry.provision({
+    worktreePath,
+    branchName: "feature/managed-file-operation",
+    baseRef: "main",
+    executionScope: {
+      version: 1,
+      kind: "implementation-execution-scope",
+      authorization: {
+        version: 1,
+        kind: "implementation-authorization",
+        contractVersion: 1,
+        implementation: { ...repositoryIdentity, number: 639 },
+        governedBodyDigest: "c".repeat(64),
+      },
+      repository: { ...repositoryIdentity, repository: "local/nawabari" },
+      base: { branch: "main", revision: baseRevision },
+      scope: { readOnly: paths, write: paths, create: paths, delete: paths, deny: [] },
+    },
+    candidateWorkingSet: {
+      kind: "candidate-working-set",
+      schemaVersion: 1,
+      workingSetId: "candidate-file-operation-639",
+      repository: { ...repositoryIdentity, repository: "local/nawabari" },
+      revision: baseRevision,
+      entries: paths.map((locator) => ({
+        state: "supporting",
+        target: { kind: "file", locator },
+        reason: { id: "managed-file-operation", summary: "managed file-operation fence" },
+        evidence: [],
+      })),
+    },
+    initialClaims: [{ resource: "docs/**", mode: "write" }],
+  });
+
+  const persisted = JSON.parse(fs.readFileSync(registry.paths.registry, "utf8")) as Record<string, unknown>;
+  const runtimeEpoch = Number(persisted.runtime_epoch);
+  const executions: unknown[] = [];
+  if (scope !== "none") {
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const starting = reserveExecution({
+      session_id: session.sessionId,
+      execution_id: `managed-file-operation-${scope}`,
+      ...(scope === "unknown" ? {} : { cgroup_root: "/sys/fs/cgroup/user.slice/test.scope" }),
+      profile_digest: "a".repeat(64),
+      filesystem_token: "b".repeat(64),
+      runtime_epoch: runtimeEpoch,
+      boot_id: bootId,
+      now: "2026-09-26T00:00:00.000Z",
+    });
+    if (!starting.ok) throw starting.error;
+    const exited = recordExecutionState(starting.value, { state: "exited", now: "2026-09-26T00:00:01.000Z" });
+    if (!exited.ok) throw exited.error;
+    executions.push(toPersistedSessionExecutionRecord(exited.value));
+  }
+  fs.writeFileSync(
+    registry.paths.registry,
+    `${JSON.stringify({
+      ...persisted,
+      required_features: ["runtime-sessions.v1", "executions.v1"],
+      runtime_sessions: [
+        {
+          kind: "session-admission",
+          schema_version: 1,
+          session_id: session.sessionId,
+          admission: "open",
+          runtime_epoch: runtimeEpoch,
+        },
+      ],
+      executions,
+    })}\n`,
+  );
+
+  const observations: { lockHeld: boolean }[] = [];
+  const cgroupFilesystem = {
+    statSync: () => ({ isDirectory: () => true, isFile: () => true }),
+    realpathSync: (file: string) => file,
+    readFileSync: (file: string) => {
+      if (file.endsWith("cgroup.events")) {
+        observations.push({ lockHeld: fs.existsSync(registry.paths.lock) });
+        return scope === "populated" ? "populated 1\n" : "populated 0\n";
+      }
+      if (file.endsWith("cgroup.procs")) return "";
+      throw new Error("unobserved cgroup file");
+    },
+    writeFileSync: () => undefined,
+    mkdirSync: () => undefined,
+    rmdirSync: () => undefined,
+  } as unknown as CgroupFileSystem;
+
+  const helperCalls: { lockHeld: boolean }[] = [];
+  const source = fs.realpathSync(execFileSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).trim());
+  const executionOptions: NonNullable<FileOperationOptions["execution_options"]> = {
+    landlock_helper: { provider: { id: "fhs-landlock-helper-provider", requirement_id: "landlock-helper" }, source },
+    runtime_projection: {
+      contract_id: SESSION_RUNTIME_PROJECTION_CONTRACT_ID,
+      schema_version: SESSION_RUNTIME_PROJECTION_SCHEMA_VERSION,
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "development", version: "1" },
+      requirements: [{ id: "landlock-helper", kind: "runtime", name: "python3", version: ">=3" }],
+      filesystem: [{ source, target: source, access_mode: "read-only", provenance: "runtime-profile" }],
+      executables: [
+        {
+          name: "python3",
+          target: source,
+          provider: { id: "fhs-landlock-helper-provider", requirement_id: "landlock-helper" },
+          provenance: "runtime-profile",
+        },
+      ],
+    },
+    run_helper: (packet: string) => {
+      helperCalls.push({ lockHeld: fs.existsSync(registry.paths.lock) });
+      const request = JSON.parse(packet) as Record<string, string>;
+      const target = path.join(request.root, request.path);
+      fs.writeFileSync(target, Buffer.from(request.payload_base64 ?? "", "base64"));
+      const stat = fs.lstatSync(target);
+      const contents = fs.readFileSync(target);
+      return JSON.stringify({
+        ok: true,
+        identity: {
+          dev: String(stat.dev),
+          ino: String(stat.ino),
+          size: stat.size,
+          digest: createHash("sha256").update(contents).digest("hex"),
+        },
+      });
+    },
+    policy: {
+      profile: {
+        status: "applied",
+        identity: "profile-639",
+        digest: "a".repeat(64),
+        revision: 1,
+        epoch: 1,
+        scope: {
+          readOnly: ["docs/**"],
+          write: ["docs/**"],
+          create: ["docs/**"],
+          delete: ["docs/**"],
+          rename: ["docs/**"],
+          deny: [],
+          immutable: [],
+        },
+      },
+      repository: repositoryIdentity,
+      base: { branch: "main", revision: baseRevision },
+    },
+  };
+  const operation = (operationId: string): WorktreeFileOperation => ({
+    contract_id: "nawabari.worktree-file-operation.v1",
+    schema_version: 1,
+    session_id: session.sessionId,
+    operation_id: operationId,
+    operation: "CREATE",
+    worktree_root: repositoryPath,
+    path: "docs/managed.txt",
+    expected_digest: null,
+    requested_generation: new SessionRegistry({ cwd: repositoryPath }).claimSetGeneration(),
+    scope: { create: ["docs/managed.txt"], delete: [], deny: [] },
+    claims: [],
+    payload_ref: { encoding: "base64", data: Buffer.from(`payload:${operationId}`).toString("base64") },
+  });
+  return {
+    repositoryPath,
+    worktreePath,
+    session,
+    runtimeEpoch,
+    backend: new LocalSessionBackend({ registry: { cgroupFilesystem } }),
+    executionOptions,
+    operation,
+    observations,
+    helperCalls,
+    registry: () => new SessionRegistry({ cwd: repositoryPath, cgroupFilesystem }),
+    cleanup: () => {
+      removeWorktree(repositoryPath, worktreePath);
+      fs.rmSync(repositoryPath, { recursive: true, force: true });
+    },
+  };
+}
+
+for (const [scope, status] of [
+  ["populated", "waiting"],
+  ["unknown", "blocked"],
+  ["none", "waiting"],
+] as const) {
+  test(`managed file operations close admission and perform no I/O when owned scope is ${scope}`, async () => {
+    const fixture = managedFileOperationFixture(scope);
+    try {
+      const result = await fixture.backend.fileOperation(
+        { cwd: fixture.repositoryPath },
+        { operation: fixture.operation(`managed-${scope}`), execution_options: fixture.executionOptions },
+      );
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.equal(result.error.code, "OPERATION_REJECTED");
+      assert.equal(result.error.details?.status, status);
+      assert.equal(fixture.helperCalls.length, 0);
+      assert.equal(fs.existsSync(path.join(fixture.worktreePath, "docs/managed.txt")), false);
+      const registry = fixture.registry();
+      assert.deepEqual(registry.fileOperations(fixture.session.sessionId), []);
+      const admission = registry.getSessionLaunchAdmission(fixture.session.sessionId);
+      assert.equal(admission?.admission, "closed");
+      assert.ok((admission?.runtime_epoch ?? 0) > fixture.runtimeEpoch);
+      assert.equal(
+        fixture.observations.every((observation) => !observation.lockHeld),
+        true,
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+test("managed file operations execute only after proven-empty owned scopes and reopen admission", async () => {
+  const fixture = managedFileOperationFixture("empty");
+  try {
+    const operation = fixture.operation("managed-empty");
+    const result = await fixture.backend.fileOperation(
+      { cwd: fixture.repositoryPath },
+      { operation, execution_options: fixture.executionOptions },
+    );
+    assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+    assert.equal(fixture.helperCalls.length, 1);
+    assert.equal(fixture.helperCalls[0]?.lockHeld, false);
+    assert.equal(
+      fixture.observations.some((observation) => !observation.lockHeld),
+      true,
+    );
+    assert.equal(fs.readFileSync(path.join(fixture.worktreePath, "docs/managed.txt"), "utf8"), "payload:managed-empty");
+    const registry = fixture.registry();
+    const [receipt] = registry.fileOperations(fixture.session.sessionId);
+    assert.equal(receipt?.stage, "completed");
+    const admission = registry.getSessionLaunchAdmission(fixture.session.sessionId);
+    assert.equal(admission?.admission, "open");
+    assert.equal(admission?.runtime_epoch, registry.runtimeEpoch);
+    assert.ok(registry.runtimeEpoch > fixture.runtimeEpoch + 1);
+
+    const replay = await fixture.backend.fileOperation(
+      { cwd: fixture.repositoryPath },
+      { operation, execution_options: fixture.executionOptions },
+    );
+    assert.equal(replay.ok, true, replay.ok ? "" : replay.error.message);
+    assert.equal(fixture.helperCalls.length, 1);
+  } finally {
+    fixture.cleanup();
   }
 });
 
