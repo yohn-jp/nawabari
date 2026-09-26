@@ -1005,8 +1005,8 @@ async function main() {
     const migrationRegistryPath = path.join(migrationRepository, ".git", "nawabari", "session-registry.json");
     const legacyRegistry = JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8"));
     legacyRegistry.schema_version = 1;
-    legacyRegistry.claims_schema_version = 1;
-    legacyRegistry.claims = legacyRegistry.claims.map((claim) => ({ ...claim, schema_version: 1 }));
+    legacyRegistry.claims_schema_version = 2;
+    legacyRegistry.claims = legacyRegistry.claims.map((claim) => ({ ...claim, schema_version: 2 }));
     fs.writeFileSync(migrationRegistryPath, `${JSON.stringify(legacyRegistry, null, 2)}\n`);
     const migrationResult = invokeInstalled(["migrate", "--json"], migrationRepository);
     const migration = parseInstalledJson(migrationResult, "legacy registry migration");
@@ -1016,7 +1016,7 @@ async function main() {
     const migratedRegistry = JSON.parse(fs.readFileSync(migrationRegistryPath, "utf8"));
     if (
       migratedRegistry.schema_version !== 2 ||
-      migratedRegistry.claims_schema_version !== 2 ||
+      migratedRegistry.claims_schema_version !== 3 ||
       migratedRegistry.sessions?.some((session) => session.session_id === migrationSession.session_id) !== true ||
       migratedRegistry.claims?.some(
         (claim) => claim.session_id === migrationSession.session_id && claim.resource === "README.md",
