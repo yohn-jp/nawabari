@@ -10,6 +10,7 @@ import {
 } from "./repository-runtime-snapshot.js";
 import type { ResourceClaim } from "./resource-claims.js";
 import type { RepositoryRegistryView, SessionRecord } from "./session-registry.js";
+import { appendRuntimeEvent } from "./session-runtime-history.js";
 
 const TIMESTAMP = "2026-01-02T03:04:05.006Z";
 
@@ -71,6 +72,41 @@ test("keeps available observations and deterministic session/claim ordering", ()
   );
   assert.deepEqual(result.value.observations.coordination, available);
   assert.equal(serializeRepositoryRuntimeSnapshot(result.value).endsWith("\n"), true);
+});
+
+test("projects bounded history for current and removed sessions without granting lifecycle authority", () => {
+  const runtimeRecords = appendRuntimeEvent({ requiredFeatures: [], records: {} }, [
+    {
+      kind: "lifecycle",
+      session_id: "session-a",
+      execution_id: null,
+      source: "session-registry",
+      operation: "absent->active",
+      before_revision: 0,
+      after_revision: 1,
+      observed_at: TIMESTAMP,
+    },
+    {
+      kind: "lifecycle",
+      session_id: "closed-session",
+      execution_id: null,
+      source: "session-registry",
+      operation: "closed->absent",
+      before_revision: 1,
+      after_revision: 2,
+      observed_at: TIMESTAMP,
+    },
+  ]);
+  const result = getNawabariRepositoryRuntimeSnapshot(
+    input({ registry: registry({ sessions: [session("session-a")], runtimeRecords }) }),
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(Object.keys(result.value.history ?? {}), ["closed-session", "session-a"]);
+  assert.equal(result.value.history?.["closed-session"]?.events[0]?.operation, "closed->absent");
+  assert.equal(result.value.history?.["session-a"]?.events[0]?.event_id, "history:1");
+  assert.equal(result.value.history?.["session-a"]?.coverage, "from-session-creation");
+  assert.equal(result.value.history?.["closed-session"]?.coverage, "prior-history-unknown");
 });
 
 test("records deterministic truncation reasons after unknown observations", () => {

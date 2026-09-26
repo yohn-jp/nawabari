@@ -96,6 +96,7 @@ test("redacts arbitrary repository content from agent runtime status", () => {
   assert.deepEqual(Object.keys(result.value).sort(), [
     "blocker",
     "cursor",
+    "history",
     "lifecycle_state",
     "physical_state",
     "process_status",
@@ -128,6 +129,7 @@ test("truncates agent attention within budget and returns an opaque cursor", () 
   assert.deepEqual(Object.keys(result.value).sort(), [
     "blocker",
     "cursor",
+    "history",
     "lifecycle_state",
     "physical_state",
     "process_status",

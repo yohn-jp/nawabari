@@ -67,6 +67,23 @@ test("renders the supplied matrix and conflict values without recalculating them
   assert.match(conflictOutput, /\\u\{1b\}/u);
 });
 
+test("runtime view renders bounded timeline evidence without interpreting it as authority", () => {
+  const output = renderRepositoryScreen(
+    model({
+      runtime: [
+        {
+          id: "s1",
+          status: "active",
+          history: { events: [{ operation: "active->parked" }], bound: 256, truncated: true },
+        },
+      ],
+    }),
+    { width: 140, height: 40 },
+    { view: "runtime", selected_id: "s1", snapshot_token: "snapshot-1" },
+  );
+  assert.match(output, /timeline=1\/256\+ latest=active->parked/u);
+});
+
 test("small viewports stay bounded and advertise snapshot truncation", () => {
   const output = renderRepositoryScreen(model({ truncated: true, next_cursor: "cursor-2" }), { width: 24, height: 5 });
   assert.ok(output.split("\n").length <= 5);

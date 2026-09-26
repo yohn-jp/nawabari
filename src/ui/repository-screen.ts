@@ -204,7 +204,20 @@ function rowText(record: ScreenRecord, view: RepositoryScreenView, index: number
     return `  [${escapeTerminalText(valueText(record, ["severity", "priority"]))}] ${id} ${escapeTerminalText(valueText(record, ["reason", "message", "detail"]))}`;
   }
   if (view === "runtime") {
-    return `  ${id} status=${escapeTerminalText(valueText(record, ["status", "health", "state", "lifecycle"]))} profile=${escapeTerminalText(valueText(record, ["profile", "runtime_profile"]))} process=${escapeTerminalText(valueText(record, ["process", "process_state"]))}`;
+    const history = record.history;
+    const timeline =
+      history !== null && typeof history === "object" && !Array.isArray(history)
+        ? (history as Record<string, unknown>)
+        : null;
+    const events = Array.isArray(timeline?.events) ? timeline.events : [];
+    const last = events.at(-1);
+    const lastEvent =
+      last !== null && typeof last === "object" && !Array.isArray(last) ? (last as Record<string, unknown>) : null;
+    const evidence =
+      timeline === null
+        ? ""
+        : ` timeline=${events.length}/${String(timeline.bound)}${timeline.truncated === true ? "+" : ""} latest=${escapeTerminalText(scalar(lastEvent?.operation) ?? "unknown")}`;
+    return `  ${id} status=${escapeTerminalText(valueText(record, ["status", "health", "state", "lifecycle"]))} profile=${escapeTerminalText(valueText(record, ["profile", "runtime_profile"]))} process=${escapeTerminalText(valueText(record, ["process", "process_state"]))}${evidence}`;
   }
   return `  ${id} path=${escapeTerminalText(valueText(record, ["path", "resource"]))} state=${escapeTerminalText(valueText(record, ["state", "classification", "status"]))} message=${escapeTerminalText(valueText(record, ["message", "reason", "detail"]))}`;
 }

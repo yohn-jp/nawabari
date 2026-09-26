@@ -174,17 +174,20 @@ test("resource handoff persists one atomic retry receipt and retries idempotentl
     };
     assert.equal(persisted.registry_revision, before.registry_revision + 1);
     assert.equal(persisted.runtime_epoch, before.runtime_epoch);
-    assert.deepEqual(persisted.required_features, ["recent-events.v1"]);
-    assert.deepEqual(persisted.recent_events[0], {
-      kind: "resource-handoff",
-      schema_version: 1,
-      operation_id: "handoff-500",
-      from_session_id: source.sessionId,
-      to_session_id: destination.sessionId,
-      resource: "README.md",
-      mode: "write",
-      claim_set_generation: result.claimSetGeneration,
-    });
+    assert.deepEqual(persisted.required_features, ["recent-events.v1", "session-history.v1"]);
+    assert.deepEqual(
+      persisted.recent_events.find((record) => record.kind === "resource-handoff"),
+      {
+        kind: "resource-handoff",
+        schema_version: 1,
+        operation_id: "handoff-500",
+        from_session_id: source.sessionId,
+        to_session_id: destination.sessionId,
+        resource: "README.md",
+        mode: "write",
+        claim_set_generation: result.claimSetGeneration,
+      },
+    );
     const retry = await new SessionRegistry({ cwd: repositoryPath }).handoffResources(options, execution);
     assert.equal(retry.status, "idempotent");
     assert.equal(retry.idempotent, true);

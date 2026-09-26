@@ -19,6 +19,7 @@ test("registry optional areas are a finite feature-gated contract", () => {
     "retentions.v1",
     "recent-events.v1",
     "file-operations.v1",
+    "session-history.v1",
   ]);
   assert.deepEqual(SUPPORTED_REGISTRY_FEATURES, [
     "pinned-profiles.v1",
@@ -26,6 +27,7 @@ test("registry optional areas are a finite feature-gated contract", () => {
     "executions.v1",
     "recent-events.v1",
     "file-operations.v1",
+    "session-history.v1",
   ]);
   assert.deepEqual(parseRuntimeRecords({}), { requiredFeatures: [], records: {} });
 });
