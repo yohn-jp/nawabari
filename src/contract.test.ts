@@ -221,6 +221,42 @@ test("session lifecycle capability truthfully publishes Linux-only stale-lock re
   assert.equal(retry.fail_closed, true);
 });
 
+test("session lifecycle publishes the profile namespace, pinning, and public inspection contracts", () => {
+  const contract = machineContract("test-version");
+  assert.ok(Array.isArray(contract.capabilities));
+  const lifecycle = contract.capabilities.find(
+    (candidate) =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      !Array.isArray(candidate) &&
+      candidate.id === "session-lifecycle",
+  ) as JsonRecord | undefined;
+  assert.ok(lifecycle);
+
+  const profile = lifecycle?.worktree_profile as JsonRecord;
+  assert.equal(profile.contract_id, "nawabari.worktree-runtime-profile.v1");
+  assert.equal(profile.schema_version, 1);
+  assert.deepEqual(profile.commands, ["session create", "profile list", "profile show"]);
+  assert.deepEqual(profile.namespaces, ["builtin", "repository"]);
+  assert.deepEqual(profile.profiles, ["minimal", "standard-shell"]);
+
+  const cli = profile.cli as JsonRecord;
+  assert.equal(cli.contract_id, "nawabari.worktree-profile-cli.v1");
+  assert.equal(cli.schema_version, 1);
+  assert.deepEqual(cli.serialization_keys, ["cli", "contract"]);
+  assert.deepEqual(cli.namespaces, ["builtin", "repository"]);
+
+  const pinning = profile.pinning as JsonRecord;
+  assert.deepEqual(pinning.catalog_sources, ["repository", "builtin"]);
+  assert.equal(pinning.builtin_revision, "sha256-canonical-validated-profile-bytes");
+  assert.equal(pinning.digest_includes, "catalog-source-discriminant-and-source");
+
+  const inspection = profile.inspection as JsonRecord;
+  assert.equal(inspection.schema_version, 1);
+  assert.equal(inspection.serialization_key, "worktree-profile-inspection");
+  assert.equal(inspection.projection, "public-state");
+});
+
 test("session-diagnostics lifecycle projection is the live XState-derived table, including both branches of a guarded transition observed at the same state", () => {
   const contract = machineContract("test-version");
   assert.ok(Array.isArray(contract.capabilities));

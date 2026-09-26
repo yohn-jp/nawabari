@@ -1,0 +1,19 @@
+{
+  "kind": "candidate-working-set",
+  "schemaVersion": 1,
+  "workingSetId": "yohn-jp/nawabari-378-repository-mismatch-v1",
+  "repository": {
+    "repositoryHost": "github.com",
+    "repositoryId": "1329799766",
+    "repository": "yohn-jp/nawabari"
+  },
+  "revision": "__BASE_REVISION__",
+  "entries": [
+    {
+      "state": "required",
+      "target": { "kind": "file", "locator": "bounded-session/visible-read.txt" },
+      "reason": { "id": "repository-mismatch", "summary": "Candidate belongs to a different repository identity" },
+      "evidence": [{ "artifact": "implementation-378", "reference": "acceptance/repository-mismatch" }]
+    }
+  ]
+}

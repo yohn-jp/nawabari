@@ -24,6 +24,39 @@ jobs:
     permissions:
       contents: read
 
+  linux-system-e2e:
+    needs: changes
+    if: needs.changes.outputs.release_docs_only != 'true'
+    name: Linux system E2E
+    uses: yohn-jp/.github/.github/workflows/linux-system-e2e.yml@main
+    with:
+      pre-command: |
+        set -euo pipefail
+        sudo apt-get update
+        # Standalone Linux compatibility (docs/standalone-linux-compatibility.md)
+        # needs the host development toolchain under the projected FHS roots,
+        # not only in runner tool caches.
+        sudo apt-get install -y bubblewrap rustc cargo
+        if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        sudo cp "$(command -v node)" /usr/bin/node
+        echo "NAWABARI_TEST_FHS_NODE_INTERPRETER=/usr/bin/node" >> "$GITHUB_ENV"
+        pnpm_spec="$(node -p "require('./package.json').packageManager.split('+')[0]")"
+        sudo "$(command -v npm)" install --global --prefix /usr/local "$pnpm_spec"
+        uv_wheel="$RUNNER_TEMP/uv-0.12.19-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+        curl -fsSLo "$uv_wheel" "https://files.pythonhosted.org/packages/py3/u/uv/$(basename "$uv_wheel")"
+        echo "a63d18a0aa38ee9f21a5406afbbaeb41303bcd954be9d6b7c1b95ac275e53958  $uv_wheel" | sha256sum -c -
+        sudo unzip -o -j "$uv_wheel" "uv-0.12.19.data/scripts/uv" -d /usr/local/bin
+        sudo chmod 0755 /usr/local/bin/uv
+        for tool in /usr/local/bin/pnpm /usr/bin/rustc /usr/bin/cargo /usr/bin/python3 /usr/local/bin/uv /usr/bin/cc; do
+          "$tool" --version
+        done
+      command: pnpm run verify
+      timeout-minutes: 40
+    permissions:
+      contents: read
+
   changes:
     name: detect release-docs-only change
     runs-on: ubuntu-latest
@@ -240,6 +273,15 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
       - name: Build
         run: pnpm run build

@@ -120,6 +120,8 @@ export interface GitCommandRunner {
   run(args: readonly string[], cwd: string): string;
   /** Preserve leading/trailing whitespace for NUL-delimited Git records. */
   readonly runRaw?: (args: readonly string[], cwd: string) => string;
+  /** Preserve exact bytes for bounded blob evidence. */
+  readonly runBuffer?: (args: readonly string[], cwd: string) => Buffer;
 }
 
 export interface GitCommandRunnerOptions {
@@ -203,12 +205,32 @@ export function createGitCommandRunner(options: GitCommandRunnerOptions = {}): G
     }
   };
 
+  const executeBuffer = (args: readonly string[], cwd: string): Buffer => {
+    const command = args.map((argument) => boundedDetail(argument)).join(" ");
+    try {
+      return Buffer.from(
+        execFileSync(executable, [...args], {
+          cwd,
+          maxBuffer: maxOutputBytes,
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: timeoutMs,
+          env: canonicalGitSubprocessEnvironment(options.env),
+        }),
+      );
+    } catch (error: unknown) {
+      throw gitProcessError(error, command, cwd);
+    }
+  };
+
   return Object.freeze({
     run(args: readonly string[], cwd: string): string {
       return execute(args, cwd).trim();
     },
     runRaw(args: readonly string[], cwd: string): string {
       return execute(args, cwd);
+    },
+    runBuffer(args: readonly string[], cwd: string): Buffer {
+      return executeBuffer(args, cwd);
     },
   });
 }

@@ -10,6 +10,9 @@ import {
   createCgroupScope,
   deriveCgroupScopeName,
   readCgroupAccounting,
+  readCgroupPopulation,
+  resolveManagedCgroupRoot,
+  terminateCgroupScope,
   type CgroupFileSystem,
 } from "./cgroups-v2.js";
 
@@ -24,8 +27,10 @@ function fixture(): { readonly root: string; readonly filesystem: CgroupFileSyst
     readFileSync: (file) => fs.readFileSync(file, "utf8"),
     writeFileSync: (file, value) => {
       fs.writeFileSync(file, value, "utf8");
-      if (path.basename(file) === "cgroup.kill")
+      if (path.basename(file) === "cgroup.kill") {
         fs.writeFileSync(path.join(path.dirname(file), "cgroup.procs"), "", "utf8");
+        fs.writeFileSync(path.join(path.dirname(file), "cgroup.events"), "populated 0\n", "utf8");
+      }
     },
     mkdirSync: (file, options) => {
       fs.mkdirSync(file, options);
@@ -36,6 +41,7 @@ function fixture(): { readonly root: string; readonly filesystem: CgroupFileSyst
         initializedScopes.add(file);
         for (const [name, value] of [
           ["cgroup.procs", ""],
+          ["cgroup.events", "populated 0\n"],
           [
             "cpu.stat",
             reused
@@ -67,6 +73,26 @@ test("cgroups v2 scope names bind session and execution identity", () => {
   assert.equal(first, same);
   assert.notEqual(first, different);
   assert.match(first, /^nawabari-[0-9a-f]{48}$/u);
+});
+
+test("managed root resolution binds the current delegated parent and rejects escaped membership", () => {
+  const root = "/sys/fs/cgroup/user.slice/delegated.scope";
+  const filesystem: CgroupFileSystem = {
+    statSync: (file) => ({
+      isDirectory: () => file === root,
+      isFile: () => file === `${root}/cgroup.controllers`,
+    }),
+    realpathSync: (file) => file,
+    readFileSync: () => "cpu memory pids\n",
+    writeFileSync: () => undefined,
+    mkdirSync: () => undefined,
+    rmdirSync: () => undefined,
+  };
+  const resolved = resolveManagedCgroupRoot({ membership: "0::/user.slice/delegated.scope/runner\n", filesystem });
+  assert.equal(resolved.ok, true, resolved.ok ? "" : resolved.error.message);
+  if (resolved.ok) assert.equal(resolved.value, root);
+  assert.equal(resolveManagedCgroupRoot({ membership: "0::/user.slice/../escape/runner\n", filesystem }).ok, false);
+  assert.equal(resolveManagedCgroupRoot({ root: "/sys/fs/cgroup/../escape", filesystem }).ok, false);
 });
 
 test("cgroups v2 limits, bounded accounting, attach, and cleanup remain identity-bound", () => {
@@ -108,6 +134,91 @@ test("occupied deterministic scopes are not adopted on restart", () => {
     const retry = createCgroupScope(identity, { root: testFixture.root, filesystem: testFixture.filesystem });
     assert.equal(retry.ok, false);
     if (!retry.ok) assert.equal(retry.error.code, "SANDBOX_CGROUP_SCOPE_CONFLICT");
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("cgroup.events proves descendant occupancy and process-read failure is unknown", () => {
+  const testFixture = fixture();
+  try {
+    const created = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-population" },
+      { root: testFixture.root, filesystem: testFixture.filesystem },
+    );
+    assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+    if (!created.ok) return;
+
+    fs.writeFileSync(path.join(created.value.path, "cgroup.events"), "populated 1\n", "utf8");
+    fs.writeFileSync(path.join(created.value.path, "cgroup.procs"), "", "utf8");
+    assert.deepEqual(readCgroupPopulation(created.value), {
+      state: "populated",
+      populated: true,
+      processes: [],
+      events: { populated: 1 },
+    });
+
+    fs.rmSync(path.join(created.value.path, "cgroup.procs"));
+    const unknown = readCgroupPopulation(created.value);
+    assert.equal(unknown.state, "unknown");
+    assert.equal(unknown.processes, null);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("cleanup refuses to remove a scope when occupancy evidence is unavailable", () => {
+  const testFixture = fixture();
+  try {
+    const created = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-unknown" },
+      { root: testFixture.root, filesystem: testFixture.filesystem },
+    );
+    assert.equal(created.ok, true, created.ok ? "" : JSON.stringify(created.error));
+    if (!created.ok) return;
+    fs.rmSync(path.join(created.value.path, "cgroup.events"));
+    const cleaned = cleanupCgroupScope(created.value);
+    assert.equal(cleaned.ok, false);
+    if (!cleaned.ok) assert.equal(cleaned.error.code, "SANDBOX_CGROUP_CLEANUP_FAILED");
+    assert.equal(fs.existsSync(created.value.path), true);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("termination kills an occupied descendant scope and leaves an empty scope observable", () => {
+  const testFixture = fixture();
+  try {
+    const descendant = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-descendant" },
+      { root: testFixture.root, filesystem: testFixture.filesystem },
+    );
+    assert.equal(descendant.ok, true, descendant.ok ? "" : JSON.stringify(descendant.error));
+    if (!descendant.ok) return;
+    fs.writeFileSync(path.join(descendant.value.path, "cgroup.events"), "populated 1\n", "utf8");
+    fs.writeFileSync(path.join(descendant.value.path, "cgroup.procs"), "", "utf8");
+
+    const terminatedDescendant = terminateCgroupScope(descendant.value);
+    assert.equal(
+      terminatedDescendant.ok,
+      true,
+      terminatedDescendant.ok ? "" : JSON.stringify(terminatedDescendant.error),
+    );
+    if (!terminatedDescendant.ok) return;
+    assert.equal(terminatedDescendant.value.after_population.state, "empty");
+    assert.equal(fs.existsSync(descendant.value.path), true);
+
+    const empty = createCgroupScope(
+      { session_id: "session-a", execution_id: "run-empty" },
+      { root: testFixture.root, filesystem: testFixture.filesystem },
+    );
+    assert.equal(empty.ok, true, empty.ok ? "" : JSON.stringify(empty.error));
+    if (!empty.ok) return;
+    const terminatedEmpty = terminateCgroupScope(empty.value);
+    assert.equal(terminatedEmpty.ok, true, terminatedEmpty.ok ? "" : JSON.stringify(terminatedEmpty.error));
+    if (!terminatedEmpty.ok) return;
+    assert.equal(terminatedEmpty.value.after_population.state, "empty");
+    assert.equal(fs.existsSync(empty.value.path), true);
   } finally {
     testFixture.cleanup();
   }

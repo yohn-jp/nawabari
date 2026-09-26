@@ -48,6 +48,21 @@ import type {
   SessionLifecycleUnconditionalTransition,
 } from "./session-lifecycle-classification.js";
 
+/** Read-only worktree-profile inspection is the public-state projection for #418. */
+export {
+  inspectWorktreeProfile,
+  serializeWorktreeProfileInspection,
+  WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION,
+  WORKTREE_PROFILE_INSPECTION_SERIALIZATION_KEY,
+} from "./domain/worktree-profile-inspection.js";
+export type {
+  WorktreeProfileCatalogObservation,
+  WorktreeProfileDrift,
+  WorktreeProfileInspection,
+  WorktreeProfileRuntimeObservation,
+  WorktreeProfileToolAvailability,
+} from "./domain/worktree-profile-inspection.js";
+
 /** Schema generation for this public state-API module itself. */
 export const NAWABARI_STATE_API_SCHEMA_VERSION = 1 as const;
 

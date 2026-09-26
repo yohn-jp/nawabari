@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -34,6 +35,17 @@ import {
   materializeAuxiliaryStateProjection,
   resolveAuxiliaryStateTrackedPathEvidence,
 } from "./domain/auxiliary-state-projection.js";
+import { DomainError } from "./domain/errors.js";
+import {
+  materializeSessionGitConfig,
+  resolveSessionHookSet,
+  runGovernedHook,
+  type GovernedHookEvent,
+  type SessionGitConfig,
+  type SessionHookMaterial,
+} from "./domain/session-git-hooks.js";
+import { spawnSync } from "node:child_process";
+import { compileWorkingSetRuntimeProjection } from "./domain/working-set-runtime-projection.js";
 import {
   composeEffectiveWorkingSet,
   evaluateWorkingSetExpansion,
@@ -48,14 +60,76 @@ import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
 import {
   REGISTRY_FEATURES,
   SUPPORTED_REGISTRY_FEATURES,
+  MAX_RUNTIME_RECORDS,
   emptyRuntimeRecords,
   parseRuntimeRecords,
+  parseSessionAdmissionRecord,
   toPersistedRuntimeRecords,
   type ParsedRuntimeRecords,
   type RegistryFeature,
+  type SessionAdmissionRecord,
   type RuntimeRecord,
   type RuntimeRecords,
+  type ResourceHandoffRecentEvent,
 } from "./registry/runtime-records.js";
+import {
+  buildResourceOverlapGraph,
+  createResourceIntent,
+  type ResourceIntentInput,
+  type ResourceOverlapBounds,
+  type ResourceOverlapGraph,
+} from "./resource-coordination.js";
+import {
+  applyCoordinationTransaction,
+  planCoordinationTransaction,
+  type CoordinationTransactionRequest,
+  type CoordinationTransactionResult,
+  type CoordinationTransactionPlan,
+  type CoordinationTransactionSnapshot,
+} from "./coordination-transactions.js";
+import {
+  previewCoordination,
+  type CoordinationPreviewOptions,
+  type CoordinationPreviewRegistry,
+  type CoordinationPreviewResult,
+} from "./coordination-preview.js";
+import {
+  projectResourceCoordinationSnapshot,
+  type CoordinationContractInput,
+  type ResourceCoordinationSnapshot,
+  type ResourceCoordinationSnapshotBounds,
+  type ResourceCoordinationSnapshotInput,
+} from "./resource-coordination-snapshot.js";
+import {
+  handoffResources,
+  validateResourceHandoff,
+  type HandoffResourcesOptions,
+  type ResourceHandoffAuthority,
+  type ResourceHandoffCommitInput,
+  type ResourceHandoffCommitResult,
+  type ResourceHandoffFenceController,
+  type ResourceHandoffResult,
+  type ResourceHandoffSnapshot,
+} from "./resource-handoff.js";
+import {
+  FILE_OPERATION_REQUIRED_FEATURE,
+  createFileOperationRegistryState,
+  fileOperationRequestDigest,
+  parseFileOperationRegistry,
+  reconcileFileOperationReceiptAuthority,
+  reconcileFileOperationReceipt,
+  recordFileOperationApplyAttempt,
+  reserveFileOperation,
+  serializeFileOperationRegistry,
+  type FileIdentity,
+  type FileOperationObservation,
+  type FileOperationPathFact,
+  type FileOperationPathObservation,
+  type FileOperationRecord,
+  type FileOperationRegistryState,
+  type FileOperationRequest,
+  type PersistedFileOperationRecord,
+} from "./registry/file-operation-record.js";
 import {
   assertCanonicalClaimResource,
   canonicalClaimId,
@@ -76,6 +150,9 @@ import {
   RESOURCE_CLAIM_SCHEMA_VERSION,
   sortResourceClaims,
   type ClaimOwnerContext,
+  type CoordinationFacts,
+  type WorktreeIdentityEvidence,
+  type CanonicalResourceClaimInput,
   type ResourceClaim,
   type ResourceClaimRecoveryAction,
   type ResourceClaimInput,
@@ -107,7 +184,62 @@ import {
   type RepositoryEvidenceOptions,
   type RepositoryEvidenceSnapshot,
 } from "./repository-evidence.js";
-import type { SandboxGitIdentity } from "./domain/sandbox.js";
+import type { SandboxGitIdentity, SandboxProbe } from "./domain/sandbox.js";
+import {
+  loadWorktreeProfileCatalog,
+  resolveWorktreeProfile,
+  substituteProfileParameters,
+} from "./domain/worktree-profile-catalog.js";
+import {
+  getBuiltinWorktreeProfile,
+  getBuiltinWorktreeProfileStatusForResolution,
+  resolveBuiltinWorktreeProfile,
+  type BuiltinWorktreeProfileId,
+} from "./domain/worktree-profile-builtins.js";
+import {
+  builtinWorktreeProfileRevision,
+  parsePinnedProfileRecord,
+  pinWorktreeProfile,
+  type PinnedWorktreeProfile,
+} from "./domain/worktree-profile-pinning.js";
+import { resolveWorktreeProfileRuntime } from "./domain/worktree-profile-runtime.js";
+import { resolveProfileRuntimeScope } from "./domain/worktree-profile-scope.js";
+import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
+import type { WorktreeProfileSessionCreateOptions } from "./domain/session.js";
+import {
+  parseSessionExecutionRecord,
+  recordExecutionState,
+  toPersistedSessionExecutionRecord,
+  type PersistedSessionExecutionRecord,
+  type SessionExecutionStateInput,
+} from "./domain/session-execution-record.js";
+import type { SessionDrainFinalization, SessionDrainExecution } from "./domain/session-execution-control.js";
+import type { SessionRuntimeEnvironmentIdentity } from "./domain/session-environment.js";
+import { CGROUPS_V2_CONTRACT_ID, deriveCgroupScopeName, type CgroupFileSystem } from "./domain/cgroups-v2.js";
+import {
+  observeOwnedExecution,
+  type SessionExecutionRecord as OwnedExecutionRecord,
+} from "./domain/session-process-observation.js";
+import {
+  compileEffectiveFilesystemPolicy,
+  decideEffectivePathAccess,
+  type EffectiveFilesystemPolicy,
+  type EffectiveFilesystemPolicyInputs,
+} from "./domain/filesystem-policy.js";
+import {
+  createFilesystemPolicyToken,
+  serializeFilesystemPolicyToken,
+  validateFilesystemPolicyToken,
+  type FilesystemPolicyToken,
+} from "./domain/filesystem-policy-revision.js";
+import {
+  executeWorktreeFileOperation,
+  prepareWorktreeFileOperation,
+  WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES,
+  type WorktreeFileOperation,
+  type WorktreeFileOperationExecutionOptions,
+  type WorktreeFileOperationResult,
+} from "./domain/worktree-file-operation.js";
 import {
   classifySessionLifecycle,
   lifecycleTransition,
@@ -235,6 +367,15 @@ export interface SessionRecord {
   readonly cleanupHead?: string;
   /** Established bounded execution visibility, when this is a governed session. */
   readonly workingSet?: EffectiveWorkingSet;
+  /**
+   * Present and true only when this session explicitly opted into
+   * resource-claim enforcement at creation. Absent (the default for newly
+   * created sessions) means operation authorization does not require
+   * resource claims for otherwise session-owned operations. Worktree and
+   * branch ownership, and claim conflicts against other sessions, remain
+   * enforced regardless of this flag.
+   */
+  readonly claimEnforcement?: boolean;
 }
 
 export interface RepositoryRegistryView {
@@ -262,6 +403,8 @@ export interface ProvisionSessionOptions {
   readonly label?: string;
   /** Complete initial claim declaration committed with the new session. */
   readonly initialClaims?: readonly ResourceClaimInput[];
+  /** Explicit opt-in to resource-claim enforcement for this session; omitted or false leaves enforcement disabled. */
+  readonly claimEnforcement?: boolean;
   /** Repository-local auxiliary-state declarations materialized in the owned worktree. */
   readonly auxiliaryState?: readonly unknown[];
   /** Bounded external execution-scope artifact supplied by the governed caller. */
@@ -270,6 +413,8 @@ export interface ProvisionSessionOptions {
   readonly candidateWorkingSet?: unknown;
   /** Optional repository identity for the transport-neutral working-set contract. */
   readonly workingSetRepository?: RepositoryIdentity;
+  /** Optional upper runtime profile pinned with the new session. */
+  readonly profile?: WorktreeProfileSessionCreateOptions | null;
   readonly defaultBranchName?: string;
   readonly protectedBranchNames?: readonly string[];
   readonly protectedWorktreePaths?: readonly string[];
@@ -498,6 +643,8 @@ export interface IntegrationProof {
 export interface GarbageCollectOptions {
   readonly apply?: boolean;
   readonly staleAfterMs?: number;
+  /** Canonical owned-execution observation filesystem; injectable for controlled runtimes. */
+  readonly cgroupFilesystem?: CgroupFileSystem;
 }
 
 /** Why a session was surfaced by garbage-collection inspection. */
@@ -796,6 +943,11 @@ export interface GuardDecision {
   readonly details: RegistryErrorDetails;
 }
 
+export interface FileOperationExecutionOptions extends WorktreeFileOperationExecutionOptions {
+  /** Current policy facts supplied by the accepted filesystem-authority path. */
+  readonly policy?: EffectiveFilesystemPolicyInputs | (() => EffectiveFilesystemPolicyInputs);
+}
+
 export type {
   CheckpointEvidence,
   CheckpointOptions,
@@ -816,6 +968,24 @@ export {
 export interface VerifiedExecutionContext extends PhysicalExecutionContext {
   readonly session: SessionRecord;
 }
+
+type GovernedGitFreshnessFence = Readonly<{
+  readonly sessionId: string;
+  readonly repositoryId: string;
+  readonly worktreeId: string;
+  readonly worktreePath: string;
+  readonly branchId: string;
+  readonly headId: string;
+  readonly registryRevision: number;
+  readonly claimSetGeneration: number;
+  readonly runtimeEpoch: number;
+  readonly resources: OperationAuthorizationDecision["resources"];
+}>;
+
+type PreparedSessionGitMutation = Readonly<{
+  readonly config: SessionGitConfig | undefined;
+  readonly fence: GovernedGitFreshnessFence | undefined;
+}>;
 
 export const GOVERNED_GIT_OPERATION_SCHEMA_VERSION = 1 as const;
 
@@ -934,7 +1104,44 @@ export interface SessionRegistryOptions {
   readonly protectedWorktreePaths?: readonly string[];
   readonly worktreeRoot?: string;
   readonly staleAfterMs?: number;
+  /** Canonical owned-execution observation filesystem; injectable for controlled runtimes. */
+  readonly cgroupFilesystem?: CgroupFileSystem;
+  /**
+   * Generic sandbox capability evidence. It is not managed-execution readiness
+   * and never authorizes a profile requiring process tracking.
+   */
+  readonly sandboxProbe?: SandboxProbe;
+  /**
+   * Explicit managed-execution readiness authority supplied by a caller-owned
+   * managed runtime. When absent, profiles requiring process tracking fail closed.
+   */
+  readonly managedExecutionReadiness?: ManagedExecutionReadiness;
+  /** Caller-approved hook material authority; never persisted or inferred from the host. */
+  readonly hookMaterialAuthority?: SessionHookMaterialAuthority;
 }
+
+/** Identity supplied when requesting hook material for a pinned session runtime. */
+export interface SessionHookMaterialRequest {
+  readonly sessionId: string;
+  readonly pinnedProfile: PinnedWorktreeProfile;
+}
+
+export type SessionHookMaterialAuthority = (
+  request: SessionHookMaterialRequest,
+) => Readonly<{ available: true; material: SessionHookMaterial }> | Readonly<{ available: false }>;
+
+/** Read-only evidence handed to the managed-execution readiness authority. */
+export interface ManagedExecutionReadinessRequest {
+  readonly processTracking: "required";
+  readonly profile: Readonly<{ id: string; version: string; digest: string }>;
+}
+
+export interface ManagedExecutionReadinessResult {
+  readonly ready: boolean;
+}
+
+/** Preflight seam: whether a caller-owned managed runtime can track the session's processes. */
+export type ManagedExecutionReadiness = (request: ManagedExecutionReadinessRequest) => ManagedExecutionReadinessResult;
 
 export interface RegistryPaths {
   readonly directory: string;
@@ -959,6 +1166,8 @@ export interface PersistedSessionRecord {
   readonly discarded_head?: string;
   readonly cleanup_head?: string;
   readonly working_set?: EffectiveWorkingSet;
+  /** Present and true only when this session opted into resource-claim enforcement; absent means disabled. */
+  readonly claim_enforcement?: boolean;
 }
 
 export interface PersistedResourceClaim {
@@ -969,6 +1178,7 @@ export interface PersistedResourceClaim {
   readonly worktree_path: string;
   readonly resource: string;
   readonly mode: ResourceClaimMode;
+  readonly sharing?: { readonly kind: "isolated-worktree"; readonly group_id: string };
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -989,7 +1199,7 @@ export interface PersistedRegistryV2 {
   readonly schema_version: RegistrySchemaVersion;
   readonly repository_id: string;
   readonly sessions: readonly PersistedSessionRecord[];
-  readonly claims_schema_version: typeof RESOURCE_CLAIM_SCHEMA_VERSION;
+  readonly claims_schema_version: typeof RESOURCE_CLAIM_SCHEMA_VERSION | typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
   readonly claims: readonly PersistedResourceClaim[];
   readonly claim_set_generation: number;
   readonly registry_revision: number;
@@ -1000,7 +1210,7 @@ export interface PersistedRegistryV2 {
   readonly executions?: readonly RuntimeRecord[];
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
-  readonly file_operations?: readonly RuntimeRecord[];
+  readonly file_operations?: readonly PersistedFileOperationRecord[];
 }
 
 export type PersistedRegistry = PersistedRegistryV1 | PersistedRegistryV2;
@@ -1037,6 +1247,7 @@ const MAX_ID_GENERATION_ATTEMPTS = 8;
 export class SessionRegistry {
   readonly repository: RepositoryContext;
   readonly paths: RegistryPaths;
+  readonly hookMaterialAuthority: SessionHookMaterialAuthority | undefined;
 
   private readonly git: GitCommandRunner;
   private readonly gitIdentity: SandboxGitIdentity | undefined;
@@ -1049,9 +1260,11 @@ export class SessionRegistry {
   private readonly worktreeRoot: string;
   private readonly worktreeRootIsDefault: boolean;
   private readonly staleAfterMs: number;
+  private readonly cgroupFilesystem?: CgroupFileSystem;
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
   private readonly lock: RepositoryLock;
+  private readonly managedExecutionReadiness: ManagedExecutionReadiness | undefined;
 
   constructor(options: SessionRegistryOptions = {}) {
     this.repository = options.repository ?? resolveRepositoryContext({ cwd: options.cwd, git: options.git });
@@ -1077,8 +1290,11 @@ export class SessionRegistry {
       this.worktreeRoot = resolveManagedWorktreeRoot(configuredWorktreeRoot);
     }
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+    this.cgroupFilesystem = options.cgroupFilesystem;
     this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
     this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
+    this.managedExecutionReadiness = options.managedExecutionReadiness;
+    this.hookMaterialAuthority = options.hookMaterialAuthority;
 
     if (!Number.isSafeInteger(this.lockTimeoutMs) || this.lockTimeoutMs < 0) {
       throw new RangeError("lockTimeoutMs must be a non-negative safe integer");
@@ -1140,6 +1356,204 @@ export class SessionRegistry {
     return record === undefined ? undefined : cloneSessionRecord(record);
   }
 
+  get runtimeEpoch(): number {
+    return this.readStateUnsafe().runtimeEpoch;
+  }
+
+  /** Configured cgroups v2 filesystem used for owned-execution observation. */
+  get cgroupObservationFilesystem(): CgroupFileSystem | undefined {
+    return this.cgroupFilesystem;
+  }
+
+  readSessionRuntimeEpoch(sessionId: string): number {
+    assertSessionId(sessionId);
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      if (!state.sessions.some((session) => session.sessionId === sessionId)) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      return state.runtimeEpoch;
+    });
+  }
+
+  getSessionLaunchAdmission(sessionId: string): SessionAdmissionRecord | undefined {
+    assertSessionId(sessionId);
+    const record = (this.readStateUnsafe().runtimeRecords.records.runtime_sessions ?? []).find((candidate) => {
+      const parsed = parseSessionAdmissionRecord(candidate);
+      return parsed.session_id === sessionId;
+    });
+    return record === undefined ? undefined : parseSessionAdmissionRecord(record);
+  }
+
+  getSessionManagedRuntime(sessionId: string, executionId?: string) {
+    assertSessionId(sessionId);
+    const state = this.readStateUnsafe();
+    if (!state.sessions.some((session) => session.sessionId === sessionId)) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    const admissionRecord = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    const pinnedRecord = (state.runtimeRecords.records.pinned_profiles ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    const profile = pinnedRecord === undefined ? null : parsePinnedProfileRecord(pinnedRecord);
+    const supplied =
+      profile?.resolved.git.hooks === "governed"
+        ? this.hookMaterialAuthority?.({ sessionId, pinnedProfile: profile })
+        : undefined;
+    return Object.freeze({
+      runtime_epoch: state.runtimeEpoch,
+      registry_revision: state.registryRevision,
+      claim_set_generation: state.claimSetGeneration,
+      admission: admissionRecord === undefined ? null : parseSessionAdmissionRecord(admissionRecord),
+      profile,
+      hook_material: supplied?.available === true ? supplied.material : null,
+      ...(executionId === undefined
+        ? {}
+        : { runtime_environment_identity: this.sessionRuntimeEnvironmentIdentity(sessionId, executionId) }),
+    });
+  }
+
+  private sessionRuntimeEnvironmentIdentity(sessionId: string, executionId: string): SessionRuntimeEnvironmentIdentity {
+    const sessionName = deriveCgroupScopeName({ session_id: sessionId, execution_id: "session-home" });
+    const executionName = deriveCgroupScopeName({ session_id: sessionId, execution_id: executionId });
+    if (typeof process.getuid !== "function" || typeof process.getgid !== "function") {
+      throw new SessionRegistryError("OPERATION_REJECTED", "The session runtime directory owner cannot be observed", {
+        sessionId,
+        executionId,
+      });
+    }
+    return Object.freeze({
+      session_id: sessionId,
+      execution_id: executionId,
+      session_root: path.join(this.paths.directory, "runtime", "sessions", sessionName, "home"),
+      execution_root: path.join(this.paths.directory, "runtime", "executions", executionName),
+      owner_uid: process.getuid(),
+      owner_gid: process.getgid(),
+    });
+  }
+
+  /** Return durable F10 file-operation receipts, optionally scoped by session. */
+  fileOperations(sessionId?: string | null): readonly FileOperationRecord[] {
+    if (sessionId !== undefined && sessionId !== null) assertSessionId(sessionId);
+    const state = this.readStateUnsafe();
+    const receipts = fileOperationStateFromRuntimeRecords(state.runtimeRecords).fileOperations;
+    return receipts
+      .filter((record) => sessionId === undefined || sessionId === null || record.sessionId === sessionId)
+      .map(cloneFileOperationRecord);
+  }
+
+  /** Reserve, fence, execute, and reconcile one typed worktree file operation. */
+  executeFileOperation(
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions = { landlock_helper: null, runtime_projection: null },
+    finalization?: SessionDrainFinalization,
+  ): WorktreeFileOperationResult {
+    const reservation = this.withLock(() => {
+      // A managed session requires a ready drain finalization whose closed
+      // admission and proven-empty owned scopes are re-read under the lock.
+      this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, operation.session_id, "release-claims");
+      return this.reserveFileOperationUnsafe(operation, executionOptions);
+    });
+    try {
+      return this.executeReservedFileOperation(operation, executionOptions, reservation);
+    } finally {
+      if (finalization !== undefined) this.reopenFileOperationAdmission(finalization);
+    }
+  }
+
+  private executeReservedFileOperation(
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
+    reservation: FileOperationReservationContext,
+  ): WorktreeFileOperationResult {
+    if (reservation.replay) {
+      if (reservation.record.stage === "completed") return replayedFileOperationResult(reservation.record);
+      throw uncertainFileOperation(operation.operation_id, "The durable receipt requires reconciliation.");
+    }
+
+    let currentBeforeIo: FileOperationAuthorityContext;
+    try {
+      currentBeforeIo = this.fileOperationAuthority(operation, executionOptions);
+    } catch (error: unknown) {
+      this.finalizeFileOperationUnresolved(operation.operation_id);
+      throw uncertainFileOperation(
+        operation.operation_id,
+        error instanceof Error ? error.message : "Current file-operation authority could not be rebuilt.",
+      );
+    }
+    const beforeIoFence = validateFilesystemPolicyToken(reservation.token, currentBeforeIo.token);
+    if (!beforeIoFence.ok) {
+      this.finalizeFileOperationUnresolved(operation.operation_id);
+      throw uncertainFileOperation(operation.operation_id, "The file-operation authority changed before physical I/O.");
+    }
+
+    let prepared: ReturnType<typeof prepareWorktreeFileOperation>;
+    try {
+      prepared = prepareWorktreeFileOperation(reservation.operation);
+    } catch (error: unknown) {
+      this.finalizeFileOperationUnresolved(operation.operation_id);
+      throw uncertainFileOperation(
+        operation.operation_id,
+        error instanceof Error ? error.message : "The file operation could not be prepared.",
+      );
+    }
+    if (!prepared.ok) {
+      this.finalizeFileOperationUnresolved(operation.operation_id);
+      throw uncertainFileOperation(operation.operation_id, prepared.error.message);
+    }
+
+    let physical: ReturnType<typeof executeWorktreeFileOperation>;
+    try {
+      physical = executeWorktreeFileOperation(prepared.value, executionOptions);
+    } catch (error: unknown) {
+      this.finalizeFileOperation(
+        operation.operation_id,
+        reservation.token,
+        reservation.operation,
+        executionOptions,
+        observeFileOperationWithoutResult(reservation.record, prepared.value.request),
+      );
+      throw uncertainFileOperation(
+        operation.operation_id,
+        error instanceof Error ? error.message : "The physical file operation failed.",
+      );
+    }
+    if (!physical.ok) {
+      this.finalizeFileOperation(
+        operation.operation_id,
+        reservation.token,
+        reservation.operation,
+        executionOptions,
+        observeFileOperationWithoutResult(reservation.record, prepared.value.request),
+      );
+      throw uncertainFileOperation(operation.operation_id, physical.error.message);
+    }
+
+    const observation = observeFileOperationEffect(reservation.record, physical.value, prepared.value.request);
+    try {
+      const currentAfterIo = this.fileOperationAuthority(operation, executionOptions);
+      validateFilesystemPolicyToken(reservation.token, currentAfterIo.token);
+    } catch {
+      // The final locked authority read is the completion decision.
+    }
+    const reconciled = this.finalizeFileOperation(
+      operation.operation_id,
+      reservation.token,
+      reservation.operation,
+      executionOptions,
+      observation,
+    );
+    if (reconciled.disposition !== "completed") {
+      throw uncertainFileOperation(
+        operation.operation_id,
+        "The file-operation result could not be durably reconciled.",
+      );
+    }
+    return physical.value;
+  }
+
   /** Return the single authoritative claim set, optionally scoped to a session. */
   listClaims(sessionId?: string | null): readonly ResourceClaim[] {
     const claims = this.readStateUnsafe().claims;
@@ -1159,6 +1573,295 @@ export class SessionRegistry {
       claims: state.claims.filter((claim) => claim.sessionId === sessionId).map(cloneResourceClaim),
       claimSetGeneration: state.claimSetGeneration,
     };
+  }
+
+  /** Project the authoritative claims and explicit intents into the coordination graph. */
+  resourceCoordinationGraph(
+    intents: readonly ResourceIntentInput[] = [],
+    bounds: ResourceOverlapBounds = {},
+  ): ResourceOverlapGraph {
+    const state = this.readStateUnsafe();
+    const canonicalIntents = intents.map((intent) =>
+      createResourceIntent({
+        ...intent,
+        repositoryId: intent.repositoryId ?? this.repository.repositoryId,
+      }),
+    );
+    return buildResourceOverlapGraph(state.claims, canonicalIntents, bounds);
+  }
+
+  /** Plan one coordination transaction against the current registry snapshot. */
+  planCoordinationTransaction(request: CoordinationTransactionRequest): CoordinationTransactionPlan {
+    const state = this.readStateUnsafe();
+    return planCoordinationTransaction(this.coordinationTransactionSnapshot(state), request, {
+      coordinationFacts: (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+    });
+  }
+
+  /** Apply one coordination transaction through the single registry writer. */
+  applyCoordinationTransaction(request: CoordinationTransactionRequest): CoordinationTransactionResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const snapshot = this.coordinationTransactionSnapshot(state);
+      return applyCoordinationTransaction(snapshot, request, {
+        coordinationFacts: (left, right) =>
+          this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+        commit: (commit) => {
+          validateRecords(state.sessions, this.repository.repositoryId);
+          this.writeUnsafe(
+            state.sessions,
+            commit.claims,
+            commit.claimSetGeneration,
+            nextRegistryRevision(state),
+            state.runtimeEpoch,
+            state.runtimeRecords,
+          );
+        },
+      });
+    });
+  }
+
+  /** Produce a read-only bounded three-way coordination preview. */
+  coordinationPreview(options: CoordinationPreviewOptions): CoordinationPreviewResult {
+    const state = this.readStateUnsafe();
+    const registry: CoordinationPreviewRegistry = {
+      repository: this.repository,
+      paths: this.paths,
+      registryRevision: state.registryRevision,
+      sessions: state.sessions,
+      claims: state.claims,
+      listClaimsSnapshot: () => ({
+        claims: state.claims,
+        claimSetGeneration: state.claimSetGeneration,
+      }),
+    };
+    return previewCoordination(registry, { ...options, git: options.git ?? this.git });
+  }
+
+  /** Compose the non-persisted coordination snapshot from current authorities. */
+  resourceCoordinationSnapshot(
+    contract: CoordinationContractInput,
+    bounds?: ResourceCoordinationSnapshotBounds,
+  ): ResourceCoordinationSnapshot {
+    const state = this.readStateUnsafe();
+    const input: ResourceCoordinationSnapshotInput = {
+      registry: {
+        repositoryId: this.repository.repositoryId,
+        claimSetGeneration: state.claimSetGeneration,
+        registryRevision: state.registryRevision,
+        sessions: state.sessions.map((session) => ({
+          sessionId: session.sessionId,
+          worktreePath: session.worktreePath,
+          state: session.state,
+          branchName: session.branchName,
+          repositoryId: session.repositoryId,
+        })),
+        claims: state.claims,
+      },
+      contract,
+      ...(bounds === undefined ? {} : { bounds }),
+    };
+    return projectResourceCoordinationSnapshot(input);
+  }
+
+  /** Execute a fenced, quiescence-verified atomic resource handoff. */
+  handoffResources(
+    options: HandoffResourcesOptions,
+    executionController: ResourceHandoffFenceController,
+  ): Promise<ResourceHandoffResult> {
+    const authority: ResourceHandoffAuthority = {
+      readResourceHandoffSnapshot: () =>
+        this.withLock(() => this.resourceHandoffSnapshotUnsafe(this.readStateUnsafe())),
+      commitResourceHandoff: (input) => this.commitResourceHandoff(input),
+    };
+    return handoffResources(authority, executionController, options);
+  }
+
+  /** Read the durable execution ledger for one explicit session. */
+  listSessionExecutions(sessionId: string): readonly PersistedSessionExecutionRecord[] {
+    assertSessionId(sessionId);
+    const records = this.readStateUnsafe().runtimeRecords.records.executions ?? [];
+    return records
+      .map((candidate, index) => {
+        const parsed = parseSessionExecutionRecord(candidate);
+        if (!parsed.ok)
+          throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid execution record at index ${index}`);
+        if (parsed.value.session_id !== sessionId) return null;
+        return toPersistedSessionExecutionRecord(parsed.value);
+      })
+      .filter((record): record is PersistedSessionExecutionRecord => record !== null);
+  }
+
+  /** Persist a new execution reservation, advancing only registry_revision. */
+  persistSessionExecution(record: PersistedSessionExecutionRecord): PersistedSessionExecutionRecord {
+    return this.persistExecutionRecord(record);
+  }
+
+  private persistExecutionRecord(
+    record: PersistedSessionExecutionRecord,
+    bootstrapSessionId?: string,
+  ): PersistedSessionExecutionRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const parsed = parseSessionExecutionRecord(record);
+      if (!parsed.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", "Invalid execution record");
+      if (parsed.value.state !== "starting") {
+        throw new SessionRegistryError("OPERATION_REJECTED", "New execution records must start in the starting state", {
+          executionId: parsed.value.execution_id,
+        });
+      }
+      const session = state.sessions.find((candidate) => candidate.sessionId === parsed.value.session_id);
+      if (session === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${parsed.value.session_id}`);
+      }
+      if (session.state !== "active" && !(session.state === "new" && bootstrapSessionId === session.sessionId)) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Execution reservation requires an active session", {
+          sessionId: parsed.value.session_id,
+          state: session.state,
+        });
+      }
+      const admission = this.getSessionLaunchAdmission(parsed.value.session_id);
+      if (
+        admission === undefined ||
+        admission.admission !== "open" ||
+        admission.runtime_epoch !== state.runtimeEpoch ||
+        parsed.value.runtime_epoch !== state.runtimeEpoch
+      ) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Session launch admission is not open at the current epoch",
+          {
+            sessionId: parsed.value.session_id,
+            runtimeEpoch: state.runtimeEpoch,
+            admission: admission?.admission ?? "untracked",
+          },
+        );
+      }
+      const executions = state.runtimeRecords.records.executions ?? [];
+      const existing = executions.find((candidate) => {
+        const current = parseSessionExecutionRecord(candidate);
+        return current.ok && current.value.execution_id === parsed.value.execution_id;
+      });
+      if (existing !== undefined) {
+        if (bootstrapSessionId !== undefined) {
+          throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap action was already attempted", {
+            sessionId: bootstrapSessionId,
+            executionId: parsed.value.execution_id,
+          });
+        }
+        const current = parseSessionExecutionRecord(existing);
+        if (
+          current.ok &&
+          JSON.stringify(toPersistedSessionExecutionRecord(current.value)) ===
+            JSON.stringify(toPersistedSessionExecutionRecord(parsed.value))
+        ) {
+          return toPersistedSessionExecutionRecord(current.value);
+        }
+        throw new SessionRegistryError("OPERATION_REJECTED", "Execution ID already exists with conflicting identity", {
+          executionId: parsed.value.execution_id,
+        });
+      }
+      const nextRecords = withExecutions(state.runtimeRecords, [
+        ...executions,
+        toPersistedSessionExecutionRecord(parsed.value),
+      ]);
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        nextRecords,
+      );
+      return toPersistedSessionExecutionRecord(parsed.value);
+    });
+  }
+
+  /** Apply the producer-owned execution transition matrix under the registry lock. */
+  transitionSessionExecution(
+    executionId: string,
+    input: SessionExecutionStateInput,
+    expectedRecord?: PersistedSessionExecutionRecord,
+  ): PersistedSessionExecutionRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const executions = state.runtimeRecords.records.executions ?? [];
+      const index = executions.findIndex((candidate) => {
+        const parsed = parseSessionExecutionRecord(candidate);
+        return parsed.ok && parsed.value.execution_id === executionId;
+      });
+      if (index < 0)
+        throw new SessionRegistryError("OPERATION_REJECTED", "Execution ID was not found", { executionId });
+      const current = parseSessionExecutionRecord(executions[index]);
+      if (!current.ok) throw new SessionRegistryError("REGISTRY_CORRUPT", "Invalid execution record");
+      const next = recordExecutionState(current.value, input);
+      if (!next.ok) {
+        const domainDetails = next.error.details;
+        const details: RegistryErrorDetails = {
+          ...(typeof domainDetails?.field === "string" ? { field: domainDetails.field } : {}),
+          ...(typeof domainDetails?.from === "string" ? { from: domainDetails.from } : {}),
+          ...(typeof domainDetails?.to === "string" ? { to: domainDetails.to } : {}),
+        };
+        throw new SessionRegistryError("OPERATION_REJECTED", next.error.message, details);
+      }
+      const persisted = toPersistedSessionExecutionRecord(next.value);
+      if (expectedRecord !== undefined && JSON.stringify(persisted) !== JSON.stringify(expectedRecord)) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Execution transition does not match the requested record",
+          {
+            executionId,
+          },
+        );
+      }
+      const updated = [...executions];
+      updated[index] = persisted;
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        withExecutions(state.runtimeRecords, updated),
+      );
+      return persisted;
+    });
+  }
+
+  /** Close launch admission and advance runtime_epoch atomically. */
+  closeSessionLaunchAdmission(sessionId: string, expectedEpoch: number): { runtimeEpoch: number } {
+    return this.withLock(() => {
+      assertSessionId(sessionId);
+      const state = this.readStateUnsafe();
+      if (!state.sessions.some((session) => session.sessionId === sessionId)) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      if (!Number.isSafeInteger(expectedEpoch) || expectedEpoch !== state.runtimeEpoch) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Runtime epoch is stale", {
+          sessionId,
+          expectedEpoch,
+          runtimeEpoch: state.runtimeEpoch,
+        });
+      }
+      const admission = this.getSessionLaunchAdmission(sessionId);
+      if (admission === undefined) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Session launch admission is untracked", { sessionId });
+      }
+      const nextEpoch = nextRuntimeEpoch(state);
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        nextEpoch,
+        withSessionAdmission(state.runtimeRecords, {
+          ...admission,
+          admission: "closed",
+          runtime_epoch: nextEpoch,
+        }),
+      );
+      return { runtimeEpoch: nextEpoch };
+    });
   }
 
   /**
@@ -1198,8 +1901,7 @@ export class SessionRegistry {
         repository === null ||
         typeof repository !== "object" ||
         repository.repositoryHost !== owner.workingSet.repository.repositoryHost ||
-        repository.repositoryId !== owner.workingSet.repository.repositoryId ||
-        repository.repositoryId !== this.repository.repositoryId
+        repository.repositoryId !== owner.workingSet.repository.repositoryId
       ) {
         throw new SessionRegistryError(
           "REPOSITORY_MISMATCH",
@@ -1365,11 +2067,7 @@ export class SessionRegistry {
     return claim === undefined ? undefined : cloneResourceClaim(claim);
   }
 
-  /**
-   * Explicitly materialize a claim section or upgrade its semantics. A v1
-   * claim registry is intentionally unreadable through ordinary operations;
-   * only this locked, explicit migration rewrites it as v2.
-   */
+  /** Explicitly materialize a claim section or upgrade legacy claims as v3. */
   migrate(): RegistryMigrationResult {
     return this.withLock(() => {
       let state: RegistryState;
@@ -1421,21 +2119,33 @@ export class SessionRegistry {
   }
 
   /** Add claims atomically. Repeating an equivalent operation is idempotent. */
-  claimResources(options: ClaimResourcesOptions): ClaimResourcesResult {
+  claimResources(options: ClaimResourcesOptions, finalization?: SessionDrainFinalization): ClaimResourcesResult {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const admission = this.assertDrainFinalizationUnsafe(state, finalization, sessionId, "release-claims");
       const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
       const requested = this.canonicalClaimInputs(options.claims, owner);
       const result = this.addClaimsUnsafe(state, owner, requested);
       const claimSetGeneration = nextClaimSetGeneration(state, result.claims);
+      const runtimeEpoch = finalization === undefined ? state.runtimeEpoch : nextRuntimeEpoch(state);
+      const runtimeRecords =
+        finalization === undefined || admission === undefined
+          ? state.runtimeRecords
+          : withSessionAdmission(state.runtimeRecords, {
+              ...admission,
+              admission: "open",
+              runtime_epoch: runtimeEpoch,
+            });
       this.writeUnsafe(
         result.sessions,
         result.claims,
         claimSetGeneration,
-        claimSetGeneration === state.claimSetGeneration ? state.registryRevision : nextRegistryRevision(state),
-        state.runtimeEpoch,
-        state.runtimeRecords,
+        claimSetGeneration === state.claimSetGeneration && finalization === undefined
+          ? state.registryRevision
+          : nextRegistryRevision(state),
+        runtimeEpoch,
+        runtimeRecords,
       );
       return {
         session: cloneSessionRecord(owner.record),
@@ -1448,11 +2158,12 @@ export class SessionRegistry {
     });
   }
 
-  updateClaims(options: UpdateClaimsOptions): ClaimResourcesResult {
+  updateClaims(options: UpdateClaimsOptions, finalization?: SessionDrainFinalization): ClaimResourcesResult {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const admission = this.assertDrainFinalizationUnsafe(state, finalization, sessionId, "release-claims");
       const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
       const requested = this.canonicalClaimInputs(options.claims, owner, true);
       const current = state.claims.filter((claim) => claim.sessionId === sessionId);
@@ -1463,6 +2174,8 @@ export class SessionRegistry {
         owner,
         state.claims.filter((claim) => claim.sessionId !== sessionId),
         state.sessions,
+        undefined,
+        (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
       );
       const nextIds = new Set(next.map((claim) => claim.claimId));
       const released = current.filter((claim) => !nextIds.has(claim.claimId));
@@ -1479,13 +2192,24 @@ export class SessionRegistry {
         ...materialized,
       ]);
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+      const runtimeEpoch = finalization === undefined ? state.runtimeEpoch : nextRuntimeEpoch(state);
+      const runtimeRecords =
+        finalization === undefined || admission === undefined
+          ? state.runtimeRecords
+          : withSessionAdmission(state.runtimeRecords, {
+              ...admission,
+              admission: "open",
+              runtime_epoch: runtimeEpoch,
+            });
       this.writeUnsafe(
         state.sessions,
         nextClaims,
         claimSetGeneration,
-        claimSetGeneration === state.claimSetGeneration ? state.registryRevision : nextRegistryRevision(state),
-        state.runtimeEpoch,
-        state.runtimeRecords,
+        claimSetGeneration === state.claimSetGeneration && finalization === undefined
+          ? state.registryRevision
+          : nextRegistryRevision(state),
+        runtimeEpoch,
+        runtimeRecords,
       );
       return {
         session: cloneSessionRecord(owner.record),
@@ -1504,11 +2228,12 @@ export class SessionRegistry {
    * the repository lock is held. A mode change replaces the old claim and
    * creates the new claim in the same persisted complete set.
    */
-  applyClaimDeltas(options: ClaimDeltasOptions): ClaimDeltasResult {
+  applyClaimDeltas(options: ClaimDeltasOptions, finalization?: SessionDrainFinalization): ClaimDeltasResult {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const admission = this.assertDrainFinalizationUnsafe(state, finalization, sessionId, "release-claims");
       const owner = this.claimOwner(state.sessions, sessionId, options.repositoryId ?? options.repository_id);
       const deltas = this.canonicalClaimDeltas(options.deltas, owner);
       const current = state.claims.filter((claim) => claim.sessionId === sessionId);
@@ -1563,17 +2288,33 @@ export class SessionRegistry {
       const externalClaims = state.claims.filter((claim) => claim.sessionId !== sessionId);
       // Validate the resulting complete set, including pairwise ownership
       // invariants, before exposing any persistence side effect.
-      this.assertCompleteClaimSet(nextSessionClaims, owner, externalClaims, state.sessions);
+      this.assertCompleteClaimSet(
+        nextSessionClaims,
+        owner,
+        externalClaims,
+        state.sessions,
+        state.claimSetGeneration,
+        (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+      );
       const nextClaims = sortResourceClaims([...externalClaims, ...nextSessionClaims]);
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
-      if (claimSetGeneration !== state.claimSetGeneration) {
+      if (claimSetGeneration !== state.claimSetGeneration || finalization !== undefined) {
+        const runtimeEpoch = finalization === undefined ? state.runtimeEpoch : nextRuntimeEpoch(state);
+        const runtimeRecords =
+          finalization === undefined || admission === undefined
+            ? state.runtimeRecords
+            : withSessionAdmission(state.runtimeRecords, {
+                ...admission,
+                admission: "open",
+                runtime_epoch: runtimeEpoch,
+              });
         this.writeUnsafe(
           state.sessions,
           nextClaims,
           claimSetGeneration,
           nextRegistryRevision(state),
-          state.runtimeEpoch,
-          state.runtimeRecords,
+          runtimeEpoch,
+          runtimeRecords,
         );
       }
 
@@ -1600,7 +2341,11 @@ export class SessionRegistry {
     });
   }
 
-  releaseClaims(sessionIdOrOptions: string | ReleaseClaimsOptions, claimIds?: readonly string[]): ReleaseClaimsResult {
+  releaseClaims(
+    sessionIdOrOptions: string | ReleaseClaimsOptions,
+    claimIds?: readonly string[],
+    finalization?: SessionDrainFinalization,
+  ): ReleaseClaimsResult {
     const options: ReleaseClaimsOptions =
       typeof sessionIdOrOptions === "string" ? { sessionId: sessionIdOrOptions, claimIds } : sessionIdOrOptions;
 
@@ -1626,13 +2371,16 @@ export class SessionRegistry {
           "Release selector families are mutually exclusive: resources, claim IDs, or all",
         );
       }
-      const result = this.applyClaimDeltas({
-        sessionId: options.sessionId ?? options.session_id,
-        deltas: selectedResources.map((resource) => ({ kind: "release", resource })),
-        expectedClaimSetGeneration: options.expectedClaimSetGeneration,
-        expected_claim_set_generation: options.expected_claim_set_generation,
-        force: options.force,
-      });
+      const result = this.applyClaimDeltas(
+        {
+          sessionId: options.sessionId ?? options.session_id,
+          deltas: selectedResources.map((resource) => ({ kind: "release", resource })),
+          expectedClaimSetGeneration: options.expectedClaimSetGeneration,
+          expected_claim_set_generation: options.expected_claim_set_generation,
+          force: options.force,
+        },
+        finalization,
+      );
       return {
         sessionId: result.session.sessionId,
         released: result.released.map(cloneResourceClaim),
@@ -1646,6 +2394,7 @@ export class SessionRegistry {
       const state = this.readStateUnsafe();
       this.assertClaimSetMutationIntent(options, state.claimSetGeneration);
       const sessionId = this.selectSessionId(options.sessionId ?? options.session_id, state.sessions);
+      const admission = this.assertDrainFinalizationUnsafe(state, finalization, sessionId, "release-claims");
       const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
       if (record === undefined) {
         throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
@@ -1687,14 +2436,23 @@ export class SessionRegistry {
       const remaining = sessionClaims.filter((claim) => !wanted.has(claim.claimId));
       const nextClaims = state.claims.filter((claim) => claim.sessionId !== sessionId || !wanted.has(claim.claimId));
       const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
-      if (claimSetGeneration !== state.claimSetGeneration) {
+      if (claimSetGeneration !== state.claimSetGeneration || finalization !== undefined) {
+        const runtimeEpoch = finalization === undefined ? state.runtimeEpoch : nextRuntimeEpoch(state);
+        const runtimeRecords =
+          finalization === undefined || admission === undefined
+            ? state.runtimeRecords
+            : withSessionAdmission(state.runtimeRecords, {
+                ...admission,
+                admission: "open",
+                runtime_epoch: runtimeEpoch,
+              });
         this.writeUnsafe(
           state.sessions,
           nextClaims,
           claimSetGeneration,
           nextRegistryRevision(state),
-          state.runtimeEpoch,
-          state.runtimeRecords,
+          runtimeEpoch,
+          runtimeRecords,
         );
       }
       return {
@@ -1767,7 +2525,12 @@ export class SessionRegistry {
       const state = this.readStateUnsafe();
       const sessionId = generateUniqueSessionId(state.sessions, this.idGenerator);
       const resources = this.resolveProvisioningResources(options, sessionId);
+      const pinnedProfile = this.resolvePinnedProfile(options.profile, resources.baseRevision);
+      if (pinnedProfile?.resolved.execution.processTracking === "required") {
+        this.assertManagedExecutionReady(pinnedProfile);
+      }
       const workingSet = this.composeProvisionedWorkingSet(options, resources);
+      if (pinnedProfile !== undefined) this.assertManagedProfileReady(pinnedProfile, workingSet, options.initialClaims);
       const timestamp = toTimestamp(this.clock());
       const record = freezeSessionRecord({
         schemaVersion: SESSION_RECORD_SCHEMA_VERSION,
@@ -1777,12 +2540,18 @@ export class SessionRegistry {
         worktreePath: resources.worktreePath,
         branchId: resources.branchId,
         branchName: resources.branchName,
-        state: "active",
+        state:
+          pinnedProfile !== undefined &&
+          "path" in pinnedProfile.provenance.catalog &&
+          (pinnedProfile.resolved.bootstrap?.length ?? 0) > 0
+            ? "new"
+            : "active",
         createdAt: timestamp,
         updatedAt: timestamp,
         baseRevision: resources.baseRevision,
         ...(options.label === undefined ? {} : { label: validateLabel(options.label) }),
         ...(workingSet === undefined ? {} : { workingSet }),
+        ...(options.claimEnforcement === true ? { claimEnforcement: true } : {}),
       });
 
       const retryEvidence = this.provisioningRetryEvidence(state, resources, options, workingSet);
@@ -1843,15 +2612,33 @@ export class SessionRegistry {
             : this.canonicalClaimInputs(options.initialClaims, owner, true).map((input) =>
                 createResourceClaim(input, owner, toTimestamp(this.clock())),
               );
-        this.assertCompleteClaimSet(initialClaims, owner, state.claims, [...state.sessions, record]);
+        this.assertCompleteClaimSet(
+          initialClaims,
+          owner,
+          state.claims,
+          [...state.sessions, record],
+          state.claimSetGeneration,
+          (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, [...state.sessions, record]),
+        );
         const nextClaims = sortResourceClaims([...state.claims, ...initialClaims]);
+        const nextEpoch = nextRuntimeEpoch(state);
+        const runtimeRecords =
+          pinnedProfile === undefined
+            ? state.runtimeRecords
+            : withSessionAdmission(withPinnedProfile(state.runtimeRecords, sessionId, pinnedProfile), {
+                kind: "session-admission",
+                schema_version: 1,
+                session_id: sessionId,
+                admission: "open",
+                runtime_epoch: nextEpoch,
+              });
         this.writeUnsafe(
           [...state.sessions, record],
           nextClaims,
           nextClaimSetGeneration(state, nextClaims),
           nextRegistryRevision(state),
-          nextRuntimeEpoch(state),
-          state.runtimeRecords,
+          nextEpoch,
+          runtimeRecords,
         );
         return cloneSessionRecord(record);
       } catch (error: unknown) {
@@ -1861,6 +2648,179 @@ export class SessionRegistry {
         throw classifyProvisioningFailure(error, this.git, this.repository.worktreePath, resources);
       }
     });
+  }
+
+  private resolvePinnedProfile(
+    request: WorktreeProfileSessionCreateOptions | null | undefined,
+    baseRevision: string,
+  ): PinnedWorktreeProfile | undefined {
+    if (request == null) return undefined;
+    let selection = request.selection.profile;
+    const builtinPrefix = "builtin:";
+    const repositoryPrefix = "repository:";
+    if (
+      !selection.startsWith(builtinPrefix) &&
+      !selection.startsWith(repositoryPrefix) &&
+      request.provenance?.catalog === undefined
+    ) {
+      if (selection.length === 0 || selection.includes(":")) {
+        throw new DomainError("RUNTIME_PROFILE_INVALID", "Worktree profile selection is not canonical.");
+      }
+      const builtinCandidate = getBuiltinWorktreeProfile(selection);
+      const catalogCandidate = loadWorktreeProfileCatalog(
+        this.repository,
+        baseRevision,
+        "nawabari.profiles.json",
+        this.git,
+      );
+      let repositoryCandidate: ReturnType<typeof resolveWorktreeProfile> | undefined;
+      if (catalogCandidate.ok) {
+        repositoryCandidate = resolveWorktreeProfile({ profile: selection }, catalogCandidate.value);
+      } else if (catalogCandidate.error.code !== "RUNTIME_PROFILE_MISSING") {
+        throw catalogCandidate.error;
+      }
+      if (builtinCandidate.ok && repositoryCandidate?.ok === true) {
+        throw new DomainError(
+          "RUNTIME_PROFILE_AMBIGUOUS",
+          "Unqualified worktree profile selection matches both repository and built-in profiles.",
+          { profile_id: selection },
+        );
+      }
+      if (builtinCandidate.ok) selection = `${builtinPrefix}${selection}`;
+      else if (repositoryCandidate?.ok === true) selection = `${repositoryPrefix}${selection}`;
+      else if (repositoryCandidate !== undefined && !repositoryCandidate.ok) throw repositoryCandidate.error;
+    }
+    if (selection.startsWith(builtinPrefix)) {
+      const builtinId = selection.slice(builtinPrefix.length);
+      if (builtinId.length === 0 || builtinId.includes(":")) {
+        throw new DomainError("RUNTIME_PROFILE_INVALID", "Built-in profile selection is not canonical.");
+      }
+      const builtin = getBuiltinWorktreeProfile(builtinId);
+      if (!builtin.ok) throw builtin.error;
+      const builtinProfileId = builtin.value.id as BuiltinWorktreeProfileId;
+      const resolved = resolveBuiltinWorktreeProfile({ profile: builtinId }, request.parameters ?? {});
+      if (!resolved.ok) throw resolved.error;
+      const readiness = getBuiltinWorktreeProfileStatusForResolution(builtinProfileId, resolved.value);
+      if (!readiness.ok) throw readiness.error;
+      if (!readiness.value.ready) {
+        throw new DomainError("RUNTIME_MATERIALIZATION_MISSING", "The selected built-in profile is not ready.", {
+          profile_id: builtinProfileId,
+          availability: readiness.value.availability,
+          missing: [...readiness.value.missing],
+        });
+      }
+      return pinWorktreeProfile(resolved.value, {
+        repository: { id: this.repository.repositoryId, revision: baseRevision },
+        base: { revision: baseRevision },
+        catalog: {
+          kind: "builtin",
+          id: builtinProfileId,
+          revision: builtinWorktreeProfileRevision(builtinProfileId),
+        },
+        selection: { profile: builtinProfileId, parameters: request.parameters ?? {} },
+      });
+    }
+
+    const repositorySelection = selection.startsWith(repositoryPrefix)
+      ? selection.slice(repositoryPrefix.length)
+      : selection;
+    if (repositorySelection.length === 0 || repositorySelection.includes(":")) {
+      throw new DomainError("RUNTIME_PROFILE_INVALID", "Repository profile selection is not canonical.");
+    }
+    const catalogPath = request.provenance?.catalog?.path ?? "nawabari.profiles.json";
+    if (catalogPath !== "nawabari.profiles.json") {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Profile catalog path is not authoritative");
+    }
+    const catalog = loadWorktreeProfileCatalog(this.repository, baseRevision, catalogPath, this.git);
+    if (!catalog.ok) throw catalog.error;
+    const resolved = resolveWorktreeProfile({ profile: repositorySelection }, catalog.value);
+    if (!resolved.ok) throw resolved.error;
+    const parameterized =
+      request.parameters === undefined ? resolved : substituteProfileParameters(resolved.value, request.parameters);
+    if (!parameterized.ok) throw parameterized.error;
+    let blobOid: string;
+    try {
+      blobOid = this.git.run(["rev-parse", `${baseRevision}:${catalogPath}`], this.repository.worktreePath);
+    } catch (error: unknown) {
+      throw new SessionRegistryError(
+        "REGISTRY_CORRUPT",
+        "The selected profile catalog authority could not be proven",
+        {},
+        error,
+      );
+    }
+    const requestedBlob = request.provenance?.catalog?.blob_oid;
+    if (requestedBlob !== undefined && requestedBlob !== blobOid) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Profile catalog provenance does not match the pinned base");
+    }
+    return pinWorktreeProfile(parameterized.value, {
+      repository: { id: this.repository.repositoryId, revision: baseRevision },
+      base: { revision: baseRevision },
+      catalog: { kind: "repository", path: catalogPath, blob_oid: blobOid },
+      selection: { profile: repositorySelection, parameters: request.parameters ?? {} },
+    });
+  }
+
+  private assertManagedProfileReady(
+    pin: PinnedWorktreeProfile,
+    workingSet: EffectiveWorkingSet | undefined,
+    initialClaims: readonly ResourceClaimInput[] | undefined,
+  ): void {
+    const runtimeLayout = discoverSandboxRuntimeLayout();
+    const runtime = resolveWorktreeProfileRuntime(pin.resolved, runtimeLayout);
+    if (!runtime.ok) throw runtime.error;
+
+    const compiledWorkingSet = workingSet === undefined ? undefined : compileWorkingSetRuntimeProjection(workingSet);
+    if (compiledWorkingSet !== undefined && !compiledWorkingSet.ok) throw compiledWorkingSet.error;
+    const scope = resolveProfileRuntimeScope(
+      pin.resolved,
+      {
+        repositoryId: this.repository.repositoryId,
+        ...(compiledWorkingSet === undefined ? {} : { workingSet: compiledWorkingSet.value, externalArtifact: true }),
+        ...(initialClaims === undefined || initialClaims.length === 0
+          ? {}
+          : {
+              claims: initialClaims.map((claim) => ({
+                resource: claim.resource,
+                repositoryId: this.repository.repositoryId,
+                mode: claim.mode,
+              })),
+            }),
+      },
+      undefined,
+    );
+    if (!scope.ok) throw scope.error;
+    if (scope.value.status !== "ready") {
+      const diagnostic = scope.value.diagnostics[0];
+      throw new DomainError("RUNTIME_PROFILE_REQUIREMENT_MISSING", "Managed profile filesystem scope is unavailable.", {
+        profile_id: pin.resolved.id,
+        diagnostic: diagnostic === undefined ? "scope did not resolve" : { ...diagnostic },
+      });
+    }
+  }
+
+  /**
+   * Fail closed before any ownership mutation unless the explicit managed-execution
+   * authority affirms readiness. Generic sandbox evidence is never consulted here.
+   */
+  private assertManagedExecutionReady(pinnedProfile: PinnedWorktreeProfile): void {
+    const authority = this.managedExecutionReadiness;
+    const ready =
+      authority !== undefined &&
+      authority({
+        processTracking: "required",
+        profile: Object.freeze({
+          id: pinnedProfile.resolved.id,
+          version: pinnedProfile.resolved.version,
+          digest: pinnedProfile.digest,
+        }),
+      }).ready === true;
+    if (!ready) {
+      throw new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "Managed execution capability is unavailable.", {
+        process_tracking: "required",
+        managed_execution_authority: authority === undefined ? "absent" : "not_ready",
+      });
+    }
   }
 
   /**
@@ -1888,6 +2848,109 @@ export class SessionRegistry {
     } catch {
       return false;
     }
+  }
+
+  /** Inspect pending bootstrap ownership without granting normal session operations. */
+  verifyBootstrapSession(sessionId: string): SessionRecord {
+    assertSessionId(sessionId);
+    const record = this.readUnsafe().find((candidate) => candidate.sessionId === sessionId);
+    if (record?.state !== "new") {
+      throw new SessionRegistryError("SESSION_NOT_ACTIVE", "Bootstrap requires an owned pending session", {
+        sessionId,
+      });
+    }
+    const pin = this.getSessionManagedRuntime(sessionId).profile;
+    if (pin === null || !("path" in pin.provenance.catalog) || !pin.resolved.bootstrap?.length) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap requires repository profile actions", {
+        sessionId,
+      });
+    }
+    const physical = verifyPhysicalExecutionContext({
+      repository: this.repository,
+      worktreePath: record.worktreePath,
+      branchName: record.branchName,
+      git: this.git,
+    });
+    if (physical.worktreeId !== record.worktreeId || physical.branchId !== record.branchId) {
+      throw new SessionRegistryError("OWNERSHIP_MISMATCH", "Bootstrap worktree ownership changed", { sessionId });
+    }
+    return cloneSessionRecord(record);
+  }
+
+  /** Only the bootstrap integration may reserve an action; its identity is durable before launch. */
+  persistBootstrapExecution(
+    sessionId: string,
+    actionId: string,
+    record: PersistedSessionExecutionRecord,
+  ): PersistedSessionExecutionRecord {
+    this.verifyBootstrapSession(sessionId);
+    const pin = this.getSessionManagedRuntime(sessionId).profile;
+    if (
+      !pin?.resolved.bootstrap?.some((action) => action.id === actionId) ||
+      record.session_id !== sessionId ||
+      record.execution_id !== `bootstrap:${sessionId}:${actionId}`
+    ) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap action identity is not pinned", {
+        sessionId,
+        actionId,
+      });
+    }
+    return this.persistExecutionRecord(record, sessionId);
+  }
+
+  /** Final readiness commit; never called after rejected or uncertain action execution. */
+  activateBootstrapSession(sessionId: string, completedActionIds: readonly string[]): SessionRecord {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const index = state.sessions.findIndex((candidate) => candidate.sessionId === sessionId);
+      const record = state.sessions[index];
+      if (record?.state !== "new") {
+        throw new SessionRegistryError("SESSION_NOT_ACTIVE", "Bootstrap session is no longer pending", { sessionId });
+      }
+      const pin = this.getSessionManagedRuntime(sessionId).profile;
+      if (pin === null || !("path" in pin.provenance.catalog) || !pin.resolved.bootstrap?.length) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap profile authority is missing", { sessionId });
+      }
+      if (
+        JSON.stringify(completedActionIds) !== JSON.stringify(pin.resolved.bootstrap.map((action) => action.id)) ||
+        !completedActionIds.every((id) =>
+          state.runtimeRecords.records.executions?.some((item) => {
+            const parsed = parseSessionExecutionRecord(item);
+            return (
+              parsed.ok &&
+              parsed.value.session_id === sessionId &&
+              parsed.value.execution_id === `bootstrap:${sessionId}:${id}` &&
+              parsed.value.state === "exited"
+            );
+          }),
+        )
+      ) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Bootstrap actions have not completed", { sessionId });
+      }
+      const physical = verifyPhysicalExecutionContext({
+        repository: this.repository,
+        worktreePath: record.worktreePath,
+        branchName: record.branchName,
+        git: this.git,
+      });
+      if (physical.worktreeId !== record.worktreeId || physical.branchId !== record.branchId) {
+        throw new SessionRegistryError("OWNERSHIP_MISMATCH", "Bootstrap ownership changed before readiness", {
+          sessionId,
+        });
+      }
+      const updated = transitionSessionState(record, "active", this.clock);
+      const sessions = [...state.sessions];
+      sessions[index] = updated;
+      this.writeUnsafe(
+        sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        state.runtimeRecords,
+      );
+      return cloneSessionRecord(updated);
+    });
   }
 
   provisionSession(options: ProvisionSessionOptions = {}): SessionRecord {
@@ -2418,6 +3481,7 @@ export class SessionRegistry {
       };
 
       const resources = canonicalOperationResources(options.resources, physical.worktreePath);
+      const claimEnforcementEnabled = currentRecord.claimEnforcement === true;
       // Authorization decision is advisory only. Claims may change between this
       // read and actual commit/push execution. Stale-decision handling is deferred
       // to future commit/push execution path; this PR adds no locking, revalidation,
@@ -2455,6 +3519,10 @@ export class SessionRegistry {
                 ? [...conflictDetails.recoveryHints]
                 : recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
             });
+          }
+          if (!claimEnforcementEnabled) {
+            authorized.push({ resource, claimIds: sortStrings(ownClaims.map((claim) => claim.claimId)) });
+            continue;
           }
           if (ownClaims.length > 0) {
             return deniedOperation("INSUFFICIENT_CLAIM_MODE", verified, {
@@ -2515,9 +3583,16 @@ export class SessionRegistry {
     // lock hostage while it backtracks.
     const messagePattern = options.messagePattern ?? options.message_pattern ?? null;
     assertFinalCommitMessage(options.message, messagePattern);
+    const prepared = this.prepareSessionGitMutation(
+      "pre-commit",
+      operationSessionId(options.sessionId, options.session_id),
+      options.resources ?? options.paths ?? [],
+      options.allClaimed === true || options.all_claimed === true,
+    );
 
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
+      this.assertSessionGitMutationFresh(prepared.fence, sessionId);
       const allClaimed = options.allClaimed === true || options.all_claimed === true;
       const explicitResources = options.resources ?? options.paths;
       if (allClaimed && explicitResources !== undefined && explicitResources.length > 0) {
@@ -2530,7 +3605,9 @@ export class SessionRegistry {
         ? this.resolveAllClaimedResourcesUnsafe("commit", sessionId)
         : operationResources(explicitResources);
       const authorization = this.requireMutationAuthorization("commit", requestedResources, sessionId);
-      const initial = this.verifyGovernedExecutionContext(sessionId);
+      this.assertSessionGitAuthorizationFresh(prepared.fence, authorization);
+      const initial =
+        this.assertSessionGitMutationFresh(prepared.fence, sessionId) ?? this.verifyGovernedExecutionContext(sessionId);
 
       const before = observeGitMutationPaths(this.git, initial.worktreePath);
       assertNoUnexpectedMutationPaths(
@@ -2579,7 +3656,7 @@ export class SessionRegistry {
       try {
         runMutationGit(
           this.git,
-          commitGitArguments(this.git, initial.worktreePath, this.gitIdentity, options.message),
+          commitGitArguments(this.git, initial.worktreePath, this.gitIdentity, options.message, prepared.config),
           initial.worktreePath,
           "commit",
           "COMMIT_FAILED",
@@ -2721,8 +3798,15 @@ export class SessionRegistry {
 
   /** Push the currently owned branch to an explicit remote/branch target. */
   push(options: PushOptions): PushResult {
+    const prepared = this.prepareSessionGitMutation(
+      "pre-push",
+      operationSessionId(options.sessionId, options.session_id),
+      options.resources ?? [],
+      options.allClaimed === true || options.all_claimed === true,
+    );
     return this.withLock(() => {
       const sessionId = operationSessionId(options.sessionId, options.session_id);
+      this.assertSessionGitMutationFresh(prepared.fence, sessionId);
       const allClaimed = options.allClaimed === true || options.all_claimed === true;
       if (allClaimed && options.resources !== undefined && options.resources.length > 0) {
         throw new SessionRegistryError("INVALID_RESOURCE", "--all-claimed cannot be combined with explicit resources", {
@@ -2733,8 +3817,10 @@ export class SessionRegistry {
       const requestedResources = allClaimed
         ? this.resolveAllClaimedResourcesUnsafe("push", sessionId)
         : operationResources(options.resources);
-      this.requireMutationAuthorization("push", requestedResources, sessionId);
-      const initial = this.verifyGovernedExecutionContext(sessionId);
+      const authorization = this.requireMutationAuthorization("push", requestedResources, sessionId);
+      this.assertSessionGitAuthorizationFresh(prepared.fence, authorization);
+      const initial =
+        this.assertSessionGitMutationFresh(prepared.fence, sessionId) ?? this.verifyGovernedExecutionContext(sessionId);
       const remote = explicitRemote(options.remote);
       const branch = explicitRemoteBranch(options.branch, options.remoteBranch ?? options.remote_branch);
       const force = options.force === true;
@@ -2800,6 +3886,7 @@ export class SessionRegistry {
       const targetRef = `refs/heads/${branch}`;
       const leaseValue = inspection.observedRemoteSha ?? "";
       const pushArguments = [
+        ...(prepared.config === undefined ? [] : ["-c", "core.hooksPath=/dev/null"]),
         "push",
         // Exact-generation CAS is required for every push mutation. The
         // force authorization check above remains independent: force is only
@@ -2860,6 +3947,134 @@ export class SessionRegistry {
 
   pushSession(options: PushOptions): PushResult {
     return this.push(options);
+  }
+
+  /** Resolve the pinned #618 material and run the approved event before taking the mutation lock. */
+  private prepareSessionGitMutation(
+    event: GovernedHookEvent,
+    requestedSessionId: string | null | undefined,
+    resources: readonly string[],
+    allClaimed: boolean,
+  ): PreparedSessionGitMutation {
+    const sessionId = requestedSessionId ?? this.resolveCurrentSession().sessionId;
+    const runtime = this.getSessionManagedRuntime(sessionId);
+    if (runtime.profile === null) return { config: undefined, fence: undefined };
+    const profile = runtime.profile.resolved;
+    const hooks = resolveSessionHookSet(profile, runtime.hook_material);
+    if (!hooks.ok) throw hooks.error;
+    const session = this.get(sessionId);
+    if (session === undefined)
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`);
+    const config = materializeSessionGitConfig(profile, {
+      repository_local_name: readLocalGitIdentityValue(this.git, "user.name", session.worktreePath),
+      repository_local_email: readLocalGitIdentityValue(this.git, "user.email", session.worktreePath),
+      host_global_name: this.gitIdentity?.host_global_name ?? null,
+      host_global_email: this.gitIdentity?.host_global_email ?? null,
+    });
+    if (!config.ok) throw config.error;
+    let fence: GovernedGitFreshnessFence | undefined;
+    if (hooks.value.mode === "governed") {
+      const mutation = event === "pre-commit" ? "commit" : "push";
+      if (allClaimed && resources.length > 0) {
+        throw new SessionRegistryError("INVALID_RESOURCE", "--all-claimed cannot be combined with explicit resources");
+      }
+      const selectedResources = this.withLock(() => {
+        const selected = allClaimed ? this.resolveAllClaimedResourcesUnsafe(mutation, sessionId) : resources;
+        const authorization = this.requireMutationAuthorization(mutation, selected, sessionId);
+        const execution = this.verifyGovernedExecutionContext(sessionId);
+        const state = this.readStateUnsafe();
+        const pinnedRecord = (state.runtimeRecords.records.pinned_profiles ?? []).find(
+          (candidate) => candidate.session_id === sessionId,
+        );
+        if (pinnedRecord === undefined || parsePinnedProfileRecord(pinnedRecord).digest !== runtime.profile?.digest) {
+          throw new SessionRegistryError("STALE_REGISTRY", "Governed hook profile changed before approval", {
+            sessionId,
+          });
+        }
+        fence = Object.freeze({
+          sessionId: execution.session.sessionId,
+          repositoryId: execution.repositoryId,
+          worktreeId: execution.worktreeId,
+          worktreePath: execution.worktreePath,
+          branchId: execution.branchId,
+          headId: execution.headId,
+          registryRevision: state.registryRevision,
+          claimSetGeneration: state.claimSetGeneration,
+          runtimeEpoch: state.runtimeEpoch,
+          resources: authorization.resources,
+        });
+        return authorization.resources.map((resource) => resource.resource);
+      });
+      const material = runtime.hook_material;
+      if (material === null)
+        throw new SessionRegistryError("OPERATION_REJECTED", "Approved hook material is unavailable");
+      const executed = runGovernedHook(event, {
+        hook_set: hooks.value,
+        session_id: sessionId,
+        cwd: session.worktreePath,
+        argv: selectedResources,
+        runner: (command, argv, options) => {
+          if (command !== material.target) throw new Error("Governed hook target changed");
+          return spawnSync(material.source, [...argv], { ...options, encoding: "utf8" });
+        },
+      });
+      if (!executed.ok) throw executed.error;
+    }
+    return { config: config.value, fence };
+  }
+
+  private assertSessionGitMutationFresh(
+    fence: GovernedGitFreshnessFence | undefined,
+    sessionId: string | null,
+  ): VerifiedExecutionContext | undefined {
+    if (fence === undefined) return undefined;
+    const execution = this.verifyGovernedExecutionContext(sessionId);
+    const state = this.readStateUnsafe();
+    if (
+      state.registryRevision !== fence.registryRevision ||
+      state.claimSetGeneration !== fence.claimSetGeneration ||
+      state.runtimeEpoch !== fence.runtimeEpoch
+    ) {
+      throw new SessionRegistryError(
+        "STALE_REGISTRY",
+        "Governed hook approval is stale after registry authority changed",
+        {
+          sessionId: fence.sessionId,
+        },
+      );
+    }
+    if (
+      execution.session.sessionId !== fence.sessionId ||
+      execution.repositoryId !== fence.repositoryId ||
+      execution.worktreeId !== fence.worktreeId ||
+      execution.worktreePath !== fence.worktreePath ||
+      execution.branchId !== fence.branchId ||
+      execution.headId !== fence.headId
+    ) {
+      throw new SessionRegistryError(
+        "GIT_STATE_AMBIGUOUS",
+        "Governed hook approval is stale after Git authority changed",
+        {
+          sessionId: fence.sessionId,
+        },
+      );
+    }
+    return execution;
+  }
+
+  private assertSessionGitAuthorizationFresh(
+    fence: GovernedGitFreshnessFence | undefined,
+    authorization: OperationAuthorizationDecision,
+  ): void {
+    if (fence !== undefined && JSON.stringify(authorization.resources) !== JSON.stringify(fence.resources)) {
+      throw new SessionRegistryError(
+        "STALE_REGISTRY",
+        "Governed hook approval is stale after resource authority changed",
+        {
+          sessionId: fence.sessionId,
+        },
+      );
+    }
   }
 
   /**
@@ -3533,13 +4748,17 @@ export class SessionRegistry {
   }
 
   /** Close one session only after its ownership and recoverability are proven safe. */
-  close(sessionIdOrOptions?: string | null | CloseSessionOptions): CloseSessionResult {
+  close(
+    sessionIdOrOptions?: string | null | CloseSessionOptions,
+    finalization?: SessionDrainFinalization,
+  ): CloseSessionResult {
     return this.withLock(() => {
       const sessionId = isCloseSessionOptions(sessionIdOrOptions)
         ? (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id)
         : sessionIdOrOptions;
       const selectedSessionId = sessionId ?? this.resolveCurrentSession().sessionId;
       assertSessionId(selectedSessionId);
+      this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, selectedSessionId, "close");
       const evidence = closeIntegrationEvidence(sessionIdOrOptions ?? null);
       return this.coordinateCleanupUnsafe("close", selectedSessionId, evidence);
     });
@@ -3550,7 +4769,10 @@ export class SessionRegistry {
   }
 
   /** Explicitly discard exactly one selected session; never resolves the current owner implicitly. */
-  discard(sessionIdOrOptions: string | DiscardSessionOptions): DiscardSessionResult {
+  discard(
+    sessionIdOrOptions: string | DiscardSessionOptions,
+    finalization?: SessionDrainFinalization,
+  ): DiscardSessionResult {
     return this.withLock(() => {
       const requestedSessionId =
         typeof sessionIdOrOptions === "string"
@@ -3563,6 +4785,7 @@ export class SessionRegistry {
         );
       }
       assertSessionId(requestedSessionId);
+      this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, requestedSessionId, "discard");
       return this.coordinateCleanupUnsafe("discard", requestedSessionId);
     });
   }
@@ -4160,6 +5383,120 @@ export class SessionRegistry {
     return this.resolveOwnerSession(records).sessionId;
   }
 
+  private assertDrainFinalizationUnsafe(
+    state: RegistryState,
+    finalization: SessionDrainFinalization | undefined,
+    sessionId: string,
+    operation: SessionDrainFinalization["operation"],
+  ): SessionAdmissionRecord | undefined {
+    const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    if (finalization === undefined) {
+      if (admissionValue !== undefined) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Managed session mutation requires a drain finalization", {
+          sessionId,
+          operation,
+        });
+      }
+      return undefined;
+    }
+    if (
+      finalization.contract_id !== "nawabari.session-execution-control.v1" ||
+      finalization.schema_version !== 1 ||
+      finalization.status !== "ready" ||
+      finalization.next_action !== "finalize-lifecycle" ||
+      finalization.admission !== "closed" ||
+      finalization.operation !== operation ||
+      finalization.session_id !== sessionId ||
+      typeof finalization.admission_epoch !== "number" ||
+      !Number.isSafeInteger(finalization.admission_epoch) ||
+      finalization.admission_epoch < 1
+    ) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Runtime drain finalization does not match the mutation", {
+        sessionId,
+        operation,
+      });
+    }
+    if (admissionValue === undefined) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Session launch admission is untracked", { sessionId });
+    }
+    const admission = parseSessionAdmissionRecord(admissionValue);
+    if (admission.admission !== "closed" || admission.runtime_epoch !== finalization.admission_epoch) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Runtime drain admission fence is stale", {
+        sessionId,
+        admissionEpoch: finalization.admission_epoch,
+        currentAdmissionEpoch: admission.runtime_epoch,
+        admission: admission.admission,
+      });
+    }
+    const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+    if (session === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    if (operation === "release-claims" && session.state !== "active") {
+      throw new SessionRegistryError(
+        "SESSION_NOT_ACTIVE",
+        "Session cannot reopen launch admission after claim release",
+        {
+          sessionId,
+          state: session.state,
+        },
+      );
+    }
+    this.assertOwnedExecutionsEmptyUnsafe(state, sessionId);
+    return admission;
+  }
+
+  private assertOwnedExecutionsEmptyUnsafe(state: RegistryState, sessionId: string): void {
+    const executionValues = state.runtimeRecords.records.executions ?? [];
+    const owned = executionValues.flatMap((value) => {
+      const parsed = parseSessionExecutionRecord(value);
+      if (!parsed.ok) throw parsed.error;
+      return parsed.value.session_id === sessionId ? [parsed.value] : [];
+    });
+    if (owned.length === 0) {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "No owned execution records are available to prove kernel quiescence",
+        { sessionId, observation: "unknown" },
+      );
+    }
+    let currentBootId: string;
+    try {
+      currentBootId = readCurrentKernelBootId();
+    } catch (error: unknown) {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "Current kernel boot identity is unavailable during drain finalization",
+        { sessionId, reason: error instanceof Error ? error.message.slice(0, 200) : "unknown" },
+      );
+    }
+    for (const record of owned) {
+      const observed = observeOwnedExecution(ownedExecutionObservationRecord(record), {
+        current_boot_id: currentBootId,
+        ...(this.cgroupFilesystem === undefined ? {} : { filesystem: this.cgroupFilesystem }),
+      });
+      if (
+        !observed.ok ||
+        observed.value.state !== "empty" ||
+        observed.value.cgroups === null ||
+        observed.value.cgroups.population.state !== "empty"
+      ) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Owned execution scope is not proven empty at finalization",
+          {
+            sessionId,
+            executionId: record.execution_id,
+            observation: observed.ok ? observed.value.state : "unknown",
+            population: observed.ok ? (observed.value.cgroups?.population.state ?? "unknown") : "unknown",
+          },
+        );
+      }
+    }
+  }
+
   private claimOwner(records: readonly SessionRecord[], sessionId: string, requestedRepositoryId?: string): ClaimOwner {
     if (requestedRepositoryId !== undefined && requestedRepositoryId !== this.repository.repositoryId) {
       throw claimError("CLAIM_REPOSITORY_MISMATCH", "Resource claim repository does not match the current repository", {
@@ -4291,9 +5628,11 @@ export class SessionRegistry {
     owner: ClaimOwner,
     externalClaims: readonly ResourceClaim[],
     sessions: readonly SessionRecord[],
+    claimSetGeneration: number,
+    coordinationFacts: (left: ResourceClaim, right: ResourceClaim) => CoordinationFacts | undefined,
   ): void {
     this.assertNoOverlappingClaims(candidates);
-    this.validateRequestedClaims(candidates, owner, externalClaims, sessions);
+    this.validateRequestedClaims(candidates, owner, externalClaims, sessions, claimSetGeneration, coordinationFacts);
   }
 
   /**
@@ -4390,14 +5729,17 @@ export class SessionRegistry {
     inputs: readonly ResourceClaimInput[],
     owner: ClaimOwner,
     allowEmpty = false,
-  ): readonly { resource: string; mode: ResourceClaimMode }[] {
+  ): readonly CanonicalResourceClaimInput[] {
     if (!Array.isArray(inputs) || (!allowEmpty && inputs.length === 0)) {
       throw claimError("INVALID_CLAIM", "At least one resource claim is required");
     }
     const canonical = inputs
       .map((input) => canonicalizeClaimInput(input, owner))
       .sort((left, right) =>
-        compareCodePointStrings(`${left.resource}\u0000${left.mode}`, `${right.resource}\u0000${right.mode}`),
+        compareCodePointStrings(
+          `${left.resource}\u0000${left.mode}\u0000${left.sharing?.kind ?? ""}\u0000${left.sharing?.groupId ?? ""}`,
+          `${right.resource}\u0000${right.mode}\u0000${right.sharing?.kind ?? ""}\u0000${right.sharing?.groupId ?? ""}`,
+        ),
       );
     const timestamp = toTimestamp(this.clock());
     const claims = canonical.map((input) => createResourceClaim(input, owner, timestamp));
@@ -4408,7 +5750,7 @@ export class SessionRegistry {
   private addClaimsUnsafe(
     state: RegistryState,
     owner: ClaimOwner,
-    requested: readonly { resource: string; mode: ResourceClaimMode }[],
+    requested: readonly CanonicalResourceClaimInput[],
   ): ClaimMutationResult {
     const timestamp = toTimestamp(this.clock());
     const candidates = requested.map((input) => createResourceClaim(input, owner, timestamp));
@@ -4420,6 +5762,7 @@ export class SessionRegistry {
       [...existing, ...current],
       state.sessions,
       state.claimSetGeneration,
+      (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
     );
     const nextClaims = sortResourceClaims([
       ...state.claims,
@@ -4439,6 +5782,7 @@ export class SessionRegistry {
     existing: readonly ResourceClaim[],
     sessions: readonly SessionRecord[] = [],
     additiveClaimSetGeneration?: number,
+    coordinationFacts?: (left: ResourceClaim, right: ResourceClaim) => CoordinationFacts | undefined,
   ): readonly ResourceClaim[] {
     for (const candidate of candidates) {
       const exact = existing.find((claim) => claim.claimId === candidate.claimId);
@@ -4491,7 +5835,7 @@ export class SessionRegistry {
                 }),
           });
         }
-        if (claimsConflict(candidate, current)) {
+        if (claimsConflict(candidate, current, coordinationFacts?.(candidate, current))) {
           const conflictDetails = this.resourceClaimConflictDetails(candidate, current, {
             sessions,
             claims: existing,
@@ -4510,6 +5854,46 @@ export class SessionRegistry {
       }
     }
     return candidates;
+  }
+
+  private coordinationFacts(
+    left: ResourceClaim,
+    right: ResourceClaim,
+    generation: number,
+    suppliedRecords?: readonly SessionRecord[],
+  ): CoordinationFacts | undefined {
+    const records = suppliedRecords ?? this.readUnsafe();
+    const identity = (claim: ResourceClaim): WorktreeIdentityEvidence => {
+      const record = records.find((candidate) => candidate.sessionId === claim.sessionId);
+      if (record === undefined || record.state !== "active") return { status: "missing" };
+      try {
+        const physical = verifyPhysicalExecutionContext({
+          repository: this.repository,
+          worktreePath: record.worktreePath,
+          branchName: record.branchName,
+          git: this.git,
+        });
+        if (physical.worktreeId !== record.worktreeId || physical.worktreePath !== record.worktreePath)
+          return { status: "ambiguous" };
+        return {
+          status: "verified",
+          repositoryId: physical.repositoryId,
+          sessionId: record.sessionId,
+          worktreeId: physical.worktreeId,
+          worktreePath: physical.worktreePath,
+        };
+      } catch {
+        return { status: "missing" };
+      }
+    };
+    return {
+      left,
+      right,
+      leftIdentity: identity(left),
+      rightIdentity: identity(right),
+      claimSetGeneration: generation,
+      observedClaimSetGeneration: generation,
+    };
   }
 
   private closeUnsafe(
@@ -5581,11 +6965,177 @@ export class SessionRegistry {
       );
     }
 
-    return parseRegistry(parsed, this.repository.repositoryId, allowLegacyClaimSchema);
+    return parseRegistry(
+      parsed,
+      this.repository.repositoryId,
+      allowLegacyClaimSchema,
+      (left, right, generation, records) => this.coordinationFacts(left, right, generation, records),
+    );
   }
 
   private readUnsafe(): readonly SessionRecord[] {
     return this.readStateUnsafe().sessions;
+  }
+
+  private coordinationTransactionSnapshot(state: RegistryState): CoordinationTransactionSnapshot {
+    return {
+      repositoryId: this.repository.repositoryId,
+      claimSetGeneration: state.claimSetGeneration,
+      sessions: state.sessions,
+      claims: state.claims,
+    };
+  }
+
+  private resourceHandoffSnapshotUnsafe(state: RegistryState): ResourceHandoffSnapshot {
+    const completedOperations = (state.runtimeRecords.records.recent_events ?? []).map((record) => {
+      const event = record as unknown as ResourceHandoffRecentEvent;
+      return {
+        operationId: event.operation_id,
+        fromSessionId: event.from_session_id,
+        toSessionId: event.to_session_id,
+        resource: event.resource,
+        mode: event.mode,
+        claimSetGeneration: event.claim_set_generation,
+      };
+    });
+    return {
+      schemaVersion: 1,
+      operation: "resource-handoff",
+      registry: {
+        repositoryId: this.repository.repositoryId,
+        claimSetGeneration: state.claimSetGeneration,
+        sessions: state.sessions.map((session) => ({
+          sessionId: session.sessionId,
+          repositoryId: session.repositoryId,
+          worktreePath: session.worktreePath,
+          state: session.state,
+          maxScope: session.workingSet?.scope ?? null,
+        })),
+        claims: state.claims.map(cloneResourceClaim),
+        ...(completedOperations.length === 0 ? {} : { completedOperations }),
+      },
+    };
+  }
+
+  private commitResourceHandoff(input: ResourceHandoffCommitInput): ResourceHandoffCommitResult {
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const current = this.resourceHandoffSnapshotUnsafe(state);
+      if (current.registry.claimSetGeneration !== input.snapshot.registry.claimSetGeneration) {
+        throw new SessionRegistryError("STALE_CLAIM_SET", "Claim-set generation changed before the handoff commit", {
+          expectedClaimSetGeneration: input.snapshot.registry.claimSetGeneration,
+          actualClaimSetGeneration: current.registry.claimSetGeneration,
+        });
+      }
+
+      const validation = validateResourceHandoff(current, input.options);
+      if (validation.status === "idempotent") {
+        return {
+          status: "idempotent",
+          operationId: input.normalized.operationId,
+          claimSetGeneration: current.registry.claimSetGeneration,
+          sourceClaim: validation.sourceClaim,
+          destinationClaim: validation.destinationClaim,
+        };
+      }
+      if (validation.status !== "allowed" || validation.sourceClaim === null) {
+        throw new SessionRegistryError(validation.code as RegistryErrorCode, "Resource handoff commit was rejected", {
+          blockers: validation.blockers as unknown as RegistryErrorDetailValue,
+          sourceRetained: true,
+        });
+      }
+
+      const sourceSession = state.sessions.find((session) => session.sessionId === input.normalized.fromSessionId);
+      const destinationSession = state.sessions.find((session) => session.sessionId === input.normalized.toSessionId);
+      if (sourceSession === undefined || destinationSession === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", "Resource handoff session identity changed before commit");
+      }
+      const expectedSource = input.snapshot.registry.sessions.find(
+        (session) => session.sessionId === input.normalized.fromSessionId,
+      );
+      const expectedDestination = input.snapshot.registry.sessions.find(
+        (session) => session.sessionId === input.normalized.toSessionId,
+      );
+      if (
+        expectedSource === undefined ||
+        expectedDestination === undefined ||
+        expectedSource.repositoryId !== sourceSession.repositoryId ||
+        expectedSource.worktreePath !== sourceSession.worktreePath ||
+        expectedSource.state !== sourceSession.state ||
+        expectedDestination.repositoryId !== destinationSession.repositoryId ||
+        expectedDestination.worktreePath !== destinationSession.worktreePath ||
+        expectedDestination.state !== destinationSession.state
+      ) {
+        throw new SessionRegistryError("WORKTREE_MISMATCH", "Handoff session identity changed before commit", {
+          fromSessionId: input.normalized.fromSessionId,
+          toSessionId: input.normalized.toSessionId,
+        });
+      }
+
+      const destinationOwner: ClaimOwner = { ...destinationSession, record: destinationSession };
+      const destinationClaim = createResourceClaim(
+        { resource: input.normalized.resource, mode: input.normalized.mode },
+        destinationOwner,
+        toTimestamp(this.clock()),
+      );
+      const nextClaims = sortResourceClaims([
+        ...state.claims.filter((claim) => claim.claimId !== validation.sourceClaim?.claimId),
+        destinationClaim,
+      ]);
+      validateRegistryClaims(
+        state.sessions,
+        nextClaims,
+        this.repository.repositoryId,
+        false,
+        (left, right, generation, records) => this.coordinationFacts(left, right, generation, records),
+        state.claimSetGeneration,
+      );
+      const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+      if (claimSetGeneration === state.claimSetGeneration) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Resource handoff did not change the claim set");
+      }
+
+      const recentEvents = [...(state.runtimeRecords.records.recent_events ?? [])];
+      if (recentEvents.length >= MAX_RUNTIME_RECORDS) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Resource handoff retry evidence capacity is exhausted", {
+          maximum: MAX_RUNTIME_RECORDS,
+        });
+      }
+      const event: ResourceHandoffRecentEvent = Object.freeze({
+        kind: "resource-handoff",
+        schema_version: 1,
+        operation_id: input.normalized.operationId,
+        from_session_id: input.normalized.fromSessionId,
+        to_session_id: input.normalized.toSessionId,
+        resource: input.normalized.resource,
+        mode: input.normalized.mode,
+        claim_set_generation: claimSetGeneration,
+      });
+      const requiredFeatures: RegistryFeature[] = [...state.runtimeRecords.requiredFeatures];
+      if (!requiredFeatures.includes("recent-events.v1")) requiredFeatures.push("recent-events.v1");
+      const runtimeRecords: ParsedRuntimeRecords = Object.freeze({
+        requiredFeatures: Object.freeze(requiredFeatures),
+        records: Object.freeze({
+          ...state.runtimeRecords.records,
+          recent_events: Object.freeze([...recentEvents, event]),
+        }),
+      });
+      this.writeUnsafe(
+        state.sessions,
+        nextClaims,
+        claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        runtimeRecords,
+      );
+      return {
+        status: "transferred",
+        operationId: input.normalized.operationId,
+        claimSetGeneration,
+        sourceClaim: null,
+        destinationClaim: cloneResourceClaim(destinationClaim),
+      };
+    });
   }
 
   /**
@@ -5611,7 +7161,8 @@ export class SessionRegistry {
     if (!Number.isSafeInteger(runtimeEpoch) || runtimeEpoch < 0) {
       throw new SessionRegistryError("REGISTRY_CORRUPT", "Runtime epoch must be a non-negative safe integer");
     }
-    const optionalRecords = toPersistedRuntimeRecords(runtimeRecords);
+    const currentRuntimeRecords = rebaseOpenSessionAdmissions(runtimeRecords, runtimeEpoch);
+    const optionalRecords = toPersistedRuntimeRecords(currentRuntimeRecords);
     const registry: PersistedRegistry = {
       schema_version: REGISTRY_SCHEMA_VERSION,
       repository_id: this.repository.repositoryId,
@@ -5621,7 +7172,7 @@ export class SessionRegistry {
       claim_set_generation: claimSetGeneration,
       registry_revision: registryRevision,
       runtime_epoch: runtimeEpoch,
-      required_features: [...runtimeRecords.requiredFeatures],
+      required_features: [...currentRuntimeRecords.requiredFeatures],
       ...optionalRecords,
     };
 
@@ -5651,6 +7202,147 @@ export class SessionRegistry {
         error,
       );
     }
+  }
+
+  private reserveFileOperationUnsafe(
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
+  ): FileOperationReservationContext {
+    const state = this.readStateUnsafe();
+    return reserveFileOperationUnsafe(this, state, operation, executionOptions, (runtimeRecords, revision) => {
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        revision,
+        state.runtimeEpoch,
+        runtimeRecords,
+      );
+    });
+  }
+
+  private finalizeFileOperationUnresolved(operationId: string): void {
+    this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
+      const record = fileOperations.fileOperations.find((candidate) => candidate.operationId === operationId);
+      if (record === undefined) {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", "File-operation receipt disappeared during reconciliation", {
+          operationId,
+        });
+      }
+      const reconciliation = reconcileFileOperationReceipt(record, {
+        authorityToken: record.authorityToken,
+        fenceEpoch: record.fenceEpoch,
+        source: null,
+        destination: null,
+        effectObserved: false,
+        executionCompleted: false,
+      });
+      if (reconciliation.record === record) return;
+      const index = fileOperations.fileOperations.findIndex((candidate) => candidate.operationId === operationId);
+      fileOperations.fileOperations[index] = reconciliation.record;
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        runtimeRecordsWithFileOperations(state.runtimeRecords, fileOperations),
+      );
+    });
+  }
+
+  private finalizeFileOperation(
+    operationId: string,
+    token: FilesystemPolicyToken,
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
+    observation: FileOperationObservation,
+  ): ReturnType<typeof reconcileFileOperationReceiptAuthority> {
+    let finalPolicyInput: CollectedFileOperationPolicyInput | undefined;
+    try {
+      finalPolicyInput = { value: resolveFileOperationPolicyInput(executionOptions) };
+    } catch {
+      // An unavailable external policy observation is unresolved below.
+    }
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
+      const record = fileOperations.fileOperations.find((candidate) => candidate.operationId === operationId);
+      if (record === undefined) {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", "File-operation receipt disappeared during reconciliation", {
+          operationId,
+        });
+      }
+      let authorityCurrent = false;
+      if (finalPolicyInput !== undefined) {
+        try {
+          const current = currentFileOperationAuthority(this, state, operation, executionOptions, finalPolicyInput);
+          authorityCurrent = validateFilesystemPolicyToken(token, current.token).ok;
+        } catch {
+          authorityCurrent = false;
+        }
+      }
+      const reconciliation = reconcileFileOperationReceiptAuthority(record, observation, authorityCurrent);
+      if (reconciliation.record === record) return reconciliation;
+      const replacementIndex = fileOperations.fileOperations.findIndex(
+        (candidate) => candidate.operationId === reconciliation.record.operationId,
+      );
+      fileOperations.fileOperations[replacementIndex] = reconciliation.record;
+      this.writeUnsafe(
+        state.sessions,
+        state.claims,
+        state.claimSetGeneration,
+        nextRegistryRevision(state),
+        state.runtimeEpoch,
+        runtimeRecordsWithFileOperations(state.runtimeRecords, fileOperations),
+      );
+      return reconciliation;
+    });
+  }
+
+  /**
+   * Reopen launch admission after the fenced file operation finished its final
+   * reconciliation. Any concurrent admission change leaves the session closed.
+   */
+  private reopenFileOperationAdmission(finalization: SessionDrainFinalization): void {
+    try {
+      this.withLock(() => {
+        const state = this.readStateUnsafe();
+        const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+          (candidate) => candidate.session_id === finalization.session_id,
+        );
+        if (admissionValue === undefined) return;
+        const admission = parseSessionAdmissionRecord(admissionValue);
+        const session = state.sessions.find((candidate) => candidate.sessionId === finalization.session_id);
+        if (
+          admission.admission !== "closed" ||
+          admission.runtime_epoch !== finalization.admission_epoch ||
+          session?.state !== "active"
+        ) {
+          return;
+        }
+        const runtimeEpoch = nextRuntimeEpoch(state);
+        this.writeUnsafe(
+          state.sessions,
+          state.claims,
+          state.claimSetGeneration,
+          nextRegistryRevision(state),
+          runtimeEpoch,
+          withSessionAdmission(state.runtimeRecords, { ...admission, admission: "open", runtime_epoch: runtimeEpoch }),
+        );
+      });
+    } catch {
+      // The file-operation receipt is authoritative; admission stays closed.
+    }
+  }
+
+  private fileOperationAuthority(
+    operation: WorktreeFileOperation,
+    executionOptions: FileOperationExecutionOptions,
+  ): FileOperationAuthorityContext {
+    return currentFileOperationAuthority(this, this.readStateUnsafe(), operation, executionOptions);
   }
 
   private mutate<T>(
@@ -5706,6 +7398,519 @@ export class SessionRegistry {
     }
     return result;
   }
+}
+
+interface FileOperationReservationContext {
+  readonly record: FileOperationRecord;
+  readonly token: FilesystemPolicyToken;
+  readonly operation: WorktreeFileOperation;
+  readonly replay: boolean;
+}
+
+interface FileOperationAuthorityContext {
+  readonly policy: EffectiveFilesystemPolicy;
+  readonly token: FilesystemPolicyToken;
+}
+
+interface CollectedFileOperationPolicyInput {
+  readonly value: EffectiveFilesystemPolicyInputs;
+}
+
+function fileOperationStateFromRuntimeRecords(runtimeRecords: ParsedRuntimeRecords): FileOperationRegistryState {
+  const persisted = runtimeRecords.records.file_operations;
+  if (persisted === undefined) return createFileOperationRegistryState();
+  try {
+    return parseFileOperationRegistry({ schema_version: 1, file_operations: persisted });
+  } catch (error: unknown) {
+    throw fileOperationRegistryError(error);
+  }
+}
+
+function runtimeRecordsWithFileOperations(
+  runtimeRecords: ParsedRuntimeRecords,
+  fileOperations: FileOperationRegistryState,
+): ParsedRuntimeRecords {
+  const serialized = serializeFileOperationRegistry(fileOperations).file_operations;
+  const requiredFeatures = runtimeRecords.requiredFeatures.includes(FILE_OPERATION_REQUIRED_FEATURE)
+    ? runtimeRecords.requiredFeatures
+    : [...runtimeRecords.requiredFeatures, FILE_OPERATION_REQUIRED_FEATURE];
+  return Object.freeze({
+    requiredFeatures: Object.freeze([...requiredFeatures]),
+    records: Object.freeze({ ...runtimeRecords.records, file_operations: Object.freeze([...serialized]) }),
+  });
+}
+
+function fileOperationRegistryError(error: unknown): SessionRegistryError {
+  if (error instanceof SessionRegistryError) return error;
+  const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+  const fileOperationCodes = new Set([
+    "FILE_OPERATION_INVALID",
+    "FILE_OPERATION_ID_CONFLICT",
+    "FILE_OPERATION_INVALID_TRANSITION",
+    "FILE_OPERATION_LIMIT",
+    "FILE_OPERATION_AUTHORITY_DENIED",
+    "FILE_OPERATION_UNSUPPORTED_SCHEMA",
+    "FILE_OPERATION_CORRUPT",
+  ]);
+  const registryCode: RegistryErrorCode = fileOperationCodes.has(String(code))
+    ? (String(code) as RegistryErrorCode)
+    : code === "FILE_OPERATION_UNSUPPORTED_SCHEMA"
+      ? "UNSUPPORTED_SCHEMA_VERSION"
+      : "REGISTRY_CORRUPT";
+  const details =
+    typeof error === "object" && error !== null && "details" in error && isRecordValue(error.details)
+      ? (error.details as RegistryErrorDetails)
+      : {};
+  return new SessionRegistryError(
+    registryCode,
+    error instanceof Error ? error.message : "File-operation registry state is invalid",
+    details,
+    error,
+  );
+}
+
+function cloneFileOperationRecord(record: FileOperationRecord): FileOperationRecord {
+  return JSON.parse(JSON.stringify(record)) as FileOperationRecord;
+}
+
+function reserveFileOperationUnsafe(
+  registry: SessionRegistry,
+  state: RegistryState,
+  operation: WorktreeFileOperation,
+  executionOptions: FileOperationExecutionOptions,
+  persist: (runtimeRecords: ParsedRuntimeRecords, registryRevision: number) => void,
+): FileOperationReservationContext {
+  const session = state.sessions.find((candidate) => candidate.sessionId === operation.session_id);
+  if (session === undefined) {
+    throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${operation.session_id}`, {
+      sessionId: operation.session_id,
+    });
+  }
+  if (session.state !== "active") {
+    throw new SessionRegistryError(
+      "SESSION_NOT_ACTIVE",
+      `Session cannot execute a file operation while ${session.state}`,
+      {
+        sessionId: operation.session_id,
+      },
+    );
+  }
+  if (operation.requested_generation !== state.claimSetGeneration) {
+    throw new SessionRegistryError("STALE_CLAIM_SET", "File-operation requested_generation is stale", {
+      requestedGeneration: operation.requested_generation,
+      claimSetGeneration: state.claimSetGeneration,
+    });
+  }
+
+  const authority = currentFileOperationAuthority(registry, state, operation, executionOptions);
+  const currentPolicy = authority.policy;
+  const rebuilt = rebuildFileOperation(registry, state, session, operation, currentPolicy);
+  const postReservationRevision = nextRegistryRevision(state);
+  const tokenResult = createFilesystemPolicyToken({
+    registry_revision: postReservationRevision,
+    session_runtime_epoch: state.runtimeEpoch,
+    claim_set_generation: state.claimSetGeneration,
+    working_set_revision: currentPolicy.provenance.working_set_revision,
+    profile_digest: effectiveFilesystemProfileBoundaryDigest(currentPolicy),
+    session_id: operation.session_id,
+  });
+  if (!tokenResult.ok) throw sessionRegistryOperationError(tokenResult.error.message, tokenResult.error.details);
+  const token = tokenResult.value;
+  const authorityToken = fileOperationAuthorityToken(token);
+  let request = fileOperationRequest(rebuilt, authorityToken);
+  const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
+  const existing = fileOperations.fileOperations.find((candidate) => candidate.operationId === request.operationId);
+  if (existing !== undefined) {
+    const existingRequest = fileOperationRequest(rebuilt, existing.authorityToken);
+    if (fileOperationRequestDigest(existingRequest) !== existing.requestDigest) {
+      throw new SessionRegistryError("FILE_OPERATION_ID_CONFLICT", "operation_id is already bound to another request", {
+        operationId: request.operationId,
+      });
+    }
+    request = existingRequest;
+    if (existing.stage !== "prepared") return { record: existing, token, operation: rebuilt, replay: true };
+  }
+  let record: FileOperationRecord;
+  try {
+    record = reserveFileOperation(fileOperations, request, new Date().toISOString());
+  } catch (error: unknown) {
+    throw fileOperationRegistryError(error);
+  }
+  let applied: FileOperationRecord;
+  try {
+    applied = recordFileOperationApplyAttempt(
+      fileOperations,
+      request.operationId,
+      request.authorityToken,
+      new Date().toISOString(),
+    );
+  } catch (error: unknown) {
+    throw fileOperationRegistryError(error);
+  }
+  const nextRuntimeRecords = runtimeRecordsWithFileOperations(state.runtimeRecords, fileOperations);
+  persist(nextRuntimeRecords, postReservationRevision);
+  return { record: applied, token, operation: rebuilt, replay: false };
+}
+
+function currentFileOperationAuthority(
+  registry: SessionRegistry,
+  state: RegistryState,
+  operation: WorktreeFileOperation,
+  executionOptions: FileOperationExecutionOptions,
+  policyInput?: CollectedFileOperationPolicyInput,
+): FileOperationAuthorityContext {
+  const session = state.sessions.find((candidate) => candidate.sessionId === operation.session_id);
+  if (session === undefined) {
+    throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${operation.session_id}`, {
+      sessionId: operation.session_id,
+    });
+  }
+  const policy = compileFileOperationPolicy(registry, state, session, operation, executionOptions, policyInput);
+  const decision = decideEffectivePathAccess({
+    policy,
+    operation: effectiveOperation(operation),
+    path: operation.path,
+    ...(operation.to_path === undefined ? {} : { destination: operation.to_path }),
+  });
+  if (decision.status !== "allow") {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "The file operation is outside the current filesystem policy",
+      {
+        operationId: operation.operation_id,
+        status: decision.status,
+        reason: decision.reason,
+      },
+    );
+  }
+  const workingSetRevision = policy.provenance.working_set_revision;
+  if (!Number.isSafeInteger(workingSetRevision) || (workingSetRevision as number) < 1) {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "Current filesystem policy has no positive working-set revision",
+      {
+        operationId: operation.operation_id,
+        field: "policy.provenance.working_set_revision",
+      },
+    );
+  }
+  const tokenResult = createFilesystemPolicyToken({
+    registry_revision: state.registryRevision,
+    session_runtime_epoch: state.runtimeEpoch,
+    claim_set_generation: state.claimSetGeneration,
+    working_set_revision: workingSetRevision as number,
+    profile_digest: effectiveFilesystemProfileBoundaryDigest(policy),
+    session_id: operation.session_id,
+  });
+  if (!tokenResult.ok) throw sessionRegistryOperationError(tokenResult.error.message, tokenResult.error.details);
+  return { policy, token: tokenResult.value };
+}
+
+function compileFileOperationPolicy(
+  registry: SessionRegistry,
+  state: RegistryState,
+  session: SessionRecord,
+  _operation: WorktreeFileOperation,
+  executionOptions: FileOperationExecutionOptions,
+  policyInput?: CollectedFileOperationPolicyInput,
+): EffectiveFilesystemPolicy {
+  const supplied = policyInput === undefined ? resolveFileOperationPolicyInput(executionOptions) : policyInput.value;
+  const suppliedWorkingSet = supplied.working_set ?? supplied.workingSet;
+  const workingSet = suppliedWorkingSet ?? session.workingSet;
+  const workingSetRecord = isRecordValue(workingSet) ? workingSet : undefined;
+  const repository =
+    workingSetRecord?.repository ??
+    supplied.repository ??
+    ({ repositoryHost: "local", repositoryId: registry.repository.repositoryId } as const);
+  const base =
+    workingSetRecord?.base ??
+    supplied.base ??
+    (session.baseRevision === undefined ? undefined : { branch: session.branchName, revision: session.baseRevision });
+  const result = compileEffectiveFilesystemPolicy({
+    ...supplied,
+    ...(workingSet === undefined ? { working_set: undefined } : { working_set: workingSet }),
+    claims: state.claims.filter((claim) => claim.sessionId === session.sessionId),
+    claim_set_generation: state.claimSetGeneration,
+    runtime_epoch: state.runtimeEpoch,
+    repository,
+    ...(base === undefined ? {} : { base }),
+    worktree_path: session.worktreePath,
+  });
+  if (!result.ok) throw sessionRegistryOperationError(result.error.message, result.error.details);
+  return result.value;
+}
+
+function resolveFileOperationPolicyInput(
+  executionOptions: FileOperationExecutionOptions,
+): EffectiveFilesystemPolicyInputs {
+  const supplied =
+    typeof executionOptions.policy === "function" ? executionOptions.policy() : (executionOptions.policy ?? {});
+  if (!isRecordValue(supplied)) {
+    throw new SessionRegistryError("OPERATION_REJECTED", "Filesystem policy input must be an object");
+  }
+  return supplied as EffectiveFilesystemPolicyInputs;
+}
+
+function rebuildFileOperation(
+  _registry: SessionRegistry,
+  state: RegistryState,
+  session: SessionRecord,
+  operation: WorktreeFileOperation,
+  policy: EffectiveFilesystemPolicy,
+): WorktreeFileOperation {
+  const claims = state.claims
+    .filter((claim) => claim.sessionId === session.sessionId)
+    .map((claim) => ({ resource: claim.resource, mode: claim.mode }));
+  return {
+    ...operation,
+    worktree_root: session.worktreePath,
+    scope: {
+      create:
+        operation.operation === "DELETE"
+          ? []
+          : [operation.operation === "RENAME" ? (operation.to_path ?? operation.path) : operation.path],
+      delete: operation.operation === "CREATE" ? [] : [operation.path],
+      deny: [],
+    },
+    claims,
+  };
+}
+
+function fileOperationRequest(operation: WorktreeFileOperation, authorityToken: string): FileOperationRequest {
+  const expectedIdentity: FileIdentity | null =
+    operation.expected_identity ?? (operation.expected_digest === null ? null : { digest: operation.expected_digest });
+  const payloadDigest =
+    operation.operation === "CREATE" && operation.payload_ref !== undefined
+      ? createHash("sha256").update(Buffer.from(operation.payload_ref.data, "base64")).digest("hex")
+      : null;
+  return {
+    operationId: operation.operation_id,
+    sessionId: operation.session_id,
+    operation: operation.operation.toLowerCase() as "create" | "delete" | "rename",
+    source: operation.operation === "CREATE" ? null : operation.path,
+    destination:
+      operation.operation === "CREATE"
+        ? operation.path
+        : operation.operation === "RENAME"
+          ? (operation.to_path ?? null)
+          : null,
+    expectedIdentity,
+    payloadDigest,
+    authorityToken,
+    fenceEpoch: operation.requested_generation,
+  };
+}
+
+function effectiveOperation(operation: WorktreeFileOperation): "CREATE" | "DELETE" | "RENAME" {
+  return operation.operation;
+}
+
+function effectiveFilesystemProfileBoundaryDigest(policy: EffectiveFilesystemPolicy): string {
+  const boundary = {
+    status: policy.profile.status,
+    identity: policy.profile.identity,
+    digest: policy.profile.digest,
+    revision: policy.profile.revision,
+    epoch: policy.profile.epoch,
+    scope: policy.profile.scope,
+  };
+  return createHash("sha256").update(stableCanonicalJson(boundary), "utf8").digest("hex");
+}
+
+function stableCanonicalJson(value: unknown): string {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value))
+      throw new SessionRegistryError("OPERATION_REJECTED", "Filesystem policy contains non-finite data");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(stableCanonicalJson).join(",")}]`;
+  if (isRecordValue(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableCanonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  throw new SessionRegistryError("OPERATION_REJECTED", "Filesystem policy contains non-JSON data");
+}
+
+function fileOperationAuthorityToken(token: FilesystemPolicyToken): string {
+  const serialized = serializeFilesystemPolicyToken(token);
+  if (!serialized.ok) throw sessionRegistryOperationError(serialized.error.message, serialized.error.details);
+  return `filesystem-policy:${createHash("sha256").update(serialized.value, "utf8").digest("hex")}`;
+}
+
+function observeFileOperationEffect(
+  record: FileOperationRecord,
+  result: WorktreeFileOperationResult,
+  operation: WorktreeFileOperation,
+): FileOperationObservation {
+  return observeFileOperationObservation(record, operation, result.identity as unknown as FileIdentity, true);
+}
+
+function observeFileOperationWithoutResult(
+  record: FileOperationRecord,
+  operation: WorktreeFileOperation,
+): FileOperationObservation {
+  try {
+    const destinationPath =
+      operation.operation === "DELETE"
+        ? null
+        : operation.operation === "RENAME"
+          ? (operation.to_path ?? operation.path)
+          : operation.path;
+    const destinationAfter =
+      destinationPath === null ? null : observeFilePath(operation.worktree_root, destinationPath);
+    return observeFileOperationObservation(
+      record,
+      operation,
+      destinationAfter?.identity === undefined ? undefined : destinationAfter.identity,
+      false,
+    );
+  } catch {
+    return unresolvedObservation(record);
+  }
+}
+
+function observeFileOperationObservation(
+  record: FileOperationRecord,
+  operation: WorktreeFileOperation,
+  resultIdentity: FileIdentity | undefined,
+  executionCompleted: boolean,
+): FileOperationObservation {
+  try {
+    const sourceAfter =
+      operation.operation === "CREATE" ? null : observeFilePath(operation.worktree_root, operation.path);
+    const destinationAfter =
+      operation.operation === "DELETE"
+        ? null
+        : observeFilePath(
+            operation.worktree_root,
+            operation.operation === "RENAME" ? (operation.to_path ?? operation.path) : operation.path,
+          );
+    const expected = record.expectedIdentity;
+    const source: FileOperationPathObservation | null =
+      operation.operation === "CREATE"
+        ? null
+        : {
+            before: { present: true, ...(expected === null ? {} : { identity: expected }) },
+            present: sourceAfter?.present ?? false,
+            ...(sourceAfter?.identity === undefined ? {} : { identity: sourceAfter.identity }),
+            ...(sourceAfter?.payloadDigest === undefined ? {} : { payloadDigest: sourceAfter.payloadDigest }),
+          };
+    const destination: FileOperationPathObservation | null =
+      operation.operation === "DELETE"
+        ? null
+        : {
+            ...(operation.operation === "RENAME" ? { before: { present: false } } : { before: { present: false } }),
+            present: destinationAfter?.present ?? false,
+            ...(destinationAfter?.payloadDigest === undefined ? {} : { payloadDigest: destinationAfter.payloadDigest }),
+            ...(destinationAfter?.present && resultIdentity !== undefined ? { identity: resultIdentity } : {}),
+          };
+    return {
+      operationId: record.operationId,
+      authorityToken: record.authorityToken,
+      fenceEpoch: record.fenceEpoch,
+      source,
+      destination,
+      effectObserved: true,
+      executionCompleted,
+    };
+  } catch (error: unknown) {
+    return unresolvedObservation(record);
+  }
+}
+
+function observeFilePath(root: string, relative: string): FileOperationPathFact {
+  const target = path.join(root, relative);
+  let descriptor: number;
+  try {
+    descriptor = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  } catch (error: unknown) {
+    if (isNodeError(error) && error.code === "ENOENT") return { present: false };
+    throw error;
+  }
+  try {
+    const stats = fs.fstatSync(descriptor, { bigint: true });
+    if (!stats.isFile() || stats.nlink !== 1n) return { present: true };
+    if (stats.size > BigInt(WORKTREE_FILE_OPERATION_MAX_PAYLOAD_BYTES))
+      throw new Error("File observation exceeds bound");
+    const contents = Buffer.alloc(Number(stats.size));
+    let offset = 0;
+    while (offset < contents.length) {
+      const count = fs.readSync(descriptor, contents, offset, contents.length - offset, offset);
+      if (count === 0) throw new Error("File changed during observation");
+      offset += count;
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      after.dev !== stats.dev ||
+      after.ino !== stats.ino ||
+      after.size !== stats.size ||
+      after.mtimeNs !== stats.mtimeNs ||
+      after.ctimeNs !== stats.ctimeNs ||
+      after.nlink !== stats.nlink
+    )
+      throw new Error("File changed during observation");
+    const digest = createHash("sha256").update(contents).digest("hex");
+    return {
+      present: true,
+      identity: { dev: String(stats.dev), ino: String(stats.ino), size: Number(stats.size), digest },
+      payloadDigest: digest,
+    };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function unresolvedObservation(
+  record: FileOperationRecord,
+  observed?: FileOperationObservation,
+): FileOperationObservation {
+  return {
+    operationId: record.operationId,
+    authorityToken: record.authorityToken,
+    fenceEpoch: record.fenceEpoch,
+    source: observed?.source ?? null,
+    destination: observed?.destination ?? null,
+    effectObserved: observed?.effectObserved === true,
+    executionCompleted: false,
+  };
+}
+
+function replayedFileOperationResult(record: FileOperationRecord): WorktreeFileOperationResult {
+  return {
+    contract_id: "nawabari.worktree-file-operation.v1",
+    schema_version: 1,
+    operation_id: record.operationId,
+    operation: record.operation.toUpperCase() as WorktreeFileOperationResult["operation"],
+    state: "applied",
+  } as WorktreeFileOperationResult;
+}
+
+function uncertainFileOperation(operationId: string, reason: string): SessionRegistryError {
+  return new SessionRegistryError(
+    "OPERATION_REJECTED",
+    "The file operation state is uncertain; reconciliation is required.",
+    {
+      operation_id: operationId,
+      operation_code: "FILE_OPERATION_STATE_UNCERTAIN",
+      state_uncertain: true,
+      reason,
+    },
+  );
+}
+
+function sessionRegistryOperationError(message: string, details: unknown): SessionRegistryError {
+  return new SessionRegistryError(
+    "OPERATION_REJECTED",
+    message,
+    isRecordValue(details) ? (details as RegistryErrorDetails) : {},
+  );
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 interface CreationResources {
@@ -6743,7 +8948,16 @@ function commitGitArguments(
   cwd: string,
   gitIdentity: SandboxGitIdentity | undefined,
   message: string,
+  sessionConfig?: SessionGitConfig,
 ): readonly string[] {
+  if (sessionConfig !== undefined) {
+    const identityArguments: string[] = [];
+    for (const [key, value] of Object.entries(sessionConfig.config)) {
+      if (key === "core.hooksPath") continue;
+      identityArguments.push("-c", `${key}=${value}`);
+    }
+    return ["-c", "core.hooksPath=/dev/null", ...identityArguments, "commit", "-m", message];
+  }
   const identityArguments: string[] = [];
   if (gitIdentity !== undefined) {
     const localName = readLocalGitIdentityValue(git, "user.name", cwd);
@@ -8133,6 +10347,45 @@ function lstatIfPresent(candidate: string): fs.Stats | undefined {
   }
 }
 
+/** Read the live kernel boot identity used to bind owned-execution observations. */
+export function readCurrentKernelBootId(): string {
+  const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  if (bootId.length === 0 || bootId.length > 256 || bootId.includes("\0")) {
+    throw new Error("invalid boot identity");
+  }
+  return bootId;
+}
+
+/** Project one durable execution record onto its canonical owned cgroup lease. */
+export function ownedExecutionObservationRecord(
+  record: Pick<
+    PersistedSessionExecutionRecord,
+    "session_id" | "execution_id" | "boot_id" | "state" | "cgroup_identity" | "cgroup_root"
+  >,
+): OwnedExecutionRecord {
+  const name = deriveCgroupScopeName(record.cgroup_identity);
+  const root = record.cgroup_root;
+  return {
+    schema_version: 1,
+    session_id: record.session_id,
+    execution_id: record.execution_id,
+    boot_id: record.boot_id,
+    state: record.state === "attached" || record.state === "running" ? "active" : "terminal",
+    cgroups:
+      root === null || root === undefined
+        ? null
+        : {
+            contract_id: CGROUPS_V2_CONTRACT_ID,
+            root,
+            parent: `${root}/nawabari`,
+            path: `${root}/nawabari/${name}`,
+            name,
+            boot_id: record.boot_id,
+            identity: record.cgroup_identity,
+          },
+  };
+}
+
 export function toPersistedSessionRecord(
   record: SessionRecord,
   expectedRepositoryId: string = record.repositoryId,
@@ -8155,6 +10408,7 @@ export function toPersistedSessionRecord(
     ...(validated.discardedHead === undefined ? {} : { discarded_head: validated.discardedHead }),
     ...(validated.cleanupHead === undefined ? {} : { cleanup_head: validated.cleanupHead }),
     ...(validated.workingSet === undefined ? {} : { working_set: validated.workingSet }),
+    ...(validated.claimEnforcement === undefined ? {} : { claim_enforcement: validated.claimEnforcement }),
   };
 }
 
@@ -8171,12 +10425,25 @@ export function toPersistedResourceClaim(
     worktree_path: validated.worktreePath,
     resource: validated.resource,
     mode: validated.mode,
+    ...(validated.sharing === undefined
+      ? {}
+      : { sharing: { kind: validated.sharing.kind, group_id: validated.sharing.groupId } }),
     created_at: validated.createdAt,
     updated_at: validated.updatedAt,
   };
 }
 
-function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacyClaimSchema = false): RegistryState {
+function parseRegistry(
+  value: unknown,
+  expectedRepositoryId: string,
+  allowLegacyClaimSchema = false,
+  coordinationFacts?: (
+    left: ResourceClaim,
+    right: ResourceClaim,
+    generation: number,
+    records: readonly SessionRecord[],
+  ) => CoordinationFacts | undefined,
+): RegistryState {
   if (!isRecord(value)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry root must be an object");
   }
@@ -8230,6 +10497,43 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
 
   const records = value.sessions.map((candidate, index) => parseSessionRecord(candidate, index, expectedRepositoryId));
   validateRecords(records, expectedRepositoryId);
+  const sessionIds = new Set(records.map((record) => record.sessionId));
+  for (const candidate of runtimeRecords.records.pinned_profiles ?? []) {
+    const owner = candidate.session_id;
+    if (owner !== undefined && (typeof owner !== "string" || !sessionIds.has(owner))) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "A pinned profile has an invalid session owner", {
+        sessionId: typeof owner === "string" ? owner : "<invalid>",
+      });
+    }
+  }
+  for (const candidate of runtimeRecords.records.runtime_sessions ?? []) {
+    const admission = parseSessionAdmissionRecord(candidate);
+    if (
+      !sessionIds.has(admission.session_id) ||
+      admission.runtime_epoch > runtimeEpoch ||
+      (admission.admission === "open" && admission.runtime_epoch !== runtimeEpoch)
+    ) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "A runtime admission record has an invalid owner or epoch", {
+        sessionId: admission.session_id,
+        runtimeEpoch,
+        admissionEpoch: admission.runtime_epoch,
+      });
+    }
+  }
+  const executionIds = new Set<string>();
+  for (const [index, candidate] of (runtimeRecords.records.executions ?? []).entries()) {
+    const execution = parseSessionExecutionRecord(candidate);
+    if (
+      !execution.ok ||
+      !sessionIds.has(execution.value.session_id) ||
+      executionIds.has(execution.value.execution_id)
+    ) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", `Invalid execution owner or duplicate at index ${index}`, {
+        index,
+      });
+    }
+    executionIds.add(execution.value.execution_id);
+  }
   const hasClaimsSchema = Object.hasOwn(value, "claims_schema_version");
   const hasClaims = Object.hasOwn(value, "claims");
   if (hasClaimsSchema !== hasClaims) {
@@ -8261,17 +10565,8 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
       { schemaVersion: claimSchemaVersion as number },
     );
   }
-  if (isLegacyClaimSchema && !allowLegacyClaimSchema) {
-    throw new SessionRegistryError(
-      "UNSUPPORTED_CLAIM_SCHEMA_VERSION",
-      "Resource claim schema v1 requires explicit migration before use",
-      {
-        schemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION,
-        migrationRequired: true,
-        recoveryHints: [...MIGRATION_RECOVERY_HINTS],
-      },
-    );
-  }
+  // Schema 2 is readable for ordinary operations, but retains its legacy
+  // no-sharing semantics and canonical IDs until explicit migration.
   if (!Array.isArray(value.claims)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry claims must be an array");
   }
@@ -8283,7 +10578,14 @@ function parseRegistry(value: unknown, expectedRepositoryId: string, allowLegacy
       isLegacyClaimSchema ? LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION : undefined,
     ),
   );
-  validateRegistryClaims(records, claims, expectedRepositoryId, isLegacyClaimSchema);
+  validateRegistryClaims(
+    records,
+    claims,
+    expectedRepositoryId,
+    isLegacyClaimSchema,
+    coordinationFacts,
+    claimSetGeneration,
+  );
   return {
     registrySchemaVersion,
     registryRevision,
@@ -8334,6 +10636,87 @@ function nextRuntimeEpoch(state: RegistryState): number {
   return state.runtimeEpoch + 1;
 }
 
+function withExecutions(
+  runtimeRecords: ParsedRuntimeRecords,
+  executions: readonly RuntimeRecord[],
+): ParsedRuntimeRecords {
+  return Object.freeze({
+    requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "executions.v1"),
+    records: Object.freeze({ ...runtimeRecords.records, executions: Object.freeze([...executions]) }),
+  });
+}
+
+function withSessionAdmission(
+  runtimeRecords: ParsedRuntimeRecords,
+  admission: SessionAdmissionRecord,
+): ParsedRuntimeRecords {
+  const existing = runtimeRecords.records.runtime_sessions ?? [];
+  const found = existing.some(
+    (candidate) => parseSessionAdmissionRecord(candidate).session_id === admission.session_id,
+  );
+  const runtimeSessions = found
+    ? existing.map((candidate) =>
+        parseSessionAdmissionRecord(candidate).session_id === admission.session_id ? admission : candidate,
+      )
+    : [...existing, admission];
+  return Object.freeze({
+    requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "runtime-sessions.v1"),
+    records: Object.freeze({ ...runtimeRecords.records, runtime_sessions: Object.freeze(runtimeSessions) }),
+  });
+}
+
+function withPinnedProfile(
+  runtimeRecords: ParsedRuntimeRecords,
+  sessionId: string,
+  profile: PinnedWorktreeProfile,
+): ParsedRuntimeRecords {
+  const existing = runtimeRecords.records.pinned_profiles ?? [];
+  if (existing.length >= MAX_RUNTIME_RECORDS) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry pinned_profiles exceeds its bounded record count", {
+      field: "pinned_profiles",
+      maximum: MAX_RUNTIME_RECORDS,
+    });
+  }
+  if (existing.some((candidate) => candidate.session_id === sessionId)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry already contains a profile pin for this session", {
+      sessionId,
+    });
+  }
+  const pinned = Object.freeze({ ...profile, session_id: sessionId }) as unknown as RuntimeRecord;
+  const profiles = Object.freeze([...existing, pinned]);
+  return Object.freeze({
+    requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "pinned-profiles.v1"),
+    records: Object.freeze({ ...runtimeRecords.records, pinned_profiles: profiles }),
+  });
+}
+
+function requiredRuntimeFeatures(
+  current: readonly RegistryFeature[],
+  added: RegistryFeature,
+): readonly RegistryFeature[] {
+  const features = new Set([...current, added]);
+  return Object.freeze(REGISTRY_FEATURES.filter((feature) => features.has(feature)));
+}
+
+function rebaseOpenSessionAdmissions(runtimeRecords: ParsedRuntimeRecords, runtimeEpoch: number): ParsedRuntimeRecords {
+  const admissions = runtimeRecords.records.runtime_sessions;
+  if (admissions === undefined) return runtimeRecords;
+  return Object.freeze({
+    ...runtimeRecords,
+    records: Object.freeze({
+      ...runtimeRecords.records,
+      runtime_sessions: Object.freeze(
+        admissions.map((candidate) => {
+          const admission = parseSessionAdmissionRecord(candidate);
+          return admission.admission === "open" && admission.runtime_epoch !== runtimeEpoch
+            ? Object.freeze({ ...admission, runtime_epoch: runtimeEpoch })
+            : admission;
+        }),
+      ),
+    }),
+  });
+}
+
 function migrationReadError(error: unknown): SessionRegistryError {
   if (!(error instanceof SessionRegistryError)) throw error;
   const suppliedHints = error.details.recoveryHints;
@@ -8375,6 +10758,8 @@ function sameClaimSet(left: readonly ResourceClaim[], right: readonly ResourceCl
       a.worktreePath !== b.worktreePath ||
       a.resource !== b.resource ||
       a.mode !== b.mode ||
+      a.sharing?.kind !== b.sharing?.kind ||
+      a.sharing?.groupId !== b.sharing?.groupId ||
       a.createdAt !== b.createdAt ||
       a.updatedAt !== b.updatedAt
     ) {
@@ -8405,7 +10790,7 @@ function parseResourceClaim(
       "created_at",
       "updated_at",
     ],
-    [],
+    expectedSchemaVersion === RESOURCE_CLAIM_SCHEMA_VERSION ? ["sharing"] : [],
     index,
   );
   if (value.schema_version !== expectedSchemaVersion) {
@@ -8415,6 +10800,7 @@ function parseResourceClaim(
       { schemaVersion: value.schema_version as number, index, expectedSchemaVersion },
     );
   }
+  const isLegacy = expectedSchemaVersion === LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
   const claim: ResourceClaim = {
     schemaVersion: RESOURCE_CLAIM_SCHEMA_VERSION,
     claimId: requireString(value.claim_id, index, "claim_id"),
@@ -8423,13 +10809,22 @@ function parseResourceClaim(
     worktreePath: requireString(value.worktree_path, index, "worktree_path"),
     resource: requireString(value.resource, index, "resource"),
     mode: requireClaimMode(value.mode, index),
+    ...(isLegacy || value.sharing === undefined ? {} : { sharing: parsePersistedSharing(value.sharing, index) }),
     createdAt: requireString(value.created_at, index, "created_at"),
     updatedAt: requireString(value.updated_at, index, "updated_at"),
   };
-  return validateResourceClaim(claim, expectedRepositoryId, index);
+  if (claim.sharing !== undefined && claim.mode !== "write") {
+    throw invalidRecord(index, "claim sharing requires write mode");
+  }
+  return validateResourceClaim(claim, expectedRepositoryId, index, isLegacy);
 }
 
-function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: string, index?: number): ResourceClaim {
+function validateResourceClaim(
+  claim: ResourceClaim,
+  expectedRepositoryId: string,
+  index?: number,
+  legacySchema = false,
+): ResourceClaim {
   const position = index === undefined ? "" : ` at index ${index}`;
   if (claim.schemaVersion !== RESOURCE_CLAIM_SCHEMA_VERSION) {
     throw new SessionRegistryError("UNSUPPORTED_CLAIM_SCHEMA_VERSION", `Unsupported claim schema version${position}`, {
@@ -8450,7 +10845,9 @@ function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: strin
     throw invalidRecord(index, `claim worktree_path must be an absolute canonical path${position}`);
   }
   assertCanonicalClaimResource(claim.resource);
-  if (claim.claimId !== canonicalClaimId(claim.sessionId, claim.resource, claim.mode)) {
+  const expectedClaimId = canonicalClaimId(claim.sessionId, claim.resource, claim.mode, claim.sharing);
+  const legacyClaimId = canonicalClaimId(claim.sessionId, claim.resource, claim.mode);
+  if (claim.claimId !== (legacySchema ? legacyClaimId : expectedClaimId)) {
     throw invalidRecord(index, `claim_id is not the canonical claim identity${position}`);
   }
   if (!isTimestamp(claim.createdAt) || !isTimestamp(claim.updatedAt)) {
@@ -8462,11 +10859,31 @@ function validateResourceClaim(claim: ResourceClaim, expectedRepositoryId: strin
   return Object.freeze({ ...claim });
 }
 
+function parsePersistedSharing(value: unknown, index: number): ResourceClaim["sharing"] {
+  if (
+    !isRecord(value) ||
+    value.kind !== "isolated-worktree" ||
+    typeof value.group_id !== "string" ||
+    value.group_id.length === 0 ||
+    value.group_id.length > 128
+  ) {
+    throw invalidRecord(index, "claim sharing is invalid");
+  }
+  return { kind: "isolated-worktree", groupId: value.group_id };
+}
+
 function validateRegistryClaims(
   records: readonly SessionRecord[],
   claims: readonly ResourceClaim[],
   expectedRepositoryId: string,
   legacySemantics = false,
+  coordinationFacts?: (
+    left: ResourceClaim,
+    right: ResourceClaim,
+    generation: number,
+    records: readonly SessionRecord[],
+  ) => CoordinationFacts | undefined,
+  claimSetGeneration = 0,
 ): void {
   const sessions = new Map(records.map((record) => [record.sessionId, record]));
   const claimIds = new Set<string>();
@@ -8510,7 +10927,12 @@ function validateRegistryClaims(
           { claimId: current.claimId, ownerClaimId: prior.claimId },
         );
       }
-      if (!(legacySemantics ? legacyClaimsConflict(current, prior) : claimsConflict(current, prior))) continue;
+      if (
+        !(legacySemantics
+          ? legacyClaimsConflict(current, prior)
+          : claimsConflict(current, prior, coordinationFacts?.(current, prior, claimSetGeneration, records)))
+      )
+        continue;
       const conflictDetails = resourceClaimConflictDetails(current, prior, records);
       throw claimError("RESOURCE_CLAIM_CONFLICT", "Persisted claims contain an unresolved conflict", {
         claimId: current.claimId,
@@ -8551,7 +10973,15 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
       "created_at",
       "updated_at",
     ],
-    ["base_revision", "label", "terminal_operation", "discarded_head", "cleanup_head", "working_set"],
+    [
+      "base_revision",
+      "label",
+      "terminal_operation",
+      "discarded_head",
+      "cleanup_head",
+      "working_set",
+      "claim_enforcement",
+    ],
     index,
   );
 
@@ -8594,6 +11024,9 @@ function parseSessionRecord(value: unknown, index: number, expectedRepositoryId:
       ? {}
       : { cleanupHead: requireRevision(value.cleanup_head, index, "cleanup_head") }),
     ...(value.working_set === undefined ? {} : { workingSet: validatePersistedWorkingSet(value.working_set, index) }),
+    ...(value.claim_enforcement === undefined
+      ? {}
+      : { claimEnforcement: requireBoolean(value.claim_enforcement, index, "claim_enforcement") }),
   };
 
   return validateSessionRecord(record, expectedRepositoryId, index);
@@ -8662,6 +11095,9 @@ function validateSessionRecord(record: SessionRecord, expectedRepositoryId: stri
     throw invalidRecord(index, "discarded_head requires terminal_operation=discard");
   }
   if (record.workingSet !== undefined) validatePersistedWorkingSet(record.workingSet, index);
+  if (record.claimEnforcement !== undefined && typeof record.claimEnforcement !== "boolean") {
+    throw invalidRecord(index, "claim_enforcement must be a boolean");
+  }
   if (record.state !== "closed" && record.state !== "closing" && record.terminalOperation !== undefined) {
     throw invalidRecord(index, "terminal_operation is only valid for a closing or closed session");
   }
@@ -8782,6 +11218,13 @@ function freezeSessionRecord(record: SessionRecord): SessionRecord {
 function requireString(value: unknown, index: number, field: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw invalidRecord(index, `${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requireBoolean(value: unknown, index: number, field: string): boolean {
+  if (typeof value !== "boolean") {
+    throw invalidRecord(index, `${field} must be a boolean`);
   }
   return value;
 }

@@ -27,7 +27,16 @@ import {
   SANDBOX_OPTIONAL_CAPABILITIES,
   SANDBOX_REQUIRED_CAPABILITIES,
 } from "./domain/sandbox.js";
+import { SESSION_CONSOLE_CONTRACT_ID, SESSION_CONSOLE_SCHEMA_VERSION } from "./domain/session-console.js";
+import { SESSION_EXECUTION_CONTROL_CONTRACT_ID } from "./domain/session-execution-control.js";
+import { SESSION_EXECUTION_RECORD_CONTRACT_ID } from "./domain/session-execution-record.js";
+import { SESSION_PROCESS_OBSERVATION_CONTRACT_ID } from "./domain/session-process-observation.js";
 import { CLI_COMMAND_REGISTRY, resolveCliCommandDefinition } from "./cli-command-registry.js";
+import {
+  WORKTREE_FILE_OPERATION_CLI_COMMANDS,
+  WORKTREE_FILE_OPERATION_CLI_CONTRACT_ID,
+  WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+} from "./worktree-file-operation-cli.js";
 import {
   DISCARD_PREVIEW_SCHEMA_VERSION,
   REGISTRY_FEATURES,
@@ -45,6 +54,55 @@ import {
   AUXILIARY_STATE_SOURCE_KINDS,
   AUXILIARY_STATE_TARGET_KINDS,
 } from "./domain/auxiliary-state-projection.js";
+import { RESOURCE_COORDINATION_SCHEMA_VERSION, RESOURCE_INTENT_SCHEMA_VERSION } from "./resource-coordination.js";
+import { COORDINATION_PREVIEW_SCHEMA_VERSION } from "./coordination-preview.js";
+import { COORDINATION_TRANSACTION_SCHEMA_VERSION } from "./coordination-transactions.js";
+import {
+  RESOURCE_HANDOFF_CONTRACT_ID,
+  RESOURCE_HANDOFF_OPERATION,
+  RESOURCE_HANDOFF_SCHEMA_VERSION,
+} from "./resource-handoff.js";
+import {
+  RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
+  RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_VERSION,
+  RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
+} from "./resource-coordination-snapshot.js";
+
+export {
+  RESOURCE_COORDINATION_SCHEMA_VERSION,
+  RESOURCE_INTENT_SCHEMA_VERSION,
+  COORDINATION_PREVIEW_SCHEMA_VERSION,
+  COORDINATION_TRANSACTION_SCHEMA_VERSION,
+  RESOURCE_HANDOFF_CONTRACT_ID,
+  RESOURCE_HANDOFF_OPERATION,
+  RESOURCE_HANDOFF_SCHEMA_VERSION,
+  RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
+  RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_VERSION,
+  RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
+};
+import {
+  BUILTIN_WORKTREE_PROFILE_DESCRIPTOR,
+  BUILTIN_WORKTREE_PROFILE_IDS,
+} from "./domain/worktree-profile-builtins.js";
+import { WORKTREE_PROFILE_CLI_DESCRIPTOR } from "./worktree-profile-cli.js";
+import {
+  WORKTREE_PROFILE_RUNTIME_CONTRACT_ID,
+  WORKTREE_PROFILE_RUNTIME_DESCRIPTOR,
+  WORKTREE_PROFILE_RUNTIME_SCHEMA_VERSION,
+} from "./domain/worktree-profile-runtime.js";
+import {
+  WORKTREE_RUNTIME_PROFILE_CONTRACT_ID,
+  WORKTREE_RUNTIME_PROFILE_SCHEMA_VERSION,
+} from "./domain/worktree-runtime-profile.js";
+import {
+  DECLARED_TOOL_MATERIAL_CONTRACT_ID,
+  DECLARED_TOOL_MATERIAL_DESCRIPTOR,
+  DECLARED_TOOL_MATERIAL_SCHEMA_VERSION,
+} from "./domain/runtime-provider-declared.js";
+import {
+  WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION,
+  WORKTREE_PROFILE_INSPECTION_SERIALIZATION_KEY,
+} from "./domain/worktree-profile-inspection.js";
 
 /** Stable discovery identifier for the standalone local execution contract. */
 export const MACHINE_CONTRACT_ID = "nawabari.standalone-execution.v1" as const;
@@ -106,6 +164,57 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
   failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["protected-execution"],
   failure_code_policy: {
     source: "implementation-owned protected-execution vocabulary",
+    missing_or_extra: "deterministic conformance failure",
+    internal_exceptions: [],
+  },
+});
+
+const SESSION_CONSOLE_CAPABILITY = Object.freeze({
+  id: "session-console",
+  contract_id: SESSION_CONSOLE_CONTRACT_ID,
+  schema_version: SESSION_CONSOLE_SCHEMA_VERSION,
+  commands: ["session enter", "session processes"],
+  result_schema: "session-console.v1",
+  result_schema_version: SESSION_CONSOLE_SCHEMA_VERSION,
+  result_schemas: [
+    {
+      schema: "session-console.v1",
+      version: SESSION_CONSOLE_SCHEMA_VERSION,
+      commands: ["session enter", "session processes"],
+    },
+  ],
+  identities: ["session_id", "execution_id", "session_closed", "execution", "processes"],
+  producer_contract_ids: {
+    execution_record: SESSION_EXECUTION_RECORD_CONTRACT_ID,
+    process_observation: SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
+    execution_control: SESSION_EXECUTION_CONTROL_CONTRACT_ID,
+  },
+  failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-console"],
+  failure_code_policy: {
+    source: "implementation-owned session-console vocabulary",
+    missing_or_extra: "deterministic conformance failure",
+    internal_exceptions: [],
+  },
+});
+
+const FILE_OPERATION_CAPABILITY = Object.freeze({
+  id: "file-operation",
+  contract_id: WORKTREE_FILE_OPERATION_CLI_CONTRACT_ID,
+  schema_version: WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+  commands: [...WORKTREE_FILE_OPERATION_CLI_COMMANDS],
+  result_schema: "nawabari.worktree-file-operation-cli.v1",
+  result_schema_version: WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+  result_schemas: [
+    {
+      schema: "nawabari.worktree-file-operation-cli.v1",
+      version: WORKTREE_FILE_OPERATION_CLI_SCHEMA_VERSION,
+      commands: [...WORKTREE_FILE_OPERATION_CLI_COMMANDS],
+    },
+  ],
+  identities: ["operation_id", "operation", "state", "previous_generation", "next_generation", "identity"],
+  failure_codes: IMPLEMENTATION_FAILURE_CODE_VOCABULARY["file-operation"],
+  failure_code_policy: {
+    source: "implementation-owned file-operation vocabulary",
     missing_or_extra: "deterministic conformance failure",
     internal_exceptions: [],
   },
@@ -313,6 +422,8 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     },
   },
   PROTECTED_EXECUTION_CAPABILITY,
+  SESSION_CONSOLE_CAPABILITY,
+  FILE_OPERATION_CAPABILITY,
   {
     id: "session-lifecycle",
     commands: [
@@ -402,6 +513,31 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
         ],
         exact_owner_adoption: false,
         fail_closed: true,
+      },
+    },
+    worktree_profile: {
+      contract_id: WORKTREE_RUNTIME_PROFILE_CONTRACT_ID,
+      schema_version: WORKTREE_RUNTIME_PROFILE_SCHEMA_VERSION,
+      commands: ["session create", "profile list", "profile show"],
+      namespaces: ["builtin", "repository"],
+      profiles: [...BUILTIN_WORKTREE_PROFILE_IDS],
+      cli: WORKTREE_PROFILE_CLI_DESCRIPTOR,
+      runtime: WORKTREE_PROFILE_RUNTIME_DESCRIPTOR,
+      builtin: BUILTIN_WORKTREE_PROFILE_DESCRIPTOR,
+      pinning: {
+        catalog_sources: ["repository", "builtin"],
+        builtin_revision: "sha256-canonical-validated-profile-bytes",
+        digest_includes: "catalog-source-discriminant-and-source",
+      },
+      inspection: {
+        schema_version: WORKTREE_PROFILE_INSPECTION_SCHEMA_VERSION,
+        serialization_key: WORKTREE_PROFILE_INSPECTION_SERIALIZATION_KEY,
+        projection: "public-state",
+      },
+      declared_tool_material: {
+        contract_id: DECLARED_TOOL_MATERIAL_CONTRACT_ID,
+        schema_version: DECLARED_TOOL_MATERIAL_SCHEMA_VERSION,
+        descriptor: DECLARED_TOOL_MATERIAL_DESCRIPTOR,
       },
     },
   },
@@ -618,6 +754,27 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       source: "implementation-owned resource-claim lifecycle vocabulary",
       missing_or_extra: "deterministic conformance failure",
       internal_exceptions: [],
+    },
+    coordination: {
+      commands: ["session coordination preview", "session handoff"],
+      producer_contracts: {
+        resource_coordination: {
+          schema_version: RESOURCE_COORDINATION_SCHEMA_VERSION,
+          intent_schema_version: RESOURCE_INTENT_SCHEMA_VERSION,
+        },
+        coordination_preview: { schema_version: COORDINATION_PREVIEW_SCHEMA_VERSION },
+        coordination_transaction: { schema_version: COORDINATION_TRANSACTION_SCHEMA_VERSION },
+        resource_handoff: {
+          contract_id: RESOURCE_HANDOFF_CONTRACT_ID,
+          operation: RESOURCE_HANDOFF_OPERATION,
+          schema_version: RESOURCE_HANDOFF_SCHEMA_VERSION,
+        },
+        coordination_snapshot: {
+          contract_id: RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_ID,
+          contract_version: RESOURCE_COORDINATION_SNAPSHOT_CONTRACT_VERSION,
+          schema_version: RESOURCE_COORDINATION_SNAPSHOT_SCHEMA_VERSION,
+        },
+      },
     },
     transition_matrix: {
       id: RESOURCE_CLAIM_TRANSITION_MATRIX_ID,
@@ -857,6 +1014,10 @@ export function machineContract(packageVersion: string): JsonObject {
         ? {
             contract_id: capability.contract_id,
             contract_version: capability.contract_version,
+            registry_schema_version: capability.registry_schema_version,
+            registry_feature_gate_version: capability.registry_feature_gate_version,
+            registry_features: [...capability.registry_features],
+            supported_registry_features: [...capability.supported_registry_features],
             claim_schema_version: capability.claim_schema_version,
             result_schema_version: capability.result_schema_version,
             command_aliases: registryAliasReferences(capability.command_aliases),
@@ -894,6 +1055,7 @@ export function machineContract(packageVersion: string): JsonObject {
         ? {
             registry_lock_recovery: jsonClone(capability.registry_lock_recovery),
             initial_claims: jsonClone(capability.initial_claims),
+            worktree_profile: jsonClone(capability.worktree_profile),
           }
         : {}),
       ...(capability.id === "session-diagnostics" ? { lifecycle: jsonClone(capability.lifecycle) } : {}),
@@ -909,6 +1071,19 @@ export function machineContract(packageVersion: string): JsonObject {
             ambient_fallback: capability.ambient_fallback,
             readiness: jsonClone(capability.readiness),
             runtime: jsonClone(capability.runtime),
+          }
+        : {}),
+      ...(capability.id === "session-console"
+        ? {
+            contract_id: capability.contract_id,
+            schema_version: capability.schema_version,
+            producer_contract_ids: jsonClone(capability.producer_contract_ids),
+          }
+        : {}),
+      ...(capability.id === "file-operation"
+        ? {
+            contract_id: capability.contract_id,
+            schema_version: capability.schema_version,
           }
         : {}),
       ...(capability.id === "auxiliary-state-projection"

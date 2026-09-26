@@ -21,6 +21,7 @@ import {
   sandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
 import type { CgroupLimitProfile } from "./cgroups-v2.js";
+import type { CompiledSessionEnvironment } from "./session-environment.js";
 import {
   DEFAULT_RUNTIME_POLICY,
   validateRuntimePolicy,
@@ -42,6 +43,8 @@ import {
   type RuntimeResolutionFhsOptions,
 } from "./runtime-resolution.js";
 import type { ResolvedRuntimeProfile, RuntimeProfileSelection } from "./runtime-profile.js";
+import type { ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
+import type { SessionHookMaterial } from "./session-git-hooks.js";
 import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
 
 /**
@@ -194,6 +197,9 @@ export type SandboxExecutionRequest = {
   identity: SandboxIdentity;
   /** Minimum host Git author identity projected for commit semantics; never a full config file. */
   git_identity: SandboxGitIdentity;
+  /** Explicit upper profile and ephemeral #618 material for managed protected Git. */
+  git_profile?: ResolvedWorktreeRuntimeProfile;
+  hook_material?: SessionHookMaterial | null;
   filesystem: SandboxFilesystemTopology;
   required_capabilities: SandboxCapabilityId[];
   seccomp_profile: ReturnType<typeof sandboxSeccompProfileMetadata>;
@@ -212,6 +218,8 @@ export type SandboxExecutionRequest = {
   runtime_projection?: SessionRuntimeProjection;
   /** Policy/profile/materializer evidence for the resolved runtime. */
   runtime_resolution?: RuntimeResolutionEvidence;
+  /** Accepted #448 environment; protected composition supplies this additively. */
+  compiled_session_environment?: CompiledSessionEnvironment;
 };
 
 export type SandboxCgroupConfig = {
@@ -1031,12 +1039,15 @@ export {
   CANONICAL_EXECUTABLE_ROOT,
   compileSandboxInvocation,
   deriveLandlockRules,
+  openSeccompProfile,
   runInteractiveSandboxedCommand,
   runSandboxedCommand,
   type SandboxCommand,
   type SandboxExecutionResult,
+  type SandboxFilesystemEnforcementOptions,
   type SandboxInvocation,
   type SandboxLauncherOptions,
+  type SeccompProfileHandle,
 } from "./sandbox-launcher.js";
 
 export {

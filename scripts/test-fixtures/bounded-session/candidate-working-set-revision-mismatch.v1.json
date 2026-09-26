@@ -1,0 +1,22 @@
+{
+  "kind": "candidate-working-set",
+  "schemaVersion": 1,
+  "workingSetId": "yohn-jp/nawabari-378-revision-mismatch-v1",
+  "repository": {
+    "repositoryHost": "github.com",
+    "repositoryId": "1329799765",
+    "repository": "yohn-jp/nawabari"
+  },
+  "revision": "ffffffffffffffffffffffffffffffffffffffff",
+  "entries": [
+    {
+      "state": "required",
+      "target": { "kind": "file", "locator": "bounded-session/visible-read.txt" },
+      "reason": {
+        "id": "revision-mismatch",
+        "summary": "Candidate revision differs from the immutable bootstrap base"
+      },
+      "evidence": [{ "artifact": "implementation-378", "reference": "acceptance/revision-mismatch" }]
+    }
+  ]
+}

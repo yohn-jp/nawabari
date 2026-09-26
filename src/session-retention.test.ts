@@ -32,7 +32,7 @@ const physical: SessionPhysicalIdentity = Object.freeze({
 
 function claim(claimId: string, sessionId: string, resource: string, mode: ResourceClaim["mode"]): ResourceClaim {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     claimId,
     sessionId,
     repositoryId: "repo-1",

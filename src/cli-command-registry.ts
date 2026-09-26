@@ -39,30 +39,41 @@ export type CliCommandDefinition = {
   readonly notes?: readonly string[];
 };
 
-export const GLOBAL_HELP_OPTIONS: readonly CliHelpOptionSpec[] = [
+export const GLOBAL_HELP_OPTIONS = [
   { name: "--json", description: "Emit one stable JSON document on stdout" },
   { name: "--help", aliases: ["-h"], description: "Show command-specific help" },
   { name: "--version", description: "Print the installed version" },
-];
+] as const satisfies readonly CliHelpOptionSpec[];
 
-const option = (
-  name: string,
+/**
+ * `const` type parameters keep every literal passed at each call site (the
+ * option's own name, and any nested `aliases`/`values` literals) instead of
+ * widening to `string`/`string[]`. This is what lets `OptionId` below be a
+ * real compile-time union derived from the registry, not a hand-typed list.
+ */
+const option = <
+  const Name extends string,
+  const Extra extends Partial<
+    Pick<
+      CliHelpOptionSpec,
+      | "aliases"
+      | "alias_of"
+      | "value"
+      | "required"
+      | "default"
+      | "minimum"
+      | "maximum"
+      | "repeatable"
+      | "values"
+      | "required_unless"
+      | "mutually_exclusive_with"
+    >
+  > = Record<never, never>,
+>(
+  name: Name,
   description: string,
-  options: Pick<
-    CliHelpOptionSpec,
-    | "aliases"
-    | "alias_of"
-    | "value"
-    | "required"
-    | "default"
-    | "minimum"
-    | "maximum"
-    | "repeatable"
-    | "values"
-    | "required_unless"
-    | "mutually_exclusive_with"
-  > = {},
-): CliHelpOptionSpec => ({ name, description, ...options });
+  extra: Extra = {} as Extra,
+) => ({ name, description, ...extra }) satisfies CliHelpOptionSpec;
 
 /**
  * Canonical public command/discovery registry.
@@ -70,16 +81,25 @@ const option = (
  * Dispatcher implementation deliberately remains below in this module.  This
  * registry only describes the public discovery surface; aliases point at the
  * canonical command so option metadata cannot drift between projections.
+ *
+ * `as const satisfies` on the underlying data (rather than a
+ * `: readonly CliCommandDefinition[]` annotation) keeps every command/option
+ * name as its own literal type so `CommandId`/`OptionId` below can be
+ * derived from this data instead of hand-typed as a second identity list.
+ * `CLI_COMMAND_REGISTRY` itself keeps the wider `CliCommandDefinition[]`
+ * view every existing consumer already expects; it is the same array, not a
+ * second copy.
  */
-export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
+const REGISTRY_DATA = [
   {
     name: "session create",
     summary: "Request a new Nawabari session",
     usage:
       `${CLI_NAME} session create [--branch <name>] [--worktree <path>|--worktree-root <path>] ` +
       `[--base <ref>] [--label <text>] ` +
+      `[--profile <id> --profile-parameter <json>] ` +
       `[--execution-scope-file <path> --candidate-working-set-file <path>] ` +
-      `[--resource <path-or-glob> --mode <read|write|exclusive-write> ...]`,
+      `[--resource <path-or-glob> --mode <read|write|exclusive-write> ...] [--enforce-claims]`,
     options: [
       option("--branch", "Branch to create; omitted uses the generated session branch", {
         value: "<name>",
@@ -100,6 +120,8 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
       ),
       option("--base", "Commit-resolving base ref for the new worktree", { value: "<ref>", default: "HEAD" }),
       option("--label", "Optional display label; never used as an identity", { value: "<text>", default: "omitted" }),
+      option("--profile", "Explicit worktree runtime profile selection", { value: "<id>" }),
+      option("--profile-parameter", "Typed JSON object of profile parameters; requires --profile", { value: "<json>" }),
       option(
         "--resource",
         "Initial repository-relative resource claim; repeatable, each paired with the --mode immediately after it",
@@ -122,11 +144,17 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
         "Bounded JSON candidate-working-set artifact file for governed bootstrap",
         { value: "<path>" },
       ),
+      option(
+        "--enforce-claims",
+        "Opt this session into resource-claim enforcement; without it, operation authorization does not require resource claims for session-owned operations",
+      ),
     ],
     notes: [
       "All create options are optional. Use status --json to discover managed_worktree_root.",
       "--worktree and --worktree-root cannot be combined.",
+      "--profile-parameter requires --profile; ambiguous unqualified profile ids are rejected.",
       "Initial claims are provisioned atomically with the session; each --resource must be immediately followed by its own --mode, and zero pairs remains backward compatible.",
+      "Resource-claim enforcement is disabled by default; pass --enforce-claims to require claims for commit/push authorization on this session. Worktree and branch ownership, and claim conflicts against other sessions, remain enforced regardless.",
       "Providing one bounded working-set artifact requires the other; both are validated before worktree ownership is established.",
       "A claim conflict returns blocking-owner evidence. A durability-uncertain result is retry-safe only after re-reading the reported registry state; an existing owner is never silently adopted.",
       "Without an override, Nawabari creates the safe managed root <repository-parent>/.nawabari/worktrees on first use. Existing absolute worktree paths directly under the repository parent remain accepted for compatibility.",
@@ -137,6 +165,21 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     summary: "Resolve the current session identity",
     usage: `${CLI_NAME} session id`,
     options: [],
+  },
+  {
+    name: "profile list",
+    summary: "List built-in worktree runtime profiles",
+    usage: `${CLI_NAME} profile list`,
+    options: [],
+    notes: [
+      "Built-in and repository profile namespaces remain distinct; collisions are reported rather than overwritten.",
+    ],
+  },
+  {
+    name: "profile show",
+    summary: "Show one worktree runtime profile",
+    usage: `${CLI_NAME} profile show --profile <id>`,
+    options: [option("--profile", "Profile id or explicit namespace:id reference", { value: "<id>", required: true })],
   },
   {
     name: "session show",
@@ -308,6 +351,55 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     ],
   },
   {
+    name: "session coordination preview",
+    summary: "Preview bounded coordination between two sessions",
+    usage:
+      `${CLI_NAME} session coordination preview --left <session-id> --right <session-id> --path <resource> ` +
+      `[--patch --allow-read-path <resource>] [--max-content-bytes <n>] [--max-diff-bytes <n>] [--max-diff-hunks <n>] [--max-retries <n>]`,
+    options: [
+      option("--left", "Left session identity", { value: "<session-id>", required: true }),
+      option("--right", "Right session identity", { value: "<session-id>", required: true }),
+      option("--path", "One concrete repository-relative resource", { value: "<resource>", required: true }),
+      option("--patch", "Request bounded patch output; requires explicit --allow-read-path authority"),
+      option("--allow-read-path", "Explicit bounded read authority for patch output", {
+        value: "<resource>",
+        repeatable: true,
+      }),
+      option("--max-content-bytes", "Maximum observed content bytes", { value: "<n>" }),
+      option("--max-diff-bytes", "Maximum bounded diff bytes", { value: "<n>" }),
+      option("--max-diff-hunks", "Maximum bounded diff hunks", { value: "<n>" }),
+      option("--max-retries", "Maximum bounded observation retries", { value: "<n>" }),
+    ],
+    notes: [
+      "Preview is read-only and metadata-only by default.",
+      "--patch requires explicit bounded read authority for the requested path.",
+      "Session identities are passed to the producer as session IDs; they are never Git revisions.",
+    ],
+  },
+  {
+    name: "session handoff",
+    summary: "Transfer one resource claim between active sessions",
+    usage:
+      `${CLI_NAME} session handoff --from <session-id> --to <session-id> --resource <exact-resource> ` +
+      `--mode <read|write|exclusive-write> --if-generation <claim-set-generation> [--operation-id <id>]`,
+    options: [
+      option("--from", "Source session identity", { value: "<session-id>", required: true }),
+      option("--to", "Destination session identity", { value: "<session-id>", required: true }),
+      option("--resource", "Exact canonical resource", { value: "<exact-resource>", required: true }),
+      option("--mode", "Destination claim mode", {
+        value: "<read|write|exclusive-write>",
+        required: true,
+        values: ["read", "write", "exclusive-write"],
+      }),
+      option("--if-generation", "Required claim-set generation", { value: "<claim-set-generation>", required: true }),
+      option("--operation-id", "Optional stable retry identity", { value: "<id>" }),
+    ],
+    notes: [
+      "--from and --to are session identities and are never interpreted as Git revisions.",
+      "A configured execution-control fence is required; absence fails closed before claim mutation.",
+    ],
+  },
+  {
     name: "session list",
     summary: "List bounded repository session records",
     usage: `${CLI_NAME} session list [--all|--history] [--limit <n>] [--offset <n>]`,
@@ -329,6 +421,25 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     notes: [
       `Default output excludes closed records; --all and --history include closed history. Both views are bounded by --limit (default ${DEFAULT_SESSION_LIST_LIMIT}, maximum ${MAX_SESSION_LIST_LIMIT}) and --offset (default 0).`,
     ],
+  },
+  {
+    name: "session enter",
+    summary: "Enter an active session through the protected runtime",
+    usage: `${CLI_NAME} session enter --session <id> [--runtime-policy <strict|compatibility>]`,
+    options: [
+      option("--session", "Select the active owned session", { value: "<id>" }),
+      option("--runtime-policy", "Select strict or explicit compatibility runtime visibility", {
+        value: "<strict|compatibility>",
+        values: ["strict", "compatibility"],
+        default: "strict",
+      }),
+    ],
+  },
+  {
+    name: "session processes",
+    summary: "List durable executions owned by a session",
+    usage: `${CLI_NAME} session processes --session <id>`,
+    options: [option("--session", "Select the session", { value: "<id>" })],
   },
   {
     name: "session claim",
@@ -527,6 +638,47 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     ],
   },
   {
+    name: "session file create",
+    summary: "Create one claim-authorized worktree file",
+    usage: `${CLI_NAME} session file create --session <id> --operation-id <id> --path <path> --if-generation <n> --expect-absent --payload-file <path>|--payload-stdin`,
+    options: [
+      option("--session", "Target active session", { value: "<id>", required: true }),
+      option("--operation-id", "Stable operation identity", { value: "<id>", required: true }),
+      option("--path", "Exact repository-relative destination", { value: "<path>", required: true }),
+      option("--if-generation", "Current claim-set generation", { value: "<n>", required: true }),
+      option("--expect-absent", "Require an absent destination"),
+      option("--payload-file", "Bounded CREATE payload file", { value: "<path>" }),
+      option("--payload-stdin", "Read the bounded CREATE payload from stdin"),
+    ],
+  },
+  {
+    name: "session file delete",
+    summary: "Delete one claim-authorized worktree file",
+    usage: `${CLI_NAME} session file delete --session <id> --operation-id <id> --path <path> --if-generation <n> (--expected-digest <sha256>|--expected-identity <json>)`,
+    options: [
+      option("--session", "Target active session", { value: "<id>", required: true }),
+      option("--operation-id", "Stable operation identity", { value: "<id>", required: true }),
+      option("--path", "Exact repository-relative source", { value: "<path>", required: true }),
+      option("--if-generation", "Current claim-set generation", { value: "<n>", required: true }),
+      option("--expected-digest", "Expected source SHA-256 digest", { value: "<sha256>" }),
+      option("--expected-identity", "Expected source identity JSON", { value: "<json>" }),
+    ],
+  },
+  {
+    name: "session file rename",
+    summary: "Rename one claim-authorized worktree file",
+    usage: `${CLI_NAME} session file rename --session <id> --operation-id <id> --path <path> --to-path <path> --if-generation <n> (--expected-digest <sha256>|--expected-identity <json>)`,
+    options: [
+      option("--session", "Target active session", { value: "<id>", required: true }),
+      option("--operation-id", "Stable operation identity", { value: "<id>", required: true }),
+      option("--path", "Exact repository-relative source", { value: "<path>", required: true }),
+      option("--to-path", "Exact repository-relative destination", { value: "<path>", required: true }),
+      option("--if-generation", "Current claim-set generation", { value: "<n>", required: true }),
+      option("--expected-digest", "Expected source SHA-256 digest", { value: "<sha256>" }),
+      option("--expected-identity", "Expected source identity JSON", { value: "<json>" }),
+    ],
+  },
+  {
     name: "authorize",
     summary: "Authorize an operation against concrete claims",
     usage: `${CLI_NAME} authorize --operation <name> --resource <path> [--resource <path>] [--session <id>]`,
@@ -720,7 +872,32 @@ export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = [
     usage: `${CLI_NAME} capabilities`,
     options: [],
   },
-];
+] as const satisfies readonly CliCommandDefinition[];
+
+/** Stable canonical command identity, derived from the registry itself. */
+export type CommandId = (typeof REGISTRY_DATA)[number]["name"];
+
+type RegistryOption = (typeof REGISTRY_DATA)[number]["options"][number];
+type GlobalRegistryOption = (typeof GLOBAL_HELP_OPTIONS)[number];
+
+/** Extracts an option's declared `aliases` literals, or `never` when absent. */
+type OptionAliasIds<Option> = Option extends { readonly aliases: infer Aliases }
+  ? Aliases extends readonly string[]
+    ? Aliases[number]
+    : never
+  : never;
+
+/**
+ * Stable canonical option identity across every command, derived from the
+ * registry itself: every option's own flag plus every declared alias.
+ */
+export type OptionId =
+  | RegistryOption["name"]
+  | OptionAliasIds<RegistryOption>
+  | GlobalRegistryOption["name"]
+  | OptionAliasIds<GlobalRegistryOption>;
+
+export const CLI_COMMAND_REGISTRY: readonly CliCommandDefinition[] = REGISTRY_DATA;
 
 export const ROOT_HELP_SPEC: CliCommandDefinition = {
   name: "root",
@@ -752,7 +929,7 @@ export function publicCliCommandDefinitions(): readonly CliCommandDefinition[] {
   ]);
 }
 
-/** Stable alias for consumers such as the future dispatcher parity layer. */
+/** Stable alias kept for existing external consumers of the registry. */
 export const COMMAND_REGISTRY = CLI_COMMAND_REGISTRY;
 
 /** Resolve either a canonical command or one of its public aliases. */

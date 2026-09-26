@@ -13,6 +13,11 @@ import {
 } from "./contract.js";
 import { publicCliCommandNames, runCli } from "./cli.js";
 import { success } from "./domain/errors.js";
+import { IMPLEMENTATION_FAILURE_CODE_VOCABULARY } from "./failure-code-vocabulary.js";
+import { SESSION_CONSOLE_CONTRACT_ID, SESSION_CONSOLE_SCHEMA_VERSION } from "./domain/session-console.js";
+import { SESSION_EXECUTION_CONTROL_CONTRACT_ID } from "./domain/session-execution-control.js";
+import { SESSION_EXECUTION_RECORD_CONTRACT_ID } from "./domain/session-execution-record.js";
+import { SESSION_PROCESS_OBSERVATION_CONTRACT_ID } from "./domain/session-process-observation.js";
 import type { SessionBackend } from "./domain/session.js";
 import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
 import { RESOURCE_CLAIM_SCHEMA_VERSION } from "./resource-claims.js";
@@ -155,6 +160,35 @@ test("every advertised result schema has one explicit version and public owner m
       `${capabilityId} command mapping drifted`,
     );
   }
+});
+
+test("managed console discovery publishes producer IDs and supported runtime gates", () => {
+  const contract = machineContract("test-version");
+  const capabilities = contract.capabilities as unknown[];
+  const consoleCapability = object(
+    capabilities.find((entry) => object(entry, "capability").id === "session-console"),
+    "session-console capability",
+  );
+  assert.equal(consoleCapability.contract_id, SESSION_CONSOLE_CONTRACT_ID);
+  assert.equal(consoleCapability.schema_version, SESSION_CONSOLE_SCHEMA_VERSION);
+  assert.deepEqual(consoleCapability.commands, ["session enter", "session processes"]);
+  assert.deepEqual(consoleCapability.failure_codes, IMPLEMENTATION_FAILURE_CODE_VOCABULARY["session-console"]);
+  assert.ok((consoleCapability.failure_codes as string[]).includes("REGISTRY_DURABILITY_UNCERTAIN"));
+  assert.equal(
+    object(consoleCapability.failure_code_policy, "session-console failure-code policy").source,
+    "implementation-owned session-console vocabulary",
+  );
+  assert.deepEqual(consoleCapability.producer_contract_ids, {
+    execution_record: SESSION_EXECUTION_RECORD_CONTRACT_ID,
+    process_observation: SESSION_PROCESS_OBSERVATION_CONTRACT_ID,
+    execution_control: SESSION_EXECUTION_CONTROL_CONTRACT_ID,
+  });
+
+  const resources = capabilityContract();
+  assert.ok((resources.registry_features as string[]).includes("runtime-sessions.v1"));
+  assert.ok((resources.registry_features as string[]).includes("executions.v1"));
+  assert.ok((resources.supported_registry_features as string[]).includes("runtime-sessions.v1"));
+  assert.ok((resources.supported_registry_features as string[]).includes("executions.v1"));
 });
 
 test("resource-claim public output carries the advertised v2 nested schema", async () => {

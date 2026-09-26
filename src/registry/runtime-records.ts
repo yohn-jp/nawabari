@@ -1,5 +1,12 @@
 import type { JsonObject, JsonValue } from "../domain/errors.js";
-import { SessionRegistryError } from "../errors.js";
+import { SessionRegistryError, type RegistryErrorCode, type RegistryErrorDetails } from "../errors.js";
+import {
+  parseFileOperationRegistry,
+  serializeFileOperationRegistry,
+  type PersistedFileOperationRecord,
+} from "./file-operation-record.js";
+import { parsePinnedProfileRecord } from "../domain/worktree-profile-pinning.js";
+import { isResourceClaimMode, type ResourceClaimMode } from "../resource-claims.js";
 
 /**
  * Optional registry areas are deliberately a closed, versioned vocabulary.
@@ -17,8 +24,17 @@ export const REGISTRY_FEATURES = Object.freeze([
 
 export type RegistryFeature = (typeof REGISTRY_FEATURES)[number];
 
-/** No optional record authority is implemented by the registry migration. */
-export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([] as const);
+/**
+ * Optional record authorities implemented by the runtime registry owner. The
+ * resource-coordination integration owns exactly the handoff receipt area.
+ */
+export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([
+  "pinned-profiles.v1",
+  "runtime-sessions.v1",
+  "executions.v1",
+  "recent-events.v1",
+  "file-operations.v1",
+] as const);
 
 export const MAX_RUNTIME_RECORDS = 256 as const;
 export const MAX_RUNTIME_RECORD_KEYS = 32 as const;
@@ -26,13 +42,32 @@ export const MAX_UNSUPPORTED_REGISTRY_FEATURES = 8 as const;
 
 export type RuntimeRecord = Readonly<JsonObject>;
 
+export type SessionAdmissionRecord = Readonly<{
+  readonly kind: "session-admission";
+  readonly schema_version: 1;
+  readonly session_id: string;
+  readonly admission: "open" | "closed";
+  readonly runtime_epoch: number;
+}>;
+
 export interface RuntimeRecords {
   readonly pinned_profiles?: readonly RuntimeRecord[];
   readonly runtime_sessions?: readonly RuntimeRecord[];
   readonly executions?: readonly RuntimeRecord[];
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
-  readonly file_operations?: readonly RuntimeRecord[];
+  readonly file_operations?: readonly PersistedFileOperationRecord[];
+}
+
+export interface ResourceHandoffRecentEvent extends JsonObject {
+  readonly kind: "resource-handoff";
+  readonly schema_version: 1;
+  readonly operation_id: string;
+  readonly from_session_id: string;
+  readonly to_session_id: string;
+  readonly resource: string;
+  readonly mode: ResourceClaimMode;
+  readonly claim_set_generation: number;
 }
 
 export interface ParsedRuntimeRecords {
@@ -81,7 +116,7 @@ export function parseRuntimeRecords(
     throw unsupportedFeatureError(unsupported);
   }
 
-  const records: Record<string, readonly RuntimeRecord[]> = {};
+  const records: Record<string, readonly unknown[]> = {};
   for (const definition of FEATURE_DEFINITIONS) {
     const present = Object.hasOwn(input, definition.field);
     const required = requiredFeatures.includes(definition.feature);
@@ -96,6 +131,10 @@ export function parseRuntimeRecords(
       );
     }
     if (!present) continue;
+    if (definition.field === "file_operations") {
+      records[definition.field] = parsePersistedFileOperationRecords(input[definition.field]);
+      continue;
+    }
     records[definition.field] = parseRecordList(input[definition.field], definition.field);
   }
 
@@ -107,15 +146,70 @@ export function parseRuntimeRecords(
 
 /** Convert parsed optional areas back to their bounded persisted fields. */
 export function toPersistedRuntimeRecords(parsed: ParsedRuntimeRecords): RuntimeRecords {
+  const fileOperations = parsed.records.file_operations;
   return Object.freeze(
     Object.fromEntries(
       FEATURE_DEFINITIONS.flatMap(({ feature, field }) =>
         parsed.requiredFeatures.includes(feature) && parsed.records[field] !== undefined
-          ? [[field, parsed.records[field]]]
+          ? [
+              [
+                field,
+                field === "file_operations"
+                  ? serializePersistedFileOperationRecords(fileOperations)
+                  : parsed.records[field],
+              ],
+            ]
           : [],
       ),
     ),
   ) as RuntimeRecords;
+}
+
+function parsePersistedFileOperationRecords(value: unknown): readonly PersistedFileOperationRecord[] {
+  try {
+    return Object.freeze(
+      serializeFileOperationRegistry(
+        parseFileOperationRegistry({ schema_version: 1, file_operations: value }),
+      ).file_operations.map((record) => Object.freeze({ ...record })),
+    );
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+    const fileOperationCodes = new Set([
+      "FILE_OPERATION_INVALID",
+      "FILE_OPERATION_ID_CONFLICT",
+      "FILE_OPERATION_INVALID_TRANSITION",
+      "FILE_OPERATION_LIMIT",
+      "FILE_OPERATION_AUTHORITY_DENIED",
+      "FILE_OPERATION_UNSUPPORTED_SCHEMA",
+      "FILE_OPERATION_CORRUPT",
+    ]);
+    if (fileOperationCodes.has(String(code))) {
+      const details =
+        typeof error === "object" && error !== null && "details" in error && isRecord(error.details)
+          ? (error.details as Record<string, unknown>)
+          : {};
+      throw new SessionRegistryError(
+        String(code) as RegistryErrorCode,
+        error instanceof Error ? error.message : "Registry file-operation records are invalid",
+        details as RegistryErrorDetails,
+        error,
+      );
+    }
+    throw new SessionRegistryError(
+      "REGISTRY_CORRUPT",
+      "Registry file-operation records are invalid",
+      { field: "file_operations" },
+      error,
+    );
+  }
+}
+
+function serializePersistedFileOperationRecords(
+  value: readonly PersistedFileOperationRecord[] | undefined,
+): readonly PersistedFileOperationRecord[] {
+  if (value === undefined) return [];
+  return parsePersistedFileOperationRecords(value);
 }
 
 export function emptyRuntimeRecords(): ParsedRuntimeRecords {
@@ -163,7 +257,160 @@ function parseRecordList(value: unknown, field: string): readonly RuntimeRecord[
       maximum: MAX_RUNTIME_RECORDS,
     });
   }
-  return Object.freeze(value.map((candidate, index) => parseRuntimeRecord(candidate, field, index)));
+  const records = value.map((candidate, index) =>
+    field === "runtime_sessions"
+      ? parseSessionAdmissionRecord(candidate, index)
+      : field === "pinned_profiles"
+        ? parsePinnedProfileRuntimeRecord(candidate, index)
+        : field === "recent_events"
+          ? parseResourceHandoffRecentEvent(candidate, field, index)
+          : parseRuntimeRecord(candidate, field, index),
+  );
+  if (field === "runtime_sessions") {
+    const owners = new Set<string>();
+    for (const record of records as SessionAdmissionRecord[]) {
+      if (owners.has(record.session_id)) {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry runtime_sessions contains a duplicate session", {
+          sessionId: record.session_id,
+        });
+      }
+      owners.add(record.session_id);
+    }
+  }
+  if (field === "pinned_profiles") {
+    const owners = new Set<string>();
+    for (const record of records) {
+      const owner = record.session_id;
+      if (typeof owner !== "string") continue;
+      if (owners.has(owner)) {
+        throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry pinned_profiles contains a duplicate session", {
+          sessionId: owner,
+        });
+      }
+      owners.add(owner);
+    }
+  }
+  return Object.freeze(records);
+}
+
+function parsePinnedProfileRuntimeRecord(value: unknown, index: number): RuntimeRecord {
+  if (!isRecord(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry pinned_profiles[${index}] must be an object`, {
+      field: "pinned_profiles",
+      index,
+    });
+  }
+  if (
+    Object.hasOwn(value, "session_id") &&
+    (typeof value.session_id !== "string" ||
+      value.session_id.length === 0 ||
+      value.session_id.length > 256 ||
+      value.session_id.includes("\0"))
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry pinned_profiles[${index}] has an invalid owner`, {
+      field: "pinned_profiles",
+      index,
+    });
+  }
+  try {
+    parsePinnedProfileRecord(value);
+  } catch (error: unknown) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry pinned_profiles[${index}] is invalid`, {
+      field: "pinned_profiles",
+      index,
+      cause: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return parseRuntimeRecord(value, "pinned_profiles", index);
+}
+
+export function parseSessionAdmissionRecord(value: unknown, index = 0): SessionAdmissionRecord {
+  if (!isRecord(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry runtime_sessions[${index}] must be an object`, {
+      field: "runtime_sessions",
+      index,
+    });
+  }
+  const keys = Object.keys(value).sort();
+  const expected = ["admission", "kind", "runtime_epoch", "schema_version", "session_id"];
+  if (
+    keys.length !== expected.length ||
+    keys.some((key, keyIndex) => key !== expected[keyIndex]) ||
+    value.kind !== "session-admission" ||
+    value.schema_version !== 1 ||
+    typeof value.session_id !== "string" ||
+    value.session_id.length === 0 ||
+    value.session_id.length > 256 ||
+    value.session_id.includes("\0") ||
+    (value.admission !== "open" && value.admission !== "closed") ||
+    typeof value.runtime_epoch !== "number" ||
+    !Number.isSafeInteger(value.runtime_epoch) ||
+    value.runtime_epoch < 0
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry runtime_sessions[${index}] is invalid`, {
+      field: "runtime_sessions",
+      index,
+    });
+  }
+  return Object.freeze({
+    kind: "session-admission",
+    schema_version: 1,
+    session_id: value.session_id,
+    admission: value.admission,
+    runtime_epoch: value.runtime_epoch,
+  });
+}
+
+function parseResourceHandoffRecentEvent(value: unknown, field: string, index: number): ResourceHandoffRecentEvent {
+  if (!isRecord(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry ${field}[${index}] must be an object`, {
+      field,
+      index,
+    });
+  }
+  const expected = [
+    "kind",
+    "schema_version",
+    "operation_id",
+    "from_session_id",
+    "to_session_id",
+    "resource",
+    "mode",
+    "claim_set_generation",
+  ];
+  if (Object.keys(value).length !== expected.length || expected.some((key) => !Object.hasOwn(value, key))) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry ${field}[${index}] is not a supported recent event`, {
+      field,
+      index,
+    });
+  }
+  if (
+    value.kind !== "resource-handoff" ||
+    value.schema_version !== 1 ||
+    !boundedText(value.operation_id) ||
+    !boundedText(value.from_session_id) ||
+    !boundedText(value.to_session_id) ||
+    !boundedText(value.resource) ||
+    !isResourceClaimMode(value.mode) ||
+    !Number.isSafeInteger(value.claim_set_generation) ||
+    (value.claim_set_generation as number) < 0
+  ) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry ${field}[${index}] is invalid`, { field, index });
+  }
+  return Object.freeze({
+    kind: "resource-handoff",
+    schema_version: 1,
+    operation_id: value.operation_id,
+    from_session_id: value.from_session_id,
+    to_session_id: value.to_session_id,
+    resource: value.resource,
+    mode: value.mode,
+    claim_set_generation: value.claim_set_generation as number,
+  });
+}
+
+function boundedText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 4096 && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function parseRuntimeRecord(value: unknown, field: string, index: number): RuntimeRecord {
