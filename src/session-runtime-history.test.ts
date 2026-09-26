@@ -99,7 +99,6 @@ test("history rejects malformed events; other evidence never competes for its bo
   });
 });
 
-
 test("history reports complete coverage only when the retained session timeline starts at creation", () => {
   let state = emptyRuntimeRecords();
   state = appendRuntimeEvent(state, [
