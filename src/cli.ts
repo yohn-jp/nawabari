@@ -163,13 +163,22 @@ validateCliRegistryParity();
 
 function helpSpecFor(commandArguments: readonly string[]): CliCommandDefinition {
   if (commandArguments.length === 0) return ROOT_HELP_SPEC;
-  const key =
-    commandArguments[0] === "resource"
-      ? `resource ${commandArguments[1] ?? "list"}`
-      : commandArguments[0] === "session" && ["coordination", "file"].includes(commandArguments[1] ?? "")
-        ? commandArguments.slice(0, 3).join(" ")
-        : commandArguments.slice(0, 2).join(" ");
-  return resolveCliCommandDefinition(key) ?? resolveCliCommandDefinition(commandArguments[0]) ?? ROOT_HELP_SPEC;
+  return (
+    registeredCommandForArguments(commandArguments) ??
+    (commandArguments[0] === "resource" && commandArguments[1] === undefined
+      ? resolveCliCommandDefinition("resource list")
+      : undefined) ??
+    resolveCliCommandDefinition(commandArguments[0] ?? "") ??
+    ROOT_HELP_SPEC
+  );
+}
+
+function registeredCommandForArguments(commandArguments: readonly string[]): CliCommandDefinition | undefined {
+  for (let length = commandArguments.length; length > 0; length -= 1) {
+    const resolved = resolveCliCommandDefinition(commandArguments.slice(0, length).join(" "));
+    if (resolved !== undefined) return resolved;
+  }
+  return undefined;
 }
 
 function helpPayload(spec: CliCommandDefinition): JsonObject {
@@ -2548,6 +2557,8 @@ async function executeSessionFileOperation(
 }
 
 function commandName(commandArguments: string[]): string {
+  const registered = registeredCommandForArguments(commandArguments);
+  if (registered !== undefined) return registered.name;
   if (commandArguments[0] === "session") {
     if (["coordination", "file"].includes(commandArguments[1] ?? "")) return commandArguments.slice(0, 3).join(" ");
     return commandArguments.slice(0, 2).join(" ");

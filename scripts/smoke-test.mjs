@@ -3259,6 +3259,20 @@ async function main() {
     };
     const executionScope = JSON.parse(fs.readFileSync(executionScopeFile, "utf8"));
     const boundedRepositoryId = executionScope.repository.repositoryId;
+    const scopeHelpResult = invokeInstalled(["session", "scope", "expand", "--help", "--json"], lifecycleRepository);
+    const scopeHelp = parseInstalledJson(scopeHelpResult, "installed working-set expansion help");
+    if (
+      scopeHelpResult.status !== 0 ||
+      scopeHelp.help_for !== "session scope expand" ||
+      !scopeHelp.usage?.includes("session scope expand") ||
+      !scopeHelp.options?.some((option) => option.name === "--revision" && option.required === true)
+    ) {
+      recordBoundedDefect(
+        "nawabari session scope expand --help --json",
+        "discover the canonical expansion contract",
+        scopeHelp,
+      );
+    }
     const createBoundedSession = (branch, worktree, candidateWorkingSetFile) => {
       const args = [
         "session",
@@ -3496,6 +3510,70 @@ async function main() {
           },
         );
       }
+      if (readExpansionGranted) {
+        if (
+          afterReadExpansion.working_set?.history?.length !== 1 ||
+          afterReadExpansion.working_set.history[0]?.revision !== 2 ||
+          !afterReadExpansion.working_set.history[0]?.paths?.includes("bounded-session/expanded-read.txt")
+        ) {
+          recordBoundedDefect(
+            "nawabari session show --json",
+            "expose revision 2 and its expansion history",
+            afterReadExpansion,
+          );
+        }
+        const staleArgs = [...expandReadArgs];
+        const staleResult = invokeInstalled(staleArgs, lifecycleRepository);
+        const stale = parseInstalledJson(staleResult, "stale working-set expansion");
+        const afterStale = parseInstalledJson(
+          invokeInstalled(["session", "show", "--session", boundedSessionId, "--json"], lifecycleRepository),
+          "working set after stale expansion",
+        );
+        if (
+          staleResult.status === 0 ||
+          stale.ok !== false ||
+          afterStale.working_set?.revision !== 2 ||
+          afterStale.working_set?.history?.length !== 1
+        ) {
+          recordBoundedDefect(`nawabari ${staleArgs.join(" ")}`, "reject stale revision without mutation", {
+            stale,
+            afterStale,
+          });
+        }
+        const mismatchedScopeFile = path.join(installDirectory, "mismatched-execution-scope.json");
+        fs.writeFileSync(
+          mismatchedScopeFile,
+          JSON.stringify({
+            ...executionScope,
+            authorization: {
+              ...executionScope.authorization,
+              governedBodyDigest: "0".repeat(64),
+            },
+          }),
+        );
+        const provenanceArgs = [...expandReadArgs];
+        provenanceArgs[provenanceArgs.indexOf("--revision") + 1] = "2";
+        provenanceArgs[provenanceArgs.indexOf("--execution-scope-file") + 1] = mismatchedScopeFile;
+        const provenanceResult = invokeInstalled(provenanceArgs, lifecycleRepository);
+        const provenance = parseInstalledJson(provenanceResult, "mismatched working-set provenance");
+        const afterProvenance = parseInstalledJson(
+          invokeInstalled(["session", "show", "--session", boundedSessionId, "--json"], lifecycleRepository),
+          "working set after mismatched provenance",
+        );
+        if (
+          provenanceResult.status !== 0 ||
+          provenance.ok !== true ||
+          provenance.status !== "denied" ||
+          !provenance.outcomes?.some((outcome) => outcome.reason?.includes("provenance does not match")) ||
+          afterProvenance.working_set?.revision !== 2 ||
+          afterProvenance.working_set?.history?.length !== 1
+        ) {
+          recordBoundedDefect(`nawabari ${provenanceArgs.join(" ")}`, "reject mismatched provenance without mutation", {
+            provenance,
+            afterProvenance,
+          });
+        }
+      }
       if (readExpansionGranted && protectedExecutionDoctor.sandbox?.ready === true) {
         const expandedReadScript =
           "const fs=require('node:fs');process.stdout.write(fs.readFileSync(process.argv[1],'utf8'))";
@@ -3579,6 +3657,15 @@ async function main() {
             response: expandMutation,
           },
         );
+      }
+      for (const operation of ["CREATE", "DELETE"]) {
+        const mutationArgs = [...expandMutationArgs];
+        mutationArgs[mutationArgs.indexOf("--operation") + 1] = operation;
+        const mutationResult = invokeInstalled(mutationArgs, lifecycleRepository);
+        const mutation = parseInstalledJson(mutationResult, `bounded-session unauthorized ${operation} expansion`);
+        if (mutationResult.status !== 0 || mutation.status !== "denied" || mutation.revision !== currentRevision) {
+          recordBoundedDefect(`nawabari ${mutationArgs.join(" ")}`, `deny ${operation} after READ expansion`, mutation);
+        }
       }
       const afterMutationExpansion = parseInstalledJson(
         invokeInstalled(["session", "show", "--session", boundedSessionId, "--json"], lifecycleRepository),
@@ -3944,10 +4031,14 @@ async function main() {
           ),
           "handoff untracked source bootstrap",
         );
+    const handoffCandidateFile = path.join(installDirectory, "handoff-candidate-working-set.json");
+    const handoffCandidate = JSON.parse(fs.readFileSync(candidateFiles.compatible, "utf8"));
+    handoffCandidate.entries = handoffCandidate.entries.filter((entry) => entry.target.locator !== handoffResource);
+    fs.writeFileSync(handoffCandidateFile, JSON.stringify(handoffCandidate));
     const handoffDestinationCreate = createBoundedSession(
       "feature/handoff-destination",
       handoffDestinationWorktree,
-      candidateFiles.compatible,
+      handoffCandidateFile,
     );
     const handoffDestination = parseInstalledJson(handoffDestinationCreate.result, "handoff destination bootstrap");
     if (handoffSource.ok !== true || handoffDestination.ok !== true) {
@@ -4096,6 +4187,75 @@ async function main() {
           "packed-managed-handoff",
           "--json",
         ];
+        const staleHandoffArgs = [...handoffArgs];
+        staleHandoffArgs[staleHandoffArgs.indexOf("--if-generation") + 1] = String(handoffGeneration - 1);
+        staleHandoffArgs[staleHandoffArgs.indexOf("--operation-id") + 1] = "packed-stale-handoff";
+        const staleHandoffResult = invokeInstalled(staleHandoffArgs, lifecycleRepository);
+        const staleHandoff = parseInstalledJson(staleHandoffResult, "stale-generation handoff");
+        if (staleHandoff.code !== "STALE_CLAIM_SET" || staleHandoff.sourceRetained !== true) {
+          recordBoundedDefect(
+            `nawabari ${staleHandoffArgs.join(" ")}`,
+            "reject stale handoff generation and retain source",
+            staleHandoff,
+          );
+        }
+        const blockedHandoffResult = invokeInstalled(handoffArgs, lifecycleRepository);
+        const blockedHandoff = parseInstalledJson(blockedHandoffResult, "destination maximum-scope handoff blocker");
+        if (
+          blockedHandoff.status !== "blocked" ||
+          blockedHandoff.sourceRetained !== true ||
+          !blockedHandoff.safeActions?.includes("request-scope-expansion") ||
+          !blockedHandoff.blockers?.some((blocker) => blocker.reason?.includes("Destination maximum scope"))
+        ) {
+          recordBoundedDefect(
+            `nawabari ${handoffArgs.join(" ")}`,
+            "block on destination maximum scope with expansion action",
+            blockedHandoff,
+          );
+        }
+        const destinationBeforeExpansion = parseInstalledJson(
+          invokeInstalled(
+            ["session", "show", "--session", handoffDestination.session_id, "--json"],
+            lifecycleRepository,
+          ),
+          "handoff destination revision before expansion",
+        );
+        const destinationExpandArgs = [
+          "session",
+          "scope",
+          "expand",
+          "--session",
+          handoffDestination.session_id,
+          "--repository",
+          boundedRepositoryId,
+          "--repository-host",
+          "github.com",
+          "--revision",
+          String(destinationBeforeExpansion.working_set?.revision),
+          "--execution-scope-file",
+          executionScopeFile,
+          "--path",
+          handoffResource,
+          "--operation",
+          "READONLY",
+          "--reason",
+          "destination handoff read scope",
+          "--json",
+        ];
+        const destinationExpandResult = invokeInstalled(destinationExpandArgs, lifecycleRepository);
+        const destinationExpand = parseInstalledJson(destinationExpandResult, "handoff destination READ expansion");
+        if (
+          destinationExpandResult.status !== 0 ||
+          destinationExpand.status !== "granted" ||
+          destinationExpand.revision !== 2
+        ) {
+          recordBoundedDefect(
+            `nawabari ${destinationExpandArgs.join(" ")}`,
+            "expand destination READ scope before handoff retry",
+            destinationExpand,
+          );
+        }
+        handoffArgs[handoffArgs.indexOf("--operation-id") + 1] = "packed-managed-handoff-retry";
         const handoffResult = invokeInstalled(handoffArgs, lifecycleRepository);
         const handoff = parseInstalledJson(handoffResult, "managed-runtime resource handoff");
         const sourceClaimsAfter = parseInstalledJson(

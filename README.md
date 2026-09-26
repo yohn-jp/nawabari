@@ -82,6 +82,75 @@ The initial-claim grammar is `--resource <path-or-glob> --mode <read|write|exclu
 
 Resource-claim enforcement is disabled by default for a new session: `commit`/`push` authorization does not require the session to hold a resource claim for its own session-owned operations. Pass `--enforce-claims` to `session create` to opt that session into the previous claim-authorization behavior, including `MISSING_RESOURCE_CLAIM`/`INSUFFICIENT_CLAIM_MODE` denials and existing claim-mode compatibility rules. Worktree ownership, branch ownership, and `RESOURCE_CLAIM_CONFLICT` protection against another session's active claim remain enforced either way.
 
+### Working-set artifacts
+
+For a bounded session, supply **both** `--execution-scope-file` and `--candidate-working-set-file` to `session create`. The JSON below illustrates the versioned fields accepted by the [canonical parsers](./src/working-set.ts). Replace the identity, revision, digest, and paths with values from the implementation authorization and the repository being bootstrapped. `repositoryHost` and `repositoryId` must agree between the two artifacts and the authorization; `repository` is optional in the execution scope and required in the candidate. The candidate `revision` and execution-scope `base.revision` must equal the session's resolved Git base revision (40 or 64 hexadecimal characters). `base.branch` names that base; `base.freshness` and the top-level execution-scope `branch` are optional bounded strings.
+
+`execution-scope.json`:
+
+```json
+{
+  "version": 1,
+  "kind": "implementation-execution-scope",
+  "authorization": {
+    "version": 1,
+    "kind": "implementation-authorization",
+    "contractVersion": 1,
+    "implementation": {
+      "repositoryHost": "github.com",
+      "repositoryId": "1329799765",
+      "repository": "yohn-jp/nawabari",
+      "number": 659
+    },
+    "governedBodyDigest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "repository": { "repositoryHost": "github.com", "repositoryId": "1329799765", "repository": "yohn-jp/nawabari" },
+  "base": { "branch": "main", "revision": "e0e3c4376c9d70c87f24c7211b5ded1f3d58a983" },
+  "scope": {
+    "readOnly": ["README.md", "src/**"],
+    "write": [],
+    "create": [],
+    "delete": [],
+    "deny": []
+  }
+}
+```
+
+`candidate-working-set.json`:
+
+```json
+{
+  "kind": "candidate-working-set",
+  "schemaVersion": 1,
+  "workingSetId": "implementation-659-candidate-v1",
+  "repository": { "repositoryHost": "github.com", "repositoryId": "1329799765", "repository": "yohn-jp/nawabari" },
+  "revision": "e0e3c4376c9d70c87f24c7211b5ded1f3d58a983",
+  "entries": [
+    {
+      "state": "required",
+      "target": { "kind": "file", "locator": "README.md" },
+      "reason": { "id": "implementation-659", "summary": "Read the public contract" },
+      "evidence": [{ "artifact": "implementation-659", "reference": "working-set-bootstrap" }]
+    }
+  ]
+}
+```
+
+The execution scope is the maximum authority: all five arrays (`readOnly`, `write`, `create`, `delete`, `deny`) are required, contain canonical repository-relative path selectors, and may be empty. The authorization's `implementation.number` is a positive integer and `governedBodyDigest` is a 64-character lowercase hexadecimal digest from the governing authorization. `implementation.repository` is optional. Candidate `entries` may be empty; each entry requires `state` (`required`, `supporting`, `verification`, or `unresolved`), `target` (`kind`: `file`, `symbol`, `test`, or `unresolved`; plus a nonempty `locator`), `reason` (`id` and `summary`), and an `evidence` array of `{ "artifact", "reference" }` objects. An `unresolved` state requires an `unresolved` target kind; concrete states require a concrete target kind. Candidate entries describe need, not permission. Unknown fields are rejected; the parser in `src/working-set.ts` is the contract authority.
+
+```bash
+nawabari session create --base main --execution-scope-file execution-scope.json \
+  --candidate-working-set-file candidate-working-set.json --json
+nawabari session show --session "$session_id" --json
+nawabari session scope expand --help --json
+nawabari session scope expand --session "$session_id" --repository 1329799765 \
+  --repository-host github.com --revision "$revision" \
+  --execution-scope-file execution-scope.json --path src/new-context.ts \
+  --operation READONLY --reason 'Needed for current task' --json
+```
+
+Read `working_set.revision` from `session show --json` before expansion. A granted expansion advances that revision and appends `working_set.history`; a stale revision or different execution-scope provenance is rejected without changing the working set. The requested path must be within the original execution-scope maximum and outside its `deny` selectors. READONLY expansion grants no WRITE, CREATE, or DELETE authority. Mutation still follows the existing claim and scope checks. If a resource handoff reports `Destination maximum scope is unavailable`, inspect the destination and explicitly expand its scope first; retry `session handoff` with fresh claim-set generation through the normal handoff command. Handoff never expands destination scope itself.
+
 The packed auxiliary-state declaration above is the bounded `copy` form: a `repository-local` source is copied to a `managed-worktree` target with `durability: durable`. It is an explicit, repeatable, allowlisted capability. It does not discover ignored state, project process-local sockets/PID files/logs, shadow Git-tracked paths, or expose arbitrary host filesystem paths. Auxiliary-state projection is separate from `SessionRuntimeProjection`: the former copies declared repository-local durable state for a managed worktree; the latter describes explicit runtime material and filesystem visibility for protected execution. Auxiliary state does not change the runtime projection.
 
 The create operation is atomic, but a caller must treat an uncertain result carefully. If JSON reports `REGISTRY_DURABILITY_UNCERTAIN`, re-read the reported session and claims before retrying. If the exact original declaration is already present, follow `bootstrap_retry.next_action: inspect-established-session` and inspect that `session_id`; if another declaration owns the worktree or branch, follow `bootstrap_retry.next_action: inspect-blocking-session`. Nawabari never silently adopts an existing owner. A retry is appropriate only after the authoritative state proves that the requested bootstrap was not established.
