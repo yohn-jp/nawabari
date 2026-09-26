@@ -105,7 +105,8 @@ test("projects bounded history for current and removed sessions without granting
   assert.deepEqual(Object.keys(result.value.history ?? {}), ["closed-session", "session-a"]);
   assert.equal(result.value.history?.["closed-session"]?.events[0]?.operation, "closed->absent");
   assert.equal(result.value.history?.["session-a"]?.events[0]?.event_id, "history:1");
-  assert.equal(result.value.history?.["session-a"]?.coverage, "since-first-recorded-event");
+  assert.equal(result.value.history?.["session-a"]?.coverage, "from-session-creation");
+  assert.equal(result.value.history?.["closed-session"]?.coverage, "prior-history-unknown");
 });
 
 test("records deterministic truncation reasons after unknown observations", () => {
