@@ -1,5 +1,5 @@
 import type { ParsedRuntimeRecords, RuntimeRecord } from "./registry/runtime-records.js";
-import { MAX_RUNTIME_RECORDS } from "./registry/runtime-records.js";
+import { MAX_RUNTIME_RECORDS, REGISTRY_FEATURES } from "./registry/runtime-records.js";
 
 /** Presentation evidence only. Neither these records nor their absence grants authority. */
 export interface SessionRuntimeHistoryEvent {
@@ -34,23 +34,40 @@ export function appendRuntimeEvent(
   if (!Number.isSafeInteger(bound) || bound < 1 || bound > MAX_RUNTIME_RECORDS)
     throw new RangeError("Invalid history bound");
   if (events.length === 0) return state;
-  const existing = (state.records.session_history ?? []) as unknown as SessionRuntimeHistoryEvent[];
+  const recent = state.records.recent_events ?? [];
+  const handoffs = recent.filter((record) => record.kind === "resource-handoff");
+  if (handoffs.length >= MAX_RUNTIME_RECORDS) throw new RangeError("No registry capacity for history evidence");
+  const existing = recent.filter(
+    (record) => record.kind !== "resource-handoff",
+  ) as unknown as SessionRuntimeHistoryEvent[];
   let sequence = existing.at(-1)?.sequence ?? 0;
   const appended = events.map((event) => {
     if (!Number.isSafeInteger(++sequence)) throw new RangeError("History sequence exhausted");
     return Object.freeze({ ...event, schema_version: 1 as const, sequence, event_id: `history:${sequence}` });
   });
   return Object.freeze({
-    requiredFeatures: Object.freeze([...new Set([...state.requiredFeatures, "session-history.v1" as const])]),
+    requiredFeatures: Object.freeze(
+      REGISTRY_FEATURES.filter(
+        (feature) =>
+          feature === "recent-events.v1" ||
+          feature === "session-history.v1" ||
+          state.requiredFeatures.includes(feature),
+      ),
+    ),
     records: Object.freeze({
       ...state.records,
-      session_history: Object.freeze([...existing, ...appended].slice(-bound)) as unknown as readonly RuntimeRecord[],
+      recent_events: Object.freeze([
+        ...handoffs,
+        ...[...existing, ...appended].slice(-Math.min(bound, MAX_RUNTIME_RECORDS - handoffs.length)),
+      ]) as unknown as readonly RuntimeRecord[],
     }),
   });
 }
 
 export function projectSessionRuntimeHistory(records: ParsedRuntimeRecords, sessionId: string): SessionRuntimeHistory {
-  const retained = (records.records.session_history ?? []) as unknown as SessionRuntimeHistoryEvent[];
+  const retained = (records.records.recent_events ?? []).filter(
+    (record) => record.kind !== "resource-handoff",
+  ) as unknown as SessionRuntimeHistoryEvent[];
   const first = retained[0]?.sequence ?? null;
   const last = retained.at(-1)?.sequence ?? null;
   return Object.freeze({

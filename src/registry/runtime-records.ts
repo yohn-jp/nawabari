@@ -59,7 +59,6 @@ export interface RuntimeRecords {
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
   readonly file_operations?: readonly PersistedFileOperationRecord[];
-  readonly session_history?: readonly RuntimeRecord[];
 }
 
 export interface ResourceHandoffRecentEvent extends JsonObject {
@@ -90,7 +89,6 @@ const FEATURE_DEFINITIONS: readonly Readonly<{
   { feature: "retentions.v1", field: "retentions" },
   { feature: "recent-events.v1", field: "recent_events" },
   { feature: "file-operations.v1", field: "file_operations" },
-  { feature: "session-history.v1", field: "session_history" },
 ]);
 
 const FEATURE_BY_FIELD = new Map(FEATURE_DEFINITIONS.map((definition) => [definition.field, definition.feature]));
@@ -140,6 +138,15 @@ export function parseRuntimeRecords(
       continue;
     }
     records[definition.field] = parseRecordList(input[definition.field], definition.field);
+  }
+  const history = (records.recent_events ?? []).filter(
+    (record) => (record as RuntimeRecord).kind !== "resource-handoff",
+  );
+  if (history.length > 0 !== requiredFeatures.includes("session-history.v1")) {
+    throw new SessionRegistryError(
+      "REGISTRY_CORRUPT",
+      "Registry history variant does not match session-history.v1 feature",
+    );
   }
 
   return Object.freeze({
@@ -268,13 +275,12 @@ function parseRecordList(value: unknown, field: string): readonly RuntimeRecord[
         ? parsePinnedProfileRuntimeRecord(candidate, index)
         : field === "recent_events"
           ? parseResourceHandoffRecentEvent(candidate, field, index)
-          : field === "session_history"
-            ? parseSessionHistoryEvent(candidate, index)
-            : parseRuntimeRecord(candidate, field, index),
+          : parseRuntimeRecord(candidate, field, index),
   );
-  if (field === "session_history") {
+  if (field === "recent_events") {
     let previous = 0;
     for (const record of records) {
+      if (record.kind === "resource-handoff") continue;
       const sequence = (record as RuntimeRecord).sequence as number;
       if (sequence <= previous || (previous !== 0 && sequence !== previous + 1)) {
         throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry history is not contiguous and ordered");
@@ -377,7 +383,10 @@ export function parseSessionAdmissionRecord(value: unknown, index = 0): SessionA
   });
 }
 
-function parseResourceHandoffRecentEvent(value: unknown, field: string, index: number): ResourceHandoffRecentEvent {
+function parseResourceHandoffRecentEvent(value: unknown, field: string, index: number): RuntimeRecord {
+  if (isRecord(value) && (value.kind === "lifecycle" || value.kind === "execution")) {
+    return parseSessionHistoryEvent(value, index);
+  }
   if (!isRecord(value)) {
     throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry ${field}[${index}] must be an object`, {
       field,
@@ -461,7 +470,7 @@ function parseSessionHistoryEvent(value: unknown, index: number): RuntimeRecord 
     !Number.isFinite(Date.parse(value.observed_at)) ||
     new Date(value.observed_at).toISOString() !== value.observed_at
   ) {
-    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry session_history[${index}] is invalid`);
+    throw new SessionRegistryError("REGISTRY_CORRUPT", `Registry recent_events[${index}] history variant is invalid`);
   }
   return cloneRecord(value);
 }

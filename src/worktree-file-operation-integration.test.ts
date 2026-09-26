@@ -404,7 +404,11 @@ test("reservation is durable before helper I/O and reconciliation increments onl
     assert.equal(calls.value, 1);
     assert.equal(beforeHelper.absent, true);
     assert.equal(beforeHelper.raw?.registry_revision, (initial.registry_revision ?? 0) + 1);
-    assert.deepEqual(beforeHelper.raw?.required_features, ["session-history.v1", FILE_OPERATION_REQUIRED_FEATURE]);
+    assert.deepEqual(beforeHelper.raw?.required_features, [
+      "recent-events.v1",
+      "session-history.v1",
+      FILE_OPERATION_REQUIRED_FEATURE,
+    ]);
     const reserved = beforeHelper.raw?.file_operations?.find((record) => record.operation_id === "durable-create");
     assert.equal(reserved?.stage, "apply-recorded");
     assert.equal(reserved?.apply_attempts, 1);

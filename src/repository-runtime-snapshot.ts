@@ -93,7 +93,8 @@ export function getNawabariRepositoryRuntimeSnapshot(
   if (claims.length > MAX_CLAIMS) incompleteReasons.push("claims truncated at 4096");
 
   const historyIds = new Set(sessions.slice(0, MAX_SESSIONS).map((session) => session.sessionId));
-  for (const record of input.registry.runtimeRecords.records.session_history ?? []) {
+  for (const record of input.registry.runtimeRecords.records.recent_events ?? []) {
+    if (record.kind === "resource-handoff") continue;
     if (typeof record.session_id === "string") historyIds.add(record.session_id);
   }
 

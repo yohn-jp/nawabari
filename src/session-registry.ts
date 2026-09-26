@@ -1211,7 +1211,6 @@ export interface PersistedRegistryV2 {
   readonly executions?: readonly RuntimeRecord[];
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
-  readonly session_history?: readonly RuntimeRecord[];
   readonly file_operations?: readonly PersistedFileOperationRecord[];
 }
 
@@ -6991,17 +6990,19 @@ export class SessionRegistry {
   }
 
   private resourceHandoffSnapshotUnsafe(state: RegistryState): ResourceHandoffSnapshot {
-    const completedOperations = (state.runtimeRecords.records.recent_events ?? []).map((record) => {
-      const event = record as unknown as ResourceHandoffRecentEvent;
-      return {
-        operationId: event.operation_id,
-        fromSessionId: event.from_session_id,
-        toSessionId: event.to_session_id,
-        resource: event.resource,
-        mode: event.mode,
-        claimSetGeneration: event.claim_set_generation,
-      };
-    });
+    const completedOperations = (state.runtimeRecords.records.recent_events ?? [])
+      .filter((record) => record.kind === "resource-handoff")
+      .map((record) => {
+        const event = record as unknown as ResourceHandoffRecentEvent;
+        return {
+          operationId: event.operation_id,
+          fromSessionId: event.from_session_id,
+          toSessionId: event.to_session_id,
+          resource: event.resource,
+          mode: event.mode,
+          claimSetGeneration: event.claim_set_generation,
+        };
+      });
     return {
       schemaVersion: 1,
       operation: "resource-handoff",
@@ -7100,6 +7101,15 @@ export class SessionRegistry {
       }
 
       const recentEvents = [...(state.runtimeRecords.records.recent_events ?? [])];
+      while (
+        recentEvents.length >= MAX_RUNTIME_RECORDS &&
+        recentEvents.filter((record) => record.kind !== "resource-handoff").length > 1
+      ) {
+        recentEvents.splice(
+          recentEvents.findIndex((record) => record.kind !== "resource-handoff"),
+          1,
+        );
+      }
       if (recentEvents.length >= MAX_RUNTIME_RECORDS) {
         throw new SessionRegistryError("OPERATION_REJECTED", "Resource handoff retry evidence capacity is exhausted", {
           maximum: MAX_RUNTIME_RECORDS,
@@ -7175,14 +7185,26 @@ export class SessionRegistry {
       registryRevision,
       this.clock().toISOString(),
     );
-    const priorHistory = previous.runtimeRecords.records.session_history;
+    const priorHistory = (previous.runtimeRecords.records.recent_events ?? []).filter(
+      (record) => record.kind !== "resource-handoff",
+    );
+    const suppliedEvents = runtimeRecords.records.recent_events ?? [];
+    const suppliedHistory = suppliedEvents.filter((record) => record.kind !== "resource-handoff");
     const historyInput: ParsedRuntimeRecords =
-      priorHistory !== undefined &&
-      (priorHistory.at(-1)?.sequence as number) >
-        ((runtimeRecords.records.session_history?.at(-1)?.sequence as number | undefined) ?? 0)
+      priorHistory.length > 0 &&
+      (priorHistory.at(-1)?.sequence as number) > ((suppliedHistory.at(-1)?.sequence as number | undefined) ?? 0)
         ? {
-            requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "session-history.v1"),
-            records: { ...runtimeRecords.records, session_history: priorHistory },
+            requiredFeatures: requiredRuntimeFeatures(
+              requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "recent-events.v1"),
+              "session-history.v1",
+            ),
+            records: {
+              ...runtimeRecords.records,
+              recent_events: [
+                ...suppliedEvents.filter((record) => record.kind === "resource-handoff"),
+                ...priorHistory,
+              ],
+            },
           }
         : runtimeRecords;
     const currentRuntimeRecords = rebaseOpenSessionAdmissions(
@@ -10575,7 +10597,6 @@ function parseRegistry(
       "executions",
       "retentions",
       "recent_events",
-      "session_history",
       "file_operations",
     ],
   );

@@ -23,7 +23,7 @@ test("history persists with stable identities, provenance, bounded retention and
   let state = emptyRuntimeRecords();
   for (let i = 0; i < MAX_RUNTIME_RECORDS + 3; i++) state = appendRuntimeEvent(state, [event(i % 2 ? "s2" : "s1", i)]);
   const persisted = toPersistedRuntimeRecords(state);
-  assert.equal(persisted.session_history?.length, MAX_RUNTIME_RECORDS);
+  assert.equal(persisted.recent_events?.length, MAX_RUNTIME_RECORDS);
   const reloaded = parseRuntimeRecords({ required_features: state.requiredFeatures, ...persisted });
   const projected = projectSessionRuntimeHistory(reloaded, "s1");
   assert.equal(projected.retained_from, 4);
@@ -36,6 +36,29 @@ test("history persists with stable identities, provenance, bounded retention and
     projected.events.every((value) => value.session_id === "s1"),
     true,
   );
+});
+
+test("history evicts only its own entries when authority evidence occupies the retained window", () => {
+  const receipts = Array.from({ length: MAX_RUNTIME_RECORDS - 1 }, (_, i) => ({
+    kind: "resource-handoff",
+    schema_version: 1,
+    operation_id: `o-${i}`,
+    from_session_id: "s1",
+    to_session_id: "s2",
+    resource: "r",
+    mode: "write",
+    claim_set_generation: i + 1,
+  }));
+  let state = parseRuntimeRecords({ required_features: ["recent-events.v1"], recent_events: receipts });
+  state = appendRuntimeEvent(state, [event("s1", 1)]);
+  state = appendRuntimeEvent(state, [event("s1", 2)]);
+  assert.equal(
+    state.records.recent_events?.filter((record) => record.kind === "resource-handoff").length,
+    MAX_RUNTIME_RECORDS - 1,
+  );
+  assert.equal(projectSessionRuntimeHistory(state, "s1").events[0]?.event_id, "history:2");
+  assert.equal(projectSessionRuntimeHistory(state, "s1").truncated, true);
+  assert.equal(state.records.recent_events?.length, MAX_RUNTIME_RECORDS);
 });
 
 test("history rejects malformed events; other evidence never competes for its bound", () => {
@@ -51,13 +74,19 @@ test("history rejects malformed events; other evidence never competes for its bo
   };
   const initial = parseRuntimeRecords({ required_features: ["recent-events.v1"], recent_events: [handoff] });
   const updated = appendRuntimeEvent(initial, [event("s1", 1)]);
-  assert.deepEqual(toPersistedRuntimeRecords(updated).recent_events, [handoff]);
+  assert.deepEqual(
+    toPersistedRuntimeRecords(updated).recent_events?.filter((record) => record.kind === "resource-handoff"),
+    [handoff],
+  );
   const persisted = toPersistedRuntimeRecords(updated);
+  assert.throws(() => parseRuntimeRecords({ ...persisted, required_features: ["recent-events.v1"] }));
   assert.throws(() =>
     parseRuntimeRecords({
       ...persisted,
       required_features: updated.requiredFeatures,
-      session_history: [{ ...persisted.session_history![0], event_id: "tampered" }],
+      recent_events: persisted.recent_events?.map((record) =>
+        record.kind === "resource-handoff" ? record : { ...record, event_id: "tampered" },
+      ),
     }),
   );
   assert.deepEqual(projectSessionRuntimeHistory(initial, "s1"), {

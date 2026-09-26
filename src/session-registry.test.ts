@@ -206,8 +206,8 @@ test("registry history is persisted with the same session mutation and survives 
     });
     const session = registry.create();
     const persisted = readJson(registry.paths.registry) as PersistedRegistryV2;
-    assert.equal(persisted.session_history?.length, 1);
-    assert.deepEqual(persisted.session_history?.[0], {
+    assert.equal(persisted.recent_events?.length, 1);
+    assert.deepEqual(persisted.recent_events?.[0], {
       kind: "lifecycle",
       schema_version: 1,
       event_id: "history:1",
@@ -221,7 +221,7 @@ test("registry history is persisted with the same session mutation and survives 
       observed_at: session.createdAt,
     });
     const reloaded = new SessionRegistry({ cwd: fixture.repositoryPath }).readRepositoryView();
-    assert.deepEqual(reloaded.runtimeRecords.records.session_history, persisted.session_history);
+    assert.deepEqual(reloaded.runtimeRecords.records.recent_events, persisted.recent_events);
   } finally {
     fixture.cleanup();
   }
@@ -260,7 +260,7 @@ test("round-trips session metadata through common Git state", () => {
     assert.equal(persisted.schema_version, 2);
     assert.equal(persisted.registry_revision, 2);
     assert.equal(persisted.runtime_epoch, 2);
-    assert.deepEqual(persisted.required_features, ["session-history.v1"]);
+    assert.deepEqual(persisted.required_features, ["recent-events.v1", "session-history.v1"]);
     assert.equal(persisted.repository_id, mainRegistry.repository.repositoryId);
     assert.equal(persisted.sessions.length, 2);
     assert.equal(persisted.sessions[0].session_id, mainSession.sessionId);
@@ -645,7 +645,7 @@ test("migrates a legacy registry without changing session ownership or claim mod
     delete legacy.runtime_epoch;
     delete legacy.required_features;
     delete legacy.runtime_sessions;
-    delete legacy.session_history;
+    delete legacy.recent_events;
     fs.writeFileSync(registry.paths.registry, `${JSON.stringify(legacy)}\n`);
 
     const result = registry.migrate();
