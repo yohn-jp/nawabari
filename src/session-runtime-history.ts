@@ -22,7 +22,7 @@ export interface SessionRuntimeHistory {
   readonly retained_from: number | null;
   readonly retained_through: number | null;
   readonly truncated: boolean;
-  readonly coverage: "since-first-recorded-event";
+  readonly coverage: "from-session-creation" | "prior-history-unknown";
 }
 
 /** Only history entries are evicted; other registry records are never touched. */
@@ -70,14 +70,16 @@ export function projectSessionRuntimeHistory(records: ParsedRuntimeRecords, sess
   ) as unknown as SessionRuntimeHistoryEvent[];
   const first = retained[0]?.sequence ?? null;
   const last = retained.at(-1)?.sequence ?? null;
+  const sessionEvents = retained.filter((event) => event.session_id === sessionId);
+  const firstSessionEvent = sessionEvents[0];
+  const coversSessionCreation =
+    firstSessionEvent?.kind === "lifecycle" && firstSessionEvent.operation.startsWith("absent->");
   return Object.freeze({
-    events: Object.freeze(
-      retained.filter((event) => event.session_id === sessionId).map((event) => Object.freeze({ ...event })),
-    ),
+    events: Object.freeze(sessionEvents.map((event) => Object.freeze({ ...event }))),
     bound: MAX_RUNTIME_RECORDS,
     retained_from: first,
     retained_through: last,
     truncated: first !== null && first > 1,
-    coverage: "since-first-recorded-event",
+    coverage: coversSessionCreation ? "from-session-creation" : "prior-history-unknown",
   });
 }
