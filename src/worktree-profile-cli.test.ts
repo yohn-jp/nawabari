@@ -105,6 +105,72 @@ test("list and show expose explicit namespaces and preserve collisions", () => {
   }
 });
 
+test("profile readiness keeps material, sandbox, and managed bootstrap separate", () => {
+  const inspection = { sandboxReadiness: () => true, managedExecutionReadiness: () => ({ ready: false }) };
+  const minimal = showWorktreeProfile("builtin:minimal", inspection);
+  assert.equal(minimal.ok, true);
+  if (!minimal.ok) return;
+  assert.equal(minimal.value.ready, true);
+  assert.deepEqual(minimal.value.readiness.definition, { ready: true });
+  assert.equal(minimal.value.readiness.material.ready, true);
+  assert.equal(minimal.value.readiness.sandbox.ready, true);
+  assert.deepEqual(minimal.value.readiness.managed_execution, { process_tracking: "required", ready: false });
+  assert.deepEqual(minimal.value.readiness.bootstrap, {
+    ready: false,
+    blocker_code: "SANDBOX_CAPABILITY_UNAVAILABLE",
+  });
+
+  const listed = listWorktreeProfiles(inspection);
+  assert.equal(listed.ok, true);
+  if (listed.ok) {
+    assert.deepEqual(listed.value.profiles[0]?.readiness.bootstrap, minimal.value.readiness.bootstrap);
+    const shell = listed.value.profiles.find((profile) => profile.id === "standard-shell");
+    assert.equal(shell?.readiness.material.ready, false);
+    assert.deepEqual(shell?.readiness.material.missing, ["bash-runtime"]);
+    assert.equal(shell?.readiness.bootstrap.blocker_code, "RUNTIME_MATERIALIZATION_MISSING");
+  }
+  const omitted = resolveWorktreeProfileSessionCreate({ command: "session create", profile: null, parameters: null });
+  assert.equal(omitted.ok, true);
+  if (omitted.ok) assert.equal(omitted.value.profile, null);
+
+  const repository = showWorktreeProfile("repository:repository-profile", {
+    ...inspection,
+    repository: repositoryProfile(),
+  });
+  assert.equal(repository.ok, true);
+  if (repository.ok) {
+    assert.equal(repository.value.readiness.material.availability, "unknown");
+    assert.deepEqual(repository.value.readiness.bootstrap, {
+      ready: false,
+      blocker_code: "SANDBOX_CAPABILITY_UNAVAILABLE",
+    });
+  }
+  const repositoryManagedReady = showWorktreeProfile("repository:repository-profile", {
+    repository: repositoryProfile(),
+    sandboxReadiness: () => true,
+    managedExecutionReadiness: () => ({ ready: true }),
+  });
+  assert.equal(repositoryManagedReady.ok, true);
+  if (repositoryManagedReady.ok) {
+    assert.deepEqual(repositoryManagedReady.value.readiness.bootstrap, { ready: null, blocker_code: null });
+  }
+});
+
+test("profile list retains unresolved declarations and reports their resolution blocker", () => {
+  const repository = { profiles: [{ ...repositoryProfile().profiles[0], extends: ["missing-parent"] }] };
+  const listed = listWorktreeProfiles({
+    repository,
+    sandboxReadiness: () => true,
+    managedExecutionReadiness: () => ({ ready: false }),
+  });
+  assert.equal(listed.ok, true);
+  if (!listed.ok) return;
+  const profile = listed.value.profiles.find((candidate) => candidate.reference === "repository:repository-profile");
+  assert.equal(profile?.readiness.definition.ready, true);
+  assert.deepEqual(profile?.readiness.resolution, { ready: false, blocker_code: "RUNTIME_PROFILE_MISSING" });
+  assert.equal(profile?.readiness.bootstrap.blocker_code, "RUNTIME_PROFILE_MISSING");
+});
+
 test("unknown profile and parameter failures use the same backend resolver", () => {
   const unknown = resolveWorktreeProfileSessionCreate(
     { command: "session create", profile: "builtin:missing", parameters: null },

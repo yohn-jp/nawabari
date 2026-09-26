@@ -1110,44 +1110,57 @@ function createLocalManagedExecutionReadiness(
   filesystem: CgroupFileSystem | undefined,
   root: DomainResult<string>,
 ): ManagedExecutionReadiness {
-  return () => {
+  return () => probeLocalManagedExecutionReadiness(probe, filesystem, root);
+}
+
+/** The bounded #607 probe used by the local admission authority and public inspection. */
+export function probeLocalManagedExecutionReadiness(
+  probe: SandboxProbe | undefined,
+  filesystem: CgroupFileSystem | undefined,
+  root: DomainResult<string>,
+): Readonly<{ ready: boolean }> {
+  try {
+    const doctor = sandboxDoctorReport(probe ?? defaultSandboxProbe, discoverSandboxRuntimeLayout());
+    if (!doctor.ready) return { ready: false };
+
+    if (!root.ok) return { ready: false };
+
+    const created = createCgroupScope(
+      { session_id: "nawabari-managed-readiness", execution_id: `readiness-${crypto.randomUUID()}` },
+      { root: root.value, ...(filesystem === undefined ? {} : { filesystem }) },
+    );
+    if (!created.ok) return { ready: false };
+
+    let population: ReturnType<typeof readCgroupPopulation> | undefined;
     try {
-      const doctor = sandboxDoctorReport(probe ?? defaultSandboxProbe, discoverSandboxRuntimeLayout());
-      if (!doctor.ready) return { ready: false };
+      population = readCgroupPopulation(created.value, filesystem);
+    } catch {
+      // The scope is still cleaned below, but uncertain observation is not readiness.
+    }
 
-      if (!root.ok) return { ready: false };
-
-      const created = createCgroupScope(
-        { session_id: "nawabari-managed-readiness", execution_id: `readiness-${crypto.randomUUID()}` },
-        { root: root.value, ...(filesystem === undefined ? {} : { filesystem }) },
-      );
-      if (!created.ok) return { ready: false };
-
-      let population: ReturnType<typeof readCgroupPopulation> | undefined;
-      try {
-        population = readCgroupPopulation(created.value, filesystem);
-      } catch {
-        // The scope is still cleaned below, but uncertain observation is not readiness.
-      }
-
-      let cleaned: ReturnType<typeof cleanupCgroupScope> | undefined;
-      try {
-        cleaned = cleanupCgroupScope(created.value, filesystem);
-      } catch {
-        return { ready: false };
-      }
-
-      return {
-        ready:
-          population?.state === "empty" &&
-          cleaned?.ok === true &&
-          cleaned.value.removed &&
-          cleaned.value.after_population.state === "empty",
-      };
+    let cleaned: ReturnType<typeof cleanupCgroupScope> | undefined;
+    try {
+      cleaned = cleanupCgroupScope(created.value, filesystem);
     } catch {
       return { ready: false };
     }
-  };
+
+    return {
+      ready:
+        population?.state === "empty" &&
+        cleaned?.ok === true &&
+        cleaned.value.removed &&
+        cleaned.value.after_population.state === "empty",
+    };
+  } catch {
+    return { ready: false };
+  }
+}
+
+/** Observe the same bounded local authority supplied to SessionRegistry admission. */
+export function inspectLocalManagedExecutionReadiness(probe?: SandboxProbe): Readonly<{ ready: boolean }> {
+  const root = resolveManagedCgroupRoot();
+  return probeLocalManagedExecutionReadiness(probe, undefined, root);
 }
 
 export function createLocalSessionBackend(options: LocalSessionBackendOptions = {}): SessionBackend {

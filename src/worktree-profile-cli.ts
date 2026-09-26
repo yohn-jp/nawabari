@@ -1,4 +1,6 @@
 import { DomainError, failure, success, type DomainResult, type JsonObject, type JsonValue } from "./domain/errors.js";
+import { inspectLocalManagedExecutionReadiness } from "./domain/session-backend.js";
+import { sandboxDoctorReport } from "./domain/sandbox.js";
 import {
   BUILTIN_WORKTREE_PROFILE_AVAILABILITY,
   BUILTIN_WORKTREE_PROFILE_CATALOG,
@@ -59,7 +61,24 @@ export type WorktreeProfileCliSummary = WorktreeProfileCliSource &
     readonly ready: boolean;
     readonly missing: readonly string[];
     readonly collision: boolean;
+    readonly readiness: WorktreeProfileReadiness;
   }>;
+
+export type WorktreeProfileReadiness = Readonly<{
+  readonly definition: Readonly<{ ready: true }>;
+  readonly resolution: Readonly<{ ready: boolean; blocker_code: string | null }>;
+  readonly material: Readonly<{
+    availability: WorktreeProfileAvailability;
+    ready: boolean;
+    missing: readonly string[];
+  }>;
+  readonly sandbox: Readonly<{ ready: boolean }>;
+  readonly managed_execution: Readonly<{ process_tracking: "required" | "not_required"; ready: boolean | null }>;
+  readonly bootstrap: Readonly<{
+    ready: boolean | null;
+    blocker_code: string | null;
+  }>;
+}>;
 
 export type WorktreeProfileCliList = Readonly<{
   readonly contract_id: typeof WORKTREE_PROFILE_CLI_CONTRACT_ID;
@@ -78,6 +97,7 @@ export type WorktreeProfileCliShow = Readonly<{
   readonly ready: boolean;
   readonly missing: readonly string[];
   readonly collision: boolean;
+  readonly readiness: WorktreeProfileReadiness;
 }>;
 
 export type WorktreeProfileSessionCreateResolution = Readonly<{
@@ -102,7 +122,43 @@ export type WorktreeProfileCliResponse = WorktreeProfileCliList | WorktreeProfil
 export type WorktreeProfileCliSources = Readonly<{
   /** Repository definitions are optional; built-ins are always explicit. */
   readonly repository?: unknown;
+  /** Read-only canonical probes may be supplied by a caller that already owns them. */
+  readonly sandboxReadiness?: () => boolean;
+  readonly managedExecutionReadiness?: () => Readonly<{ ready: boolean }>;
 }>;
+
+function readinessFor(
+  profile: ResolvedWorktreeRuntimeProfile,
+  availability: WorktreeProfileAvailability,
+  materialReady: boolean,
+  missing: readonly string[],
+  input: WorktreeProfileCliSources,
+  resolutionBlocker: string | null = null,
+): WorktreeProfileReadiness {
+  const sandboxReady = (input.sandboxReadiness ?? (() => sandboxDoctorReport().ready))();
+  const required = profile.execution.processTracking === "required";
+  const managedReady = required
+    ? (input.managedExecutionReadiness ?? inspectLocalManagedExecutionReadiness)().ready
+    : null;
+  const blocker =
+    resolutionBlocker !== null
+      ? resolutionBlocker
+      : availability === "missing"
+        ? "RUNTIME_MATERIALIZATION_MISSING"
+        : required && !managedReady
+          ? "SANDBOX_CAPABILITY_UNAVAILABLE"
+          : !materialReady && availability !== "unknown"
+            ? "RUNTIME_MATERIALIZATION_MISSING"
+            : null;
+  return Object.freeze({
+    definition: { ready: true },
+    resolution: { ready: resolutionBlocker === null, blocker_code: resolutionBlocker },
+    material: { availability, ready: materialReady, missing: [...missing] },
+    sandbox: { ready: sandboxReady },
+    managed_execution: { process_tracking: required ? "required" : "not_required", ready: managedReady },
+    bootstrap: { ready: blocker === null ? (availability === "unknown" ? null : true) : false, blocker_code: blocker },
+  });
+}
 
 type ParsedReference = Readonly<{ readonly namespace: WorktreeProfileNamespace | null; readonly id: string }>;
 type ResolvedSource = Readonly<{
@@ -367,6 +423,9 @@ function summary(
     readonly missing: readonly string[];
   },
   collision: boolean,
+  input: WorktreeProfileCliSources,
+  resolved: ResolvedWorktreeRuntimeProfile,
+  resolutionBlocker: string | null = null,
 ): WorktreeProfileCliSummary {
   return Object.freeze({
     ...sourceFor(namespace, profile.id, profile.version),
@@ -374,6 +433,7 @@ function summary(
     ready: status.ready,
     missing: Object.freeze([...status.missing]),
     collision,
+    readiness: readinessFor(resolved, status.availability, status.ready, status.missing, input, resolutionBlocker),
   });
 }
 
@@ -387,15 +447,21 @@ export function listWorktreeProfiles(input: WorktreeProfileCliSources = {}): Dom
   const profiles: WorktreeProfileCliSummary[] = [];
   for (const profile of BUILTIN_WORKTREE_PROFILE_CATALOG.profiles) {
     const status = builtinStatus(profile.id);
-    profiles.push(summary("builtin", profile, status, repositoryIds.has(profile.id)));
+    const resolved = resolveBuiltinWorktreeProfile({ profile: profile.id }, {});
+    if (!resolved.ok) return resolved;
+    profiles.push(summary("builtin", profile, status, repositoryIds.has(profile.id), input, resolved.value));
   }
   for (const profile of repository?.profiles ?? []) {
+    const resolved = resolveFromCatalog("repository", profile.id, repository!, undefined);
     profiles.push(
       summary(
         "repository",
         profile,
         { availability: "unknown", ready: false, missing: Object.freeze([]) },
         builtinIds.has(profile.id),
+        input,
+        resolved.ok ? resolved.value : profile,
+        resolved.ok ? null : resolved.error.code,
       ),
     );
   }
@@ -430,6 +496,13 @@ export function showWorktreeProfile(
       ready: resolved.value.ready,
       missing: resolved.value.missing,
       collision: resolved.value.collision,
+      readiness: readinessFor(
+        resolved.value.profile,
+        resolved.value.availability,
+        resolved.value.ready,
+        resolved.value.missing,
+        input,
+      ),
     }),
   );
 }
@@ -547,5 +620,10 @@ export const WORKTREE_PROFILE_CLI_DESCRIPTOR: JsonObject = Object.freeze({
   omitted_profile: "preserve-existing-bootstrap",
   unknown_profile: "RUNTIME_PROFILE_MISSING",
   unknown_parameter: "RUNTIME_PROFILE_INVALID",
-  readiness: "availability and ready are observational; missing material never becomes ready",
+  readiness: {
+    legacy_ready: "material-resolution-only",
+    fields: ["definition", "resolution", "material", "sandbox", "managed_execution", "bootstrap"],
+    managed_authority: "LocalSessionBackend",
+    sandbox_ready_is_sufficient_for_managed_bootstrap: false,
+  },
 });

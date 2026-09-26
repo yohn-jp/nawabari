@@ -9,6 +9,7 @@ import { projectSessionLifecycleActions } from "../session-lifecycle-actions.js"
 import { availableLifecycleOperations } from "../session-lifecycle-classification.js";
 import { success, type DomainResult, type ErrorCode, type JsonObject, type JsonValue } from "./errors.js";
 import { supportsRuntime } from "./runtime.js";
+import { inspectLocalManagedExecutionReadiness } from "./session-backend.js";
 import {
   defaultSandboxProbe,
   discoverSandboxRuntimeLayout,
@@ -40,6 +41,13 @@ export type DoctorReport = {
   repository: RepositoryInfo | null;
   /** Runtime protected-execution readiness from the canonical sandbox probe. */
   sandbox: SandboxDoctorReport;
+  /** Process-tracking authority required by profile-selected managed create. */
+  managed_execution: Readonly<{
+    process_tracking: "required";
+    ready: boolean;
+    blocker_code: "SANDBOX_CAPABILITY_UNAVAILABLE" | null;
+    sandbox_ready_is_sufficient: false;
+  }>;
 };
 
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {
@@ -155,6 +163,7 @@ export function summarizeDoctorReport(report: DoctorReport): JsonObject {
     })),
     repository: report.repository,
     sandbox: compactSandboxReport(report.sandbox),
+    managed_execution: report.managed_execution,
   };
 }
 
@@ -332,9 +341,17 @@ export async function runDoctor(
   sandboxProbe: SandboxProbe = defaultSandboxProbe,
   runtimeVersion = process.versions.node,
   runtimeLayout: SandboxRuntimeLayout = discoverSandboxRuntimeLayout(),
+  managedReadiness: () => Readonly<{ ready: boolean }> = () => inspectLocalManagedExecutionReadiness(sandboxProbe),
 ): Promise<DomainResult<DoctorReport>> {
   const checks: DoctorCheck[] = [];
   const sandbox = sandboxDoctorReport(sandboxProbe, runtimeLayout);
+  const managedReady = managedReadiness().ready;
+  const managed_execution = {
+    process_tracking: "required" as const,
+    ready: managedReady,
+    blocker_code: managedReady ? null : ("SANDBOX_CAPABILITY_UNAVAILABLE" as const),
+    sandbox_ready_is_sufficient: false as const,
+  };
   const runtimeOk = supportsRuntime(runtimeVersion);
   checks.push(
     runtimeOk
@@ -364,7 +381,7 @@ export async function runDoctor(
     checks.push(
       check("registry", "not_applicable", null, "Registry inspection was skipped because Git is unavailable."),
     );
-    return success({ ok: false, checks, repository: null, sandbox });
+    return success({ ok: false, checks, repository: null, sandbox, managed_execution });
   }
 
   let repository: RepositoryInfo | null = null;
@@ -405,7 +422,7 @@ export async function runDoctor(
   }
 
   const hasError = checks.some((item) => item.status === "error");
-  return success({ ok: !hasError, checks, repository, sandbox });
+  return success({ ok: !hasError, checks, repository, sandbox, managed_execution });
 }
 
 function doctorErrorCode(error: unknown, fallback: ErrorCode): ErrorCode {
