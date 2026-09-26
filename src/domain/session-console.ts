@@ -386,10 +386,15 @@ export async function launchManagedSessionCommand(
     repositoryId: claim.repository,
     mode: claim.mode,
   }));
-  const pathRequests = [
-    ...profile.filesystem.readOnly.map((path) => ({ path, operation: "READONLY" as const })),
-    ...profile.filesystem.write.map((path) => ({ path, operation: "WRITE" as const })),
-  ];
+  // Profile filesystem entries are authorization ceilings, not concrete path
+  // evidence. Project only concrete claimed resources into the runtime scope;
+  // broad profile selectors such as builtin:minimal's "**" remain ceilings.
+  const pathRequests = claims
+    .filter((claim) => !claim.resource.includes("*") && !claim.resource.includes("?"))
+    .map((claim) => ({
+      path: claim.resource,
+      operation: claim.mode === "read" ? ("READONLY" as const) : ("WRITE" as const),
+    }));
   const scope = resolveProfileRuntimeScope(
     profile,
     {
