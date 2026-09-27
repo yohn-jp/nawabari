@@ -12,6 +12,8 @@ import {
   serializeEffectiveFilesystemPolicy,
   validateEffectiveFilesystemPolicy,
 } from "./filesystem-policy.js";
+import { STRICT_RUNTIME_POLICY } from "./runtime-projection.js";
+import { resolveProfileRuntimeScope } from "./worktree-profile-scope.js";
 import { RESOURCE_CLAIM_SCHEMA_VERSION, canonicalClaimId } from "../resource-claims.js";
 
 const PROFILE_DIGEST = "a".repeat(64);
@@ -41,6 +43,38 @@ function workingSet(scope: Record<string, unknown>, revision = 4) {
     repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
     base: { branch: "main", revision: "a".repeat(40) },
     scope,
+  };
+}
+
+function runtimeWorkingSet(scope: Record<string, unknown>) {
+  return {
+    contract_id: "nawabari.working-set-runtime-projection.v1",
+    schema_version: 1,
+    working_set_id: "ews-policy-test",
+    revision: 4,
+    repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+    base: { branch: "main", revision: "a".repeat(40) },
+    scope,
+  };
+}
+
+function runtimeProfile(filesystem: Record<string, unknown>) {
+  return {
+    contract_id: "nawabari.worktree-runtime-profile.v1",
+    schema_version: 1,
+    id: "filesystem-policy-test",
+    version: "1",
+    materialSelection: { profiles: ["base"] },
+    filesystem,
+    tools: [{ entrypoint: "node", provider: { id: "node", requirement_id: "node-runtime" } }],
+    shell: { entrypoint: "node" },
+    environment: {
+      home: "session",
+      xdg: { config: "session", cache: "session", data: "session", state: "session" },
+      tmp: "execution",
+    },
+    git: { config: "session-private", globalConfig: "excluded", credentialHelpers: "disabled", hooks: "disabled" },
+    execution: { policy: STRICT_RUNTIME_POLICY, processTracking: "optional" },
   };
 }
 
@@ -145,6 +179,131 @@ test("checks each mutation independently against its own working-set scope, back
   assert.equal(decideEffectivePathAccess({ policy, operation: "WRITE", path: "src/new.ts" }).allowed, false);
 });
 
+test("the shared READONLY/WRITE corpus agrees through profile and effective production consumers", () => {
+  const broadScope = {
+    readOnly: ["src/**"],
+    write: ["src/**"],
+    create: [],
+    delete: [],
+    deny: [],
+    immutable: [],
+  };
+  const broadWorkingSet = { readOnly: ["src/**"], write: ["src/**"], create: [], delete: [], deny: [] };
+  const cases = [
+    {
+      name: "READONLY glob selector",
+      operation: "READONLY" as const,
+      path: "src/nested/readme.md",
+      profile: broadScope,
+      workingSet: broadWorkingSet,
+      claims: [claim("src/**", "read")],
+      expected: true,
+    },
+    {
+      name: "WRITE glob selector",
+      operation: "WRITE" as const,
+      path: "src/nested/change.ts",
+      profile: broadScope,
+      workingSet: broadWorkingSet,
+      claims: [claim("src/**", "write")],
+      expected: true,
+    },
+    {
+      name: "deny overrides a broader allow",
+      operation: "READONLY" as const,
+      path: "src/private.ts",
+      profile: { ...broadScope, deny: ["src/private.ts"] },
+      workingSet: broadWorkingSet,
+      claims: [claim("src/**", "read")],
+      expected: false,
+    },
+    {
+      name: "immutable blocks mutation while retaining read access",
+      operation: "WRITE" as const,
+      path: "src/frozen.ts",
+      profile: { ...broadScope, immutable: ["src/frozen.ts"] },
+      workingSet: broadWorkingSet,
+      claims: [claim("src/**", "write")],
+      expected: false,
+    },
+    {
+      name: "immutable does not block READONLY",
+      operation: "READONLY" as const,
+      path: "src/frozen.ts",
+      profile: { ...broadScope, immutable: ["src/frozen.ts"] },
+      workingSet: broadWorkingSet,
+      claims: [claim("src/**", "read")],
+      expected: true,
+    },
+    {
+      name: "claims-on requires operation strength",
+      operation: "WRITE" as const,
+      path: "src/read-only.ts",
+      profile: broadScope,
+      workingSet: broadWorkingSet,
+      claims: [claim("src/read-only.ts", "read")],
+      expected: false,
+    },
+    {
+      name: "claims-off still honors the bounded working set",
+      operation: "WRITE" as const,
+      path: "src/no-own-claim.ts",
+      profile: broadScope,
+      workingSet: broadWorkingSet,
+      claims: undefined,
+      expected: true,
+    },
+    {
+      name: "the bounded working set narrows a broader profile",
+      operation: "READONLY" as const,
+      path: "docs/readme.md",
+      profile: { ...broadScope, readOnly: ["**"] },
+      workingSet: broadWorkingSet,
+      claims: undefined,
+      expected: false,
+    },
+    {
+      name: "an unbounded local session remains distinct from a failed boundary",
+      operation: "READONLY" as const,
+      path: "src/local-only.ts",
+      profile: broadScope,
+      workingSet: undefined,
+      claims: undefined,
+      expected: true,
+    },
+  ];
+
+  for (const current of cases) {
+    const hasClaims = current.claims !== undefined;
+    const policy = compile({
+      profile: { status: "applied", digest: PROFILE_DIGEST, filesystem: current.profile },
+      working_set: current.workingSet === undefined ? undefined : workingSet(current.workingSet, 1),
+      claims: current.claims,
+      claim_set_generation: hasClaims ? 1 : undefined,
+      backend_requirements: undefined,
+    });
+    const effective = decideEffectivePathAccess({ policy, operation: current.operation, path: current.path });
+    assert.equal(effective.allowed, current.expected, `${current.name}: effective policy`);
+
+    const profileRuntime = resolveProfileRuntimeScope(
+      runtimeProfile(current.profile),
+      {
+        repositoryId: "1329799765",
+        ...(current.workingSet === undefined ? {} : { workingSet: runtimeWorkingSet(current.workingSet) }),
+        ...(current.claims === undefined ? {} : { claims: current.claims, claimsRequired: true }),
+      },
+      { paths: [current.path], requests: [{ path: current.path, operation: current.operation }] },
+    );
+    assert.equal(profileRuntime.ok, true, `${current.name}: profile scope compiles`);
+    if (!profileRuntime.ok) continue;
+    assert.equal(
+      profileRuntime.value.decisions[0]?.status === "allowed",
+      current.expected,
+      `${current.name}: profile runtime scope`,
+    );
+  }
+});
+
 test("distinguishes an unapplied legacy boundary from an applied unknown boundary", () => {
   const legacy = compile({ profile: undefined, working_set: undefined });
   const legacyDecision = decideEffectivePathAccess({ policy: legacy, operation: "READONLY", path: "src/write.ts" });
@@ -159,23 +318,43 @@ test("distinguishes an unapplied legacy boundary from an applied unknown boundar
   assert.equal(unknownDecision.allowed, false);
 });
 
-test("runtime/package/infrastructure selectors do not authorize repository content", () => {
-  const policy = compile({
-    profile: {
-      status: "applied",
-      digest: PROFILE_DIGEST,
-      filesystem: { readOnly: [{ domain: "runtime", path: "/nix/store/**" }] },
+test("domain-scoped selectors stay within runtime, package, and infrastructure projections", () => {
+  const cases = [
+    { domain: "runtime" as const, selector: "/nix/store/**", path: "/nix/store/node/bin/node" },
+    {
+      domain: "package" as const,
+      selector: "/opt/nawabari/packages/**",
+      path: "/opt/nawabari/packages/editor/index.js",
     },
-    working_set: workingSet({ readOnly: [], write: [], create: [], delete: [], deny: [] }, 1),
-    claims: [claim("src/**", "read")],
-    claim_set_generation: 1,
-    backend_requirements: undefined,
-  });
-  assert.equal(decideEffectivePathAccess({ policy, operation: "READONLY", path: "src/file.ts" }).allowed, false);
-  assert.equal(
-    decideEffectivePathAccess({ policy, operation: "READONLY", path: "/nix/store/node", domain: "runtime" }).allowed,
-    true,
-  );
+    {
+      domain: "infrastructure" as const,
+      selector: "/run/user/1000/nawabari/**",
+      path: "/run/user/1000/nawabari/control.sock",
+    },
+  ];
+  for (const current of cases) {
+    const policy = compile({
+      profile: {
+        status: "applied",
+        digest: PROFILE_DIGEST,
+        filesystem: { readOnly: [{ domain: current.domain, path: current.selector }] },
+      },
+      working_set: workingSet({ readOnly: [], write: [], create: [], delete: [], deny: [] }, 1),
+      claims: [claim("src/**", "read")],
+      claim_set_generation: 1,
+      backend_requirements: undefined,
+    });
+    assert.equal(
+      decideEffectivePathAccess({ policy, operation: "READONLY", path: current.path, domain: current.domain }).allowed,
+      true,
+      `${current.domain} selector matches its projected path`,
+    );
+    assert.equal(
+      decideEffectivePathAccess({ policy, operation: "READONLY", path: "src/file.ts" }).allowed,
+      false,
+      `${current.domain} selector does not authorize repository content`,
+    );
+  }
 });
 
 test("immutable profile areas override broader mutation scopes", () => {
@@ -186,15 +365,36 @@ test("immutable profile areas override broader mutation scopes", () => {
       filesystem: {
         readOnly: ["src/**"],
         write: ["src/**"],
+        create: ["src/**"],
+        delete: ["src/**"],
+        rename: ["src/**"],
         immutable: ["src/frozen.ts"],
       },
     },
-    working_set: workingSet({ readOnly: ["src/**"], write: ["src/**"], create: [], delete: [], deny: [] }),
-    claims: [claim("src/frozen.ts", "write")],
+    working_set: workingSet({
+      readOnly: ["src/**"],
+      write: ["src/**"],
+      create: ["src/**"],
+      delete: ["src/**"],
+      rename: ["src/**"],
+      deny: [],
+    }),
+    claims: [claim("src/frozen.ts", "write"), claim("src/renamed.ts", "write")],
     claim_set_generation: 1,
-    backend_requirements: undefined,
+    backend_requirements: [
+      { operation: "CREATE", path: "src/frozen.ts" },
+      { operation: "DELETE", path: "src/frozen.ts" },
+      { operation: "RENAME", path: "src/frozen.ts", destination: "src/renamed.ts" },
+    ],
   });
-  assert.equal(decideEffectivePathAccess({ policy, operation: "WRITE", path: "src/frozen.ts" }).allowed, false);
+  for (const operation of ["WRITE", "CREATE", "DELETE"] as const) {
+    assert.equal(decideEffectivePathAccess({ policy, operation, path: "src/frozen.ts" }).allowed, false);
+  }
+  assert.equal(
+    decideEffectivePathAccess({ policy, operation: "RENAME", path: "src/frozen.ts", destination: "src/renamed.ts" })
+      .allowed,
+    false,
+  );
   assert.equal(decideEffectivePathAccess({ policy, operation: "READONLY", path: "src/frozen.ts" }).allowed, true);
 });
 

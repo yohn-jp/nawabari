@@ -17,7 +17,14 @@ import type { SessionObservationInput } from "./state/session/types.js";
 export const SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION = 1 as const;
 
 export type SessionLifecycleState =
-  "active" | "close-ready" | "blocked-recoverable" | "discarded" | "stale-inconsistent" | "closed";
+  | "active"
+  | "parking"
+  | "parked"
+  | "close-ready"
+  | "blocked-recoverable"
+  | "discarded"
+  | "stale-inconsistent"
+  | "closed";
 
 /**
  * The public state vocabulary is derived from the machine's own explicit
@@ -29,7 +36,8 @@ export const SESSION_LIFECYCLE_STATES: readonly SessionLifecycleState[] = Object
   Object.keys(SESSION_LIFECYCLE_STATE_NODE_IDS) as SessionLifecycleState[],
 );
 
-export type SessionLifecycleOperation = "close" | "discard" | "inspect" | "doctor" | "reconcile" | "gc";
+export type SessionLifecycleOperation =
+  "close" | "discard" | "inspect" | "doctor" | "reconcile" | "gc" | "park" | "resume";
 
 export type SessionLifecyclePhase = "current" | "termination";
 
@@ -76,7 +84,12 @@ export interface SessionLifecycleTransition {
     | "already-terminal"
     | "age-is-not-destructive-authority"
     | "discarded-terminal"
-    | "closed-terminal";
+    | "closed-terminal"
+    | "park-requested"
+    | "parked"
+    | "resume-authorized"
+    | "parking-in-progress"
+    | "session-not-parked";
 }
 
 /**

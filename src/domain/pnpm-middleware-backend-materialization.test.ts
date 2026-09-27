@@ -141,7 +141,7 @@ function evidenceBlock(markdown: string, heading: string): string {
 
 function checkedInEvidence(): Readonly<Record<string, string>> {
   const document = fs.readFileSync(
-    new URL("../../docs/architecture/pnpm-middleware-backend-materialization.md", import.meta.url),
+    new URL("../../docs/evidence/runtime/pnpm-materialization.md", import.meta.url),
     "utf8",
   );
   return {
@@ -151,6 +151,32 @@ function checkedInEvidence(): Readonly<Record<string, string>> {
     pnpm_help: evidenceBlock(document, "Exact pnpm `--help` evidence"),
   };
 }
+
+test("checked-in pinned RTK and pnpm evidence source matches exact observations", () => {
+  const evidence = checkedInEvidence();
+  assert.equal(evidence.rtk_version, RTK_BACKEND_EVIDENCE.version);
+  assert.equal(Buffer.byteLength(evidence.rtk_version, "utf8"), RTK_BACKEND_EVIDENCE.version_bytes);
+  assert.equal(
+    createHash("sha256").update(evidence.rtk_version, "utf8").digest("hex"),
+    RTK_BACKEND_EVIDENCE.version_sha256,
+  );
+  assert.equal(Buffer.byteLength(evidence.rtk_proxy_help, "utf8"), RTK_BACKEND_EVIDENCE.proxy_help_bytes);
+  assert.equal(
+    createHash("sha256").update(evidence.rtk_proxy_help, "utf8").digest("hex"),
+    RTK_BACKEND_EVIDENCE.proxy_help_sha256,
+  );
+  assert.equal(evidence.pnpm_version, PNPM_BACKEND_EVIDENCE.version);
+  assert.equal(Buffer.byteLength(evidence.pnpm_version, "utf8"), PNPM_BACKEND_EVIDENCE.version_bytes);
+  assert.equal(
+    createHash("sha256").update(evidence.pnpm_version, "utf8").digest("hex"),
+    PNPM_BACKEND_EVIDENCE.version_sha256,
+  );
+  assert.equal(Buffer.byteLength(evidence.pnpm_help, "utf8"), PNPM_BACKEND_EVIDENCE.help_bytes);
+  assert.equal(
+    createHash("sha256").update(evidence.pnpm_help, "utf8").digest("hex"),
+    PNPM_BACKEND_EVIDENCE.help_sha256,
+  );
+});
 
 function sha256(source: string): string {
   return createHash("sha256").update(fs.readFileSync(source)).digest("hex");

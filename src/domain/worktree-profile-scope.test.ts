@@ -160,6 +160,33 @@ test("projects finite evidence through broad ceilings and still rejects unsuppor
   assert.equal(denied.value.status, "unsupported");
 });
 
+test("profile CREATE and DELETE remain unsupported before immutable matching", () => {
+  const immutableProfile = {
+    ...profile,
+    filesystem: {
+      ...profile.filesystem,
+      readOnly: [],
+      write: [],
+      create: [],
+      delete: [],
+      deny: [],
+      immutable: ["src/frozen.ts"],
+    },
+  };
+  for (const operation of ["CREATE", "DELETE"] as const) {
+    const result = resolveProfileRuntimeScope(
+      immutableProfile,
+      { repositoryId: "repo" },
+      { paths: ["src/frozen.ts"], requests: [{ path: "src/frozen.ts", operation }] },
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) continue;
+    assert.equal(result.value.status, "unsupported", `${operation} remains outside the bounded runtime backend`);
+    assert.equal(result.value.decisions[0]?.status, "unsupported");
+    assert.match(result.value.decisions[0]?.reason ?? "", /existing runtime backend cannot safely compile/u);
+  }
+});
+
 test("serializes the scope under the filesystem-policy key", () => {
   const result = resolveProfileRuntimeScope(profile, { repositoryId: "repo" }, pathEvidence());
   assert.equal(result.ok, true);

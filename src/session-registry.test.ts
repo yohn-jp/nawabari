@@ -306,6 +306,73 @@ test("discard advances registry_revision once for each sequential persisted muta
   }
 });
 
+test("legacy direct discard rejects an effect change after capturing its approval", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-approval`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-approval" });
+    const before = persistedRegistryRevision(registry);
+    const previewDiscard = registry.previewDiscard.bind(registry);
+    registry.previewDiscard = (sessionIdOrOptions) => {
+      const preview = previewDiscard(sessionIdOrOptions);
+      fs.writeFileSync(path.join(worktreePath, "late.txt"), "changed after approval capture\n");
+      return preview;
+    };
+
+    assertRegistryError(() => registry.discard(session.sessionId), "STALE_REGISTRY");
+
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(fs.existsSync(path.join(worktreePath, "late.txt")), true);
+    assert.equal(
+      runGit(["show-ref", "--verify", "--quiet", "refs/heads/feature/discard-approval"], fixture.repositoryPath),
+      "",
+    );
+    assert.equal(persistedRegistryRevision(registry), before);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
+test("object-form direct discard requires an explicit approval witness before preview or mutation", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-explicit-approval`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-explicit-approval" });
+    const before = persistedRegistryRevision(registry);
+    let previewCalls = 0;
+    const previewDiscard = registry.previewDiscard.bind(registry);
+    registry.previewDiscard = (sessionIdOrOptions) => {
+      previewCalls += 1;
+      return previewDiscard(sessionIdOrOptions);
+    };
+
+    assertRegistryError(() => registry.discard({ sessionId: session.sessionId }), "OPERATION_REJECTED");
+    assertRegistryError(
+      () => registry.discard({ sessionId: session.sessionId, approvalWitness: "" }),
+      "OPERATION_REJECTED",
+    );
+
+    assert.equal(previewCalls, 0);
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(
+      runGit(
+        ["show-ref", "--verify", "--quiet", "refs/heads/feature/discard-explicit-approval"],
+        fixture.repositoryPath,
+      ),
+      "",
+    );
+    assert.equal(persistedRegistryRevision(registry), before);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 test("multi-candidate garbage collection never reuses or regresses registry_revision", () => {
   const fixture = createRepositoryFixture();
   const worktreePaths = [`${fixture.repositoryPath}-gc-revision-1`, `${fixture.repositoryPath}-gc-revision-2`];
@@ -334,6 +401,7 @@ test("multi-candidate garbage collection never reuses or regresses registry_revi
 test("expands a governed working set atomically with revision CAS and claim checks", () => {
   const fixture = createRepositoryFixture();
   const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-expansion");
+  const claimsOnWorktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-expansion-claims-on");
   try {
     const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
     const revision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
@@ -358,8 +426,8 @@ test("expands a governed working set atomically with revision CAS and claim chec
       scope: {
         readOnly: ["README.md", "src/**"],
         write: ["src/new.ts"],
-        create: [],
-        delete: [],
+        create: ["src/new.ts"],
+        delete: ["src/new.ts"],
         deny: ["src/secret.ts"],
       },
     };
@@ -384,8 +452,27 @@ test("expands a governed working set atomically with revision CAS and claim chec
       branchName: "feature/expansion",
       executionScope,
       candidateWorkingSet,
-      initialClaims: [{ resource: "src/new.ts", mode: "write" }],
+      initialClaims: [],
     });
+    const claimsOnSession = registry.provision({
+      worktreePath: claimsOnWorktreePath,
+      branchName: "feature/expansion-claims-on",
+      executionScope,
+      candidateWorkingSet: { ...candidateWorkingSet, workingSetId: "candidate-376-claims-on" },
+      initialClaims: [{ resource: "src/new.ts", mode: "read" }],
+      claimEnforcement: true,
+    });
+    const claimsOnExpansion = registry.expandWorkingSet({
+      sessionId: claimsOnSession.sessionId,
+      repository: identity,
+      currentRevision: 1,
+      executionScope,
+      entries: [{ path: "src/new.ts", operation: "WRITE", reason: "insufficient read claim" }],
+    });
+    assert.equal(claimsOnExpansion.status, "denied");
+    assert.equal(claimsOnExpansion.outcomes[0]?.status, "denied");
+    assert.equal(claimsOnExpansion.revision, 1);
+
     const expandedRead = registry.expandWorkingSet({
       sessionId: session.sessionId,
       repository: identity,
@@ -433,12 +520,34 @@ test("expands a governed working set atomically with revision CAS and claim chec
     assert.equal(expandedMutation.revision, 3);
     assert.deepEqual(expandedMutation.workingSet.scope.write, ["src/new.ts"]);
 
+    const expandedCreate = registry.expandWorkingSet({
+      sessionId: session.sessionId,
+      repository: identity,
+      currentRevision: 3,
+      executionScope,
+      entries: [{ path: "src/new.ts", operation: "CREATE", reason: "authorized create context" }],
+    });
+    assert.equal(expandedCreate.status, "granted");
+    assert.equal(expandedCreate.revision, 4);
+    assert.deepEqual(expandedCreate.workingSet.scope.create, ["src/new.ts"]);
+
+    const expandedDelete = registry.expandWorkingSet({
+      sessionId: session.sessionId,
+      repository: identity,
+      currentRevision: 4,
+      executionScope,
+      entries: [{ path: "src/new.ts", operation: "DELETE", reason: "authorized delete context" }],
+    });
+    assert.equal(expandedDelete.status, "granted");
+    assert.equal(expandedDelete.revision, 5);
+    assert.deepEqual(expandedDelete.workingSet.scope.delete, ["src/new.ts"]);
+
     assertRegistryError(
       () =>
         registry.expandWorkingSet({
           sessionId: session.sessionId,
           repository: identity,
-          currentRevision: 2,
+          currentRevision: 3,
           executionScope,
           entries: [{ path: "src/other.ts", operation: "READONLY", reason: "stale" }],
         }),
@@ -447,18 +556,23 @@ test("expands a governed working set atomically with revision CAS and claim chec
     const denied = registry.expandWorkingSet({
       sessionId: session.sessionId,
       repository: identity,
-      currentRevision: 3,
+      currentRevision: 5,
       executionScope,
       entries: [{ path: "src/secret.ts", operation: "READONLY", reason: "denied" }],
     });
     assert.equal(denied.status, "denied");
-    assert.equal(denied.revision, 3);
-    assert.equal(registry.get(session.sessionId)?.workingSet?.revision, 3);
+    assert.equal(denied.revision, 5);
+    assert.equal(registry.get(session.sessionId)?.workingSet?.revision, 5);
   } finally {
     try {
       runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
     } catch {
       fs.rmSync(worktreePath, { recursive: true, force: true });
+    }
+    try {
+      runGit(["worktree", "remove", "--force", claimsOnWorktreePath], fixture.repositoryPath);
+    } catch {
+      fs.rmSync(claimsOnWorktreePath, { recursive: true, force: true });
     }
     fixture.cleanup();
   }
@@ -1464,13 +1578,22 @@ test("an unexpected post-rename directory-sync failure is reported durability-un
   }
 });
 
-test("a known unsupported directory-fsync condition does not fail an ordinary mutation", () => {
+test("a known unsupported directory-fsync condition reports durability uncertainty after mutation", () => {
   const fixture = createRepositoryFixture();
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
-    const session = withDirectoryFsyncFailure(registry.paths.directory, "EINVAL", () => registry.create());
-    assert.equal(registry.list().length, 1);
-    assert.equal(registry.get(session.sessionId)?.sessionId, session.sessionId);
+    assert.throws(
+      () => withDirectoryFsyncFailure(registry.paths.directory, "EINVAL", () => registry.create()),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        return true;
+      },
+    );
+    // Rename already published the new registry document. Unsupported
+    // directory sync reports uncertainty and must not imply rollback.
+    assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).list().length, 1);
+    assert.equal(fs.existsSync(registry.paths.registry), true);
   } finally {
     fixture.cleanup();
   }

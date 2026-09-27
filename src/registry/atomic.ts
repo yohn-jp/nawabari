@@ -21,20 +21,6 @@ export interface AtomicWriteOptions {
   hooks?: AtomicWriteHooks;
 }
 
-function errorCode(error: unknown): string | undefined {
-  if (!(error instanceof Error) || !("code" in error)) {
-    return undefined;
-  }
-
-  const code = error.code;
-  return typeof code === "string" ? code : undefined;
-}
-
-function isUnsupportedDirectorySync(error: unknown): boolean {
-  const code = errorCode(error);
-  return code === "EINVAL" || code === "ENOTSUP" || code === "EISDIR";
-}
-
 /**
  * A failure observed after the target file was already renamed into place.
  * Callers must not read this as "the write succeeded" — durability past
@@ -79,10 +65,6 @@ async function syncDirectory(directory: string): Promise<void> {
   try {
     handle = await open(directory, "r");
     await handle.sync();
-  } catch (error) {
-    if (!isUnsupportedDirectorySync(error)) {
-      throw error;
-    }
   } finally {
     if (handle !== undefined) {
       await handle.close();
@@ -95,10 +77,6 @@ function syncDirectorySync(directory: string): void {
   try {
     descriptor = fs.openSync(directory, "r");
     fs.fsyncSync(descriptor);
-  } catch (error) {
-    if (!isUnsupportedDirectorySync(error)) {
-      throw error;
-    }
   } finally {
     if (descriptor !== undefined) {
       fs.closeSync(descriptor);
@@ -108,8 +86,14 @@ function syncDirectorySync(directory: string): void {
 
 /**
  * Persist JSON by writing and syncing a same-directory temporary file, then
- * replacing the target with rename. Readers therefore observe either the
- * previous complete document or the next complete document.
+ * replacing the target with rename and syncing its parent directory. Canonical
+ * durability therefore requires a local filesystem that supports atomic
+ * same-directory replacement plus successful file and directory sync calls.
+ * Unsupported or failed sync is an error; a post-rename failure is reported as
+ * durability-uncertain. Successful calls reflect the filesystem's report and
+ * cannot prove power-loss behavior beyond the host and storage guarantees.
+ * Readers observe either the previous complete document or the next complete
+ * document.
  */
 export async function writeJsonAtomically(
   targetPath: string,

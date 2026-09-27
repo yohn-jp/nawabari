@@ -26,6 +26,10 @@ import {
 import { RESOURCE_CLAIM_SCHEMA_VERSION } from "./resource-claims.js";
 import { SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION, SESSION_DIAGNOSTIC_V2_SCHEMA_VERSION } from "./domain/session.js";
 import {
+  SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION,
+  SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION,
+} from "./session-lifecycle-actions.js";
+import {
   classifySessionLifecycle,
   lifecycleTransition,
   SESSION_LIFECYCLE_STATES,
@@ -225,6 +229,60 @@ test("session lifecycle capability truthfully publishes Linux-only stale-lock re
   assert.equal(retry.uncertain_code, "REGISTRY_DURABILITY_UNCERTAIN");
   assert.equal(retry.exact_owner_adoption, false);
   assert.equal(retry.fail_closed, true);
+});
+
+test("machine contract publishes v2 park/resume discovery alongside the unchanged v1 recovery vocabulary", async () => {
+  const contract = machineContract("test-version");
+  assert.equal(contract.contract_id, MACHINE_CONTRACT_ID);
+  assert.equal(contract.schema_version, MACHINE_CONTRACT_SCHEMA_VERSION);
+  assert.ok(Array.isArray(contract.capabilities));
+
+  const lifecycle = contract.capabilities.find(
+    (candidate) =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      !Array.isArray(candidate) &&
+      candidate.id === "session-lifecycle",
+  ) as JsonRecord | undefined;
+  assert.ok(lifecycle);
+  assert.equal("action_ids" in lifecycle, false);
+  const v1ActionIds = [
+    "retain-session",
+    "supply-exact-integrated-revision",
+    "retry-close-with-bounded-integration-fetch",
+    "discard-session",
+    "reconcile-physical-state",
+  ];
+  assert.deepEqual(lifecycle?.park_resume_actions, {
+    schema_version: SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION,
+    action_ids: ["park-session", "resume-session"],
+    diagnostic_identity: "park_resume_actions",
+  });
+
+  const diagnostics = contract.capabilities.find(
+    (candidate) =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      !Array.isArray(candidate) &&
+      candidate.id === "session-diagnostics",
+  ) as JsonRecord | undefined;
+  assert.ok(diagnostics);
+  assert.ok((diagnostics?.identities as string[]).includes("park_resume_actions"));
+  const lifecycleProjection = diagnostics?.lifecycle as JsonRecord;
+  const recoveryActions = lifecycleProjection.recovery_actions as JsonRecord;
+  assert.equal(recoveryActions.schema_version, SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION);
+  assert.deepEqual(recoveryActions.action_ids, v1ActionIds);
+
+  const output: string[] = [];
+  const exitCode = await runCli(["capabilities", "--json"], {
+    version: "test-version",
+    io: { stdout: (line) => output.push(line), stderr: () => undefined },
+  });
+  assert.equal(exitCode, 0);
+  const publicContract = JSON.parse(output[0] ?? "") as JsonRecord;
+  assert.equal(publicContract.contract_id, MACHINE_CONTRACT_ID);
+  assert.equal(publicContract.schema_version, MACHINE_CONTRACT_SCHEMA_VERSION);
+  assert.deepEqual(publicContract.capabilities, contract.capabilities);
 });
 
 test("session lifecycle publishes the loopback-only control server contract", () => {

@@ -204,7 +204,7 @@ function evidenceBlock(markdown: string, heading: string): string {
 
 function readEvidenceDocument(): { readonly version: string; readonly help: string } {
   const document = fs.readFileSync(
-    new URL("../../docs/architecture/tgrep-runtime-materialization.md", import.meta.url),
+    new URL("../../docs/evidence/runtime/tgrep-materialization.md", import.meta.url),
     "utf8",
   );
   return {
@@ -212,6 +212,13 @@ function readEvidenceDocument(): { readonly version: string; readonly help: stri
     help: evidenceBlock(document, "Exact `--help` evidence"),
   };
 }
+
+test("checked-in pinned tgrep evidence source matches its exact observations", () => {
+  const evidence = readEvidenceDocument();
+  assert.equal(evidence.version, TGREP_BACKEND_EVIDENCE.version);
+  assert.equal(Buffer.byteLength(evidence.help, "utf8"), TGREP_BACKEND_EVIDENCE.help_bytes);
+  assert.equal(createHash("sha256").update(evidence.help, "utf8").digest("hex"), TGREP_BACKEND_EVIDENCE.help_sha256);
+});
 
 function runGit(arguments_: readonly string[], cwd: string): void {
   execFileSync("git", [...arguments_], {

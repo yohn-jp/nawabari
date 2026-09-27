@@ -6,9 +6,12 @@ import {
   FILESYSTEM_POLICY_CONTRACT_ID,
   FILESYSTEM_POLICY_EVIDENCE_CONTRACT_ID,
   FILESYSTEM_POLICY_SCHEMA_VERSION,
+  SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+  SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
   VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
   VerificationExecutionAuthority,
   projectFilesystemPolicyEvidence,
+  serializeSourceBoundVerificationExecutionEvidence,
   serializeFilesystemPolicyEvidence,
   serializeVerificationExecutionEvidence,
   validateFilesystemPolicy,
@@ -288,4 +291,73 @@ test("verification serialization validates the nested result and keeps its expli
   assert.equal(typeof parsed.verification, "object");
   assert.equal("result" in parsed, false);
   assert.equal("working_set" in parsed, false);
+});
+
+test("source-bound verification evidence serializes hashes only and does not upgrade v1", () => {
+  const sourceText = "verifier-visible-secret-source";
+  const verification = {
+    schema_version: 2,
+    contract_id: "nawabari.verification-result.v2",
+    status: "passed",
+    verification: {
+      schema_version: 1,
+      contract_id: "nawabari.verification-profile.v1",
+      profile_id: "policy-check",
+      profile_version: "1",
+      status: "passed",
+      exit_code: 0,
+      signal: null,
+      duration_ms: 1,
+      stdout: { chars: 0, lines: 1, bytes: 0, sha256: "0".repeat(64), text: "", truncated: false },
+      stderr: { chars: 0, lines: 1, bytes: 0, sha256: "0".repeat(64), text: "", truncated: false },
+      working_set_mutated: false,
+    },
+    source: {
+      status: "proven",
+      witness: {
+        contract_id: "nawabari.verification-source-witness.v1",
+        schema_version: 1,
+        identity_sha256: "1".repeat(64),
+        head_id: "a".repeat(40),
+        base_id: "b".repeat(40),
+        profile_sha256: "2".repeat(64),
+        policy_sha256: "3".repeat(64),
+        runtime_sha256: "4".repeat(64),
+        source_sha256: "5".repeat(64),
+        file_count: 2,
+        byte_count: Buffer.byteLength(sourceText),
+        source_contents: sourceText,
+      },
+    },
+  };
+  const serialized = serializeSourceBoundVerificationExecutionEvidence({
+    schema_version: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+    contract_id: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+    verification,
+  });
+  assert.equal(serialized.ok, true);
+  if (!serialized.ok) return;
+  assert.equal(serialized.value.includes(sourceText), false);
+  const parsed = JSON.parse(serialized.value) as Record<string, unknown>;
+  assert.equal(parsed.schema_version, 2);
+  assert.equal(parsed.contract_id, SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID);
+  assert.equal(typeof parsed.verification, "object");
+
+  const legacy = serializeSourceBoundVerificationExecutionEvidence({
+    schema_version: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+    contract_id: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+    verification: verification.verification,
+  });
+  assert.equal(legacy.ok, false);
+
+  const unresolvedPass = serializeSourceBoundVerificationExecutionEvidence({
+    schema_version: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+    contract_id: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+    verification: {
+      ...verification,
+      status: "passed",
+      source: { status: "unresolved", reason: "source-changed" },
+    },
+  });
+  assert.equal(unresolvedPass.ok, false);
 });

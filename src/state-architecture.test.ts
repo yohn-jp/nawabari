@@ -21,6 +21,9 @@ test("session state module exposes capability-oriented internal events", () => {
       "SESSION.DOCTOR.REQUESTED",
       "SESSION.RECONCILE.REQUESTED",
       "SESSION.GC.REQUESTED",
+      "SESSION.PARK.REQUESTED",
+      "SESSION.PARK.FINALIZE",
+      "SESSION.RESUME.REQUESTED",
       "SESSION.CLEANUP.RETRY",
       "SESSION.CLEANUP.FINALIZE",
       "SESSION.MARK_STALE",
@@ -44,6 +47,8 @@ test("session lifecycle operations map to capability events without CLI-shaped n
     doctor: "SESSION.DOCTOR.REQUESTED",
     reconcile: "SESSION.RECONCILE.REQUESTED",
     gc: "SESSION.GC.REQUESTED",
+    park: "SESSION.PARK.REQUESTED",
+    resume: "SESSION.RESUME.REQUESTED",
   });
 });
 

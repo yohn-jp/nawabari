@@ -135,7 +135,7 @@ test("explicit discard destroys only the selected recoverable session and is ide
     assert.equal(diagnostic.blockers[0]?.details.lineageProof, "unproven");
     assert.equal(diagnostic.blockers[0]?.details.contentProof, "not-attempted");
 
-    const result = registry.discard({ sessionId: discarded.sessionId });
+    const result = registry.discard(discarded.sessionId);
     assert.equal(result.operation, "discard");
     assert.equal(result.previousHead, previousHead);
     assert.equal(result.worktreeRemoved, true);

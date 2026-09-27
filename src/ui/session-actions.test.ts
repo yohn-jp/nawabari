@@ -11,7 +11,11 @@ import type {
   SessionLifecycleAction,
   SessionRecord,
 } from "../domain/session.js";
-import { createSessionActions, parseSessionDiscardPreview, type SessionActionIdentity } from "./session-actions.js";
+import {
+  createSessionActions,
+  parseSessionDiscardPreview,
+  type SessionActionIdentity,
+} from "../domain/session-actions.js";
 
 const context: SessionContext = { cwd: "/repo" };
 
@@ -60,6 +64,7 @@ function diagnosticFor(record: SessionRecord, nextActions: readonly SessionLifec
 function discardPreviewFor(record: SessionRecord): SessionDiscardPreview {
   return {
     schema_version: 1,
+    approval_witness: "a".repeat(64),
     operation: "discard-preview",
     destructive: true,
     warning: "discard is destructive",
@@ -275,11 +280,12 @@ test("a stale snapshot is denied before a close and never follows a reordered ro
   assert.deepEqual(calls.close, ["two"]);
 });
 
-test("discard requires explicit confirmation and repeated delivery does not duplicate mutation", async () => {
+test("discard requires confirmation and a completed result does not mask changed current state", async () => {
   const record = session("one");
+  const records = new Map([[record.session_id, record]]);
   const calls = { close: [], preview: [], discard: [], diagnostic: [] };
   const controller = createSessionActions(
-    backendFor(new Map([[record.session_id, record]]), new Map([[record.session_id, [discardAction]]]), calls),
+    backendFor(records, new Map([[record.session_id, [discardAction]]]), calls),
     context,
   );
   const snapshot = await controller.readSessionActionSnapshot(identity(record));
@@ -302,12 +308,14 @@ test("discard requires explicit confirmation and repeated delivery does not dupl
   assert.equal(confirmed.ok, true);
   assert.deepEqual(calls.discard, ["one"]);
 
+  records.set(record.session_id, { ...record, state: "closed", updated_at: "one-after-discard" });
   const repeated = await controller.dispatchSessionAction("discard-session", identity(record), snapshot.value.token, {
     confirmed: true,
     operation_id: "discard-one",
     preview: preview.value.preview,
   });
-  assert.equal(repeated.ok, true);
+  assert.equal(repeated.ok, false);
+  if (!repeated.ok) assert.equal(repeated.error.code, "STALE_SESSION");
   assert.deepEqual(calls.discard, ["one"]);
   assert.deepEqual(calls.preview, ["one", "one"]);
 });

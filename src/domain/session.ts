@@ -4,10 +4,12 @@ import type {
   SessionLifecycleState,
   SessionLifecycleTransition,
 } from "../session-lifecycle-classification.js";
+import type { SessionLifecycleParkResumeAction } from "../session-lifecycle-actions.js";
+import type { SessionRetentionOperationResult } from "../session-retention.js";
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
 import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
-import type { SessionActionDispatcher } from "../ui/session-actions.js";
+import type { SessionActionDispatcher } from "./session-actions.js";
 import type {
   CoordinationPreviewOptions as RegistryCoordinationPreviewOptions,
   CoordinationPreviewResult as RegistryCoordinationPreviewResult,
@@ -40,7 +42,7 @@ import type {
 
 export type { OperationName } from "../operation-authorization.js";
 
-export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
+export type SessionState = "new" | "active" | "closing" | "closed" | "stale" | "parked";
 
 export type SessionRecord = {
   schema_version: number;
@@ -411,12 +413,17 @@ export type SessionDiagnostic = {
   next_action?: SessionLifecycleAction;
   /** All bounded actions available for the observed lifecycle state. */
   next_actions?: SessionLifecycleAction[];
+  /** Separately versioned canonical park/resume actions. */
+  park_resume_actions?: SessionLifecycleParkResumeAction[];
   integration_evidence: SessionDiagnosticIntegrationEvidence;
   garbage_collection?: SessionDiagnosticGarbageCollection;
   /** Canonical read-only termination/recovery classification. */
   lifecycle_state?: SessionLifecycleState;
   lifecycle?: SessionLifecycleProjection;
 };
+
+/** Typed result returned by the canonical atomic park/resume retention service. */
+export type SessionParkResumeResult = SessionRetentionOperationResult;
 
 /** Status rows retain persisted identity while carrying derived lifecycle data. */
 export type SessionStatusRecord = SessionRecord & {
@@ -428,6 +435,7 @@ export type SessionStatusRecord = SessionRecord & {
   safe_actions?: string[];
   next_action?: SessionLifecycleAction;
   next_actions?: SessionLifecycleAction[];
+  park_resume_actions?: SessionLifecycleParkResumeAction[];
   lifecycle_state?: SessionLifecycleState;
   lifecycle?: SessionLifecycleProjection;
 };
@@ -882,6 +890,8 @@ export type SessionDiscardPreview = {
     blockers: SessionDiscardPreviewEvidence[];
     lifecycle_state?: string;
   };
+  /** Opaque registry witness for the exact bounded effect in this preview. */
+  approval_witness?: string;
 };
 
 export type GarbageCollectBlocked = {
@@ -958,7 +968,11 @@ export interface SessionBackend {
   listSessions(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<SessionListResult>>;
   status(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
-  discardSession?(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardResult>>;
+  discardSession?(
+    context: SessionContext,
+    sessionId: string,
+    approvalWitness: string,
+  ): Promise<DomainResult<SessionDiscardResult>>;
   discardPreview?(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardPreview>>;
   sessionDiagnostic?(
     context: SessionContext,
@@ -978,6 +992,16 @@ export interface SessionBackend {
   repositoryRuntimeSnapshot?(context: SessionContext): Promise<DomainResult<RepositoryRuntimeSnapshot>>;
   /** Typed lifecycle action adapter; command strings are never executed. */
   sessionActions?(context: SessionContext): SessionActionDispatcher;
+  parkSession?(
+    context: SessionContext,
+    sessionId: string,
+    operationId?: string,
+  ): Promise<DomainResult<SessionParkResumeResult>>;
+  resumeSession?(
+    context: SessionContext,
+    sessionId: string,
+    operationId?: string,
+  ): Promise<DomainResult<SessionParkResumeResult>>;
   coordinationPreview?(
     context: SessionContext,
     options: CoordinationPreviewOptions,

@@ -14,7 +14,11 @@ import {
   type RepositoryTerminalOutput,
 } from "./repository-terminal.js";
 import type { RepositoryScreenModel } from "./repository-screen.js";
-import type { SessionActionConfirmation, SessionActionDispatcher, SessionActionToken } from "./session-actions.js";
+import type {
+  SessionActionConfirmation,
+  SessionActionDispatcher,
+  SessionActionToken,
+} from "../domain/session-actions.js";
 
 class FakeInput extends EventEmitter {
   readonly isTTY: boolean;

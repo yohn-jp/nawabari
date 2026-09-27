@@ -30,7 +30,10 @@ const observation = Object.freeze({
   physicalState: "healthy",
 } as const);
 
-function input(state: SessionParkingOperationalState, current = observation): SessionParkingTransitionInput {
+function input(
+  state: SessionParkingOperationalState,
+  current: SessionParkingTransitionInput["observation"] = observation,
+): SessionParkingTransitionInput {
   return { state, observation: current };
 }
 
@@ -131,6 +134,24 @@ test("keeps parking transient and allows only observation/diagnostics during it"
     authority: "reconciliation",
     reason: "observe",
   });
+
+  const uncertainInput = input("parking", {
+    sessionState: "active",
+    physicalState: "unavailable",
+    terminalOperation: "discard",
+  });
+  for (const blockedEvent of [
+    { type: "SESSION.CLOSE.REQUESTED" },
+    { type: "SESSION.DISCARD.REQUESTED" },
+    { type: "SESSION.GC.REQUESTED" },
+  ] as const) {
+    const result = projectSessionParkingTransition(uncertainInput, blockedEvent);
+    assert.equal(result.ok, true);
+    if (!result.ok) continue;
+    assert.equal(result.value.allowed, false);
+    assert.equal(result.value.target, null);
+    assert.equal(result.value.reason, "parking-in-progress");
+  }
 });
 
 test("observation classifies parked only after stale, discarded, and closed precedence", () => {

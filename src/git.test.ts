@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { SessionRegistryError } from "./errors.js";
 import {
   canonicalizeGitObservedPaths,
+  captureGitSourceObservation,
   createGitCommandRunner,
   defaultGit,
   listGitWorktrees,
@@ -458,6 +459,51 @@ test("shares canonical checkpoint and mutation observations without dropping lit
     assert.throws(
       () => canonicalizeGitObservedPaths(["../escape.txt"], fixture.repositoryPath),
       (error: unknown) => error instanceof SessionRegistryError && error.code === "GIT_STATE_AMBIGUOUS",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("captures bounded verifier-visible staged, untracked, ignored, and same-path source bytes", () => {
+  const fixture = createRepositoryFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.repositoryPath, ".gitignore"), "ignored.txt\n");
+    runGit(["add", ".gitignore"], fixture.repositoryPath);
+    runGit(["commit", "-m", "ignore generated file"], fixture.repositoryPath);
+
+    const stagedPath = path.join(fixture.repositoryPath, "staged.txt");
+    fs.writeFileSync(stagedPath, "staged\n");
+    runGit(["add", "staged.txt"], fixture.repositoryPath);
+    fs.writeFileSync(stagedPath, "worktree\n");
+    fs.writeFileSync(path.join(fixture.repositoryPath, "untracked.txt"), "untracked\n");
+    fs.writeFileSync(path.join(fixture.repositoryPath, "ignored.txt"), "ignored\n");
+    const sourcePath = path.join(fixture.repositoryPath, "README.md");
+    const fixedSourceTime = new Date("2020-01-01T00:00:00.000Z");
+    fs.utimesSync(sourcePath, fixedSourceTime, fixedSourceTime);
+
+    const initial = captureGitSourceObservation({ cwd: fixture.repositoryPath, read_selectors: ["**"] });
+    assert.match(initial.source_sha256, /^[0-9a-f]{64}$/u);
+    assert.ok(initial.file_count > 0);
+    assert.ok(initial.byte_count > 0);
+
+    fs.writeFileSync(sourcePath, "changed\n");
+    fs.utimesSync(sourcePath, fixedSourceTime, fixedSourceTime);
+    const samePathEdit = captureGitSourceObservation({ cwd: fixture.repositoryPath, read_selectors: ["**"] });
+    assert.notEqual(samePathEdit.source_sha256, initial.source_sha256);
+
+    fs.writeFileSync(path.join(fixture.repositoryPath, "ignored.txt"), "changed\n");
+    const ignoredEdit = captureGitSourceObservation({ cwd: fixture.repositoryPath, read_selectors: ["**"] });
+    assert.notEqual(ignoredEdit.source_sha256, samePathEdit.source_sha256);
+
+    assert.throws(
+      () =>
+        captureGitSourceObservation({
+          cwd: fixture.repositoryPath,
+          read_selectors: ["**"],
+          limits: { max_file_bytes: 2 },
+        }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "GIT_OUTPUT_LIMIT",
     );
   } finally {
     fixture.cleanup();

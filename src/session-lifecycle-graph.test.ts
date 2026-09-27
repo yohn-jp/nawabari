@@ -4,13 +4,13 @@ import { createTestModel, getShortestPaths, toDirectedGraph, type AdjacencyMap }
 
 import {
   classifySessionLifecycle,
-  lifecycleTransition,
   SESSION_LIFECYCLE_STATES,
   SESSION_LIFECYCLE_TRANSITION_TABLE,
   type SessionLifecycleOperation,
   type SessionLifecycleObservation,
   type SessionLifecycleState,
   type SessionLifecycleTransition,
+  type SessionLifecycleTransitionProjection,
 } from "./session-lifecycle-classification.js";
 import { SESSION_OPERATION_EVENT_TYPES, sessionLifecycleMachine } from "./state/session/machine.js";
 import type { SessionMachineEvent, SessionMachineInput } from "./state/session/types.js";
@@ -22,6 +22,9 @@ const GRAPH_OPERATION_EVENT_TYPES = new Set([
   "SESSION.DOCTOR.REQUESTED",
   "SESSION.RECONCILE.REQUESTED",
   "SESSION.GC.REQUESTED",
+  "SESSION.PARK.REQUESTED",
+  "SESSION.PARK.FINALIZE",
+  "SESSION.RESUME.REQUESTED",
 ]);
 
 const GRAPH_OBSERVATIONS: readonly SessionLifecycleObservation[] = Object.freeze([
@@ -93,6 +96,33 @@ const GRAPH_OBSERVATIONS: readonly SessionLifecycleObservation[] = Object.freeze
     ageSuspicious: false,
     gcAuthorized: false,
   },
+  {
+    sessionState: "parked",
+    physicalState: "healthy",
+    closeReadiness: "not-evaluated",
+    blockers: [],
+    phase: "current",
+    ageSuspicious: false,
+    gcAuthorized: false,
+  },
+  {
+    sessionState: "parked",
+    physicalState: "healthy",
+    closeReadiness: "external_evidence_required",
+    blockers: [{ code: "RECOVERABLE_COMMITS" }],
+    phase: "termination",
+    ageSuspicious: false,
+    gcAuthorized: false,
+  },
+  {
+    sessionState: "parked",
+    physicalState: "healthy",
+    closeReadiness: "ready",
+    blockers: [],
+    phase: "termination",
+    ageSuspicious: false,
+    gcAuthorized: true,
+  },
 ]);
 
 const GRAPH_INPUT: SessionMachineInput = {
@@ -102,20 +132,38 @@ const GRAPH_INPUT: SessionMachineInput = {
 
 type GraphSnapshot = ReturnType<typeof sessionLifecycleMachine.getInitialSnapshot>;
 
-function graphEvents(_snapshot: GraphSnapshot): readonly SessionMachineEvent[] {
+function graphEvents(snapshot: GraphSnapshot): readonly SessionMachineEvent[] {
+  const parkedSource = snapshot.value === "parked";
+  const parkingSource = snapshot.value === "parking";
+  const isInitialActiveSnapshot =
+    snapshot.value === "active" &&
+    JSON.stringify(snapshot.context.observation) === JSON.stringify(GRAPH_OBSERVATIONS[0]);
+  const observations = parkedSource
+    ? GRAPH_OBSERVATIONS.filter((observation) => observation.sessionState === "parked")
+    : isInitialActiveSnapshot
+      ? GRAPH_OBSERVATIONS.filter((observation) => observation.sessionState !== "parked")
+      : [snapshot.context.observation];
   return [
-    ...GRAPH_OBSERVATIONS.map((observation) => ({ type: "SESSION.OBSERVE", observation }) as const),
+    ...observations.map((observation) => ({ type: "SESSION.OBSERVE", observation }) as const),
     { type: "SESSION.CLOSE.REQUESTED" },
     { type: "SESSION.DISCARD.REQUESTED" },
     { type: "SESSION.DOCTOR.REQUESTED" },
     { type: "SESSION.RECONCILE.REQUESTED" },
     { type: "SESSION.GC.REQUESTED" },
+    { type: "SESSION.PARK.REQUESTED" },
+    ...(parkingSource ? [{ type: "SESSION.PARK.FINALIZE", status: "parked", operationId: "graph-park" } as const] : []),
+    {
+      type: "SESSION.RESUME.REQUESTED",
+      status: "resumed",
+      operationId: parkedSource ? "graph-resume" : "graph-invalid-state",
+    },
+    ...(parkedSource ? [{ type: "SESSION.RESUME.REQUESTED", status: "resumed", operationId: "   " } as const] : []),
   ];
 }
 
-function graphOptions() {
+function graphOptions(input: SessionMachineInput = GRAPH_INPUT) {
   return {
-    input: GRAPH_INPUT,
+    input,
     events: graphEvents,
     filterEvents: (_snapshot: GraphSnapshot, event: SessionMachineEvent) => GRAPH_OPERATION_EVENT_TYPES.has(event.type),
     limit: 2_000,
@@ -152,7 +200,31 @@ type ObservedTransition = {
   readonly requiresExplicitIntent: boolean;
 };
 
-function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<GraphSnapshot, SessionMachineEvent>): void {
+function expectedTransition(
+  state: SessionLifecycleState,
+  operation: SessionLifecycleOperation,
+  accepted: boolean,
+): SessionLifecycleTransition {
+  const projection = SESSION_LIFECYCLE_TRANSITION_TABLE[state].find(
+    (transition) => transition.operation === operation,
+  )!;
+  if (projection.guarded) {
+    const branch = accepted ? projection.whenGuardAccepts : projection.whenGuardRejects;
+    return {
+      operation,
+      allowed: branch.allowed,
+      target: branch.target,
+      requiresExplicitIntent: projection.requiresExplicitIntent,
+      authority: projection.authority,
+      reason: branch.reason,
+    };
+  }
+  return projection;
+}
+
+function assertReachableStateAndTransitionCoverage(
+  ...adjacencies: readonly AdjacencyMap<GraphSnapshot, SessionMachineEvent>[]
+): void {
   const reachableStates = new Set<string>();
   const observed = new Map<string, ObservedTransition>();
   const directed = toDirectedGraph(sessionLifecycleMachine);
@@ -161,7 +233,7 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
   for (const state of SESSION_LIFECYCLE_STATES) {
     const node = directedNodes.get(`${sessionLifecycleMachine.id}.${state}`);
     if (node === undefined) throw new Error(`graph is missing operational node: ${state}`);
-    for (const operation of ["close", "discard", "inspect", "doctor", "reconcile", "gc"] as const) {
+    for (const operation of ["close", "discard", "inspect", "doctor", "reconcile", "gc", "park", "resume"] as const) {
       const eventType = SESSION_OPERATION_EVENT_TYPES[operation];
       assert.equal(
         node.edges.some((edge) => edge.label.text === eventType),
@@ -171,7 +243,7 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
     }
   }
 
-  for (const adjacencyValue of Object.values(adjacency)) {
+  for (const adjacencyValue of adjacencies.flatMap((adjacency) => Object.values(adjacency))) {
     const source = adjacencyValue.state;
     const sourceState = publicState(source.value);
     const observedState = classifySessionLifecycle(source.context.observation).state;
@@ -180,6 +252,10 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
     // new authoritative observation is supplied. Do not use such a
     // state/context-drift snapshot as a semantic fixture; canonical observe
     // paths below provide the same state with matching authoritative facts.
+    // Parking is the one intentional transient state: the accepted request
+    // precedes authority finalization, so its context still describes the
+    // prior active observation. Its protocol-only gates are covered directly
+    // by the machine and v1 facade tests.
     if (observedState !== sourceState) continue;
     const transitions = Object.values(adjacencyValue.transitions) as readonly {
       readonly event: SessionMachineEvent;
@@ -188,8 +264,8 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
     for (const transition of transitions) {
       const operation = operationForEvent(source, transition.event);
       if (operation === undefined) continue;
-      const expected = lifecycleTransition(classifySessionLifecycle(source.context.observation), operation);
       const accepted = source.can(transition.event);
+      const expected = expectedTransition(sourceState, operation, accepted);
       const target = publicState(transition.state.value);
       assert.equal(accepted, expected.allowed, `${sourceState}.${operation} accepted mismatch`);
       if (expected.allowed) {
@@ -213,11 +289,12 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
 
   assert.deepEqual([...reachableStates].sort(), [...SESSION_LIFECYCLE_STATES].sort());
   for (const state of SESSION_LIFECYCLE_STATES) {
+    if (state === "parking") continue;
     const stateNode = sessionLifecycleMachine.getStateNodeById(`${sessionLifecycleMachine.id}.${state}`);
-    for (const operation of ["close", "discard", "inspect", "doctor", "reconcile", "gc"] as const) {
+    for (const operation of ["close", "discard", "inspect", "doctor", "reconcile", "gc", "park", "resume"] as const) {
       const eventType = SESSION_OPERATION_EVENT_TYPES[operation];
       assert.equal((stateNode.transitions.get(eventType) ?? []).length > 0, true, `${state}.${operation} is unmodeled`);
-      const expected = SESSION_LIFECYCLE_TRANSITION_TABLE[state].find(
+      const expected: SessionLifecycleTransitionProjection = SESSION_LIFECYCLE_TRANSITION_TABLE[state].find(
         (transition) => transition.operation === operation,
       )!;
       if (expected.guarded) {
@@ -228,8 +305,8 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
         // branch must carry the full public transition metadata the static
         // projection promises for it — allowed, target, reason, authority,
         // and requiresExplicitIntent (#266).
-        const acceptedKey = `${state}.${operation}.accepted`;
-        const forbiddenKey = `${state}.${operation}.forbidden`;
+        const acceptedKey: string = `${state}.${operation}.accepted`;
+        const forbiddenKey: string = `${state}.${operation}.forbidden`;
         assert.equal(observed.has(acceptedKey), true, `graph did not cover ${acceptedKey}`);
         assert.equal(observed.has(forbiddenKey), true, `graph did not cover ${forbiddenKey}`);
 
@@ -266,7 +343,7 @@ function assertReachableStateAndTransitionCoverage(adjacency: AdjacencyMap<Graph
         continue;
       }
       const expectedKind = expected.allowed ? "accepted" : "forbidden";
-      const key = `${state}.${operation}.${expectedKind}`;
+      const key: string = `${state}.${operation}.${expectedKind}`;
       assert.equal(observed.has(key), true, `graph did not cover ${key}`);
       const coverage = observed.get(key)!;
       assert.equal(coverage.accepted, expected.allowed, `${key} availability drift`);
@@ -318,5 +395,10 @@ test("XState graph traversal reaches exactly the public operational states", () 
 
 test("graph adjacency covers accepted and forbidden lifecycle transitions", () => {
   const model = createTestModel(sessionLifecycleMachine, graphOptions());
-  assertReachableStateAndTransitionCoverage(model.getAdjacencyMap());
+  const contradictoryPersistedInput: SessionMachineInput = {
+    persisted: { sessionId: "session-graph-test", state: "closed" },
+    observation: GRAPH_OBSERVATIONS[0]!,
+  };
+  const contradictoryModel = createTestModel(sessionLifecycleMachine, graphOptions(contradictoryPersistedInput));
+  assertReachableStateAndTransitionCoverage(model.getAdjacencyMap(), contradictoryModel.getAdjacencyMap());
 });

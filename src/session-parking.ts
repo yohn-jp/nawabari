@@ -1,265 +1,45 @@
 import { DomainError, failure, success, type DomainResult } from "./domain/errors.js";
-import {
-  classifySessionLifecycle,
-  lifecycleTransition,
-  type SessionLifecycleObservation,
-  type SessionLifecycleOperation,
-  type SessionLifecycleState,
-  type SessionLifecycleTransition,
+import { projectSessionLifecycleEvent, projectSessionParkingTransitionTable } from "./state/session/machine.js";
+import type { SessionMachineEvent } from "./state/session/types.js";
+import type {
+  SessionParkingEvent,
+  SessionParkingOperationalState,
+  SessionParkingTransitionRow,
+} from "./state/session/types.js";
+import type {
+  SessionLifecycleObservation,
+  SessionLifecycleState,
+  SessionLifecycleTransition,
 } from "./session-lifecycle-classification.js";
+
+export type {
+  SessionParkingEvent,
+  SessionParkingOperationalState,
+  SessionParkingTransitionRow,
+} from "./state/session/types.js";
 
 export const SESSION_PARKING_CONTRACT_ID = "nawabari.session-parking.v1" as const;
 export const SESSION_PARKING_SCHEMA_VERSION = 1 as const;
 
 export type SessionParkingPersistedState = "active" | "parked";
-export type SessionParkingOperationalState = "active" | "parking" | "parked";
-
-export type SessionParkingEvent =
-  | { readonly type: "SESSION.PARK.REQUESTED" }
-  | { readonly type: "SESSION.PARK.FINALIZE"; readonly status: "parked"; readonly operationId: string }
-  | { readonly type: "SESSION.RESUME.REQUESTED"; readonly status: "resumed"; readonly operationId: string }
-  | { readonly type: "SESSION.OBSERVE"; readonly observation: SessionLifecycleObservation }
-  | { readonly type: "SESSION.CLOSE.REQUESTED" }
-  | { readonly type: "SESSION.DISCARD.REQUESTED" }
-  | { readonly type: "SESSION.DOCTOR.REQUESTED" }
-  | { readonly type: "SESSION.RECONCILE.REQUESTED" }
-  | { readonly type: "SESSION.GC.REQUESTED" };
+export type SessionParkingProjectedState = SessionLifecycleState;
 
 export type SessionParkingTransitionInput = Readonly<{
   state: SessionParkingOperationalState;
   observation: SessionLifecycleObservation;
 }>;
 
-export type SessionParkingProjectedState = SessionLifecycleState | "parking" | "parked";
-
 export type SessionParkingTransition = Readonly<{
   allowed: boolean;
   target: SessionParkingProjectedState | null;
   requiresExplicitIntent: boolean;
-  authority: "caller" | "session-registry" | "reconciliation" | "gc";
-  reason:
-    | SessionLifecycleTransition["reason"]
-    | "park-requested"
-    | "parked"
-    | "resume-authorized"
-    | "parking-in-progress"
-    | "session-not-parked";
+  authority: SessionLifecycleTransition["authority"];
+  reason: SessionLifecycleTransition["reason"];
 }>;
 
-export type SessionParkingTransitionRow = Readonly<{
-  source: SessionParkingOperationalState;
-  event: SessionParkingEvent["type"];
-  guarded: boolean;
-  allowed: boolean | null;
-  target: SessionParkingProjectedState | null;
-  requiresExplicitIntent: boolean;
-  authority: SessionParkingTransition["authority"];
-  reason: SessionParkingTransition["reason"];
-}>;
-
-const OBSERVE_ROW = {
-  guarded: true,
-  allowed: null,
-  target: null,
-  requiresExplicitIntent: false,
-  authority: "session-registry",
-  reason: "observe",
-} as const;
-
-const LIFECYCLE_GUARDS = {
-  close: {
-    guarded: true,
-    allowed: null,
-    target: null,
-    requiresExplicitIntent: false,
-    authority: "session-registry",
-    reason: "close-proof-required",
-  },
-  discard: {
-    guarded: true,
-    allowed: null,
-    target: null,
-    requiresExplicitIntent: true,
-    authority: "caller",
-    reason: "explicit-discard-required",
-  },
-  gc: {
-    guarded: true,
-    allowed: null,
-    target: null,
-    requiresExplicitIntent: false,
-    authority: "gc",
-    reason: "age-is-not-destructive-authority",
-  },
-} as const satisfies Record<"close" | "discard" | "gc", Omit<SessionParkingTransitionRow, "source" | "event">>;
-
-function row(
-  source: SessionParkingOperationalState,
-  event: SessionParkingEvent["type"],
-  values: Omit<SessionParkingTransitionRow, "source" | "event">,
-): SessionParkingTransitionRow {
-  return Object.freeze({ source, event, ...values });
-}
-
-const staticRows: readonly SessionParkingTransitionRow[] = [
-  row("active", "SESSION.PARK.REQUESTED", {
-    guarded: false,
-    allowed: true,
-    target: "parking",
-    requiresExplicitIntent: true,
-    authority: "caller",
-    reason: "park-requested",
-  }),
-  row("active", "SESSION.PARK.FINALIZE", {
-    guarded: false,
-    allowed: false,
-    target: null,
-    requiresExplicitIntent: false,
-    authority: "session-registry",
-    reason: "park-requested",
-  }),
-  row("active", "SESSION.RESUME.REQUESTED", {
-    guarded: false,
-    allowed: false,
-    target: null,
-    requiresExplicitIntent: true,
-    authority: "caller",
-    reason: "session-not-parked",
-  }),
-  row("active", "SESSION.OBSERVE", OBSERVE_ROW),
-  row("active", "SESSION.CLOSE.REQUESTED", LIFECYCLE_GUARDS.close),
-  row("active", "SESSION.DISCARD.REQUESTED", LIFECYCLE_GUARDS.discard),
-  row("active", "SESSION.DOCTOR.REQUESTED", {
-    guarded: false,
-    allowed: true,
-    target: "active",
-    requiresExplicitIntent: false,
-    authority: "reconciliation",
-    reason: "observe",
-  }),
-  row("active", "SESSION.RECONCILE.REQUESTED", {
-    guarded: false,
-    allowed: true,
-    target: "active",
-    requiresExplicitIntent: false,
-    authority: "reconciliation",
-    reason: "observe",
-  }),
-  row("active", "SESSION.GC.REQUESTED", LIFECYCLE_GUARDS.gc),
-
-  row("parking", "SESSION.PARK.REQUESTED", {
-    guarded: false,
-    allowed: false,
-    target: null,
-    requiresExplicitIntent: true,
-    authority: "caller",
-    reason: "parking-in-progress",
-  }),
-  row("parking", "SESSION.PARK.FINALIZE", {
-    guarded: false,
-    allowed: true,
-    target: "parked",
-    requiresExplicitIntent: false,
-    authority: "session-registry",
-    reason: "parked",
-  }),
-  row("parking", "SESSION.RESUME.REQUESTED", {
-    guarded: false,
-    allowed: false,
-    target: null,
-    requiresExplicitIntent: true,
-    authority: "caller",
-    reason: "parking-in-progress",
-  }),
-  row("parking", "SESSION.OBSERVE", OBSERVE_ROW),
-  row("parking", "SESSION.CLOSE.REQUESTED", {
-    guarded: false,
-    allowed: false,
-    target: null,
-    requiresExplicitIntent: true,
-    authority: "caller",
-    reason: "parking-in-progress",
-  }),
-  row("parking", "SESSION.DISCARD.REQUESTED", {
-    guarded: false,
-    allowed: false,
-    target: null,
-    requiresExplicitIntent: true,
-    authority: "caller",
-    reason: "parking-in-progress",
-  }),
-  row("parking", "SESSION.DOCTOR.REQUESTED", {
-    guarded: false,
-    allowed: true,
-    target: "parking",
-    requiresExplicitIntent: false,
-    authority: "reconciliation",
-    reason: "observe",
-  }),
-  row("parking", "SESSION.RECONCILE.REQUESTED", {
-    guarded: false,
-    allowed: true,
-    target: "parking",
-    requiresExplicitIntent: false,
-    authority: "reconciliation",
-    reason: "observe",
-  }),
-  row("parking", "SESSION.GC.REQUESTED", {
-    guarded: false,
-    allowed: false,
-    target: null,
-    requiresExplicitIntent: false,
-    authority: "gc",
-    reason: "parking-in-progress",
-  }),
-
-  row("parked", "SESSION.PARK.REQUESTED", {
-    guarded: false,
-    allowed: true,
-    target: "parked",
-    requiresExplicitIntent: true,
-    authority: "session-registry",
-    reason: "parked",
-  }),
-  row("parked", "SESSION.PARK.FINALIZE", {
-    guarded: false,
-    allowed: false,
-    target: null,
-    requiresExplicitIntent: false,
-    authority: "session-registry",
-    reason: "parked",
-  }),
-  row("parked", "SESSION.RESUME.REQUESTED", {
-    guarded: false,
-    allowed: true,
-    target: "active",
-    requiresExplicitIntent: true,
-    authority: "caller",
-    reason: "resume-authorized",
-  }),
-  row("parked", "SESSION.OBSERVE", OBSERVE_ROW),
-  row("parked", "SESSION.CLOSE.REQUESTED", LIFECYCLE_GUARDS.close),
-  row("parked", "SESSION.DISCARD.REQUESTED", LIFECYCLE_GUARDS.discard),
-  row("parked", "SESSION.DOCTOR.REQUESTED", {
-    guarded: false,
-    allowed: true,
-    target: "parked",
-    requiresExplicitIntent: false,
-    authority: "reconciliation",
-    reason: "observe",
-  }),
-  row("parked", "SESSION.RECONCILE.REQUESTED", {
-    guarded: false,
-    allowed: true,
-    target: "parked",
-    requiresExplicitIntent: false,
-    authority: "reconciliation",
-    reason: "observe",
-  }),
-  row("parked", "SESSION.GC.REQUESTED", LIFECYCLE_GUARDS.gc),
-];
-
-export const SESSION_PARKING_TRANSITION_TABLE: readonly SessionParkingTransitionRow[] = Object.freeze(staticRows);
+/** Frozen v1 compatibility projection, generated from the canonical XState machine. */
+export const SESSION_PARKING_TRANSITION_TABLE: readonly SessionParkingTransitionRow[] =
+  projectSessionParkingTransitionTable();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -316,9 +96,9 @@ function validEvent(value: unknown): value is SessionParkingEvent {
     case "SESSION.GC.REQUESTED":
       return true;
     case "SESSION.PARK.FINALIZE":
-      return value.status === "parked" && typeof value.operationId === "string" && value.operationId.length > 0;
+      return value.status === "parked" && typeof value.operationId === "string" && value.operationId.trim().length > 0;
     case "SESSION.RESUME.REQUESTED":
-      return value.status === "resumed" && typeof value.operationId === "string" && value.operationId.length > 0;
+      return value.status === "resumed" && typeof value.operationId === "string" && value.operationId.trim().length > 0;
     case "SESSION.OBSERVE":
       return validObservation(value.observation);
     default:
@@ -326,77 +106,40 @@ function validEvent(value: unknown): value is SessionParkingEvent {
   }
 }
 
-function staticTransition(rowValue: SessionParkingTransitionRow): SessionParkingTransition {
-  if (rowValue.allowed === null || rowValue.target === null) {
-    return Object.freeze({
-      allowed: rowValue.allowed ?? false,
-      target: rowValue.target,
-      requiresExplicitIntent: rowValue.requiresExplicitIntent,
-      authority: rowValue.authority,
-      reason: rowValue.reason,
-    });
-  }
-  return Object.freeze({
-    allowed: rowValue.allowed,
-    target: rowValue.target,
-    requiresExplicitIntent: rowValue.requiresExplicitIntent,
-    authority: rowValue.authority,
-    reason: rowValue.reason,
-  });
-}
-
-function observationTarget(observation: SessionLifecycleObservation): SessionParkingProjectedState {
-  const classification = classifySessionLifecycle(
-    observation.sessionState === "parked" ? { ...observation, sessionState: "active" } : observation,
-  );
-  if (
-    observation.sessionState === "parked" &&
-    classification.state !== "stale-inconsistent" &&
-    classification.state !== "discarded" &&
-    classification.state !== "closed"
-  ) {
-    return "parked";
-  }
-  return classification.state;
-}
-
-function lifecycleOperation(eventType: SessionParkingEvent["type"]): SessionLifecycleOperation | undefined {
-  switch (eventType) {
-    case "SESSION.CLOSE.REQUESTED":
-      return "close";
-    case "SESSION.DISCARD.REQUESTED":
-      return "discard";
-    case "SESSION.GC.REQUESTED":
-      return "gc";
-    default:
-      return undefined;
-  }
-}
-
-function delegatedTransition(
+function machineInput(
   input: SessionParkingTransitionInput,
   event: SessionParkingEvent,
-): SessionParkingTransition {
-  const operation = lifecycleOperation(event.type);
-  if (operation === undefined) {
-    throw new Error(`Unsupported delegated parking event: ${event.type}`);
+): {
+  readonly observation: SessionLifecycleObservation;
+  readonly initialOperationalState?: SessionParkingOperationalState;
+} {
+  if (event.type === "SESSION.OBSERVE") {
+    return { observation: event.observation };
   }
-  const observation =
-    input.state === "parked" && input.observation.sessionState === "parked"
-      ? { ...input.observation, sessionState: "active" }
-      : input.observation;
-  const transition = lifecycleTransition(classifySessionLifecycle(observation), operation);
-  const target =
-    input.state === "parked" && !transition.allowed && transition.target === "active" ? "parked" : transition.target;
-  return Object.freeze({
-    allowed: transition.allowed,
-    target,
-    requiresExplicitIntent: transition.requiresExplicitIntent,
-    authority: transition.authority,
-    reason: transition.reason,
-  });
+  if (input.state === "parking") {
+    return { observation: input.observation, initialOperationalState: "parking" };
+  }
+  if (
+    input.state === "parked" &&
+    (event.type === "SESSION.PARK.REQUESTED" ||
+      event.type === "SESSION.RESUME.REQUESTED" ||
+      event.type === "SESSION.PARK.FINALIZE" ||
+      event.type === "SESSION.DOCTOR.REQUESTED" ||
+      event.type === "SESSION.RECONCILE.REQUESTED")
+  ) {
+    return { observation: { ...input.observation, sessionState: "parked" } };
+  }
+  if (input.state === "active" && event.type === "SESSION.PARK.REQUESTED") {
+    return { observation: { ...input.observation, sessionState: "active" } };
+  }
+  return { observation: input.observation };
 }
 
+/**
+ * Project one legacy v1 request by executing the canonical lifecycle machine.
+ * The supplied operational state only seeds the transient compatibility path;
+ * all admissibility and result metadata come from the XState definition.
+ */
 export function projectSessionParkingTransition(
   input: SessionParkingTransitionInput,
   event: SessionParkingEvent,
@@ -407,32 +150,21 @@ export function projectSessionParkingTransition(
   if (!validEvent(event)) return invalid("Session parking event is invalid");
 
   try {
-    if (event.type === "SESSION.OBSERVE") {
-      return success(
-        Object.freeze({
-          allowed: true,
-          target: observationTarget(event.observation),
-          requiresExplicitIntent: false,
-          authority: "session-registry",
-          reason: "observe",
-        }),
-      );
-    }
-
-    if (
-      (input.state === "active" || input.state === "parked") &&
-      (event.type === "SESSION.CLOSE.REQUESTED" ||
-        event.type === "SESSION.DISCARD.REQUESTED" ||
-        event.type === "SESSION.GC.REQUESTED")
-    ) {
-      return success(delegatedTransition(input, event));
-    }
-
-    const rowValue = SESSION_PARKING_TRANSITION_TABLE.find(
-      (candidate) => candidate.source === input.state && candidate.event === event.type,
+    const projectionInput = machineInput(input, event);
+    const projection = projectSessionLifecycleEvent(
+      { observation: projectionInput.observation },
+      event as SessionMachineEvent,
+      projectionInput.initialOperationalState,
     );
-    if (rowValue === undefined) return invalid("Session parking transition is not defined");
-    return success(staticTransition(rowValue));
+    return success(
+      Object.freeze({
+        allowed: projection.allowed,
+        target: projection.target,
+        requiresExplicitIntent: projection.requiresExplicitIntent,
+        authority: projection.authority,
+        reason: projection.reason,
+      }),
+    );
   } catch {
     return invalid("Session parking observation is invalid");
   }

@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
 import { SessionRegistryError } from "./errors.js";
+import { resolveWorkingSetPathsWithEvidence } from "./domain/filesystem-policy-materialization.js";
 import { CHECKPOINT_MAX_PATHS, type GitCheckpointPaths } from "./operation-authorization.js";
 import { canonicalizeConcretePath } from "./resource-claims.js";
 
@@ -13,6 +15,11 @@ export const DIFF_EVIDENCE_SCHEMA_VERSION = 1 as const;
 export const EVIDENCE_MAX_DIFF_PATHS = 64 as const;
 export const EVIDENCE_MAX_DIFF_BYTES = GIT_COMMAND_MAX_OUTPUT_BYTES;
 export const EVIDENCE_MAX_DIFF_HUNKS = 128 as const;
+export const GIT_SOURCE_MAX_PATHS = 4_096 as const;
+export const GIT_SOURCE_MAX_DEPTH = 64 as const;
+export const GIT_SOURCE_MAX_FILE_BYTES = 16 * 1_024 * 1_024;
+export const GIT_SOURCE_MAX_TOTAL_BYTES = 64 * 1_024 * 1_024;
+export const GIT_SOURCE_MAX_METADATA_BYTES = 8 * 1_024 * 1_024;
 const MAX_ERROR_DETAIL_LENGTH = 4_096;
 
 /**
@@ -175,6 +182,33 @@ export interface PhysicalExecutionContext {
   readonly worktree: GitWorktreeInfo;
   readonly worktrees: readonly GitWorktreeInfo[];
 }
+
+export type GitSourceObservationLimits = Readonly<{
+  readonly max_paths?: number;
+  readonly max_depth?: number;
+  readonly max_file_bytes?: number;
+  readonly max_total_bytes?: number;
+}>;
+
+export type GitSourceObservation = Readonly<{
+  /** Physical repository identity; callers must hash this before transport. */
+  readonly repository_id: string;
+  /** Physical worktree identity; callers must hash this before transport. */
+  readonly worktree_id: string;
+  readonly branch_id: string;
+  readonly head_id: string;
+  /** SHA-256 over every resolved file/directory plus Git index/ref/config state. */
+  readonly source_sha256: string;
+  readonly file_count: number;
+  readonly byte_count: number;
+}>;
+
+type SourceFileDigest = Readonly<{
+  readonly sha256: string;
+  readonly bytes: number;
+  readonly mode: number;
+  readonly version: string;
+}>;
 
 export function createGitCommandRunner(options: GitCommandRunnerOptions = {}): GitCommandRunner {
   const executable = options.executable ?? "git";
@@ -1113,6 +1147,445 @@ export function readCurrentHead(git: GitCommandRunner, cwd: string): string {
       error,
     );
   }
+}
+
+/**
+ * Capture the exact bounded file set the verifier's working-set selectors can
+ * read, together with the index/ref state projected into its private Git
+ * metadata. Git status is deliberately not used as content evidence: ignored,
+ * untracked, and same-path byte changes must be covered too.
+ */
+export function captureGitSourceObservation(options: {
+  readonly cwd: string;
+  readonly read_selectors: readonly string[];
+  readonly git?: GitCommandRunner;
+  readonly limits?: GitSourceObservationLimits;
+}): GitSourceObservation {
+  const limits = gitSourceLimits(options.limits);
+  const git = options.git ?? createGitCommandRunner({ maxOutputBytes: GIT_SOURCE_MAX_METADATA_BYTES });
+  const initial = verifyPhysicalExecutionContext({ cwd: options.cwd, worktreePath: options.cwd, git });
+  const normalizedWorktree = path.resolve(options.cwd);
+  if (initial.worktreePath !== normalizedWorktree) {
+    throw new SessionRegistryError("WORKTREE_MISMATCH", "Git source observation resolved a different worktree", {
+      expectedWorktree: normalizedWorktree,
+      actualWorktree: initial.worktreePath,
+    });
+  }
+
+  const resolution = resolveWorkingSetPathsWithEvidence(initial.worktreePath, options.read_selectors, {
+    maxSelectors: 2_048,
+    maxPaths: limits.max_paths,
+    maxDepth: limits.max_depth,
+    maxDiagnostics: 256,
+  });
+  if (!resolution.complete) {
+    const code = resolution.truncated ? "GIT_OUTPUT_LIMIT" : "PHYSICAL_OBSERVATION_UNAVAILABLE";
+    throw new SessionRegistryError(code, "The verifier-visible source set could not be fully resolved", {
+      truncated: resolution.truncated,
+      unsupported: resolution.unsupported.length,
+      unreadable: resolution.unreadable.length,
+      maxPaths: limits.max_paths,
+      maxDepth: limits.max_depth,
+    });
+  }
+
+  const control = captureGitSourceControl(
+    git,
+    initial.worktreePath,
+    initial.commonGitDirectory,
+    limits.max_total_bytes,
+  );
+  let byteCount = control.byte_count;
+  let fileCount = 0;
+  const sourceHash = createHash("sha256");
+  sourceHash.update("nawabari.git-source-observation.v1\0", "utf8");
+  sourceHash.update(control.sha256, "ascii");
+  sourceHash.update("\0", "ascii");
+  sourceHash.update(JSON.stringify(resolution.selectors), "utf8");
+  sourceHash.update("\0", "ascii");
+  sourceHash.update(JSON.stringify(resolution.missingExact), "utf8");
+  sourceHash.update("\0", "ascii");
+
+  const observedVersions = new Map<string, string>();
+  for (const entry of resolution.resolved) {
+    if (entry.relativePath.includes("\u0000") || entry.relativePath.includes("\uFFFD")) {
+      throw new SessionRegistryError(
+        "PHYSICAL_OBSERVATION_UNAVAILABLE",
+        "A source path is not losslessly representable",
+        {
+          worktree: initial.worktreePath,
+        },
+      );
+    }
+    let digest: SourceFileDigest;
+    if (entry.kind === "directory") {
+      digest = observeSourceDirectory(entry.absolutePath, entry.identity);
+    } else {
+      digest = observeSourceFile(entry.absolutePath, entry.identity, entry.parent.identity, {
+        maxFileBytes: limits.max_file_bytes,
+        remainingBytes: limits.max_total_bytes - byteCount,
+      });
+      fileCount += 1;
+      byteCount += digest.bytes;
+    }
+    observedVersions.set(entry.absolutePath, digest.version);
+    sourceHash.update(
+      JSON.stringify([entry.relativePath, entry.kind, digest.mode, digest.bytes, digest.sha256, digest.version]),
+      "utf8",
+    );
+    sourceHash.update("\0", "ascii");
+  }
+
+  const finalResolution = resolveWorkingSetPathsWithEvidence(initial.worktreePath, options.read_selectors, {
+    maxSelectors: 2_048,
+    maxPaths: limits.max_paths,
+    maxDepth: limits.max_depth,
+    maxDiagnostics: 256,
+  });
+  if (!finalResolution.complete || sourceResolutionIdentity(resolution) !== sourceResolutionIdentity(finalResolution)) {
+    throw new SessionRegistryError(
+      "GIT_STATE_AMBIGUOUS",
+      "The verifier-visible source set changed during observation",
+      {
+        worktree: initial.worktreePath,
+        truncated: finalResolution.truncated,
+        unsupported: finalResolution.unsupported.length,
+        unreadable: finalResolution.unreadable.length,
+      },
+    );
+  }
+  assertSourceVersionsUnchanged(resolution, observedVersions);
+  const final = verifyPhysicalExecutionContext({ cwd: options.cwd, worktreePath: options.cwd, git });
+  const finalControl = captureGitSourceControl(
+    git,
+    final.worktreePath,
+    final.commonGitDirectory,
+    limits.max_total_bytes,
+  );
+  if (
+    initial.repositoryId !== final.repositoryId ||
+    initial.worktreeId !== final.worktreeId ||
+    initial.branchId !== final.branchId ||
+    initial.headId !== final.headId ||
+    control.sha256 !== finalControl.sha256
+  ) {
+    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git source identity changed during observation", {
+      worktree: initial.worktreePath,
+    });
+  }
+
+  return Object.freeze({
+    repository_id: initial.repositoryId,
+    worktree_id: initial.worktreeId,
+    branch_id: initial.branchId,
+    head_id: initial.headId,
+    source_sha256: sourceHash.digest("hex"),
+    file_count: fileCount,
+    byte_count: byteCount,
+  });
+}
+
+function assertSourceVersionsUnchanged(
+  resolution: ReturnType<typeof resolveWorkingSetPathsWithEvidence>,
+  observedVersions: ReadonlyMap<string, string>,
+): void {
+  for (const entry of resolution.resolved) {
+    let stat: fs.BigIntStats;
+    try {
+      stat = fs.lstatSync(entry.absolutePath, { bigint: true });
+    } catch (error: unknown) {
+      throw sourceObservationError("A verifier-visible source changed during observation", entry.absolutePath, error);
+    }
+    const version = `${stat.dev.toString(10)}:${stat.ino.toString(10)}:${stat.mtimeNs.toString(10)}:${stat.ctimeNs.toString(10)}`;
+    if (
+      observedVersions.get(entry.absolutePath) !== version ||
+      (entry.kind === "file" ? !stat.isFile() : !stat.isDirectory())
+    ) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "A verifier-visible source changed during observation", {
+        path: entry.absolutePath,
+      });
+    }
+  }
+}
+
+function sourceResolutionIdentity(resolution: ReturnType<typeof resolveWorkingSetPathsWithEvidence>): string {
+  return JSON.stringify({
+    selectors: resolution.selectors,
+    missingExact: resolution.missingExact,
+    resolved: resolution.resolved.map((entry) => ({
+      relativePath: entry.relativePath,
+      selector: entry.selector,
+      kind: entry.kind,
+      identity: entry.identity,
+      parent: entry.parent.identity,
+    })),
+  });
+}
+
+type GitSourceResolvedIdentity = Readonly<{ readonly device: string; readonly inode: string }>;
+
+function observeSourceDirectory(candidate: string, expected: GitSourceResolvedIdentity): SourceFileDigest {
+  let stat: fs.BigIntStats;
+  try {
+    stat = fs.lstatSync(candidate, { bigint: true });
+  } catch (error: unknown) {
+    throw sourceObservationError("A verifier-visible directory changed during observation", candidate, error);
+  }
+  if (!stat.isDirectory() || stat.dev.toString(10) !== expected.device || stat.ino.toString(10) !== expected.inode) {
+    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "A verifier-visible directory changed during observation", {
+      path: candidate,
+    });
+  }
+  return Object.freeze({
+    sha256: createHash("sha256").digest("hex"),
+    bytes: 0,
+    mode: Number(stat.mode & 0o7777n),
+    version: `${stat.dev.toString(10)}:${stat.ino.toString(10)}:${stat.mtimeNs.toString(10)}:${stat.ctimeNs.toString(10)}`,
+  });
+}
+
+function observeSourceFile(
+  candidate: string,
+  expected: GitSourceResolvedIdentity,
+  expectedParent: GitSourceResolvedIdentity,
+  limits: { readonly maxFileBytes: number; readonly remainingBytes: number },
+): SourceFileDigest {
+  const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+  const directory = fs.constants.O_DIRECTORY;
+  let parentDescriptor: number | undefined;
+  let descriptor: number | undefined;
+  try {
+    parentDescriptor = fs.openSync(path.dirname(candidate), fs.constants.O_RDONLY | directory | noFollow);
+    const parent = fs.fstatSync(parentDescriptor, { bigint: true });
+    if (
+      !parent.isDirectory() ||
+      parent.dev.toString(10) !== expectedParent.device ||
+      parent.ino.toString(10) !== expectedParent.inode
+    ) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "A verifier-visible parent changed during observation", {
+        path: path.dirname(candidate),
+      });
+    }
+    descriptor = fs.openSync(candidate, fs.constants.O_RDONLY | noFollow);
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    if (!before.isFile() || before.dev.toString(10) !== expected.device || before.ino.toString(10) !== expected.inode) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "A verifier-visible file changed during observation", {
+        path: candidate,
+      });
+    }
+    if (before.size > BigInt(limits.maxFileBytes) || before.size > BigInt(limits.remainingBytes)) {
+      throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Verifier-visible source exceeds its byte bound", {
+        path: candidate,
+        fileBytes: before.size.toString(10),
+        maxFileBytes: limits.maxFileBytes,
+        remainingBytes: limits.remainingBytes,
+      });
+    }
+
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(64 * 1_024);
+    let bytes = 0;
+    for (;;) {
+      const read = fs.readSync(descriptor, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      bytes += read;
+      if (bytes > limits.maxFileBytes || bytes > limits.remainingBytes) {
+        throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Verifier-visible source exceeds its byte bound", {
+          path: candidate,
+          maxFileBytes: limits.maxFileBytes,
+          remainingBytes: limits.remainingBytes,
+        });
+      }
+      hash.update(chunk.subarray(0, read));
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mode !== after.mode ||
+      before.mtimeNs !== after.mtimeNs ||
+      before.ctimeNs !== after.ctimeNs ||
+      BigInt(bytes) !== after.size
+    ) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "A verifier-visible file changed while it was read", {
+        path: candidate,
+      });
+    }
+    return Object.freeze({
+      sha256: hash.digest("hex"),
+      bytes,
+      mode: Number(after.mode & 0o7777n),
+      version: `${after.dev.toString(10)}:${after.ino.toString(10)}:${after.mtimeNs.toString(10)}:${after.ctimeNs.toString(10)}`,
+    });
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw sourceObservationError("A verifier-visible file could not be read", candidate, error);
+  } finally {
+    for (const handle of [descriptor, parentDescriptor]) {
+      if (handle === undefined) continue;
+      try {
+        fs.closeSync(handle);
+      } catch {
+        // Preserve the observation result.
+      }
+    }
+  }
+}
+
+function captureGitSourceControl(
+  git: GitCommandRunner,
+  cwd: string,
+  commonGitDirectory: string,
+  maximumBytes: number,
+): { readonly sha256: string; readonly byte_count: number } {
+  if (git.runBuffer === undefined) {
+    throw new SessionRegistryError(
+      "PHYSICAL_OBSERVATION_UNAVAILABLE",
+      "Git runner cannot preserve exact source bytes",
+      {
+        cwd,
+      },
+    );
+  }
+  try {
+    const indexPathValue = git.run(["rev-parse", "--git-path", "index"], cwd);
+    const indexPath = path.isAbsolute(indexPathValue)
+      ? path.resolve(indexPathValue)
+      : path.resolve(cwd, indexPathValue);
+    if (!isPathInside(commonGitDirectory, indexPath)) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git index escaped the repository authority", { cwd });
+    }
+    const index = observeBoundedRawFile(indexPath, GIT_SOURCE_MAX_METADATA_BYTES, maximumBytes);
+    const indexEntries = git.runBuffer(["ls-files", "--stage", "-z"], cwd);
+    const references = git.runBuffer(["show-ref", "--head", "-d"], cwd);
+    const localConfig = git.runBuffer(["config", "--local", "--null", "--list"], cwd);
+    if (
+      indexEntries.byteLength > GIT_SOURCE_MAX_METADATA_BYTES ||
+      references.byteLength > GIT_SOURCE_MAX_METADATA_BYTES
+    ) {
+      throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Git source metadata exceeds its byte bound", {
+        cwd,
+        maxBytes: GIT_SOURCE_MAX_METADATA_BYTES,
+      });
+    }
+    const metadataBytes = index.bytes + indexEntries.byteLength + references.byteLength + localConfig.byteLength;
+    if (metadataBytes > maximumBytes) {
+      throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Git source metadata exceeds its total byte bound", {
+        cwd,
+        metadataBytes,
+        maxBytes: maximumBytes,
+      });
+    }
+    const hash = createHash("sha256");
+    hash.update("nawabari.git-source-control.v1\0", "utf8");
+    hash.update(index.sha256, "ascii");
+    hash.update("\0", "ascii");
+    hash.update(index.version, "utf8");
+    hash.update("\0", "ascii");
+    hash.update(indexEntries);
+    hash.update("\0", "ascii");
+    hash.update(references);
+    hash.update("\0", "ascii");
+    hash.update(localConfig);
+    return Object.freeze({ sha256: hash.digest("hex"), byte_count: metadataBytes });
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw sourceObservationError("Git source metadata could not be observed", cwd, error);
+  }
+}
+
+function observeBoundedRawFile(
+  candidate: string,
+  maximumFileBytes: number,
+  maximumTotalBytes: number,
+): SourceFileDigest {
+  const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(candidate, fs.constants.O_RDONLY | noFollow);
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    if (!before.isFile()) throw new Error("Git index is not a regular file");
+    if (before.size > BigInt(maximumFileBytes) || before.size > BigInt(maximumTotalBytes)) {
+      throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Git index exceeds its byte bound", {
+        maxFileBytes: maximumFileBytes,
+        maxTotalBytes: maximumTotalBytes,
+      });
+    }
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(64 * 1_024);
+    let bytes = 0;
+    for (;;) {
+      const read = fs.readSync(descriptor, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      bytes += read;
+      if (bytes > maximumFileBytes || bytes > maximumTotalBytes) {
+        throw new SessionRegistryError("GIT_OUTPUT_LIMIT", "Git index exceeds its byte bound", {
+          maxFileBytes: maximumFileBytes,
+          maxTotalBytes: maximumTotalBytes,
+        });
+      }
+      hash.update(chunk.subarray(0, read));
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs ||
+      before.ctimeNs !== after.ctimeNs ||
+      BigInt(bytes) !== after.size
+    ) {
+      throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git index changed during source observation", {});
+    }
+    return Object.freeze({
+      sha256: hash.digest("hex"),
+      bytes,
+      mode: Number(after.mode & 0o7777n),
+      version: `${after.dev.toString(10)}:${after.ino.toString(10)}:${after.mtimeNs.toString(10)}:${after.ctimeNs.toString(10)}`,
+    });
+  } catch (error: unknown) {
+    if (error instanceof SessionRegistryError) throw error;
+    throw sourceObservationError("Git index could not be read", candidate, error);
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // Preserve the observation result.
+      }
+    }
+  }
+}
+
+function sourceObservationError(message: string, candidate: string, cause: unknown): SessionRegistryError {
+  return new SessionRegistryError("PHYSICAL_OBSERVATION_UNAVAILABLE", message, { path: candidate }, cause);
+}
+
+function gitSourceLimits(requested: GitSourceObservationLimits | undefined): Required<GitSourceObservationLimits> {
+  const limit = (value: number | undefined, fallback: number, maximum: number, field: string): number => {
+    const selected = value ?? fallback;
+    if (!Number.isSafeInteger(selected) || selected < 1 || selected > maximum) {
+      throw new RangeError(`Git source ${field} must be a positive integer no greater than ${maximum}`);
+    }
+    return selected;
+  };
+  return Object.freeze({
+    max_paths: limit(requested?.max_paths, GIT_SOURCE_MAX_PATHS, GIT_SOURCE_MAX_PATHS, "path limit"),
+    max_depth: limit(requested?.max_depth, GIT_SOURCE_MAX_DEPTH, GIT_SOURCE_MAX_DEPTH, "depth limit"),
+    max_file_bytes: limit(
+      requested?.max_file_bytes,
+      GIT_SOURCE_MAX_FILE_BYTES,
+      GIT_SOURCE_MAX_FILE_BYTES,
+      "file limit",
+    ),
+    max_total_bytes: limit(
+      requested?.max_total_bytes,
+      GIT_SOURCE_MAX_TOTAL_BYTES,
+      GIT_SOURCE_MAX_TOTAL_BYTES,
+      "total byte limit",
+    ),
+  });
 }
 
 function canonicalListedPath(candidate: string): string {

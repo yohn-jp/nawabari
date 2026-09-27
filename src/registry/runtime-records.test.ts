@@ -6,16 +6,54 @@ import { BUILTIN_WORKTREE_PROFILE_IDS, resolveBuiltinWorktreeProfile } from "../
 import { builtinWorktreeProfileRevision, pinWorktreeProfile } from "../domain/worktree-profile-pinning.js";
 import {
   REGISTRY_FEATURES,
+  MAX_RUNTIME_RECORDS,
   SUPPORTED_REGISTRY_FEATURES,
   parseRuntimeRecords,
   toPersistedRuntimeRecords,
 } from "./runtime-records.js";
+
+function retentionRecord(sessionId = "session-1") {
+  return {
+    schemaVersion: 1,
+    operationId: "operation-1",
+    sessionId,
+    repositoryId: "/repositories/example/.git",
+    state: "parked",
+    physicalIdentity: {
+      repositoryId: "/repositories/example/.git",
+      worktreeId: "/repositories/example-worktrees/session-1",
+      worktreePath: "/repositories/example-worktrees/session-1",
+      branchId: "refs/heads/session/session-1",
+      branchName: "session/session-1",
+    },
+    desiredClaims: [
+      { resource: "README.md", mode: "read" },
+      { resource: "src/**", mode: "write" },
+    ],
+    pinnedProfileDigest: "a".repeat(64),
+    parkedAt: "2026-09-27T00:00:00.000Z",
+    updatedAt: "2026-09-27T00:00:00.000Z",
+  } as const;
+}
+
+function parkIntentRecord(sessionId = "session-1") {
+  return {
+    schemaVersion: 1,
+    operationId: "park-operation-1",
+    sessionId,
+    admissionEpoch: 4,
+    expectedClaimSetGeneration: 7,
+    createdAt: "2026-09-27T00:00:00.000Z",
+    updatedAt: "2026-09-27T00:00:00.000Z",
+  } as const;
+}
 
 test("registry optional areas are a finite feature-gated contract", () => {
   assert.deepEqual(REGISTRY_FEATURES, [
     "pinned-profiles.v1",
     "runtime-sessions.v1",
     "executions.v1",
+    "park-intents.v1",
     "retentions.v1",
     "recent-events.v1",
     "file-operations.v1",
@@ -25,6 +63,8 @@ test("registry optional areas are a finite feature-gated contract", () => {
     "pinned-profiles.v1",
     "runtime-sessions.v1",
     "executions.v1",
+    "park-intents.v1",
+    "retentions.v1",
     "recent-events.v1",
     "file-operations.v1",
     "session-history.v1",
@@ -90,6 +130,165 @@ test("supported feature records require matching presence and round-trip as boun
       },
     ],
   });
+});
+
+test("retentions.v1 parses exact SessionRetentionRecord values and preserves other runtime areas", () => {
+  const retention = retentionRecord();
+  const parsed = parseRuntimeRecords({
+    required_features: ["retentions.v1", "executions.v1"],
+    retentions: [retention],
+    executions: [{ execution_id: "exec-1", state: "starting" }],
+  });
+
+  assert.deepEqual(parsed.records.retentions, [retention]);
+  assert.deepEqual(toPersistedRuntimeRecords(parsed), {
+    executions: [{ execution_id: "exec-1", state: "starting" }],
+    retentions: [retention],
+  });
+  assert.equal(parseRuntimeRecords({}).records.retentions, undefined);
+});
+
+test("retentions.v1 rejects payloads without the matching feature gate", () => {
+  const retention = retentionRecord();
+  for (const input of [{ retentions: [retention] }, { required_features: ["retentions.v1"] }]) {
+    assert.throws(
+      () => parseRuntimeRecords(input),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+    );
+  }
+  assert.throws(
+    () => parseRuntimeRecords({ required_features: ["retentions.v1"], retentions: [retention] }, []),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_FEATURE_UNSUPPORTED",
+  );
+});
+
+test("retentions.v1 rejects unsupported versions, malformed fields, and duplicate sessions", () => {
+  const valid = retentionRecord();
+  const missingOperationId = Object.fromEntries(Object.entries(valid).filter(([key]) => key !== "operationId"));
+  const invalidRecords = [
+    { ...valid, unexpected: true },
+    missingOperationId,
+    { ...valid, schemaVersion: 2 },
+    { ...valid, operationId: "" },
+    { ...valid, sessionId: "" },
+    { ...valid, repositoryId: "/repositories/other/.git" },
+    { ...valid, state: "active" },
+    { ...valid, physicalIdentity: { ...valid.physicalIdentity, extra: true } },
+    { ...valid, physicalIdentity: { ...valid.physicalIdentity, repositoryId: "relative/.git" } },
+    { ...valid, physicalIdentity: { ...valid.physicalIdentity, worktreeId: "/different/path" } },
+    { ...valid, physicalIdentity: { ...valid.physicalIdentity, branchId: "refs/heads/other" } },
+    { ...valid, physicalIdentity: { ...valid.physicalIdentity, branchName: "refs/heads/session/session-1" } },
+    { ...valid, desiredClaims: "README.md" },
+    { ...valid, desiredClaims: [{ ...valid.desiredClaims[0], extra: true }] },
+    { ...valid, desiredClaims: [{ resource: "", mode: "read" }] },
+    { ...valid, desiredClaims: [{ resource: "../outside", mode: "read" }] },
+    { ...valid, desiredClaims: [{ resource: "README.md", mode: "unknown" }] },
+    {
+      ...valid,
+      desiredClaims: [valid.desiredClaims[0], valid.desiredClaims[0]],
+    },
+    { ...valid, pinnedProfileDigest: "g".repeat(64) },
+    { ...valid, parkedAt: "2026-09-27T00:00:00Z" },
+    { ...valid, updatedAt: "2026-09-26T23:59:59.999Z" },
+  ];
+
+  for (const invalid of invalidRecords) {
+    assert.throws(
+      () => parseRuntimeRecords({ required_features: ["retentions.v1"], retentions: [invalid] }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+    );
+  }
+
+  assert.throws(
+    () =>
+      parseRuntimeRecords({
+        required_features: ["retentions.v1"],
+        retentions: [valid, valid],
+      }),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+  assert.throws(
+    () =>
+      parseRuntimeRecords({
+        required_features: ["retentions.v1"],
+        retentions: Array.from({ length: MAX_RUNTIME_RECORDS + 1 }, (_, index) => retentionRecord(`session-${index}`)),
+      }),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+});
+
+test("park-intents.v1 parses exact lifecycle-owned records and round-trips with other runtime areas", () => {
+  const intent = parkIntentRecord();
+  const retention = retentionRecord("session-2");
+  const parsed = parseRuntimeRecords({
+    required_features: ["retentions.v1", "park-intents.v1"],
+    retentions: [retention],
+    park_intents: [intent],
+  });
+
+  assert.deepEqual(parsed.records.park_intents, [intent]);
+  assert.deepEqual(toPersistedRuntimeRecords(parsed), {
+    park_intents: [intent],
+    retentions: [retention],
+  });
+  assert.equal(parseRuntimeRecords({}).records.park_intents, undefined);
+});
+
+test("park-intents.v1 fails closed when its feature gate and record area disagree", () => {
+  const intent = parkIntentRecord();
+  for (const input of [{ park_intents: [intent] }, { required_features: ["park-intents.v1"] }]) {
+    assert.throws(
+      () => parseRuntimeRecords(input),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+    );
+  }
+  assert.throws(
+    () => parseRuntimeRecords({ required_features: ["park-intents.v1"], park_intents: [intent] }, []),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_FEATURE_UNSUPPORTED",
+  );
+});
+
+test("park-intents.v1 rejects malformed, unbounded, and duplicate owner records", () => {
+  const valid = parkIntentRecord();
+  const invalidRecords = [
+    { ...valid, unexpected: true },
+    Object.fromEntries(Object.entries(valid).filter(([key]) => key !== "operationId")),
+    { ...valid, schemaVersion: 2 },
+    { ...valid, operationId: "" },
+    { ...valid, sessionId: "" },
+    { ...valid, admissionEpoch: 0 },
+    { ...valid, admissionEpoch: Number.MAX_SAFE_INTEGER + 1 },
+    { ...valid, expectedClaimSetGeneration: -1 },
+    { ...valid, expectedClaimSetGeneration: Number.MAX_SAFE_INTEGER + 1 },
+    { ...valid, createdAt: "2026-09-27T00:00:00Z" },
+    { ...valid, updatedAt: "2026-09-26T23:59:59.999Z" },
+  ];
+
+  for (const invalid of invalidRecords) {
+    assert.throws(
+      () => parseRuntimeRecords({ required_features: ["park-intents.v1"], park_intents: [invalid] }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+    );
+  }
+
+  assert.throws(
+    () =>
+      parseRuntimeRecords({
+        required_features: ["park-intents.v1"],
+        park_intents: [valid, valid],
+      }),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+  assert.throws(
+    () =>
+      parseRuntimeRecords({
+        required_features: ["park-intents.v1"],
+        park_intents: Array.from({ length: MAX_RUNTIME_RECORDS + 1 }, (_, index) =>
+          parkIntentRecord(`session-${index}`),
+        ),
+      }),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
 });
 
 test("feature presence without a matching gate fails closed", () => {

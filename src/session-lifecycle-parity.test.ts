@@ -24,13 +24,14 @@ test("classifier and shadow machine have deterministic parity across the semanti
   }
 });
 
-test("state parity covers every public lifecycle state", () => {
+test("legacy classifier parity covers every pre-parking derived lifecycle state", () => {
   const classifierStates = new Set(
     SESSION_PARITY_FIXTURES.map((parityFixture) => projectClassifier(parityFixture).state),
   );
   const shadowStates = new Set(SESSION_PARITY_FIXTURES.map((parityFixture) => projectXState(parityFixture).state));
-  assert.deepEqual([...classifierStates].sort(), [...SESSION_LIFECYCLE_STATES].sort());
-  assert.deepEqual([...shadowStates].sort(), [...SESSION_LIFECYCLE_STATES].sort());
+  const legacyDerivedStates = SESSION_LIFECYCLE_STATES.filter((state) => state !== "parking" && state !== "parked");
+  assert.deepEqual([...classifierStates].sort(), [...legacyDerivedStates].sort());
+  assert.deepEqual([...shadowStates].sort(), [...legacyDerivedStates].sort());
 });
 
 test("transition parity compares all operation semantics for every matrix fixture", () => {
@@ -43,7 +44,9 @@ test("transition parity compares all operation semantics for every matrix fixtur
     for (const operation of SESSION_PARITY_OPERATIONS) operations.add(operation);
     operationCoverage.set(classifier.state, operations);
   }
-  for (const state of SESSION_LIFECYCLE_STATES) {
+  for (const state of SESSION_LIFECYCLE_STATES.filter(
+    (candidate) => candidate !== "parking" && candidate !== "parked",
+  )) {
     assert.deepEqual([...(operationCoverage.get(state) ?? [])].sort(), [...SESSION_PARITY_OPERATIONS].sort(), state);
   }
 });

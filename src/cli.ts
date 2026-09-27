@@ -325,8 +325,11 @@ export type CliDependencies = {
   /** Optional Control Server composition; test/integration seam. */
   controlServer?: {
     readonly catalogPath?: string;
+    readonly operationalDirectory?: string;
     readonly signal?: AbortSignal;
     readonly onListening?: (server: ControlServer) => void;
+    /** Internal composition marker set by runCli only for its default local backend. */
+    readonly isolateLocalBackendRequests?: boolean;
   };
   version?: string;
   sandboxRunner?: (
@@ -1819,7 +1822,17 @@ async function executeCommand(
     // Discovery metadata only: the current repository is recorded when it is
     // already Nawabari-managed; other known repositories stay visible.
     registerRepositoryLocator(catalogPath, dependencies.cwd);
-    const started = await startControlServer({ port, backend: dependencies.backend, catalogPath });
+    const started = await startControlServer({
+      port,
+      backend: dependencies.backend,
+      catalogPath,
+      ...(dependencies.controlServer?.isolateLocalBackendRequests === true
+        ? { isolateLocalBackendRequests: true }
+        : {}),
+      ...(dependencies.controlServer?.operationalDirectory === undefined
+        ? {}
+        : { operationalDirectory: dependencies.controlServer.operationalDirectory }),
+    });
     if (!started.ok) return started;
     const endpoint: JsonObject = {
       schema: CONTROL_SERVER_SCHEMA,
@@ -1827,6 +1840,7 @@ async function executeCommand(
       url: started.value.url,
       host: CONTROL_SERVER_HOST,
       port: started.value.port,
+      credential_file: started.value.credentialFile,
     };
     (dependencies.io ?? defaultCliIO()).stdout(renderSuccess(dependencies.json ? "json" : "human", "server", endpoint));
     dependencies.controlServer?.onListening?.(started.value);
@@ -1863,6 +1877,8 @@ async function executeCommand(
       "retry-close-with-bounded-integration-fetch",
       "discard-session",
       "reconcile-physical-state",
+      "park-session",
+      "resume-session",
     ];
     if (!actionIds.includes(parsed.value.action_id as SessionActionId)) {
       return failure(
@@ -2210,7 +2226,21 @@ async function executeCommand(
         return preview.ok ? { ok: true, value: preview.value as unknown as JsonObject } : preview;
       }
       if (dependencies.backend.discardSession === undefined) return sessionDiscardCapabilityUnavailable();
-      const result = await dependencies.backend.discardSession(context, parsed.value.session_id as string);
+      if (dependencies.backend.discardPreview === undefined) return sessionDiscardPreviewCapabilityUnavailable();
+      const approval = await dependencies.backend.discardPreview(context, parsed.value.session_id as string);
+      if (!approval.ok) return approval;
+      if (approval.value.approval_witness === undefined) {
+        return failure(
+          new DomainError("BACKEND_UNAVAILABLE", "Session discard approval witness is not available.", {
+            operation: "session.discard.approval",
+          }),
+        );
+      }
+      const result = await dependencies.backend.discardSession(
+        context,
+        parsed.value.session_id as string,
+        approval.value.approval_witness,
+      );
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "id" || subcommand === "show" || subcommand === "close") {
@@ -2946,7 +2976,10 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       io,
       json: mode === "json",
       repositoryTerminal: dependencies.repositoryTerminal,
-      controlServer: dependencies.controlServer,
+      controlServer: {
+        ...dependencies.controlServer,
+        isolateLocalBackendRequests: dependencies.backend === undefined,
+      },
       sandboxRunner: dependencies.sandboxRunner,
       sandboxProbe: dependencies.sandboxProbe,
       sandboxRuntimeLayout: runtimeLayout,
