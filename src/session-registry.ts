@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -49,6 +49,7 @@ import { compileWorkingSetRuntimeProjection } from "./domain/working-set-runtime
 import {
   composeEffectiveWorkingSet,
   evaluateWorkingSetExpansion,
+  parseImplementationExecutionScope,
   type EffectiveWorkingSet,
   type RepositoryIdentity,
   type WorkingSetExpansionOutcome,
@@ -74,6 +75,7 @@ import {
   type ParsedRuntimeRecords,
   type RegistryFeature,
   type SessionAdmissionRecord,
+  type ParkIntentRecord,
   type RuntimeRecord,
   type RuntimeRecords,
   type ResourceHandoffRecentEvent,
@@ -86,6 +88,25 @@ import {
   type ResourceOverlapBounds,
   type ResourceOverlapGraph,
 } from "./resource-coordination.js";
+import {
+  retentionIdentityDigest,
+  SessionRetentionError,
+  type SessionRetentionErrorCode,
+  type ParkCommitInput,
+  type RetainedClaimIntent,
+  type ResumeCommitInput,
+  type ResumeValidationInput,
+  type ResumeValidationResult,
+  type RetentionCommitResult,
+  type RetentionFenceResult,
+  type RetentionDrainResult,
+  type RetentionReobservation,
+  type RetentionStepRejection,
+  type SessionPhysicalIdentity,
+  type SessionRetentionAuthority,
+  type SessionRetentionRecord,
+  type SessionRetentionSnapshot,
+} from "./session-retention.js";
 import {
   applyCoordinationTransaction,
   planCoordinationTransaction,
@@ -233,6 +254,7 @@ import {
   type EffectiveFilesystemPolicy,
   type EffectiveFilesystemPolicyInputs,
 } from "./domain/filesystem-policy.js";
+import { decideFilesystemScopePermission } from "./domain/filesystem-policy-decision.js";
 import {
   createFilesystemPolicyToken,
   serializeFilesystemPolicyToken,
@@ -342,7 +364,7 @@ const MIGRATION_RECOVERY_HINTS = Object.freeze([
 
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
 export type SessionRecordSchemaVersion = typeof SESSION_RECORD_SCHEMA_VERSION;
-export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
+export type SessionState = "new" | "active" | "closing" | "closed" | "stale" | "parked";
 
 export interface SessionRecord {
   readonly schemaVersion: SessionRecordSchemaVersion;
@@ -380,6 +402,21 @@ export interface SessionRecord {
    * enforced regardless of this flag.
    */
   readonly claimEnforcement?: boolean;
+}
+
+interface SessionRetentionFenceLease {
+  readonly operationId: string;
+  readonly token: string;
+  readonly admissionEpoch: number;
+  readonly expectedClaimSetGeneration: number;
+}
+
+interface SessionRetentionValidationLease {
+  readonly operationId: string;
+  readonly token: string;
+  readonly requestDigest: string;
+  readonly registryRevision: number;
+  readonly claimSetGeneration: number;
 }
 
 export interface RepositoryRegistryView {
@@ -1210,6 +1247,7 @@ export interface PersistedRegistryV2 {
   readonly pinned_profiles?: readonly RuntimeRecord[];
   readonly runtime_sessions?: readonly RuntimeRecord[];
   readonly executions?: readonly RuntimeRecord[];
+  readonly park_intents?: readonly RuntimeRecord[];
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
   readonly file_operations?: readonly PersistedFileOperationRecord[];
@@ -1228,13 +1266,13 @@ interface ClaimMutationResult {
   readonly added: readonly ResourceClaim[];
 }
 
-const ACTIVE_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "stale"]);
-const CURRENT_SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing"]);
-const SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "closed", "stale"]);
+const ACTIVE_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "stale", "parked"]);
+const CURRENT_SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "parked"]);
+const SESSION_STATES: ReadonlySet<SessionState> = new Set(["new", "active", "closing", "closed", "stale", "parked"]);
 const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const MAX_ID_GENERATION_ATTEMPTS = 8;
 
-export class SessionRegistry {
+export class SessionRegistry implements SessionRetentionAuthority {
   readonly repository: RepositoryContext;
   readonly paths: RegistryPaths;
   readonly hookMaterialAuthority: SessionHookMaterialAuthority | undefined;
@@ -1255,6 +1293,9 @@ export class SessionRegistry {
   private readonly lockMetadataGraceMs: number;
   private readonly stateBoundary: RepositoryStateBoundary;
   private readonly managedExecutionReadiness: ManagedExecutionReadiness | undefined;
+  /** Ephemeral sequencing proofs only; canonical admission and retention remain in the registry. */
+  private readonly retentionFences = new Map<string, SessionRetentionFenceLease>();
+  private readonly retentionValidations = new Map<string, SessionRetentionValidationLease>();
   /** Last authoritative registry read within this instance; never used to authorize a mutation. */
   private lastReadState: RegistryState | undefined;
 
@@ -1845,11 +1886,943 @@ export class SessionRegistry {
     });
   }
 
+  /** Return the authoritative park/resume snapshot, including verified Git identity. */
+  observe(sessionId: string): SessionRetentionSnapshot {
+    assertSessionId(sessionId);
+    return this.withLock(() => this.retentionSnapshotUnsafe(this.readStateUnsafe(), sessionId));
+  }
+
+  /** Persist or adopt the lifecycle-owned park intent and its closed admission gate. */
+  fence(input: { readonly sessionId: string; readonly operationId: string }): RetentionFenceResult {
+    try {
+      assertSessionId(input.sessionId);
+      assertRetentionOperationId(input.operationId);
+      const prior = this.retentionFences.get(input.sessionId);
+      if (prior !== undefined && prior.operationId !== input.operationId) {
+        return retentionStepRejected("FENCE_REJECTED", "A different retention fence is already in progress", {
+          sessionId: input.sessionId,
+        });
+      }
+
+      const intent = this.withLock(() => {
+        const state = this.readStateUnsafe();
+        const session = state.sessions.find((candidate) => candidate.sessionId === input.sessionId);
+        if (session === undefined) {
+          throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${input.sessionId}`, {
+            sessionId: input.sessionId,
+          });
+        }
+        if (session.state !== "active") {
+          throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Session cannot be parked while ${session.state}`, {
+            sessionId: input.sessionId,
+            state: session.state,
+          });
+        }
+        const existingIntent = this.parkIntentUnsafe(state, input.sessionId);
+        if (existingIntent !== undefined) {
+          if (existingIntent.operationId !== input.operationId) {
+            throw retentionFailure("FENCE_REJECTED", "A different park operation already owns this session", {
+              sessionId: input.sessionId,
+              operationId: existingIntent.operationId,
+            });
+          }
+          const existingLease = prior ?? {
+            operationId: existingIntent.operationId,
+            token: randomUUID(),
+            admissionEpoch: existingIntent.admissionEpoch,
+            expectedClaimSetGeneration: existingIntent.expectedClaimSetGeneration,
+          };
+          this.assertRetentionFenceUnsafe(state, input.sessionId, existingLease);
+          return existingIntent;
+        }
+        const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+          (candidate) => candidate.session_id === input.sessionId,
+        );
+        if (admissionValue === undefined) {
+          throw new SessionRegistryError("OPERATION_REJECTED", "Session launch admission is untracked", {
+            sessionId: input.sessionId,
+          });
+        }
+        const admission = parseSessionAdmissionRecord(admissionValue);
+        if (admission.runtime_epoch > state.runtimeEpoch) {
+          throw new SessionRegistryError(
+            "OPERATION_REJECTED",
+            "Session launch admission is not open at the current epoch",
+            {
+              sessionId: input.sessionId,
+              admission: admission.admission,
+              admissionEpoch: admission.runtime_epoch,
+              runtimeEpoch: state.runtimeEpoch,
+            },
+          );
+        }
+        if (admission.admission === "closed") {
+          throw retentionFailure("FENCE_REJECTED", "Closed admission has no park intent to adopt", {
+            sessionId: input.sessionId,
+            admissionEpoch: admission.runtime_epoch,
+          });
+        }
+        if (admission.runtime_epoch !== state.runtimeEpoch) {
+          throw new SessionRegistryError(
+            "OPERATION_REJECTED",
+            "Session launch admission is not open at the current epoch",
+            {
+              sessionId: input.sessionId,
+              admission: admission.admission,
+              admissionEpoch: admission.runtime_epoch,
+              runtimeEpoch: state.runtimeEpoch,
+            },
+          );
+        }
+        const nextEpoch = nextRuntimeEpoch(state);
+        const now = toTimestamp(this.clock());
+        const parkIntent: ParkIntentRecord = Object.freeze({
+          schemaVersion: 1,
+          operationId: input.operationId,
+          sessionId: input.sessionId,
+          admissionEpoch: nextEpoch,
+          expectedClaimSetGeneration: state.claimSetGeneration,
+          createdAt: now,
+          updatedAt: now,
+        });
+        const runtimeRecords = withParkIntents(
+          withSessionAdmission(state.runtimeRecords, {
+            ...admission,
+            admission: "closed",
+            runtime_epoch: nextEpoch,
+          }),
+          [...(state.runtimeRecords.records.park_intents ?? []), parkIntent],
+        );
+        this.writeUnsafe(
+          state.sessions,
+          state.claims,
+          state.claimSetGeneration,
+          nextRegistryRevision(state),
+          nextEpoch,
+          runtimeRecords,
+        );
+        return parkIntent;
+      });
+      const lease = Object.freeze({
+        operationId: input.operationId,
+        token: prior?.token ?? randomUUID(),
+        admissionEpoch: intent.admissionEpoch,
+        expectedClaimSetGeneration: intent.expectedClaimSetGeneration,
+      });
+      this.retentionFences.set(input.sessionId, lease);
+      return Object.freeze({ accepted: true, token: lease.token });
+    } catch (error: unknown) {
+      return retentionStepRejected("FENCE_REJECTED", retentionErrorMessage(error), retentionErrorDetails(error));
+    }
+  }
+
+  /** One bounded owned-runtime observation; no wait or effect runs under the repository lock. */
+  drain(input: {
+    readonly sessionId: string;
+    readonly operationId: string;
+    readonly fenceToken: string;
+  }): RetentionDrainResult {
+    try {
+      assertSessionId(input.sessionId);
+      const lease = this.assertRetentionFenceToken(input.sessionId, input.operationId, input.fenceToken);
+      const state = this.withLock(() => {
+        const current = this.readStateUnsafe();
+        this.assertRetentionFenceUnsafe(current, input.sessionId, lease);
+        return current;
+      });
+      this.assertOwnedExecutionsEmptyUnsafe(state, input.sessionId);
+      const executionCount = (state.runtimeRecords.records.executions ?? []).filter(
+        (candidate) => candidate.session_id === input.sessionId,
+      ).length;
+      return Object.freeze({ drained: true, executionCount });
+    } catch (error: unknown) {
+      return retentionStepRejected("DRAIN_INCOMPLETE", retentionErrorMessage(error), retentionErrorDetails(error));
+    }
+  }
+
+  /** Re-read locked authority and physical/runtime evidence after the drain step. */
+  revalidate(input: {
+    readonly sessionId: string;
+    readonly operationId: string;
+    readonly fenceToken: string;
+  }): SessionRetentionSnapshot | RetentionStepRejection {
+    try {
+      assertSessionId(input.sessionId);
+      const lease = this.assertRetentionFenceToken(input.sessionId, input.operationId, input.fenceToken);
+      return this.withLock(() => {
+        const state = this.readStateUnsafe();
+        this.assertRetentionFenceUnsafe(state, input.sessionId, lease);
+        this.assertOwnedExecutionsEmptyUnsafe(state, input.sessionId);
+        const snapshot = this.retentionSnapshotUnsafe(state, input.sessionId);
+        const profile = this.pinnedProfileUnsafe(state, input.sessionId);
+        if (profile === undefined) {
+          throw new SessionRegistryError("OPERATION_REJECTED", "Parking requires an authoritative pinned profile", {
+            sessionId: input.sessionId,
+          });
+        }
+        return snapshot;
+      });
+    } catch (error: unknown) {
+      return retentionStepRejected("REVALIDATION_FAILED", retentionErrorMessage(error), retentionErrorDetails(error));
+    }
+  }
+
+  /** Atomically persist parked state, exact retention intent, and release of every target claim. */
+  atomicPark(input: ParkCommitInput): RetentionCommitResult {
+    try {
+      const result = this.withLock(() => {
+        const state = this.readStateUnsafe();
+        const lease = this.assertRetentionFenceToken(input.sessionId, input.operationId, input.fenceToken);
+        this.assertRetentionFenceUnsafe(state, input.sessionId, lease);
+        const sessionIndex = state.sessions.findIndex((candidate) => candidate.sessionId === input.sessionId);
+        const session = state.sessions[sessionIndex];
+        if (session === undefined) {
+          throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${input.sessionId}`, {
+            sessionId: input.sessionId,
+          });
+        }
+        if (session.state !== input.expectedState || session.state !== "active") {
+          throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Session cannot be parked while ${session.state}`, {
+            sessionId: input.sessionId,
+            state: session.state,
+          });
+        }
+        if (
+          input.expectedClaimSetGeneration !== lease.expectedClaimSetGeneration ||
+          input.expectedClaimSetGeneration !== state.claimSetGeneration
+        ) {
+          return retentionCommitRejected(input, "STALE_CLAIM_SET", "Claim-set generation changed during park", {
+            expectedClaimSetGeneration: input.expectedClaimSetGeneration,
+            parkIntentClaimSetGeneration: lease.expectedClaimSetGeneration,
+            actualClaimSetGeneration: state.claimSetGeneration,
+          });
+        }
+        const physicalIdentity = this.retentionPhysicalIdentity(session);
+        if (!sameRetentionPhysicalIdentity(input.physicalIdentity, physicalIdentity)) {
+          throw retentionFailure("PHYSICAL_IDENTITY_MISMATCH", "Physical session identity changed before park", {
+            sessionId: input.sessionId,
+          });
+        }
+        const pin = this.pinnedProfileUnsafe(state, input.sessionId);
+        if (pin === undefined || retentionIdentityDigest(pin) !== input.pinnedProfileDigest) {
+          throw retentionFailure("PINNED_PROFILE_MISMATCH", "Park profile does not match the persisted pin", {
+            sessionId: input.sessionId,
+          });
+        }
+        this.assertOwnedExecutionsEmptyUnsafe(state, input.sessionId);
+        const owner: ClaimOwner = { ...session, record: session };
+        const desiredClaims = this.canonicalClaimInputs(
+          input.desiredClaims.map((claim) => ({ resource: claim.resource, mode: claim.mode })),
+          owner,
+          true,
+        );
+        const currentSessionClaims = state.claims.filter((claim) => claim.sessionId === input.sessionId);
+        for (const desired of desiredClaims) {
+          const existing = currentSessionClaims.find(
+            (claim) => claim.resource === desired.resource && claim.mode === desired.mode,
+          );
+          if (existing === undefined) {
+            throw new SessionRegistryError("STALE_CLAIM_SET", "Desired retained claim is no longer owned", {
+              sessionId: input.sessionId,
+              resource: desired.resource,
+              mode: desired.mode,
+            });
+          }
+          if (existing.sharing !== undefined) {
+            throw new SessionRegistryError(
+              "INVALID_CLAIM",
+              "A shared-write claim cannot be retained because the accepted retention intent has no sharing binding",
+              { sessionId: input.sessionId, resource: existing.resource, mode: existing.mode },
+            );
+          }
+        }
+        const expectedReleaseIds = currentSessionClaims.map((claim) => claim.claimId).sort(compareCodePointStrings);
+        const suppliedReleaseIds = [...input.releaseClaimIds].sort(compareCodePointStrings);
+        if (!sameStringList(expectedReleaseIds, suppliedReleaseIds)) {
+          return retentionCommitRejected(input, "STALE_CLAIM_SET", "The target session claim set changed during park", {
+            expectedReleaseClaimIds: expectedReleaseIds,
+            suppliedReleaseClaimIds: suppliedReleaseIds,
+          });
+        }
+        const admission = this.retentionAdmissionUnsafe(state, input.sessionId);
+        if (admission.admission !== "closed" || admission.runtime_epoch !== lease.admissionEpoch) {
+          throw retentionFailure("FENCE_REJECTED", "The launch-admission fence changed before park", {
+            sessionId: input.sessionId,
+            expectedAdmissionEpoch: lease.admissionEpoch,
+            actualAdmissionEpoch: admission.runtime_epoch,
+            admission: admission.admission,
+          });
+        }
+        const now = toTimestamp(this.clock());
+        if (!isTimestamp(input.parkedAt) || !isSafeRetentionDigest(input.pinnedProfileDigest)) {
+          throw retentionFailure("INVALID_INPUT", "Park input contains an invalid timestamp or profile digest");
+        }
+        const updated = transitionSessionState(session, "parked", this.clock);
+        const retention: SessionRetentionRecord = Object.freeze({
+          schemaVersion: 1,
+          operationId: input.operationId,
+          sessionId: input.sessionId,
+          repositoryId: session.repositoryId,
+          state: "parked",
+          physicalIdentity,
+          desiredClaims: Object.freeze(desiredClaims.map(({ resource, mode }) => Object.freeze({ resource, mode }))),
+          pinnedProfileDigest: input.pinnedProfileDigest,
+          parkedAt: input.parkedAt,
+          updatedAt: new Date(Math.max(Date.parse(now), Date.parse(input.parkedAt))).toISOString(),
+        });
+        const sessions = [...state.sessions];
+        sessions[sessionIndex] = updated;
+        const claims = sortResourceClaims(state.claims.filter((claim) => claim.sessionId !== input.sessionId));
+        const claimSetGeneration = nextClaimSetGeneration(state, claims);
+        const retentions = [
+          ...(state.runtimeRecords.records.retentions ?? []).filter(
+            (candidate) => (candidate as unknown as SessionRetentionRecord).sessionId !== input.sessionId,
+          ),
+          retention,
+        ];
+        const parkIntents = (state.runtimeRecords.records.park_intents ?? []).filter(
+          (candidate) => candidate.sessionId !== input.sessionId,
+        );
+        const runtimeRecords = withParkIntents(withRetentions(state.runtimeRecords, retentions), parkIntents);
+        this.writeUnsafe(
+          sessions,
+          claims,
+          claimSetGeneration,
+          nextRegistryRevision(state),
+          state.runtimeEpoch,
+          runtimeRecords,
+        );
+        this.retentionFences.delete(input.sessionId);
+        this.retentionValidations.delete(input.sessionId);
+        const snapshot: SessionRetentionSnapshot = Object.freeze({
+          session: Object.freeze({ sessionId: updated.sessionId, state: "parked", physicalIdentity }),
+          claims: Object.freeze(claims.map(cloneResourceClaim)),
+          claimSetGeneration,
+          retention,
+        });
+        return Object.freeze({
+          status: "committed" as const,
+          operationId: input.operationId,
+          snapshot,
+          releasedClaims: Object.freeze(currentSessionClaims.map(cloneResourceClaim)),
+        });
+      });
+      if (result.status !== "committed") this.retentionFences.delete(input.sessionId);
+      return result;
+    } catch (error: unknown) {
+      this.retentionFences.delete(input.sessionId);
+      if (error instanceof SessionRegistryError && error.code === "STALE_CLAIM_SET") {
+        return retentionCommitRejected(input, "STALE_CLAIM_SET", error.message, error.details);
+      }
+      if (error instanceof SessionRegistryError && error.code === "REGISTRY_DURABILITY_UNCERTAIN") {
+        this.retentionFences.delete(input.sessionId);
+        return Object.freeze({ status: "uncertain", operationId: input.operationId, reason: error.message });
+      }
+      throw error;
+    }
+  }
+
+  /** Validate the parked pin, latest external authority, desired claims, and all-session conflict set. */
+  validateResume(input: ResumeValidationInput): ResumeValidationResult {
+    try {
+      assertSessionId(input.sessionId);
+      assertRetentionOperationId(input.operationId);
+      return this.withLock(() => {
+        const state = this.readStateUnsafe();
+        const session = this.assertParkedRetentionUnsafe(state, input.sessionId, input.retention);
+        if (
+          input.snapshot.claimSetGeneration !== state.claimSetGeneration ||
+          input.snapshot.session.state !== "parked" ||
+          input.snapshot.retention === undefined ||
+          !sameRetentionRecord(input.snapshot.retention, input.retention)
+        ) {
+          return retentionValidationRejected("STALE_CLAIM_SET", "Resume snapshot is stale");
+        }
+        const actualIdentity = this.retentionPhysicalIdentity(session);
+        if (
+          !sameRetentionPhysicalIdentity(input.physicalIdentity, actualIdentity) ||
+          !sameRetentionPhysicalIdentity(input.retention.physicalIdentity, actualIdentity)
+        ) {
+          throw retentionFailure("PHYSICAL_IDENTITY_MISMATCH", "Parked physical identity changed before resume", {
+            sessionId: input.sessionId,
+          });
+        }
+        const pin = this.pinnedProfileUnsafe(state, input.sessionId);
+        if (
+          pin === undefined ||
+          retentionIdentityDigest(pin) !== input.pinnedProfileDigest ||
+          input.retention.pinnedProfileDigest !== input.pinnedProfileDigest
+        ) {
+          throw retentionFailure("PINNED_PROFILE_MISMATCH", "Resume profile does not match the persisted pin", {
+            sessionId: input.sessionId,
+          });
+        }
+        this.assertOwnedExecutionsEmptyUnsafe(state, input.sessionId);
+        const external = this.validateRetentionExternalScope(
+          session,
+          pin,
+          input.latestExternalScope,
+          input.desiredClaims,
+        );
+        if (!external.accepted) {
+          return retentionValidationRejected("EXTERNAL_SCOPE_REJECTED", external.reason, external.details);
+        }
+        const candidateClaims = this.retainedClaimsForSession(session, input.desiredClaims, state);
+        try {
+          this.validateRequestedClaims(
+            candidateClaims,
+            { ...session, state: "active", record: session },
+            state.claims,
+            state.sessions,
+            state.claimSetGeneration,
+            (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+          );
+        } catch (error: unknown) {
+          if (error instanceof SessionRegistryError && error.code === "STALE_CLAIM_SET") {
+            return retentionValidationRejected("STALE_CLAIM_SET", error.message, error.details);
+          }
+          return retentionValidationRejected(
+            "CLAIM_CONFLICT",
+            retentionErrorMessage(error),
+            retentionErrorDetails(error),
+          );
+        }
+        const requestDigest = retentionResumeRequestDigest(input, external.value);
+        const token = randomUUID();
+        this.retentionValidations.set(
+          input.sessionId,
+          Object.freeze({
+            operationId: input.operationId,
+            token,
+            requestDigest,
+            registryRevision: state.registryRevision,
+            claimSetGeneration: state.claimSetGeneration,
+          }),
+        );
+        return Object.freeze({ accepted: true, token });
+      });
+    } catch (error: unknown) {
+      const code =
+        error instanceof SessionRegistryError && error.code === "STALE_CLAIM_SET"
+          ? "STALE_CLAIM_SET"
+          : "EXTERNAL_SCOPE_REJECTED";
+      return retentionValidationRejected(code, retentionErrorMessage(error), retentionErrorDetails(error));
+    }
+  }
+
+  /** Revalidate and atomically restore active state, claims, retention consumption, and admission. */
+  atomicResume(input: ResumeCommitInput): RetentionCommitResult {
+    try {
+      const result = this.withLock(() => {
+        const state = this.readStateUnsafe();
+        const lease = this.retentionValidations.get(input.sessionId);
+        const external = this.validateRetentionExternalScope(
+          state.sessions.find((candidate) => candidate.sessionId === input.sessionId),
+          this.pinnedProfileUnsafe(state, input.sessionId),
+          input.latestExternalScope,
+          input.desiredClaims,
+        );
+        if (!external.accepted) {
+          throw retentionFailure("EXTERNAL_SCOPE_REJECTED", external.reason, external.details);
+        }
+        const expectedDigest = retentionResumeRequestDigest(input, external.value);
+        if (
+          lease === undefined ||
+          lease.operationId !== input.operationId ||
+          lease.token !== input.validationToken ||
+          lease.requestDigest !== expectedDigest ||
+          lease.registryRevision !== state.registryRevision ||
+          lease.claimSetGeneration !== state.claimSetGeneration ||
+          input.expectedClaimSetGeneration !== state.claimSetGeneration
+        ) {
+          return retentionCommitRejected(input, "STALE_CLAIM_SET", "Resume validation or claim generation is stale", {
+            expectedClaimSetGeneration: input.expectedClaimSetGeneration,
+            actualClaimSetGeneration: state.claimSetGeneration,
+          });
+        }
+        const session = this.assertParkedRetentionUnsafe(state, input.sessionId, input.retention);
+        if (
+          input.snapshot.claimSetGeneration !== state.claimSetGeneration ||
+          input.snapshot.retention === undefined ||
+          !sameRetentionRecord(input.snapshot.retention, input.retention)
+        ) {
+          return retentionCommitRejected(input, "STALE_CLAIM_SET", "Parked retention snapshot changed before resume");
+        }
+        const actualIdentity = this.retentionPhysicalIdentity(session);
+        if (
+          !sameRetentionPhysicalIdentity(input.physicalIdentity, actualIdentity) ||
+          !sameRetentionPhysicalIdentity(input.retention.physicalIdentity, actualIdentity)
+        ) {
+          throw retentionFailure("PHYSICAL_IDENTITY_MISMATCH", "Parked physical identity changed before resume", {
+            sessionId: input.sessionId,
+          });
+        }
+        const pin = this.pinnedProfileUnsafe(state, input.sessionId);
+        if (
+          pin === undefined ||
+          retentionIdentityDigest(pin) !== input.pinnedProfileDigest ||
+          input.retention.pinnedProfileDigest !== input.pinnedProfileDigest
+        ) {
+          throw retentionFailure("PINNED_PROFILE_MISMATCH", "Resume profile does not match the persisted pin", {
+            sessionId: input.sessionId,
+          });
+        }
+        const admission = this.retentionAdmissionUnsafe(state, input.sessionId);
+        if (admission.admission !== "closed") {
+          throw retentionFailure("FENCE_REJECTED", "Parked session launch admission is not closed", {
+            sessionId: input.sessionId,
+            admission: admission.admission,
+          });
+        }
+        this.assertOwnedExecutionsEmptyUnsafe(state, input.sessionId);
+        const nextClaimsForSession = this.retainedClaimsForSession(session, input.desiredClaims, state);
+        let acceptedClaims: readonly ResourceClaim[];
+        try {
+          acceptedClaims = this.validateRequestedClaims(
+            nextClaimsForSession,
+            { ...session, state: "active", record: session },
+            state.claims,
+            state.sessions,
+            state.claimSetGeneration,
+            (left, right) => this.coordinationFacts(left, right, state.claimSetGeneration, state.sessions),
+          );
+        } catch (error: unknown) {
+          if (error instanceof SessionRegistryError && error.code === "STALE_CLAIM_SET") {
+            return retentionCommitRejected(input, "STALE_CLAIM_SET", error.message, error.details);
+          }
+          return retentionCommitRejected(
+            input,
+            "CLAIM_CONFLICT",
+            retentionErrorMessage(error),
+            retentionErrorDetails(error),
+          );
+        }
+        const nextClaims = sortResourceClaims([...state.claims, ...acceptedClaims]);
+        const claimSetGeneration = nextClaimSetGeneration(state, nextClaims);
+        const runtimeEpoch = nextRuntimeEpoch(state);
+        const sessions = [...state.sessions];
+        sessions[state.sessions.indexOf(session)] = transitionSessionState(session, "active", this.clock);
+        const records = withRetentions(
+          state.runtimeRecords,
+          (state.runtimeRecords.records.retentions ?? []).filter(
+            (candidate) => (candidate as unknown as SessionRetentionRecord).sessionId !== input.sessionId,
+          ),
+        );
+        const runtimeRecords = withSessionAdmission(records, {
+          ...admission,
+          admission: "open",
+          runtime_epoch: runtimeEpoch,
+        });
+        this.writeUnsafe(
+          sessions,
+          nextClaims,
+          claimSetGeneration,
+          nextRegistryRevision(state),
+          runtimeEpoch,
+          runtimeRecords,
+        );
+        const updated = sessions.find((candidate) => candidate.sessionId === input.sessionId);
+        if (updated === undefined) throw new SessionRegistryError("REGISTRY_CORRUPT", "Resumed session disappeared");
+        const snapshot: SessionRetentionSnapshot = Object.freeze({
+          session: Object.freeze({ sessionId: updated.sessionId, state: "active", physicalIdentity: actualIdentity }),
+          claims: Object.freeze(nextClaims.map(cloneResourceClaim)),
+          claimSetGeneration,
+        });
+        this.retentionFences.delete(input.sessionId);
+        this.retentionValidations.delete(input.sessionId);
+        return Object.freeze({
+          status: "committed" as const,
+          operationId: input.operationId,
+          snapshot,
+          reacquiredClaims: Object.freeze(acceptedClaims.map(cloneResourceClaim)),
+        });
+      });
+      this.retentionValidations.delete(input.sessionId);
+      return result;
+    } catch (error: unknown) {
+      this.retentionValidations.delete(input.sessionId);
+      if (error instanceof SessionRegistryError && error.code === "REGISTRY_DURABILITY_UNCERTAIN") {
+        return Object.freeze({ status: "uncertain", operationId: input.operationId, reason: error.message });
+      }
+      throw error;
+    }
+  }
+
+  /** Reobserve only committed postconditions after a durability-uncertain response. */
+  reobserve(input: {
+    readonly operationId: string;
+    readonly sessionId: string;
+    readonly operation: "park" | "resume";
+  }): RetentionReobservation {
+    try {
+      const state = this.withLock(() => this.readStateUnsafe());
+      const session = state.sessions.find((candidate) => candidate.sessionId === input.sessionId);
+      if (session === undefined)
+        return Object.freeze({ status: "unknown", operationId: input.operationId, reason: "session is absent" });
+      const snapshot = this.retentionSnapshotUnsafe(state, input.sessionId);
+      const retention = snapshot.retention;
+      const admission = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+        (candidate) => candidate.session_id === input.sessionId,
+      );
+      if (admission === undefined) {
+        return Object.freeze({
+          status: "unknown",
+          operationId: input.operationId,
+          reason: "admission evidence is absent",
+        });
+      }
+      const parsedAdmission = parseSessionAdmissionRecord(admission);
+      const matches =
+        input.operation === "park"
+          ? session.state === "parked" &&
+            retention?.operationId === input.operationId &&
+            parsedAdmission.admission === "closed" &&
+            !state.claims.some((claim) => claim.sessionId === input.sessionId)
+          : false;
+      if (matches) {
+        return Object.freeze({
+          status: "unknown",
+          operationId: input.operationId,
+          reason: "parked state and operation identity are visible, but directory durability is not proven",
+        });
+      }
+      return Object.freeze({
+        status: "unknown",
+        operationId: input.operationId,
+        reason: "retention postconditions are not proven",
+      });
+    } catch (error: unknown) {
+      return Object.freeze({ status: "unknown", operationId: input.operationId, reason: retentionErrorMessage(error) });
+    }
+  }
+
+  private retentionSnapshotUnsafe(state: RegistryState, sessionId: string): SessionRetentionSnapshot {
+    const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+    if (session === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    if (session.state !== "active" && session.state !== "parked") {
+      throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Session cannot be retained while ${session.state}`, {
+        sessionId,
+        state: session.state,
+      });
+    }
+    const physicalIdentity = this.retentionPhysicalIdentity(session);
+    const retention = this.retentionRecordUnsafe(state, sessionId);
+    return Object.freeze({
+      session: Object.freeze({ sessionId, state: session.state, physicalIdentity }),
+      claims: Object.freeze(state.claims.map(cloneResourceClaim)),
+      claimSetGeneration: state.claimSetGeneration,
+      ...(retention === undefined ? {} : { retention }),
+    });
+  }
+
+  private retentionPhysicalIdentity(session: SessionRecord): SessionPhysicalIdentity {
+    const physical = verifyPhysicalExecutionContext({
+      repository: this.repository,
+      worktreePath: session.worktreePath,
+      branchName: session.branchName,
+      git: this.git,
+    });
+    if (
+      physical.repositoryId !== session.repositoryId ||
+      physical.worktreeId !== session.worktreeId ||
+      physical.worktreePath !== session.worktreePath ||
+      physical.branchId !== session.branchId ||
+      physical.branchName !== session.branchName
+    ) {
+      throw new SessionRegistryError("OWNERSHIP_MISMATCH", "Session physical identity no longer matches Git", {
+        sessionId: session.sessionId,
+        expectedWorktree: session.worktreePath,
+        actualWorktree: physical.worktreePath,
+        expectedBranch: session.branchName,
+        actualBranch: physical.branchName,
+      });
+    }
+    return Object.freeze({
+      repositoryId: physical.repositoryId,
+      worktreeId: physical.worktreeId,
+      worktreePath: physical.worktreePath,
+      branchId: physical.branchId,
+      branchName: physical.branchName,
+    });
+  }
+
+  private retentionRecordUnsafe(state: RegistryState, sessionId: string): SessionRetentionRecord | undefined {
+    const found = (state.runtimeRecords.records.retentions ?? []).find(
+      (candidate) => (candidate as unknown as SessionRetentionRecord).sessionId === sessionId,
+    );
+    return found === undefined ? undefined : (found as unknown as SessionRetentionRecord);
+  }
+
+  private pinnedProfileUnsafe(state: RegistryState, sessionId: string): PinnedWorktreeProfile | undefined {
+    const value = (state.runtimeRecords.records.pinned_profiles ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    if (value === undefined) return undefined;
+    try {
+      const pin = parsePinnedProfileRecord(value);
+      const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+      if (
+        session === undefined ||
+        pin.provenance.repository.id !== session.repositoryId ||
+        (session.baseRevision !== undefined && pin.provenance.base.revision !== session.baseRevision)
+      ) {
+        throw new Error("Pinned profile identity does not match its session");
+      }
+      return pin;
+    } catch (error: unknown) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Session pinned profile could not be verified", {
+        sessionId,
+        reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+      });
+    }
+  }
+
+  private retentionAdmissionUnsafe(state: RegistryState, sessionId: string): SessionAdmissionRecord {
+    const value = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    if (value === undefined) {
+      throw new SessionRegistryError("OPERATION_REJECTED", "Session launch admission is untracked", { sessionId });
+    }
+    return parseSessionAdmissionRecord(value);
+  }
+
+  private parkIntentUnsafe(state: RegistryState, sessionId: string): ParkIntentRecord | undefined {
+    return state.runtimeRecords.records.park_intents?.find((candidate) => candidate.sessionId === sessionId);
+  }
+
+  private assertRetentionFenceToken(sessionId: string, operationId: string, token: string): SessionRetentionFenceLease {
+    const lease = this.retentionFences.get(sessionId);
+    if (lease === undefined || lease.operationId !== operationId || lease.token !== token) {
+      throw retentionFailure("FENCE_REJECTED", "Retention fence token is absent or stale", { sessionId, operationId });
+    }
+    return lease;
+  }
+
+  private assertRetentionFenceUnsafe(state: RegistryState, sessionId: string, lease: SessionRetentionFenceLease): void {
+    const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+    if (session?.state !== "active") {
+      throw new SessionRegistryError("SESSION_NOT_ACTIVE", "Session is no longer active under its retention fence", {
+        sessionId,
+        state: session?.state ?? "missing",
+      });
+    }
+    const intent = this.parkIntentUnsafe(state, sessionId);
+    if (
+      intent === undefined ||
+      intent.operationId !== lease.operationId ||
+      intent.admissionEpoch !== lease.admissionEpoch ||
+      intent.expectedClaimSetGeneration !== lease.expectedClaimSetGeneration
+    ) {
+      throw retentionFailure("FENCE_REJECTED", "Durable park intent is absent or changed", {
+        sessionId,
+        operationId: lease.operationId,
+      });
+    }
+    const admission = this.retentionAdmissionUnsafe(state, sessionId);
+    if (admission.admission !== "closed" || admission.runtime_epoch !== lease.admissionEpoch) {
+      throw retentionFailure("FENCE_REJECTED", "Retention launch-admission fence is stale", {
+        sessionId,
+        expectedAdmissionEpoch: lease.admissionEpoch,
+        actualAdmissionEpoch: admission.runtime_epoch,
+        admission: admission.admission,
+      });
+    }
+  }
+
+  private assertParkedRetentionUnsafe(
+    state: RegistryState,
+    sessionId: string,
+    supplied: SessionRetentionRecord,
+  ): SessionRecord {
+    const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+    const persisted = this.retentionRecordUnsafe(state, sessionId);
+    if (session === undefined || session.state !== "parked" || persisted === undefined) {
+      throw retentionFailure("SESSION_NOT_PARKED", "Session has no authoritative parked retention", { sessionId });
+    }
+    if (!sameRetentionRecord(persisted, supplied)) {
+      throw new SessionRegistryError("STALE_CLAIM_SET", "Retention record changed before resume", { sessionId });
+    }
+    const admission = this.retentionAdmissionUnsafe(state, sessionId);
+    if (
+      admission.admission !== "closed" ||
+      state.claims.some((claim) => claim.sessionId === sessionId) ||
+      persisted.repositoryId !== session.repositoryId ||
+      persisted.physicalIdentity.worktreeId !== session.worktreeId ||
+      persisted.physicalIdentity.worktreePath !== session.worktreePath ||
+      persisted.physicalIdentity.branchId !== session.branchId ||
+      persisted.physicalIdentity.branchName !== session.branchName
+    ) {
+      throw retentionFailure("RETENTION_STEP_FAILED", "Parked ownership is inconsistent", { sessionId });
+    }
+    return session;
+  }
+
+  private retainedClaimsForSession(
+    session: SessionRecord,
+    desiredClaims: readonly RetainedClaimIntent[],
+    state: RegistryState,
+  ): readonly ResourceClaim[] {
+    if (!Array.isArray(desiredClaims)) {
+      throw retentionFailure("INVALID_INPUT", "Retained desired claims are malformed", {
+        sessionId: session.sessionId,
+      });
+    }
+    const owner: ClaimOwner = { ...session, state: "active", record: session };
+    const canonical = this.canonicalClaimInputs(
+      desiredClaims.map((claim) => ({ resource: claim.resource, mode: claim.mode })),
+      owner,
+      true,
+    );
+    if (
+      canonical.length !== desiredClaims.length ||
+      canonical.some(
+        (claim, index) =>
+          claim.resource !== desiredClaims[index]?.resource || claim.mode !== desiredClaims[index]?.mode,
+      )
+    ) {
+      throw retentionFailure("INVALID_INPUT", "Retained claims are not in canonical order or form", {
+        sessionId: session.sessionId,
+      });
+    }
+    const timestamp = toTimestamp(this.clock());
+    return Object.freeze(canonical.map((claim) => createResourceClaim(claim, owner, timestamp)));
+  }
+
+  private validateRetentionExternalScope(
+    session: SessionRecord | undefined,
+    pin: PinnedWorktreeProfile | undefined,
+    input: unknown,
+    desiredClaims: readonly RetainedClaimIntent[],
+  ):
+    | { readonly accepted: true; readonly value: ReturnType<typeof parseImplementationExecutionScope> }
+    | { readonly accepted: false; readonly reason: string; readonly details?: Readonly<Record<string, unknown>> } {
+    if (session === undefined || pin === undefined || session.workingSet === undefined) {
+      return { accepted: false, reason: "Resume requires a pinned profile and persisted Effective Working Set" };
+    }
+    let external: ReturnType<typeof parseImplementationExecutionScope>;
+    try {
+      external = parseImplementationExecutionScope(input);
+    } catch (error: unknown) {
+      return {
+        accepted: false,
+        reason: "Latest external execution scope is unavailable or invalid",
+        details: { reason: error instanceof Error ? error.message.slice(0, 200) : "unknown" },
+      };
+    }
+    const workingSet = session.workingSet;
+    if (
+      external.repository.repositoryHost !== workingSet.repository.repositoryHost ||
+      external.repository.repositoryId !== workingSet.repository.repositoryId ||
+      external.base.branch !== workingSet.base.branch ||
+      external.base.revision !== workingSet.base.revision ||
+      (external.base.freshness !== undefined &&
+        workingSet.base.freshness !== undefined &&
+        external.base.freshness !== workingSet.base.freshness)
+    ) {
+      return {
+        accepted: false,
+        reason: "Latest external scope repository/base does not match the persisted Effective Working Set",
+        details: { sessionId: session.sessionId },
+      };
+    }
+    const approvedScopes = [
+      ["READONLY", workingSet.scope.readOnly],
+      ["WRITE", workingSet.scope.write],
+      ["CREATE", workingSet.scope.create],
+      ["DELETE", workingSet.scope.delete],
+    ] as const;
+    for (const [operation, selectors] of approvedScopes) {
+      for (const pathValue of selectors) {
+        if (pathValue.includes("*") || pathValue.includes("?")) {
+          return {
+            accepted: false,
+            reason: "A persisted Effective Working Set glob cannot be proven within the current external scope",
+            details: { sessionId: session.sessionId, operation, path: pathValue },
+          };
+        }
+        const profileDecision = decideFilesystemScopePermission({
+          scope: pin.resolved.filesystem,
+          operation,
+          path: pathValue,
+        });
+        const workingSetDecision = decideFilesystemScopePermission({
+          scope: workingSet.scope,
+          operation,
+          path: pathValue,
+        });
+        const externalDecision = decideFilesystemScopePermission({
+          scope: external.scope,
+          operation,
+          path: pathValue,
+        });
+        if (!profileDecision.allowed || !workingSetDecision.allowed || !externalDecision.allowed) {
+          return {
+            accepted: false,
+            reason:
+              "A persisted Effective Working Set operation is outside the pinned or latest external filesystem scope",
+            details: {
+              sessionId: session.sessionId,
+              operation,
+              path: pathValue,
+              profile: profileDecision.reason,
+              workingSet: workingSetDecision.reason,
+              external: externalDecision.reason,
+            },
+          };
+        }
+      }
+    }
+    for (const claim of desiredClaims) {
+      if (claim.resource.includes("*") || claim.resource.includes("?")) {
+        return {
+          accepted: false,
+          reason: "A retained glob claim cannot be proven within the current external scope",
+          details: { sessionId: session.sessionId, resource: claim.resource },
+        };
+      }
+      const operation = claim.mode === "read" ? "READONLY" : "WRITE";
+      const profileDecision = decideFilesystemScopePermission({
+        scope: pin.resolved.filesystem,
+        operation,
+        path: claim.resource,
+      });
+      const workingSetDecision = decideFilesystemScopePermission({
+        scope: workingSet.scope,
+        operation,
+        path: claim.resource,
+      });
+      const externalDecision = decideFilesystemScopePermission({
+        scope: external.scope,
+        operation,
+        path: claim.resource,
+      });
+      if (!profileDecision.allowed || !workingSetDecision.allowed || !externalDecision.allowed) {
+        return {
+          accepted: false,
+          reason: "A retained claim is outside the pinned, approved, or latest external filesystem scope",
+          details: {
+            sessionId: session.sessionId,
+            resource: claim.resource,
+            mode: claim.mode,
+            profile: profileDecision.reason,
+            workingSet: workingSetDecision.reason,
+            external: externalDecision.reason,
+          },
+        };
+      }
+    }
+    return { accepted: true, value: external };
+  }
+
   /** Close launch admission and advance runtime_epoch atomically. */
   closeSessionLaunchAdmission(sessionId: string, expectedEpoch: number): { runtimeEpoch: number } {
     return this.withLock(() => {
       assertSessionId(sessionId);
       const state = this.readStateUnsafe();
+      this.assertNoParkIntentUnsafe(state, sessionId);
       if (!state.sessions.some((session) => session.sessionId === sessionId)) {
         throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
       }
@@ -4975,6 +5948,7 @@ export class SessionRegistry {
         });
       const candidates = assessments.filter((assessment) => assessment.suspicion !== "none");
       const eligible = assessments.filter((assessment) => {
+        if (this.parkIntentUnsafe(state, assessment.sessionId) !== undefined) return false;
         if (assessment.terminalOperation === "discard") return false;
         // Eligibility is evaluated from the GC authority's own bounded
         // evidence. Full cleanup blockers are applied by the existing
@@ -4996,7 +5970,24 @@ export class SessionRegistry {
         return false;
       });
 
-      const blocked: GarbageCollectBlocked[] = [];
+      const blocked: GarbageCollectBlocked[] = candidates.flatMap((candidate) => {
+        const intent = this.parkIntentUnsafe(state, candidate.sessionId);
+        if (intent === undefined) return [];
+        return [
+          toGarbageCollectBlocked(
+            candidate.sessionId,
+            new SessionRegistryError(
+              "OPERATION_REJECTED",
+              "Garbage collection cannot bypass a durable in-progress park intent",
+              {
+                sessionId: candidate.sessionId,
+                operationId: intent.operationId,
+                safeActions: ["retry-park"],
+              },
+            ),
+          ),
+        ];
+      });
       if (!apply) {
         for (const candidate of eligible) {
           const current = records.find((record) => record.sessionId === candidate.sessionId);
@@ -5092,6 +6083,8 @@ export class SessionRegistry {
     retryOverride?: boolean,
     approvalWitness?: string,
   ): CloseSessionResult | DiscardSessionResult {
+    const state = this.readStateUnsafe();
+    this.assertNoParkIntentUnsafe(state, sessionId);
     const requiredDiscardWitness = (): string => {
       if (typeof approvalWitness !== "string" || approvalWitness.length === 0) {
         throw new SessionRegistryError("OPERATION_REJECTED", "Discard requires an explicit approval witness", {
@@ -5102,7 +6095,6 @@ export class SessionRegistry {
       return approvalWitness;
     };
     if (operation === "discard") requiredDiscardWitness();
-    const state = this.readStateUnsafe();
     const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (record === undefined) {
       throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
@@ -5451,6 +6443,7 @@ export class SessionRegistry {
     sessionId: string,
     operation: SessionDrainFinalization["operation"],
   ): SessionAdmissionRecord | undefined {
+    if (operation !== "release-claims") this.assertNoParkIntentUnsafe(state, sessionId);
     const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
       (candidate) => candidate.session_id === sessionId,
     );
@@ -5508,6 +6501,21 @@ export class SessionRegistry {
     }
     this.assertOwnedExecutionsEmptyUnsafe(state, sessionId);
     return admission;
+  }
+
+  private assertNoParkIntentUnsafe(state: RegistryState, sessionId: string): void {
+    const intent = this.parkIntentUnsafe(state, sessionId);
+    if (intent !== undefined) {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "Lifecycle cleanup cannot bypass a durable in-progress park intent",
+        {
+          sessionId,
+          operationId: intent.operationId,
+          safeActions: ["retry-park"],
+        },
+      );
+    }
   }
 
   private assertOwnedExecutionsEmptyUnsafe(state: RegistryState, sessionId: string): void {
@@ -6006,6 +7014,13 @@ export class SessionRegistry {
         );
     let closingRecords = replaceRecord(records, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
+    const closingRuntimeRecords =
+      record.state === "parked"
+        ? withRetentions(
+            state.runtimeRecords,
+            (state.runtimeRecords.records.retentions ?? []).filter((retention) => retention.sessionId !== sessionId),
+          )
+        : state.runtimeRecords;
     if (!resuming) {
       this.writeUnsafe(
         closingRecords,
@@ -6013,7 +7028,7 @@ export class SessionRegistry {
         state.claimSetGeneration,
         nextRegistryRevision(state),
         state.runtimeEpoch,
-        state.runtimeRecords,
+        closingRuntimeRecords,
       );
     }
 
@@ -6073,7 +7088,7 @@ export class SessionRegistry {
         claimSetGeneration,
         nextRegistryRevision(this.readStateUnsafe()),
         state.runtimeEpoch,
-        state.runtimeRecords,
+        closingRuntimeRecords,
       );
     } catch (error: unknown) {
       throw this.cleanupFailure(error, closingRecord, cleanupOperation);
@@ -6131,7 +7146,12 @@ export class SessionRegistry {
         { sessionId, state: record.state, safeActions: ["retry-close", "retain-session"] },
       );
     }
-    if (record.state !== "active" && record.state !== "stale" && record.state !== "closing") {
+    if (
+      record.state !== "active" &&
+      record.state !== "stale" &&
+      record.state !== "closing" &&
+      record.state !== "parked"
+    ) {
       throw new SessionRegistryError("STALE_REGISTRY", `Session cannot be discarded while ${record.state}`, {
         sessionId,
         state: record.state,
@@ -6174,6 +7194,13 @@ export class SessionRegistry {
         );
     let closingRecords = resuming ? state.sessions : replaceRecord(state.sessions, closingRecord);
     validateRecords(closingRecords, this.repository.repositoryId);
+    const closingRuntimeRecords =
+      record.state === "parked"
+        ? withRetentions(
+            state.runtimeRecords,
+            (state.runtimeRecords.records.retentions ?? []).filter((retention) => retention.sessionId !== sessionId),
+          )
+        : state.runtimeRecords;
     if (!resuming) {
       this.writeUnsafe(
         closingRecords,
@@ -6181,7 +7208,7 @@ export class SessionRegistry {
         state.claimSetGeneration,
         nextRegistryRevision(state),
         state.runtimeEpoch,
-        state.runtimeRecords,
+        closingRuntimeRecords,
       );
     }
 
@@ -6233,7 +7260,7 @@ export class SessionRegistry {
         claimSetGeneration,
         nextRegistryRevision(this.readStateUnsafe()),
         state.runtimeEpoch,
-        state.runtimeRecords,
+        closingRuntimeRecords,
       );
     } catch (error: unknown) {
       throw this.cleanupFailure(error, closingRecord, "discard");
@@ -6363,12 +7390,29 @@ export class SessionRegistry {
   private cleanupDecisionUnsafe(record: SessionRecord, state: RegistryState): CleanupDecision {
     let physicalState = "unavailable";
     let blockers: readonly CleanupBlocker[] = [];
-    try {
-      const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
-      physicalState = inspectWorktreeState(record.worktreePath, worktrees).kind;
-      this.inspectCleanupResources(record, worktrees);
-    } catch (error: unknown) {
-      blockers = [toCleanupBlocker(error)];
+    const parkIntent = this.parkIntentUnsafe(state, record.sessionId);
+    if (parkIntent !== undefined) {
+      blockers = [
+        toCleanupBlocker(
+          new SessionRegistryError(
+            "OPERATION_REJECTED",
+            "Session cleanup cannot bypass a durable in-progress park intent",
+            {
+              sessionId: record.sessionId,
+              operationId: parkIntent.operationId,
+              safeActions: ["retry-park"],
+            },
+          ),
+        ),
+      ];
+    } else {
+      try {
+        const worktrees = listGitWorktrees(this.git, this.repository.worktreePath);
+        physicalState = inspectWorktreeState(record.worktreePath, worktrees).kind;
+        this.inspectCleanupResources(record, worktrees);
+      } catch (error: unknown) {
+        blockers = [toCleanupBlocker(error)];
+      }
     }
     const claims = state.claims.filter((claim) => claim.sessionId === record.sessionId).map(cloneResourceClaim);
     const recoveryHints = sortStrings(blockers.flatMap((blocker) => blocker.recoveryHints));
@@ -10640,6 +11684,7 @@ function parseRegistry(
       "pinned_profiles",
       "runtime_sessions",
       "executions",
+      "park_intents",
       "retentions",
       "recent_events",
       "file_operations",
@@ -10712,6 +11757,7 @@ function parseRegistry(
   if (!hasClaimsSchema) {
     // v0.1.0 had no claim section. It is a deterministic empty claim set,
     // materialized on the next locked mutation or via migrate().
+    validateRetentionOwnership(records, [], runtimeRecords, expectedRepositoryId, claimSetGeneration);
     return {
       registrySchemaVersion,
       registryRevision,
@@ -10753,6 +11799,7 @@ function parseRegistry(
     coordinationFacts,
     claimSetGeneration,
   );
+  validateRetentionOwnership(records, claims, runtimeRecords, expectedRepositoryId, claimSetGeneration);
   return {
     registrySchemaVersion,
     registryRevision,
@@ -10764,6 +11811,92 @@ function parseRegistry(
     legacyClaimsAbsent: false,
     ...(isLegacyClaimSchema ? { legacyClaimsSchemaVersion: LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION } : {}),
   };
+}
+
+function validateRetentionOwnership(
+  sessions: readonly SessionRecord[],
+  claims: readonly ResourceClaim[],
+  runtimeRecords: ParsedRuntimeRecords,
+  repositoryId: string,
+  claimSetGeneration: number,
+): void {
+  const retentions = (runtimeRecords.records.retentions ?? []) as readonly SessionRetentionRecord[];
+  const retentionBySession = new Map<string, SessionRetentionRecord>();
+  const sessionById = new Map(sessions.map((session) => [session.sessionId, session]));
+  const admissions = new Map(
+    (runtimeRecords.records.runtime_sessions ?? []).map((candidate) => {
+      const admission = parseSessionAdmissionRecord(candidate);
+      return [admission.session_id, admission] as const;
+    }),
+  );
+  const pins = new Map<string, PinnedWorktreeProfile>();
+  for (const value of runtimeRecords.records.pinned_profiles ?? []) {
+    if (typeof value.session_id !== "string") continue;
+    try {
+      pins.set(value.session_id, parsePinnedProfileRecord(value));
+    } catch {
+      // The profile parser reports the owning registry corruption at its consumer.
+    }
+  }
+  for (const retention of retentions) {
+    const session = sessionById.get(retention.sessionId);
+    if (
+      retention.state !== "parked" ||
+      retention.repositoryId !== repositoryId ||
+      session === undefined ||
+      session.state !== "parked" ||
+      retentionBySession.has(retention.sessionId) ||
+      retention.physicalIdentity.repositoryId !== session.repositoryId ||
+      retention.physicalIdentity.worktreeId !== session.worktreeId ||
+      retention.physicalIdentity.worktreePath !== session.worktreePath ||
+      retention.physicalIdentity.branchId !== session.branchId ||
+      retention.physicalIdentity.branchName !== session.branchName
+    ) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Retention record does not match one parked session", {
+        sessionId: retention.sessionId,
+      });
+    }
+    const admission = admissions.get(retention.sessionId);
+    const pin = pins.get(retention.sessionId);
+    if (
+      admission?.admission !== "closed" ||
+      pin === undefined ||
+      retention.pinnedProfileDigest !== retentionIdentityDigest(pin) ||
+      claims.some((claim) => claim.sessionId === retention.sessionId)
+    ) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Parked retention ownership is incomplete", {
+        sessionId: retention.sessionId,
+      });
+    }
+    retentionBySession.set(retention.sessionId, retention);
+  }
+  for (const intent of runtimeRecords.records.park_intents ?? []) {
+    const session = sessionById.get(intent.sessionId);
+    const admission = admissions.get(intent.sessionId);
+    if (
+      session === undefined ||
+      session.state !== "active" ||
+      retentionBySession.has(intent.sessionId) ||
+      admission?.admission !== "closed" ||
+      admission.runtime_epoch !== intent.admissionEpoch ||
+      intent.expectedClaimSetGeneration > claimSetGeneration
+    ) {
+      throw new SessionRegistryError(
+        "REGISTRY_CORRUPT",
+        "Park intent does not match one active closed-admission session",
+        {
+          sessionId: intent.sessionId,
+        },
+      );
+    }
+  }
+  for (const session of sessions) {
+    if (session.state === "parked" && !retentionBySession.has(session.sessionId)) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Parked session has no retention record", {
+        sessionId: session.sessionId,
+      });
+    }
+  }
 }
 
 function parseClaimSetGeneration(value: unknown): number {
@@ -10810,6 +11943,26 @@ function withExecutions(
   return Object.freeze({
     requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "executions.v1"),
     records: Object.freeze({ ...runtimeRecords.records, executions: Object.freeze([...executions]) }),
+  });
+}
+
+function withRetentions(
+  runtimeRecords: ParsedRuntimeRecords,
+  retentions: readonly SessionRetentionRecord[],
+): ParsedRuntimeRecords {
+  return Object.freeze({
+    requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "retentions.v1"),
+    records: Object.freeze({ ...runtimeRecords.records, retentions: Object.freeze([...retentions]) }),
+  });
+}
+
+function withParkIntents(
+  runtimeRecords: ParsedRuntimeRecords,
+  parkIntents: readonly ParkIntentRecord[],
+): ParsedRuntimeRecords {
+  return Object.freeze({
+    requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "park-intents.v1"),
+    records: Object.freeze({ ...runtimeRecords.records, park_intents: Object.freeze([...parkIntents]) }),
   });
 }
 
@@ -11368,6 +12521,105 @@ function isTimestamp(value: string): boolean {
   return (
     ISO_TIMESTAMP_PATTERN.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value
   );
+}
+
+function assertRetentionOperationId(value: unknown): asserts value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 512 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw retentionFailure("INVALID_INPUT", "operationId must be a bounded non-empty string");
+  }
+}
+
+function retentionStepRejected(
+  code: RetentionStepRejection["code"],
+  reason: string,
+  details?: Readonly<Record<string, unknown>>,
+): RetentionStepRejection {
+  return Object.freeze({ accepted: false, code, reason, ...(details === undefined ? {} : { details }) });
+}
+
+function retentionValidationRejected(
+  code: "CLAIM_CONFLICT" | "STALE_CLAIM_SET" | "EXTERNAL_SCOPE_REJECTED",
+  reason: string,
+  details?: Readonly<Record<string, unknown>>,
+): ResumeValidationResult {
+  return Object.freeze({ accepted: false, code, reason, ...(details === undefined ? {} : { details }) });
+}
+
+function retentionCommitRejected(
+  input: Readonly<{ operationId: string }>,
+  code: "CLAIM_CONFLICT" | "STALE_CLAIM_SET",
+  reason: string,
+  details?: Readonly<Record<string, unknown>>,
+): RetentionCommitResult {
+  return Object.freeze({
+    status: "rejected",
+    operationId: input.operationId,
+    code,
+    reason,
+    ...(details === undefined ? {} : { details }),
+  });
+}
+
+function retentionFailure(
+  code: SessionRetentionErrorCode,
+  message: string,
+  details: Readonly<Record<string, unknown>> = {},
+): SessionRetentionError {
+  return new SessionRetentionError(code, message, details);
+}
+
+function retentionErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message.slice(0, 512) : "Retention authority rejected the operation";
+}
+
+function retentionErrorDetails(error: unknown): Readonly<Record<string, unknown>> | undefined {
+  if (error instanceof SessionRegistryError || error instanceof SessionRetentionError) return error.details;
+  if (error !== null && typeof error === "object" && "details" in error && isRecordValue(error.details)) {
+    return error.details;
+  }
+  return undefined;
+}
+
+function sameRetentionPhysicalIdentity(left: SessionPhysicalIdentity, right: SessionPhysicalIdentity): boolean {
+  return (
+    left.repositoryId === right.repositoryId &&
+    left.worktreeId === right.worktreeId &&
+    left.worktreePath === right.worktreePath &&
+    left.branchId === right.branchId &&
+    left.branchName === right.branchName
+  );
+}
+
+function sameRetentionRecord(left: SessionRetentionRecord, right: SessionRetentionRecord): boolean {
+  try {
+    return retentionIdentityDigest(left) === retentionIdentityDigest(right);
+  } catch {
+    return false;
+  }
+}
+
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function isSafeRetentionDigest(value: string): boolean {
+  return /^[a-f0-9]{64}$/u.test(value);
+}
+
+function retentionResumeRequestDigest(
+  input: ResumeValidationInput,
+  external: ReturnType<typeof parseImplementationExecutionScope>,
+): string {
+  return retentionIdentityDigest({
+    operationId: input.operationId,
+    sessionId: input.sessionId,
+    snapshot: input.snapshot,
+    retention: input.retention,
+    physicalIdentity: input.physicalIdentity,
+    pinnedProfileDigest: input.pinnedProfileDigest,
+    desiredClaims: input.desiredClaims,
+    latestExternalScope: external,
+  });
 }
 
 function isAbsolutePath(value: string): boolean {
