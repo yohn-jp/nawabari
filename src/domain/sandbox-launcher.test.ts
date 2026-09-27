@@ -8,7 +8,9 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { runCli } from "../cli.js";
+import { startControlServer } from "../control-server.js";
 import { LocalSessionBackend } from "./session-backend.js";
+import { compileSessionEnvironment, materializeSessionRuntimeDirectories } from "./session-environment.js";
 import {
   buildExplicitCompatibilityRuntimeProjection,
   compileSandboxInvocation,
@@ -95,8 +97,8 @@ function readyProbe(): SandboxProbe {
   };
 }
 
-function createRepository(): string {
-  const repository = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-sandbox-launcher-"));
+function createRepository(parent = os.tmpdir()): string {
+  const repository = fs.mkdtempSync(path.join(parent, "nawabari-sandbox-launcher-"));
   runGit(["init", "--quiet", "--initial-branch", "main", repository], repository);
   runGit(["config", "user.name", "Nawabari Tests"], repository);
   runGit(["config", "user.email", "tests@nawabari.invalid"], repository);
@@ -782,11 +784,12 @@ test("bounded Landlock scopes /tmp scratch access away from a worktree mounted u
     t.skip("bounded bubblewrap profile is Linux-only");
     return;
   }
-  const nodeExecutable = fs.realpathSync.native(process.execPath);
-  if (!["/nix/store/", "/usr/", "/run/current-system/"].some((root) => nodeExecutable.startsWith(root))) {
-    t.skip("the test Node executable is outside the fixed runtime profile");
+  const runtimeLayout = discoverSandboxRuntimeLayout();
+  if (runtimeLayout.landlock_helper == null) {
+    t.skip("Landlock helper is unavailable in the selected runtime profile");
     return;
   }
+  const landlockHelper = fs.realpathSync.native(runtimeLayout.landlock_helper);
 
   const repository = createRepository();
   const worktree = `${repository}-owned`;
@@ -825,7 +828,12 @@ test("bounded Landlock scopes /tmp scratch access away from a worktree mounted u
       profile: { id: "bounded-tmp-test", version: "1" },
       requirements: [],
       filesystem: [
-        { source: nodeExecutable, target: nodeExecutable, access_mode: "read-only", provenance: "runtime-profile" },
+        {
+          source: path.dirname(landlockHelper),
+          target: "/runtime/landlock",
+          access_mode: "read-only",
+          provenance: "runtime-profile",
+        },
       ],
       executables: [],
       working_set: workingSet.value,
@@ -836,7 +844,7 @@ test("bounded Landlock scopes /tmp scratch access away from a worktree mounted u
     const compiled = compileSandboxInvocation(
       {
         ...request,
-        landlock_executable: nodeExecutable,
+        landlock_executable: landlockHelper,
         landlock_abi: 3,
         landlock_state: "available",
         landlock_required: true,
@@ -1227,6 +1235,198 @@ test("a protected session runs with a private root/tmp/proc view and only its ow
   } finally {
     removeWorktree(repository, worktree);
     fs.rmSync(sibling, { recursive: true, force: true });
+    fs.rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("compiled protected execution keeps a worktree under /tmp visible and hides the host Control credential", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("compiled bubblewrap profile is Linux-only");
+    return;
+  }
+  const layout = discoverSandboxRuntimeLayout();
+  if (layout.bubblewrap === null) {
+    t.skip("bubblewrap is unavailable in this test environment");
+    return;
+  }
+
+  const repository = createRepository("/tmp");
+  const worktree = `${repository}-owned`;
+  const sibling = `${repository}-sibling-secret`;
+  const fallbackCredentialDirectory = path.join("/tmp", `nawabari-control-fallback-${process.pid}-${Date.now()}`);
+  const fallbackCredentialFile = path.join(fallbackCredentialDirectory, "credential");
+  const environmentRoot = `${repository}-environment`;
+  let controlServer: { readonly credentialFile: string; close(): Promise<void> } | undefined;
+  try {
+    fs.mkdirSync(sibling, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(sibling, "secret.txt"), "host sibling\n", { mode: 0o600 });
+    fs.mkdirSync(fallbackCredentialDirectory, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(fallbackCredentialFile, "fallback credential sentinel\n", { mode: 0o600 });
+
+    const started = await startControlServer({
+      port: 0,
+      backend: new LocalSessionBackend(),
+      catalogPath: path.join(environmentRoot, "control-repositories.json"),
+    });
+    assert.equal(started.ok, true, started.ok ? "" : JSON.stringify(started.error));
+    if (!started.ok) return;
+    controlServer = started.value;
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    assert.notEqual(uid, null);
+    const runtimeDirectory = `/run/user/${uid}`;
+    let selectedCredentialRoot = "/tmp";
+    try {
+      const runtimeStat = fs.lstatSync(runtimeDirectory);
+      if (
+        runtimeStat.isDirectory() &&
+        !runtimeStat.isSymbolicLink() &&
+        runtimeStat.uid === uid &&
+        (runtimeStat.mode & 0o077) === 0
+      ) {
+        selectedCredentialRoot = runtimeDirectory;
+      }
+    } catch {
+      // Control Server uses the host temporary directory when no private
+      // per-user runtime directory is available.
+    }
+    assert.equal(path.dirname(path.dirname(controlServer.credentialFile)), selectedCredentialRoot);
+
+    const request = await resolvedRequest(repository, worktree, layout);
+    const profile = {
+      id: "compiled-tmp-worktree-test",
+      version: "1",
+      materialSelection: { profiles: ["base"], operations: [] },
+      filesystem: { readOnly: [], write: [], create: [], delete: [], deny: [], immutable: [] },
+      tools: [{ entrypoint: "node", provider: { id: "runtime", requirement_id: "node-runtime" } }],
+      shell: { entrypoint: "node" },
+      environment: {
+        home: "session",
+        xdg: { config: "session", cache: "session", data: "session", state: "session" },
+        tmp: "execution",
+      },
+      git: { config: "session-private", globalConfig: "excluded", credentialHelpers: "disabled", hooks: "disabled" },
+      execution: { policy: STRICT_RUNTIME_POLICY, processTracking: "required" },
+    };
+    const profileResult = validateWorktreeRuntimeProfile(profile);
+    assert.equal(profileResult.ok, true, profileResult.ok ? "" : JSON.stringify(profileResult.error));
+    if (!profileResult.ok) return;
+    const compiled = compileSessionEnvironment(profile, {
+      session_id: request.session_id,
+      execution_id: `compiled-tmp-${process.pid}-${Date.now()}`,
+      session_root: path.join(environmentRoot, "session"),
+      execution_root: path.join(environmentRoot, "execution"),
+      owner_uid: typeof process.getuid === "function" ? process.getuid() : 0,
+      owner_gid: typeof process.getgid === "function" ? process.getgid() : 0,
+      term: "xterm-256color",
+    });
+    assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
+    if (!compiled.ok) return;
+    const materialized = materializeSessionRuntimeDirectories(compiled.value.manifest);
+    assert.equal(materialized.ok, true, materialized.ok ? "" : JSON.stringify(materialized.error));
+    if (!materialized.ok) return;
+    fs.writeFileSync(path.join(compiled.value.manifest.execution.tmp.path, "host-marker"), "private tmp\n");
+
+    const credentialFile = controlServer.credentialFile;
+    const nodeExecutable = fs.realpathSync.native(process.execPath);
+    const runtimeFilesystem: Array<Record<string, unknown>> = [
+      {
+        source: path.dirname(nodeExecutable),
+        target: "/runtime/node",
+        access_mode: "read-only",
+        provenance: "runtime-profile",
+      },
+    ];
+    const systemRoots: string[] = [];
+    for (const candidate of [layout.nix_store, layout.usr, layout.bin, layout.lib, layout.lib64]) {
+      if (candidate === null) continue;
+      const root = fs.realpathSync.native(candidate);
+      if (systemRoots.some((parent) => root === parent || root.startsWith(`${parent}${path.sep}`))) continue;
+      systemRoots.push(root);
+    }
+    for (const root of systemRoots) {
+      runtimeFilesystem.push({
+        source: root,
+        target: root,
+        access_mode: "read-only",
+        provenance: "runtime-profile",
+      });
+    }
+    const runtimeProjection = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "compiled-tmp-worktree-test", version: "1" },
+      requirements: [{ id: "node-runtime", kind: "runtime", name: "node", version: ">=24" }],
+      filesystem: runtimeFilesystem,
+      executables: [
+        {
+          name: "node",
+          target: "/runtime/node/node",
+          provider: { id: "runtime", requirement_id: "node-runtime" },
+          provenance: "runtime-profile",
+        },
+      ],
+    });
+    assert.equal(runtimeProjection.ok, true, runtimeProjection.ok ? "" : JSON.stringify(runtimeProjection.error));
+    if (!runtimeProjection.ok) return;
+    const compiledRequest = {
+      ...request,
+      runtime_projection: runtimeProjection.value,
+      compiled_session_environment: compiled.value,
+    };
+    const args = [
+      "-e",
+      [
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        "const [worktree, controlCredential, fallbackCredential, sibling] = process.argv.slice(1);",
+        "if (process.cwd() !== worktree || process.env.TMPDIR !== '/tmp') process.exit(10);",
+        "if (!fs.existsSync(path.join(worktree, 'README.md')) || !fs.existsSync('/tmp/host-marker')) process.exit(11);",
+        "for (const secret of [controlCredential, fallbackCredential, path.join(sibling, 'secret.txt')]) if (fs.existsSync(secret)) process.exit(12);",
+        "fs.writeFileSync(path.join(worktree, 'sandbox-write.txt'), 'compiled');",
+        "fs.writeFileSync('/tmp/sandbox-write.txt', 'private');",
+      ].join(" "),
+      worktree,
+      credentialFile,
+      fallbackCredentialFile,
+      sibling,
+    ];
+    const invocation = compileSandboxInvocation(compiledRequest, { command: "node", args });
+    assert.equal(invocation.ok, true, invocation.ok ? "" : JSON.stringify(invocation.error));
+    if (!invocation.ok) return;
+    const tmpBind = invocation.value.args.findIndex(
+      (value, index, values) =>
+        value === "--bind" &&
+        values[index + 1] === compiled.value.manifest.execution.tmp.path &&
+        values[index + 2] === "/tmp",
+    );
+    const worktreeBind = invocation.value.args.findIndex(
+      (value, index, values) => value === "--bind" && values[index + 1] === worktree && values[index + 2] === worktree,
+    );
+    assert.notEqual(tmpBind, -1, "the per-execution tmp directory is mounted at logical /tmp");
+    assert.notEqual(worktreeBind, -1, "the exact managed worktree is mounted at its host path");
+    assert.ok(tmpBind < worktreeBind, "the later worktree mount remains visible below /tmp");
+    assert.equal(
+      invocation.value.args.some(
+        (value, index, values) => value === "--bind" && values[index + 1] === "/tmp" && values[index + 2] === "/tmp",
+      ),
+      false,
+      "host /tmp is not broadly mounted",
+    );
+
+    const result = await runSandboxedCommand(compiledRequest, { command: "node", args });
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+    if (!result.ok) return;
+    assert.equal(result.value.exit_code, 0, JSON.stringify(result.value));
+    assert.equal(fs.readFileSync(path.join(worktree, "sandbox-write.txt"), "utf8"), "compiled");
+    assert.equal(
+      fs.readFileSync(path.join(compiled.value.manifest.execution.tmp.path, "sandbox-write.txt"), "utf8"),
+      "private",
+    );
+  } finally {
+    if (controlServer !== undefined) await controlServer.close();
+    removeWorktree(repository, worktree);
+    fs.rmSync(fallbackCredentialDirectory, { recursive: true, force: true });
+    fs.rmSync(sibling, { recursive: true, force: true });
+    fs.rmSync(`${repository}-environment`, { recursive: true, force: true });
     fs.rmSync(repository, { recursive: true, force: true });
   }
 });
