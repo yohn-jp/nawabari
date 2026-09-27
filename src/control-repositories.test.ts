@@ -33,7 +33,7 @@ function repository(root: string, name: string, managed: boolean): string {
 }
 
 type RegistrationChildMessage = Readonly<{
-  readonly type: "started" | "publication" | "result";
+  readonly type: "publication" | "contended" | "result";
   readonly ok?: boolean;
   readonly repository_id?: string;
   readonly code?: string;
@@ -42,14 +42,16 @@ type RegistrationChildMessage = Readonly<{
 function startRegistrationChild(
   catalog: string,
   cwd: string,
-  stallPublication = false,
+  options: { readonly stallPublication?: boolean; readonly observeContention?: boolean } = {},
 ): {
   readonly child: ChildProcess;
   readonly messages: RegistrationChildMessage[];
   readonly stderr: () => string;
   readonly waitFor: (type: RegistrationChildMessage["type"], timeoutMs?: number) => Promise<RegistrationChildMessage>;
   readonly waitForExit: () => Promise<number>;
+  readonly releasePublication: () => void;
 } {
+  const { stallPublication = false, observeContention = false } = options;
   const importUrl = new URL("./control-repositories.ts", import.meta.url).href;
   const source = `
     import fs from "node:fs";
@@ -63,13 +65,29 @@ function startRegistrationChild(
       fs.renameSync = ((source, destination) => {
         if (path.resolve(String(destination)) === path.resolve(catalog)) {
           process.send?.({ type: "publication" });
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_200);
+          const release = Buffer.alloc(1);
+          if (fs.readSync(4, release, 0, 1, null) !== 1) throw new Error("publication barrier closed before release");
         }
         return rename.call(fs, source, destination);
       });
     }
+    if (${JSON.stringify(observeContention)}) {
+      const mkdir = fs.mkdirSync;
+      fs.mkdirSync = ((directory, ...args) => {
+        try {
+          return mkdir.call(fs, directory, ...args);
+        } catch (error) {
+          if (
+            path.resolve(String(directory)) === path.resolve(catalog + ".lock") &&
+            typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST"
+          ) {
+            process.send?.({ type: "contended" });
+          }
+          throw error;
+        }
+      });
+    }
 
-    process.send?.({ type: "started" });
     const result = registerRepositoryLocator(catalog, cwd);
     process.send?.({
       type: "result",
@@ -81,8 +99,9 @@ function startRegistrationChild(
   `;
   const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", source], {
     cwd: process.cwd(),
-    stdio: ["ignore", "ignore", "pipe", "ipc"],
+    stdio: ["ignore", "ignore", "pipe", "ipc", "pipe"],
   });
+  const releasePipe = child.stdio[4] as NodeJS.WritableStream | null;
   const messages: RegistrationChildMessage[] = [];
   const waiters: {
     readonly type: RegistrationChildMessage["type"];
@@ -144,6 +163,11 @@ function startRegistrationChild(
       });
     },
     waitForExit: async () => (exitCode === null ? exited : exitCode),
+    releasePublication: () => {
+      if (releasePipe === null) throw new Error("publication release pipe is unavailable");
+      releasePipe.write(Buffer.from([1]));
+      releasePipe.end();
+    },
   };
 }
 
@@ -188,7 +212,7 @@ test("concurrent processes serialize catalog registration without losing either 
   const catalog = path.join(root, "state", "control-repositories.json");
   const first = repository(root, "first", true);
   const second = repository(root, "second", true);
-  const firstWriter = startRegistrationChild(catalog, first, true);
+  const firstWriter = startRegistrationChild(catalog, first, { stallPublication: true });
   t.after(() => {
     if (firstWriter.child.exitCode === null) firstWriter.child.kill("SIGKILL");
   });
@@ -196,16 +220,17 @@ test("concurrent processes serialize catalog registration without losing either 
   await firstWriter.waitFor("publication");
   assert.equal(fs.existsSync(`${catalog}.lock/owner.json`), true);
 
-  const secondWriter = startRegistrationChild(catalog, second);
+  const secondWriter = startRegistrationChild(catalog, second, { observeContention: true });
   t.after(() => {
     if (secondWriter.child.exitCode === null) secondWriter.child.kill("SIGKILL");
   });
-  await secondWriter.waitFor("started");
-  const resultBeforeFirstPublishes = await secondWriter.waitFor("result", 200).then(
-    () => true,
-    () => false,
+  await secondWriter.waitFor("contended");
+  assert.equal(
+    secondWriter.messages.some((message) => message.type === "result"),
+    false,
+    "the second process cannot finish while the first writer holds the catalog lease",
   );
-  assert.equal(resultBeforeFirstPublishes, false, "the second process waits for the catalog writer lease");
+  firstWriter.releasePublication();
 
   const [firstResult, secondResult] = await Promise.all([
     firstWriter.waitFor("result"),
