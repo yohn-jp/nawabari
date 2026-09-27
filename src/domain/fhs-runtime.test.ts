@@ -365,6 +365,10 @@ test("FHS materialization fails closed when the inspected executable is replaced
 });
 
 test("a strict FHS projection executes its declared runtime and hides absolute-path host tools", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("bubblewrap FHS integration is Linux-only");
     return;

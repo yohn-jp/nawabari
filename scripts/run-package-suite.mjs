@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -142,7 +143,11 @@ function main() {
   fs.rmSync(tarballPath, { force: true });
 
   try {
+    const packStarted = performance.now();
     const packResult = run("pnpm", ["pack", "--json", "--pack-destination", repoRoot]);
+    console.log(
+      `verification package invocation: fresh_prepack_build=1 pack=1 pack_duration_ms=${Math.round(performance.now() - packStarted)}`,
+    );
     const packInfo = parsePackInfo(packResult.stdout);
     if (path.basename(packInfo.filename) !== tarballName) {
       throw new Error(`pnpm produced ${packInfo.filename}; expected ${tarballName}`);
@@ -173,9 +178,10 @@ function main() {
       artifact_sha256: artifact.sha256,
     };
     try {
+      const smokeStarted = performance.now();
       run(process.execPath, smokeArgs, { stdio: "inherit" });
       console.log(
-        `installed consumer evidence: ${JSON.stringify({ ...installedConsumerEvidence, outcome: "passed" })}`,
+        `installed consumer evidence: ${JSON.stringify({ ...installedConsumerEvidence, outcome: "passed", duration_ms: Math.round(performance.now() - smokeStarted) })}`,
       );
     } catch (error) {
       console.log(

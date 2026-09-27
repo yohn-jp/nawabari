@@ -476,6 +476,10 @@ test("doctor reports strict_ready false with an actionable reason when /usr exis
 });
 
 test("the default strict FHS projection keeps the development baseline functional without host visibility", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("strict FHS protected execution is Linux-only");
     return;

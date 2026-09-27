@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 import { resolveSandboxExecutionRequest } from "../dist/domain/sandbox.js";
@@ -317,9 +318,13 @@ async function main() {
     );
 
     console.log("installing packed tarball into isolated directory...");
+    const installStarted = performance.now();
     run("npm", ["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--no-save", tarballPath], {
       cwd: installDirectory,
     });
+    console.log(
+      `verification package invocation: npm_install=1 duration_ms=${Math.round(performance.now() - installStarted)}`,
+    );
 
     const scope = packageName.startsWith("@") ? packageName.split("/")[0] : undefined;
     const installedPackageDirectory = scope

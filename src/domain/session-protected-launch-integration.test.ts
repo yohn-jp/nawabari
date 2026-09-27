@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { compileSessionEnvironment, materializeSessionRuntimeDirectories } from "./session-environment.js";
@@ -149,12 +149,18 @@ test("the protected compiler consumes the materialized environment and one canon
 });
 
 test("the protected composition reaches the repaired worker on a supported runtime", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   const bwrap = "/run/current-system/sw/bin/bwrap";
   if (process.platform !== "linux" || !fs.existsSync(bwrap)) {
     t.skip("supported bubblewrap runtime is unavailable");
     return;
   }
-  const workerArtifact = fileURLToPath(new URL("./session-launch-supervisor-worker.js", import.meta.url));
+  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const supervisorArtifact = path.join(repositoryRoot, "dist", "domain", "session-launch-supervisor.js");
+  const workerArtifact = path.join(repositoryRoot, "dist", "domain", "session-launch-supervisor-worker.js");
   if (!fs.existsSync(workerArtifact)) {
     t.skip("compiled trusted supervisor worker artifact is unavailable in the source test run");
     return;
@@ -296,10 +302,12 @@ test("the protected composition reaches the repaired worker on a supported runti
       {
         materializeSessionRuntimeDirectories,
         compileSandboxInvocation,
-        runSessionLaunchSupervisor: (packet) =>
-          import("./session-launch-supervisor.js").then(({ runSessionLaunchSupervisor }) =>
-            runSessionLaunchSupervisor(packet),
-          ),
+        runSessionLaunchSupervisor: async (packet) => {
+          const { runSessionLaunchSupervisor } = (await import(
+            pathToFileURL(supervisorArtifact).href
+          )) as typeof import("./session-launch-supervisor.js");
+          return runSessionLaunchSupervisor(packet);
+        },
         persist_execution: async (record) => {
           records.push(record as SessionExecutionRecord);
         },
@@ -326,7 +334,7 @@ test("the protected composition reaches the repaired worker on a supported runti
     assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
     if (!result.ok) return;
     assert.equal(result.value.supervisor.status, "completed");
-    assert.equal(result.value.result?.stdout, "worker-ok");
+    assert.equal(result.value.result?.stdout, "worker-ok", JSON.stringify(result.value));
     assert.equal(result.value.execution.state, "exited");
     assert.deepEqual(
       records.map((record) => record.state),

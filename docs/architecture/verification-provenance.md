@@ -25,6 +25,36 @@ Map every acceptance invariant to its owning lane and prerequisites; keep exhaus
 silently drop tests. Build/pack/install each exact artifact in its owning lane; avoid redundant builds inside unrelated tests.
 Standalone compiled/package runs still prepare their required fresh artifact.
 
+The executable lanes are:
+
+| Entry point                     | Owned proof and prerequisites                                                                                                                                                                              | Local and CI owner                                                                  |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `pnpm run test:fast`            | Environment-independent domain, state, and script tests; no build or protected runtime.                                                                                                                    | Local fast lane; included in `pnpm test` and the shared TypeScript workflow.        |
+| `pnpm run test:integration`     | Bounded repository, UI, registry, and application integration tests; no full build.                                                                                                                        | Local integration lane; included in `pnpm test` and the shared TypeScript workflow. |
+| `pnpm test`                     | Exhaustive discovered source/script suite. It records lane-owned compiled and Linux proofs as skipped with their owner command.                                                                            | Shared TypeScript workflow's ordinary test step and local aggregate tests.          |
+| `pnpm run test:compiled-worker` | One fresh normal build followed by the real compiled fd 4/5 package-entrypoint proof.                                                                                                                      | Shared workflow's canonical `conformance-script` input.                             |
+| `pnpm run test:linux:system`    | One fresh normal build followed by selected real bubblewrap/Landlock, FHS, filesystem, and cgroup/descendant proofs. A missing required capability or a skipped selected proof fails this lane as BLOCKED. | Delegated supported-Linux `linux-system-e2e` job.                                   |
+| `pnpm run test:package`         | One fresh build through `pnpm pack`/`prepack`, one pack, and one isolated installed-consumer smoke/install. Protected package gate uses the same owner with its required enforcement flag.                 | Package-contents job, local package gate, and protected full verification.          |
+
+The lane runner recursively discovers every `*.test.ts` under `src` and `*.test.mjs` under `scripts`, assigns each file to
+fast, integration, or Linux-system ownership, and prints the discovered/owned counts and invocation durations. New or
+unclassifiable test paths fail discovery. Exact compiled-worker and Linux-system test titles are separately enumerated;
+the runner checks each title remains present before selecting it. Ordinary test entry points exclude these exact titles
+through explicit lane guards at the start of each test; the dedicated owners enable the matching guard and select those
+titles through Node's native name filter. A capability-gated skip in the dedicated Linux lane fails that lane as BLOCKED,
+so aggregate-suite skips cannot stand in for positive physical evidence. The compiled-worker test consumes only the
+build prepared by its owning lane; it no longer builds from inside a test worker.
+
+`run-package-suite.mjs` relies on the package's `prepack` hook for its single fresh build, then reports pack and installed
+consumer durations. `smoke-test.mjs` reports the isolated npm install duration. The compiled and Linux-system runners
+report one build and one node-test invocation each, with durations. The shared workflow's tgrep, pnpm runtime, and UID
+handoff jobs remain independent because they exercise distinct runtime/package/identity boundaries.
+
+The package-contents job checks the source checkout's packed consumer; the release-build job repeats the package suite
+to retain and validate the exact release tarball. The Mottainai job repeats the protected package proof in its own UID
+handoff environment and passes that same tarball plus evidence to the handoff script without repacking. These remain
+separate artifact/identity boundaries even though each now obtains its one build through `prepack`.
+
 Do not repeat ordinary lint/typecheck/domain checks inside a delegated Linux lane merely because it calls the umbrella.
 Do preserve repeated scenarios when they prove different source/build/package/kernel boundaries, including UID handoff,
 tgrep, and pnpm conformance. Document that distinct purpose and measure invocation counts/duration before claiming savings.

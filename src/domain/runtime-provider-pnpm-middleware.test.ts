@@ -597,6 +597,10 @@ test("rejects a declared node executable that does not resolve to a materialized
 });
 
 test("the launcher transport stays isolated under a bounded real runtime with synthetic backend fixtures", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("bubblewrap profile is Linux-only");
     return;

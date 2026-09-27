@@ -5,10 +5,12 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const distDirectory = path.join(repoRoot, "dist");
+const buildStarted = performance.now();
 
 fs.rmSync(distDirectory, { recursive: true, force: true });
 for (const incrementalMetadata of ["tsconfig.tsbuildinfo", "tsconfig.build.tsbuildinfo"]) {
@@ -29,3 +31,4 @@ const chmod = spawnSync(process.execPath, [path.join(repoRoot, "scripts", "chmod
 });
 if (chmod.error !== undefined) throw chmod.error;
 if (chmod.status !== 0) process.exit(chmod.status ?? 1);
+console.log(`verification build: fresh_artifact=1 duration_ms=${Math.round(performance.now() - buildStarted)}`);
