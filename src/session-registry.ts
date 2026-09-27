@@ -4725,12 +4725,19 @@ export class SessionRegistry {
           : unregisteredMissingRecovery || interruptedCleanupRecovery
             ? "close"
             : "gc";
-      const result =
-        operation === "discard"
-          ? this.coordinateCleanupUnsafe("discard", sessionId)
-          : operation === "close"
-            ? this.coordinateCleanupUnsafe("close", sessionId)
-            : this.coordinateCleanupUnsafe("gc", sessionId);
+      // Persisted discard intent plus the independent recovery proof above is
+      // reconcileApply's authority. Bind the freshly observed recovery effect
+      // explicitly before entering the same final mutation path as confirmed
+      // application requests.
+      let result: CloseSessionResult | DiscardSessionResult;
+      if (operation === "discard") {
+        const discardRecoveryWitness = this.previewDiscardUnsafe(sessionId).approvalWitness;
+        result = this.coordinateCleanupUnsafe("discard", sessionId, undefined, undefined, discardRecoveryWitness);
+      } else if (operation === "close") {
+        result = this.coordinateCleanupUnsafe("close", sessionId);
+      } else {
+        result = this.coordinateCleanupUnsafe("gc", sessionId);
+      }
       const terminalSession = result.session;
       const releasedClaims = operation === "discard" ? (result as DiscardSessionResult).releasedClaims : ownedClaims;
       return {
@@ -4780,22 +4787,25 @@ export class SessionRegistry {
     sessionIdOrOptions: string | DiscardSessionOptions,
     finalization?: SessionDrainFinalization,
   ): DiscardSessionResult {
+    const requestedSessionId =
+      typeof sessionIdOrOptions === "string"
+        ? sessionIdOrOptions
+        : (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id ?? null);
+    if (requestedSessionId === null) {
+      throw new SessionRegistryError(
+        "SESSION_NOT_FOUND",
+        "Explicit session identity is required for discard; the current session is never inferred",
+      );
+    }
+    assertSessionId(requestedSessionId);
+    const suppliedApprovalWitness =
+      typeof sessionIdOrOptions === "string" ? undefined : sessionIdOrOptions.approvalWitness;
+    // Preserve the legacy direct registry entry while binding its approval
+    // before entering the final mutation lock. A concurrent effect change is
+    // rejected by discardUnsafe after the lock is acquired.
+    const approvalWitness = suppliedApprovalWitness ?? this.previewDiscard(requestedSessionId).approvalWitness;
     return this.withLock(() => {
-      const requestedSessionId =
-        typeof sessionIdOrOptions === "string"
-          ? sessionIdOrOptions
-          : (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id ?? null);
-      if (requestedSessionId === null) {
-        throw new SessionRegistryError(
-          "SESSION_NOT_FOUND",
-          "Explicit session identity is required for discard; the current session is never inferred",
-        );
-      }
-      assertSessionId(requestedSessionId);
       this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, requestedSessionId, "discard");
-      const approvalWitness =
-        (typeof sessionIdOrOptions === "string" ? undefined : sessionIdOrOptions.approvalWitness) ??
-        this.previewDiscardUnsafe(requestedSessionId).approvalWitness;
       return this.coordinateCleanupUnsafe("discard", requestedSessionId, undefined, undefined, approvalWitness);
     });
   }
@@ -5043,9 +5053,9 @@ export class SessionRegistry {
   private coordinateCleanupUnsafe(
     operation: "discard",
     sessionId: string,
-    evidence?: undefined,
-    retryOverride?: boolean,
-    approvalWitness?: string,
+    evidence: undefined,
+    retryOverride: boolean | undefined,
+    approvalWitness: string,
   ): DiscardSessionResult;
   private coordinateCleanupUnsafe(
     operation: "gc",
@@ -5060,6 +5070,16 @@ export class SessionRegistry {
     retryOverride?: boolean,
     approvalWitness?: string,
   ): CloseSessionResult | DiscardSessionResult {
+    const requiredDiscardWitness = (): string => {
+      if (typeof approvalWitness !== "string" || approvalWitness.length === 0) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Discard requires an explicit approval witness", {
+          sessionId,
+          reason: "discard-approval-required",
+        });
+      }
+      return approvalWitness;
+    };
+    if (operation === "discard") requiredDiscardWitness();
     const state = this.readStateUnsafe();
     const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (record === undefined) {
@@ -5128,7 +5148,7 @@ export class SessionRegistry {
           );
         },
         effect: () => {
-          if (operation === "discard") return this.discardUnsafe(sessionId, approvalWitness);
+          if (operation === "discard") return this.discardUnsafe(sessionId, requiredDiscardWitness());
           return this.closeUnsafe(
             sessionId,
             operation === "close" ? evidence : undefined,
@@ -6059,13 +6079,13 @@ export class SessionRegistry {
     };
   }
 
-  private discardUnsafe(sessionId: string, approvalWitness?: string): DiscardSessionResult {
+  private discardUnsafe(sessionId: string, approvalWitness: string): DiscardSessionResult {
     const state = this.readStateUnsafe();
     const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (record === undefined) {
       throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
     }
-    if (approvalWitness !== undefined && this.previewDiscardUnsafe(sessionId).approvalWitness !== approvalWitness) {
+    if (this.previewDiscardUnsafe(sessionId).approvalWitness !== approvalWitness) {
       throw new SessionRegistryError(
         "STALE_REGISTRY",
         "The discard preview changed before the final mutation; refresh and confirm the new destructive scope",

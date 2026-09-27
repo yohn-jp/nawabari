@@ -306,6 +306,36 @@ test("discard advances registry_revision once for each sequential persisted muta
   }
 });
 
+test("legacy direct discard rejects an effect change after capturing its approval", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-approval`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-approval" });
+    const before = persistedRegistryRevision(registry);
+    const previewDiscard = registry.previewDiscard.bind(registry);
+    registry.previewDiscard = (sessionIdOrOptions) => {
+      const preview = previewDiscard(sessionIdOrOptions);
+      fs.writeFileSync(path.join(worktreePath, "late.txt"), "changed after approval capture\n");
+      return preview;
+    };
+
+    assertRegistryError(() => registry.discard(session.sessionId), "STALE_REGISTRY");
+
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(fs.existsSync(path.join(worktreePath, "late.txt")), true);
+    assert.equal(
+      runGit(["show-ref", "--verify", "--quiet", "refs/heads/feature/discard-approval"], fixture.repositoryPath),
+      "",
+    );
+    assert.equal(persistedRegistryRevision(registry), before);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 test("multi-candidate garbage collection never reuses or regresses registry_revision", () => {
   const fixture = createRepositoryFixture();
   const worktreePaths = [`${fixture.repositoryPath}-gc-revision-1`, `${fixture.repositoryPath}-gc-revision-2`];

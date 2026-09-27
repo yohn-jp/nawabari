@@ -368,7 +368,7 @@ test("local backend accepts an unchanged discard witness and rejects a changed e
     const snapshot = await actions.readSessionActionSnapshot(identity);
     assert.equal(snapshot.ok, true);
     if (!snapshot.ok) return;
-    assert.ok(snapshot.value.diagnostic.next_actions.some((action) => action.action_id === "discard-session"));
+    assert.ok(snapshot.value.diagnostic.next_actions?.some((action) => action.action_id === "discard-session"));
 
     const previewed = await actions.dispatchSessionAction("discard-session", identity, snapshot.value.token, {
       confirmed: false,
