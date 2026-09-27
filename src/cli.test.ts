@@ -16,6 +16,7 @@ import {
 } from "./cli.js";
 import { machineContract } from "./contract.js";
 import { DomainError, failure, success } from "./domain/errors.js";
+import { SESSION_ACTION_IDS } from "./domain/session-actions.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import type {
   ClaimDeltasOptions,
@@ -944,6 +945,11 @@ test("canonical command registry resolves aliases without duplicating option def
       assert.equal(resolved.usage, canonical.usage.replace(canonical.name, alias));
     }
   }
+
+  const actionValues = resolveCliCommandDefinition("session action")?.options.find(
+    (option) => option.name === "--action",
+  )?.values;
+  assert.deepEqual(actionValues, SESSION_ACTION_IDS);
 
   assert.deepEqual(publicNames, [
     "session create",
