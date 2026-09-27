@@ -3,11 +3,20 @@ import { createHash } from "node:crypto";
 import type { CheckpointEvidence, GitCheckpointPaths } from "../operation-authorization.js";
 import {
   executeVerification,
+  executeSourceBoundVerification,
+  SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID,
+  SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA_VERSION,
   VERIFICATION_PROFILE_CONTRACT_ID,
   VERIFICATION_RESULT_SCHEMA_VERSION,
+  VERIFICATION_SOURCE_WITNESS_CONTRACT_ID,
+  VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
+  validateVerificationSourceWitness,
   type VerificationDiagnosticStream,
   type VerificationExecutorDependencies,
   type VerificationResult,
+  type SourceBoundVerificationResult,
+  type VerificationFilesystemPolicyFence,
+  type VerificationSourceWitness,
 } from "../verification-executor.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
@@ -23,6 +32,9 @@ export const FILESYSTEM_POLICY_EVIDENCE_SCHEMA_VERSION = 1 as const;
 /** Versioned identity for the serialized verifier envelope. */
 export const VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID = "nawabari.verification-execution-evidence.v1" as const;
 export const VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION = 1 as const;
+export const SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID =
+  "nawabari.verification-execution-evidence.v2" as const;
+export const SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION = 2 as const;
 
 const MAX_TEXT = 1_024;
 const MAX_POLICY_ID = 256;
@@ -131,6 +143,12 @@ export type VerificationExecutionEvidence = Readonly<{
   readonly contract_id: typeof VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID;
   /** The verifier result is nested under the explicit serialization key. */
   readonly verification: VerificationResult;
+}>;
+
+export type SourceBoundVerificationExecutionEvidence = Readonly<{
+  readonly schema_version: typeof SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION;
+  readonly contract_id: typeof SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID;
+  readonly verification: SourceBoundVerificationResult;
 }>;
 
 function invalid(field: string, reason: string, value?: string): DomainResult<never> {
@@ -904,6 +922,22 @@ export class VerificationExecutionAuthority {
       }),
     );
   }
+
+  public async executeSourceBoundEvidence(
+    profile: unknown,
+    request: SandboxExecutionRequest,
+    filesystemPolicyFence: VerificationFilesystemPolicyFence | undefined,
+  ): Promise<DomainResult<SourceBoundVerificationExecutionEvidence>> {
+    const result = await executeSourceBoundVerification(profile, request, filesystemPolicyFence, this.#dependencies);
+    if (!result.ok) return result;
+    return success(
+      Object.freeze({
+        schema_version: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+        contract_id: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+        verification: result.value,
+      }),
+    );
+  }
 }
 
 /** Serialize a verifier result only under the canonical `verification` key. */
@@ -924,6 +958,72 @@ export function serializeVerificationExecutionEvidence(input: unknown): DomainRe
   );
 }
 
+function validateSourceBoundVerificationResult(input: unknown): DomainResult<SourceBoundVerificationResult> {
+  if (!isRecord(input)) return invalid("verification", "expected a source-bound result object");
+  if (input.schema_version !== SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA_VERSION)
+    return invalid("verification.schema_version", "unsupported source-bound schema version");
+  if (input.contract_id !== SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID)
+    return invalid("verification.contract_id", "unsupported source-bound contract");
+  const verification = validateVerificationResult(input.verification);
+  if (!verification.ok) return verification;
+  if (input.status !== "passed" && input.status !== "failed" && input.status !== "unavailable")
+    return invalid("verification.status", "unsupported status");
+  if (!isRecord(input.source)) return invalid("verification.source", "expected a source status object");
+  if (input.source.status === "proven") {
+    const witness = validateVerificationSourceWitness(input.source.witness);
+    if (!witness.ok) return witness;
+    if (input.status !== verification.value.status)
+      return invalid("verification.status", "must match the verified result when its source is proven");
+    return success(
+      Object.freeze({
+        schema_version: SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA_VERSION,
+        contract_id: SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID,
+        status: input.status,
+        verification: verification.value,
+        source: Object.freeze({ status: "proven" as const, witness: witness.value }),
+      }),
+    );
+  }
+  if (input.source.status !== "unresolved") return invalid("verification.source.status", "unsupported source status");
+  if (
+    input.source.reason !== "policy-fence-unavailable" &&
+    input.source.reason !== "pre-observation-unavailable" &&
+    input.source.reason !== "post-observation-unavailable" &&
+    input.source.reason !== "source-changed"
+  ) {
+    return invalid("verification.source.reason", "unsupported unresolved reason");
+  }
+  if (input.status !== "unavailable")
+    return invalid("verification.status", "unresolved source cannot represent a reusable pass or failure");
+  return success(
+    Object.freeze({
+      schema_version: SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA_VERSION,
+      contract_id: SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID,
+      status: "unavailable",
+      verification: verification.value,
+      source: Object.freeze({ status: "unresolved" as const, reason: input.source.reason }),
+    }),
+  );
+}
+
+/** Serialize versioned source evidence after dropping every unrecognized field. */
+export function serializeSourceBoundVerificationExecutionEvidence(input: unknown): DomainResult<string> {
+  if (!isRecord(input)) return invalid("verification_evidence", "expected an object");
+  if (input.schema_version !== SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION)
+    return invalid("verification_evidence.schema_version", "unsupported source-bound schema version");
+  if (input.contract_id !== SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID)
+    return invalid("verification_evidence.contract_id", "unsupported source-bound contract");
+  const verification = validateSourceBoundVerificationResult(input.verification);
+  if (!verification.ok) return verification;
+  return success(
+    JSON.stringify({
+      schema_version: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+      contract_id: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+      verification: verification.value,
+    }),
+  );
+}
+
 export const VERIFICATION_EXECUTION_EVIDENCE_DESCRIPTOR: JsonObject = Object.freeze({
   contract_id: VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
   schema_version: VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
@@ -931,4 +1031,18 @@ export const VERIFICATION_EXECUTION_EVIDENCE_DESCRIPTOR: JsonObject = Object.fre
   authority: "nawabari.verification-execution-authority.v1",
   mutates_working_set: false,
   protected_execution_required: true,
+});
+
+export const SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_DESCRIPTOR: JsonObject = Object.freeze({
+  contract_id: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+  schema_version: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+  key: "verification",
+  result_contract_id: SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID,
+  source_witness_contract_id: VERIFICATION_SOURCE_WITNESS_CONTRACT_ID,
+  source_witness_schema_version: VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
+  authority: "nawabari.verification-execution-authority.v1",
+  mutates_working_set: false,
+  protected_execution_required: true,
+  unresolved_source_status: "unavailable",
+  source_contents_serialized: false,
 });

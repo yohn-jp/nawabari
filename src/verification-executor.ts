@@ -10,12 +10,25 @@ import { validateFilesystemPolicyToken, type FilesystemPolicyToken } from "./dom
 import { validateSessionRuntimeProjection, type SessionRuntimeProjection } from "./domain/runtime-projection.js";
 import { runSandboxedCommand, type SandboxCommand, type SandboxExecutionResult } from "./domain/sandbox-launcher.js";
 import type { SandboxExecutionRequest } from "./domain/sandbox.js";
+import { captureGitSourceObservation, normalizeBranchId } from "./git.js";
+import { isSessionId } from "./session-id.js";
 
 /** Stable, transport-neutral verification profile identity. */
 export const VERIFICATION_PROFILE_CONTRACT_ID = "nawabari.verification-profile.v1" as const;
 export const VERIFICATION_PROFILE_SCHEMA_VERSION = 1 as const;
 export const VERIFICATION_RESULT_SCHEMA_VERSION = 1 as const;
 export const VERIFICATION_RESULT_SCHEMA = "verification-result.v1" as const;
+export const SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID = "nawabari.verification-result.v2" as const;
+export const SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA_VERSION = 2 as const;
+export const SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA = "verification-result.v2" as const;
+export const VERIFICATION_SOURCE_WITNESS_CONTRACT_ID = "nawabari.verification-source-witness.v1" as const;
+export const VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION = 1 as const;
+
+const SOURCE_HASH = /^[0-9a-f]{64}$/u;
+const SOURCE_REVISION = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
+const MAX_RUNTIME_IDENTITY_BYTES = 128 * 1_024;
+const MAX_SOURCE_FILE_COUNT = 4_096;
+const MAX_SOURCE_BYTE_COUNT = 64 * 1_024 * 1_024;
 
 const MAX_PROFILE_ID_LENGTH = 128;
 const MAX_PROFILE_VERSION_LENGTH = 64;
@@ -97,6 +110,40 @@ export type VerificationResult = Readonly<{
   readonly stderr: VerificationDiagnosticStream;
   /** The verifier never returns an agent working-set revision or mutation. */
   readonly working_set_mutated: false;
+}>;
+
+/** Hash-only identity of the exact bounded inputs covered by verification. */
+export type VerificationSourceWitness = Readonly<{
+  readonly contract_id: typeof VERIFICATION_SOURCE_WITNESS_CONTRACT_ID;
+  readonly schema_version: typeof VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION;
+  readonly identity_sha256: string;
+  readonly head_id: string;
+  readonly base_id: string;
+  readonly profile_sha256: string;
+  readonly policy_sha256: string;
+  readonly runtime_sha256: string;
+  readonly source_sha256: string;
+  readonly file_count: number;
+  readonly byte_count: number;
+}>;
+
+export type SourceBoundVerificationResult = Readonly<{
+  readonly schema_version: typeof SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA_VERSION;
+  readonly contract_id: typeof SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID;
+  /** Effective status is unavailable whenever source provenance is unresolved. */
+  readonly status: VerificationResult["status"];
+  /** Existing v1 diagnostics/result semantics are retained without rewriting them. */
+  readonly verification: VerificationResult;
+  readonly source:
+    | Readonly<{ readonly status: "proven"; readonly witness: VerificationSourceWitness }>
+    | Readonly<{
+        readonly status: "unresolved";
+        readonly reason:
+          | "policy-fence-unavailable"
+          | "pre-observation-unavailable"
+          | "post-observation-unavailable"
+          | "source-changed";
+      }>;
 }>;
 
 export type VerificationExecutorDependencies = Readonly<{
@@ -393,6 +440,264 @@ export async function executeVerification(
       stdout: streamDiagnostic(value.stdout, profile.value.max_output_bytes),
       stderr: streamDiagnostic(value.stderr, profile.value.max_output_bytes),
       working_set_mutated: false,
+    }),
+  );
+}
+
+function stableJson(value: unknown): string {
+  const visit = (current: unknown, ancestors: Set<object>): unknown => {
+    if (current === null || typeof current === "string" || typeof current === "boolean") return current;
+    if (typeof current === "number" && Number.isFinite(current)) return current;
+    if (Array.isArray(current)) {
+      if (ancestors.has(current)) throw new TypeError("cyclic source identity");
+      ancestors.add(current);
+      const result = current.map((entry) => visit(entry, ancestors));
+      ancestors.delete(current);
+      return result;
+    }
+    if (typeof current === "object") {
+      if (ancestors.has(current)) throw new TypeError("cyclic source identity");
+      ancestors.add(current);
+      const record = current as Record<string, unknown>;
+      const result: Record<string, unknown> = {};
+      for (const key of Object.keys(record).sort()) result[key] = visit(record[key], ancestors);
+      ancestors.delete(current);
+      return result;
+    }
+    throw new TypeError("source identity is not bounded JSON data");
+  };
+  return JSON.stringify(visit(value, new Set()));
+}
+
+function digestJson(value: unknown, maximumBytes: number): string {
+  const encoded = stableJson(value);
+  if (Buffer.byteLength(encoded, "utf8") > maximumBytes) throw new RangeError("source identity exceeds its bound");
+  return createHash("sha256").update(encoded, "utf8").digest("hex");
+}
+
+function sourceUnavailable(message: string): DomainError {
+  return new DomainError("PHYSICAL_OBSERVATION_UNAVAILABLE", message, {});
+}
+
+/**
+ * Capture the exact bounded verifier-visible source and the already-authoritative
+ * session/policy/runtime inputs. Raw filesystem paths stay local and are folded
+ * into identity hashes before this witness can cross a transport boundary.
+ */
+export function captureVerificationSourceWitness(
+  profileInput: unknown,
+  request: SandboxExecutionRequest,
+  filesystemPolicyFence: VerificationFilesystemPolicyFence | undefined,
+): DomainResult<VerificationSourceWitness> {
+  const profile = validateVerificationProfile(profileInput);
+  if (!profile.ok) return profile;
+  if (filesystemPolicyFence === undefined) {
+    return failure(sourceUnavailable("Verification source provenance requires a current filesystem-policy fence."));
+  }
+  const token = validateFilesystemPolicyToken(
+    filesystemPolicyFence.policy_token,
+    filesystemPolicyFence.expected_policy_token,
+  );
+  if (!token.ok) return token;
+  if (!request.enforce || typeof request.session_id !== "string" || !isSessionId(request.session_id)) {
+    return failure(sourceUnavailable("Verification source provenance requires an enforced, identified session."));
+  }
+  if (
+    typeof request.worktree !== "string" ||
+    !path.isAbsolute(request.worktree) ||
+    path.resolve(request.worktree) !== request.worktree ||
+    !path.isAbsolute(profile.value.cwd)
+  ) {
+    return failure(sourceUnavailable("Verification source provenance requires an absolute authoritative worktree."));
+  }
+  if (profile.value.cwd !== request.worktree && !isWithin(request.worktree, profile.value.cwd)) {
+    return failure(sourceUnavailable("The verification profile is outside the authoritative worktree."));
+  }
+  const runtimeProjection = validateSessionRuntimeProjection(request.runtime_projection);
+  if (!runtimeProjection.ok || runtimeProjection.value.working_set === undefined) {
+    return failure(sourceUnavailable("Verification source provenance requires a bounded runtime working set."));
+  }
+  const workingSet = runtimeProjection.value.working_set;
+  if (
+    token.value.working_set_revision !== workingSet.revision ||
+    (token.value.session_id !== undefined && token.value.session_id !== request.session_id)
+  ) {
+    return failure(sourceUnavailable("The current policy fence disagrees with the session working-set identity."));
+  }
+  if (typeof request.repository !== "string" || request.repository.length === 0 || typeof request.branch !== "string") {
+    return failure(sourceUnavailable("Verification source provenance requires repository and branch identity."));
+  }
+
+  try {
+    const source = captureGitSourceObservation({
+      cwd: request.worktree,
+      read_selectors: profile.value.read_visibility === "repository" ? ["**"] : profile.value.declared_read,
+    });
+    if (source.branch_id !== normalizeBranchId(request.branch)) {
+      return failure(sourceUnavailable("The execution branch does not match the observed worktree branch."));
+    }
+    const runtimeIdentity = {
+      projection: runtimeProjection.value,
+      resolution: request.runtime_resolution ?? null,
+      repository_filesystem: request.filesystem,
+      network_mode: request.network_mode,
+      required_capabilities: request.required_capabilities,
+      sandbox_executable: request.sandbox_executable,
+      landlock_executable: request.landlock_executable ?? null,
+      landlock_abi: request.landlock_abi ?? null,
+      landlock_state: request.landlock_state ?? null,
+      landlock_required: request.landlock_required ?? null,
+      seccomp_profile: request.seccomp_profile,
+      capability_baseline: request.capability_baseline,
+    };
+    const identitySha256 = digestJson(
+      {
+        local_repository_id: source.repository_id,
+        local_worktree_id: source.worktree_id,
+        request_repository: request.repository,
+        request_worktree: request.worktree,
+        request_session_id: request.session_id,
+        request_branch: request.branch,
+        observed_branch_id: source.branch_id,
+        working_set_repository: workingSet.repository,
+        base_branch: workingSet.base.branch,
+      },
+      MAX_RUNTIME_IDENTITY_BYTES,
+    );
+    const witness: VerificationSourceWitness = Object.freeze({
+      contract_id: VERIFICATION_SOURCE_WITNESS_CONTRACT_ID,
+      schema_version: VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
+      identity_sha256: identitySha256,
+      head_id: source.head_id,
+      base_id: workingSet.base.revision,
+      profile_sha256: digestJson(profile.value, MAX_RUNTIME_IDENTITY_BYTES),
+      policy_sha256: digestJson(token.value, MAX_RUNTIME_IDENTITY_BYTES),
+      runtime_sha256: digestJson(runtimeIdentity, MAX_RUNTIME_IDENTITY_BYTES),
+      source_sha256: source.source_sha256,
+      file_count: source.file_count,
+      byte_count: source.byte_count,
+    });
+    return success(witness);
+  } catch {
+    return failure(sourceUnavailable("The exact bounded verifier-visible source could not be observed."));
+  }
+}
+
+/** Re-observe the source and accepted identity inputs without rerunning verification. */
+export function isVerificationSourceWitnessCurrent(
+  witnessInput: unknown,
+  profileInput: unknown,
+  request: SandboxExecutionRequest,
+  filesystemPolicyFence: VerificationFilesystemPolicyFence | undefined,
+): boolean {
+  const witness = validateVerificationSourceWitness(witnessInput);
+  if (!witness.ok) return false;
+  const current = captureVerificationSourceWitness(profileInput, request, filesystemPolicyFence);
+  return current.ok && stableJson(current.value) === stableJson(witness.value);
+}
+
+/** Execute only when the pre-execution witness is complete, then bind a second observation. */
+export async function executeSourceBoundVerification(
+  profileInput: unknown,
+  request: SandboxExecutionRequest,
+  filesystemPolicyFence: VerificationFilesystemPolicyFence | undefined,
+  dependencies: VerificationExecutorDependencies = {},
+): Promise<DomainResult<SourceBoundVerificationResult>> {
+  const profile = validateVerificationProfile(profileInput);
+  if (!profile.ok) return profile;
+  const before = captureVerificationSourceWitness(profile.value, request, filesystemPolicyFence);
+  if (!before.ok) {
+    const result = failureResult(
+      profile.value,
+      sourceUnavailable("Verification did not run because its source could not be proven."),
+    );
+    return success(
+      sourceBoundResult(result, {
+        status: "unresolved",
+        reason: filesystemPolicyFence === undefined ? "policy-fence-unavailable" : "pre-observation-unavailable",
+      }),
+    );
+  }
+
+  const executed = await executeVerification(profile.value, request, dependencies, filesystemPolicyFence);
+  if (!executed.ok) return executed;
+  const after = captureVerificationSourceWitness(profile.value, request, filesystemPolicyFence);
+  if (!after.ok) {
+    return success(sourceBoundResult(executed.value, { status: "unresolved", reason: "post-observation-unavailable" }));
+  }
+  if (stableJson(before.value) !== stableJson(after.value)) {
+    return success(sourceBoundResult(executed.value, { status: "unresolved", reason: "source-changed" }));
+  }
+  return success(sourceBoundResult(executed.value, { status: "proven", witness: before.value }));
+}
+
+function sourceBoundResult(
+  verification: VerificationResult,
+  source: SourceBoundVerificationResult["source"],
+): SourceBoundVerificationResult {
+  return Object.freeze({
+    schema_version: SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA_VERSION,
+    contract_id: SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID,
+    status: source.status === "proven" ? verification.status : "unavailable",
+    verification,
+    source,
+  });
+}
+
+/** Canonicalize and bound a source witness before evidence serialization. */
+export function validateVerificationSourceWitness(input: unknown): DomainResult<VerificationSourceWitness> {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return failure(new DomainError("INVALID_ARGUMENT", "Verification source witness must be an object.", {}));
+  }
+  const value = input as Record<string, unknown>;
+  if (
+    value.contract_id !== VERIFICATION_SOURCE_WITNESS_CONTRACT_ID ||
+    value.schema_version !== VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION
+  ) {
+    return failure(new DomainError("INVALID_ARGUMENT", "Verification source witness contract is unsupported.", {}));
+  }
+  for (const field of [
+    "identity_sha256",
+    "profile_sha256",
+    "policy_sha256",
+    "runtime_sha256",
+    "source_sha256",
+  ] as const) {
+    if (typeof value[field] !== "string" || !SOURCE_HASH.test(value[field] as string)) {
+      return failure(new DomainError("INVALID_ARGUMENT", `Verification source witness '${field}' is invalid.`, {}));
+    }
+  }
+  if (
+    typeof value.head_id !== "string" ||
+    !SOURCE_REVISION.test(value.head_id) ||
+    typeof value.base_id !== "string" ||
+    !SOURCE_REVISION.test(value.base_id)
+  ) {
+    return failure(new DomainError("INVALID_ARGUMENT", "Verification source witness revisions are invalid.", {}));
+  }
+  if (
+    !Number.isSafeInteger(value.file_count) ||
+    (value.file_count as number) < 0 ||
+    (value.file_count as number) > MAX_SOURCE_FILE_COUNT ||
+    !Number.isSafeInteger(value.byte_count) ||
+    (value.byte_count as number) < 0 ||
+    (value.byte_count as number) > MAX_SOURCE_BYTE_COUNT
+  ) {
+    return failure(new DomainError("INVALID_ARGUMENT", "Verification source witness bounds are invalid.", {}));
+  }
+  return success(
+    Object.freeze({
+      contract_id: VERIFICATION_SOURCE_WITNESS_CONTRACT_ID,
+      schema_version: VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
+      identity_sha256: value.identity_sha256 as string,
+      head_id: value.head_id,
+      base_id: value.base_id,
+      profile_sha256: value.profile_sha256 as string,
+      policy_sha256: value.policy_sha256 as string,
+      runtime_sha256: value.runtime_sha256 as string,
+      source_sha256: value.source_sha256 as string,
+      file_count: value.file_count as number,
+      byte_count: value.byte_count as number,
     }),
   );
 }
