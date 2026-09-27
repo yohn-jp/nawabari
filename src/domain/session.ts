@@ -40,7 +40,7 @@ import type {
 
 export type { OperationName } from "../operation-authorization.js";
 
-export type SessionState = "new" | "active" | "closing" | "closed" | "stale";
+export type SessionState = "new" | "active" | "closing" | "closed" | "stale" | "parked";
 
 export type SessionRecord = {
   schema_version: number;
