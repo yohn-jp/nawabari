@@ -545,13 +545,21 @@ export async function handoffResources(
           ? "STALE_CLAIM_SET"
           : registryError?.code === "RESOURCE_CLAIM_CONFLICT"
             ? "RESOURCE_CLAIM_CONFLICT"
-            : "PHYSICAL_OBSERVATION_UNAVAILABLE";
-    return code === "STALE_CLAIM_SET" || code === "RESOURCE_CLAIM_CONFLICT"
+            : registryError?.code === "OPERATION_REJECTED"
+              ? "OPERATION_REJECTED"
+              : "PHYSICAL_OBSERVATION_UNAVAILABLE";
+    const reason =
+      registryError === undefined
+        ? "Atomic handoff durability could not be proven"
+        : Object.keys(registryError.details).length === 0
+          ? registryError.message
+          : `${registryError.message} (${JSON.stringify(registryError.details)})`;
+    return code === "STALE_CLAIM_SET" || code === "RESOURCE_CLAIM_CONFLICT" || code === "OPERATION_REJECTED"
       ? blockedResult(
           normalized,
           current.registry.claimSetGeneration,
           code,
-          registryError?.message ?? "Atomic handoff commit was rejected",
+          reason,
           fence.epoch,
           [],
           currentValidation.sourceClaim,
@@ -560,7 +568,7 @@ export async function handoffResources(
           normalized,
           current.registry.claimSetGeneration,
           code,
-          registryError?.message ?? "Atomic handoff durability could not be proven",
+          reason,
           fence.epoch,
           [],
           currentValidation.sourceClaim,

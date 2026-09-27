@@ -7113,6 +7113,9 @@ export class SessionRegistry {
       if (recentEvents.length >= MAX_RUNTIME_RECORDS) {
         throw new SessionRegistryError("OPERATION_REJECTED", "Resource handoff retry evidence capacity is exhausted", {
           maximum: MAX_RUNTIME_RECORDS,
+          receiptCount: recentEvents.filter((record) => record.kind === "resource-handoff").length,
+          historyCount: recentEvents.filter((record) => record.kind !== "resource-handoff").length,
+          sourceRetained: true,
         });
       }
       const event: ResourceHandoffRecentEvent = Object.freeze({
