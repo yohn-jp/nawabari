@@ -19,7 +19,7 @@ jobs:
   skip-external-fork:
     name: Autofix skipped for external fork PR
     if: github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Report fork exclusion
         shell: bash
@@ -28,7 +28,7 @@ jobs:
   skip-recursion:
     name: Autofix skipped for an autofix PR
     if: github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.event.pull_request.head.ref, 'autofix/prettier/pr-')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Report recursion prevention
         shell: bash
