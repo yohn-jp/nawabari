@@ -4,13 +4,15 @@ import path from "node:path";
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
 import { validateAuxiliaryStateDeclaration, type AuxiliaryStateDeclaration } from "./auxiliary-state-projection.js";
 import {
+  decideFilesystemScopePermission,
+  filesystemClaimAllowsPath,
+  requiredFilesystemClaimMode,
+} from "./filesystem-policy-decision.js";
+import {
   assertCanonicalClaimResource,
   canonicalClaimId,
-  claimModeGrantsAccess,
   RESOURCE_CLAIM_SCHEMA_VERSION,
-  resourceMatchesClaim,
   type ResourceClaim,
-  type ResourceClaimMode,
 } from "../resource-claims.js";
 import { isSessionId } from "../session-id.js";
 import { EFFECTIVE_WORKING_SET_KIND, EFFECTIVE_WORKING_SET_VERSION, type RepositoryIdentity } from "../working-set.js";
@@ -763,65 +765,6 @@ function sameRepository(left: FilesystemRepositoryIdentity, right: FilesystemRep
   return left.repositoryHost === right.repositoryHost && left.repositoryId === right.repositoryId;
 }
 
-function selectorMatches(
-  item: FilesystemPolicySelector,
-  pathValue: string,
-  selectedDomain: EffectiveFilesystemDomain,
-): boolean {
-  if ((item.domain ?? "repository") !== selectedDomain) return false;
-  let expression = "^";
-  for (let index = 0; index < item.path.length; index += 1) {
-    const character = item.path[index] as string;
-    if (character === "*" && item.path[index + 1] === "*") {
-      expression += ".*";
-      index += 1;
-    } else if (character === "*") expression += "[^/]*";
-    else if (character === "?") expression += "[^/]";
-    else expression += character.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  }
-  return new RegExp(`${expression}$`, "u").test(pathValue);
-}
-
-function scopeEntries(
-  scope: EffectiveFilesystemScope,
-  operation: EffectiveFilesystemOperation,
-): readonly FilesystemPolicySelector[] {
-  if (operation === "READONLY") return scope.readOnly;
-  if (operation === "WRITE") return scope.write;
-  if (operation === "CREATE") return scope.create;
-  if (operation === "DELETE") return scope.delete;
-  return scope.rename;
-}
-
-function scopeAllows(
-  scope: EffectiveFilesystemScope,
-  operation: EffectiveFilesystemOperation,
-  pathValue: string,
-  selectedDomain: EffectiveFilesystemDomain,
-): boolean {
-  return scopeEntries(scope, operation).some((item) => selectorMatches(item, pathValue, selectedDomain));
-}
-
-function scopeDenies(
-  scope: EffectiveFilesystemScope,
-  pathValue: string,
-  selectedDomain: EffectiveFilesystemDomain,
-): boolean {
-  return scope.deny.some((item) => selectorMatches(item, pathValue, selectedDomain));
-}
-
-function scopeIsImmutable(
-  scope: EffectiveFilesystemScope,
-  pathValue: string,
-  selectedDomain: EffectiveFilesystemDomain,
-): boolean {
-  return scope.immutable.some((item) => selectorMatches(item, pathValue, selectedDomain));
-}
-
-function operationClaimMode(operation: EffectiveFilesystemOperation): ResourceClaimMode {
-  return operation === "READONLY" ? "read" : "write";
-}
-
 function policyDigest(policy: Omit<EffectiveFilesystemPolicy, "digest">): string {
   return createHash("sha256").update(stableJson(policy)).digest("hex");
 }
@@ -1020,11 +963,17 @@ function authorityDecision(
     return Object.freeze({ authority, status: "unresolved", reason: "authority observation is incomplete" });
   if (boundary.status === "unapplied-legacy")
     return Object.freeze({ authority, status: "legacy", reason: "legacy boundary was not applied" });
-  if (scopeDenies(boundary.scope, pathValue, selectedDomain))
+  const permission = decideFilesystemScopePermission({
+    scope: boundary.scope,
+    operation,
+    path: pathValue,
+    domain: selectedDomain,
+  });
+  if (permission.reason === "deny")
     return Object.freeze({ authority, status: "denied", reason: "explicit deny matches" });
-  if (operation !== "READONLY" && scopeIsImmutable(boundary.scope, pathValue, selectedDomain))
+  if (permission.reason === "immutable")
     return Object.freeze({ authority, status: "denied", reason: "immutable area rejects mutation" });
-  if (!scopeAllows(boundary.scope, operation, pathValue, selectedDomain))
+  if (!permission.allowed)
     return Object.freeze({ authority, status: "denied", reason: "path is outside the operation scope" });
   return Object.freeze({ authority, status: "allowed", reason: "operation scope matches" });
 }
@@ -1175,20 +1124,35 @@ export function decideEffectivePathAccess(facts: EffectivePathAccessFacts): Effe
       selectedDomain,
     );
   else if (facts.policy.claims.status === "applied") {
-    const required = operationClaimMode(facts.operation);
     for (const currentPath of paths) {
-      const matching = facts.policy.claims.claims.filter((claim) => resourceMatchesClaim(claim, currentPath));
-      if (!matching.some((claim) => claimModeGrantsAccess(claim.mode, required))) {
+      if (
+        !filesystemClaimAllowsPath({
+          claims: facts.policy.claims.claims,
+          path: currentPath,
+          operation: facts.operation,
+        })
+      ) {
         return decision(
           canonicalFacts,
           "deny",
           "resource claim does not grant the required operation",
-          [...reasons, { authority: "claims", status: "denied", reason: `required ${required} claim is absent` }],
+          [
+            ...reasons,
+            {
+              authority: "claims",
+              status: "denied",
+              reason: `required ${requiredFilesystemClaimMode(facts.operation)} claim is absent`,
+            },
+          ],
           selectedDomain,
         );
       }
     }
-    reasons.push({ authority: "claims", status: "allowed", reason: `required ${required} claim matches` });
+    reasons.push({
+      authority: "claims",
+      status: "allowed",
+      reason: `required ${requiredFilesystemClaimMode(facts.operation)} claim matches`,
+    });
   } else reasons.push({ authority: "claims", status: "legacy", reason: "legacy boundary was not applied" });
 
   return decision(canonicalFacts, "allow", "all effective authorities allow the operation", reasons, selectedDomain);
