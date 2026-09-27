@@ -1913,6 +1913,12 @@ test("session close help distinguishes provider APIs from explicit Git remote fe
 
 test("session-scoped commands accept one consistent positional target and discard requires it", async () => {
   let discardedSessionId: string | null = null;
+  let discardedApprovalWitness: string | null = null;
+  const approvalWitness = "a".repeat(64);
+  const discardApproval = {
+    ...actionPreviewFixture({}),
+    approval_witness: approvalWitness,
+  } as unknown as SessionDiscardPreview;
   const discardedResult: SessionDiscardResult = {
     schema_version: 1,
     operation: "discard",
@@ -1930,8 +1936,10 @@ test("session-scoped commands accept one consistent positional target and discar
     claim_set_generation: 0,
   };
   const backend = backendForTests({
-    discardSession: async (_context: SessionContext, sessionId: string) => {
+    discardPreview: async () => success(discardApproval),
+    discardSession: async (_context: SessionContext, sessionId: string, witness: string) => {
       discardedSessionId = sessionId;
+      discardedApprovalWitness = witness;
       return success(discardedResult);
     },
   });
@@ -1942,6 +1950,7 @@ test("session-scoped commands accept one consistent positional target and discar
   });
   assert.equal(positionalExit, 0);
   assert.equal(discardedSessionId, sampleSession.session_id);
+  assert.equal(discardedApprovalWitness, approvalWitness);
   assert.deepEqual(JSON.parse(output.stdout[0]), { ok: true, command: "session discard", ...discardedResult });
 
   const missingOutput = capture();
@@ -1958,6 +1967,71 @@ test("session-scoped commands accept one consistent positional target and discar
   assert.equal(JSON.parse(ambiguousOutput.stdout[0]).code, "INVALID_ARGUMENT");
 });
 
+test("direct session discard rejects a changed effect at the final registry mutation", async () => {
+  const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-cli-discard-approval-"));
+  const worktreePath = `${repositoryPath}-worktree`;
+  const branchName = "feature/cli-discard-approval";
+  const git = (args: readonly string[]) =>
+    String(
+      execFileSync("git", args, {
+        cwd: repositoryPath,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_SYSTEM: "/dev/null",
+          GIT_TERMINAL_PROMPT: "0",
+        },
+      }),
+    ).trim();
+  try {
+    git(["init", "-b", "main"]);
+    git(["config", "user.name", "Nawabari Tests"]);
+    git(["config", "user.email", "nawabari-tests@example.invalid"]);
+    git(["config", "commit.gpgsign", "false"]);
+    fs.writeFileSync(path.join(repositoryPath, "README.md"), "fixture\n");
+    git(["add", "README.md"]);
+    git(["commit", "-m", "initial"]);
+
+    const { SessionRegistry } = await import("./session-registry.js");
+    const { LocalSessionBackend } = await import("./domain/session-backend.js");
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    const session = registry.provision({ worktreePath, branchName });
+    class ChangedAfterPreviewBackend extends LocalSessionBackend {
+      override discardSession(context: SessionContext, sessionId: string, approvalWitness: string) {
+        fs.writeFileSync(path.join(worktreePath, "late.txt"), "appeared after preview\n");
+        return super.discardSession(context, sessionId, approvalWitness);
+      }
+    }
+
+    const output = capture();
+    const exitCode = await runCli(["--json", "session", "discard", session.sessionId], {
+      backend: new ChangedAfterPreviewBackend(),
+      cwd: repositoryPath,
+      io: output.io,
+    });
+
+    assert.notEqual(exitCode, 0);
+    assert.equal(JSON.parse(output.stdout[0] ?? "").code, "STALE_REGISTRY");
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(fs.existsSync(path.join(worktreePath, "late.txt")), true);
+    assert.equal(git(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`]), "");
+  } finally {
+    try {
+      execFileSync("git", ["worktree", "remove", "--force", worktreePath], {
+        cwd: repositoryPath,
+        stdio: "ignore",
+      });
+    } catch {
+      // The directory cleanup below is enough if Git could not remove it.
+    }
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("discard help JSON makes explicit targeting and destructive semantics discoverable", async () => {
   const output = capture();
   const exitCode = await runCli(["session", "discard", "--help", "--json"], { io: output.io });
@@ -1971,6 +2045,7 @@ test("discard help JSON makes explicit targeting and destructive semantics disco
 test("session discard --preview emits one stable destructive summary without invoking discard", async () => {
   const preview: SessionDiscardPreview = {
     schema_version: 1,
+    approval_witness: "a".repeat(64),
     operation: "discard-preview",
     destructive: true,
     warning: "Actual session discard is destructive.",

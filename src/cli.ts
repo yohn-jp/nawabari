@@ -2211,7 +2211,21 @@ async function executeCommand(
         return preview.ok ? { ok: true, value: preview.value as unknown as JsonObject } : preview;
       }
       if (dependencies.backend.discardSession === undefined) return sessionDiscardCapabilityUnavailable();
-      const result = await dependencies.backend.discardSession(context, parsed.value.session_id as string);
+      if (dependencies.backend.discardPreview === undefined) return sessionDiscardPreviewCapabilityUnavailable();
+      const approval = await dependencies.backend.discardPreview(context, parsed.value.session_id as string);
+      if (!approval.ok) return approval;
+      if (approval.value.approval_witness === undefined) {
+        return failure(
+          new DomainError("BACKEND_UNAVAILABLE", "Session discard approval witness is not available.", {
+            operation: "session.discard.approval",
+          }),
+        );
+      }
+      const result = await dependencies.backend.discardSession(
+        context,
+        parsed.value.session_id as string,
+        approval.value.approval_witness,
+      );
       return result.ok ? { ok: true, value: result.value as unknown as JsonObject } : result;
     }
     if (subcommand === "id" || subcommand === "show" || subcommand === "close") {

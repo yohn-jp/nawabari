@@ -489,6 +489,8 @@ export interface DiscardPreviewEvidence {
 /** Bounded, read-only destruction evidence projected by `session discard --preview`. */
 export interface DiscardPreview {
   readonly schemaVersion: typeof DISCARD_PREVIEW_SCHEMA_VERSION;
+  /** Binds the final mutation to this exact bounded target/effect observation. */
+  readonly approvalWitness: string;
   readonly operation: "discard-preview";
   readonly destructive: true;
   readonly warning: string;
@@ -575,6 +577,8 @@ export interface SessionLifecycleClassificationOptions extends CloseSessionOptio
 export interface DiscardSessionOptions {
   readonly sessionId?: string | null;
   readonly session_id?: string | null;
+  /** Opaque witness returned by previewDiscard for this explicit mutation. */
+  readonly approvalWitness?: string;
 }
 
 function isCloseSessionOptions(value: unknown): value is CloseSessionOptions {
@@ -4721,12 +4725,19 @@ export class SessionRegistry {
           : unregisteredMissingRecovery || interruptedCleanupRecovery
             ? "close"
             : "gc";
-      const result =
-        operation === "discard"
-          ? this.coordinateCleanupUnsafe("discard", sessionId)
-          : operation === "close"
-            ? this.coordinateCleanupUnsafe("close", sessionId)
-            : this.coordinateCleanupUnsafe("gc", sessionId);
+      // Persisted discard intent plus the independent recovery proof above is
+      // reconcileApply's authority. Bind the freshly observed recovery effect
+      // explicitly before entering the same final mutation path as confirmed
+      // application requests.
+      let result: CloseSessionResult | DiscardSessionResult;
+      if (operation === "discard") {
+        const discardRecoveryWitness = this.previewDiscardUnsafe(sessionId).approvalWitness;
+        result = this.coordinateCleanupUnsafe("discard", sessionId, undefined, undefined, discardRecoveryWitness);
+      } else if (operation === "close") {
+        result = this.coordinateCleanupUnsafe("close", sessionId);
+      } else {
+        result = this.coordinateCleanupUnsafe("gc", sessionId);
+      }
       const terminalSession = result.session;
       const releasedClaims = operation === "discard" ? (result as DiscardSessionResult).releasedClaims : ownedClaims;
       return {
@@ -4776,20 +4787,37 @@ export class SessionRegistry {
     sessionIdOrOptions: string | DiscardSessionOptions,
     finalization?: SessionDrainFinalization,
   ): DiscardSessionResult {
-    return this.withLock(() => {
-      const requestedSessionId =
-        typeof sessionIdOrOptions === "string"
-          ? sessionIdOrOptions
-          : (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id ?? null);
-      if (requestedSessionId === null) {
+    const requestedSessionId =
+      typeof sessionIdOrOptions === "string"
+        ? sessionIdOrOptions
+        : (sessionIdOrOptions.sessionId ?? sessionIdOrOptions.session_id ?? null);
+    if (requestedSessionId === null) {
+      throw new SessionRegistryError(
+        "SESSION_NOT_FOUND",
+        "Explicit session identity is required for discard; the current session is never inferred",
+      );
+    }
+    assertSessionId(requestedSessionId);
+    let approvalWitness: string;
+    if (typeof sessionIdOrOptions === "string") {
+      // Preserve the legacy direct registry entry while binding its approval
+      // before entering the final mutation lock. A concurrent effect change is
+      // rejected by discardUnsafe after the lock is acquired.
+      approvalWitness = this.previewDiscard(requestedSessionId).approvalWitness;
+    } else {
+      const suppliedApprovalWitness = sessionIdOrOptions.approvalWitness;
+      if (typeof suppliedApprovalWitness !== "string" || suppliedApprovalWitness.length === 0) {
         throw new SessionRegistryError(
-          "SESSION_NOT_FOUND",
-          "Explicit session identity is required for discard; the current session is never inferred",
+          "OPERATION_REJECTED",
+          "Object-form discard requires an explicit approval witness",
+          { sessionId: requestedSessionId, reason: "discard-approval-required" },
         );
       }
-      assertSessionId(requestedSessionId);
+      approvalWitness = suppliedApprovalWitness;
+    }
+    return this.withLock(() => {
       this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, requestedSessionId, "discard");
-      return this.coordinateCleanupUnsafe("discard", requestedSessionId);
+      return this.coordinateCleanupUnsafe("discard", requestedSessionId, undefined, undefined, approvalWitness);
     });
   }
 
@@ -4814,77 +4842,85 @@ export class SessionRegistry {
           "Explicit session identity is required for discard preview; the current session is never inferred",
         );
       }
-      assertSessionId(requestedSessionId);
-      const state = this.readStateUnsafe();
-      const record = state.sessions.find((candidate) => candidate.sessionId === requestedSessionId);
-      if (record === undefined) {
-        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${requestedSessionId}`, {
-          sessionId: requestedSessionId,
-        });
-      }
+      return this.previewDiscardUnsafe(requestedSessionId);
+    });
+  }
 
-      const diagnostic = this.diagnoseUnsafe(record, state);
-      const reconciliation = this.observeCleanupReconciliation(record, "discard");
-      const blockers = diagnostic.blockers.map((blocker) => ({
-        code: blocker.code,
-        message: blocker.message,
-        details: { ...blocker.details },
-      }));
-      const recoverableEvidence = blockers.filter((blocker) => blocker.code === "RECOVERABLE_COMMITS");
-      const dirtyEvidence = blockers.filter((blocker) => blocker.code === "DIRTY_WORKTREE");
-      const branchEvidenceObservable = recoverableEvidence.length > 0 || blockers.length === 0;
-      const worktreeEvidenceObservable =
-        dirtyEvidence.length > 0 || recoverableEvidence.length > 0 || blockers.length === 0;
-      const recoverableCommits = {
-        observable: branchEvidenceObservable,
-        present: recoverableEvidence.length > 0 ? true : branchEvidenceObservable ? false : null,
-        evidence: Object.freeze(recoverableEvidence.slice(0, 8)),
-      } as const;
-      const uncommittedWork = {
-        observable: worktreeEvidenceObservable,
-        present: dirtyEvidence.length > 0 ? true : worktreeEvidenceObservable ? false : null,
-        evidence: Object.freeze(dirtyEvidence.slice(0, 8)),
-      } as const;
-      const ownedClaims = sortResourceClaims(state.claims.filter((claim) => claim.sessionId === record.sessionId));
-      const boundedClaims = ownedClaims.slice(0, MAX_DISCARD_CLAIMS).map(cloneResourceClaim);
-      const worktreeHead = reconciliation.observedWorktreeHead;
-      const branchHead = reconciliation.observedBranchHead;
-      return Object.freeze({
-        schemaVersion: DISCARD_PREVIEW_SCHEMA_VERSION,
-        operation: "discard-preview" as const,
-        destructive: true as const,
-        warning:
-          "Actual session discard is destructive: it may remove the worktree and branch and discard recoverable work.",
-        session: cloneSessionRecord(record),
-        currentState: record.state,
-        persistedState: record.state,
-        physicalState: diagnostic.physicalState,
-        worktreePresent: reconciliation.worktreePresent,
-        branchPresent: reconciliation.branchPresent,
-        worktreeHead,
-        branchHead,
-        head: worktreeHead ?? branchHead ?? record.discardedHead ?? null,
-        expectedHead: reconciliation.expectedHead,
-        recoverableCommits,
-        uncommittedWork,
-        claims: Object.freeze(boundedClaims),
-        claimCount: ownedClaims.length,
-        claimsTruncated: ownedClaims.length > boundedClaims.length,
-        destructiveScope: Object.freeze({
-          worktree: reconciliation.worktreePresent,
-          branch: reconciliation.branchPresent,
-          unintegratedCommits: recoverableCommits.present,
-          uncommittedWork: uncommittedWork.present,
-          claims: ownedClaims.length,
-        }),
-        diagnostic: Object.freeze({
-          closeReadiness: diagnostic.closeReadiness,
-          cleanupReadiness: diagnostic.cleanupReadiness,
-          resultState: diagnostic.resultState,
-          blockers: Object.freeze(blockers.slice(0, 8)),
-          ...(diagnostic.lifecycle === undefined ? {} : { lifecycleState: diagnostic.lifecycle.state }),
-        }),
+  private previewDiscardUnsafe(requestedSessionId: string): DiscardPreview {
+    assertSessionId(requestedSessionId);
+    const state = this.readStateUnsafe();
+    const record = state.sessions.find((candidate) => candidate.sessionId === requestedSessionId);
+    if (record === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${requestedSessionId}`, {
+        sessionId: requestedSessionId,
       });
+    }
+
+    const diagnostic = this.diagnoseUnsafe(record, state);
+    const reconciliation = this.observeCleanupReconciliation(record, "discard");
+    const blockers = diagnostic.blockers.map((blocker) => ({
+      code: blocker.code,
+      message: blocker.message,
+      details: { ...blocker.details },
+    }));
+    const recoverableEvidence = blockers.filter((blocker) => blocker.code === "RECOVERABLE_COMMITS");
+    const dirtyEvidence = blockers.filter((blocker) => blocker.code === "DIRTY_WORKTREE");
+    const branchEvidenceObservable = recoverableEvidence.length > 0 || blockers.length === 0;
+    const worktreeEvidenceObservable =
+      dirtyEvidence.length > 0 || recoverableEvidence.length > 0 || blockers.length === 0;
+    const recoverableCommits = {
+      observable: branchEvidenceObservable,
+      present: recoverableEvidence.length > 0 ? true : branchEvidenceObservable ? false : null,
+      evidence: Object.freeze(recoverableEvidence.slice(0, 8)),
+    } as const;
+    const uncommittedWork = {
+      observable: worktreeEvidenceObservable,
+      present: dirtyEvidence.length > 0 ? true : worktreeEvidenceObservable ? false : null,
+      evidence: Object.freeze(dirtyEvidence.slice(0, 8)),
+    } as const;
+    const ownedClaims = sortResourceClaims(state.claims.filter((claim) => claim.sessionId === record.sessionId));
+    const boundedClaims = ownedClaims.slice(0, MAX_DISCARD_CLAIMS).map(cloneResourceClaim);
+    const worktreeHead = reconciliation.observedWorktreeHead;
+    const branchHead = reconciliation.observedBranchHead;
+    const preview = {
+      schemaVersion: DISCARD_PREVIEW_SCHEMA_VERSION,
+      operation: "discard-preview" as const,
+      destructive: true as const,
+      warning:
+        "Actual session discard is destructive: it may remove the worktree and branch and discard recoverable work.",
+      session: cloneSessionRecord(record),
+      currentState: record.state,
+      persistedState: record.state,
+      physicalState: diagnostic.physicalState,
+      worktreePresent: reconciliation.worktreePresent,
+      branchPresent: reconciliation.branchPresent,
+      worktreeHead,
+      branchHead,
+      head: worktreeHead ?? branchHead ?? record.discardedHead ?? null,
+      expectedHead: reconciliation.expectedHead,
+      recoverableCommits,
+      uncommittedWork,
+      claims: Object.freeze(boundedClaims),
+      claimCount: ownedClaims.length,
+      claimsTruncated: ownedClaims.length > boundedClaims.length,
+      destructiveScope: Object.freeze({
+        worktree: reconciliation.worktreePresent,
+        branch: reconciliation.branchPresent,
+        unintegratedCommits: recoverableCommits.present,
+        uncommittedWork: uncommittedWork.present,
+        claims: ownedClaims.length,
+      }),
+      diagnostic: Object.freeze({
+        closeReadiness: diagnostic.closeReadiness,
+        cleanupReadiness: diagnostic.cleanupReadiness,
+        resultState: diagnostic.resultState,
+        blockers: Object.freeze(blockers.slice(0, 8)),
+        ...(diagnostic.lifecycle === undefined ? {} : { lifecycleState: diagnostic.lifecycle.state }),
+      }),
+    } satisfies Omit<DiscardPreview, "approvalWitness">;
+    return Object.freeze({
+      ...preview,
+      approvalWitness: createHash("sha256").update(JSON.stringify(preview)).digest("hex"),
     });
   }
 
@@ -5028,8 +5064,9 @@ export class SessionRegistry {
   private coordinateCleanupUnsafe(
     operation: "discard",
     sessionId: string,
-    evidence?: undefined,
-    retryOverride?: boolean,
+    evidence: undefined,
+    retryOverride: boolean | undefined,
+    approvalWitness: string,
   ): DiscardSessionResult;
   private coordinateCleanupUnsafe(
     operation: "gc",
@@ -5042,7 +5079,18 @@ export class SessionRegistry {
     sessionId: string,
     evidence?: IntegrationEvidenceInput,
     retryOverride?: boolean,
+    approvalWitness?: string,
   ): CloseSessionResult | DiscardSessionResult {
+    const requiredDiscardWitness = (): string => {
+      if (typeof approvalWitness !== "string" || approvalWitness.length === 0) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Discard requires an explicit approval witness", {
+          sessionId,
+          reason: "discard-approval-required",
+        });
+      }
+      return approvalWitness;
+    };
+    if (operation === "discard") requiredDiscardWitness();
     const state = this.readStateUnsafe();
     const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (record === undefined) {
@@ -5111,7 +5159,7 @@ export class SessionRegistry {
           );
         },
         effect: () => {
-          if (operation === "discard") return this.discardUnsafe(sessionId);
+          if (operation === "discard") return this.discardUnsafe(sessionId, requiredDiscardWitness());
           return this.closeUnsafe(
             sessionId,
             operation === "close" ? evidence : undefined,
@@ -6042,11 +6090,18 @@ export class SessionRegistry {
     };
   }
 
-  private discardUnsafe(sessionId: string): DiscardSessionResult {
+  private discardUnsafe(sessionId: string, approvalWitness: string): DiscardSessionResult {
     const state = this.readStateUnsafe();
     const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (record === undefined) {
       throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    if (this.previewDiscardUnsafe(sessionId).approvalWitness !== approvalWitness) {
+      throw new SessionRegistryError(
+        "STALE_REGISTRY",
+        "The discard preview changed before the final mutation; refresh and confirm the new destructive scope",
+        { sessionId, reason: "discard-preview-changed" },
+      );
     }
     if (record.state === "closed") {
       if (record.terminalOperation !== "discard") {

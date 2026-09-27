@@ -315,6 +315,89 @@ test("local session backend provisions initial claims in the same registry mutat
   }
 });
 
+test("local backend accepts an unchanged discard witness and rejects a changed effect at final mutation", async () => {
+  const repositoryPath = createRepository();
+  const successWorktree = `${repositoryPath}-discard-approved`;
+  const changedWorktree = `${repositoryPath}-discard-changed`;
+  const context = { cwd: repositoryPath };
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(context, {
+      branch: "feature/discard-approved",
+      worktree: successWorktree,
+      label: null,
+      base: null,
+    });
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const preview = await backend.discardPreview(context, created.value.session_id);
+    assert.equal(preview.ok, true);
+    if (!preview.ok) return;
+    assert.match(preview.value.approval_witness ?? "", /^[a-f0-9]{64}$/u);
+
+    const discarded = await backend.discardSession(context, created.value.session_id, preview.value.approval_witness!);
+    assert.equal(discarded.ok, true);
+    assert.equal(fs.existsSync(successWorktree), false);
+
+    class ChangedBeforeFinalDiscardBackend extends LocalSessionBackend {
+      override discardSession(discardContext: typeof context, sessionId: string, approvalWitness: string) {
+        fs.writeFileSync(path.join(changedWorktree, "late.txt"), "arrived after approval\n");
+        return super.discardSession(discardContext, sessionId, approvalWitness);
+      }
+    }
+
+    const changedBackend = new ChangedBeforeFinalDiscardBackend();
+    const changed = await changedBackend.createSession(context, {
+      branch: "feature/discard-changed",
+      worktree: changedWorktree,
+      label: null,
+      base: null,
+      claims: [{ resource: "README.md", mode: "write" }],
+    });
+    assert.equal(changed.ok, true);
+    if (!changed.ok) return;
+    fs.writeFileSync(path.join(changedWorktree, "before.txt"), "approved work\n");
+
+    const actions = changedBackend.sessionActions(context);
+    const identity = {
+      session_id: changed.value.session_id,
+      repository: changed.value.repository,
+      worktree: changed.value.worktree,
+    };
+    const snapshot = await actions.readSessionActionSnapshot(identity);
+    assert.equal(snapshot.ok, true);
+    if (!snapshot.ok) return;
+    assert.ok(snapshot.value.diagnostic.next_actions?.some((action) => action.action_id === "discard-session"));
+
+    const previewed = await actions.dispatchSessionAction("discard-session", identity, snapshot.value.token, {
+      confirmed: false,
+    });
+    assert.equal(previewed.ok, true);
+    if (!previewed.ok || previewed.value.status !== "confirmation-required") return;
+
+    const rejected = await actions.dispatchSessionAction("discard-session", identity, snapshot.value.token, {
+      confirmed: true,
+      operation_id: "changed-before-final-discard",
+      preview: previewed.value.preview,
+    });
+    assert.equal(rejected.ok, false);
+    if (!rejected.ok) assert.equal(rejected.error.code, "STALE_REGISTRY");
+
+    const registry = new SessionRegistry({ cwd: repositoryPath });
+    assert.equal(registry.get(changed.value.session_id)?.state, "active");
+    assert.equal(registry.listClaims(changed.value.session_id).length, 1);
+    assert.equal(fs.existsSync(changedWorktree), true);
+    assert.equal(fs.existsSync(path.join(changedWorktree, "before.txt")), true);
+    assert.equal(fs.existsSync(path.join(changedWorktree, "late.txt")), true);
+    assert.equal(runGit(["show-ref", "--verify", "--quiet", "refs/heads/feature/discard-changed"], repositoryPath), "");
+  } finally {
+    removeWorktree(repositoryPath, successWorktree);
+    removeWorktree(repositoryPath, changedWorktree);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
 test("same-ID execution transitions persist through the backend and survive restart", async () => {
   const repositoryPath = createRepository();
   const worktreePath = `${repositoryPath}-managed-execution-ledger`;
