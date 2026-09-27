@@ -492,7 +492,7 @@ test("the default strict FHS projection keeps the development baseline functiona
 
   let materialRoot: string;
   try {
-    materialRoot = fs.mkdtempSync("/usr/local/nawabari-runtime-resolution-");
+    materialRoot = fs.mkdtempSync(path.join("/usr/local/nawabari-test-fixtures", "runtime-resolution-"));
   } catch {
     t.skip("a writable FHS fixture root is unavailable");
     return;

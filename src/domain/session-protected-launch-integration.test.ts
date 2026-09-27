@@ -40,9 +40,23 @@ function profileInput(): Record<string, unknown> {
   };
 }
 
+function executableOnPath(command: string): string | null {
+  for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (directory.length === 0) continue;
+    const candidate = path.join(directory, command);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.realpathSync.native(candidate);
+    } catch {
+      // Continue searching the caller's PATH.
+    }
+  }
+  return null;
+}
+
 test("the protected compiler consumes the materialized environment and one canonical descriptor path", (t) => {
-  const bwrap = "/run/current-system/sw/bin/bwrap";
-  if (process.platform !== "linux" || !fs.existsSync(bwrap)) {
+  const bwrap = executableOnPath("bwrap");
+  if (process.platform !== "linux" || bwrap === null) {
     t.skip("supported bubblewrap runtime is unavailable");
     return;
   }
@@ -153,8 +167,8 @@ test("the protected composition reaches the repaired worker on a supported runti
     t.skip("run via pnpm test:linux:system");
     return;
   }
-  const bwrap = "/run/current-system/sw/bin/bwrap";
-  if (process.platform !== "linux" || !fs.existsSync(bwrap)) {
+  const bwrap = executableOnPath("bwrap");
+  if (process.platform !== "linux" || bwrap === null) {
     t.skip("supported bubblewrap runtime is unavailable");
     return;
   }
