@@ -74,6 +74,8 @@ function runGit(args: readonly string[], cwd: string): string {
   return execFileSync("git", [...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
+const FIXED_SOURCE_TIME = new Date("2020-01-01T00:00:00.000Z");
+
 function createSourceRepository(): {
   readonly root: string;
   readonly request: SandboxExecutionRequest;
@@ -85,6 +87,7 @@ function createSourceRepository(): {
   runGit(["config", "user.email", "verification-test@nawabari.invalid"], root);
   fs.mkdirSync(path.join(root, "src"));
   fs.writeFileSync(path.join(root, "src", "entry.js"), "first\n");
+  fs.utimesSync(path.join(root, "src", "entry.js"), FIXED_SOURCE_TIME, FIXED_SOURCE_TIME);
   runGit(["add", "src/entry.js"], root);
   runGit(["commit", "--quiet", "-m", "initial"], root);
   const head = runGit(["rev-parse", "HEAD"], root);
@@ -288,9 +291,8 @@ test("source-bound verification rejects same-path byte edits during protected ex
       {
         execute: async () => {
           invoked = true;
-          const before = fs.statSync(sourcePath);
           fs.writeFileSync(sourcePath, "other\n");
-          fs.utimesSync(sourcePath, before.atime, before.mtime);
+          fs.utimesSync(sourcePath, FIXED_SOURCE_TIME, FIXED_SOURCE_TIME);
           return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
         },
       },
@@ -367,9 +369,8 @@ test("source witness currentness tracks source, base, profile, policy, runtime, 
     assert.equal(isVerificationSourceWitnessCurrent(witness, currentProfile, changedBaseRequest, policyFence), false);
 
     const sourcePath = path.join(fixture.root, "src", "entry.js");
-    const beforeContentEdit = fs.statSync(sourcePath);
     fs.writeFileSync(sourcePath, "other\n");
-    fs.utimesSync(sourcePath, beforeContentEdit.atime, beforeContentEdit.mtime);
+    fs.utimesSync(sourcePath, FIXED_SOURCE_TIME, FIXED_SOURCE_TIME);
     assert.equal(isVerificationSourceWitnessCurrent(witness, currentProfile, fixture.request, policyFence), false);
 
     fs.writeFileSync(path.join(fixture.root, "src", "later.js"), "later\n");
