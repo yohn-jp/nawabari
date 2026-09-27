@@ -1256,6 +1256,10 @@ test("a protected session runs with a private root/tmp/proc view and only its ow
 });
 
 test("compiled protected execution keeps a worktree under /tmp visible and hides the host Control credential", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("compiled bubblewrap profile is Linux-only");
     return;
@@ -1352,17 +1356,16 @@ test("compiled protected execution keeps a worktree under /tmp visible and hides
         provenance: "runtime-profile",
       },
     ];
-    const systemRoots: string[] = [];
+    const systemRoots: Array<{ readonly source: string; readonly target: string }> = [];
     for (const candidate of [layout.nix_store, layout.usr, layout.bin, layout.lib, layout.lib64]) {
       if (candidate === null) continue;
-      const root = fs.realpathSync.native(candidate);
-      if (systemRoots.some((parent) => root === parent || root.startsWith(`${parent}${path.sep}`))) continue;
-      systemRoots.push(root);
+      if (systemRoots.some((entry) => entry.target === candidate)) continue;
+      systemRoots.push({ source: fs.realpathSync.native(candidate), target: candidate });
     }
-    for (const root of systemRoots) {
+    for (const { source, target } of systemRoots) {
       runtimeFilesystem.push({
-        source: root,
-        target: root,
+        source,
+        target,
         access_mode: "read-only",
         provenance: "runtime-profile",
       });

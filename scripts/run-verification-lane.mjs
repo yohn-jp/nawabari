@@ -36,6 +36,7 @@ const linuxSystemCases = new Map([
       "interactive execution inherits the caller streams and skips bounded limits",
       "interactive execution under a strict runtime projection resolves PATH only through the canonical surface",
       "a protected session runs with a private root/tmp/proc view and only its owned worktree",
+      "compiled protected execution keeps a worktree under /tmp visible and hides the host Control credential",
       "direct execution and PATH-based child lookup resolve the same projected executable under real isolation",
       "session shell CLI path shares the compiled strict-projection authority with session run under real isolation",
     ],
