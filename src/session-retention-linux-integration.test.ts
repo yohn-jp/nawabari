@@ -20,7 +20,7 @@ import type { PersistedSessionExecutionRecord } from "./domain/session-execution
 import { resolveBuiltinWorktreeProfile } from "./domain/worktree-profile-builtins.js";
 import { ownedExecutionObservationRecord, readCurrentKernelBootId, SessionRegistry } from "./session-registry.js";
 
-const DESCENDANT_MARKER = "nawabari-public-park-owned-descendant";
+const DESCENDANT_MARKER = "nwb-park-child";
 const LINUX_SYSTEM_TEST_TITLE =
   "the public park action adopts its intent only after a real owned cgroup descendant exits";
 
@@ -42,7 +42,9 @@ async function waitFor<T>(description: string, observe: () => T | undefined, tim
   throw new Error(`Timed out waiting for ${description}.`);
 }
 
-function readProcess(pid: number): Readonly<{ parentPid: number; commandLine: string }> | undefined {
+function readProcess(
+  pid: number,
+): Readonly<{ parentPid: number; processName: string; commandLine: string }> | undefined {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     const fields = stat
@@ -53,6 +55,7 @@ function readProcess(pid: number): Readonly<{ parentPid: number; commandLine: st
     if (!Number.isSafeInteger(parentPid) || parentPid < 0) return undefined;
     return {
       parentPid,
+      processName: fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim(),
       commandLine: fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " "),
     };
   } catch {
@@ -251,7 +254,7 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
 
   const payload = [
     "const { spawn } = require('node:child_process');",
-    `const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', '${DESCENDANT_MARKER}'], { stdio: 'ignore' });`,
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(`process.title = ${JSON.stringify(DESCENDANT_MARKER)}; setInterval(() => {}, 1000);`)}], { stdio: 'ignore' });`,
     "child.once('error', () => process.exit(2));",
     "child.once('exit', () => process.exit(0));",
     "setInterval(() => {}, 1000);",
@@ -310,15 +313,21 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
       return undefined;
     }
     const pids = observed.value.cgroups.population.processes;
-    const processSummaries: { pid: number; parentPid: number | null; commandLine: string }[] = [];
+    const processSummaries: {
+      pid: number;
+      parentPid: number | null;
+      processName: string;
+      commandLine: string;
+    }[] = [];
     for (const pid of pids) {
       const info = readProcess(pid);
       processSummaries.push({
         pid,
         parentPid: info?.parentPid ?? null,
+        processName: info?.processName ?? "unavailable",
         commandLine: info?.commandLine.slice(0, 160) ?? "unavailable",
       });
-      if (info?.commandLine.includes(DESCENDANT_MARKER) && pids.includes(info.parentPid)) {
+      if (info?.processName === DESCENDANT_MARKER && pids.includes(info.parentPid)) {
         return { record, scope: ownedScope(record), descendantPid: pid, parentPid: info.parentPid };
       }
     }
@@ -386,7 +395,21 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
   // The backend creates a fresh SessionRegistry for each call, so this public retry must adopt persisted intent.
   process.kill(running.descendantPid, "SIGTERM");
   const runExitCode = await runPromise;
-  assert.equal(runExitCode, 0, [...runStdout, ...runStderr].join("\n"));
+  const runResult = JSON.parse(runStdout.join("").trim()) as {
+    readonly ok?: unknown;
+    readonly command?: unknown;
+    readonly exit_code?: unknown;
+    readonly signal?: unknown;
+    readonly execution?: { readonly state?: unknown };
+  };
+  assert.equal(runResult.ok, true, JSON.stringify({ runExitCode, runResult, runStderr }));
+  assert.equal(runResult.command, "session run");
+  assert.equal(runResult.execution?.state, "exited");
+  assert.ok(
+    (runExitCode === 0 && runResult.exit_code === 0 && runResult.signal === null) ||
+      (runExitCode === 3 && runResult.exit_code === null && runResult.signal === "SIGTERM"),
+    JSON.stringify({ runExitCode, runResult, runStderr }),
+  );
   const exited = latestExecution(registry, sessionId);
   assert.equal(exited?.state, "exited");
   assert.ok(exited);
