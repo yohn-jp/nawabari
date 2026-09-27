@@ -344,7 +344,7 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
     JSON.stringify(firstSnapshot.diagnostic),
   );
   const firstAttempt = await dispatchPark(backend, repositoryPath, sessionId, parkOperationId, firstSnapshot.token);
-  assert.equal(firstAttempt.exitCode, 4, firstAttempt.stdout.join("\n"));
+  assert.equal(firstAttempt.exitCode, 3, firstAttempt.stdout.join("\n"));
   assert.equal(firstAttempt.body.ok, false);
   assert.equal(firstAttempt.body.code, "OPERATION_REJECTED");
   assert.equal((firstAttempt.body.details as Record<string, unknown> | undefined)?.retention_code, "DRAIN_INCOMPLETE");
@@ -370,7 +370,7 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
     "linux-park-different-operation",
     differentOperationSnapshot.token,
   );
-  assert.equal(differentOperation.exitCode, 4, differentOperation.stdout.join("\n"));
+  assert.equal(differentOperation.exitCode, 3, differentOperation.stdout.join("\n"));
   assert.equal(differentOperation.body.code, "OPERATION_REJECTED");
   assert.equal(
     (differentOperation.body.details as Record<string, unknown> | undefined)?.retention_code,
