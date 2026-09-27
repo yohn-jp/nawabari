@@ -7,11 +7,7 @@ import {
   type ResourceClaimMode,
 } from "../resource-claims.js";
 import { DomainError, failure, success, type DomainResult } from "./errors.js";
-import {
-  allowsWorkingSetPath,
-  type WorkingSetRuntimeOperation,
-  type WorkingSetRuntimeProjection,
-} from "./working-set-runtime-projection.js";
+import type { WorkingSetRuntimeProjection } from "./working-set-runtime-projection.js";
 import type { WorktreeRuntimeFilesystemCeiling } from "./worktree-runtime-profile.js";
 
 /** Versioned pure compiler boundary for profile-derived filesystem policy. */
@@ -23,7 +19,27 @@ export const PROFILE_RUNTIME_BOUNDARY_SCHEMA_VERSION = 1 as const;
 
 export const FILESYSTEM_POLICY_OPERATIONS = Object.freeze(["READONLY", "WRITE", "CREATE", "DELETE"] as const);
 export type FilesystemPolicyOperation = (typeof FILESYSTEM_POLICY_OPERATIONS)[number];
+export type FilesystemPermissionOperation = FilesystemPolicyOperation | "RENAME";
 export type FilesystemPolicyDecisionStatus = "allowed" | "denied" | "unsupported";
+
+export type FilesystemPermissionSelector = string | Readonly<{ readonly path: string; readonly domain?: string }>;
+
+export type FilesystemPermissionScope = Readonly<{
+  readonly readOnly: readonly FilesystemPermissionSelector[];
+  readonly write: readonly FilesystemPermissionSelector[];
+  readonly create: readonly FilesystemPermissionSelector[];
+  readonly delete: readonly FilesystemPermissionSelector[];
+  readonly rename?: readonly FilesystemPermissionSelector[];
+  readonly deny: readonly FilesystemPermissionSelector[];
+  readonly immutable?: readonly FilesystemPermissionSelector[];
+}>;
+
+export type FilesystemScopePermissionReason = "allowed" | "deny" | "immutable" | "outside-operation-scope";
+
+export type FilesystemScopePermission = Readonly<{
+  readonly allowed: boolean;
+  readonly reason: FilesystemScopePermissionReason;
+}>;
 
 export type ProfileFilesystemBoundary = Readonly<{
   readonly contract_id: typeof PROFILE_RUNTIME_BOUNDARY_CONTRACT_ID;
@@ -118,17 +134,68 @@ function ceilingOf(
 }
 
 function operationSelectors(
-  ceiling: WorktreeRuntimeFilesystemCeiling,
-  operation: FilesystemPolicyOperation,
-): readonly string[] {
-  if (operation === "READONLY") return ceiling.readOnly;
-  if (operation === "WRITE") return ceiling.write;
-  if (operation === "CREATE") return ceiling.create;
-  return ceiling.delete;
+  scope: FilesystemPermissionScope,
+  operation: FilesystemPermissionOperation,
+): readonly FilesystemPermissionSelector[] {
+  if (operation === "READONLY") return scope.readOnly;
+  if (operation === "WRITE") return scope.write;
+  if (operation === "CREATE") return scope.create;
+  if (operation === "DELETE") return scope.delete;
+  return scope.rename ?? [];
 }
 
-function requiredClaimMode(operation: FilesystemPolicyOperation): ResourceClaimMode {
+function selectorMatchesDomain(selector: FilesystemPermissionSelector, path: string, domain: string): boolean {
+  if (typeof selector === "string") return domain === "repository" && selectorMatches(selector, path);
+  return (selector.domain ?? "repository") === domain && selectorMatches(selector.path, path);
+}
+
+/**
+ * Shared profile/effective-policy predicates: operation-to-selector lookup,
+ * glob/domain matching, and deny/immutable precedence. Callers retain input
+ * normalization, boundary status/evidence handling, profile backend limits,
+ * and exact-operation backend representability checks.
+ */
+export function decideFilesystemScopePermission(
+  facts: Readonly<{
+    readonly scope: FilesystemPermissionScope;
+    readonly operation: FilesystemPermissionOperation;
+    readonly path: string;
+    readonly domain?: string;
+  }>,
+): FilesystemScopePermission {
+  const domain = facts.domain ?? "repository";
+  const matches = (selector: FilesystemPermissionSelector) => selectorMatchesDomain(selector, facts.path, domain);
+  if (facts.scope.deny.some(matches)) return Object.freeze({ allowed: false, reason: "deny" });
+  if (facts.operation !== "READONLY" && facts.scope.immutable?.some(matches)) {
+    return Object.freeze({ allowed: false, reason: "immutable" });
+  }
+  if (!operationSelectors(facts.scope, facts.operation).some(matches)) {
+    return Object.freeze({ allowed: false, reason: "outside-operation-scope" });
+  }
+  return Object.freeze({ allowed: true, reason: "allowed" });
+}
+
+/** The claim strength required for a filesystem operation. */
+export function requiredFilesystemClaimMode(operation: FilesystemPermissionOperation): ResourceClaimMode {
   return operation === "READONLY" ? "read" : "write";
+}
+
+/** Match the current canonical claim set for one already-validated path. */
+export function filesystemClaimAllowsPath(
+  input: Readonly<{
+    readonly claims: readonly ResourceClaim[];
+    readonly path: string;
+    readonly operation: FilesystemPermissionOperation;
+    readonly repositoryId?: string;
+  }>,
+): boolean {
+  const required = requiredFilesystemClaimMode(input.operation);
+  return input.claims.some(
+    (claim) =>
+      (input.repositoryId === undefined || claim.repositoryId === input.repositoryId) &&
+      resourceMatchesClaim(claim, input.path) &&
+      claimModeGrantsAccess(claim.mode, required),
+  );
 }
 
 function decision(
@@ -211,19 +278,26 @@ export function decideEffectivePathAccess(facts: FilesystemPolicyFacts): Filesys
       authorities,
     );
   }
-  if (ceiling.deny.some((entry) => selectorMatches(entry, path))) {
-    return decision(path, facts.operation, "denied", "profile DENY overrides every allow", authorities);
-  }
-  if (facts.operation === "WRITE" && ceiling.immutable.some((entry) => selectorMatches(entry, path))) {
-    return decision(path, facts.operation, "denied", "profile immutable area cannot be mutated", authorities);
-  }
-  if (!operationSelectors(ceiling, facts.operation).some((entry) => selectorMatches(entry, path))) {
-    return decision(path, facts.operation, "denied", "path is outside the profile operation ceiling", authorities);
+  const profilePermission = decideFilesystemScopePermission({ scope: ceiling, operation: facts.operation, path });
+  if (!profilePermission.allowed) {
+    const reason =
+      profilePermission.reason === "deny"
+        ? "profile DENY overrides every allow"
+        : profilePermission.reason === "immutable"
+          ? "profile immutable area cannot be mutated"
+          : "path is outside the profile operation ceiling";
+    return decision(path, facts.operation, "denied", reason, authorities);
   }
   authorities.profile = "allow";
 
   if (facts.workingSet !== undefined) {
-    if (!allowsWorkingSetPath(facts.workingSet, path, facts.operation as WorkingSetRuntimeOperation)) {
+    if (
+      !decideFilesystemScopePermission({
+        scope: facts.workingSet.scope,
+        operation: facts.operation,
+        path,
+      }).allowed
+    ) {
       return decision(path, facts.operation, "denied", "path is outside the Effective Working Set", authorities);
     }
     authorities.working_set = "allow";
@@ -250,15 +324,14 @@ export function decideEffectivePathAccess(facts: FilesystemPolicyFacts): Filesys
         authorities,
       );
     }
-    const required = requiredClaimMode(facts.operation);
-    let matching: readonly ResourceClaim[] = [];
+    let allowed = false;
     try {
-      matching = facts.claims.filter(
-        (claim) =>
-          claim.repositoryId === facts.repositoryId &&
-          resourceMatchesClaim(claim, path) &&
-          claimModeGrantsAccess(claim.mode, required),
-      );
+      allowed = filesystemClaimAllowsPath({
+        claims: facts.claims,
+        path,
+        operation: facts.operation,
+        repositoryId: facts.repositoryId,
+      });
     } catch {
       return decision(
         path,
@@ -268,7 +341,7 @@ export function decideEffectivePathAccess(facts: FilesystemPolicyFacts): Filesys
         authorities,
       );
     }
-    if (matching.length === 0) {
+    if (!allowed) {
       return decision(
         path,
         facts.operation,
