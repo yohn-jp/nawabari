@@ -1,4 +1,7 @@
+import path from "node:path";
+
 import type { JsonObject, JsonValue } from "../domain/errors.js";
+import { normalizeBranchId } from "../git.js";
 import { SessionRegistryError, type RegistryErrorCode, type RegistryErrorDetails } from "../errors.js";
 import {
   parseFileOperationRegistry,
@@ -6,7 +9,8 @@ import {
   type PersistedFileOperationRecord,
 } from "./file-operation-record.js";
 import { parsePinnedProfileRecord } from "../domain/worktree-profile-pinning.js";
-import { isResourceClaimMode, type ResourceClaimMode } from "../resource-claims.js";
+import { assertCanonicalClaimResource, isResourceClaimMode, type ResourceClaimMode } from "../resource-claims.js";
+import { SESSION_RETENTION_SCHEMA_VERSION, type SessionRetentionRecord } from "../session-retention.js";
 
 /**
  * Optional registry areas are deliberately a closed, versioned vocabulary.
@@ -25,14 +29,12 @@ export const REGISTRY_FEATURES = Object.freeze([
 
 export type RegistryFeature = (typeof REGISTRY_FEATURES)[number];
 
-/**
- * Optional record authorities implemented by the runtime registry owner. The
- * resource-coordination integration owns exactly the handoff receipt area.
- */
+/** Optional record features implemented by the current runtime registry. */
 export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([
   "pinned-profiles.v1",
   "runtime-sessions.v1",
   "executions.v1",
+  "retentions.v1",
   "recent-events.v1",
   "file-operations.v1",
   "session-history.v1",
@@ -56,10 +58,14 @@ export interface RuntimeRecords {
   readonly pinned_profiles?: readonly RuntimeRecord[];
   readonly runtime_sessions?: readonly RuntimeRecord[];
   readonly executions?: readonly RuntimeRecord[];
-  readonly retentions?: readonly RuntimeRecord[];
+  readonly retentions?: readonly SessionRetentionRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
   readonly file_operations?: readonly PersistedFileOperationRecord[];
 }
+
+type PersistedRuntimeRecords = Omit<RuntimeRecords, "retentions"> & {
+  readonly retentions?: readonly RuntimeRecord[];
+};
 
 export interface ResourceHandoffRecentEvent extends JsonObject {
   readonly kind: "resource-handoff";
@@ -100,8 +106,8 @@ const EMPTY_RUNTIME_RECORDS: ParsedRuntimeRecords = Object.freeze({
 
 /**
  * Parse the optional registry areas without accepting an opaque plugin bag.
- * `supportedFeatures` is supplied by the authority that owns the current
- * record implementations; the registry itself supports none yet.
+ * `supportedFeatures` defaults to the feature set implemented by this runtime
+ * and may be restricted by an authority with a narrower compatibility policy.
  */
 export function parseRuntimeRecords(
   input: unknown,
@@ -137,6 +143,10 @@ export function parseRuntimeRecords(
       records[definition.field] = parsePersistedFileOperationRecords(input[definition.field]);
       continue;
     }
+    if (definition.field === "retentions") {
+      records[definition.field] = parseSessionRetentionRecords(input[definition.field]);
+      continue;
+    }
     records[definition.field] = parseRecordList(input[definition.field], definition.field);
   }
   const history = (records.recent_events ?? []).filter(
@@ -156,7 +166,7 @@ export function parseRuntimeRecords(
 }
 
 /** Convert parsed optional areas back to their bounded persisted fields. */
-export function toPersistedRuntimeRecords(parsed: ParsedRuntimeRecords): RuntimeRecords {
+export function toPersistedRuntimeRecords(parsed: ParsedRuntimeRecords): PersistedRuntimeRecords {
   const fileOperations = parsed.records.file_operations;
   return Object.freeze(
     Object.fromEntries(
@@ -167,13 +177,17 @@ export function toPersistedRuntimeRecords(parsed: ParsedRuntimeRecords): Runtime
                 field,
                 field === "file_operations"
                   ? serializePersistedFileOperationRecords(fileOperations)
-                  : parsed.records[field],
+                  : field === "retentions"
+                    ? parsed.records.retentions?.map((record) =>
+                        cloneRecord(record as unknown as Record<string, unknown>),
+                      )
+                    : parsed.records[field],
               ],
             ]
           : [],
       ),
     ),
-  ) as RuntimeRecords;
+  ) as PersistedRuntimeRecords;
 }
 
 function parsePersistedFileOperationRecords(value: unknown): readonly PersistedFileOperationRecord[] {
@@ -313,6 +327,178 @@ function parseRecordList(value: unknown, field: string): readonly RuntimeRecord[
     }
   }
   return Object.freeze(records);
+}
+
+function parseSessionRetentionRecords(value: unknown): readonly SessionRetentionRecord[] {
+  if (!Array.isArray(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry retentions must be an array", {
+      field: "retentions",
+    });
+  }
+  if (value.length > MAX_RUNTIME_RECORDS) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry retentions exceeds its bounded record count", {
+      field: "retentions",
+      maximum: MAX_RUNTIME_RECORDS,
+    });
+  }
+
+  const records = value.map((candidate, index) => parseSessionRetentionRecord(candidate, index));
+  const owners = new Set<string>();
+  for (const record of records) {
+    if (owners.has(record.sessionId)) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry retentions contains a duplicate session", {
+        field: "retentions",
+        sessionId: record.sessionId,
+      });
+    }
+    owners.add(record.sessionId);
+  }
+  return Object.freeze(records);
+}
+
+function parseSessionRetentionRecord(value: unknown, index: number): SessionRetentionRecord {
+  const field = "retentions";
+  const invalid = (): SessionRegistryError =>
+    new SessionRegistryError("REGISTRY_CORRUPT", `Registry ${field}[${index}] is invalid`, { field, index });
+  const expectedKeys = [
+    "schemaVersion",
+    "operationId",
+    "sessionId",
+    "repositoryId",
+    "state",
+    "physicalIdentity",
+    "desiredClaims",
+    "pinnedProfileDigest",
+    "parkedAt",
+    "updatedAt",
+  ];
+  if (!isRecord(value) || !hasExactKeys(value, expectedKeys)) throw invalid();
+  if (
+    value.schemaVersion !== SESSION_RETENTION_SCHEMA_VERSION ||
+    !retentionText(value.operationId) ||
+    !retentionText(value.sessionId) ||
+    !retentionText(value.repositoryId) ||
+    value.state !== "parked" ||
+    typeof value.pinnedProfileDigest !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(value.pinnedProfileDigest) ||
+    !canonicalRetentionTimestamp(value.parkedAt) ||
+    !canonicalRetentionTimestamp(value.updatedAt) ||
+    Date.parse(value.updatedAt) < Date.parse(value.parkedAt) ||
+    !Array.isArray(value.desiredClaims)
+  ) {
+    throw invalid();
+  }
+
+  const physicalIdentity = parseRetentionPhysicalIdentity(value.physicalIdentity, invalid);
+  if (physicalIdentity.repositoryId !== value.repositoryId) throw invalid();
+
+  const desiredClaims = value.desiredClaims.map((candidate) => parseRetainedClaimIntent(candidate, invalid));
+  const desiredClaimKeys = new Set<string>();
+  for (const desired of desiredClaims) {
+    const key = `${desired.resource}\u0000${desired.mode}`;
+    if (desiredClaimKeys.has(key)) throw invalid();
+    desiredClaimKeys.add(key);
+  }
+
+  return Object.freeze({
+    schemaVersion: SESSION_RETENTION_SCHEMA_VERSION,
+    operationId: value.operationId,
+    sessionId: value.sessionId,
+    repositoryId: value.repositoryId,
+    state: "parked",
+    physicalIdentity,
+    desiredClaims: Object.freeze(desiredClaims),
+    pinnedProfileDigest: value.pinnedProfileDigest,
+    parkedAt: value.parkedAt,
+    updatedAt: value.updatedAt,
+  });
+}
+
+function parseRetentionPhysicalIdentity(
+  value: unknown,
+  invalid: () => SessionRegistryError,
+): SessionRetentionRecord["physicalIdentity"] {
+  const expectedKeys = ["repositoryId", "worktreeId", "worktreePath", "branchId", "branchName"];
+  if (!isRecord(value) || !hasExactKeys(value, expectedKeys)) throw invalid();
+  if (
+    !retentionText(value.repositoryId) ||
+    !retentionText(value.worktreeId) ||
+    !retentionText(value.worktreePath) ||
+    !retentionText(value.branchId) ||
+    !retentionText(value.branchName) ||
+    !canonicalAbsolutePath(value.repositoryId) ||
+    !canonicalAbsolutePath(value.worktreeId) ||
+    !canonicalAbsolutePath(value.worktreePath) ||
+    value.worktreeId !== value.worktreePath
+  ) {
+    throw invalid();
+  }
+
+  let canonicalBranchId: string;
+  try {
+    canonicalBranchId = normalizeBranchId(value.branchName);
+  } catch {
+    throw invalid();
+  }
+  if (canonicalBranchId !== value.branchId || value.branchName !== canonicalBranchId.slice("refs/heads/".length)) {
+    throw invalid();
+  }
+
+  return Object.freeze({
+    repositoryId: value.repositoryId,
+    worktreeId: value.worktreeId,
+    worktreePath: value.worktreePath,
+    branchId: value.branchId,
+    branchName: value.branchName,
+  });
+}
+
+function parseRetainedClaimIntent(
+  value: unknown,
+  invalid: () => SessionRegistryError,
+): SessionRetentionRecord["desiredClaims"][number] {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["resource", "mode"]) ||
+    !retentionText(value.resource) ||
+    !isResourceClaimMode(value.mode)
+  ) {
+    throw invalid();
+  }
+  try {
+    assertCanonicalClaimResource(value.resource);
+  } catch {
+    throw invalid();
+  }
+  return Object.freeze({ resource: value.resource, mode: value.mode });
+}
+
+function retentionText(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    !/[\u0000-\u001f\u007f]/u.test(value) &&
+    value.normalize("NFC") === value
+  );
+}
+
+function canonicalAbsolutePath(value: string): boolean {
+  return path.isAbsolute(value) && path.resolve(value) === value;
+}
+
+function canonicalRetentionTimestamp(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value) &&
+    Number.isFinite(Date.parse(value)) &&
+    new Date(value).toISOString() === value
+  );
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
 }
 
 function parsePinnedProfileRuntimeRecord(value: unknown, index: number): RuntimeRecord {
