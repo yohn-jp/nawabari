@@ -1877,6 +1877,8 @@ async function executeCommand(
       "retry-close-with-bounded-integration-fetch",
       "discard-session",
       "reconcile-physical-state",
+      "park-session",
+      "resume-session",
     ];
     if (!actionIds.includes(parsed.value.action_id as SessionActionId)) {
       return failure(

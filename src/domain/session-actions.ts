@@ -9,9 +9,14 @@ import type {
   SessionDiscardResult,
   SessionDiscardPreviewEvidence,
   SessionLifecycleAction,
+  SessionParkResumeResult,
   SessionRecord,
   SessionState,
 } from "./session.js";
+import type {
+  SessionLifecycleParkResumeAction,
+  SessionLifecycleParkResumeActionId,
+} from "../session-lifecycle-actions.js";
 import { IMPLEMENTATION_FAILURE_CODE_VOCABULARY } from "../failure-code-vocabulary.js";
 
 /** Application-owned action decisions consumed by UI and other control surfaces. */
@@ -19,7 +24,7 @@ export const SESSION_ACTIONS_SCHEMA_VERSION = 1 as const;
 
 const PREVIEW_MAX_TEXT_CODE_POINTS = 4_096;
 const PREVIEW_MAX_JSON_DEPTH = 32;
-const SESSION_STATES: readonly SessionState[] = ["new", "active", "closing", "closed", "stale"];
+const SESSION_STATES: readonly SessionState[] = ["new", "active", "closing", "closed", "stale", "parked"];
 const READINESS_STATES = ["ready", "not_due", "blocked", "external_evidence_required", "ambiguous"] as const;
 const RESULT_STATES = ["complete", "ambiguous", "stale", "external_evidence_required"] as const;
 const ERROR_CODE_VOCABULARY = new Set<string>(Object.values(IMPLEMENTATION_FAILURE_CODE_VOCABULARY).flat());
@@ -453,7 +458,7 @@ export function parseSessionDiscardPreview(input: unknown): DomainResult<Session
   });
 }
 
-export type SessionActionId = SessionLifecycleAction["action_id"];
+export type SessionActionId = SessionLifecycleAction["action_id"] | SessionLifecycleParkResumeActionId;
 
 /** Stable identity carried by a rendered row. Never use a row index as identity. */
 export type SessionActionIdentity = {
@@ -519,6 +524,12 @@ export type SessionActionResponse =
       readonly status: "completed";
       readonly token: SessionActionToken;
       readonly result: SessionDiscardResult;
+    }
+  | {
+      readonly action_id: SessionLifecycleParkResumeActionId;
+      readonly status: "completed" | "uncertain";
+      readonly token: SessionActionToken;
+      readonly result: SessionParkResumeResult;
     };
 
 export type DestructiveSessionActionRequest = {
@@ -540,7 +551,7 @@ export type SessionActionDispatcher = {
   ): Promise<DomainResult<SessionActionResponse>>;
 };
 
-type DispatchableAction = Extract<SessionLifecycleAction, { action_id: SessionActionId }>;
+type DispatchableAction = SessionLifecycleAction | SessionLifecycleParkResumeAction;
 
 function capabilityUnavailable(operation: string): DomainResult<never> {
   return failure(
@@ -689,7 +700,10 @@ function sameIdentity(left: SessionActionIdentity, right: SessionActionIdentity)
 }
 
 function actionFor(diagnostic: SessionDiagnostic, actionId: SessionActionId): DispatchableAction | undefined {
-  return diagnostic.next_actions?.find((candidate) => candidate.action_id === actionId);
+  return (
+    diagnostic.next_actions?.find((candidate) => candidate.action_id === actionId) ??
+    diagnostic.park_resume_actions?.find((candidate) => candidate.actionId === actionId)
+  );
 }
 
 function operationKey(
@@ -774,7 +788,7 @@ export function createSessionActions(backend: SessionBackend, context: SessionCo
     const fresh = await requireFreshSnapshot(request.identity, request.expected_token);
     if (!fresh.ok) return fresh;
     const action = actionFor(fresh.value.diagnostic, "discard-session");
-    if (action === undefined || action.action_id !== "discard-session") {
+    if (action === undefined || !("action_id" in action) || action.action_id !== "discard-session") {
       return invalidAction("discard-session", request.identity.session_id);
     }
     if (backend.discardPreview === undefined) return capabilityUnavailable("discardPreview");
@@ -849,6 +863,27 @@ export function createSessionActions(backend: SessionBackend, context: SessionCo
       if (!fresh.ok) return fresh;
       const action = actionFor(fresh.value.diagnostic, actionId);
       if (action === undefined) return invalidAction(actionId, identity.session_id);
+      if ("actionId" in action) {
+        if (!confirmation.confirmed) return explicitIntentRequired(action.actionId, identity.session_id);
+        const result =
+          action.actionId === "park-session"
+            ? backend.parkSession === undefined
+              ? capabilityUnavailable("parkSession")
+              : await backend.parkSession(context, identity.session_id, confirmation.operation_id)
+            : backend.resumeSession === undefined
+              ? capabilityUnavailable("resumeSession")
+              : await backend.resumeSession(context, identity.session_id, confirmation.operation_id);
+        if (!result.ok) {
+          await readSessionActionSnapshot(identity);
+          return result;
+        }
+        return success({
+          action_id: action.actionId,
+          status: result.value.status === "uncertain" ? "uncertain" : "completed",
+          token: fresh.value.token,
+          result: result.value,
+        });
+      }
 
       switch (action.action_id) {
         case "retain-session":
