@@ -460,6 +460,21 @@ export function parseSessionDiscardPreview(input: unknown): DomainResult<Session
 
 export type SessionActionId = SessionLifecycleAction["action_id"] | SessionLifecycleParkResumeActionId;
 
+const SESSION_ACTION_ID_VOCABULARY = {
+  "retain-session": true,
+  "supply-exact-integrated-revision": true,
+  "retry-close-with-bounded-integration-fetch": true,
+  "discard-session": true,
+  "reconcile-physical-state": true,
+  "park-session": true,
+  "resume-session": true,
+} as const satisfies Record<SessionActionId, true>;
+
+/** Application-owned typed lifecycle action IDs shared by the control adapters. */
+export const SESSION_ACTION_IDS: readonly SessionActionId[] = Object.freeze(
+  Object.keys(SESSION_ACTION_ID_VOCABULARY) as SessionActionId[],
+);
+
 /** Stable identity carried by a rendered row. Never use a row index as identity. */
 export type SessionActionIdentity = {
   readonly session_id: string;

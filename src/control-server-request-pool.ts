@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { Worker, isMainThread, parentPort, threadId, workerData } from "node:worker_threads";
 import type { Worker as WorkerHandle } from "node:worker_threads";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { SESSION_ACTION_IDS } from "./domain/session-actions.js";
 import {
   DomainError,
   EXIT_CODES,
@@ -13,7 +14,6 @@ import {
 } from "./domain/errors.js";
 import type { SessionBackend, SessionContext } from "./domain/session.js";
 import type { GitCommandRunner } from "./git.js";
-import { resolveCliCommandDefinition } from "./cli-command-registry.js";
 import {
   listControlRepositories,
   openRepositoryLocator,
@@ -136,12 +136,6 @@ function domainReply<T>(result: DomainResult<T>, project: (value: T) => JsonObje
   );
 }
 
-function actionIds(): readonly string[] {
-  return (
-    resolveCliCommandDefinition("session action")?.options.find((option) => option.name === "--action")?.values ?? []
-  );
-}
-
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -158,7 +152,7 @@ export function parseControlActionRequest(input: unknown): DomainResult<ActionRe
   for (const key of Object.keys(input)) {
     if (key !== "action_id" && key !== "token" && key !== "confirmation") return invalid(key, "unknown field");
   }
-  if (typeof input.action_id !== "string" || !actionIds().includes(input.action_id)) {
+  if (typeof input.action_id !== "string" || !SESSION_ACTION_IDS.some((actionId) => actionId === input.action_id)) {
     return invalid("action_id", "expected a typed lifecycle action ID");
   }
   if (!isPlainObject(input.token)) return invalid("token", "expected the current action token object");
