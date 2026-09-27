@@ -9,7 +9,6 @@ import {
   validateRequiredMetadataString
 } from "gh-inari/artifact";
 import { compileLocalGovernedContract } from "gh-inari/governance";
-import { classifyPullRequestBranch } from "./pr-contract-routing.mjs";
 import { countTemplateIdentityMarkerAttempts } from "./pr-template-marker.mjs";
 import { classifyEpicPrTitle } from "./epic-branch.mjs";
 
@@ -21,47 +20,100 @@ const REPOSITORY_ROOT = path.resolve(
 /**
  * Validate a pull-request event against the checked-out repository's local
  * Inari snapshot. The workflow owns event plumbing; gh-inari owns contract
- * compilation, Markdown parsing, and semantic validation.
+ * compilation, Markdown parsing, semantic validation, branch/release routing,
+ * and (when route evidence is supplied) Integration Routing projection.
  *
  * Template selection (Issue #211) is resolved directly from the PR body's
  * own gh-inari template-identity marker: `default`, `release`, `epic`, and
  * `authority` all go through the same marker mechanism, and there is no
  * branch/path/body-shape inference here. Branch-name governance
- * (classifyPullRequestBranch) still validates the head ref as its own
- * independent contract, but it no longer participates in template
- * selection. gh-inari itself only checks that a title is non-empty; the
- * canonical epic(<scope>): <description> title form (Issue #177) is a
- * separate, narrow addition owned directly here, exactly like branch-name
- * validation — see epic-branch.mjs. It only ever classifies a title that is
- * itself attempting the epic type; every ordinary/release title remains
- * unaffected.
+ * still validates the head ref as its own independent contract, but it no
+ * longer participates in template selection. gh-inari itself only checks
+ * that a title is non-empty; the canonical
+ * `epic(<scope>): <description>` title form (Issue #177) is a separate,
+ * narrow addition owned directly here — see epic-branch.mjs. It only ever
+ * classifies a title that is itself attempting the epic type; every
+ * ordinary/release title remains unaffected.
  */
 export async function validatePullRequest({
   title,
   body,
   root = REPOSITORY_ROOT,
-  branch
+  branch,
+  routing: routingEvidence,
+  observedPullRequest
 }) {
-  const routing = classifyPullRequestBranch({ branch });
-  if (routing.errors.length > 0) {
-    const violations = routing.errors.map((message) => ({
-      code: "GOVERNANCE_RELEASE_BRANCH_INVALID",
-      path: "$.pull_request.head.ref",
-      message
-    }));
+  const releaseBranch =
+    typeof branch === "string" && branch.startsWith("release/");
+  let branchClassification = releaseBranch
+    ? "release"
+    : branch === undefined || branch === ""
+      ? "unclassified"
+      : "ordinary";
+
+  if (routingEvidence?.invalid !== undefined) {
+    const violation = routingEvidence.invalid;
     return {
       valid: false,
-      branchClassification: routing.classification,
-      violations,
-      errors: violations.map((violation) => violation.message)
+      branchClassification,
+      violations: [violation],
+      errors: [violation.message]
     };
+  }
+
+  let routingProjection;
+  if (releaseBranch || isReleaseRoutingEvidence(routingEvidence)) {
+    const suppliedNonReleaseRoute =
+      routingEvidence !== undefined &&
+      !isReleaseRoutingEvidence(routingEvidence);
+    const routeResult =
+      releaseBranch && suppliedNonReleaseRoute
+        ? await validateIntegrationRouting(routingEvidence, observedPullRequest)
+        : await validateReleaseRouting({
+            branch,
+            routingEvidence,
+            observedPullRequest
+          });
+    if (!routeResult.valid) {
+      if (releaseBranch) branchClassification = "invalid-release";
+      return {
+        valid: false,
+        branchClassification,
+        ...(routeResult.projection === undefined
+          ? {}
+          : { routing: routeResult.projection }),
+        violations: routeResult.diagnostics,
+        errors: routeResult.diagnostics.map((violation) => violation.message)
+      };
+    }
+    routingProjection = routeResult.projection;
+  } else if (routingEvidence !== undefined) {
+    const routeResult = await validateIntegrationRouting(
+      routingEvidence,
+      observedPullRequest
+    );
+    if (!routeResult.valid) {
+      return {
+        valid: false,
+        branchClassification,
+        ...(routeResult.projection === undefined
+          ? {}
+          : { routing: routeResult.projection }),
+        violations: routeResult.diagnostics,
+        errors: routeResult.diagnostics.map((violation) => violation.message)
+      };
+    }
+    routingProjection = routeResult.projection;
   }
 
   const resolution = await resolveTemplateContract(root, body);
   if (!resolution.valid) {
     return {
       valid: false,
-      branchClassification: routing.classification,
+      branchClassification,
+      ...(routingProjection === undefined
+        ? {}
+        : { routing: routingProjection }),
       violations: resolution.violations,
       errors: resolution.violations.map((violation) => violation.message)
     };
@@ -71,11 +123,278 @@ export async function validatePullRequest({
     resolution.contract,
     resolution.body
   );
-  return report(
+  const outcome = report(
     { contract: resolution.contract, result },
     title,
-    routing.classification
+    branchClassification
   );
+  return {
+    ...outcome,
+    ...(routingProjection === undefined ? {} : { routing: routingProjection })
+  };
+}
+
+/**
+ * Validate explicit integration-route evidence through the published Inari
+ * projector, then bind it to the observed pull-request evidence through
+ * Inari's publication-request validator.
+ */
+async function validateIntegrationRouting(input, observedPullRequest) {
+  let inari;
+  try {
+    inari = await import("gh-inari");
+  } catch (cause) {
+    return {
+      valid: false,
+      diagnostics: [
+        {
+          code: "GOVERNANCE_INARI_ROUTING_UNAVAILABLE",
+          path: "$.routing",
+          message: `Canonical Inari routing could not be loaded: ${cause instanceof Error ? cause.message : String(cause)}`
+        }
+      ]
+    };
+  }
+
+  const projector = inari.tryProjectIntegrationRouting;
+  if (typeof projector !== "function") {
+    return {
+      valid: false,
+      diagnostics: [
+        {
+          code: "GOVERNANCE_INARI_ROUTING_UNAVAILABLE",
+          path: "$.routing",
+          message:
+            "Canonical Inari routing is unavailable; route evidence cannot be validated."
+        }
+      ]
+    };
+  }
+
+  try {
+    const result = projector(input);
+    const projected = {
+      valid: result?.valid === true,
+      projection: result?.projection,
+      diagnostics: Array.isArray(result?.diagnostics)
+        ? result.diagnostics
+        : [
+            {
+              code: "GOVERNANCE_INARI_ROUTING_INVALID",
+              path: "$.routing",
+              message:
+                "Canonical Inari routing returned no structured diagnostics."
+            }
+          ]
+    };
+    if (!projected.valid || observedPullRequest === undefined) return projected;
+    if (projected.projection === undefined) {
+      return {
+        valid: false,
+        diagnostics: [
+          {
+            code: "GOVERNANCE_INARI_ROUTING_INVALID",
+            path: "$.routing",
+            message: "Canonical Inari routing returned no route projection."
+          }
+        ]
+      };
+    }
+
+    const workIdentity = workIdentityFromProjection(projected.projection);
+    return validatePublishedPullRequestEvidence(
+      inari,
+      projected.projection,
+      workIdentity,
+      observedPullRequest
+    );
+  } catch (cause) {
+    return {
+      valid: false,
+      diagnostics: [
+        {
+          code: "GOVERNANCE_INARI_ROUTING_INVALID",
+          path: "$.routing",
+          message: `Canonical Inari routing failed closed: ${cause instanceof Error ? cause.message : String(cause)}`
+        }
+      ]
+    };
+  }
+}
+
+async function validateReleaseRouting({
+  branch,
+  routingEvidence,
+  observedPullRequest
+}) {
+  let inari;
+  try {
+    inari = await import("gh-inari");
+  } catch (cause) {
+    return unavailableRoutingResult(cause);
+  }
+
+  if (typeof inari.tryValidatePrPublicationRequest !== "function") {
+    return {
+      valid: false,
+      diagnostics: [
+        {
+          code: "GOVERNANCE_INARI_ROUTING_UNAVAILABLE",
+          path: "$.routing",
+          message:
+            "Canonical Inari release routing is unavailable; release route evidence cannot be validated."
+        }
+      ]
+    };
+  }
+
+  const suppliedRoute = unwrapRoutingEvidence(routingEvidence);
+  const targetVersion =
+    suppliedRoute?.targetVersion ??
+    (typeof branch === "string" && branch.startsWith("release/")
+      ? branch.slice("release/".length)
+      : undefined);
+  const sourceRevision = observedPullRequest?.headRevision;
+  const workIdentity = {
+    release: { targetVersion, sourceRevision }
+  };
+  if (observedPullRequest === undefined) {
+    return {
+      valid: false,
+      ...(suppliedRoute === undefined ? {} : { projection: suppliedRoute }),
+      diagnostics: [
+        {
+          code: "GOVERNANCE_INARI_PR_EVIDENCE_INVALID",
+          path: "$.pull_request",
+          message:
+            "Observed repository and pull-request evidence is required for release route validation."
+        }
+      ]
+    };
+  }
+  return validatePublishedPullRequestEvidence(
+    inari,
+    suppliedRoute,
+    workIdentity,
+    observedPullRequest
+  );
+}
+
+function validatePublishedPullRequestEvidence(
+  inari,
+  routing,
+  workIdentity,
+  observedPullRequest
+) {
+  if (observedPullRequest.invalid !== undefined) {
+    return {
+      valid: false,
+      projection: routing,
+      diagnostics: [observedPullRequest.invalid]
+    };
+  }
+  const validator = inari.tryValidatePrPublicationRequest;
+  if (typeof validator !== "function") {
+    return {
+      valid: false,
+      projection: routing,
+      diagnostics: [
+        {
+          code: "GOVERNANCE_INARI_ROUTING_UNAVAILABLE",
+          path: "$.routing",
+          message:
+            "Canonical Inari pull-request evidence validation is unavailable."
+        }
+      ]
+    };
+  }
+  try {
+    const result = validator({
+      version: 1,
+      kind: "pr-publication",
+      repository: observedPullRequest.repository,
+      workIdentity,
+      routing,
+      expectedHead: observedPullRequest.head,
+      expectedBase: observedPullRequest.base,
+      headRevision: observedPullRequest.headRevision,
+      title: observedPullRequest.title,
+      body: observedPullRequest.body
+    });
+    return {
+      valid: result?.valid === true,
+      projection: result?.routing ?? routing,
+      diagnostics: Array.isArray(result?.diagnostics)
+        ? result.diagnostics
+        : [
+            {
+              code: "GOVERNANCE_INARI_ROUTING_INVALID",
+              path: "$.routing",
+              message:
+                "Canonical Inari pull-request validation returned no structured diagnostics."
+            }
+          ]
+    };
+  } catch (cause) {
+    return {
+      valid: false,
+      projection: routing,
+      diagnostics: [
+        {
+          code: "GOVERNANCE_INARI_ROUTING_INVALID",
+          path: "$.routing",
+          message: `Canonical Inari pull-request validation failed closed: ${cause instanceof Error ? cause.message : String(cause)}`
+        }
+      ]
+    };
+  }
+}
+
+function workIdentityFromProjection(projection) {
+  if (projection.implementation === undefined) return undefined;
+  return {
+    implementation: projection.implementation,
+    ...(projection.sourceIssue === undefined
+      ? {}
+      : { sourceIssue: projection.sourceIssue })
+  };
+}
+
+function isReleaseRoutingEvidence(input) {
+  const route = unwrapRoutingEvidence(input);
+  return (
+    typeof route === "object" &&
+    route !== null &&
+    !Array.isArray(route) &&
+    route.kind === "release-pr-publication"
+  );
+}
+
+function unwrapRoutingEvidence(input) {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return input;
+  }
+  const keys = Object.keys(input);
+  if (keys.length === 1 && Object.hasOwn(input, "routing")) {
+    return input.routing;
+  }
+  if (keys.length === 1 && Object.hasOwn(input, "input")) {
+    return input.input;
+  }
+  return input;
+}
+
+function unavailableRoutingResult(cause) {
+  return {
+    valid: false,
+    diagnostics: [
+      {
+        code: "GOVERNANCE_INARI_ROUTING_UNAVAILABLE",
+        path: "$.routing",
+        message: `Canonical Inari routing could not be loaded: ${cause instanceof Error ? cause.message : String(cause)}`
+      }
+    ]
+  };
 }
 
 /**
@@ -191,6 +510,93 @@ function report(outcome, title, branchClassification) {
   };
 }
 
+function readRoutingEvidence(event) {
+  const pullRequest = event.pull_request;
+  const configured = process.env.INARI_ROUTING;
+  let input;
+  if (configured !== undefined && configured.trim() !== "") {
+    try {
+      const source = configured.trim();
+      input = fs.existsSync(source)
+        ? JSON.parse(fs.readFileSync(source, "utf8"))
+        : JSON.parse(source);
+    } catch (cause) {
+      return {
+        invalid: {
+          code: "GOVERNANCE_INARI_ROUTING_INVALID",
+          path: "$.routing",
+          message: `Configured Inari routing evidence is not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`
+        }
+      };
+    }
+  } else {
+    input =
+      pullRequest?.routing ??
+      pullRequest?.integration_routing ??
+      pullRequest?.inari?.routing;
+  }
+  if (input === undefined) return undefined;
+  input = unwrapRoutingEvidence(input);
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return {
+      invalid: {
+        code: "GOVERNANCE_INARI_ROUTING_INVALID",
+        path: "$.routing",
+        message: "Inari routing evidence must be an object."
+      }
+    };
+  }
+
+  const observed = {
+    ...(pullRequest?.head?.ref === undefined
+      ? {}
+      : { head: pullRequest.head.ref }),
+    ...(pullRequest?.base?.ref === undefined
+      ? {}
+      : { base: pullRequest.base.ref })
+  };
+  const route = { ...input, ...observed };
+  if (
+    typeof input.pullRequest === "object" &&
+    input.pullRequest !== null &&
+    !Array.isArray(input.pullRequest)
+  ) {
+    route.pullRequest = { ...input.pullRequest, ...observed };
+  }
+  return route;
+}
+
+function readObservedPullRequest(event) {
+  const repository = event.repository;
+  const pullRequest = event.pull_request;
+  try {
+    if (typeof repository?.html_url !== "string") {
+      throw new TypeError("GitHub event repository html_url is missing.");
+    }
+    const repositoryHost = new URL(repository.html_url).host;
+    return {
+      repository: {
+        repositoryHost,
+        repositoryId: String(repository.id ?? ""),
+        repository: repository.full_name
+      },
+      head: pullRequest?.head?.ref,
+      base: pullRequest?.base?.ref,
+      headRevision: pullRequest?.head?.sha,
+      title: pullRequest?.title ?? "",
+      body: pullRequest?.body ?? ""
+    };
+  } catch (cause) {
+    return {
+      invalid: {
+        code: "GOVERNANCE_INARI_PR_EVIDENCE_INVALID",
+        path: "$.pull_request",
+        message: `Observed repository evidence is invalid: ${cause instanceof Error ? cause.message : String(cause)}`
+      }
+    };
+  }
+}
+
 async function main() {
   const eventPathArgIndex = process.argv.indexOf("--event");
   if (eventPathArgIndex === -1)
@@ -204,11 +610,15 @@ async function main() {
   const pullRequest = event.pull_request;
   const branch =
     branchIndex === -1 ? pullRequest.head?.ref : process.argv[branchIndex + 1];
+  const routingEvidence = readRoutingEvidence(event);
+  const observedPullRequest = readObservedPullRequest(event);
   const result = await validatePullRequest({
     title: pullRequest.title ?? "",
     body: pullRequest.body ?? "",
     root: process.cwd(),
-    branch
+    branch,
+    routing: routingEvidence,
+    observedPullRequest
   });
   console.log(
     JSON.stringify({
@@ -222,6 +632,7 @@ async function main() {
       ...(result.result === undefined
         ? {}
         : { classification: result.result.classification }),
+      ...(result.routing === undefined ? {} : { routing: result.routing }),
       violations: result.violations
     })
   );
