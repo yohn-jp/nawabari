@@ -1,5 +1,8 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import {
   DomainError,
   EXIT_CODES,
@@ -53,8 +56,8 @@ export type ControlServerOptions = {
 export type ControlServer = {
   readonly port: number;
   readonly url: string;
-  /** Ephemeral in-memory token; never logged or persisted. */
-  readonly token: string;
+  /** Host-only, owner-readable bootstrap artifact for the trusted operator. */
+  readonly credentialFile: string;
   close(): Promise<void>;
 };
 
@@ -102,6 +105,50 @@ function sameSecret(expected: string, supplied: string | string[] | undefined): 
   const left = Buffer.from(expected, "utf8");
   const right = Buffer.from(supplied, "utf8");
   return left.length === right.length && timingSafeEqual(left, right);
+}
+
+type HostCredentialArtifact = { readonly directory: string; readonly file: string };
+
+/**
+ * Use the per-user runtime directory when the OS provides one. The fallback
+ * is the host temporary directory, which protected sessions replace with a
+ * private tmpfs instead of mounting from the host.
+ */
+function hostCredentialDirectory(): string {
+  if (process.platform === "linux" && typeof process.getuid === "function") {
+    const runtime = `/run/user/${process.getuid()}`;
+    try {
+      const stat = fs.lstatSync(runtime);
+      if (stat.isDirectory() && !stat.isSymbolicLink() && stat.uid === process.getuid() && (stat.mode & 0o077) === 0) {
+        return runtime;
+      }
+    } catch {
+      // Fall back to host /tmp, which is replaced by a private tmpfs in the
+      // protected runtime and is therefore outside its filesystem view.
+    }
+    return "/tmp";
+  }
+  return os.tmpdir();
+}
+
+function createHostCredentialArtifact(token: string): HostCredentialArtifact {
+  const directory = fs.mkdtempSync(path.join(hostCredentialDirectory(), "nawabari-control-"));
+  try {
+    fs.chmodSync(directory, 0o700);
+    const file = path.join(directory, "credential");
+    const descriptor = fs.openSync(file, "wx", 0o600);
+    try {
+      fs.writeSync(descriptor, `${token}\n`);
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    fs.chmodSync(file, 0o600);
+    return { directory, file };
+  } catch (error: unknown) {
+    fs.rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -345,7 +392,7 @@ export async function startControlServer(options: ControlServerOptions): Promise
           `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; ` +
           "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
       });
-      response.end(renderControlWebDocument({ token, nonce }));
+      response.end(renderControlWebDocument({ nonce }));
       return;
     }
     let segments: string[];
@@ -412,14 +459,43 @@ export async function startControlServer(options: ControlServerOptions): Promise
   const address = server.address();
   port = typeof address === "object" && address !== null ? address.port : options.port;
 
+  let credential: HostCredentialArtifact;
+  try {
+    credential = createHostCredentialArtifact(token);
+  } catch {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      server.closeAllConnections();
+    });
+    return failure(
+      new DomainError("BACKEND_UNAVAILABLE", "The host-only Control credential file could not be created."),
+    );
+  }
+
+  let closePromise: Promise<void> | undefined;
+
   return success({
     port,
     url: `http://${CONTROL_SERVER_HOST}:${port}/`,
-    token,
-    close: () =>
-      new Promise<void>((resolve) => {
-        server.close(() => resolve());
+    credentialFile: credential.file,
+    close: () => {
+      if (closePromise !== undefined) return closePromise;
+      closePromise = new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error !== undefined) {
+            reject(error);
+            return;
+          }
+          try {
+            fs.rmSync(credential.directory, { recursive: true, force: true });
+            resolve();
+          } catch (cleanupError: unknown) {
+            reject(cleanupError);
+          }
+        });
         server.closeAllConnections();
-      }),
+      });
+      return closePromise;
+    },
   });
 }

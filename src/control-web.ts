@@ -6,8 +6,6 @@
 export const CONTROL_WEB_POLL_INTERVAL_MS = 3_000;
 
 export type ControlWebDocumentInput = {
-  /** Same-origin bootstrap of the ephemeral control token; never placed in a URL. */
-  readonly token: string;
   readonly nonce: string;
 };
 
@@ -15,6 +13,11 @@ const STYLE = `
 body{font:14px/1.4 system-ui,sans-serif;margin:0;background:#f7f7f8;color:#1b1b1f}
 header{display:flex;gap:12px;align-items:center;padding:10px 16px;background:#1b1b1f;color:#fff}
 header h1{font-size:16px;margin:0;flex:1}
+#operator-connect{max-width:520px;margin:24px auto;padding:16px;background:#fff;border:1px solid #ddd;border-radius:6px}
+#operator-connect label,#operator-connect input{display:block;width:100%;box-sizing:border-box;margin:8px 0}
+#operator-connect input{font:inherit;padding:8px}
+#operator-connect p{font-size:12px;color:#444}
+[hidden]{display:none!important}
 main{display:grid;grid-template-columns:minmax(200px,260px) 1fr;gap:16px;padding:16px}
 section{background:#fff;border:1px solid #ddd;border-radius:6px;padding:10px 12px;margin-bottom:12px;overflow-x:auto}
 h2{font-size:14px;margin:0 0 8px}
@@ -32,7 +35,7 @@ pre{margin:0;white-space:pre-wrap;word-break:break-all;font-size:12px;max-height
 const SCRIPT = `
 const TOKEN_HEADER = "x-nawabari-control-token";
 const POLL_MS = ${CONTROL_WEB_POLL_INTERVAL_MS};
-const token = document.querySelector('meta[name="nawabari-control-token"]').content;
+let token = "";
 const state = { repository: null, session: null, snapshotToken: null, pending: null };
 const $ = (id) => document.getElementById(id);
 
@@ -52,8 +55,41 @@ async function api(path, init) {
     headers: { [TOKEN_HEADER]: token, ...(init && init.body ? { "content-type": "application/json" } : {}) },
   });
   const body = await response.json();
+  if ((response.status === 401 || response.status === 403) && body.error && body.error.code === "OPERATION_REJECTED") {
+    token = "";
+    $("operator-connect").hidden = false;
+    $("control").hidden = true;
+    $("disconnect").hidden = true;
+    $("refresh").hidden = true;
+    status("Credential rejected or expired. Enter the current host operator credential.", true);
+  }
   return { status: response.status, body };
 }
+
+$("operator-connect").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const supplied = $("operator-token").value.trim();
+  if (!/^[0-9a-f]{64}$/u.test(supplied)) {
+    status("Enter the 64-character credential from the host operator's credential file.", true);
+    return;
+  }
+  token = supplied;
+  $("operator-token").value = "";
+  $("operator-connect").hidden = true;
+  $("control").hidden = false;
+  $("disconnect").hidden = false;
+  $("refresh").hidden = false;
+  loadRepositories();
+});
+
+$("disconnect").addEventListener("click", () => {
+  token = "";
+  $("operator-connect").hidden = false;
+  $("control").hidden = true;
+  $("disconnect").hidden = true;
+  $("refresh").hidden = true;
+  status("Enter the current host operator credential.");
+});
 
 function table(columns, rows, onSelect) {
   const t = el("table");
@@ -170,14 +206,13 @@ async function dispatch(path, actionId, actionToken, confirmation) {
   await refresh(true);
 }
 
-$("refresh").addEventListener("click", () => { loadRepositories(); refresh(true); });
-setInterval(() => { if (document.visibilityState === "visible") refresh(false); }, POLL_MS);
-loadRepositories();
+$("refresh").addEventListener("click", () => { if (token !== "") { loadRepositories(); refresh(true); } });
+setInterval(() => { if (token !== "" && document.visibilityState === "visible") refresh(false); }, POLL_MS);
 `;
 
 export function renderControlWebDocument(input: ControlWebDocumentInput): string {
-  if (!/^[0-9a-f]+$/u.test(input.token) || !/^[A-Za-z0-9+/=]+$/u.test(input.nonce)) {
-    throw new Error("Control Web document requires a hex token and base64 nonce.");
+  if (!/^[A-Za-z0-9+/=]+$/u.test(input.nonce)) {
+    throw new Error("Control Web document requires a base64 nonce.");
   }
   return `<!doctype html>
 <html lang="en">
@@ -185,13 +220,18 @@ export function renderControlWebDocument(input: ControlWebDocumentInput): string
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta name="nawabari-control-token" content="${input.token}">
 <title>Nawabari Control</title>
 <style nonce="${input.nonce}">${STYLE}</style>
 </head>
 <body>
-<header><h1>Nawabari Control</h1><span id="status" class="status"></span><button id="refresh" type="button">Refresh</button></header>
-<main>
+<header><h1>Nawabari Control</h1><span id="status" class="status"></span><button id="disconnect" type="button" hidden>Disconnect</button><button id="refresh" type="button" hidden>Refresh</button></header>
+<form id="operator-connect">
+<label for="operator-token">Host operator credential</label>
+<input id="operator-token" type="password" autocomplete="off" spellcheck="false" aria-describedby="operator-help">
+<p id="operator-help">Paste the credential from the host-only file path printed by the running server command. It expires when that server stops.</p>
+<button type="submit">Connect</button>
+</form>
+<main id="control" hidden>
 <nav><h2>Repositories</h2><div id="repositories"></div></nav>
 <div id="repository"><p>Select a repository.</p></div>
 </main>

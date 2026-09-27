@@ -1827,6 +1827,7 @@ async function executeCommand(
       url: started.value.url,
       host: CONTROL_SERVER_HOST,
       port: started.value.port,
+      credential_file: started.value.credentialFile,
     };
     (dependencies.io ?? defaultCliIO()).stdout(renderSuccess(dependencies.json ? "json" : "human", "server", endpoint));
     dependencies.controlServer?.onListening?.(started.value);
