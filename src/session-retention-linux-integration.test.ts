@@ -237,7 +237,7 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
     "setInterval(() => {}, 1000);",
   ].join("\n");
   runPromise = runCli(["--json", "session", "run", "--session", sessionId, "--", "node", "-e", payload], {
-    cwd: repositoryPath,
+    cwd: targetWorktreePath,
     backend,
     io: {
       stdout: (line) => runStdout.push(line),
