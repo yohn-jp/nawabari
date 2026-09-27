@@ -17,10 +17,12 @@ import {
   startControlServer,
   type ControlServer,
 } from "./control-server.js";
+import type { CanonicalLockObservation } from "./control-server-request-pool.js";
 import { DomainError } from "./domain/errors.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { controlServerEndpointPath, defaultControlServerOperationalDirectory } from "./control-server-lease.js";
 import { RepositoryLock } from "./registry/lock.js";
+import { REGISTRY_DIRECTORY_NAME, REGISTRY_LOCK_FILE_NAME } from "./registry/repository-state-boundary.js";
 
 type Fixture = {
   readonly root: string;
@@ -101,6 +103,25 @@ async function start(t: test.TestContext, context: Fixture, port = 0): Promise<T
     backend: createLocalSessionBackend(),
     catalogPath: context.catalog,
     operationalDirectory: context.operationalDirectory,
+  });
+  if (!started.ok) throw started.error;
+  const server = { ...started.value, token: fs.readFileSync(started.value.credentialFile, "utf8").trim() };
+  t.after(() => server.close());
+  return server;
+}
+
+async function startWithIsolatedLocalBackend(
+  t: test.TestContext,
+  context: Fixture,
+  onCanonicalLockAcquire: (observation: CanonicalLockObservation) => void,
+): Promise<TestControlServer> {
+  const started = await startControlServer({
+    port: 0,
+    backend: createLocalSessionBackend(),
+    catalogPath: context.catalog,
+    operationalDirectory: context.operationalDirectory,
+    isolateLocalBackendRequests: true,
+    onCanonicalLockAcquire,
   });
   if (!started.ok) throw started.error;
   const server = { ...started.value, token: fs.readFileSync(started.value.credentialFile, "utf8").trim() };
@@ -286,6 +307,130 @@ function serverWorker(
 function waitForWorkerClose(child: ChildProcessWithoutNullStreams): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   return new Promise((resolve) => child.once("close", () => resolve()));
+}
+
+function withinDeadline<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(message)), milliseconds);
+    promise.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+
+function observationRecorder(): {
+  readonly events: CanonicalLockObservation[];
+  readonly onObservation: (observation: CanonicalLockObservation) => void;
+  waitFor(predicate: (observation: CanonicalLockObservation) => boolean): Promise<CanonicalLockObservation>;
+} {
+  const events: CanonicalLockObservation[] = [];
+  const waiters: {
+    readonly predicate: (observation: CanonicalLockObservation) => boolean;
+    readonly resolve: (observation: CanonicalLockObservation) => void;
+  }[] = [];
+  const onObservation = (observation: CanonicalLockObservation) => {
+    events.push(observation);
+    for (let index = waiters.length - 1; index >= 0; index -= 1) {
+      const waiter = waiters[index];
+      if (waiter !== undefined && waiter.predicate(observation)) {
+        waiters.splice(index, 1);
+        waiter.resolve(observation);
+      }
+    }
+  };
+  return {
+    events,
+    onObservation,
+    waitFor(predicate) {
+      const existing = events.find(predicate);
+      if (existing !== undefined) return Promise.resolve(existing);
+      return new Promise((resolve) => waiters.push({ predicate, resolve }));
+    },
+  };
+}
+
+type CanonicalLockHolder = {
+  readonly child: ChildProcessWithoutNullStreams;
+  readonly pid: number;
+  release(): Promise<void>;
+};
+
+async function holdCanonicalLock(lockPath: string): Promise<CanonicalLockHolder> {
+  const moduleUrl = new URL("./registry/lock.ts", import.meta.url).href;
+  const tsxLoader = fileURLToPath(import.meta.resolve("tsx/esm"));
+  const script = `
+    const { RepositoryLock } = await import(process.env.NAWABARI_CANONICAL_LOCK_MODULE);
+    const lockPath = process.env.NAWABARI_CANONICAL_LOCK_PATH;
+    const lease = await new RepositoryLock({ lockPath }).acquire();
+    process.stdout.write(JSON.stringify({ pid: process.pid, lockPath, acquired: true }) + "\\n");
+    process.stdin.once("data", () => {
+      void lease.release().then(() => process.stdout.write("released\\n", () => process.exit(0)));
+    });
+  `;
+  const child = spawn(process.execPath, ["--import", tsxLoader, "--input-type=module", "-e", script], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      NAWABARI_CANONICAL_LOCK_MODULE: moduleUrl,
+      NAWABARI_CANONICAL_LOCK_PATH: lockPath,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const queuedLines: string[] = [];
+  const lineWaiters: ((line: string) => void)[] = [];
+  let pending = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    pending += chunk;
+    while (true) {
+      const newline = pending.indexOf("\n");
+      if (newline === -1) return;
+      const line = pending.slice(0, newline);
+      pending = pending.slice(newline + 1);
+      const waiter = lineWaiters.shift();
+      if (waiter === undefined) queuedLines.push(line);
+      else waiter(line);
+    }
+  });
+  child.stderr.setEncoding("utf8");
+  let stderr = "";
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const nextLine = () =>
+    queuedLines.length > 0
+      ? Promise.resolve(queuedLines.shift() ?? "")
+      : new Promise<string>((resolve) => lineWaiters.push(resolve));
+  let ready: { readonly pid: number; readonly lockPath: string; readonly acquired: boolean };
+  try {
+    ready = JSON.parse(
+      await withinDeadline(nextLine(), 5_000, `canonical lock helper did not acquire ${lockPath}: ${stderr}`),
+    ) as typeof ready;
+  } catch (error: unknown) {
+    child.kill("SIGKILL");
+    await waitForWorkerClose(child);
+    throw error;
+  }
+  assert.equal(ready.lockPath, lockPath);
+  assert.equal(ready.acquired, true);
+  return {
+    child,
+    pid: ready.pid,
+    async release() {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.stdin.write("release\n");
+      const released = await withinDeadline(nextLine(), 5_000, `canonical lock helper did not release ${lockPath}`);
+      assert.equal(released, "released");
+      await waitForWorkerClose(child);
+    },
+  };
 }
 
 function stopWorkerAfterTest(t: test.TestContext, child: ChildProcessWithoutNullStreams): void {
@@ -480,6 +625,116 @@ test("typed actions reject stale evidence and keep destructive preview plus conf
   assert.equal(fs.existsSync(session.worktree), false);
   assert.ok(!JSON.stringify(discarded.body).includes(server.token));
   assert.ok(!fs.readFileSync(context.catalog, "utf8").includes(server.token));
+});
+
+test("a real Control action waits on its canonical lock without blocking health or another repository", async (t) => {
+  const context = fixture(t);
+  const alpha = repository(context, "alpha");
+  const beta = repository(context, "beta");
+  const alphaSession = await createSession(context, alpha, "feature/locked-alpha");
+  const betaSession = await createSession(context, beta, "feature/responsive-beta");
+  fs.writeFileSync(path.join(alphaSession.worktree, "scratch.txt"), "discard through Control after lock release\n");
+  const observations = observationRecorder();
+  const server = await startWithIsolatedLocalBackend(t, context, observations.onObservation);
+  const alphaKey = repositoryKey(alphaSession.repository);
+  const betaKey = repositoryKey(betaSession.repository);
+  const alphaPath = `/api/v1/repositories/${alphaKey}/sessions/${alphaSession.session_id}`;
+  const alphaRead = await call(server, alphaPath);
+  assert.equal(alphaRead.status, 200, alphaRead.text);
+  const previewed = await postAction(server, alphaKey, alphaSession.session_id, {
+    action_id: "discard-session",
+    token: at(alphaRead.body, "action_snapshot", "token"),
+    confirmation: { confirmed: false },
+  });
+  assert.equal(previewed.status, 200, previewed.text);
+  assert.equal(at(previewed.body, "result", "status"), "confirmation-required");
+  const actionToken = at(previewed.body, "result", "token");
+  const preview = at(previewed.body, "result", "preview");
+
+  const commonGitDirectory = execFileSync("git", ["rev-parse", "--git-common-dir"], {
+    cwd: alpha,
+    encoding: "utf8",
+  }).trim();
+  const lockPath = path.join(path.resolve(alpha, commonGitDirectory), REGISTRY_DIRECTORY_NAME, REGISTRY_LOCK_FILE_NAME);
+  const held = await holdCanonicalLock(lockPath);
+  t.after(async () => held.release());
+  assert.notEqual(held.pid, process.pid, "a separate helper process owns the canonical registry lock");
+  const ownerPath = path.join(lockPath, "owner.json");
+  assert.equal((JSON.parse(fs.readFileSync(ownerPath, "utf8")) as { pid: number }).pid, held.pid);
+  assert.equal(held.child.exitCode, null, "the canonical lock helper process is still running");
+  observations.events.length = 0;
+
+  const startedWaiting = observations.waitFor(
+    (observation) => observation.phase === "acquire-start" && observation.lockPath === lockPath,
+  );
+  let alphaSettled = false;
+  const pendingAlpha = postAction(server, alphaKey, alphaSession.session_id, {
+    action_id: "discard-session",
+    token: actionToken,
+    confirmation: {
+      confirmed: true,
+      preview,
+      operation_id: "control-lock-wait-isolation",
+    },
+  }).then((response) => {
+    alphaSettled = true;
+    return response;
+  });
+  const lockStart = await withinDeadline(
+    startedWaiting,
+    2_000,
+    "repository A did not enter the canonical RepositoryLock.acquireSync call",
+  );
+  assert.ok(lockStart.workerThreadId > 0);
+  const unfinishedLockWait = observations.waitFor(
+    (observation) =>
+      observation.phase === "acquire-finish" &&
+      observation.requestId === lockStart.requestId &&
+      observation.lockPath === lockPath,
+  );
+  assert.equal(alphaSettled, false, "the authenticated typed A mutation remains pending in the lock call");
+  assert.equal(fs.existsSync(ownerPath), true, "the separate process still holds repository A's canonical lock");
+
+  const [health, betaRead] = await withinDeadline(
+    Promise.all([
+      call(server, "/api/v1/health"),
+      call(server, `/api/v1/repositories/${betaKey}/sessions/${betaSession.session_id}`),
+    ]),
+    2_000,
+    "health or repository B did not complete while repository A waited",
+  );
+  assert.equal(health.status, 200, health.text);
+  assert.equal(betaRead.status, 200, betaRead.text);
+  assert.equal(at(betaRead.body, "session", "session_id"), betaSession.session_id);
+  assert.equal(fs.existsSync(ownerPath), true, "A's canonical lock remains held through B and health responses");
+  assert.equal(alphaSettled, false, "A must remain pending until the holder releases the lock");
+  assert.equal(
+    observations.events.some(
+      (observation) => observation.phase === "acquire-finish" && observation.requestId === lockStart.requestId,
+    ),
+    false,
+    "the canonical synchronous acquire has not returned while its lock owner remains live",
+  );
+
+  await held.release();
+  const lockFinish = await withinDeadline(
+    unfinishedLockWait,
+    3_000,
+    "A's canonical lock wait did not finish after release",
+  );
+  assert.equal(lockFinish.workerThreadId, lockStart.workerThreadId);
+  const alphaResult = await withinDeadline(pendingAlpha, 3_000, "A's typed mutation did not return after lock release");
+  assert.equal(alphaResult.status, 200, alphaResult.text);
+  assert.equal(at(alphaResult.body, "result", "status"), "completed");
+  assert.equal(
+    fs.existsSync(alphaSession.worktree),
+    false,
+    "the confirmed discard durably removed the selected worktree",
+  );
+  const durableSession = await call(server, alphaPath);
+  assert.equal(durableSession.status, 200, durableSession.text);
+  assert.equal(at(durableSession.body, "session", "state"), "closed");
+  assert.equal(at(durableSession.body, "session", "terminal_operation"), "discard");
 });
 
 test("transport security rejects host, origin, token, content-type and body violations", async (t) => {
