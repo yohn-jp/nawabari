@@ -591,11 +591,11 @@ test("the default strict FHS projection keeps the development baseline functiona
       args: [
         "-ceu",
         [
-          "for candidate do",
+          "for candidate; do",
           'if [ -e "$candidate" ]; then printf "unexpected-visible-host-path:%s\\n" "$candidate"; exit 1; fi',
           "done",
           "printf strict-fhs-host-paths-hidden",
-        ].join(";"),
+        ].join("\n"),
         "strict-visibility",
         ...hiddenHostPaths,
       ],
