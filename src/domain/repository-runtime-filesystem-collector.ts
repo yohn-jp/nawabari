@@ -238,12 +238,7 @@ function projectSessionEvidence(
   policy: EffectiveFilesystemPolicy,
 ): RepositoryRuntimeFilesystemObservation {
   const pathBound = Math.min(MAX_PATHS, evidence.bounds.maxPaths);
-  const pathSets = [
-    evidence.paths.changed,
-    evidence.paths.staged,
-    evidence.paths.unstaged,
-    evidence.paths.untracked,
-  ];
+  const pathSets = [evidence.paths.changed, evidence.paths.staged, evidence.paths.unstaged, evidence.paths.untracked];
   if (
     !Number.isSafeInteger(pathBound) ||
     pathBound < 0 ||
