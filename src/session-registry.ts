@@ -75,6 +75,7 @@ import {
   type ParsedRuntimeRecords,
   type RegistryFeature,
   type SessionAdmissionRecord,
+  type ParkIntentRecord,
   type RuntimeRecord,
   type RuntimeRecords,
   type ResourceHandoffRecentEvent,
@@ -407,6 +408,7 @@ interface SessionRetentionFenceLease {
   readonly operationId: string;
   readonly token: string;
   readonly admissionEpoch: number;
+  readonly expectedClaimSetGeneration: number;
 }
 
 interface SessionRetentionValidationLease {
@@ -1245,6 +1247,7 @@ export interface PersistedRegistryV2 {
   readonly pinned_profiles?: readonly RuntimeRecord[];
   readonly runtime_sessions?: readonly RuntimeRecord[];
   readonly executions?: readonly RuntimeRecord[];
+  readonly park_intents?: readonly RuntimeRecord[];
   readonly retentions?: readonly RuntimeRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
   readonly file_operations?: readonly PersistedFileOperationRecord[];
@@ -1889,23 +1892,19 @@ export class SessionRegistry implements SessionRetentionAuthority {
     return this.withLock(() => this.retentionSnapshotUnsafe(this.readStateUnsafe(), sessionId));
   }
 
-  /** Durably close admission. The returned token is process-local sequencing evidence, not caller authority. */
+  /** Persist or adopt the lifecycle-owned park intent and its closed admission gate. */
   fence(input: { readonly sessionId: string; readonly operationId: string }): RetentionFenceResult {
     try {
       assertSessionId(input.sessionId);
       assertRetentionOperationId(input.operationId);
       const prior = this.retentionFences.get(input.sessionId);
-      if (prior !== undefined) {
-        if (prior.operationId !== input.operationId) {
-          return retentionStepRejected("FENCE_REJECTED", "A different retention fence is already in progress", {
-            sessionId: input.sessionId,
-          });
-        }
-        this.withLock(() => this.assertRetentionFenceUnsafe(this.readStateUnsafe(), input.sessionId, prior));
-        return Object.freeze({ accepted: true, token: prior.token });
+      if (prior !== undefined && prior.operationId !== input.operationId) {
+        return retentionStepRejected("FENCE_REJECTED", "A different retention fence is already in progress", {
+          sessionId: input.sessionId,
+        });
       }
 
-      const admissionEpoch = this.withLock(() => {
+      const intent = this.withLock(() => {
         const state = this.readStateUnsafe();
         const session = state.sessions.find((candidate) => candidate.sessionId === input.sessionId);
         if (session === undefined) {
@@ -1918,6 +1917,23 @@ export class SessionRegistry implements SessionRetentionAuthority {
             sessionId: input.sessionId,
             state: session.state,
           });
+        }
+        const existingIntent = this.parkIntentUnsafe(state, input.sessionId);
+        if (existingIntent !== undefined) {
+          if (existingIntent.operationId !== input.operationId) {
+            throw retentionFailure("FENCE_REJECTED", "A different park operation already owns this session", {
+              sessionId: input.sessionId,
+              operationId: existingIntent.operationId,
+            });
+          }
+          const existingLease = prior ?? {
+            operationId: existingIntent.operationId,
+            token: randomUUID(),
+            admissionEpoch: existingIntent.admissionEpoch,
+            expectedClaimSetGeneration: existingIntent.expectedClaimSetGeneration,
+          };
+          this.assertRetentionFenceUnsafe(state, input.sessionId, existingLease);
+          return existingIntent;
         }
         const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
           (candidate) => candidate.session_id === input.sessionId,
@@ -1941,10 +1957,10 @@ export class SessionRegistry implements SessionRetentionAuthority {
           );
         }
         if (admission.admission === "closed") {
-          // A process may have exited after the durable close and before the
-          // park commit. Re-adopt only that existing closed gate; fresh drain,
-          // physical, profile, claim, and CAS evidence is still required.
-          return admission.runtime_epoch;
+          throw retentionFailure("FENCE_REJECTED", "Closed admission has no park intent to adopt", {
+            sessionId: input.sessionId,
+            admissionEpoch: admission.runtime_epoch,
+          });
         }
         if (admission.runtime_epoch !== state.runtimeEpoch) {
           throw new SessionRegistryError(
@@ -1959,21 +1975,40 @@ export class SessionRegistry implements SessionRetentionAuthority {
           );
         }
         const nextEpoch = nextRuntimeEpoch(state);
+        const now = toTimestamp(this.clock());
+        const parkIntent: ParkIntentRecord = Object.freeze({
+          schemaVersion: 1,
+          operationId: input.operationId,
+          sessionId: input.sessionId,
+          admissionEpoch: nextEpoch,
+          expectedClaimSetGeneration: state.claimSetGeneration,
+          createdAt: now,
+          updatedAt: now,
+        });
+        const runtimeRecords = withParkIntents(
+          withSessionAdmission(state.runtimeRecords, {
+            ...admission,
+            admission: "closed",
+            runtime_epoch: nextEpoch,
+          }),
+          [...(state.runtimeRecords.records.park_intents ?? []), parkIntent],
+        );
         this.writeUnsafe(
           state.sessions,
           state.claims,
           state.claimSetGeneration,
           nextRegistryRevision(state),
           nextEpoch,
-          withSessionAdmission(state.runtimeRecords, {
-            ...admission,
-            admission: "closed",
-            runtime_epoch: nextEpoch,
-          }),
+          runtimeRecords,
         );
-        return nextEpoch;
+        return parkIntent;
       });
-      const lease = Object.freeze({ operationId: input.operationId, token: randomUUID(), admissionEpoch });
+      const lease = Object.freeze({
+        operationId: input.operationId,
+        token: prior?.token ?? randomUUID(),
+        admissionEpoch: intent.admissionEpoch,
+        expectedClaimSetGeneration: intent.expectedClaimSetGeneration,
+      });
       this.retentionFences.set(input.sessionId, lease);
       return Object.freeze({ accepted: true, token: lease.token });
     } catch (error: unknown) {
@@ -2052,9 +2087,13 @@ export class SessionRegistry implements SessionRetentionAuthority {
             state: session.state,
           });
         }
-        if (input.expectedClaimSetGeneration !== state.claimSetGeneration) {
+        if (
+          input.expectedClaimSetGeneration !== lease.expectedClaimSetGeneration ||
+          input.expectedClaimSetGeneration !== state.claimSetGeneration
+        ) {
           return retentionCommitRejected(input, "STALE_CLAIM_SET", "Claim-set generation changed during park", {
             expectedClaimSetGeneration: input.expectedClaimSetGeneration,
+            parkIntentClaimSetGeneration: lease.expectedClaimSetGeneration,
             actualClaimSetGeneration: state.claimSetGeneration,
           });
         }
@@ -2141,7 +2180,10 @@ export class SessionRegistry implements SessionRetentionAuthority {
           ),
           retention,
         ];
-        const runtimeRecords = withRetentions(state.runtimeRecords, retentions);
+        const parkIntents = (state.runtimeRecords.records.park_intents ?? []).filter(
+          (candidate) => candidate.sessionId !== input.sessionId,
+        );
+        const runtimeRecords = withParkIntents(withRetentions(state.runtimeRecords, retentions), parkIntents);
         this.writeUnsafe(
           sessions,
           claims,
@@ -2547,6 +2589,10 @@ export class SessionRegistry implements SessionRetentionAuthority {
     return parseSessionAdmissionRecord(value);
   }
 
+  private parkIntentUnsafe(state: RegistryState, sessionId: string): ParkIntentRecord | undefined {
+    return state.runtimeRecords.records.park_intents?.find((candidate) => candidate.sessionId === sessionId);
+  }
+
   private assertRetentionFenceToken(sessionId: string, operationId: string, token: string): SessionRetentionFenceLease {
     const lease = this.retentionFences.get(sessionId);
     if (lease === undefined || lease.operationId !== operationId || lease.token !== token) {
@@ -2561,6 +2607,18 @@ export class SessionRegistry implements SessionRetentionAuthority {
       throw new SessionRegistryError("SESSION_NOT_ACTIVE", "Session is no longer active under its retention fence", {
         sessionId,
         state: session?.state ?? "missing",
+      });
+    }
+    const intent = this.parkIntentUnsafe(state, sessionId);
+    if (
+      intent === undefined ||
+      intent.operationId !== lease.operationId ||
+      intent.admissionEpoch !== lease.admissionEpoch ||
+      intent.expectedClaimSetGeneration !== lease.expectedClaimSetGeneration
+    ) {
+      throw retentionFailure("FENCE_REJECTED", "Durable park intent is absent or changed", {
+        sessionId,
+        operationId: lease.operationId,
       });
     }
     const admission = this.retentionAdmissionUnsafe(state, sessionId);
@@ -2764,6 +2822,7 @@ export class SessionRegistry implements SessionRetentionAuthority {
     return this.withLock(() => {
       assertSessionId(sessionId);
       const state = this.readStateUnsafe();
+      this.assertNoParkIntentUnsafe(state, sessionId);
       if (!state.sessions.some((session) => session.sessionId === sessionId)) {
         throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
       }
@@ -5889,7 +5948,7 @@ export class SessionRegistry implements SessionRetentionAuthority {
         });
       const candidates = assessments.filter((assessment) => assessment.suspicion !== "none");
       const eligible = assessments.filter((assessment) => {
-        if (this.retentionFences.has(assessment.sessionId)) return false;
+        if (this.parkIntentUnsafe(state, assessment.sessionId) !== undefined) return false;
         if (assessment.terminalOperation === "discard") return false;
         // Eligibility is evaluated from the GC authority's own bounded
         // evidence. Full cleanup blockers are applied by the existing
@@ -5911,7 +5970,24 @@ export class SessionRegistry implements SessionRetentionAuthority {
         return false;
       });
 
-      const blocked: GarbageCollectBlocked[] = [];
+      const blocked: GarbageCollectBlocked[] = candidates.flatMap((candidate) => {
+        const intent = this.parkIntentUnsafe(state, candidate.sessionId);
+        if (intent === undefined) return [];
+        return [
+          toGarbageCollectBlocked(
+            candidate.sessionId,
+            new SessionRegistryError(
+              "OPERATION_REJECTED",
+              "Garbage collection cannot bypass a durable in-progress park intent",
+              {
+                sessionId: candidate.sessionId,
+                operationId: intent.operationId,
+                safeActions: ["retry-park"],
+              },
+            ),
+          ),
+        ];
+      });
       if (!apply) {
         for (const candidate of eligible) {
           const current = records.find((record) => record.sessionId === candidate.sessionId);
@@ -6007,7 +6083,8 @@ export class SessionRegistry implements SessionRetentionAuthority {
     retryOverride?: boolean,
     approvalWitness?: string,
   ): CloseSessionResult | DiscardSessionResult {
-    this.assertNoRetentionFenceUnsafe(sessionId);
+    const state = this.readStateUnsafe();
+    this.assertNoParkIntentUnsafe(state, sessionId);
     const requiredDiscardWitness = (): string => {
       if (typeof approvalWitness !== "string" || approvalWitness.length === 0) {
         throw new SessionRegistryError("OPERATION_REJECTED", "Discard requires an explicit approval witness", {
@@ -6018,7 +6095,6 @@ export class SessionRegistry implements SessionRetentionAuthority {
       return approvalWitness;
     };
     if (operation === "discard") requiredDiscardWitness();
-    const state = this.readStateUnsafe();
     const record = state.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (record === undefined) {
       throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
@@ -6367,7 +6443,7 @@ export class SessionRegistry implements SessionRetentionAuthority {
     sessionId: string,
     operation: SessionDrainFinalization["operation"],
   ): SessionAdmissionRecord | undefined {
-    if (operation !== "release-claims") this.assertNoRetentionFenceUnsafe(sessionId);
+    if (operation !== "release-claims") this.assertNoParkIntentUnsafe(state, sessionId);
     const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
       (candidate) => candidate.session_id === sessionId,
     );
@@ -6427,15 +6503,15 @@ export class SessionRegistry implements SessionRetentionAuthority {
     return admission;
   }
 
-  private assertNoRetentionFenceUnsafe(sessionId: string): void {
-    const lease = this.retentionFences.get(sessionId);
-    if (lease !== undefined) {
+  private assertNoParkIntentUnsafe(state: RegistryState, sessionId: string): void {
+    const intent = this.parkIntentUnsafe(state, sessionId);
+    if (intent !== undefined) {
       throw new SessionRegistryError(
         "OPERATION_REJECTED",
-        "Lifecycle cleanup cannot bypass an in-progress parking fence",
+        "Lifecycle cleanup cannot bypass a durable in-progress park intent",
         {
           sessionId,
-          operationId: lease.operationId,
+          operationId: intent.operationId,
           safeActions: ["retry-park"],
         },
       );
@@ -7314,13 +7390,19 @@ export class SessionRegistry implements SessionRetentionAuthority {
   private cleanupDecisionUnsafe(record: SessionRecord, state: RegistryState): CleanupDecision {
     let physicalState = "unavailable";
     let blockers: readonly CleanupBlocker[] = [];
-    if (this.retentionFences.has(record.sessionId)) {
+    const parkIntent = this.parkIntentUnsafe(state, record.sessionId);
+    if (parkIntent !== undefined) {
       blockers = [
         toCleanupBlocker(
-          new SessionRegistryError("OPERATION_REJECTED", "Session cleanup cannot bypass an in-progress parking fence", {
-            sessionId: record.sessionId,
-            safeActions: ["retry-park"],
-          }),
+          new SessionRegistryError(
+            "OPERATION_REJECTED",
+            "Session cleanup cannot bypass a durable in-progress park intent",
+            {
+              sessionId: record.sessionId,
+              operationId: parkIntent.operationId,
+              safeActions: ["retry-park"],
+            },
+          ),
         ),
       ];
     } else {
@@ -11602,6 +11684,7 @@ function parseRegistry(
       "pinned_profiles",
       "runtime_sessions",
       "executions",
+      "park_intents",
       "retentions",
       "recent_events",
       "file_operations",
@@ -11674,7 +11757,7 @@ function parseRegistry(
   if (!hasClaimsSchema) {
     // v0.1.0 had no claim section. It is a deterministic empty claim set,
     // materialized on the next locked mutation or via migrate().
-    validateRetentionOwnership(records, [], runtimeRecords, expectedRepositoryId);
+    validateRetentionOwnership(records, [], runtimeRecords, expectedRepositoryId, claimSetGeneration);
     return {
       registrySchemaVersion,
       registryRevision,
@@ -11716,7 +11799,7 @@ function parseRegistry(
     coordinationFacts,
     claimSetGeneration,
   );
-  validateRetentionOwnership(records, claims, runtimeRecords, expectedRepositoryId);
+  validateRetentionOwnership(records, claims, runtimeRecords, expectedRepositoryId, claimSetGeneration);
   return {
     registrySchemaVersion,
     registryRevision,
@@ -11735,6 +11818,7 @@ function validateRetentionOwnership(
   claims: readonly ResourceClaim[],
   runtimeRecords: ParsedRuntimeRecords,
   repositoryId: string,
+  claimSetGeneration: number,
 ): void {
   const retentions = (runtimeRecords.records.retentions ?? []) as readonly SessionRetentionRecord[];
   const retentionBySession = new Map<string, SessionRetentionRecord>();
@@ -11785,6 +11869,26 @@ function validateRetentionOwnership(
       });
     }
     retentionBySession.set(retention.sessionId, retention);
+  }
+  for (const intent of runtimeRecords.records.park_intents ?? []) {
+    const session = sessionById.get(intent.sessionId);
+    const admission = admissions.get(intent.sessionId);
+    if (
+      session === undefined ||
+      session.state !== "active" ||
+      retentionBySession.has(intent.sessionId) ||
+      admission?.admission !== "closed" ||
+      admission.runtime_epoch !== intent.admissionEpoch ||
+      intent.expectedClaimSetGeneration > claimSetGeneration
+    ) {
+      throw new SessionRegistryError(
+        "REGISTRY_CORRUPT",
+        "Park intent does not match one active closed-admission session",
+        {
+          sessionId: intent.sessionId,
+        },
+      );
+    }
   }
   for (const session of sessions) {
     if (session.state === "parked" && !retentionBySession.has(session.sessionId)) {
@@ -11849,6 +11953,16 @@ function withRetentions(
   return Object.freeze({
     requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "retentions.v1"),
     records: Object.freeze({ ...runtimeRecords.records, retentions: Object.freeze([...retentions]) }),
+  });
+}
+
+function withParkIntents(
+  runtimeRecords: ParsedRuntimeRecords,
+  parkIntents: readonly ParkIntentRecord[],
+): ParsedRuntimeRecords {
+  return Object.freeze({
+    requiredFeatures: requiredRuntimeFeatures(runtimeRecords.requiredFeatures, "park-intents.v1"),
+    records: Object.freeze({ ...runtimeRecords.records, park_intents: Object.freeze([...parkIntents]) }),
   });
 }
 

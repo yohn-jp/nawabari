@@ -21,6 +21,7 @@ export const REGISTRY_FEATURES = Object.freeze([
   "pinned-profiles.v1",
   "runtime-sessions.v1",
   "executions.v1",
+  "park-intents.v1",
   "retentions.v1",
   "recent-events.v1",
   "file-operations.v1",
@@ -34,6 +35,7 @@ export const SUPPORTED_REGISTRY_FEATURES = Object.freeze([
   "pinned-profiles.v1",
   "runtime-sessions.v1",
   "executions.v1",
+  "park-intents.v1",
   "retentions.v1",
   "recent-events.v1",
   "file-operations.v1",
@@ -54,16 +56,28 @@ export type SessionAdmissionRecord = Readonly<{
   readonly runtime_epoch: number;
 }>;
 
+export interface ParkIntentRecord {
+  readonly schemaVersion: 1;
+  readonly operationId: string;
+  readonly sessionId: string;
+  readonly admissionEpoch: number;
+  readonly expectedClaimSetGeneration: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
 export interface RuntimeRecords {
   readonly pinned_profiles?: readonly RuntimeRecord[];
   readonly runtime_sessions?: readonly RuntimeRecord[];
   readonly executions?: readonly RuntimeRecord[];
+  readonly park_intents?: readonly ParkIntentRecord[];
   readonly retentions?: readonly SessionRetentionRecord[];
   readonly recent_events?: readonly RuntimeRecord[];
   readonly file_operations?: readonly PersistedFileOperationRecord[];
 }
 
-type PersistedRuntimeRecords = Omit<RuntimeRecords, "retentions"> & {
+type PersistedRuntimeRecords = Omit<RuntimeRecords, "park_intents" | "retentions"> & {
+  readonly park_intents?: readonly RuntimeRecord[];
   readonly retentions?: readonly RuntimeRecord[];
 };
 
@@ -92,6 +106,7 @@ const FEATURE_DEFINITIONS: readonly Readonly<{
   { feature: "pinned-profiles.v1", field: "pinned_profiles" },
   { feature: "runtime-sessions.v1", field: "runtime_sessions" },
   { feature: "executions.v1", field: "executions" },
+  { feature: "park-intents.v1", field: "park_intents" },
   { feature: "retentions.v1", field: "retentions" },
   { feature: "recent-events.v1", field: "recent_events" },
   { feature: "file-operations.v1", field: "file_operations" },
@@ -147,6 +162,10 @@ export function parseRuntimeRecords(
       records[definition.field] = parseSessionRetentionRecords(input[definition.field]);
       continue;
     }
+    if (definition.field === "park_intents") {
+      records[definition.field] = parseSessionParkIntentRecords(input[definition.field]);
+      continue;
+    }
     records[definition.field] = parseRecordList(input[definition.field], definition.field);
   }
   const history = (records.recent_events ?? []).filter(
@@ -181,7 +200,11 @@ export function toPersistedRuntimeRecords(parsed: ParsedRuntimeRecords): Persist
                     ? parsed.records.retentions?.map((record) =>
                         cloneRecord(record as unknown as Record<string, unknown>),
                       )
-                    : parsed.records[field],
+                    : field === "park_intents"
+                      ? parsed.records.park_intents?.map((record) =>
+                          cloneRecord(record as unknown as Record<string, unknown>),
+                        )
+                      : parsed.records[field],
               ],
             ]
           : [],
@@ -356,6 +379,69 @@ function parseSessionRetentionRecords(value: unknown): readonly SessionRetention
   return Object.freeze(records);
 }
 
+function parseSessionParkIntentRecords(value: unknown): readonly ParkIntentRecord[] {
+  const field = "park_intents";
+  if (!Array.isArray(value)) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry park_intents must be an array", { field });
+  }
+  if (value.length > MAX_RUNTIME_RECORDS) {
+    throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry park_intents exceeds its bounded record count", {
+      field,
+      maximum: MAX_RUNTIME_RECORDS,
+    });
+  }
+
+  const records = value.map((candidate, index) => {
+    const invalid = (): SessionRegistryError =>
+      new SessionRegistryError("REGISTRY_CORRUPT", `Registry park_intents[${index}] is invalid`, { field, index });
+    const expectedKeys = [
+      "schemaVersion",
+      "operationId",
+      "sessionId",
+      "admissionEpoch",
+      "expectedClaimSetGeneration",
+      "createdAt",
+      "updatedAt",
+    ];
+    if (!isRecord(candidate) || !hasExactKeys(candidate, expectedKeys)) throw invalid();
+    if (
+      candidate.schemaVersion !== 1 ||
+      !parkIntentText(candidate.operationId) ||
+      !parkIntentText(candidate.sessionId) ||
+      !Number.isSafeInteger(candidate.admissionEpoch) ||
+      (candidate.admissionEpoch as number) < 1 ||
+      !Number.isSafeInteger(candidate.expectedClaimSetGeneration) ||
+      (candidate.expectedClaimSetGeneration as number) < 0 ||
+      !canonicalRetentionTimestamp(candidate.createdAt) ||
+      !canonicalRetentionTimestamp(candidate.updatedAt) ||
+      Date.parse(candidate.updatedAt) < Date.parse(candidate.createdAt)
+    ) {
+      throw invalid();
+    }
+    return Object.freeze({
+      schemaVersion: 1 as const,
+      operationId: candidate.operationId,
+      sessionId: candidate.sessionId,
+      admissionEpoch: candidate.admissionEpoch as number,
+      expectedClaimSetGeneration: candidate.expectedClaimSetGeneration as number,
+      createdAt: candidate.createdAt,
+      updatedAt: candidate.updatedAt,
+    });
+  });
+
+  const owners = new Set<string>();
+  for (const record of records) {
+    if (owners.has(record.sessionId)) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "Registry park_intents contains a duplicate session", {
+        field,
+        sessionId: record.sessionId,
+      });
+    }
+    owners.add(record.sessionId);
+  }
+  return Object.freeze(records);
+}
+
 function parseSessionRetentionRecord(value: unknown, index: number): SessionRetentionRecord {
   const field = "retentions";
   const invalid = (): SessionRegistryError =>
@@ -474,6 +560,16 @@ function parseRetainedClaimIntent(
 }
 
 function retentionText(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    !/[\u0000-\u001f\u007f]/u.test(value) &&
+    value.normalize("NFC") === value
+  );
+}
+
+function parkIntentText(value: unknown): value is string {
   return (
     typeof value === "string" &&
     value.length > 0 &&

@@ -102,20 +102,42 @@ test("real registry park survives restart, rejects a conflicting resume, then re
 test("a new registry can revalidate and finish parking after the durable closed-gate crash cut", () => {
   const fixture = createRetentionFixture();
   try {
+    const operationId = "retention-park-before-crash";
     const fence = fixture.registry.fence({
       sessionId: fixture.session.sessionId,
-      operationId: "retention-park-before-crash",
+      operationId,
     });
     assert.equal(fence.accepted, true);
     assert.equal(fixture.registry.get(fixture.session.sessionId)?.state, "active");
     assert.equal(fixture.registry.getSessionManagedRuntime(fixture.session.sessionId).admission?.admission, "closed");
     assert.equal(fixture.registry.listClaims(fixture.session.sessionId).length, 1);
+    const durableIntent = fixture.registry.readRepositoryView().runtimeRecords.records.park_intents?.[0];
+    assert.equal(durableIntent?.operationId, operationId);
+    assert.equal(durableIntent?.sessionId, fixture.session.sessionId);
+    assert.equal(
+      durableIntent?.admissionEpoch,
+      fixture.registry.getSessionManagedRuntime(fixture.session.sessionId).runtime_epoch,
+    );
+    assert.equal(durableIntent?.expectedClaimSetGeneration, fixture.registry.readRepositoryView().claimSetGeneration);
 
     const restarted = new SessionRegistry({ cwd: fixture.repositoryPath, cgroupFilesystem: fixture.cgroupFilesystem });
+    const beforeRejectedAdoption = restarted.readRepositoryView();
+    const rejectedAdoption = restarted.fence({
+      sessionId: fixture.session.sessionId,
+      operationId: "retention-park-different-operation",
+    });
+    assert.equal(rejectedAdoption.accepted, false);
+    if (!rejectedAdoption.accepted) assert.equal(rejectedAdoption.code, "FENCE_REJECTED");
+    assert.equal(restarted.readRepositoryView().registryRevision, beforeRejectedAdoption.registryRevision);
+    assert.equal(restarted.readRepositoryView().claimSetGeneration, beforeRejectedAdoption.claimSetGeneration);
+    assert.deepEqual(restarted.readRepositoryView().runtimeRecords.records.park_intents, [durableIntent]);
+
+    const adopted = restarted.fence({ sessionId: fixture.session.sessionId, operationId });
+    assert.equal(adopted.accepted, true);
     const recovered = parkSession(restarted, {
       sessionId: fixture.session.sessionId,
       pinnedProfile: fixture.pinnedProfile,
-      operationId: "retention-park-after-restart",
+      operationId,
     });
 
     assert.equal(recovered.status, "parked");
@@ -125,12 +147,190 @@ test("a new registry can revalidate and finish parking after the durable closed-
       restarted.listClaims(fixture.otherSession.sessionId).map((claim) => claim.resource),
       ["OTHER.md"],
     );
-    assert.equal(
-      restarted.readRepositoryView().runtimeRecords.records.retentions?.[0]?.operationId,
-      "retention-park-after-restart",
-    );
+    assert.equal(restarted.readRepositoryView().runtimeRecords.records.retentions?.[0]?.operationId, operationId);
+    assert.equal(restarted.readRepositoryView().runtimeRecords.records.park_intents?.length ?? 0, 0);
   } finally {
     fixture.cleanup();
+  }
+});
+
+test("fresh registries cannot close or discard while a durable park intent owns admission", () => {
+  const fixture = createRetentionFixture();
+  try {
+    const preview = fixture.registry.previewDiscard(fixture.session.sessionId);
+    const fence = fixture.registry.fence({
+      sessionId: fixture.session.sessionId,
+      operationId: "retention-park-block-cleanup",
+    });
+    assert.equal(fence.accepted, true);
+    const restarted = new SessionRegistry({ cwd: fixture.repositoryPath, cgroupFilesystem: fixture.cgroupFilesystem });
+    const before = restarted.readRepositoryView();
+    const admissionEpoch = restarted.getSessionManagedRuntime(fixture.session.sessionId).runtime_epoch;
+
+    assert.throws(
+      () => restarted.close({ sessionId: fixture.session.sessionId }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        /durable in-progress park intent/iu.test(error.message),
+    );
+    assert.throws(
+      () =>
+        restarted.discard({
+          sessionId: fixture.session.sessionId,
+          approvalWitness: preview.approvalWitness,
+        }),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        /durable in-progress park intent/iu.test(error.message),
+    );
+    assert.throws(
+      () => restarted.closeSessionLaunchAdmission(fixture.session.sessionId, admissionEpoch),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        /durable in-progress park intent/iu.test(error.message),
+    );
+
+    const after = restarted.readRepositoryView();
+    assert.equal(after.registryRevision, before.registryRevision);
+    assert.equal(after.runtimeEpoch, before.runtimeEpoch);
+    assert.equal(after.claimSetGeneration, before.claimSetGeneration);
+    assert.equal(restarted.get(fixture.session.sessionId)?.state, "active");
+    assert.equal(restarted.get(fixture.session.sessionId)?.terminalOperation, undefined);
+    assert.equal(restarted.listClaims(fixture.session.sessionId).length, 1);
+    assert.equal(after.runtimeRecords.records.park_intents?.length, 1);
+    assert.equal(fs.existsSync(fixture.session.worktreePath), true);
+    assert.equal(fs.existsSync(path.join(fixture.session.worktreePath, "README.md")), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("garbage collection reports but cannot mutate a session with a durable park intent", () => {
+  const fixture = createRetentionFixture({ clock: () => new Date("2000-01-01T00:00:00.000Z") });
+  try {
+    const fence = fixture.registry.fence({
+      sessionId: fixture.session.sessionId,
+      operationId: "retention-park-block-gc",
+    });
+    assert.equal(fence.accepted, true);
+    const restarted = new SessionRegistry({ cwd: fixture.repositoryPath, cgroupFilesystem: fixture.cgroupFilesystem });
+    const before = restarted.readRepositoryView();
+
+    const result = restarted.garbageCollect({ apply: true, staleAfterMs: 1 });
+
+    assert.ok(result.candidates.some((candidate) => candidate.sessionId === fixture.session.sessionId));
+    assert.ok(!result.eligible.some((candidate) => candidate.sessionId === fixture.session.sessionId));
+    assert.ok(!result.cleaned.some((session) => session.sessionId === fixture.session.sessionId));
+    assert.ok(result.blocked.some((item) => item.sessionId === fixture.session.sessionId));
+    assert.equal(restarted.readRepositoryView().registryRevision, before.registryRevision);
+    assert.equal(restarted.readRepositoryView().runtimeEpoch, before.runtimeEpoch);
+    assert.equal(restarted.get(fixture.session.sessionId)?.state, "active");
+    assert.equal(restarted.get(fixture.session.sessionId)?.terminalOperation, undefined);
+    assert.equal(restarted.listClaims(fixture.session.sessionId).length, 1);
+    assert.equal(fs.existsSync(fixture.session.worktreePath), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("registry rejects park intents with inconsistent session, admission, generation, or retention ownership", async (t) => {
+  const mutations: readonly [string, (document: Record<string, unknown>, fixture: RetentionFixture) => void][] = [
+    ["unknown session", (document) => patchParkIntent(document, { sessionId: "missing-session" })],
+    [
+      "non-active session",
+      (document, fixture) => {
+        const sessions = document.sessions as Record<string, unknown>[];
+        sessions.find((session) => session.session_id === fixture.session.sessionId)!.state = "stale";
+      },
+    ],
+    [
+      "open admission",
+      (document, fixture) => {
+        const runtimeSessions = document.runtime_sessions as Record<string, unknown>[];
+        runtimeSessions.find((record) => record.session_id === fixture.session.sessionId)!.admission = "open";
+      },
+    ],
+    ["admission epoch mismatch", (document) => patchParkIntent(document, { admissionEpoch: 999_999 })],
+    [
+      "future claim generation",
+      (document) => {
+        const intents = document.park_intents as Record<string, unknown>[];
+        intents[0]!.expectedClaimSetGeneration = Number(document.claim_set_generation) + 1;
+      },
+    ],
+    [
+      "simultaneous final retention",
+      (document, fixture) => {
+        const session = (document.sessions as Record<string, unknown>[]).find(
+          (candidate) => candidate.session_id === fixture.session.sessionId,
+        )!;
+        session.state = "parked";
+        document.claims = (document.claims as Record<string, unknown>[]).filter(
+          (claim) => claim.session_id !== fixture.session.sessionId,
+        );
+        document.claim_set_generation = Number(document.claim_set_generation) + 1;
+        const features = document.required_features as string[];
+        if (!features.includes("retentions.v1")) features.push("retentions.v1");
+        features.sort(
+          (left, right) =>
+            REGISTRY_FEATURES.indexOf(left as (typeof REGISTRY_FEATURES)[number]) -
+            REGISTRY_FEATURES.indexOf(right as (typeof REGISTRY_FEATURES)[number]),
+        );
+        document.retentions = [
+          {
+            schemaVersion: 1,
+            operationId: "retention-park-final-record",
+            sessionId: fixture.session.sessionId,
+            repositoryId: fixture.session.repositoryId,
+            state: "parked",
+            physicalIdentity: {
+              repositoryId: fixture.session.repositoryId,
+              worktreeId: fixture.session.worktreeId,
+              worktreePath: fixture.session.worktreePath,
+              branchId: fixture.session.branchId,
+              branchName: fixture.session.branchName,
+            },
+            desiredClaims: [{ resource: "README.md", mode: "exclusive-write" }],
+            pinnedProfileDigest: retentionIdentityDigest(fixture.pinnedProfile),
+            parkedAt: "2026-09-27T00:00:00.000Z",
+            updatedAt: "2026-09-27T00:00:00.000Z",
+          },
+        ];
+      },
+    ],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const fixture = createRetentionFixture();
+      try {
+        const fence = fixture.registry.fence({
+          sessionId: fixture.session.sessionId,
+          operationId: `retention-park-corruption-${name.replaceAll(" ", "-")}`,
+        });
+        assert.equal(fence.accepted, true);
+        const document = JSON.parse(fs.readFileSync(fixture.registry.paths.registry, "utf8")) as Record<
+          string,
+          unknown
+        >;
+        mutate(document, fixture);
+        fs.writeFileSync(fixture.registry.paths.registry, `${JSON.stringify(document, null, 2)}\n`);
+
+        assert.throws(
+          () =>
+            new SessionRegistry({
+              cwd: fixture.repositoryPath,
+              cgroupFilesystem: fixture.cgroupFilesystem,
+            }).readRepositoryView(),
+          (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+        );
+      } finally {
+        fixture.cleanup();
+      }
+    });
   }
 });
 
@@ -494,6 +694,7 @@ function createRetentionFixture(
   options: {
     readonly population?: "empty" | "populated" | "unknown";
     readonly sharedWrite?: boolean;
+    readonly clock?: () => Date;
   } = {},
 ): RetentionFixture {
   const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-retention-registry-"));
@@ -514,6 +715,7 @@ function createRetentionFixture(
       cwd: repositoryPath,
       cgroupFilesystem,
       managedExecutionReadiness: () => ({ ready: true }),
+      ...(options.clock === undefined ? {} : { clock: options.clock }),
     });
     const otherRegistry = new SessionRegistry({ cwd: linkedWorktreePath, cgroupFilesystem });
     const otherSession = otherRegistry.create();
@@ -638,6 +840,11 @@ function createRetentionFixture(
     fs.rmSync(repositoryPath, { recursive: true, force: true });
     throw error;
   }
+}
+
+function patchParkIntent(document: Record<string, unknown>, patch: Record<string, unknown>): void {
+  const intents = document.park_intents as Record<string, unknown>[];
+  Object.assign(intents[0]!, patch);
 }
 
 function closeAdmissionForCleanup(

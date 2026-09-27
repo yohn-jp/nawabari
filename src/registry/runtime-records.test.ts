@@ -36,11 +36,24 @@ function retentionRecord(sessionId = "session-1") {
   } as const;
 }
 
+function parkIntentRecord(sessionId = "session-1") {
+  return {
+    schemaVersion: 1,
+    operationId: "park-operation-1",
+    sessionId,
+    admissionEpoch: 4,
+    expectedClaimSetGeneration: 7,
+    createdAt: "2026-09-27T00:00:00.000Z",
+    updatedAt: "2026-09-27T00:00:00.000Z",
+  } as const;
+}
+
 test("registry optional areas are a finite feature-gated contract", () => {
   assert.deepEqual(REGISTRY_FEATURES, [
     "pinned-profiles.v1",
     "runtime-sessions.v1",
     "executions.v1",
+    "park-intents.v1",
     "retentions.v1",
     "recent-events.v1",
     "file-operations.v1",
@@ -50,6 +63,7 @@ test("registry optional areas are a finite feature-gated contract", () => {
     "pinned-profiles.v1",
     "runtime-sessions.v1",
     "executions.v1",
+    "park-intents.v1",
     "retentions.v1",
     "recent-events.v1",
     "file-operations.v1",
@@ -198,6 +212,80 @@ test("retentions.v1 rejects unsupported versions, malformed fields, and duplicat
       parseRuntimeRecords({
         required_features: ["retentions.v1"],
         retentions: Array.from({ length: MAX_RUNTIME_RECORDS + 1 }, (_, index) => retentionRecord(`session-${index}`)),
+      }),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+});
+
+test("park-intents.v1 parses exact lifecycle-owned records and round-trips with other runtime areas", () => {
+  const intent = parkIntentRecord();
+  const retention = retentionRecord("session-2");
+  const parsed = parseRuntimeRecords({
+    required_features: ["retentions.v1", "park-intents.v1"],
+    retentions: [retention],
+    park_intents: [intent],
+  });
+
+  assert.deepEqual(parsed.records.park_intents, [intent]);
+  assert.deepEqual(toPersistedRuntimeRecords(parsed), {
+    park_intents: [intent],
+    retentions: [retention],
+  });
+  assert.equal(parseRuntimeRecords({}).records.park_intents, undefined);
+});
+
+test("park-intents.v1 fails closed when its feature gate and record area disagree", () => {
+  const intent = parkIntentRecord();
+  for (const input of [{ park_intents: [intent] }, { required_features: ["park-intents.v1"] }]) {
+    assert.throws(
+      () => parseRuntimeRecords(input),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+    );
+  }
+  assert.throws(
+    () => parseRuntimeRecords({ required_features: ["park-intents.v1"], park_intents: [intent] }, []),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_FEATURE_UNSUPPORTED",
+  );
+});
+
+test("park-intents.v1 rejects malformed, unbounded, and duplicate owner records", () => {
+  const valid = parkIntentRecord();
+  const invalidRecords = [
+    { ...valid, unexpected: true },
+    Object.fromEntries(Object.entries(valid).filter(([key]) => key !== "operationId")),
+    { ...valid, schemaVersion: 2 },
+    { ...valid, operationId: "" },
+    { ...valid, sessionId: "" },
+    { ...valid, admissionEpoch: 0 },
+    { ...valid, admissionEpoch: Number.MAX_SAFE_INTEGER + 1 },
+    { ...valid, expectedClaimSetGeneration: -1 },
+    { ...valid, expectedClaimSetGeneration: Number.MAX_SAFE_INTEGER + 1 },
+    { ...valid, createdAt: "2026-09-27T00:00:00Z" },
+    { ...valid, updatedAt: "2026-09-26T23:59:59.999Z" },
+  ];
+
+  for (const invalid of invalidRecords) {
+    assert.throws(
+      () => parseRuntimeRecords({ required_features: ["park-intents.v1"], park_intents: [invalid] }),
+      (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+    );
+  }
+
+  assert.throws(
+    () =>
+      parseRuntimeRecords({
+        required_features: ["park-intents.v1"],
+        park_intents: [valid, valid],
+      }),
+    (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
+  );
+  assert.throws(
+    () =>
+      parseRuntimeRecords({
+        required_features: ["park-intents.v1"],
+        park_intents: Array.from({ length: MAX_RUNTIME_RECORDS + 1 }, (_, index) =>
+          parkIntentRecord(`session-${index}`),
+        ),
       }),
     (error: unknown) => error instanceof SessionRegistryError && error.code === "REGISTRY_CORRUPT",
   );
