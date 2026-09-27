@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -27,6 +27,7 @@ type Fixture = {
 
 type Response = { status: number; headers: http.IncomingHttpHeaders; text: string; body: unknown };
 type CreatedSession = { readonly session_id: string; readonly repository: string; readonly worktree: string };
+type TestControlServer = ControlServer & { readonly token: string };
 
 /** Read one field path from a parsed JSON response. */
 function at(value: unknown, ...keys: readonly (string | number)[]): unknown {
@@ -85,25 +86,26 @@ async function createSession(context: Fixture, cwd: string, branch: string): Pro
   return created.body as CreatedSession;
 }
 
-async function start(t: test.TestContext, context: Fixture, port = 0): Promise<ControlServer> {
+async function start(t: test.TestContext, context: Fixture, port = 0): Promise<TestControlServer> {
   const started = await startControlServer({
     port,
     backend: createLocalSessionBackend(),
     catalogPath: context.catalog,
   });
   if (!started.ok) throw started.error;
-  t.after(() => started.value.close());
-  return started.value;
+  const server = { ...started.value, token: fs.readFileSync(started.value.credentialFile, "utf8").trim() };
+  t.after(() => server.close());
+  return server;
 }
 
 function call(
-  server: Pick<ControlServer, "port" | "token">,
+  server: Pick<ControlServer, "port"> & { readonly token?: string },
   pathname: string,
   options: { method?: string; headers?: Record<string, string>; body?: string; token?: string | null } = {},
 ): Promise<Response> {
   const headers: Record<string, string> = { host: `${CONTROL_SERVER_HOST}:${server.port}`, ...options.headers };
   const token = options.token === undefined ? server.token : options.token;
-  if (token !== null) headers[CONTROL_TOKEN_HEADER] = token;
+  if (typeof token === "string") headers[CONTROL_TOKEN_HEADER] = token;
   if (options.body !== undefined && headers["content-type"] === undefined) headers["content-type"] = "application/json";
   return new Promise((resolve, reject) => {
     const request = http.request(
@@ -129,7 +131,7 @@ function call(
   });
 }
 
-function postAction(server: ControlServer, repositoryKeyValue: string, sessionId: string, body: unknown) {
+function postAction(server: TestControlServer, repositoryKeyValue: string, sessionId: string, body: unknown) {
   return call(server, `/api/v1/repositories/${repositoryKeyValue}/sessions/${sessionId}/actions`, {
     method: "POST",
     headers: { origin: `http://${CONTROL_SERVER_HOST}:${server.port}` },
@@ -242,8 +244,10 @@ test("browser refresh observes concurrent direct CLI changes and restart rebuild
   );
 
   await server.close();
+  assert.equal(fs.existsSync(server.credentialFile), false, "the old host credential file is removed on shutdown");
   const restarted = await start(t, context);
   assert.notEqual(restarted.token, server.token, "the control token rotates on restart");
+  assert.notEqual(restarted.credentialFile, server.credentialFile);
   const reread = await call(restarted, `/api/v1/repositories/${key}/snapshot`);
   assert.equal(at(reread.body, "view", "snapshot_token"), at(after.body, "view", "snapshot_token"));
   assert.equal((await call(restarted, "/api/v1/health", { token: server.token })).status, 403);
@@ -395,6 +399,156 @@ test("transport security rejects host, origin, token, content-type and body viol
   assert.equal(accepted.status, 200, accepted.text);
 });
 
+test("protected local-network payload cannot read the host credential or mutate a session", async (t) => {
+  if (process.platform !== "linux" || !fs.existsSync("/proc/self/ns/user")) {
+    t.skip("BLOCKED: the Linux bubblewrap protected-execution environment is unavailable");
+    return;
+  }
+  try {
+    execFileSync("bwrap", ["--version"], { stdio: "ignore" });
+  } catch {
+    t.skip("BLOCKED: bubblewrap is unavailable");
+    return;
+  }
+
+  const context = fixture(t);
+  const alpha = repository(context, "alpha");
+  const session = await createSession(context, alpha, "feature/protected-control");
+  const key = repositoryKey(session.repository);
+  const server = await start(t, context);
+  const before = await call(server, `/api/v1/repositories/${key}/sessions/${session.session_id}`);
+  assert.equal(before.status, 200);
+
+  const protectedProbe = `
+const fs = require("node:fs");
+const http = require("node:http");
+const credentialFile = process.argv[1];
+const port = Number(process.argv[2]);
+const repositoryKey = process.argv[3];
+const sessionId = process.argv[4];
+function request(path, method = "GET", body) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: "127.0.0.1",
+      port,
+      path,
+      method,
+      headers: {
+        host: "127.0.0.1:" + port,
+        connection: "close",
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+    }, (response) => {
+      let text = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { text += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode, text }));
+    });
+    request.on("error", reject);
+    if (body !== undefined) request.write(body);
+    request.end();
+  });
+}
+(async () => {
+  let credentialFileReadable = true;
+  try {
+    fs.readFileSync(credentialFile, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT" && error.code !== "EACCES") throw error;
+    credentialFileReadable = false;
+  }
+  const root = await request("/");
+  const api = await request("/api/v1/health");
+  const action = await request(
+    "/api/v1/repositories/" + encodeURIComponent(repositoryKey) + "/sessions/" + encodeURIComponent(sessionId) + "/actions",
+    "POST",
+    JSON.stringify({ action_id: "retain-session", token: {} }),
+  );
+  process.stdout.write(JSON.stringify({ credentialFileReadable, root: root.text, rootStatus: root.status, apiStatus: api.status, actionStatus: action.status }), () => process.exit(0));
+})().catch((error) => { process.stderr.write(String(error)); process.exitCode = 1; });
+`;
+  const arguments_: string[] = [
+    "--die-with-parent",
+    "--new-session",
+    "--unshare-user",
+    "--unshare-pid",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--uid",
+    "0",
+    "--gid",
+    "0",
+    "--cap-drop",
+    "ALL",
+    "--clearenv",
+    "--tmpfs",
+    "/",
+    "--dev",
+    "/dev",
+    "--proc",
+    "/proc",
+    "--tmpfs",
+    "/tmp",
+  ];
+  for (const directory of ["/nix/store", "/usr", "/bin", "/lib", "/lib64", "/etc"]) {
+    if (fs.existsSync(directory)) arguments_.push("--ro-bind", directory, directory);
+  }
+  arguments_.push(
+    "--",
+    fs.realpathSync(process.execPath),
+    "-e",
+    protectedProbe,
+    server.credentialFile,
+    String(server.port),
+    key,
+    session.session_id,
+  );
+
+  const execution = await new Promise<{
+    readonly code: number | null;
+    readonly stdout: string;
+    readonly stderr: string;
+  }>((resolve, reject) => {
+    const child = spawn("bwrap", arguments_, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => child.kill("SIGKILL"), 10_000);
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timeout);
+      resolve({ code, stdout, stderr });
+    });
+  });
+  if (execution.code !== 0) {
+    if (execution.stderr.startsWith("bwrap:")) {
+      t.skip(`BLOCKED: bubblewrap could not create the protected namespace: ${execution.stderr.trim()}`);
+      return;
+    }
+    assert.fail(`Protected control probe exited ${execution.code}: ${execution.stderr}`);
+  }
+  const resultText = execution.stdout;
+  const result = JSON.parse(resultText) as {
+    readonly credentialFileReadable: boolean;
+    readonly root: string;
+    readonly rootStatus: number;
+    readonly apiStatus: number;
+    readonly actionStatus: number;
+  };
+  assert.equal(result.credentialFileReadable, false, "the host credential artifact is outside protected visibility");
+  assert.equal(result.rootStatus, 200, "the protected process retains inherited loopback networking");
+  assert.ok(!result.root.includes(server.token), "unauthenticated root HTML does not disclose the credential");
+  assert.equal(result.apiStatus, 401, "the protected process cannot authenticate to the API");
+  assert.equal(result.actionStatus, 401, "the protected process cannot control another session");
+  const after = await call(server, `/api/v1/repositories/${key}/sessions/${session.session_id}`);
+  assert.equal(after.status, 200);
+  assert.equal(at(after.body, "session", "state"), at(before.body, "session", "state"));
+});
+
 test("transport status mapping preserves domain error semantics", () => {
   assert.equal(controlStatusForError(new DomainError("SESSION_NOT_FOUND", "x")), 404);
   assert.equal(controlStatusForError(new DomainError("INVALID_ARGUMENT", "x")), 400);
@@ -438,6 +592,7 @@ test("server CLI runs in the foreground on loopback, never prints the token, and
   const stdout: string[] = [];
   const stderr: string[] = [];
   let listening: ControlServer | undefined;
+  let issuedCredential = "";
   const running = runCli(["--json", "server", "--port", String(port)], {
     cwd: alpha,
     io: { stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line) },
@@ -446,7 +601,12 @@ test("server CLI runs in the foreground on loopback, never prints the token, and
       signal: controller.signal,
       onListening: (server) => {
         listening = server;
-        void call(server, "/api/v1/repositories").then((response) => {
+        issuedCredential = fs.readFileSync(server.credentialFile, "utf8").trim();
+        assert.equal(fs.statSync(server.credentialFile).mode & 0o777, 0o600);
+        assert.equal(fs.statSync(path.dirname(server.credentialFile)).mode & 0o777, 0o700);
+        const credentialRelativePath = path.relative(context.root, server.credentialFile);
+        assert.ok(credentialRelativePath.startsWith("..") || path.isAbsolute(credentialRelativePath));
+        void call(server, "/api/v1/repositories", { token: issuedCredential }).then((response) => {
           assert.deepEqual(
             list(response.body, "repositories").map((entry) => at(entry, "repository_id")),
             [session.repository],
@@ -469,8 +629,10 @@ test("server CLI runs in the foreground on loopback, never prints the token, and
     url: `http://127.0.0.1:${port}/`,
     host: "127.0.0.1",
     port,
+    credential_file: listening.credentialFile,
   });
-  assert.ok(![...stdout, ...stderr].join("\n").includes(listening.token));
+  assert.ok(![...stdout, ...stderr].join("\n").includes(issuedCredential));
+  assert.equal(fs.existsSync(listening.credentialFile), false, "shutdown removes the host-only credential artifact");
   const released = net.createServer();
   await new Promise<void>((resolve, reject) => {
     released.once("error", reject);
