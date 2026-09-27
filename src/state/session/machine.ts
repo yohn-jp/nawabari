@@ -15,9 +15,20 @@ import {
   isObservationCloseReady,
   isObservationClosed,
   isObservationDiscarded,
+  isObservationParked,
   isObservationStaleInconsistent,
+  isParkRequestAllowed,
+  isParkedCloseAllowed,
+  isParkedGcAllowed,
 } from "./guards.js";
-import type { SessionMachineContext, SessionMachineEvent, SessionMachineInput } from "./types.js";
+import type {
+  SessionMachineContext,
+  SessionMachineEvent,
+  SessionMachineInput,
+  SessionParkingEvent,
+  SessionParkingOperationalState,
+  SessionParkingTransitionRow,
+} from "./types.js";
 
 /**
  * Canonical semantic metadata retained on every modeled operation transition.
@@ -66,14 +77,48 @@ const machineSetup = setup({
             }
           : context.evidence,
     }),
+    recordParkedState: assign({
+      observation: ({ context, event }) =>
+        event.type === "SESSION.PARK.FINALIZE"
+          ? { ...context.observation, sessionState: "parked" }
+          : context.observation,
+      persisted: ({ context, event }) =>
+        event.type === "SESSION.PARK.FINALIZE" && context.persisted !== undefined
+          ? { ...context.persisted, state: "parked" }
+          : context.persisted,
+    }),
+    recordResumedState: assign({
+      observation: ({ context, event }) =>
+        event.type === "SESSION.RESUME.REQUESTED"
+          ? { ...context.observation, sessionState: "active" }
+          : context.observation,
+      persisted: ({ context, event }) =>
+        event.type === "SESSION.RESUME.REQUESTED" && context.persisted !== undefined
+          ? { ...context.persisted, state: "active" }
+          : context.persisted,
+    }),
   },
   guards: {
     observationIsStaleInconsistent: ({ context }) => isObservationStaleInconsistent(context),
     observationIsDiscarded: ({ context }) => isObservationDiscarded(context),
     observationIsClosed: ({ context }) => isObservationClosed(context),
+    observationIsParked: ({ context }) => isObservationParked(context),
     observationIsBlockedRecoverable: ({ context }) => isObservationBlockedRecoverable(context),
     observationIsCloseReady: ({ context }) => isObservationCloseReady(context),
     destructiveGcIsAllowed: ({ context }) => isDestructiveGcAllowed(context),
+    parkRequestIsAllowed: ({ context }) => isParkRequestAllowed(context),
+    parkFinalizationEvidenceIsValid: ({ event }) =>
+      event.type === "SESSION.PARK.FINALIZE" &&
+      event.status === "parked" &&
+      typeof event.operationId === "string" &&
+      event.operationId.trim().length > 0,
+    resumeResultEvidenceIsValid: ({ event }) =>
+      event.type === "SESSION.RESUME.REQUESTED" &&
+      event.status === "resumed" &&
+      typeof event.operationId === "string" &&
+      event.operationId.trim().length > 0,
+    parkedCloseIsAllowed: ({ context }) => isParkedCloseAllowed(context),
+    parkedGcIsAllowed: ({ context }) => isParkedGcAllowed(context),
     operationIsForbidden: () => false,
   },
 });
@@ -149,6 +194,8 @@ export const SESSION_OPERATION_EVENT_TYPES = Object.freeze({
   doctor: "SESSION.DOCTOR.REQUESTED",
   reconcile: "SESSION.RECONCILE.REQUESTED",
   gc: "SESSION.GC.REQUESTED",
+  park: "SESSION.PARK.REQUESTED",
+  resume: "SESSION.RESUME.REQUESTED",
 } as const satisfies Record<SessionLifecycleOperation, string>);
 
 /**
@@ -168,6 +215,7 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
         { target: "stale-inconsistent", guard: "observationIsStaleInconsistent" },
         { target: "discarded", guard: "observationIsDiscarded" },
         { target: "closed", guard: "observationIsClosed" },
+        { target: "parked", guard: "observationIsParked" },
         { target: "blocked-recoverable", guard: "observationIsBlockedRecoverable" },
         { target: "close-ready", guard: "observationIsCloseReady" },
         { target: "active" },
@@ -186,6 +234,17 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
         ),
         "SESSION.GC.REQUESTED": forbiddenTransition(
           operationMetadata("gc", false, null, false, "gc", "age-is-not-destructive-authority"),
+        ),
+        "SESSION.PARK.REQUESTED": {
+          target: "parking",
+          guard: "parkRequestIsAllowed",
+          meta: operationMetadata("park", true, "parking", true, "caller", "park-requested", "session-not-parked"),
+        },
+        "SESSION.PARK.FINALIZE": forbiddenTransition(
+          operationMetadata("park", false, null, false, "session-registry", "park-requested"),
+        ),
+        "SESSION.RESUME.REQUESTED": forbiddenTransition(
+          operationMetadata("resume", false, null, true, "caller", "session-not-parked"),
         ),
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
@@ -216,6 +275,15 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
             "age-is-not-destructive-authority",
           ),
         },
+        "SESSION.PARK.REQUESTED": forbiddenTransition(
+          operationMetadata("park", false, null, true, "caller", "session-not-parked"),
+        ),
+        "SESSION.PARK.FINALIZE": forbiddenTransition(
+          operationMetadata("park", false, null, false, "session-registry", "park-requested"),
+        ),
+        "SESSION.RESUME.REQUESTED": forbiddenTransition(
+          operationMetadata("resume", false, null, true, "caller", "session-not-parked"),
+        ),
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
         "SESSION.MARK_STALE": { target: "stale-inconsistent" },
@@ -241,6 +309,15 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
         "SESSION.GC.REQUESTED": forbiddenTransition(
           operationMetadata("gc", false, null, false, "gc", "recoverable-work-must-be-retained-or-discarded"),
         ),
+        "SESSION.PARK.REQUESTED": forbiddenTransition(
+          operationMetadata("park", false, null, true, "caller", "session-not-parked"),
+        ),
+        "SESSION.PARK.FINALIZE": forbiddenTransition(
+          operationMetadata("park", false, null, false, "session-registry", "park-requested"),
+        ),
+        "SESSION.RESUME.REQUESTED": forbiddenTransition(
+          operationMetadata("resume", false, null, true, "caller", "session-not-parked"),
+        ),
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
         "SESSION.MARK_STALE": { target: "stale-inconsistent" },
@@ -257,6 +334,15 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
         ),
         "SESSION.GC.REQUESTED": forbiddenTransition(
           operationMetadata("gc", false, null, false, "gc", "discarded-terminal", "age-is-not-destructive-authority"),
+        ),
+        "SESSION.PARK.REQUESTED": forbiddenTransition(
+          operationMetadata("park", false, null, true, "caller", "discarded-terminal"),
+        ),
+        "SESSION.PARK.FINALIZE": forbiddenTransition(
+          operationMetadata("park", false, null, false, "session-registry", "discarded-terminal"),
+        ),
+        "SESSION.RESUME.REQUESTED": forbiddenTransition(
+          operationMetadata("resume", false, null, true, "caller", "session-not-parked"),
         ),
       },
     },
@@ -280,6 +366,15 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
             "age-is-not-destructive-authority",
           ),
         ),
+        "SESSION.PARK.REQUESTED": forbiddenTransition(
+          operationMetadata("park", false, null, true, "caller", "physical-reconciliation-required"),
+        ),
+        "SESSION.PARK.FINALIZE": forbiddenTransition(
+          operationMetadata("park", false, null, false, "session-registry", "physical-reconciliation-required"),
+        ),
+        "SESSION.RESUME.REQUESTED": forbiddenTransition(
+          operationMetadata("resume", false, null, true, "caller", "physical-reconciliation-required"),
+        ),
         "SESSION.CLEANUP.RETRY": cleanupRetryTransition,
         "SESSION.CLEANUP.FINALIZE": cleanupFinalizeTransition,
       },
@@ -296,6 +391,102 @@ export const sessionLifecycleMachine = machineSetup.createMachine({
         "SESSION.GC.REQUESTED": forbiddenTransition(
           operationMetadata("gc", false, null, false, "gc", "closed-terminal", "age-is-not-destructive-authority"),
         ),
+        "SESSION.PARK.REQUESTED": forbiddenTransition(
+          operationMetadata("park", false, null, true, "caller", "closed-terminal"),
+        ),
+        "SESSION.PARK.FINALIZE": forbiddenTransition(
+          operationMetadata("park", false, null, false, "session-registry", "closed-terminal"),
+        ),
+        "SESSION.RESUME.REQUESTED": forbiddenTransition(
+          operationMetadata("resume", false, null, true, "caller", "session-not-parked"),
+        ),
+      },
+    },
+    parking: {
+      on: {
+        ...observationTransitions("parking"),
+        "SESSION.PARK.REQUESTED": forbiddenTransition(
+          operationMetadata("park", false, null, true, "caller", "parking-in-progress"),
+        ),
+        "SESSION.PARK.FINALIZE": [
+          {
+            target: "parked",
+            guard: "parkFinalizationEvidenceIsValid",
+            meta: operationMetadata("park", true, "parked", false, "session-registry", "parked", "parking-in-progress"),
+            actions: "recordParkedState",
+          },
+          forbiddenTransition(operationMetadata("park", false, null, false, "session-registry", "parking-in-progress")),
+        ],
+        "SESSION.RESUME.REQUESTED": forbiddenTransition(
+          operationMetadata("resume", false, null, true, "caller", "parking-in-progress"),
+        ),
+        "SESSION.CLOSE.REQUESTED": forbiddenTransition(
+          operationMetadata("close", false, null, true, "caller", "parking-in-progress"),
+        ),
+        "SESSION.DISCARD.REQUESTED": forbiddenTransition(
+          operationMetadata("discard", false, null, true, "caller", "parking-in-progress"),
+        ),
+        "SESSION.GC.REQUESTED": forbiddenTransition(
+          operationMetadata("gc", false, null, false, "gc", "parking-in-progress"),
+        ),
+      },
+    },
+    parked: {
+      on: {
+        ...observationTransitions("parked"),
+        "SESSION.PARK.REQUESTED": selfTransition(
+          operationMetadata("park", true, "parked", true, "session-registry", "parked"),
+        ),
+        "SESSION.PARK.FINALIZE": forbiddenTransition(
+          operationMetadata("park", false, null, false, "session-registry", "parked"),
+        ),
+        "SESSION.RESUME.REQUESTED": [
+          {
+            target: "active",
+            guard: "resumeResultEvidenceIsValid",
+            meta: operationMetadata(
+              "resume",
+              true,
+              "active",
+              true,
+              "caller",
+              "resume-authorized",
+              "session-not-parked",
+            ),
+            actions: "recordResumedState",
+          },
+          forbiddenTransition(operationMetadata("resume", false, null, true, "caller", "session-not-parked")),
+        ],
+        "SESSION.CLOSE.REQUESTED": {
+          target: "close-ready",
+          guard: "parkedCloseIsAllowed",
+          meta: operationMetadata(
+            "close",
+            true,
+            "close-ready",
+            false,
+            "session-registry",
+            "close-proof-required",
+            "recoverable-work-must-be-retained-or-discarded",
+          ),
+        },
+        "SESSION.DISCARD.REQUESTED": allowedTransition(
+          "discarded",
+          operationMetadata("discard", true, "discarded", true, "caller", "explicit-discard-required"),
+        ),
+        "SESSION.GC.REQUESTED": {
+          target: "closed",
+          guard: "parkedGcIsAllowed",
+          meta: operationMetadata(
+            "gc",
+            true,
+            "closed",
+            false,
+            "gc",
+            "close-authorized",
+            "age-is-not-destructive-authority",
+          ),
+        },
       },
     },
   },
@@ -317,6 +508,8 @@ export const sessionMachine = sessionLifecycleMachine;
  */
 export const SESSION_LIFECYCLE_STATE_NODE_IDS: Readonly<Record<SessionLifecycleState, string>> = Object.freeze({
   active: "active",
+  parking: "parking",
+  parked: "parked",
   "close-ready": "close-ready",
   "blocked-recoverable": "blocked-recoverable",
   discarded: "discarded",
@@ -456,6 +649,13 @@ function eventFor(input: SessionMachineInput, operation: SessionLifecycleOperati
       return { type: "SESSION.RECONCILE.REQUESTED" };
     case "gc":
       return { type: "SESSION.GC.REQUESTED" };
+    case "park":
+      return { type: "SESSION.PARK.REQUESTED" };
+    case "resume":
+      // Classification describes whether the already-parked lifecycle can
+      // accept a resume result. This sentinel only projects that success
+      // branch; it is never persisted or treated as authority evidence.
+      return { type: "SESSION.RESUME.REQUESTED", status: "resumed", operationId: "projection" };
   }
 }
 
@@ -465,14 +665,77 @@ function transitionDefinitions(nodeId: string, eventType: string): readonly Tran
   return (stateNode.transitions.get(eventType) ?? []) as readonly TransitionDefinition[];
 }
 
-function projectMachineTransition(
+const PARKING_OPERATIONAL_STATES: readonly SessionParkingOperationalState[] = ["active", "parking", "parked"];
+const PARKING_EVENT_TYPES: readonly SessionParkingEvent["type"][] = [
+  "SESSION.PARK.REQUESTED",
+  "SESSION.PARK.FINALIZE",
+  "SESSION.RESUME.REQUESTED",
+  "SESSION.OBSERVE",
+  "SESSION.CLOSE.REQUESTED",
+  "SESSION.DISCARD.REQUESTED",
+  "SESSION.DOCTOR.REQUESTED",
+  "SESSION.RECONCILE.REQUESTED",
+  "SESSION.GC.REQUESTED",
+];
+
+/** Derive the legacy v1 parking matrix from the canonical XState transitions. */
+export function projectSessionParkingTransitionTable(): readonly SessionParkingTransitionRow[] {
+  const rows = PARKING_OPERATIONAL_STATES.flatMap((source) =>
+    PARKING_EVENT_TYPES.map((event) => {
+      const definitions = transitionDefinitions(source, event);
+      const metadata = transitionMetadata(definitions[0]?.meta);
+      const delegatedLifecycleEvent =
+        (source === "active" || source === "parked") &&
+        (event === "SESSION.CLOSE.REQUESTED" ||
+          event === "SESSION.DISCARD.REQUESTED" ||
+          event === "SESSION.GC.REQUESTED");
+      const observationEvent = event === "SESSION.OBSERVE";
+      const successfulResultEvent =
+        (source === "parking" && event === "SESSION.PARK.FINALIZE") ||
+        (source === "parked" && event === "SESSION.RESUME.REQUESTED") ||
+        (source === "active" && event === "SESSION.PARK.REQUESTED");
+      const guarded =
+        observationEvent ||
+        delegatedLifecycleEvent ||
+        (!successfulResultEvent && isContextDependentGuard(definitions[0]));
+      let reason = metadata.allowed ? metadata.reason : (metadata.forbiddenReason ?? metadata.reason);
+      if (observationEvent) reason = "observe";
+      if (delegatedLifecycleEvent && event === "SESSION.CLOSE.REQUESTED") reason = "close-proof-required";
+      if (delegatedLifecycleEvent && event === "SESSION.DISCARD.REQUESTED") reason = "explicit-discard-required";
+      if (delegatedLifecycleEvent && event === "SESSION.GC.REQUESTED") reason = "age-is-not-destructive-authority";
+      return Object.freeze({
+        source,
+        event,
+        guarded,
+        allowed: guarded ? null : metadata.allowed,
+        target: guarded ? null : metadata.allowed ? (metadata.target ?? source) : null,
+        requiresExplicitIntent: metadata.requiresExplicitIntent,
+        authority: metadata.authority,
+        reason,
+      });
+    }),
+  );
+  return Object.freeze(rows);
+}
+
+/** Execute one capability event through the canonical machine as a pure projection. */
+export function projectSessionLifecycleEvent(
   input: SessionMachineInput,
-  initialState: SessionLifecycleState,
-  operation: SessionLifecycleOperation,
+  event: SessionMachineEvent,
+  initialOperationalState?: SessionParkingOperationalState,
 ): SessionMachineTransitionProjection {
-  const actor = createActor(sessionLifecycleMachine, { input }).start();
+  const actor =
+    initialOperationalState === undefined
+      ? createActor(sessionLifecycleMachine, { input }).start()
+      : createActor(sessionLifecycleMachine, {
+          input,
+          snapshot: sessionLifecycleMachine.resolveState({
+            value: initialOperationalState,
+            context: contextForInput(input),
+          }),
+        }).start();
   const initial = actor.getSnapshot();
-  const event = eventFor(input, operation);
+  const initialState = operationalState(initial.value);
   const definitions = transitionDefinitions(SESSION_LIFECYCLE_STATE_NODE_IDS[initialState], event.type);
   const accepted = initial.can(event);
   const enabledDefinitions = sessionLifecycleMachine.getTransitionData(
@@ -487,7 +750,7 @@ function projectMachineTransition(
   actor.stop();
 
   return Object.freeze({
-    operation,
+    operation: metadata.operation,
     eventType: event.type,
     allowed: accepted,
     target,
@@ -495,6 +758,15 @@ function projectMachineTransition(
     authority: metadata.authority,
     reason: accepted ? metadata.reason : (metadata.forbiddenReason ?? metadata.reason),
   });
+}
+
+function projectMachineTransition(
+  input: SessionMachineInput,
+  initialState: SessionLifecycleState,
+  operation: SessionLifecycleOperation,
+): SessionMachineTransitionProjection {
+  const event = eventFor(input, operation);
+  return projectSessionLifecycleEvent(input, event);
 }
 
 /**

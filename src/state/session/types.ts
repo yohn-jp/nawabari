@@ -6,13 +6,14 @@ import type {
   SessionLifecycleObservation,
   SessionLifecyclePhase,
   SessionLifecycleState,
+  SessionLifecycleTransition,
 } from "../../session-lifecycle-classification.js";
 
 /** Internal schema generation for the session state-module boundary. */
 export const SESSION_STATE_MODULE_SCHEMA_VERSION = 1 as const;
 
 /** Durable state stored by the existing session-registry authority. */
-export type PersistedSessionState = "new" | "active" | "closing" | "closed" | "stale";
+export type PersistedSessionState = "new" | "active" | "closing" | "closed" | "stale" | "parked";
 
 /** Derived operational state; it is not the persisted SessionRecord.state value. */
 export type SessionOperationalState = SessionLifecycleState;
@@ -61,6 +62,30 @@ export type SessionObservationBlocker = SessionLifecycleBlocker;
 export type SessionObservationCloseReadiness = SessionLifecycleCloseReadiness;
 export type SessionObservationPhase = SessionLifecyclePhase;
 
+export type SessionParkingOperationalState = Extract<SessionLifecycleState, "active" | "parking" | "parked">;
+
+export type SessionParkingEvent =
+  | { readonly type: "SESSION.PARK.REQUESTED" }
+  | { readonly type: "SESSION.PARK.FINALIZE"; readonly status: "parked"; readonly operationId: string }
+  | { readonly type: "SESSION.RESUME.REQUESTED"; readonly status: "resumed"; readonly operationId: string }
+  | { readonly type: "SESSION.OBSERVE"; readonly observation: SessionLifecycleObservation }
+  | { readonly type: "SESSION.CLOSE.REQUESTED" }
+  | { readonly type: "SESSION.DISCARD.REQUESTED" }
+  | { readonly type: "SESSION.DOCTOR.REQUESTED" }
+  | { readonly type: "SESSION.RECONCILE.REQUESTED" }
+  | { readonly type: "SESSION.GC.REQUESTED" };
+
+export type SessionParkingTransitionRow = Readonly<{
+  source: SessionParkingOperationalState;
+  event: SessionParkingEvent["type"];
+  guarded: boolean;
+  allowed: boolean | null;
+  target: SessionLifecycleState | null;
+  requiresExplicitIntent: boolean;
+  authority: SessionLifecycleTransition["authority"];
+  reason: SessionLifecycleTransition["reason"];
+}>;
+
 /** Input hydrated from authoritative adapters before a machine is evaluated. */
 export interface SessionMachineInput {
   /** Optional because lifecycle projection may receive observation only. */
@@ -93,6 +118,17 @@ export type SessionMachineEvent =
   | (SessionEventWithPayload & { readonly type: "SESSION.DOCTOR.REQUESTED" })
   | (SessionEventWithPayload & { readonly type: "SESSION.RECONCILE.REQUESTED" })
   | (SessionEventWithPayload & { readonly type: "SESSION.GC.REQUESTED" })
+  | (SessionEventWithPayload & { readonly type: "SESSION.PARK.REQUESTED" })
+  | (SessionEventWithPayload & {
+      readonly type: "SESSION.PARK.FINALIZE";
+      readonly status: "parked";
+      readonly operationId: string;
+    })
+  | (SessionEventWithPayload & {
+      readonly type: "SESSION.RESUME.REQUESTED";
+      readonly status: "resumed";
+      readonly operationId: string;
+    })
   | (SessionEventWithPayload & { readonly type: "SESSION.CLEANUP.RETRY" })
   | (SessionEventWithPayload & { readonly type: "SESSION.CLEANUP.FINALIZE" })
   | (SessionEventWithPayload & { readonly type: "SESSION.MARK_STALE" });
@@ -104,6 +140,9 @@ export const SESSION_MACHINE_EVENT_TYPES = Object.freeze([
   "SESSION.DOCTOR.REQUESTED",
   "SESSION.RECONCILE.REQUESTED",
   "SESSION.GC.REQUESTED",
+  "SESSION.PARK.REQUESTED",
+  "SESSION.PARK.FINALIZE",
+  "SESSION.RESUME.REQUESTED",
   "SESSION.CLEANUP.RETRY",
   "SESSION.CLEANUP.FINALIZE",
   "SESSION.MARK_STALE",

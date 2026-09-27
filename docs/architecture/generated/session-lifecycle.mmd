@@ -1,6 +1,8 @@
 %% Generated from Nawabari Product State Manifest; do not edit.
 stateDiagram-v2
   state "active" as active
+  state "parking" as parking
+  state "parked" as parked
   state "close-ready" as close_ready
   state "blocked-recoverable" as blocked_recoverable
   state "discarded" as discarded
@@ -12,6 +14,28 @@ stateDiagram-v2
   active --> active : doctor
   active --> active : reconcile
   %% active -- gc --> no public transition (age-is-not-destructive-authority)
+  active --> parking : park [guard accepts]
+  %% active -- park [guard rejects] --> no public transition (session-not-parked)
+  %% active -- resume --> no public transition (session-not-parked)
+  %% parking -- close --> no public transition (parking-in-progress)
+  %% parking -- discard --> no public transition (parking-in-progress)
+  parking --> parking : inspect
+  parking --> parking : doctor
+  parking --> parking : reconcile
+  %% parking -- gc --> no public transition (parking-in-progress)
+  %% parking -- park --> no public transition (parking-in-progress)
+  %% parking -- resume --> no public transition (parking-in-progress)
+  parked --> close_ready : close [guard accepts]
+  %% parked -- close [guard rejects] --> no public transition (recoverable-work-must-be-retained-or-discarded)
+  parked --> discarded : discard
+  parked --> parked : inspect
+  parked --> parked : doctor
+  parked --> parked : reconcile
+  parked --> closed : gc [guard accepts]
+  %% parked -- gc [guard rejects] --> no public transition (age-is-not-destructive-authority)
+  parked --> parked : park
+  parked --> active : resume [guard accepts]
+  %% parked -- resume [guard rejects] --> no public transition (session-not-parked)
   close_ready --> closed : close
   close_ready --> discarded : discard
   close_ready --> close_ready : inspect
@@ -19,27 +43,37 @@ stateDiagram-v2
   close_ready --> close_ready : reconcile
   close_ready --> closed : gc [guard accepts]
   %% close-ready -- gc [guard rejects] --> no public transition (age-is-not-destructive-authority)
+  %% close-ready -- park --> no public transition (session-not-parked)
+  %% close-ready -- resume --> no public transition (session-not-parked)
   %% blocked-recoverable -- close --> no public transition (recoverable-work-must-be-retained-or-discarded)
   blocked_recoverable --> discarded : discard
   blocked_recoverable --> blocked_recoverable : inspect
   blocked_recoverable --> blocked_recoverable : doctor
   blocked_recoverable --> blocked_recoverable : reconcile
   %% blocked-recoverable -- gc --> no public transition (recoverable-work-must-be-retained-or-discarded)
+  %% blocked-recoverable -- park --> no public transition (session-not-parked)
+  %% blocked-recoverable -- resume --> no public transition (session-not-parked)
   %% discarded -- close --> no public transition (discarded-terminal)
   discarded --> discarded : discard
   discarded --> discarded : inspect
   discarded --> discarded : doctor
   discarded --> discarded : reconcile
   %% discarded -- gc --> no public transition (age-is-not-destructive-authority)
+  %% discarded -- park --> no public transition (discarded-terminal)
+  %% discarded -- resume --> no public transition (session-not-parked)
   %% stale-inconsistent -- close --> no public transition (physical-reconciliation-required)
   %% stale-inconsistent -- discard --> no public transition (physical-reconciliation-required)
   stale_inconsistent --> stale_inconsistent : inspect
   stale_inconsistent --> stale_inconsistent : doctor
   stale_inconsistent --> stale_inconsistent : reconcile
   %% stale-inconsistent -- gc --> no public transition (age-is-not-destructive-authority)
+  %% stale-inconsistent -- park --> no public transition (physical-reconciliation-required)
+  %% stale-inconsistent -- resume --> no public transition (physical-reconciliation-required)
   closed --> closed : close
   %% closed -- discard --> no public transition (closed-terminal)
   closed --> closed : inspect
   closed --> closed : doctor
   closed --> closed : reconcile
   %% closed -- gc --> no public transition (age-is-not-destructive-authority)
+  %% closed -- park --> no public transition (closed-terminal)
+  %% closed -- resume --> no public transition (session-not-parked)

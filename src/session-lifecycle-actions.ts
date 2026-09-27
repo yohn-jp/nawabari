@@ -8,6 +8,8 @@ import { lifecycleTransition, type SessionLifecycleClassification } from "./sess
 export const SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION = 1 as const;
 /** Versioned action descriptor for the mutating reconciliation command. */
 export const SESSION_LIFECYCLE_APPLY_ACTION_SCHEMA_VERSION = 2 as const;
+/** Park/resume actions are a separate v2 projection; the established v1 next-action contract stays frozen. */
+export const SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION = 2 as const;
 
 export type SessionLifecycleActionId =
   | "retain-session"
@@ -18,6 +20,28 @@ export type SessionLifecycleActionId =
 
 /** Naming alias for callers that refer to the projection as a next action. */
 export type SessionLifecycleNextActionId = SessionLifecycleActionId;
+
+export type SessionLifecycleParkResumeAction =
+  | {
+      readonly schemaVersion: typeof SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION;
+      readonly actionId: "park-session";
+      readonly kind: "park";
+      readonly command: "session action";
+      readonly sessionId: string;
+      readonly requiresExplicitIntent: true;
+      readonly mutates: true;
+    }
+  | {
+      readonly schemaVersion: typeof SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION;
+      readonly actionId: "resume-session";
+      readonly kind: "resume";
+      readonly command: "session action";
+      readonly sessionId: string;
+      readonly requiresExplicitIntent: true;
+      readonly mutates: true;
+    };
+
+export type SessionLifecycleParkResumeActionId = SessionLifecycleParkResumeAction["actionId"];
 
 export type SessionLifecycleAction =
   | {
@@ -222,6 +246,45 @@ export function projectSessionLifecycleActions(
   }
 
   return Object.freeze(actions);
+}
+
+/**
+ * Project executable park/resume offers from canonical operation availability.
+ * This separately versioned contract leaves the established v1 diagnostic
+ * next-action projection unchanged; `retain-session` remains observational.
+ */
+export function projectSessionLifecycleParkResumeActions(input: {
+  readonly classification: SessionLifecycleClassification;
+  readonly sessionId: string;
+}): readonly SessionLifecycleParkResumeAction[] {
+  const { classification, sessionId } = input;
+  if (classification.state === "active" && lifecycleTransition(classification, "park").allowed) {
+    return Object.freeze([
+      Object.freeze({
+        schemaVersion: SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION,
+        actionId: "park-session",
+        kind: "park",
+        command: "session action",
+        sessionId,
+        requiresExplicitIntent: true,
+        mutates: true,
+      }),
+    ]);
+  }
+  if (classification.state === "parked" && lifecycleTransition(classification, "resume").allowed) {
+    return Object.freeze([
+      Object.freeze({
+        schemaVersion: SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION,
+        actionId: "resume-session",
+        kind: "resume",
+        command: "session action",
+        sessionId,
+        requiresExplicitIntent: true,
+        mutates: true,
+      }),
+    ]);
+  }
+  return Object.freeze([]);
 }
 
 export function primarySessionLifecycleAction(
