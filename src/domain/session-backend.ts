@@ -12,7 +12,13 @@ import {
   type SessionRegistryOptions,
 } from "../session-registry.js";
 import type { SessionLifecycleAction as RegistrySessionLifecycleAction } from "../session-lifecycle-actions.js";
-import { availableLifecycleOperations } from "../session-lifecycle-classification.js";
+import { SessionRetentionError, SessionRetentionService } from "../session-retention.js";
+import { projectSessionLifecycleParkResumeActions } from "../session-lifecycle-actions.js";
+import {
+  resolveLatestImplementationExecutionScope,
+  type ImplementationExecutionScopeResolver,
+} from "./implementation-execution-scope-resolver.js";
+import { availableLifecycleOperations, classifySessionLifecycle } from "../session-lifecycle-classification.js";
 import { isSessionRegistryError, type RegistryErrorCode, type SessionRegistryError } from "../errors.js";
 import { DomainError, failure, success, type DomainResult, type ErrorCode, type JsonObject } from "./errors.js";
 import {
@@ -55,6 +61,7 @@ import {
   type SessionDiagnosticOptions,
   type SessionDiagnosticSchemaVersion,
   type SessionLifecycleAction,
+  type SessionParkResumeResult,
   type SessionLifecycleProjection,
   type SessionDiagnosticGarbageCollection,
   SESSION_DIAGNOSTIC_DEFAULT_SCHEMA_VERSION,
@@ -151,6 +158,8 @@ export interface LocalSessionBackendOptions {
   >;
   /** Explicit override for the managed-runtime handoff fence (tests/custom composition). */
   readonly resourceHandoffExecution?: ResourceHandoffFenceController;
+  /** Current external authorization source for fail-closed retention resume. */
+  readonly implementationExecutionScopeResolver?: ImplementationExecutionScopeResolver;
 }
 
 export const LOCAL_SESSION_CAPABILITIES: BackendCapabilities = Object.freeze({
@@ -267,6 +276,7 @@ export class LocalSessionBackend implements SessionBackend {
     "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority"
   >;
   private readonly resourceHandoffExecution: ResourceHandoffFenceController | undefined;
+  private readonly implementationExecutionScopeResolver: ImplementationExecutionScopeResolver | undefined;
 
   public constructor(options: LocalSessionBackendOptions = {}) {
     this.git = options.git;
@@ -274,6 +284,7 @@ export class LocalSessionBackend implements SessionBackend {
     this.sandboxProbe = options.sandboxProbe;
     this.registryOptions = options.registry ?? {};
     this.resourceHandoffExecution = options.resourceHandoffExecution;
+    this.implementationExecutionScopeResolver = options.implementationExecutionScopeResolver;
     this.managedCgroupRoot = resolveManagedCgroupRoot({
       ...(options.cgroupRoot === undefined ? {} : { root: options.cgroupRoot }),
       ...(this.registryOptions.cgroupFilesystem === undefined
@@ -420,6 +431,90 @@ export class LocalSessionBackend implements SessionBackend {
 
   public sessionActions(context: SessionContext): SessionActionDispatcher {
     return createSessionActions(this, context);
+  }
+
+  public async parkSession(
+    context: SessionContext,
+    sessionId: string,
+    operationId?: string,
+  ): Promise<DomainResult<SessionParkResumeResult>> {
+    try {
+      const registry = this.registryFor(context);
+      const pinnedProfile = registry.getSessionManagedRuntime(sessionId).profile;
+      return success(
+        new SessionRetentionService(registry).parkSession({
+          sessionId,
+          pinnedProfile,
+          ...(operationId === undefined ? {} : { operationId }),
+        }),
+      );
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async resumeSession(
+    context: SessionContext,
+    sessionId: string,
+    operationId?: string,
+  ): Promise<DomainResult<SessionParkResumeResult>> {
+    try {
+      const registry = this.registryFor(context);
+      const session = registry.get(sessionId);
+      if (session === undefined) {
+        return failure(
+          new DomainError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { session_id: sessionId }),
+        );
+      }
+      if (session.state !== "parked") {
+        return failure(
+          toDomainError(
+            new SessionRetentionError("SESSION_NOT_PARKED", `Session cannot resume while ${session.state}`, {
+              sessionId,
+            }),
+          ),
+        );
+      }
+      if (session.workingSet === undefined) {
+        return failure(
+          new DomainError("BACKEND_UNAVAILABLE", "Resume requires persisted execution-scope provenance.", {
+            operation: "session.resume",
+            reason: "working-set-provenance-missing",
+          }),
+        );
+      }
+      const resolved = await resolveLatestImplementationExecutionScope(
+        this.implementationExecutionScopeResolver,
+        session.workingSet.provenance,
+      );
+      if (resolved.status !== "resolved") {
+        const unavailable = resolved.status === "unavailable" || resolved.status === "stale";
+        return failure(
+          new DomainError(
+            unavailable ? "BACKEND_UNAVAILABLE" : "OPERATION_REJECTED",
+            unavailable
+              ? "The latest implementation execution scope is unavailable."
+              : "The latest implementation execution scope is invalid.",
+            {
+              operation: "session.resume",
+              scope_resolution: resolved.status,
+              ...(resolved.reason === undefined ? {} : { reason: resolved.reason.slice(0, 200) }),
+            },
+          ),
+        );
+      }
+      const pinnedProfile = registry.getSessionManagedRuntime(sessionId).profile;
+      return success(
+        new SessionRetentionService(registry).resumeSession({
+          sessionId,
+          pinnedProfile,
+          latestExternalScope: resolved.artifact,
+          ...(operationId === undefined ? {} : { operationId }),
+        }),
+      );
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
   }
 
   public async createSession(
@@ -1452,6 +1547,7 @@ function toDomainStatusRecord(
     safe_actions: [...projected.safe_actions],
     ...(projected.next_action === undefined ? {} : { next_action: projected.next_action }),
     next_actions: projected.next_actions,
+    ...(projected.park_resume_actions === undefined ? {} : { park_resume_actions: projected.park_resume_actions }),
     ...(projected.lifecycle_state === undefined ? {} : { lifecycle_state: projected.lifecycle_state }),
     ...(projected.lifecycle === undefined ? {} : { lifecycle: projected.lifecycle }),
   };
@@ -1769,6 +1865,26 @@ function toDomainSessionDiagnostic(
 ): SessionDiagnostic {
   const nextActions = diagnostic.nextActions.map(toDomainSessionLifecycleAction);
   const lifecycle = diagnostic.lifecycle === undefined ? undefined : toDomainLifecycleProjection(diagnostic.lifecycle);
+  const currentLifecycle =
+    diagnostic.lifecycle === undefined
+      ? undefined
+      : classifySessionLifecycle({
+          sessionState: diagnostic.lifecycle.sessionState,
+          physicalState: diagnostic.lifecycle.physicalState ?? undefined,
+          closeReadiness: diagnostic.lifecycle.closeReadiness,
+          blockers: diagnostic.lifecycle.blockers,
+          terminalOperation: diagnostic.session.terminalOperation,
+          ageSuspicious: diagnostic.lifecycle.ageSuspicious,
+          gcAuthorized: diagnostic.lifecycle.gcAuthorized,
+          phase: "current",
+        });
+  const parkResumeActions =
+    currentLifecycle === undefined
+      ? undefined
+      : projectSessionLifecycleParkResumeActions({
+          classification: currentLifecycle,
+          sessionId: diagnostic.session.sessionId,
+        });
   return {
     schema_version: schemaVersion,
     session_id: diagnostic.session.sessionId,
@@ -1793,6 +1909,7 @@ function toDomainSessionDiagnostic(
       ? {}
       : { next_action: toDomainSessionLifecycleAction(diagnostic.nextAction) }),
     next_actions: nextActions,
+    ...(parkResumeActions === undefined ? {} : { park_resume_actions: [...parkResumeActions] }),
     integration_evidence: {
       supplied: diagnostic.integrationEvidence.supplied,
       ...(diagnostic.integrationEvidence.integratedRevision === undefined
@@ -2069,6 +2186,15 @@ function toDomainClaim(claim: RegistryResourceClaim): ResourceClaim {
 
 function toDomainError(error: unknown, fallbackCode?: ErrorCode): DomainError {
   if (error instanceof DomainError) return error;
+  if (error instanceof SessionRetentionError) {
+    return new DomainError(
+      retentionDomainErrorCode(error),
+      error.message,
+      { ...(error.details as JsonObject), retention_code: error.code },
+      undefined,
+      error,
+    );
+  }
   if (!isSessionRegistryError(error)) {
     const cause = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     return new DomainError(
@@ -2083,6 +2209,37 @@ function toDomainError(error: unknown, fallbackCode?: ErrorCode): DomainError {
   const details: JsonObject = { ...error.details };
   const code = domainErrorCode(error, fallbackCode);
   return new DomainError(code, error.message, details);
+}
+
+function retentionDomainErrorCode(error: SessionRetentionError): ErrorCode {
+  switch (error.code) {
+    case "INVALID_INPUT":
+      return "INVALID_ARGUMENT";
+    case "SESSION_NOT_FOUND":
+      return "SESSION_NOT_FOUND";
+    case "SESSION_NOT_ACTIVE":
+      return "SESSION_NOT_ACTIVE";
+    case "PHYSICAL_IDENTITY_MISMATCH":
+      return "OWNERSHIP_MISMATCH";
+    case "CLAIM_CONFLICT":
+      return "RESOURCE_CLAIM_CONFLICT";
+    case "STALE_CLAIM_SET":
+      return "STALE_CLAIM_SET";
+    case "RETENTION_STEP_FAILED":
+      return "INTERNAL_ERROR";
+    case "SESSION_NOT_PARKED":
+    case "SESSION_ALREADY_PARKED":
+    case "FENCE_REJECTED":
+    case "DRAIN_INCOMPLETE":
+    case "REVALIDATION_FAILED":
+    case "PINNED_PROFILE_MISMATCH":
+    case "EXTERNAL_SCOPE_REJECTED":
+      return "OPERATION_REJECTED";
+    case "RETENTION_UNCERTAIN":
+      // Uncertainty is returned as a structured service result, never as a failure.
+      // Reaching this branch means the retention service violated that contract.
+      return "INTERNAL_ERROR";
+  }
 }
 
 function domainErrorCode(error: SessionRegistryError, fallbackCode?: ErrorCode): ErrorCode {

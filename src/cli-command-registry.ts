@@ -324,7 +324,7 @@ const REGISTRY_DATA = [
     usage: `${CLI_NAME} session action --session <id> --action <action-id> --token <json> [--confirm --preview <json>] [--operation-id <id>]`,
     options: [
       option("--session", "Explicit session identity; never inferred", { value: "<id>", required: true }),
-      option("--action", "Typed action ID from the current diagnostic next_actions", {
+      option("--action", "Typed action ID from the current lifecycle action projection", {
         value: "<action-id>",
         required: true,
         values: [
@@ -333,6 +333,8 @@ const REGISTRY_DATA = [
           "retry-close-with-bounded-integration-fetch",
           "discard-session",
           "reconcile-physical-state",
+          "park-session",
+          "resume-session",
         ],
       }),
       option("--token", "JSON action token returned by the current UI snapshot", { value: "<json>", required: true }),
