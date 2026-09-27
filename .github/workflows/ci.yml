@@ -38,6 +38,11 @@ jobs:
         # needs the host development toolchain under the projected FHS roots,
         # not only in runner tool caches.
         sudo apt-get install -y bubblewrap rustc cargo
+        runner_local_bin="${HOME}/.local/bin"
+        case ":${PATH}:" in
+          *":${runner_local_bin}:"*) install -d -m 0700 "$runner_local_bin" ;;
+          *) echo "Expected runner-local PATH entry is missing: ${runner_local_bin}" >&2; exit 1 ;;
+        esac
         sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0700 /usr/local/nawabari-test-fixtures
         if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
