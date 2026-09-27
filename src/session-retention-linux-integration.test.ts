@@ -159,6 +159,11 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
   let sessionIdForCleanup: string | undefined;
   let registryForCleanup: SessionRegistry | undefined;
   let runPromise: Promise<number> | undefined;
+  let runCompletion:
+    | Readonly<{ exitCode: number; rejected: false }>
+    | Readonly<{ exitCode: null; rejected: true; reason: string }>
+    | undefined;
+  let lastExecutionObservation = "no owned execution record observed";
   const runStdout: string[] = [];
   const runStderr: string[] = [];
   t.after(async () => {
@@ -238,14 +243,47 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
       stdout: (line) => runStdout.push(line),
       stderr: (line) => runStderr.push(line),
     },
-  });
+  }).then(
+    (exitCode) => {
+      runCompletion = { exitCode, rejected: false };
+      return exitCode;
+    },
+    (error: unknown) => {
+      const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      runCompletion = { exitCode: null, rejected: true, reason };
+      return 1;
+    },
+  );
 
   const running = await waitFor("a real owned descendant in the protected execution cgroup", () => {
+    if (runCompletion !== undefined) {
+      throw new Error(
+        `The protected CLI run completed before its owned descendant was observed: ${JSON.stringify({
+          completion: runCompletion,
+          stdout: runStdout,
+          stderr: runStderr,
+          lastExecutionObservation,
+        })}`,
+      );
+    }
     const record = latestExecution(registry, sessionId);
-    if (record === undefined || (record.state !== "attached" && record.state !== "running")) return undefined;
+    if (record === undefined) return undefined;
     const observed = observeOwnedExecution(ownedExecutionObservationRecord(record), {
       current_boot_id: readCurrentKernelBootId(),
     });
+    lastExecutionObservation = JSON.stringify({
+      execution_id: record.execution_id,
+      record_state: record.state,
+      cgroup_root: record.cgroup_root ?? null,
+      observation: observed.ok
+        ? {
+            state: observed.value.state,
+            population: observed.value.cgroups?.population.state ?? null,
+            processes: observed.value.cgroups?.population.processes ?? null,
+          }
+        : { error: observed.error.message },
+    });
+    if (record.state !== "attached" && record.state !== "running") return undefined;
     if (
       !observed.ok ||
       observed.value.state !== "active" ||
@@ -255,13 +293,29 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
       return undefined;
     }
     const pids = observed.value.cgroups.population.processes;
+    const processSummaries: { pid: number; parentPid: number | null; commandLine: string }[] = [];
     for (const pid of pids) {
       const info = readProcess(pid);
+      processSummaries.push({
+        pid,
+        parentPid: info?.parentPid ?? null,
+        commandLine: info?.commandLine.slice(0, 160) ?? "unavailable",
+      });
       if (info?.commandLine.includes(DESCENDANT_MARKER) && pids.includes(info.parentPid)) {
         return { record, scope: ownedScope(record), descendantPid: pid, parentPid: info.parentPid };
       }
     }
+    lastExecutionObservation = JSON.stringify({
+      execution_id: record.execution_id,
+      record_state: record.state,
+      cgroup_root: record.cgroup_root ?? null,
+      population: observed.value.cgroups.population.state,
+      processes: processSummaries,
+    });
     return undefined;
+  }).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message}\nLast protected execution evidence: ${lastExecutionObservation}`);
   });
   assert.ok(running.scope, "the execution record must carry its owned cgroup lease");
   assert.notEqual(running.descendantPid, running.parentPid);
