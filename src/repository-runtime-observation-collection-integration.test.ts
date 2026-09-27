@@ -399,7 +399,7 @@ function responseView(body: unknown): RepositoryScreenModel {
 function assertExplicitCoordinationUnavailable(model: RepositoryScreenModel): void {
   const sections = model.unavailable_sections as Record<string, unknown> | undefined;
   assert.ok(sections !== undefined);
-  for (const section of ["files", "conflicts"]) {
+  for (const section of ["files", "conflicts", "attention", "runtime"]) {
     const value = sections[section] as Record<string, unknown> | undefined;
     assert.equal(value?.status, "unavailable", `${section} must not infer a clean or empty result`);
   }

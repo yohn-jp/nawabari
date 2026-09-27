@@ -42,7 +42,8 @@ export function repositoryScreenModelFromRuntimeSnapshot(
     unavailable_sections.conflicts = { status: "unavailable", source: "projectFileSessionMatrix", reason };
   }
   const unknownObservations = ["coordination", "profiles", "filesystem", "processes", "lifecycle"].filter(
-    (name) => snapshot.observations[name as keyof typeof snapshot.observations].status === "unknown",
+    (name) =>
+      projectionSnapshot.observations[name as keyof typeof projectionSnapshot.observations].status === "unknown",
   );
   if (unknownObservations.length > 0) {
     const reason = `observations unavailable: ${unknownObservations.join(", ")}`;
