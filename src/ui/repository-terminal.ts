@@ -14,7 +14,7 @@ import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.j
 import { type DomainResult, type JsonObject } from "../domain/errors.js";
 import { projectFileSessionMatrix } from "../resource-coordination-view.js";
 import { projectAgentRuntimeStatus, projectSessionAttention } from "../session-attention.js";
-import type { SessionActionDispatcher, SessionActionIdentity, SessionActionToken } from "./session-actions.js";
+import type { SessionActionDispatcher, SessionActionIdentity, SessionActionToken } from "../domain/session-actions.js";
 import type { SessionLifecycleAction } from "../domain/session.js";
 
 /** Map one canonical runtime snapshot into the screen's projection-only model. */
