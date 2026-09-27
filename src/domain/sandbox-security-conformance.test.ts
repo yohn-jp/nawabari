@@ -102,6 +102,10 @@ async function successfulRun(request: SandboxExecutionRequest, command: string, 
 }
 
 test("canonical protected execution rejects the Issue #93 security-negative matrix", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("canonical protected execution is Linux-only");
     return;

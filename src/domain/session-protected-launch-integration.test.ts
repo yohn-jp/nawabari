@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { compileSessionEnvironment, materializeSessionRuntimeDirectories } from "./session-environment.js";
 import { reserveExecution, type SessionExecutionRecord } from "./session-execution-record.js";
 import { launchProtectedSessionExecution } from "./session-protected-launch.js";
+import { materializeFhsRuntime } from "./fhs-runtime.js";
+import { resolveRuntimeProfile } from "./runtime-profile.js";
 import { compileSandboxInvocation } from "./sandbox-launcher.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import {
@@ -16,7 +18,11 @@ import {
   sandboxCapabilityBaseline,
   sandboxSeccompProfileMetadata,
 } from "./sandbox.js";
-import { STRICT_RUNTIME_POLICY, validateSessionRuntimeProjection } from "./runtime-projection.js";
+import {
+  STRICT_RUNTIME_POLICY,
+  validateSessionRuntimeProjection,
+  type RuntimeFilesystemProjection,
+} from "./runtime-projection.js";
 import { validateWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 
 function profileInput(): Record<string, unknown> {
@@ -40,9 +46,23 @@ function profileInput(): Record<string, unknown> {
   };
 }
 
+function executableOnPath(command: string): string | null {
+  for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (directory.length === 0) continue;
+    const candidate = path.join(directory, command);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.realpathSync.native(candidate);
+    } catch {
+      // Continue searching the caller's PATH.
+    }
+  }
+  return null;
+}
+
 test("the protected compiler consumes the materialized environment and one canonical descriptor path", (t) => {
-  const bwrap = "/run/current-system/sw/bin/bwrap";
-  if (process.platform !== "linux" || !fs.existsSync(bwrap)) {
+  const bwrap = executableOnPath("bwrap");
+  if (process.platform !== "linux" || bwrap === null) {
     t.skip("supported bubblewrap runtime is unavailable");
     return;
   }
@@ -149,12 +169,18 @@ test("the protected compiler consumes the materialized environment and one canon
 });
 
 test("the protected composition reaches the repaired worker on a supported runtime", async (t) => {
-  const bwrap = "/run/current-system/sw/bin/bwrap";
-  if (process.platform !== "linux" || !fs.existsSync(bwrap)) {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
+  const bwrap = executableOnPath("bwrap");
+  if (process.platform !== "linux" || bwrap === null) {
     t.skip("supported bubblewrap runtime is unavailable");
     return;
   }
-  const workerArtifact = fileURLToPath(new URL("./session-launch-supervisor-worker.js", import.meta.url));
+  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const supervisorArtifact = path.join(repositoryRoot, "dist", "domain", "session-launch-supervisor.js");
+  const workerArtifact = path.join(repositoryRoot, "dist", "domain", "session-launch-supervisor-worker.js");
   if (!fs.existsSync(workerArtifact)) {
     t.skip("compiled trusted supervisor worker artifact is unavailable in the source test run");
     return;
@@ -184,12 +210,12 @@ test("the protected composition reaches the repaired worker on a supported runti
     assert.equal(materialized.ok, true);
     if (!materialized.ok) return;
 
-    const node = fs.realpathSync.native(process.execPath);
-    const projection = validateSessionRuntimeProjection({
-      policy: STRICT_RUNTIME_POLICY,
-      profile: { id: "integration-material", version: "1" },
-      requirements: [{ id: "node-runtime", kind: "runtime", name: "node", version: ">=24" }],
-      filesystem: [
+    const node = fs.realpathSync.native(process.env.NAWABARI_TEST_FHS_NODE_INTERPRETER ?? process.execPath);
+    const nodeUsesNixStore = node.startsWith("/nix/store/");
+    const nodeTarget = nodeUsesNixStore ? "/runtime/node/node" : "/usr/local/bin/node";
+    let filesystem: readonly RuntimeFilesystemProjection[];
+    if (nodeUsesNixStore) {
+      filesystem = [
         {
           source: "/nix/store",
           target: "/nix/store",
@@ -202,11 +228,28 @@ test("the protected composition reaches the repaired worker on a supported runti
           access_mode: "read-only",
           provenance: "runtime-profile",
         },
-      ],
+      ];
+    } else {
+      const baseProfile = resolveRuntimeProfile({ profiles: ["base"] });
+      assert.equal(baseProfile.ok, true, baseProfile.ok ? "" : JSON.stringify(baseProfile.error));
+      if (!baseProfile.ok) return;
+      const materializedNode = materializeFhsRuntime({
+        profile: baseProfile.value,
+        executables: [{ requirement_id: "node-runtime", path: node, target: nodeTarget }],
+      });
+      assert.equal(materializedNode.ok, true, materializedNode.ok ? "" : JSON.stringify(materializedNode.error));
+      if (!materializedNode.ok) return;
+      filesystem = materializedNode.value.filesystem;
+    }
+    const projection = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "integration-material", version: "1" },
+      requirements: [{ id: "node-runtime", kind: "runtime", name: "node", version: ">=24" }],
+      filesystem,
       executables: [
         {
           name: "node",
-          target: "/runtime/node/node",
+          target: nodeTarget,
           provider: { id: "runtime", requirement_id: "node-runtime" },
           provenance: "runtime-profile",
         },
@@ -262,7 +305,7 @@ test("the protected composition reaches the repaired worker on a supported runti
         profile: upper.value,
         compiled_environment: compiled.value,
         request: { ...request, cgroups: { required: true, execution_id: "worker-execution" } },
-        command: { command: "node", args: ["-e", "process.stdout.write('worker-ok')"] },
+        command: { command: nodeTarget, args: ["-e", "process.stdout.write('worker-ok')"] },
         admission: {
           session_id: "worker-session",
           execution_id: "worker-execution",
@@ -296,10 +339,12 @@ test("the protected composition reaches the repaired worker on a supported runti
       {
         materializeSessionRuntimeDirectories,
         compileSandboxInvocation,
-        runSessionLaunchSupervisor: (packet) =>
-          import("./session-launch-supervisor.js").then(({ runSessionLaunchSupervisor }) =>
-            runSessionLaunchSupervisor(packet),
-          ),
+        runSessionLaunchSupervisor: async (packet) => {
+          const { runSessionLaunchSupervisor } = (await import(
+            pathToFileURL(supervisorArtifact).href
+          )) as typeof import("./session-launch-supervisor.js");
+          return runSessionLaunchSupervisor(packet);
+        },
         persist_execution: async (record) => {
           records.push(record as SessionExecutionRecord);
         },
@@ -326,7 +371,7 @@ test("the protected composition reaches the repaired worker on a supported runti
     assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
     if (!result.ok) return;
     assert.equal(result.value.supervisor.status, "completed");
-    assert.equal(result.value.result?.stdout, "worker-ok");
+    assert.equal(result.value.result?.stdout, "worker-ok", JSON.stringify(result.value));
     assert.equal(result.value.execution.state, "exited");
     assert.deepEqual(
       records.map((record) => record.state),

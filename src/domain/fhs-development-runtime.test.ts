@@ -406,6 +406,10 @@ test("doctor strict_ready and its reason are projections of the same FHS resolve
 });
 
 test("standalone Linux protected execution runs the materialized Node/Git baseline", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("protected FHS execution is Linux-only");
     return;
@@ -524,6 +528,10 @@ test("standalone Linux protected execution runs the materialized Node/Git baseli
 
 /** Issue #398 regression: a bounded (working-set-constrained) session must actually execute on a strict FHS host. */
 test("a bounded session under the default strict FHS profile actually executes, with Landlock enforced", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("protected FHS execution is Linux-only");
     return;

@@ -350,6 +350,10 @@ test("Landlock setup failure is reported once with bounded diagnostics and never
 });
 
 test("supported Landlock denies a write outside the canonical topology", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("Landlock is Linux-only");
     return;
