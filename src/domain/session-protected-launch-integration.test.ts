@@ -8,6 +8,8 @@ import test from "node:test";
 import { compileSessionEnvironment, materializeSessionRuntimeDirectories } from "./session-environment.js";
 import { reserveExecution, type SessionExecutionRecord } from "./session-execution-record.js";
 import { launchProtectedSessionExecution } from "./session-protected-launch.js";
+import { materializeFhsRuntime } from "./fhs-runtime.js";
+import { resolveRuntimeProfile } from "./runtime-profile.js";
 import { compileSandboxInvocation } from "./sandbox-launcher.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import {
@@ -16,7 +18,11 @@ import {
   sandboxCapabilityBaseline,
   sandboxSeccompProfileMetadata,
 } from "./sandbox.js";
-import { STRICT_RUNTIME_POLICY, validateSessionRuntimeProjection } from "./runtime-projection.js";
+import {
+  STRICT_RUNTIME_POLICY,
+  validateSessionRuntimeProjection,
+  type RuntimeFilesystemProjection,
+} from "./runtime-projection.js";
 import { validateWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 
 function profileInput(): Record<string, unknown> {
@@ -204,12 +210,12 @@ test("the protected composition reaches the repaired worker on a supported runti
     assert.equal(materialized.ok, true);
     if (!materialized.ok) return;
 
-    const node = fs.realpathSync.native(process.execPath);
-    const projection = validateSessionRuntimeProjection({
-      policy: STRICT_RUNTIME_POLICY,
-      profile: { id: "integration-material", version: "1" },
-      requirements: [{ id: "node-runtime", kind: "runtime", name: "node", version: ">=24" }],
-      filesystem: [
+    const node = fs.realpathSync.native(process.env.NAWABARI_TEST_FHS_NODE_INTERPRETER ?? process.execPath);
+    const nodeUsesNixStore = node.startsWith("/nix/store/");
+    const nodeTarget = nodeUsesNixStore ? "/runtime/node/node" : "/usr/local/bin/node";
+    let filesystem: readonly RuntimeFilesystemProjection[];
+    if (nodeUsesNixStore) {
+      filesystem = [
         {
           source: "/nix/store",
           target: "/nix/store",
@@ -222,11 +228,28 @@ test("the protected composition reaches the repaired worker on a supported runti
           access_mode: "read-only",
           provenance: "runtime-profile",
         },
-      ],
+      ];
+    } else {
+      const baseProfile = resolveRuntimeProfile({ profiles: ["base"] });
+      assert.equal(baseProfile.ok, true, baseProfile.ok ? "" : JSON.stringify(baseProfile.error));
+      if (!baseProfile.ok) return;
+      const materializedNode = materializeFhsRuntime({
+        profile: baseProfile.value,
+        executables: [{ requirement_id: "node-runtime", path: node, target: nodeTarget }],
+      });
+      assert.equal(materializedNode.ok, true, materializedNode.ok ? "" : JSON.stringify(materializedNode.error));
+      if (!materializedNode.ok) return;
+      filesystem = materializedNode.value.filesystem;
+    }
+    const projection = validateSessionRuntimeProjection({
+      policy: STRICT_RUNTIME_POLICY,
+      profile: { id: "integration-material", version: "1" },
+      requirements: [{ id: "node-runtime", kind: "runtime", name: "node", version: ">=24" }],
+      filesystem,
       executables: [
         {
           name: "node",
-          target: "/runtime/node/node",
+          target: nodeTarget,
           provider: { id: "runtime", requirement_id: "node-runtime" },
           provenance: "runtime-profile",
         },
@@ -282,7 +305,7 @@ test("the protected composition reaches the repaired worker on a supported runti
         profile: upper.value,
         compiled_environment: compiled.value,
         request: { ...request, cgroups: { required: true, execution_id: "worker-execution" } },
-        command: { command: "node", args: ["-e", "process.stdout.write('worker-ok')"] },
+        command: { command: nodeTarget, args: ["-e", "process.stdout.write('worker-ok')"] },
         admission: {
           session_id: "worker-session",
           execution_id: "worker-execution",

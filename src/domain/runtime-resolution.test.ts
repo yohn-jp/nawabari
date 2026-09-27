@@ -585,20 +585,26 @@ test("the default strict FHS projection keeps the development baseline functiona
 
     const hostHome = discovered.user_home ?? "/home/host-user";
     const userToolPath = discovered.user_local_bin ?? path.join(hostHome, ".local", "bin");
+    const hiddenHostPaths = ["/usr/bin/sh", "/bin/ls", "/nix/store", hostHome, userToolPath];
     const visibility = await runSandboxedCommand(request.value, {
       command: "/bin/sh",
       args: [
         "-ceu",
-        ["test ! -e /usr/bin/sh", "test ! -e /bin/ls", "test ! -e /nix/store", 'test ! -e "$1"', 'test ! -e "$2"'].join(
-          ";",
-        ),
+        [
+          "for candidate do",
+          'if [ -e "$candidate" ]; then printf "unexpected-visible-host-path:%s\\n" "$candidate"; exit 1; fi',
+          "done",
+          "printf strict-fhs-host-paths-hidden",
+        ].join(";"),
         "strict-visibility",
-        hostHome,
-        userToolPath,
+        ...hiddenHostPaths,
       ],
     });
     assert.equal(visibility.ok, true, visibility.ok ? "" : JSON.stringify(visibility.error));
-    if (visibility.ok) assert.equal(visibility.value.exit_code, 0, JSON.stringify(visibility.value));
+    if (visibility.ok) {
+      assert.equal(visibility.value.exit_code, 0, JSON.stringify(visibility.value));
+      assert.equal(visibility.value.stdout, "strict-fhs-host-paths-hidden", JSON.stringify(visibility.value));
+    }
   } finally {
     try {
       git(["worktree", "remove", "--force", worktree]);
