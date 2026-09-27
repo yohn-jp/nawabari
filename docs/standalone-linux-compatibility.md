@@ -1,42 +1,41 @@
-# Standalone Linux protected-session compatibility
+# Standalone Linux compatibility qualification
 
-The executable compatibility conformance evidence for Issue #147 is
-`src/domain/standalone-linux-compat.test.ts`. It resolves a real session with
-`enforce: true` and the explicit `EXPLICIT_COMPATIBILITY_RUNTIME_POLICY`, uses
-the discovered runtime layout, and executes commands through
-`runSandboxedCommand`; it does not use the controlled bubblewrap test stub.
+Classification: implementation/test reference, not a universal platform-support or security guarantee.
+The [runtime/process contract](architecture/runtime-process.md) and
+[verification/provenance contract](architecture/verification-provenance.md) own the design and proof obligations.
 
-The default protected path is strict `development` runtime resolution. Its
-policy/materializer wiring and default-deny projection are covered by
-`src/domain/runtime-resolution.test.ts` and the protected-runtime package
-coverage; this compatibility suite intentionally opts into the legacy layout.
+## Named proof
 
-Run the evidence on a supported standalone Linux host with:
+The executable compatibility scenario is `src/domain/standalone-linux-compat.test.ts`.
+It resolves a real session with `enforce: true` and the explicit `EXPLICIT_COMPATIBILITY_RUNTIME_POLICY`, discovers the
+runtime layout, and calls `runSandboxedCommand`. It does not use a controlled bubblewrap substitute as positive evidence.
 
-```text
+```bash
 node --test --import tsx src/domain/standalone-linux-compat.test.ts
 ```
 
-The test covers:
+This deliberately exercises compatibility mode. The default strict `development` resolution and managed process-tracking
+boundary have separate tests and prerequisites; a passing compatibility scenario does not prove all three equivalent.
+No test result is newly reported by this documentation revision.
 
-- Git worktree root, status, and diff observation inside the protected child;
-- Nawabari checkpoint, diff, claim, commit, local-bare-remote push, merge, and
-  close lifecycle operations;
-- shell/core tools, Node, pnpm, Rust/Cargo, Python/uv, a C compiler and its
-  subprocess, and a short-lived long-running agent-like CLI process;
-- repository-owned shared HOME state and per-session HOME/cache state across
-  sequential sessions;
-- independent worktree, `/tmp`, and process views during concurrent launches.
+## Coverage and prerequisites
 
-The fixture uses only a temporary local Git repository and local bare remote.
-It does not contact GitHub, invoke `gh`, require Mottainai or an LLM, or make
-network access part of the evidence. The assertion for the protected contract
-also requires `network_mode: "inherited"`.
+The existing scenario covers Git worktree root/status/diff, Nawabari checkpoint/diff/claims/commit, local-bare-remote push,
+integration and close; shell/core tools, Node, pnpm, Rust/Cargo, Python/uv, C compiler subprocesses, and an agent-like process;
+compatibility HOME/cache behavior across sequential sessions; and independent worktree, temporary, and process views
+across concurrent launches.
 
-For reproducibility, record the source revision and host/tool identities with
-the test result:
+Run on a supported standalone Linux host with the actual sandbox/kernel capability and required tool material.
+Missing capability or material is unsupported/BLOCKED evidence, not a passing isolation proof.
+The fixture uses temporary local Git repositories and a local bare remote, not GitHub, `gh`, an LLM, or Mottainai.
+The asserted network mode is `inherited`; it does not establish isolation from host loopback services or the Control Server.
+The [current Control Server limitation](../SECURITY.md) and accepted trusted-operator correction remain separate concerns.
 
-```text
+## Record the evidence
+
+Tie results to the exact source, environment, and tool identities rather than a release label alone.
+
+```bash
 git rev-parse HEAD
 uname -a
 node --version
@@ -48,3 +47,7 @@ python3 --version
 uv --version
 cc --version
 ```
+
+Use `package.json#packageManager` for repository development, not a pinned provider's backend pnpm version.
+See [runtime projection](reference/runtime-projection.md) and [provider evidence](evidence/runtime/index.md)
+for the distinction between declarations, materialization, executable projection, and historical qualification.
