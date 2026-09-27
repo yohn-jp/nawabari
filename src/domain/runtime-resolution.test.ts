@@ -476,6 +476,10 @@ test("doctor reports strict_ready false with an actionable reason when /usr exis
 });
 
 test("the default strict FHS projection keeps the development baseline functional without host visibility", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("strict FHS protected execution is Linux-only");
     return;
@@ -488,7 +492,7 @@ test("the default strict FHS projection keeps the development baseline functiona
 
   let materialRoot: string;
   try {
-    materialRoot = fs.mkdtempSync("/usr/local/nawabari-runtime-resolution-");
+    materialRoot = fs.mkdtempSync(path.join("/usr/local/nawabari-test-fixtures", "runtime-resolution-"));
   } catch {
     t.skip("a writable FHS fixture root is unavailable");
     return;
@@ -517,6 +521,9 @@ test("the default strict FHS projection keeps the development baseline functiona
   git(["commit", "--quiet", "-m", "initial"]);
 
   const backend = new LocalSessionBackend();
+  let homeSentinelDirectory: string | null = null;
+  let toolSentinelDirectory: string | null = null;
+  const missingUserToolDirectories: string[] = [];
   try {
     const created = await backend.createSession(
       { cwd: repository },
@@ -579,23 +586,56 @@ test("the default strict FHS projection keeps the development baseline functiona
       );
     }
 
-    const hostHome = discovered.user_home ?? "/home/host-user";
+    const hostHome = discovered.user_home;
+    if (hostHome === null || hostHome === undefined) {
+      throw new Error("strict FHS host visibility proof requires an absolute host HOME");
+    }
     const userToolPath = discovered.user_local_bin ?? path.join(hostHome, ".local", "bin");
+    if (userToolPath.startsWith(`${hostHome}${path.sep}`)) {
+      for (let directory = userToolPath; directory !== hostHome && !fs.existsSync(directory);) {
+        missingUserToolDirectories.push(directory);
+        const parent = path.dirname(directory);
+        if (parent === directory) break;
+        directory = parent;
+      }
+    }
+    fs.mkdirSync(userToolPath, { recursive: true });
+    homeSentinelDirectory = fs.mkdtempSync(path.join(hostHome, ".nawabari-fhs-home-visibility-"));
+    toolSentinelDirectory = fs.mkdtempSync(path.join(userToolPath, ".nawabari-fhs-tool-visibility-"));
+    const homeSentinel = path.join(homeSentinelDirectory, "host-only-sentinel");
+    const toolSentinel = path.join(toolSentinelDirectory, "host-only-sentinel");
+    fs.writeFileSync(homeSentinel, "host home sentinel\n");
+    fs.writeFileSync(toolSentinel, "host user tool sentinel\n");
+    const hiddenHostPaths = ["/usr/bin/sh", "/bin/ls", "/nix/store", homeSentinel, toolSentinel];
     const visibility = await runSandboxedCommand(request.value, {
       command: "/bin/sh",
       args: [
         "-ceu",
-        ["test ! -e /usr/bin/sh", "test ! -e /bin/ls", "test ! -e /nix/store", 'test ! -e "$1"', 'test ! -e "$2"'].join(
-          ";",
-        ),
+        [
+          "for candidate; do",
+          'if [ -e "$candidate" ]; then printf "unexpected-visible-host-path:%s\\n" "$candidate"; exit 1; fi',
+          "done",
+          "printf strict-fhs-host-paths-hidden",
+        ].join("\n"),
         "strict-visibility",
-        hostHome,
-        userToolPath,
+        ...hiddenHostPaths,
       ],
     });
     assert.equal(visibility.ok, true, visibility.ok ? "" : JSON.stringify(visibility.error));
-    if (visibility.ok) assert.equal(visibility.value.exit_code, 0, JSON.stringify(visibility.value));
+    if (visibility.ok) {
+      assert.equal(visibility.value.exit_code, 0, JSON.stringify(visibility.value));
+      assert.equal(visibility.value.stdout, "strict-fhs-host-paths-hidden", JSON.stringify(visibility.value));
+    }
   } finally {
+    if (homeSentinelDirectory !== null) fs.rmSync(homeSentinelDirectory, { recursive: true, force: true });
+    if (toolSentinelDirectory !== null) fs.rmSync(toolSentinelDirectory, { recursive: true, force: true });
+    for (const directory of missingUserToolDirectories) {
+      try {
+        fs.rmdirSync(directory);
+      } catch {
+        // Preserve any files concurrently added by the host user.
+      }
+    }
     try {
       git(["worktree", "remove", "--force", worktree]);
     } catch {

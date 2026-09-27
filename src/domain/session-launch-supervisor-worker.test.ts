@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -25,30 +25,13 @@ type CompiledSupervisorModule = typeof import("./session-launch-supervisor.js");
 type CompiledSupervisorResult = Awaited<ReturnType<CompiledSupervisorModule["runSessionLaunchSupervisor"]>>;
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-let compiledPackagePromise: Promise<{ readonly supervisor: string; readonly worker: string }> | null = null;
-
-function ensureFreshCompiledPackage(): Promise<{ readonly supervisor: string; readonly worker: string }> {
-  if (compiledPackagePromise !== null) return compiledPackagePromise;
-  compiledPackagePromise = new Promise((resolve, reject) => {
-    const build = spawnSync("pnpm", ["run", "build"], {
-      cwd: repositoryRoot,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    if (build.status !== 0) {
-      const diagnostic = `${build.stdout ?? ""}${build.stderr ?? ""}`.slice(-2_000);
-      reject(new Error(`BLOCKED: normal TypeScript build failed before compiled-worker evidence\n${diagnostic}`));
-      return;
-    }
-    const supervisor = path.join(repositoryRoot, "dist", "domain", "session-launch-supervisor.js");
-    const worker = path.join(repositoryRoot, "dist", "domain", "session-launch-supervisor-worker.js");
-    if (!fs.existsSync(supervisor) || !fs.existsSync(worker)) {
-      reject(new Error("BLOCKED: normal TypeScript build did not produce the compiled supervisor and worker"));
-      return;
-    }
-    resolve({ supervisor, worker });
-  });
-  return compiledPackagePromise;
+function compiledPackageArtifacts(): { readonly supervisor: string; readonly worker: string } {
+  const supervisor = path.join(repositoryRoot, "dist", "domain", "session-launch-supervisor.js");
+  const worker = path.join(repositoryRoot, "dist", "domain", "session-launch-supervisor-worker.js");
+  if (!fs.existsSync(supervisor) || !fs.existsSync(worker)) {
+    throw new Error("BLOCKED: the owning verification lane did not prepare a fresh compiled worker artifact");
+  }
+  return { supervisor, worker };
 }
 
 const admissionFacts = {
@@ -170,8 +153,12 @@ test("executes only after GO and carries the actual bounded result", async () =>
   assert.equal(envelope.result.stderr, "worker-err");
 });
 
-test("the real package entrypoint uses fd 4/5 without sharing payload stdio", async () => {
-  const { worker: workerEntrypoint } = await ensureFreshCompiledPackage();
+test("the real package entrypoint uses fd 4/5 without sharing payload stdio", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "compiled-worker") {
+    t.skip("run via pnpm test:compiled-worker");
+    return;
+  }
+  const { worker: workerEntrypoint } = compiledPackageArtifacts();
   const seccompFd = fs.openSync("/dev/null", "r");
   try {
     const child = spawn(process.execPath, [workerEntrypoint], {
@@ -204,6 +191,10 @@ test("the real package entrypoint uses fd 4/5 without sharing payload stdio", as
 });
 
 test("the compiled trusted supervisor keeps an immediate payload descendant in its owned cgroup", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("the cgroups v2 descendant conformance requires supported Linux");
     return;
@@ -232,7 +223,7 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
   }
   const cleaned = cleanupCgroupScope(probe.value);
   assert.equal(cleaned.ok, true, cleaned.ok ? "" : cleaned.error.message);
-  const { supervisor: supervisorEntrypoint } = await ensureFreshCompiledPackage();
+  const { supervisor: supervisorEntrypoint } = compiledPackageArtifacts();
   const compiledSupervisor = (await import(pathToFileURL(supervisorEntrypoint).href)) as CompiledSupervisorModule;
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-451-descendant-"));
   const marker = path.join(tempDirectory, "marker.txt");

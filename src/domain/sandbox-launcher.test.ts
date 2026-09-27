@@ -780,6 +780,10 @@ test("bounded working-set execution fails closed when Landlock cannot establish 
 });
 
 test("bounded Landlock scopes /tmp scratch access away from a worktree mounted under /tmp", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("bounded bubblewrap profile is Linux-only");
     return;
@@ -1010,7 +1014,11 @@ test("sandboxed child limits are bounded and fail with stable errors", async () 
   }
 });
 
-test("interactive execution inherits the caller streams and skips bounded limits", async () => {
+test("interactive execution inherits the caller streams and skips bounded limits", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   const repository = createRepository();
   const worktree = `${repository}-owned`;
   const fixture = createControlledSandboxFixture();
@@ -1075,6 +1083,10 @@ test("interactive execution inherits the caller streams and skips bounded limits
 });
 
 test("interactive execution under a strict runtime projection resolves PATH only through the canonical surface", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("bubblewrap profile is Linux-only");
     return;
@@ -1164,6 +1176,10 @@ test("interactive execution under a strict runtime projection resolves PATH only
 });
 
 test("a protected session runs with a private root/tmp/proc view and only its owned worktree", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("bubblewrap profile is Linux-only");
     return;
@@ -1240,6 +1256,10 @@ test("a protected session runs with a private root/tmp/proc view and only its ow
 });
 
 test("compiled protected execution keeps a worktree under /tmp visible and hides the host Control credential", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("compiled bubblewrap profile is Linux-only");
     return;
@@ -1336,17 +1356,16 @@ test("compiled protected execution keeps a worktree under /tmp visible and hides
         provenance: "runtime-profile",
       },
     ];
-    const systemRoots: string[] = [];
+    const systemRoots: Array<{ readonly source: string; readonly target: string }> = [];
     for (const candidate of [layout.nix_store, layout.usr, layout.bin, layout.lib, layout.lib64]) {
       if (candidate === null) continue;
-      const root = fs.realpathSync.native(candidate);
-      if (systemRoots.some((parent) => root === parent || root.startsWith(`${parent}${path.sep}`))) continue;
-      systemRoots.push(root);
+      if (systemRoots.some((entry) => entry.target === candidate)) continue;
+      systemRoots.push({ source: fs.realpathSync.native(candidate), target: candidate });
     }
-    for (const root of systemRoots) {
+    for (const { source, target } of systemRoots) {
       runtimeFilesystem.push({
-        source: root,
-        target: root,
+        source,
+        target,
         access_mode: "read-only",
         provenance: "runtime-profile",
       });
@@ -1432,6 +1451,10 @@ test("compiled protected execution keeps a worktree under /tmp visible and hides
 });
 
 test("direct execution and PATH-based child lookup resolve the same projected executable under real isolation", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("bubblewrap profile is Linux-only");
     return;
@@ -1543,6 +1566,10 @@ test("direct execution and PATH-based child lookup resolve the same projected ex
 });
 
 test("session shell CLI path shares the compiled strict-projection authority with session run under real isolation", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("bubblewrap profile is Linux-only");
     return;

@@ -107,6 +107,10 @@ function capabilityUnavailable(error: unknown): boolean {
 }
 
 test("standalone Linux runs development workloads through the exact protected profile", async (t) => {
+  if (process.env.NAWABARI_TEST_LANE !== "linux-system") {
+    t.skip("run via pnpm test:linux:system");
+    return;
+  }
   if (process.platform !== "linux") {
     t.skip("the canonical protected profile is Linux-only");
     return;
