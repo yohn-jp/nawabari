@@ -64,6 +64,7 @@ function diagnosticFor(record: SessionRecord, nextActions: readonly SessionLifec
 function discardPreviewFor(record: SessionRecord): SessionDiscardPreview {
   return {
     schema_version: 1,
+    approval_witness: "a".repeat(64),
     operation: "discard-preview",
     destructive: true,
     warning: "discard is destructive",

@@ -268,6 +268,17 @@ export function parseSessionDiscardPreview(input: unknown): DomainResult<Session
   if (!object.ok) return object;
   const schema = previewInteger(previewField(object.value, "schema_version"), "schema_version");
   if (!schema.ok) return schema;
+  const approvalWitness = Object.hasOwn(object.value, "approval_witness")
+    ? previewText(previewField(object.value, "approval_witness"), "approval_witness")
+    : success(null);
+  if (!approvalWitness.ok) return approvalWitness;
+  if (approvalWitness.value !== null && !/^[a-f0-9]{64}$/u.test(approvalWitness.value)) {
+    return failure(
+      new DomainError("INVALID_ARGUMENT", "Invalid discard preview field 'approval_witness'.", {
+        field: "approval_witness",
+      }),
+    );
+  }
   if (object.value.operation !== "discard-preview" || object.value.destructive !== true) {
     return failure(
       new DomainError("INVALID_ARGUMENT", "Discard preview has invalid operation or destructive discriminant.", {
@@ -438,6 +449,7 @@ export function parseSessionDiscardPreview(input: unknown): DomainResult<Session
       blockers: blockers.value,
       ...(lifecycleState.value === null ? {} : { lifecycle_state: lifecycleState.value }),
     },
+    ...(approvalWitness.value === null ? {} : { approval_witness: approvalWitness.value }),
   });
 }
 
@@ -798,7 +810,8 @@ export function createSessionActions(backend: SessionBackend, context: SessionCo
       return staleDestructivePreview(request.identity, request.confirmation.preview, preview.value);
     }
 
-    const result = await backend.discardSession(context, request.identity.session_id);
+    if (preview.value.approval_witness === undefined) return capabilityUnavailable("discardApprovalWitness");
+    const result = await backend.discardSession(context, request.identity.session_id, preview.value.approval_witness);
     if (!result.ok) {
       // A failed mutation may have an unknown postcondition. Force the caller
       // back through a fresh read; never retry the backend call implicitly.

@@ -882,6 +882,8 @@ export type SessionDiscardPreview = {
     blockers: SessionDiscardPreviewEvidence[];
     lifecycle_state?: string;
   };
+  /** Opaque registry witness for the exact bounded effect in this preview. */
+  approval_witness?: string;
 };
 
 export type GarbageCollectBlocked = {
@@ -958,7 +960,11 @@ export interface SessionBackend {
   listSessions(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<SessionListResult>>;
   status(context: SessionContext, options?: SessionListOptions): Promise<DomainResult<StatusResult>>;
   closeSession(context: SessionContext, options: SessionCloseOptions): Promise<DomainResult<SessionCloseResult>>;
-  discardSession?(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardResult>>;
+  discardSession?(
+    context: SessionContext,
+    sessionId: string,
+    approvalWitness: string,
+  ): Promise<DomainResult<SessionDiscardResult>>;
   discardPreview?(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardPreview>>;
   sessionDiagnostic?(
     context: SessionContext,

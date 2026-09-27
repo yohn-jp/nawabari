@@ -805,18 +805,22 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
-  public discardSession(context: SessionContext, sessionId: string): Promise<DomainResult<SessionDiscardResult>> {
+  public discardSession(
+    context: SessionContext,
+    sessionId: string,
+    approvalWitness: string,
+  ): Promise<DomainResult<SessionDiscardResult>> {
     try {
       const registry = this.registryFor(context);
       if (registry.getSessionLaunchAdmission(sessionId) === undefined) {
-        const mutation = registryMutation(() => registry.discard(sessionId));
+        const mutation = registryMutation(() => registry.discard({ sessionId, approvalWitness }));
         return Promise.resolve(mutation.ok ? success(toDomainSessionDiscardResult(mutation.value)) : mutation);
       }
       return discardSessionWithRuntimeDrain(
         runtimeLifecycleAdapter(
           registry,
           ({ session_id: mutationSessionId, fence }) =>
-            registryMutation(() => registry.discard({ sessionId: mutationSessionId }, fence)),
+            registryMutation(() => registry.discard({ sessionId: mutationSessionId, approvalWitness }, fence)),
           this.registryOptions.cgroupFilesystem,
         ),
         sessionId,
@@ -1914,6 +1918,7 @@ function toDomainSessionDiscardPreview(
   });
   return {
     schema_version: preview.schemaVersion,
+    approval_witness: preview.approvalWitness,
     operation: preview.operation,
     destructive: preview.destructive,
     warning: preview.warning,
