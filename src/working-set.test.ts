@@ -80,6 +80,12 @@ test("composition is deterministic, operation-separated, and preserves DENY", ()
   if (first.status !== "satisfied" || second.status !== "satisfied") return;
   assert.deepEqual(first.workingSet, second.workingSet);
   assert.equal(first.workingSet.kind, EFFECTIVE_WORKING_SET_KIND);
+  assert.deepEqual(first.workingSet.provenance.executionScope.producer, {
+    repositoryHost: "github.com",
+    repositoryId: "1329799765",
+    number: 373,
+  });
+  assert.equal(first.workingSet.provenance.executionScope.identity, "b".repeat(64));
   assert.deepEqual(first.workingSet.scope.readOnly, ["src/working-set.test.ts", "src/working-set.ts"]);
   assert.deepEqual(first.workingSet.scope.write, ["src/working-set.ts"]);
   assert.deepEqual(first.workingSet.scope.deny, ["src/secret.ts"]);
