@@ -478,16 +478,17 @@ test("captures bounded verifier-visible staged, untracked, ignored, and same-pat
     fs.writeFileSync(stagedPath, "worktree\n");
     fs.writeFileSync(path.join(fixture.repositoryPath, "untracked.txt"), "untracked\n");
     fs.writeFileSync(path.join(fixture.repositoryPath, "ignored.txt"), "ignored\n");
+    const sourcePath = path.join(fixture.repositoryPath, "README.md");
+    const fixedSourceTime = new Date("2020-01-01T00:00:00.000Z");
+    fs.utimesSync(sourcePath, fixedSourceTime, fixedSourceTime);
 
     const initial = captureGitSourceObservation({ cwd: fixture.repositoryPath, read_selectors: ["**"] });
     assert.match(initial.source_sha256, /^[0-9a-f]{64}$/u);
     assert.ok(initial.file_count > 0);
     assert.ok(initial.byte_count > 0);
 
-    const sourcePath = path.join(fixture.repositoryPath, "README.md");
-    const original = fs.statSync(sourcePath);
     fs.writeFileSync(sourcePath, "changed\n");
-    fs.utimesSync(sourcePath, original.atime, original.mtime);
+    fs.utimesSync(sourcePath, fixedSourceTime, fixedSourceTime);
     const samePathEdit = captureGitSourceObservation({ cwd: fixture.repositoryPath, read_selectors: ["**"] });
     assert.notEqual(samePathEdit.source_sha256, initial.source_sha256);
 
