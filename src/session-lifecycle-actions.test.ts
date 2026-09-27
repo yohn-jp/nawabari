@@ -5,6 +5,8 @@ import { availableLifecycleOperations, classifySessionLifecycle } from "./sessio
 import {
   primarySessionLifecycleAction,
   projectSessionLifecycleActions,
+  projectSessionLifecycleParkResumeActions,
+  SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION,
   reconciliationApplyAction,
 } from "./session-lifecycle-actions.js";
 
@@ -152,13 +154,67 @@ test("v1 physical reconciliation remains diagnostic-only while apply uses an exp
   });
 });
 
+test("projects versioned park and resume actions only from their canonical source states", () => {
+  assert.equal(SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION, 2);
+  const active = classifySessionLifecycle({ sessionState: "active", physicalState: "healthy" });
+  assert.deepEqual(projectSessionLifecycleParkResumeActions({ classification: active, sessionId: "session-park" }), [
+    {
+      schemaVersion: SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION,
+      actionId: "park-session",
+      kind: "park",
+      command: "session action",
+      sessionId: "session-park",
+      requiresExplicitIntent: true,
+      mutates: true,
+    },
+  ]);
+  assert.deepEqual(projectSessionLifecycleActions({ classification: active, sessionId: "session-park" }), []);
+
+  const parked = classifySessionLifecycle({ sessionState: "parked", physicalState: "healthy" });
+  assert.deepEqual(projectSessionLifecycleParkResumeActions({ classification: parked, sessionId: "session-resume" }), [
+    {
+      schemaVersion: SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION,
+      actionId: "resume-session",
+      kind: "resume",
+      command: "session action",
+      sessionId: "session-resume",
+      requiresExplicitIntent: true,
+      mutates: true,
+    },
+  ]);
+  assert.deepEqual(projectSessionLifecycleActions({ classification: parked, sessionId: "session-resume" }), []);
+
+  const unavailable = [
+    classifySessionLifecycle({ sessionState: "active", physicalState: "unavailable" }),
+    classifySessionLifecycle({ sessionState: "parked", physicalState: "unavailable" }),
+    classifySessionLifecycle({
+      sessionState: "active",
+      physicalState: "healthy",
+      phase: "termination",
+      closeReadiness: "ready",
+    }),
+    classifySessionLifecycle({
+      sessionState: "active",
+      physicalState: "healthy",
+      blockers: [{ code: "RECOVERABLE_COMMITS" }],
+    }),
+    classifySessionLifecycle({ sessionState: "closed", physicalState: "closed" }),
+  ];
+  for (const classification of unavailable) {
+    assert.deepEqual(
+      projectSessionLifecycleParkResumeActions({ classification, sessionId: "session-unavailable" }),
+      [],
+    );
+  }
+});
+
 test("next-actions and operation availability follow the XState transition projection for every public state", () => {
   const cases = [
     {
       id: "active",
       observation: { sessionState: "active", physicalState: "healthy", phase: "current" as const },
       actions: [],
-      available: ["close", "discard", "inspect", "doctor", "reconcile"],
+      available: ["close", "discard", "inspect", "doctor", "reconcile", "park"],
     },
     {
       id: "close-ready",
@@ -216,6 +272,28 @@ test("next-actions and operation availability follow the XState transition proje
       },
       actions: [],
       available: ["close", "inspect", "doctor", "reconcile"],
+    },
+    {
+      id: "parked",
+      observation: {
+        sessionState: "parked",
+        physicalState: "healthy",
+        phase: "current" as const,
+      },
+      actions: [],
+      available: ["close", "discard", "inspect", "doctor", "reconcile", "park", "resume"],
+    },
+    {
+      id: "parked",
+      observation: {
+        sessionState: "parked",
+        physicalState: "healthy",
+        closeReadiness: "external_evidence_required" as const,
+        blockers: [{ code: "RECOVERABLE_COMMITS" }],
+        phase: "termination" as const,
+      },
+      actions: ["retain-session", "discard-session"],
+      available: ["discard", "inspect", "doctor", "reconcile", "park", "resume"],
     },
   ] as const;
 

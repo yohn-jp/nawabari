@@ -33,6 +33,8 @@ export const SESSION_PARITY_OPERATIONS = Object.freeze([
   "gc",
 ] as const satisfies readonly SessionLifecycleOperation[]);
 
+type SessionParityOperation = (typeof SESSION_PARITY_OPERATIONS)[number];
+
 type PhysicalStateClass = {
   readonly id: string;
   readonly value: string;
@@ -478,7 +480,7 @@ addFixture(
 export const SESSION_PARITY_FIXTURES: readonly SessionParityFixture[] = Object.freeze(fixtures);
 
 export type ParityTransitionProjection = {
-  readonly operation: SessionLifecycleOperation;
+  readonly operation: SessionParityOperation;
   readonly eventType: string;
   readonly allowed: boolean;
   readonly target: SessionLifecycleState | null;
@@ -489,7 +491,7 @@ export type ParityTransitionProjection = {
 
 export type ClassifierParityProjection = {
   readonly state: SessionLifecycleState;
-  readonly transitions: Readonly<Record<SessionLifecycleOperation, ParityTransitionProjection>>;
+  readonly transitions: Readonly<Record<SessionParityOperation, ParityTransitionProjection>>;
 };
 
 export type XStateTransitionProjection = ParityTransitionProjection & {
@@ -501,7 +503,7 @@ export type XStateTransitionProjection = ParityTransitionProjection & {
 
 export type XStateParityProjection = {
   readonly state: SessionLifecycleState;
-  readonly transitions: Readonly<Record<SessionLifecycleOperation, XStateTransitionProjection>>;
+  readonly transitions: Readonly<Record<SessionParityOperation, XStateTransitionProjection>>;
 };
 
 /**
@@ -529,11 +531,11 @@ export function projectClassifier(fixtureToProject: SessionParityFixture): Class
         },
       ];
     }),
-  ) as Record<SessionLifecycleOperation, ParityTransitionProjection>;
+  ) as Record<SessionParityOperation, ParityTransitionProjection>;
   return { state: classification.state, transitions };
 }
 
-function eventFor(fixtureToProject: SessionParityFixture, operation: SessionLifecycleOperation): SessionMachineEvent {
+function eventFor(fixtureToProject: SessionParityFixture, operation: SessionParityOperation): SessionMachineEvent {
   switch (operation) {
     case "inspect":
       return {
@@ -617,7 +619,7 @@ export function projectXState(fixtureToProject: SessionParityFixture): XStatePar
         },
       ];
     }),
-  ) as Record<SessionLifecycleOperation, XStateTransitionProjection>;
+  ) as Record<SessionParityOperation, XStateTransitionProjection>;
   return { state: initialState, transitions };
 }
 

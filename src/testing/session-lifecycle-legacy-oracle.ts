@@ -22,16 +22,41 @@
 
 import type {
   SessionLifecycleBlocker,
-  SessionLifecycleClassification,
+  SessionLifecycleCloseReadiness,
   SessionLifecycleObservation,
-  SessionLifecycleOperation,
-  SessionLifecycleState,
   SessionLifecycleTransition,
 } from "../session-lifecycle-classification.js";
-import {
-  SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION,
-  SESSION_LIFECYCLE_STATES,
-} from "../session-lifecycle-classification.js";
+import { SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION } from "../session-lifecycle-classification.js";
+
+type LegacyLifecycleState =
+  "active" | "close-ready" | "blocked-recoverable" | "discarded" | "stale-inconsistent" | "closed";
+type LegacyLifecycleOperation = "close" | "discard" | "inspect" | "doctor" | "reconcile" | "gc";
+type LegacyLifecycleTransition = Omit<SessionLifecycleTransition, "operation" | "target"> & {
+  readonly operation: LegacyLifecycleOperation;
+  readonly target: LegacyLifecycleState | null;
+};
+type LegacyLifecycleClassification = {
+  readonly schemaVersion: typeof SESSION_LIFECYCLE_CLASSIFICATION_SCHEMA_VERSION;
+  readonly state: LegacyLifecycleState;
+  readonly sessionState: string;
+  readonly physicalState: string | null;
+  readonly closeReadiness: SessionLifecycleCloseReadiness;
+  readonly blockers: readonly SessionLifecycleBlocker[];
+  readonly recoverability: "none" | "recoverable" | "ambiguous";
+  readonly ageSuspicious: boolean;
+  readonly gcAuthorized: boolean;
+  readonly destructiveCleanupEligible: boolean;
+  readonly transitions: readonly LegacyLifecycleTransition[];
+};
+
+const LEGACY_LIFECYCLE_STATES: readonly LegacyLifecycleState[] = [
+  "active",
+  "close-ready",
+  "blocked-recoverable",
+  "discarded",
+  "stale-inconsistent",
+  "closed",
+];
 
 const AMBIGUOUS_CODES = new Set([
   "GIT_STATE_AMBIGUOUS",
@@ -99,12 +124,12 @@ function isStalePhysicalState(physicalState: string | null): boolean {
   );
 }
 
-function freezeTransitions(transitions: readonly SessionLifecycleTransition[]): readonly SessionLifecycleTransition[] {
+function freezeTransitions(transitions: readonly LegacyLifecycleTransition[]): readonly LegacyLifecycleTransition[] {
   return Object.freeze(transitions.map((transition) => Object.freeze({ ...transition })));
 }
 
-function transitionTable(state: SessionLifecycleState): readonly SessionLifecycleTransition[] {
-  const inspect = (operation: "inspect" | "doctor"): SessionLifecycleTransition => ({
+function transitionTable(state: LegacyLifecycleState): readonly LegacyLifecycleTransition[] {
+  const inspect = (operation: "inspect" | "doctor"): LegacyLifecycleTransition => ({
     operation,
     allowed: true,
     target: state,
@@ -112,7 +137,7 @@ function transitionTable(state: SessionLifecycleState): readonly SessionLifecycl
     authority: operation === "doctor" ? "reconciliation" : "session-registry",
     reason: "observe",
   });
-  const reconcile: SessionLifecycleTransition = {
+  const reconcile: LegacyLifecycleTransition = {
     operation: "reconcile",
     allowed: true,
     target: state,
@@ -312,7 +337,7 @@ function transitionTable(state: SessionLifecycleState): readonly SessionLifecycl
  */
 export function classifySessionLifecycleLegacyOracle(
   observation: SessionLifecycleObservation,
-): SessionLifecycleClassification {
+): LegacyLifecycleClassification {
   const blockers = Object.freeze((observation.blockers ?? []).map(freezeBlocker));
   const physicalState = observation.physicalState ?? null;
   const closeReadiness = observation.closeReadiness ?? "not-evaluated";
@@ -331,7 +356,7 @@ export function classifySessionLifecycleLegacyOracle(
   const ambiguousReadiness = closeReadiness === "ambiguous" || (closeReadiness === "blocked" && blockers.length === 0);
   const phase = observation.phase ?? "current";
 
-  let state: SessionLifecycleState;
+  let state: LegacyLifecycleState;
   const physicalEvidenceRequired = observation.sessionState !== "closed";
   if (
     unknownSessionState ||
@@ -394,9 +419,9 @@ export function classifySessionLifecycleLegacyOracle(
 
 /** Return one transition without exposing a mutable table to callers. */
 export function legacyOracleTransition(
-  classification: SessionLifecycleClassification,
-  operation: SessionLifecycleOperation,
-): SessionLifecycleTransition {
+  classification: LegacyLifecycleClassification,
+  operation: LegacyLifecycleOperation,
+): LegacyLifecycleTransition {
   const transition = classification.transitions.find((candidate) => candidate.operation === operation);
   if (transition === undefined) {
     throw new RangeError(`Unsupported lifecycle operation: ${operation}`);
@@ -406,10 +431,10 @@ export function legacyOracleTransition(
 
 /** The complete #252-baseline state/operation table, for fixture authoring. */
 export const SESSION_LIFECYCLE_LEGACY_ORACLE_TRANSITION_TABLE: Readonly<
-  Record<SessionLifecycleState, readonly SessionLifecycleTransition[]>
+  Record<LegacyLifecycleState, readonly LegacyLifecycleTransition[]>
 > = Object.freeze(
-  Object.fromEntries(SESSION_LIFECYCLE_STATES.map((state) => [state, transitionTable(state)])) as Record<
-    SessionLifecycleState,
-    readonly SessionLifecycleTransition[]
+  Object.fromEntries(LEGACY_LIFECYCLE_STATES.map((state) => [state, transitionTable(state)])) as Record<
+    LegacyLifecycleState,
+    readonly LegacyLifecycleTransition[]
   >,
 );

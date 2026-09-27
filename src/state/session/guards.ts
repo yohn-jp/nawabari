@@ -36,7 +36,7 @@ const STALE_PHYSICAL_STATES = new Set([
   "unavailable",
 ]);
 
-const KNOWN_SESSION_STATES = new Set(["new", "active", "closing", "closed", "stale"]);
+const KNOWN_SESSION_STATES = new Set(["new", "active", "closing", "closed", "stale", "parked"]);
 const KNOWN_PHYSICAL_STATES = new Set(["healthy", "closed", ...STALE_PHYSICAL_STATES]);
 const KNOWN_BLOCKER_CLASSIFICATIONS = new Set(["recoverable", "ambiguous", "stale"]);
 
@@ -109,6 +109,11 @@ export function isObservationClosed(context: SessionMachineContext): boolean {
   return context.observation.sessionState === "closed";
 }
 
+/** Parked is durable input, never inferred from an actor snapshot. */
+export function isObservationParked(context: SessionMachineContext): boolean {
+  return context.observation.sessionState === "parked" || context.persisted?.state === "parked";
+}
+
 export function isObservationBlockedRecoverable(context: SessionMachineContext): boolean {
   const current = observation(context);
   const recoverability = classifyObservationBlockers(current.blockers ?? []);
@@ -118,6 +123,19 @@ export function isObservationBlockedRecoverable(context: SessionMachineContext):
 export function isObservationCloseReady(context: SessionMachineContext): boolean {
   const current = observation(context);
   return current.phase === "termination" && current.closeReadiness === "ready";
+}
+
+/** A park request is explicit intent for an active persisted session only. */
+export function isParkRequestAllowed(context: SessionMachineContext): boolean {
+  return (
+    context.observation.sessionState === "active" &&
+    (context.persisted === undefined || context.persisted.state === "active")
+  );
+}
+
+/** Parked termination uses the same recoverable-work safety rule as active termination. */
+export function isParkedCloseAllowed(context: SessionMachineContext): boolean {
+  return !isObservationStaleInconsistent(context) && !isObservationBlockedRecoverable(context);
 }
 
 /** GC authority matches the classifier: strictly observation.gcAuthorized === true. */
@@ -133,4 +151,14 @@ export function hasGcAuthorization(context: SessionMachineContext): boolean {
 export function isDestructiveGcAllowed(context: SessionMachineContext): boolean {
   const current = observation(context);
   return hasGcAuthorization(context) && !(current.ageSuspicious === true && current.physicalState === "healthy");
+}
+
+/** Parked GC additionally requires the ordinary close-ready evidence. */
+export function isParkedGcAllowed(context: SessionMachineContext): boolean {
+  return (
+    !isObservationStaleInconsistent(context) &&
+    !isObservationBlockedRecoverable(context) &&
+    isObservationCloseReady(context) &&
+    isDestructiveGcAllowed(context)
+  );
 }
