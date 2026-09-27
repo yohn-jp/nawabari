@@ -55,8 +55,14 @@ import {
   type WorkingSetExpansionRequestEntry,
 } from "./working-set.js";
 import { generateSessionId, isSessionId } from "./session-id.js";
-import { isPostRenameFailure, writeJsonAtomicallySync } from "./registry/atomic.js";
-import { RegistryLockError, RepositoryLock } from "./registry/lock.js";
+import { RepositoryStateBoundary } from "./registry/repository-state-boundary.js";
+import type { RegistryPaths, RegistryState } from "./registry/repository-state-boundary.js";
+export {
+  REGISTRY_DIRECTORY_NAME,
+  REGISTRY_FILE_NAME,
+  REGISTRY_LOCK_FILE_NAME,
+} from "./registry/repository-state-boundary.js";
+export type { RegistryPaths } from "./registry/repository-state-boundary.js";
 import {
   REGISTRY_FEATURES,
   SUPPORTED_REGISTRY_FEATURES,
@@ -319,9 +325,6 @@ export const LEGACY_REGISTRY_SCHEMA_VERSION = 1 as const;
 export const SESSION_RECORD_SCHEMA_VERSION = 1 as const;
 export { RESOURCE_CLAIM_SCHEMA_VERSION };
 export { REGISTRY_FEATURES, SUPPORTED_REGISTRY_FEATURES };
-export const REGISTRY_DIRECTORY_NAME = "nawabari";
-export const REGISTRY_FILE_NAME = "session-registry.json";
-export const REGISTRY_LOCK_FILE_NAME = "session-registry.lock";
 export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 export const CLEANUP_DECISION_SCHEMA_VERSION = 1 as const;
 export const RECONCILIATION_SCHEMA_VERSION = 1 as const;
@@ -1148,12 +1151,6 @@ export interface ManagedExecutionReadinessResult {
 /** Preflight seam: whether a caller-owned managed runtime can track the session's processes. */
 export type ManagedExecutionReadiness = (request: ManagedExecutionReadinessRequest) => ManagedExecutionReadinessResult;
 
-export interface RegistryPaths {
-  readonly directory: string;
-  readonly registry: string;
-  readonly lock: string;
-}
-
 export interface PersistedSessionRecord {
   readonly schema_version: SessionRecordSchemaVersion;
   readonly session_id: string;
@@ -1220,18 +1217,6 @@ export interface PersistedRegistryV2 {
 
 export type PersistedRegistry = PersistedRegistryV1 | PersistedRegistryV2;
 
-interface RegistryState {
-  readonly registrySchemaVersion: typeof LEGACY_REGISTRY_SCHEMA_VERSION | RegistrySchemaVersion;
-  readonly registryRevision: number;
-  readonly runtimeEpoch: number;
-  readonly runtimeRecords: ParsedRuntimeRecords;
-  readonly sessions: readonly SessionRecord[];
-  readonly claims: readonly ResourceClaim[];
-  readonly claimSetGeneration: number;
-  readonly legacyClaimsAbsent: boolean;
-  readonly legacyClaimsSchemaVersion?: typeof LEGACY_RESOURCE_CLAIM_SCHEMA_VERSION;
-}
-
 interface ClaimOwner extends ClaimOwnerContext {
   readonly record: SessionRecord;
 }
@@ -1268,7 +1253,7 @@ export class SessionRegistry {
   private readonly cgroupFilesystem?: CgroupFileSystem;
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
-  private readonly lock: RepositoryLock;
+  private readonly stateBoundary: RepositoryStateBoundary;
   private readonly managedExecutionReadiness: ManagedExecutionReadiness | undefined;
   /** Last authoritative registry read within this instance; never used to authorize a mutation. */
   private lastReadState: RegistryState | undefined;
@@ -1316,18 +1301,31 @@ export class SessionRegistry {
       throw new RangeError("lockMetadataGraceMs must be a non-negative safe integer");
     }
 
-    const directory = path.join(this.repository.commonGitDirectory, REGISTRY_DIRECTORY_NAME);
-    this.paths = Object.freeze({
-      directory,
-      registry: path.join(directory, REGISTRY_FILE_NAME),
-      lock: path.join(directory, REGISTRY_LOCK_FILE_NAME),
+    const parseState = (parsed: unknown, allowLegacyClaimSchema: boolean): RegistryState =>
+      parseRegistry(parsed, this.repository.repositoryId, allowLegacyClaimSchema, (left, right, generation, records) =>
+        this.coordinationFacts(left, right, generation, records),
+      );
+    this.stateBoundary = new RepositoryStateBoundary({
+      commonGitDirectory: this.repository.commonGitDirectory,
+      lockTimeoutMs: this.lockTimeoutMs,
+      lockStaleAfterMs: this.lockStaleAfterMs,
+      lockMetadataGraceMs: this.lockMetadataGraceMs,
+      emptyState: () => ({
+        registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
+        registryRevision: 0,
+        runtimeEpoch: 0,
+        runtimeRecords: emptyRuntimeRecords(),
+        sessions: [],
+        claims: [],
+        claimSetGeneration: 0,
+        legacyClaimsAbsent: false,
+      }),
+      parseState,
+      validateCommit: (document) => {
+        parseState(document, false);
+      },
     });
-    this.lock = new RepositoryLock({
-      lockPath: this.paths.lock,
-      staleAfterMs: this.lockStaleAfterMs,
-      acquireTimeoutMs: this.lockTimeoutMs,
-      metadataGraceMs: this.lockMetadataGraceMs,
-    });
+    this.paths = this.stateBoundary.paths;
   }
 
   /** Resolved managed root used for default session worktrees. */
@@ -6983,52 +6981,7 @@ export class SessionRegistry {
   }
 
   private readStateUnsafe(allowLegacyClaimSchema = false): RegistryState {
-    let contents: string;
-    try {
-      contents = fs.readFileSync(this.paths.registry, "utf8");
-    } catch (error: unknown) {
-      if (isNodeError(error) && error.code === "ENOENT") {
-        return (this.lastReadState = {
-          registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
-          registryRevision: 0,
-          runtimeEpoch: 0,
-          runtimeRecords: emptyRuntimeRecords(),
-          sessions: [],
-          claims: [],
-          claimSetGeneration: 0,
-          legacyClaimsAbsent: false,
-        });
-      }
-      throw new SessionRegistryError(
-        "REGISTRY_IO_FAILURE",
-        `Could not read ${this.paths.registry}`,
-        {
-          path: this.paths.registry,
-        },
-        error,
-      );
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(contents) as unknown;
-    } catch (error: unknown) {
-      throw new SessionRegistryError(
-        "REGISTRY_CORRUPT",
-        `Registry is not valid JSON: ${this.paths.registry}`,
-        {
-          path: this.paths.registry,
-        },
-        error,
-      );
-    }
-
-    return (this.lastReadState = parseRegistry(
-      parsed,
-      this.repository.repositoryId,
-      allowLegacyClaimSchema,
-      (left, right, generation, records) => this.coordinationFacts(left, right, generation, records),
-    ));
+    return (this.lastReadState = this.stateBoundary.read(allowLegacyClaimSchema));
   }
 
   private readUnsafe(): readonly SessionRecord[] {
@@ -7210,15 +7163,7 @@ export class SessionRegistry {
     });
   }
 
-  /**
-   * The single authoritative persistence path for session/claim registry
-   * state, sharing its durability policy with `registry/atomic.ts`: the
-   * temporary file and target directory are fsynced around an atomic
-   * rename, and only known unsupported-directory-fsync conditions are
-   * tolerated. A failure observed after rename is reported as a distinct
-   * durability-uncertain outcome rather than an ordinary write failure,
-   * since the renamed document may already be the one readers observe.
-   */
+  /** Build the complete canonical document after the typed mutation decision. */
   private writeUnsafe(
     records: readonly SessionRecord[],
     claims: readonly ResourceClaim[],
@@ -7270,7 +7215,7 @@ export class SessionRegistry {
       runtimeEpoch,
     );
     const optionalRecords = toPersistedRuntimeRecords(currentRuntimeRecords);
-    const registry: PersistedRegistry = {
+    const registry: PersistedRegistryV2 = {
       schema_version: REGISTRY_SCHEMA_VERSION,
       repository_id: this.repository.repositoryId,
       sessions: records.map((record) => toPersistedSessionRecord(record, this.repository.repositoryId)),
@@ -7283,32 +7228,7 @@ export class SessionRegistry {
       ...optionalRecords,
     };
 
-    try {
-      writeJsonAtomicallySync(this.paths.registry, registry);
-    } catch (error: unknown) {
-      if (isPostRenameFailure(error)) {
-        throw new SessionRegistryError(
-          "REGISTRY_DURABILITY_UNCERTAIN",
-          `Registry rename to ${this.paths.registry} may have already committed, but durable persistence could not be proven`,
-          {
-            path: this.paths.registry,
-            recoveryHints: [
-              "Re-read the registry to check whether the mutation is already visible before retrying.",
-              "Do not assume this operation did not happen.",
-            ],
-          },
-          error,
-        );
-      }
-      throw new SessionRegistryError(
-        "REGISTRY_IO_FAILURE",
-        `Could not atomically write ${this.paths.registry}`,
-        {
-          path: this.paths.registry,
-        },
-        error,
-      );
-    }
+    this.stateBoundary.commit(registry);
     this.lastReadState = {
       ...previous,
       registrySchemaVersion: REGISTRY_SCHEMA_VERSION,
@@ -7484,37 +7404,7 @@ export class SessionRegistry {
   }
 
   private withLock<T>(operation: () => T): T {
-    let lease;
-    try {
-      lease = this.lock.acquireSync();
-    } catch (error: unknown) {
-      throw toSessionRegistryLockError(error, this.paths.lock);
-    }
-
-    let result!: T;
-    let operationFailed = false;
-    let operationError: unknown;
-    try {
-      result = operation();
-    } catch (error: unknown) {
-      operationFailed = true;
-      operationError = error;
-    }
-
-    let releaseError: unknown;
-    try {
-      lease.release();
-    } catch (error: unknown) {
-      releaseError = toSessionRegistryLockError(error, this.paths.lock);
-    }
-
-    if (operationFailed) {
-      throw operationError;
-    }
-    if (releaseError !== undefined) {
-      throw releaseError;
-    }
-    return result;
+    return this.stateBoundary.withLock(operation);
   }
 }
 
@@ -11529,26 +11419,4 @@ function stringifyDetail(value: unknown): string {
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
     ? String(value)
     : "<invalid>";
-}
-
-function toSessionRegistryLockError(error: unknown, lockPath: string): SessionRegistryError {
-  if (error instanceof SessionRegistryError) {
-    return error;
-  }
-
-  if (error instanceof RegistryLockError) {
-    const details: Record<string, string | number | boolean> = { path: lockPath };
-    for (const [key, value] of Object.entries(error.details)) {
-      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-        details[key] = value;
-      }
-    }
-    const code =
-      error.code === "LOCK_BUSY" || error.code === "LOCK_STALE" || error.code === "LOCK_INVALID"
-        ? "REGISTRY_LOCK_TIMEOUT"
-        : "REGISTRY_IO_FAILURE";
-    return new SessionRegistryError(code, error.message, details, error);
-  }
-
-  return new SessionRegistryError("REGISTRY_IO_FAILURE", `Could not operate on ${lockPath}`, { path: lockPath }, error);
 }
