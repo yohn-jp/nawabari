@@ -7,7 +7,7 @@ import type {
 import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
 import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
-import type { SessionActionDispatcher } from "../ui/session-actions.js";
+import type { SessionActionDispatcher } from "./session-actions.js";
 import type {
   CoordinationPreviewOptions as RegistryCoordinationPreviewOptions,
   CoordinationPreviewResult as RegistryCoordinationPreviewResult,

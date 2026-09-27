@@ -86,7 +86,7 @@ import {
   type CoordinationTransactionResult,
 } from "./session.js";
 import { getNawabariRepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
-import { createSessionActions } from "../ui/session-actions.js";
+import { createSessionActions, type SessionActionDispatcher } from "./session-actions.js";
 import {
   parseSessionExecutionRecord,
   recordExecutionState,
@@ -418,7 +418,7 @@ export class LocalSessionBackend implements SessionBackend {
     }
   }
 
-  public sessionActions(context: SessionContext): import("../ui/session-actions.js").SessionActionDispatcher {
+  public sessionActions(context: SessionContext): SessionActionDispatcher {
     return createSessionActions(this, context);
   }
 
