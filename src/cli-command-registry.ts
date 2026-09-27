@@ -1,4 +1,5 @@
 import { DEFAULT_SESSION_LIST_LIMIT, MAX_SESSION_LIST_LIMIT } from "./domain/session.js";
+import { SESSION_ACTION_IDS } from "./domain/session-actions.js";
 import { claimModeOperationRequirements, OPERATION_VOCABULARY } from "./operation-authorization.js";
 import { EVIDENCE_MAX_DIFF_BYTES, EVIDENCE_MAX_DIFF_HUNKS } from "./repository-evidence.js";
 
@@ -327,15 +328,7 @@ const REGISTRY_DATA = [
       option("--action", "Typed action ID from the current lifecycle action projection", {
         value: "<action-id>",
         required: true,
-        values: [
-          "retain-session",
-          "supply-exact-integrated-revision",
-          "retry-close-with-bounded-integration-fetch",
-          "discard-session",
-          "reconcile-physical-state",
-          "park-session",
-          "resume-session",
-        ],
+        values: SESSION_ACTION_IDS,
       }),
       option("--token", "JSON action token returned by the current UI snapshot", { value: "<json>", required: true }),
       option("--confirm", "Explicit intent for actions that require confirmation"),

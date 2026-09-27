@@ -19,6 +19,7 @@ import {
 } from "./control-server.js";
 import type { CanonicalLockObservation } from "./control-server-request-pool.js";
 import { DomainError } from "./domain/errors.js";
+import { SESSION_ACTION_IDS } from "./domain/session-actions.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
 import { controlServerEndpointPath, defaultControlServerOperationalDirectory } from "./control-server-lease.js";
 import { RepositoryLock } from "./registry/lock.js";
@@ -564,6 +565,12 @@ test("typed actions reject stale evidence and keep destructive preview plus conf
   assert.deepEqual(offered, ["retain-session", "discard-session"]);
   const token = at(read.body, "action_snapshot", "token");
 
+  for (const action_id of ["park-session", "resume-session"] as const) {
+    const withoutIntent = await postAction(server, key, session.session_id, { action_id, token });
+    assert.equal(withoutIntent.status, 409);
+    assert.equal(at(withoutIntent.body, "error", "code"), "OPERATION_REJECTED");
+  }
+
   const observed = await postAction(server, key, session.session_id, { action_id: "retain-session", token });
   assert.equal(observed.status, 200, observed.text);
   assert.equal(at(observed.body, "result", "status"), "observed");
@@ -752,6 +759,9 @@ test("transport security rejects host, origin, token, content-type and body viol
   );
   const valid = JSON.stringify({ action_id: "retain-session", token });
 
+  assert.ok(SESSION_ACTION_IDS.includes("park-session"));
+  assert.ok(SESSION_ACTION_IDS.includes("resume-session"));
+
   assert.equal((await call(server, "/api/v1/health", { token: null })).status, 401);
   assert.equal((await call(server, "/api/v1/health", { token: "0".repeat(64) })).status, 403);
   assert.equal((await call(server, "/api/v1/health", { token: `${server.token}0` })).status, 403);
@@ -790,6 +800,7 @@ test("transport security rejects host, origin, token, content-type and body viol
   for (const body of [
     { action_id: "retain-session", token, command: "rm -rf /" },
     { action_id: "session discard", token },
+    { action_id: "unknown-action", token },
     { action_id: "retain-session" },
     { action_id: "retain-session", token, confirmation: { confirmed: false, preview: {} } },
   ]) {
