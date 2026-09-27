@@ -1464,13 +1464,22 @@ test("an unexpected post-rename directory-sync failure is reported durability-un
   }
 });
 
-test("a known unsupported directory-fsync condition does not fail an ordinary mutation", () => {
+test("a known unsupported directory-fsync condition reports durability uncertainty after mutation", () => {
   const fixture = createRepositoryFixture();
   try {
     const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
-    const session = withDirectoryFsyncFailure(registry.paths.directory, "EINVAL", () => registry.create());
-    assert.equal(registry.list().length, 1);
-    assert.equal(registry.get(session.sessionId)?.sessionId, session.sessionId);
+    assert.throws(
+      () => withDirectoryFsyncFailure(registry.paths.directory, "EINVAL", () => registry.create()),
+      (error: unknown) => {
+        assert.ok(error instanceof SessionRegistryError);
+        assert.equal(error.code, "REGISTRY_DURABILITY_UNCERTAIN");
+        return true;
+      },
+    );
+    // Rename already published the new registry document. Unsupported
+    // directory sync reports uncertainty and must not imply rollback.
+    assert.equal(new SessionRegistry({ cwd: fixture.repositoryPath }).list().length, 1);
+    assert.equal(fs.existsSync(registry.paths.registry), true);
   } finally {
     fixture.cleanup();
   }
