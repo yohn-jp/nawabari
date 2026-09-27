@@ -1,3 +1,9 @@
+import {
+  CONTROL_SERVER_HOST,
+  CONTROL_SERVER_SCHEMA,
+  CONTROL_TOKEN_HEADER,
+  DEFAULT_CONTROL_SERVER_PORT,
+} from "./control-server.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -219,6 +225,37 @@ test("session lifecycle capability truthfully publishes Linux-only stale-lock re
   assert.equal(retry.uncertain_code, "REGISTRY_DURABILITY_UNCERTAIN");
   assert.equal(retry.exact_owner_adoption, false);
   assert.equal(retry.fail_closed, true);
+});
+
+test("session lifecycle publishes the loopback-only control server contract", () => {
+  const contract = machineContract("test-version");
+  assert.ok(Array.isArray(contract.capabilities));
+  const lifecycle = contract.capabilities.find(
+    (candidate) =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      !Array.isArray(candidate) &&
+      candidate.id === "session-lifecycle",
+  ) as JsonRecord | undefined;
+  assert.ok(lifecycle);
+  assert.ok((lifecycle?.commands as string[]).includes("server"));
+  assert.deepEqual(
+    (lifecycle?.result_schemas as JsonRecord[]).find((schema) => schema.schema === CONTROL_SERVER_SCHEMA),
+    { schema: CONTROL_SERVER_SCHEMA, version: 1, commands: ["server"] },
+  );
+  assert.deepEqual(lifecycle?.control_server, {
+    command: "server",
+    bind_host: CONTROL_SERVER_HOST,
+    bind_host_configurable: false,
+    default_port: DEFAULT_CONTROL_SERVER_PORT,
+    token_header: CONTROL_TOKEN_HEADER,
+    token: "ephemeral-random-per-start",
+    cors: false,
+    push_updates: false,
+    repository_discovery: "machine-local-locator-catalog",
+    authority: "per-repository-backend",
+    required_by_cli: false,
+  });
 });
 
 test("session lifecycle publishes the profile namespace, pinning, and public inspection contracts", () => {

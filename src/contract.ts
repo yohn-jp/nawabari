@@ -443,6 +443,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "session close",
       "session action",
       "ui",
+      "server",
     ],
     result_schema: "session.v1",
     result_schema_version: 1,
@@ -454,6 +455,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       },
       { schema: "session-action.v1", version: 1, commands: ["session action"] },
       { schema: "repository-runtime-ui.v1", version: 1, commands: ["ui"] },
+      { schema: "control-server.v1", version: 1, commands: ["server"] },
     ],
     identities: [
       "session_id",
@@ -490,6 +492,19 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
     shell_execution: false,
     destructive_confirmation: "typed-preview-and-explicit-intent",
     action_authority: "existing-session-lifecycle-and-cleanup-backend",
+    control_server: {
+      command: "server",
+      bind_host: "127.0.0.1",
+      bind_host_configurable: false,
+      default_port: 47_471,
+      token_header: "x-nawabari-control-token",
+      token: "ephemeral-random-per-start",
+      cors: false,
+      push_updates: false,
+      repository_discovery: "machine-local-locator-catalog",
+      authority: "per-repository-backend",
+      required_by_cli: false,
+    },
     registry_lock_recovery: {
       contract_id: REGISTRY_LOCK_RECOVERY_CONTRACT_ID,
       contract_version: REGISTRY_LOCK_RECOVERY_CONTRACT_VERSION,
@@ -1064,6 +1079,7 @@ export function machineContract(packageVersion: string): JsonObject {
             registry_lock_recovery: jsonClone(capability.registry_lock_recovery),
             initial_claims: jsonClone(capability.initial_claims),
             worktree_profile: jsonClone(capability.worktree_profile),
+            control_server: jsonClone(capability.control_server),
           }
         : {}),
       ...(capability.id === "session-diagnostics" ? { lifecycle: jsonClone(capability.lifecycle) } : {}),

@@ -357,6 +357,24 @@ const REGISTRY_DATA = [
     ],
   },
   {
+    name: "server",
+    summary: "Run the machine-local control server and built-in Web UI",
+    usage: `${CLI_NAME} server [--port <port>]`,
+    options: [
+      option("--port", "Local TCP port on 127.0.0.1", {
+        value: "<port>",
+        default: "47471",
+        minimum: 1,
+        maximum: 65535,
+      }),
+    ],
+    notes: [
+      "Runs in the foreground and binds 127.0.0.1 only; the bind address is not configurable. An occupied port fails.",
+      "Serves every locally known Nawabari repository through one listener; each repository keeps its own backend authority.",
+      "API requests require the ephemeral startup token header; the token rotates on restart and is never printed.",
+    ],
+  },
+  {
     name: "session coordination preview",
     summary: "Preview bounded coordination between two sessions",
     usage:

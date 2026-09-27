@@ -1,3 +1,4 @@
+import { DEFAULT_CONTROL_SERVER_PORT } from "./control-server.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -958,6 +959,7 @@ test("canonical command registry resolves aliases without duplicating option def
     "session shell",
     "session action",
     "ui",
+    "server",
     "session coordination preview",
     "session handoff",
     "session list",
@@ -1003,6 +1005,28 @@ test("dispatcher command and option inventory is structurally bound to the canon
     ["--resource", "--mode", "--if-generation", "--force", "--session", "--repository"],
   );
   assert.deepEqual([...dispatcherAllowedOptions("session exec")], ["--session", "--runtime-policy"]);
+});
+
+test("server discovery exposes only the loopback port option", async () => {
+  const output = capture();
+  assert.equal(await runCli(["--json", "server", "--help"], { io: output.io }), 0);
+  const response = JSON.parse(output.stdout[0] ?? "") as {
+    help_for: string;
+    usage: string;
+    options: Array<{ name: string; default?: string; minimum?: number; maximum?: number }>;
+    notes: string[];
+  };
+  assert.equal(response.help_for, "server");
+  assert.equal(response.usage, "nawabari server [--port <port>]");
+  assert.deepEqual(
+    response.options.map((option) => option.name),
+    ["--port"],
+  );
+  assert.equal(response.options[0]?.default, String(DEFAULT_CONTROL_SERVER_PORT));
+  assert.equal(response.options[0]?.minimum, 1);
+  assert.equal(response.options[0]?.maximum, 65535);
+  assert.match(response.notes.join("\n"), /127\.0\.0\.1 only/u);
+  assert.deepEqual([...dispatcherAllowedOptions("server")], ["--port"]);
 });
 
 test("session list discovery describes the implemented bounded pagination and history semantics", async () => {
@@ -1261,6 +1285,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "session shell",
       "session action",
       "ui",
+      "server",
       "session coordination preview",
       "session handoff",
       "session list",
@@ -1485,7 +1510,12 @@ test("every canonical command and alias is recognized by the dispatcher", async 
   try {
     for (const definition of publicCliCommandDefinitions()) {
       const output = capture();
-      await runCli([...definition.name.split(" "), "--json"], { io: output.io, cwd: directory });
+      // The foreground `server` command starts and stops immediately here.
+      await runCli([...definition.name.split(" "), "--json"], {
+        io: output.io,
+        cwd: directory,
+        controlServer: { catalogPath: path.join(directory, "catalog.json"), signal: AbortSignal.abort() },
+      });
       const response = JSON.parse(output.stdout[0] ?? "{}") as { code?: string };
       assert.notEqual(
         response.code,
