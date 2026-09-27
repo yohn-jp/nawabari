@@ -54,6 +54,12 @@ test("public contract exposes isolated verification authority", () => {
   const contract = nawabariVerificationContract();
   assert.equal(contract.contract_id, "nawabari.verification-profile.v1");
   assert.equal(contract.contract_version, 1);
+  assert.equal(contract.result_schema, "verification-result.v1");
+  assert.equal(contract.source_bound_result_schema, "verification-result.v2");
+  assert.equal(contract.source_bound_result_contract_id, "nawabari.verification-result.v2");
+  assert.equal(contract.source_witness_contract_id, "nawabari.verification-source-witness.v1");
+  assert.equal(contract.source_bound_evidence_contract_id, "nawabari.verification-execution-evidence.v2");
+  assert.equal(contract.legacy_result_freshness, "unproven");
   assert.deepEqual(contract.read_visibility, ["declared", "repository"]);
   assert.equal(contract.write_policy, "deny");
   assert.equal(contract.execution, "fixed-argv-no-shell");
