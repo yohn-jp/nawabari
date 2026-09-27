@@ -270,6 +270,254 @@ function runPackedVerification(installDirectory, input) {
   return parseInstalledJson(result, "packed verification API");
 }
 
+function runPackedSourceBoundVerification(installDirectory, gitEnvironment) {
+  const sourceRepository = fs.mkdtempSync(path.join(installDirectory, "source-bound-repository-"));
+  const scriptPath = path.join(installDirectory, "run-packed-source-bound-verification.mjs");
+  const inputPath = path.join(installDirectory, "packed-source-bound-verification-input.json");
+  const sessionId = "019123e4-7abc-7def-8123-456789abcdef";
+  try {
+    run("git", ["init", "--quiet", "--initial-branch", "main", sourceRepository], { env: gitEnvironment });
+    run("git", ["config", "user.name", "Nawabari Source Smoke"], {
+      cwd: sourceRepository,
+      env: gitEnvironment,
+    });
+    run("git", ["config", "user.email", "nawabari-source-smoke@example.invalid"], {
+      cwd: sourceRepository,
+      env: gitEnvironment,
+    });
+    run("git", ["config", "commit.gpgsign", "false"], { cwd: sourceRepository, env: gitEnvironment });
+    run("git", ["config", "core.hooksPath", "/dev/null"], { cwd: sourceRepository, env: gitEnvironment });
+    fs.mkdirSync(path.join(sourceRepository, "src"));
+    const sourcePath = path.join(sourceRepository, "src", "entry.js");
+    fs.writeFileSync(sourcePath, "initial source\n");
+    run("git", ["add", "src/entry.js"], { cwd: sourceRepository, env: gitEnvironment });
+    run("git", ["commit", "--quiet", "-m", "initial source"], { cwd: sourceRepository, env: gitEnvironment });
+    const head = run("git", ["rev-parse", "HEAD"], { cwd: sourceRepository, env: gitEnvironment }).stdout.trim();
+
+    const workingSet = {
+      contract_id: "nawabari.working-set-runtime-projection.v1",
+      schema_version: 1,
+      working_set_id: "packed-source-bound-smoke",
+      revision: 7,
+      repository: { repositoryHost: "github.com", repositoryId: "1329799765", repository: "yohn-jp/nawabari" },
+      base: { branch: "main", revision: head },
+      scope: { readOnly: ["src/**"], write: [], create: [], delete: [], deny: [] },
+    };
+    const request = {
+      schema_version: 1,
+      contract_id: "nawabari.sandbox-execution.v1",
+      enforce: true,
+      session_id: sessionId,
+      repository: "yohn-jp/nawabari",
+      worktree: sourceRepository,
+      branch: "main",
+      network_mode: "inherited",
+      sandbox_executable: "/usr/bin/bwrap",
+      identity: { real_uid: 1000, real_gid: 1000, namespace_uid: 0, namespace_gid: 0 },
+      git_identity: { host_global_name: null, host_global_email: null },
+      filesystem: {
+        owned_worktree: sourceRepository,
+        home: path.join(sourceRepository, ".host-home"),
+        cache: path.join(sourceRepository, ".cache"),
+        persistent_home: path.join(sourceRepository, ".nawabari"),
+        git_metadata: path.join(sourceRepository, ".git"),
+        git_objects: path.join(sourceRepository, ".git", "objects"),
+        user_tool_paths: [],
+        runtime_paths: [],
+        system_paths: [],
+      },
+      required_capabilities: [],
+      seccomp_profile: { id: "packed-source-bound-fixture" },
+      capability_baseline: { id: "packed-source-bound-fixture" },
+      runtime_projection: {
+        contract_id: "nawabari.session-runtime-projection.v1",
+        schema_version: 1,
+        policy: {
+          mode: "strict",
+          host_visibility: "default-deny",
+          compatibility: "disabled",
+          unrestricted_host_fallback: "forbidden",
+        },
+        profile: { id: "node-runtime", version: "1" },
+        requirements: [],
+        filesystem: [],
+        executables: [],
+        working_set: workingSet,
+      },
+      runtime_resolution: {
+        policy: {
+          mode: "strict",
+          host_visibility: "default-deny",
+          compatibility: "disabled",
+          unrestricted_host_fallback: "forbidden",
+        },
+        profile: { id: "node-runtime", version: "1" },
+        materializer: "provided",
+      },
+    };
+    const token = {
+      contract_id: "nawabari.filesystem-policy-token.v1",
+      schema_version: 1,
+      serialization_key: "filesystem-policy-token",
+      registry_revision: 1,
+      session_runtime_epoch: 2,
+      claim_set_generation: 3,
+      working_set_revision: workingSet.revision,
+      profile_digest: "b".repeat(64),
+      session_id: sessionId,
+    };
+    const input = {
+      profile: {
+        contract_id: "nawabari.verification-profile.v1",
+        schema_version: 1,
+        profile_id: "packed-source-bound-smoke",
+        profile_version: "1",
+        executable: process.execPath,
+        argv: ["--version"],
+        cwd: sourceRepository,
+        read_visibility: "declared",
+        declared_read: ["src/entry.js"],
+        write_policy: "deny",
+        timeout_ms: 10_000,
+        max_output_bytes: 1_024,
+      },
+      request,
+      policy_fence: { policy_token: token, expected_policy_token: token },
+      source_path: sourcePath,
+    };
+
+    fs.writeFileSync(inputPath, JSON.stringify(input));
+    fs.writeFileSync(
+      scriptPath,
+      String.raw`import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import { executeSourceBoundVerification, isVerificationSourceWitnessCurrent } from "nawabari/contract";
+
+const input = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const root = input.request.worktree;
+const git = (args) => execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+let executorCalls = 0;
+const dependencies = {
+  execute: async () => {
+    executorCalls += 1;
+    return { ok: true, value: { exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 } };
+  },
+};
+
+const result = await executeSourceBoundVerification(input.profile, input.request, input.policy_fence, dependencies);
+assert.equal(result.ok, true, "installed source-bound API should return its typed result");
+assert.equal(result.value.status, "passed");
+assert.equal(result.value.source.status, "proven");
+const witness = result.value.source.witness;
+const stableCurrent = isVerificationSourceWitnessCurrent(witness, input.profile, input.request, input.policy_fence);
+assert.equal(stableCurrent, true);
+
+const changedToken = { ...input.policy_fence.policy_token, registry_revision: 2 };
+const changedPolicyCurrent = isVerificationSourceWitnessCurrent(
+  witness,
+  input.profile,
+  input.request,
+  { policy_token: changedToken, expected_policy_token: changedToken },
+);
+const changedBaseRequest = structuredClone(input.request);
+changedBaseRequest.runtime_projection.working_set.base.revision = "f".repeat(40);
+const changedBaseCurrent = isVerificationSourceWitnessCurrent(
+  witness,
+  input.profile,
+  changedBaseRequest,
+  input.policy_fence,
+);
+const changedRuntimeRequest = structuredClone(input.request);
+changedRuntimeRequest.runtime_projection.profile.version = "2";
+const changedRuntimeCurrent = isVerificationSourceWitnessCurrent(
+  witness,
+  input.profile,
+  changedRuntimeRequest,
+  input.policy_fence,
+);
+
+const initialStat = fs.statSync(input.source_path);
+fs.writeFileSync(input.source_path, "changed source\n");
+fs.utimesSync(input.source_path, initialStat.atime, initialStat.mtime);
+const changedContentCurrent = isVerificationSourceWitnessCurrent(
+  witness,
+  input.profile,
+  input.request,
+  input.policy_fence,
+);
+fs.writeFileSync(input.source_path, "initial source\n");
+fs.utimesSync(input.source_path, initialStat.atime, initialStat.mtime);
+git(["commit", "--quiet", "--allow-empty", "-m", "advance head"]);
+const changedHeadCurrent = isVerificationSourceWitnessCurrent(
+  witness,
+  input.profile,
+  input.request,
+  input.policy_fence,
+);
+
+const unobservablePath = root + "/selected-link.js";
+fs.symlinkSync(input.source_path, unobservablePath);
+const unobservableResult = await executeSourceBoundVerification(
+  { ...input.profile, declared_read: ["selected-link.js"] },
+  input.request,
+  input.policy_fence,
+  dependencies,
+);
+assert.equal(unobservableResult.ok, true);
+assert.equal(unobservableResult.value.status, "unavailable");
+assert.deepEqual(unobservableResult.value.source, { status: "unresolved", reason: "pre-observation-unavailable" });
+assert.equal(executorCalls, 1, "unobservable source must not invoke the executor");
+
+process.stdout.write(JSON.stringify({
+  source_status: result.value.source.status,
+  verification_status: result.value.verification.status,
+  stable_current: stableCurrent,
+  changed_content_current: changedContentCurrent,
+  changed_head_current: changedHeadCurrent,
+  changed_base_current: changedBaseCurrent,
+  changed_policy_current: changedPolicyCurrent,
+  changed_runtime_current: changedRuntimeCurrent,
+  unobservable_status: unobservableResult.value.status,
+  unobservable_reason: unobservableResult.value.source.reason,
+  executor_calls: executorCalls,
+}));
+`,
+    );
+    const result = spawnSync(process.execPath, [scriptPath, inputPath], {
+      cwd: installDirectory,
+      env: gitEnvironment,
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    if (result.error) fail(`packed source-bound verification API failed to start: ${result.error.message}`);
+    if (result.status !== 0) {
+      fail(`packed source-bound verification API failed (${result.status}): ${result.stdout}\n${result.stderr}`);
+    }
+    const evidence = parseInstalledJson(result, "packed source-bound verification API");
+    if (
+      evidence.source_status !== "proven" ||
+      evidence.verification_status !== "passed" ||
+      evidence.stable_current !== true ||
+      evidence.changed_content_current !== false ||
+      evidence.changed_head_current !== false ||
+      evidence.changed_base_current !== false ||
+      evidence.changed_policy_current !== false ||
+      evidence.changed_runtime_current !== false ||
+      evidence.unobservable_status !== "unavailable" ||
+      evidence.unobservable_reason !== "pre-observation-unavailable" ||
+      evidence.executor_calls !== 1
+    ) {
+      fail(`packed source-bound verification proof matrix did not match: ${JSON.stringify(evidence)}`);
+    }
+    return evidence;
+  } finally {
+    fs.rmSync(sourceRepository, { recursive: true, force: true });
+    fs.rmSync(scriptPath, { force: true });
+    fs.rmSync(inputPath, { force: true });
+  }
+}
+
 function parseInstalledJson(result, label) {
   if (result.stdout.trim().length === 0) fail(`${label} emitted no JSON`);
   try {
@@ -419,6 +667,12 @@ async function main() {
       GIT_TERMINAL_PROMPT: "0",
       GIT_OPTIONAL_LOCKS: "0",
     };
+    console.log("checking source-bound verification through installed contract...");
+    const sourceBoundEvidence = runPackedSourceBoundVerification(installDirectory, gitEnvironment);
+    console.log(
+      `packed source-bound fixture proof (policy fence is caller input; no live policy producer asserted): ${JSON.stringify(sourceBoundEvidence)}`,
+    );
+
     const installedBinary = path.join(binDirectory, "nawabari");
     // Git reserves `git <external-command> --help` for man-page lookup, so
     // version is the portable discovery probe that does not require a manpage.
