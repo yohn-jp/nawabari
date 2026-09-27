@@ -4798,12 +4798,23 @@ export class SessionRegistry {
       );
     }
     assertSessionId(requestedSessionId);
-    const suppliedApprovalWitness =
-      typeof sessionIdOrOptions === "string" ? undefined : sessionIdOrOptions.approvalWitness;
-    // Preserve the legacy direct registry entry while binding its approval
-    // before entering the final mutation lock. A concurrent effect change is
-    // rejected by discardUnsafe after the lock is acquired.
-    const approvalWitness = suppliedApprovalWitness ?? this.previewDiscard(requestedSessionId).approvalWitness;
+    let approvalWitness: string;
+    if (typeof sessionIdOrOptions === "string") {
+      // Preserve the legacy direct registry entry while binding its approval
+      // before entering the final mutation lock. A concurrent effect change is
+      // rejected by discardUnsafe after the lock is acquired.
+      approvalWitness = this.previewDiscard(requestedSessionId).approvalWitness;
+    } else {
+      const suppliedApprovalWitness = sessionIdOrOptions.approvalWitness;
+      if (typeof suppliedApprovalWitness !== "string" || suppliedApprovalWitness.length === 0) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Object-form discard requires an explicit approval witness",
+          { sessionId: requestedSessionId, reason: "discard-approval-required" },
+        );
+      }
+      approvalWitness = suppliedApprovalWitness;
+    }
     return this.withLock(() => {
       this.assertDrainFinalizationUnsafe(this.readStateUnsafe(), finalization, requestedSessionId, "discard");
       return this.coordinateCleanupUnsafe("discard", requestedSessionId, undefined, undefined, approvalWitness);

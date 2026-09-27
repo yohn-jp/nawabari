@@ -336,6 +336,43 @@ test("legacy direct discard rejects an effect change after capturing its approva
   }
 });
 
+test("object-form direct discard requires an explicit approval witness before preview or mutation", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = `${fixture.repositoryPath}-discard-explicit-approval`;
+  try {
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({ worktreePath, branchName: "feature/discard-explicit-approval" });
+    const before = persistedRegistryRevision(registry);
+    let previewCalls = 0;
+    const previewDiscard = registry.previewDiscard.bind(registry);
+    registry.previewDiscard = (sessionIdOrOptions) => {
+      previewCalls += 1;
+      return previewDiscard(sessionIdOrOptions);
+    };
+
+    assertRegistryError(() => registry.discard({ sessionId: session.sessionId }), "OPERATION_REJECTED");
+    assertRegistryError(
+      () => registry.discard({ sessionId: session.sessionId, approvalWitness: "" }),
+      "OPERATION_REJECTED",
+    );
+
+    assert.equal(previewCalls, 0);
+    assert.equal(registry.get(session.sessionId)?.state, "active");
+    assert.equal(fs.existsSync(worktreePath), true);
+    assert.equal(
+      runGit(
+        ["show-ref", "--verify", "--quiet", "refs/heads/feature/discard-explicit-approval"],
+        fixture.repositoryPath,
+      ),
+      "",
+    );
+    assert.equal(persistedRegistryRevision(registry), before);
+  } finally {
+    removeWorktree(fixture.repositoryPath, worktreePath);
+    fixture.cleanup();
+  }
+});
+
 test("multi-candidate garbage collection never reuses or regresses registry_revision", () => {
   const fixture = createRepositoryFixture();
   const worktreePaths = [`${fixture.repositoryPath}-gc-revision-1`, `${fixture.repositoryPath}-gc-revision-2`];
