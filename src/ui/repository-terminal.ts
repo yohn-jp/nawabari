@@ -11,6 +11,7 @@ import {
   type RepositoryScreenViewport,
 } from "./repository-screen.js";
 import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
+import { adaptRepositoryRuntimeSnapshotForMatrixV1 } from "../resource-coordination-compatibility.js";
 import { type DomainResult, type JsonObject } from "../domain/errors.js";
 import { projectFileSessionMatrix } from "../resource-coordination-view.js";
 import { projectAgentRuntimeStatus, projectSessionAttention } from "../session-attention.js";
@@ -21,14 +22,15 @@ import type { SessionLifecycleAction } from "../domain/session.js";
 export function repositoryScreenModelFromRuntimeSnapshot(
   snapshot: RepositoryRuntimeSnapshot,
 ): DomainResult<RepositoryScreenModel> {
-  const matrix = projectFileSessionMatrix(snapshot, { limit: 4_096 });
+  const projectionSnapshot = adaptRepositoryRuntimeSnapshotForMatrixV1(snapshot);
+  const matrix = projectFileSessionMatrix(projectionSnapshot, { limit: 4_096 });
   if (!matrix.ok) return matrix;
-  const attention = projectSessionAttention(snapshot);
+  const attention = projectSessionAttention(projectionSnapshot);
   if (!attention.ok) return attention;
 
   const runtime: Record<string, unknown>[] = [];
   for (const session of snapshot.sessions) {
-    const status = projectAgentRuntimeStatus(snapshot, session.sessionId, 4_096);
+    const status = projectAgentRuntimeStatus(projectionSnapshot, session.sessionId, 4_096);
     if (!status.ok) return status;
     runtime.push(status.value as unknown as Record<string, unknown>);
   }

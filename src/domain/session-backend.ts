@@ -92,7 +92,7 @@ import {
   type CoordinationTransactionRequest,
   type CoordinationTransactionResult,
 } from "./session.js";
-import { getNawabariRepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
+import { collectRepositoryRuntimeSnapshot } from "./repository-observation-service.js";
 import { createSessionActions, type SessionActionDispatcher } from "./session-actions.js";
 import {
   parseSessionExecutionRecord,
@@ -414,16 +414,13 @@ export class LocalSessionBackend implements SessionBackend {
     return this.registryFor(context).readSessionRuntimeEpoch(sessionId);
   }
 
-  /** Project the registry's canonical read view without mutating state. */
+  /** Collect one fresh, read-only repository snapshot through its application service. */
   public async repositoryRuntimeSnapshot(
     context: SessionContext,
   ): Promise<DomainResult<import("../repository-runtime-snapshot.js").RepositoryRuntimeSnapshot>> {
     try {
       const registry = this.registryFor(context);
-      return getNawabariRepositoryRuntimeSnapshot({
-        registry: registry.readRepositoryView(),
-        captured_at: new Date().toISOString(),
-      });
+      return collectRepositoryRuntimeSnapshot(registry);
     } catch (error) {
       return failure(toDomainError(error));
     }
