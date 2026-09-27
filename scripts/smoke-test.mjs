@@ -566,17 +566,15 @@ async function main() {
       }
     }
     if (capabilitiesResult.stderr.trim().length > 0) fail("capabilities --json wrote decorative output to stderr");
-    // The v2 resource-claim capability publishes lifecycle result mappings,
-    // transition/recovery identities, and operation-mode rationale in one
-    // bounded document. The session-diagnostics capability additionally
-    // publishes the complete XState-derived session lifecycle state and
-    // guarded/unconditional transition table (#256), so the document as a
-    // whole is bigger than the resource-claim vocabulary alone. Keep enough
-    // room for the complete failure-code, result-schema, and lifecycle
-    // transition vocabularies advertised by the public contract, plus
-    // headroom for incremental growth — this remains a fixed budget, not an
-    // unbounded one.
-    if (capabilitiesResult.stdout.length > 42_000) fail("capabilities --json exceeded its fixed discovery budget");
+    // A fresh packed installed consumer measured 46,355 characters at the
+    // NAWABARI-TA-1 convergence base. Leave 17,645 characters for the accepted
+    // R4 retention and R5 observation capability mappings while preserving a
+    // fixed ceiling and every semantic check above.
+    if (capabilitiesResult.stdout.length > 64_000) {
+      fail(
+        `capabilities --json exceeded its fixed 64,000-character discovery budget (${capabilitiesResult.stdout.length})`,
+      );
+    }
 
     const helpJsonResult = spawnSync(installedBinary, ["--help", "--json"], {
       cwd: installDirectory,
@@ -1075,7 +1073,7 @@ async function main() {
     }).stdout;
     const supportedRegistryText = fs.readFileSync(migrationRegistryPath, "utf8");
     const unsupportedRegistry = JSON.parse(supportedRegistryText);
-    unsupportedRegistry.required_features = ["retentions.v1"];
+    unsupportedRegistry.required_features = ["retentions.v2"];
     unsupportedRegistry.retentions = [{ fixture: "preserve", payload: { nested: ["optional", 1, true] } }];
     const unsupportedRegistryText = `${JSON.stringify(unsupportedRegistry, null, 2)}\n`;
     fs.writeFileSync(migrationRegistryPath, unsupportedRegistryText);
