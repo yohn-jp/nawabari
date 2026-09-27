@@ -38,6 +38,13 @@ export interface AcquireControlServerLeaseOptions {
   readonly directory?: string;
 }
 
+export interface DefaultControlServerOperationalDirectoryOptions {
+  /** Internal test seam for exercising the fallback while a runtime dir exists. */
+  readonly runtimeDirectory?: string | null;
+  /** Internal test seam for isolating fallback-path process tests. */
+  readonly fallbackRoot?: string;
+}
+
 type EndpointRead =
   | { readonly kind: "missing" }
   | { readonly kind: "invalid" }
@@ -63,21 +70,41 @@ function isPrivateDirectory(directory: string, uid: number | undefined): boolean
   }
 }
 
-/** Stable per-user location; independent of the selected port, cwd, or repository. */
-export function defaultControlServerOperationalDirectory(): string {
+/** Stable per-user location; independent of the selected port, cwd, repository, or temp environment. */
+export function defaultControlServerOperationalDirectory(
+  options: DefaultControlServerOperationalDirectoryOptions = {},
+): string {
   const uid = currentUid();
-  if (process.platform === "linux" && uid !== undefined) {
-    const runtimeDirectory = `/run/user/${uid}`;
-    if (isPrivateDirectory(runtimeDirectory, uid)) {
-      return path.join(runtimeDirectory, CONTROL_SERVER_LEASE_DIRECTORY);
-    }
+  const runtimeDirectory =
+    options.runtimeDirectory === undefined ? (uid === undefined ? null : `/run/user/${uid}`) : options.runtimeDirectory;
+  if (process.platform === "linux" && runtimeDirectory !== null && isPrivateDirectory(runtimeDirectory, uid)) {
+    return path.join(runtimeDirectory, CONTROL_SERVER_LEASE_DIRECTORY);
   }
 
+  const userInfo = uid === undefined ? os.userInfo() : undefined;
+  if (uid === undefined && userInfo?.username.trim().length === 0) {
+    throw unavailable(
+      "The current user identity is unavailable for a Control Server operational directory.",
+      "operational-directory-unavailable",
+    );
+  }
   const userScope =
     uid === undefined
-      ? createHash("sha256").update(os.userInfo().username, "utf8").digest("hex").slice(0, 20)
+      ? createHash("sha256")
+          .update(userInfo?.username ?? "", "utf8")
+          .digest("hex")
+          .slice(0, 20)
       : String(uid);
-  return path.join(os.tmpdir(), `${CONTROL_SERVER_LEASE_DIRECTORY}-${userScope}`);
+  const fallbackRoot =
+    options.fallbackRoot ??
+    (process.platform === "win32" ? path.join(userInfo?.homedir ?? "", "AppData", "Local", "Nawabari") : "/tmp");
+  if (!path.isAbsolute(fallbackRoot)) {
+    throw unavailable(
+      "A stable per-user Control Server operational directory is unavailable.",
+      "operational-directory-unavailable",
+    );
+  }
+  return path.join(fallbackRoot, `${CONTROL_SERVER_LEASE_DIRECTORY}-${userScope}`);
 }
 
 export function controlServerEndpointPath(directory: string): string {

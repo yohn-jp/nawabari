@@ -19,7 +19,7 @@ import {
 } from "./control-server.js";
 import { DomainError } from "./domain/errors.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
-import { controlServerEndpointPath } from "./control-server-lease.js";
+import { controlServerEndpointPath, defaultControlServerOperationalDirectory } from "./control-server-lease.js";
 import { RepositoryLock } from "./registry/lock.js";
 
 type Fixture = {
@@ -158,13 +158,31 @@ async function freePort(): Promise<number> {
 }
 
 type ServerWorkerReply =
-  | { readonly ok: true; readonly port: number; readonly url: string; readonly credentialFile: string }
-  | { readonly ok: false; readonly code: string; readonly reason?: string };
+  | {
+      readonly ok: true;
+      readonly port: number;
+      readonly url: string;
+      readonly credentialFile: string;
+      readonly operationalDirectory: string;
+      readonly temporaryDirectory: string;
+    }
+  | {
+      readonly ok: false;
+      readonly code: string;
+      readonly reason?: string;
+      readonly operationalDirectory: string;
+      readonly temporaryDirectory: string;
+    };
 
 function serverWorker(
-  operationalDirectory: string,
+  operationalDirectory: string | undefined,
   cwd: string,
   port: number,
+  options: {
+    readonly fallbackRoot?: string;
+    readonly forceFallback?: boolean;
+    readonly temporaryDirectory?: string;
+  } = {},
 ): {
   readonly child: ChildProcessWithoutNullStreams;
   readonly firstReply: Promise<ServerWorkerReply>;
@@ -172,21 +190,40 @@ function serverWorker(
   const moduleUrl = new URL("./control-server.ts", import.meta.url).href;
   const tsxLoader = fileURLToPath(import.meta.resolve("tsx/esm"));
   const script = `
-    const { startControlServer } = await import(process.env.NAWABARI_CONTROL_SERVER_MODULE);
+    const os = await import("node:os");
+    const controlServerModule = await import(process.env.NAWABARI_CONTROL_SERVER_MODULE);
+    const leaseModule = await import(new URL("./control-server-lease.ts", process.env.NAWABARI_CONTROL_SERVER_MODULE));
+    const operationalDirectory = process.env.NAWABARI_CONTROL_SERVER_FORCE_FALLBACK === "1"
+      ? leaseModule.defaultControlServerOperationalDirectory({
+          runtimeDirectory: null,
+          ...(process.env.NAWABARI_CONTROL_SERVER_FALLBACK_ROOT === undefined
+            ? {}
+            : { fallbackRoot: process.env.NAWABARI_CONTROL_SERVER_FALLBACK_ROOT }),
+        })
+      : process.env.NAWABARI_CONTROL_SERVER_OPERATIONAL_DIRECTORY;
+    const { startControlServer } = controlServerModule;
     const started = await startControlServer({
       port: Number(process.env.NAWABARI_CONTROL_SERVER_PORT),
       backend: {},
       catalogPath: process.env.NAWABARI_CONTROL_SERVER_CATALOG,
-      operationalDirectory: process.env.NAWABARI_CONTROL_SERVER_OPERATIONAL_DIRECTORY,
+      operationalDirectory,
     });
     if (!started.ok) {
-      process.stdout.write(JSON.stringify({ ok: false, code: started.error.code, reason: started.error.details?.reason }) + "\\n");
+      process.stdout.write(JSON.stringify({
+        ok: false,
+        code: started.error.code,
+        reason: started.error.details?.reason,
+        operationalDirectory,
+        temporaryDirectory: os.tmpdir(),
+      }) + "\\n");
     } else {
       process.stdout.write(JSON.stringify({
         ok: true,
         port: started.value.port,
         url: started.value.url,
         credentialFile: started.value.credentialFile,
+        operationalDirectory,
+        temporaryDirectory: os.tmpdir(),
       }) + "\\n");
       process.on("SIGTERM", () => void started.value.close().then(() => process.exit(0)));
     }
@@ -197,8 +234,22 @@ function serverWorker(
       ...process.env,
       NAWABARI_CONTROL_SERVER_MODULE: moduleUrl,
       NAWABARI_CONTROL_SERVER_PORT: String(port),
-      NAWABARI_CONTROL_SERVER_CATALOG: path.join(operationalDirectory, "catalog.json"),
-      NAWABARI_CONTROL_SERVER_OPERATIONAL_DIRECTORY: operationalDirectory,
+      NAWABARI_CONTROL_SERVER_CATALOG: path.join(
+        operationalDirectory ?? options.fallbackRoot ?? "/tmp",
+        "catalog.json",
+      ),
+      ...(operationalDirectory === undefined
+        ? {}
+        : { NAWABARI_CONTROL_SERVER_OPERATIONAL_DIRECTORY: operationalDirectory }),
+      ...(options.forceFallback ? { NAWABARI_CONTROL_SERVER_FORCE_FALLBACK: "1" } : {}),
+      ...(options.fallbackRoot === undefined ? {} : { NAWABARI_CONTROL_SERVER_FALLBACK_ROOT: options.fallbackRoot }),
+      ...(options.temporaryDirectory === undefined
+        ? {}
+        : {
+            TMPDIR: options.temporaryDirectory,
+            TMP: options.temporaryDirectory,
+            TEMP: options.temporaryDirectory,
+          }),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -685,16 +736,48 @@ test("port conflicts fail explicitly and shutdown releases the listener", async 
   assert.equal(again.port, port);
 });
 
-test("concurrent Control Server processes contend across ports and working directories", async (t) => {
+test("Control Server fallback path is independent of temporary-directory environment variables", () => {
+  const temporaryVariables = ["TMPDIR", "TMP", "TEMP"] as const;
+  const originalValues = new Map(temporaryVariables.map((name) => [name, process.env[name]]));
+  const temporaryRoot = path.parse(os.tmpdir()).root;
+  const expected = defaultControlServerOperationalDirectory({ runtimeDirectory: null });
+  try {
+    for (const index of [1, 2]) {
+      const temporaryPath = path.join(temporaryRoot, `nawabari-temp-env-${index}`);
+      for (const variable of temporaryVariables) process.env[variable] = temporaryPath;
+      assert.equal(defaultControlServerOperationalDirectory({ runtimeDirectory: null }), expected);
+    }
+  } finally {
+    for (const name of temporaryVariables) {
+      const previous = originalValues.get(name);
+      if (previous === undefined) delete process.env[name];
+      else process.env[name] = previous;
+    }
+  }
+});
+
+test("concurrent Control Server processes contend across ports, working directories, and TMPDIR values", async (t) => {
   const context = fixture(t);
   const alternateCwd = path.join(context.root, "alternate-cwd");
+  const firstTemporaryDirectory = path.join(context.root, "temporary-directory-one");
+  const secondTemporaryDirectory = path.join(context.root, "temporary-directory-two");
   fs.mkdirSync(alternateCwd);
+  fs.mkdirSync(firstTemporaryDirectory, { mode: 0o700 });
+  fs.mkdirSync(secondTemporaryDirectory, { mode: 0o700 });
   const firstPort = await freePort();
   let secondPort = await freePort();
   while (secondPort === firstPort) secondPort = await freePort();
 
-  const first = serverWorker(context.operationalDirectory, context.root, firstPort);
-  const second = serverWorker(context.operationalDirectory, alternateCwd, secondPort);
+  const first = serverWorker(undefined, context.root, firstPort, {
+    fallbackRoot: context.root,
+    forceFallback: true,
+    temporaryDirectory: firstTemporaryDirectory,
+  });
+  const second = serverWorker(undefined, alternateCwd, secondPort, {
+    fallbackRoot: context.root,
+    forceFallback: true,
+    temporaryDirectory: secondTemporaryDirectory,
+  });
   stopWorkerAfterTest(t, first.child);
   stopWorkerAfterTest(t, second.child);
   const [firstReply, secondReply] = await Promise.all([first.firstReply, second.firstReply]);
@@ -702,6 +785,16 @@ test("concurrent Control Server processes contend across ports and working direc
     { child: first.child, reply: firstReply },
     { child: second.child, reply: secondReply },
   ];
+  assert.notEqual(firstReply.temporaryDirectory, secondReply.temporaryDirectory, "workers use different temp dirs");
+  assert.equal(
+    firstReply.operationalDirectory,
+    secondReply.operationalDirectory,
+    "fallback lease path is independent of TMPDIR",
+  );
+  assert.equal(
+    firstReply.operationalDirectory,
+    defaultControlServerOperationalDirectory({ runtimeDirectory: null, fallbackRoot: context.root }),
+  );
   const active = replies.filter((entry) => entry.reply.ok);
   assert.equal(active.length, 1, "only one process may publish an active listener");
   const contender = replies.find((entry) => !entry.reply.ok);
@@ -717,7 +810,7 @@ test("concurrent Control Server processes contend across ports and working direc
   if (!owner.reply.ok) throw new Error("expected one active Control Server worker");
   const token = fs.readFileSync(owner.reply.credentialFile, "utf8").trim();
   assert.equal((await call({ port: owner.reply.port, token }, "/api/v1/health")).status, 200);
-  const endpointPath = controlServerEndpointPath(context.operationalDirectory);
+  const endpointPath = controlServerEndpointPath(owner.reply.operationalDirectory);
   const endpoint = JSON.parse(fs.readFileSync(endpointPath, "utf8")) as Record<string, unknown>;
   assert.deepEqual(Object.keys(endpoint).sort(), ["host", "owner", "port", "schema_version", "url"]);
   assert.equal(endpoint.host, "127.0.0.1");
