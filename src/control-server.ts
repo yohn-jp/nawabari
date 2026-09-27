@@ -23,6 +23,11 @@ import {
   type RepositoryLocator,
 } from "./control-repositories.js";
 import { renderControlWebDocument } from "./control-web.js";
+import {
+  acquireControlServerLease,
+  defaultControlServerOperationalDirectory,
+  type ControlServerLease,
+} from "./control-server-lease.js";
 import { repositoryScreenModelFromRuntimeSnapshot } from "./ui/repository-terminal.js";
 import {
   parseSessionDiscardPreview,
@@ -51,6 +56,8 @@ export type ControlServerOptions = {
   readonly backend: SessionBackend;
   readonly catalogPath: string;
   readonly git?: GitCommandRunner;
+  /** Internal test seam; production uses a stable per-user operational path. */
+  readonly operationalDirectory?: string;
 };
 
 export type ControlServer = {
@@ -229,6 +236,19 @@ async function readJsonBody(request: http.IncomingMessage): Promise<unknown> {
 }
 
 export async function startControlServer(options: ControlServerOptions): Promise<DomainResult<ControlServer>> {
+  let lease: ControlServerLease;
+  try {
+    lease = await acquireControlServerLease({
+      directory: options.operationalDirectory ?? defaultControlServerOperationalDirectory(),
+    });
+  } catch (error: unknown) {
+    return failure(
+      error instanceof DomainError
+        ? error
+        : new DomainError("BACKEND_UNAVAILABLE", "The Control Server singleton lease could not be acquired."),
+    );
+  }
+
   const token = randomBytes(32).toString("hex");
   let port = options.port;
   const allowedHosts = () => new Set([`${CONTROL_SERVER_HOST}:${port}`, `localhost:${port}`]);
@@ -455,7 +475,10 @@ export async function startControlServer(options: ControlServerOptions): Promise
       resolve(success(undefined)),
     );
   });
-  if (!listening.ok) return listening;
+  if (!listening.ok) {
+    await lease.release();
+    return listening;
+  }
   const address = server.address();
   port = typeof address === "object" && address !== null ? address.port : options.port;
 
@@ -467,8 +490,23 @@ export async function startControlServer(options: ControlServerOptions): Promise
       server.close(() => resolve());
       server.closeAllConnections();
     });
+    await lease.release();
     return failure(
       new DomainError("BACKEND_UNAVAILABLE", "The host-only Control credential file could not be created."),
+    );
+  }
+
+  try {
+    await lease.publishEndpoint(port);
+  } catch {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      server.closeAllConnections();
+    });
+    fs.rmSync(credential.directory, { recursive: true, force: true });
+    await lease.release();
+    return failure(
+      new DomainError("BACKEND_UNAVAILABLE", "The Control Server endpoint locator could not be published."),
     );
   }
 
@@ -486,12 +524,16 @@ export async function startControlServer(options: ControlServerOptions): Promise
             reject(error);
             return;
           }
+          let cleanupError: unknown;
           try {
             fs.rmSync(credential.directory, { recursive: true, force: true });
-            resolve();
-          } catch (cleanupError: unknown) {
-            reject(cleanupError);
+          } catch (error: unknown) {
+            cleanupError = error;
           }
+          void lease.release().then(
+            () => (cleanupError === undefined ? resolve() : reject(cleanupError)),
+            (leaseError: unknown) => reject(cleanupError ?? leaseError),
+          );
         });
         server.closeAllConnections();
       });

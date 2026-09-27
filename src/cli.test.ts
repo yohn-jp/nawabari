@@ -1514,7 +1514,11 @@ test("every canonical command and alias is recognized by the dispatcher", async 
       await runCli([...definition.name.split(" "), "--json"], {
         io: output.io,
         cwd: directory,
-        controlServer: { catalogPath: path.join(directory, "catalog.json"), signal: AbortSignal.abort() },
+        controlServer: {
+          catalogPath: path.join(directory, "catalog.json"),
+          operationalDirectory: path.join(directory, "control-server-operations"),
+          signal: AbortSignal.abort(),
+        },
       });
       const response = JSON.parse(output.stdout[0] ?? "{}") as { code?: string };
       assert.notEqual(
