@@ -54,6 +54,10 @@ const linuxSystemCases = new Map([
     ["the protected composition reaches the repaired worker on a supported runtime"],
   ],
   [
+    "src/session-retention-linux-integration.test.ts",
+    ["the public park action adopts its intent only after a real owned cgroup descendant exits"],
+  ],
+  [
     "src/domain/standalone-linux-compat.test.ts",
     ["standalone Linux runs development workloads through the exact protected profile"],
   ],

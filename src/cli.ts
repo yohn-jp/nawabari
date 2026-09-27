@@ -328,6 +328,8 @@ export type CliDependencies = {
     readonly operationalDirectory?: string;
     readonly signal?: AbortSignal;
     readonly onListening?: (server: ControlServer) => void;
+    /** Internal composition marker set by runCli only for its default local backend. */
+    readonly isolateLocalBackendRequests?: boolean;
   };
   version?: string;
   sandboxRunner?: (
@@ -1824,6 +1826,9 @@ async function executeCommand(
       port,
       backend: dependencies.backend,
       catalogPath,
+      ...(dependencies.controlServer?.isolateLocalBackendRequests === true
+        ? { isolateLocalBackendRequests: true }
+        : {}),
       ...(dependencies.controlServer?.operationalDirectory === undefined
         ? {}
         : { operationalDirectory: dependencies.controlServer.operationalDirectory }),
@@ -1872,6 +1877,8 @@ async function executeCommand(
       "retry-close-with-bounded-integration-fetch",
       "discard-session",
       "reconcile-physical-state",
+      "park-session",
+      "resume-session",
     ];
     if (!actionIds.includes(parsed.value.action_id as SessionActionId)) {
       return failure(
@@ -2969,7 +2976,10 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       io,
       json: mode === "json",
       repositoryTerminal: dependencies.repositoryTerminal,
-      controlServer: dependencies.controlServer,
+      controlServer: {
+        ...dependencies.controlServer,
+        isolateLocalBackendRequests: dependencies.backend === undefined,
+      },
       sandboxRunner: dependencies.sandboxRunner,
       sandboxProbe: dependencies.sandboxProbe,
       sandboxRuntimeLayout: runtimeLayout,

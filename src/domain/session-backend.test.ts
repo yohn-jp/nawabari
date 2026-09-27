@@ -7,7 +7,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { runCli } from "../cli.js";
-import { resolveRepositoryContext } from "../git.js";
+import { defaultGit, resolveRepositoryContext, type GitCommandRunner } from "../git.js";
 import { SessionRegistry } from "../session-registry.js";
 import { resolveManagedCgroupRoot, type CgroupFileSystem } from "./cgroups-v2.js";
 import { withDirectoryFsyncFailure } from "../testing/fs-fault-injection.js";
@@ -1324,6 +1324,98 @@ test("the local backend preserves unexpected error diagnostics", async () => {
     assert.equal(result.error.details?.cause, "TypeError: injected backend failure");
     assert.equal(result.error.cause, expectedError);
   } finally {
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("the local backend preserves a typed park fence denial and its retention code", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-park-untracked`;
+  try {
+    const backend = new LocalSessionBackend();
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      {
+        branch: "feature/park-untracked",
+        worktree: worktreePath,
+        label: null,
+        base: null,
+      },
+    );
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+
+    const parked = await backend.parkSession!({ cwd: repositoryPath }, created.value.session_id);
+    assert.equal(parked.ok, false);
+    if (!parked.ok) {
+      assert.equal(parked.error.code, "OPERATION_REJECTED");
+      assert.equal(parked.error.details?.retention_code, "FENCE_REJECTED");
+    }
+    assert.equal((await backend.getSession({ cwd: repositoryPath }, created.value.session_id)).ok, true);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
+    fs.rmSync(repositoryPath, { recursive: true, force: true });
+  }
+});
+
+test("domain park/resume offers use current observation without changing termination diagnostics", async () => {
+  const repositoryPath = createRepository();
+  const worktreePath = `${repositoryPath}-park-action-projection`;
+  let failWorktreeObservation = false;
+  const git: GitCommandRunner = {
+    run(args, cwd) {
+      if (failWorktreeObservation && args[0] === "worktree" && args[1] === "list") {
+        throw new Error("injected worktree observation failure");
+      }
+      return defaultGit.run(args, cwd);
+    },
+    runRaw: defaultGit.runRaw,
+    runBuffer: defaultGit.runBuffer,
+  };
+
+  try {
+    const backend = new LocalSessionBackend({ git });
+    const created = await backend.createSession(
+      { cwd: repositoryPath },
+      {
+        branch: "feature/park-action-projection",
+        worktree: worktreePath,
+        label: null,
+        base: null,
+      },
+    );
+    assert.equal(created.ok, true, created.ok ? "session created" : JSON.stringify(created.error));
+    if (!created.ok) return;
+
+    const current = await backend.sessionDiagnostic({ cwd: repositoryPath }, { session_id: created.value.session_id });
+    assert.equal(current.ok, true, current.ok ? "diagnostic read" : JSON.stringify(current.error));
+    if (!current.ok) return;
+    assert.equal(current.value.lifecycle?.state, "close-ready");
+    assert.ok(current.value.park_resume_actions?.some((action) => action.actionId === "park-session"));
+
+    failWorktreeObservation = true;
+    const ambiguous = await backend.sessionDiagnostic(
+      { cwd: repositoryPath },
+      { session_id: created.value.session_id },
+    );
+    assert.equal(ambiguous.ok, true, ambiguous.ok ? "diagnostic read" : JSON.stringify(ambiguous.error));
+    if (!ambiguous.ok) return;
+    assert.equal(ambiguous.value.lifecycle?.state, "stale-inconsistent");
+    assert.deepEqual(ambiguous.value.park_resume_actions, []);
+
+    failWorktreeObservation = false;
+    const untrackedPath = path.join(worktreePath, "untracked.txt");
+    fs.writeFileSync(untrackedPath, "recoverable work\n");
+    const recoverable = await backend.sessionDiagnostic(
+      { cwd: repositoryPath },
+      { session_id: created.value.session_id },
+    );
+    assert.equal(recoverable.ok, true, recoverable.ok ? "diagnostic read" : JSON.stringify(recoverable.error));
+    if (!recoverable.ok) return;
+    assert.equal(recoverable.value.lifecycle?.state, "blocked-recoverable");
+    assert.deepEqual(recoverable.value.park_resume_actions, []);
+  } finally {
+    removeWorktree(repositoryPath, worktreePath);
     fs.rmSync(repositoryPath, { recursive: true, force: true });
   }
 });

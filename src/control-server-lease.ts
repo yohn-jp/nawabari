@@ -195,30 +195,67 @@ function parseEndpoint(value: unknown): ControlServerEndpointLocator | undefined
   };
 }
 
+function sameEndpointIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
 function readEndpoint(directory: string): EndpointRead {
   const endpointPath = controlServerEndpointPath(directory);
-  let stat: fs.Stats;
+  const noFollow = fs.constants.O_NOFOLLOW;
+  const nonBlock = fs.constants.O_NONBLOCK;
+  let descriptor: number;
   try {
-    stat = fs.lstatSync(endpointPath);
+    descriptor = fs.openSync(
+      endpointPath,
+      fs.constants.O_RDONLY |
+        (typeof noFollow === "number" ? noFollow : 0) |
+        (typeof nonBlock === "number" ? nonBlock : 0),
+    );
   } catch (error: unknown) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") return { kind: "missing" };
     return { kind: "invalid" };
   }
-  const uid = currentUid();
-  if (
-    !stat.isFile() ||
-    stat.isSymbolicLink() ||
-    stat.size > MAX_ENDPOINT_BYTES ||
-    (uid !== undefined && stat.uid !== uid) ||
-    (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
-  ) {
-    return { kind: "invalid" };
-  }
   try {
-    const parsed = parseEndpoint(JSON.parse(fs.readFileSync(endpointPath, "utf8")) as unknown);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    const uid = currentUid();
+    if (
+      !opened.isFile() ||
+      opened.size > BigInt(MAX_ENDPOINT_BYTES) ||
+      (uid !== undefined && opened.uid !== BigInt(uid)) ||
+      (process.platform !== "win32" && (opened.mode & 0o077n) !== 0n)
+    ) {
+      return { kind: "invalid" };
+    }
+    if (typeof noFollow !== "number") {
+      // Without O_NOFOLLOW the open may have traversed a symlink; bind the descriptor to a non-link path entry.
+      const entry = fs.lstatSync(endpointPath, { bigint: true });
+      if (entry.isSymbolicLink() || !sameEndpointIdentity(entry, opened)) return { kind: "invalid" };
+    }
+
+    const bytes = Buffer.alloc(MAX_ENDPOINT_BYTES + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = fs.readSync(descriptor, bytes, length, bytes.length - length, length);
+      if (count === 0) break;
+      length += count;
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      length > MAX_ENDPOINT_BYTES ||
+      BigInt(length) !== opened.size ||
+      !sameEndpointIdentity(opened, after) ||
+      after.size !== opened.size ||
+      after.mtimeNs !== opened.mtimeNs
+    ) {
+      return { kind: "invalid" };
+    }
+
+    const parsed = parseEndpoint(JSON.parse(bytes.toString("utf8", 0, length)) as unknown);
     return parsed === undefined ? { kind: "invalid" } : { kind: "present", value: parsed };
   } catch {
     return { kind: "invalid" };
+  } finally {
+    fs.closeSync(descriptor);
   }
 }
 

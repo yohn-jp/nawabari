@@ -27,29 +27,56 @@ import {
   RESOURCE_CLAIM_TRANSITION_MATRIX_ID,
 } from "./contract.js";
 import {
+  SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID,
+  SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA,
+  SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA_VERSION,
   VERIFICATION_PROFILE_CONTRACT_ID,
   VERIFICATION_PROFILE_SCHEMA_VERSION,
   VERIFICATION_RESULT_SCHEMA_VERSION,
   VERIFICATION_RESULT_SCHEMA,
+  VERIFICATION_SOURCE_WITNESS_CONTRACT_ID,
+  VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
 } from "./verification-executor.js";
+import {
+  SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+  SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+} from "./domain/filesystem-policy-evidence.js";
 
 export {
+  captureVerificationSourceWitness,
   executeVerification,
+  executeSourceBoundVerification,
+  isVerificationSourceWitnessCurrent,
   runVerification,
   validateVerificationProfile,
+  validateVerificationSourceWitness,
   VERIFICATION_PROFILE_CONTRACT_ID,
   VERIFICATION_PROFILE_SCHEMA_VERSION,
   VERIFICATION_RESULT_SCHEMA,
   VERIFICATION_RESULT_SCHEMA_VERSION,
+  SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID,
+  SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA,
+  SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA_VERSION,
+  VERIFICATION_SOURCE_WITNESS_CONTRACT_ID,
+  VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
 } from "./verification-executor.js";
 export type {
+  SourceBoundVerificationResult,
   VerificationDiagnosticStream,
   VerificationExecutorDependencies,
+  VerificationFilesystemPolicyFence,
   VerificationProfile,
   VerificationProfileInput,
   VerificationReadVisibility,
   VerificationResult,
+  VerificationSourceWitness,
 } from "./verification-executor.js";
+export {
+  SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+  SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+  serializeSourceBoundVerificationExecutionEvidence,
+} from "./domain/filesystem-policy-evidence.js";
+export type { SourceBoundVerificationExecutionEvidence } from "./domain/filesystem-policy-evidence.js";
 
 /** Stable identity of Nawabari's bounded Effective Working Set capability. */
 export const EFFECTIVE_WORKING_SET_CONTRACT_ID = "effective-working-set" as const;
@@ -112,6 +139,13 @@ export function nawabariVerificationContract(): JsonObject {
     contract_id: VERIFICATION_PROFILE_CONTRACT_ID,
     contract_version: VERIFICATION_PROFILE_SCHEMA_VERSION,
     result_schema: VERIFICATION_RESULT_SCHEMA,
+    source_bound_result_schema: SOURCE_BOUND_VERIFICATION_RESULT_SCHEMA,
+    source_bound_result_contract_id: SOURCE_BOUND_VERIFICATION_RESULT_CONTRACT_ID,
+    source_witness_contract_id: VERIFICATION_SOURCE_WITNESS_CONTRACT_ID,
+    source_witness_schema_version: VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
+    source_bound_evidence_contract_id: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
+    source_bound_evidence_schema_version: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+    legacy_result_freshness: "unproven",
     read_visibility: ["declared", "repository"],
     write_policy: "deny",
     execution: "fixed-argv-no-shell",

@@ -19,7 +19,9 @@ import {
 import {
   SESSION_LIFECYCLE_ACTION_SCHEMA_VERSION,
   SESSION_LIFECYCLE_APPLY_ACTION_SCHEMA_VERSION,
+  SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION,
   type SessionLifecycleActionId,
+  type SessionLifecycleParkResumeActionId,
 } from "./session-lifecycle-actions.js";
 import {
   SANDBOX_CONTRACT_ID,
@@ -488,6 +490,11 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "discard-session",
       "reconcile-physical-state",
     ],
+    park_resume_actions: {
+      schema_version: SESSION_LIFECYCLE_PARK_RESUME_ACTION_SCHEMA_VERSION,
+      action_ids: ["park-session", "resume-session"] satisfies readonly SessionLifecycleParkResumeActionId[],
+      diagnostic_identity: "park_resume_actions",
+    },
     reauthorize_before_dispatch: true,
     shell_execution: false,
     destructive_confirmation: "typed-preview-and-explicit-intent",
@@ -650,6 +657,7 @@ const MACHINE_CONTRACT_CAPABILITIES = Object.freeze([
       "safe_actions",
       "next_action",
       "next_actions",
+      "park_resume_actions",
       "integration_evidence",
       "lifecycle_state",
       "lifecycle",
@@ -1080,6 +1088,7 @@ export function machineContract(packageVersion: string): JsonObject {
             initial_claims: jsonClone(capability.initial_claims),
             worktree_profile: jsonClone(capability.worktree_profile),
             control_server: jsonClone(capability.control_server),
+            park_resume_actions: jsonClone(capability.park_resume_actions),
           }
         : {}),
       ...(capability.id === "session-diagnostics" ? { lifecycle: jsonClone(capability.lifecycle) } : {}),

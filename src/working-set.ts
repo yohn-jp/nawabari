@@ -50,8 +50,20 @@ export type WorkingSetSourceIdentity = {
   readonly identity: string;
 };
 
+/** Stable upstream implementation identity; it locates a producer but grants no authority by itself. */
+export type ImplementationExecutionScopeProducerLocator = {
+  readonly repositoryHost: string;
+  readonly repositoryId: string;
+  readonly number: number;
+};
+
+/** Older effective working sets may lack the producer locator and remain readable. */
+export type ImplementationExecutionScopeSourceIdentity = WorkingSetSourceIdentity & {
+  readonly producer?: ImplementationExecutionScopeProducerLocator;
+};
+
 export type EffectiveWorkingSetProvenance = {
-  readonly executionScope: WorkingSetSourceIdentity;
+  readonly executionScope: ImplementationExecutionScopeSourceIdentity;
   readonly candidateWorkingSet: WorkingSetSourceIdentity;
   readonly repository: RepositoryIdentity;
   readonly base: BaseIdentity;
@@ -530,6 +542,7 @@ export function composeEffectiveWorkingSet(input: WorkingSetCompositionInput): E
       version: executionScope.version,
       digest: executionDigest,
       identity: executionScope.authorization.governedBodyDigest as string,
+      producer: implementationExecutionScopeProducerLocator(executionScope),
     }),
     candidateWorkingSet: Object.freeze({
       kind: candidate.kind,
@@ -555,6 +568,21 @@ export function composeEffectiveWorkingSet(input: WorkingSetCompositionInput): E
       provenance,
     }),
   };
+}
+
+function implementationExecutionScopeProducerLocator(
+  artifact: ImplementationExecutionScopeArtifact,
+): ImplementationExecutionScopeProducerLocator {
+  const implementation = artifact.authorization.implementation;
+  if (!isRecord(implementation)) throw new Error("execution scope implementation is invalid");
+  const number = implementation.number;
+  if (!Number.isSafeInteger(number) || (number as number) < 1)
+    throw new Error("execution scope implementation.number is invalid");
+  return Object.freeze({
+    repositoryHost: text(implementation.repositoryHost, "execution scope implementation.repositoryHost"),
+    repositoryId: text(implementation.repositoryId, "execution scope implementation.repositoryId"),
+    number: number as number,
+  });
 }
 
 /** Digest an externally supplied bounded artifact for provenance matching. */

@@ -45,6 +45,96 @@ test("represents every derived operational lifecycle state", () => {
   assert.equal(stateOf(input({ terminalOperation: "discard" })), "discarded");
   assert.equal(stateOf(input({ closeReadiness: "ambiguous" })), "stale-inconsistent");
   assert.equal(stateOf(input({ sessionState: "closed", physicalState: "closed" }, "closed")), "closed");
+  assert.equal(stateOf(input({ sessionState: "parked" }, "parked")), "parked");
+});
+
+test("park and resume lifecycle changes require the canonical request/result sequence", () => {
+  const actor = actorFor(input());
+  assert.equal(send(actor, { type: "SESSION.PARK.REQUESTED" }), "parking");
+  assert.equal(send(actor, { type: "SESSION.CLOSE.REQUESTED" }), "parking");
+  assert.equal(send(actor, { type: "SESSION.DISCARD.REQUESTED" }), "parking");
+  assert.equal(send(actor, { type: "SESSION.GC.REQUESTED" }), "parking");
+  assert.equal(send(actor, { type: "SESSION.PARK.FINALIZE", status: "parked", operationId: "park-op-1" }), "parked");
+  assert.equal(
+    send(actor, { type: "SESSION.RESUME.REQUESTED", status: "resumed", operationId: "resume-op-1" }),
+    "active",
+  );
+  actor.stop();
+
+  const invalidFinalize = actorFor(input());
+  assert.equal(send(invalidFinalize, { type: "SESSION.PARK.REQUESTED" }), "parking");
+  assert.equal(
+    send(invalidFinalize, {
+      type: "SESSION.PARK.FINALIZE",
+      status: "parked",
+      operationId: "   ",
+    }),
+    "parking",
+  );
+  const nullFinalize = {
+    type: "SESSION.PARK.FINALIZE",
+    status: "parked",
+    operationId: null as unknown as string,
+  } satisfies SessionMachineEvent;
+  assert.doesNotThrow(() => invalidFinalize.send(nullFinalize));
+  assert.equal(invalidFinalize.getSnapshot().status, "active");
+  assert.equal(invalidFinalize.getSnapshot().value, "parking");
+  invalidFinalize.stop();
+
+  const activeResume = actorFor(input());
+  assert.equal(
+    send(activeResume, { type: "SESSION.RESUME.REQUESTED", status: "resumed", operationId: "resume-op-2" }),
+    "active",
+  );
+  activeResume.stop();
+
+  const malformedResume = actorFor(input({ sessionState: "parked" }, "parked"));
+  const nullResume = {
+    type: "SESSION.RESUME.REQUESTED",
+    status: "resumed",
+    operationId: null as unknown as string,
+  } satisfies SessionMachineEvent;
+  assert.doesNotThrow(() => malformedResume.send(nullResume));
+  assert.equal(malformedResume.getSnapshot().status, "active");
+  assert.equal(malformedResume.getSnapshot().value, "parked");
+  malformedResume.stop();
+});
+
+test("park request requires the persisted session record to remain active", () => {
+  const contradictory = actorFor(input({}, "closed"));
+  assert.equal(contradictory.getSnapshot().value, "active");
+  assert.equal(contradictory.getSnapshot().can({ type: "SESSION.PARK.REQUESTED" }), false);
+  assert.equal(send(contradictory, { type: "SESSION.PARK.REQUESTED" }), "active");
+  contradictory.stop();
+
+  const closeReady = actorFor(input({ closeReadiness: "ready", phase: "termination" }));
+  assert.equal(closeReady.getSnapshot().value, "close-ready");
+  assert.equal(send(closeReady, { type: "SESSION.PARK.REQUESTED" }), "close-ready");
+  closeReady.stop();
+
+  const blockedRecoverable = actorFor(input({ blockers: [{ code: "RECOVERABLE_COMMITS" }] }));
+  assert.equal(blockedRecoverable.getSnapshot().value, "blocked-recoverable");
+  assert.equal(send(blockedRecoverable, { type: "SESSION.PARK.REQUESTED" }), "blocked-recoverable");
+  blockedRecoverable.stop();
+});
+
+test("parked sessions retain normal recovery guards and only resume from authoritative parked state", () => {
+  const recoverableParked = actorFor(
+    input({ sessionState: "parked", blockers: [{ code: "RECOVERABLE_COMMITS" }] }, "parked"),
+  );
+  assert.equal(recoverableParked.getSnapshot().value, "parked");
+  assert.equal(send(recoverableParked, { type: "SESSION.CLOSE.REQUESTED" }), "parked");
+  assert.equal(send(recoverableParked, { type: "SESSION.GC.REQUESTED" }), "parked");
+  assert.equal(send(recoverableParked, { type: "SESSION.DISCARD.REQUESTED" }), "discarded");
+  recoverableParked.stop();
+
+  const unknownParked = actorFor(input({ sessionState: "parked", physicalState: "unavailable" }, "parked"));
+  assert.equal(unknownParked.getSnapshot().value, "stale-inconsistent");
+  assert.equal(
+    send(unknownParked, { type: "SESSION.RESUME.REQUESTED", status: "resumed", operationId: "resume-op-3" }),
+    "stale-inconsistent",
+  );
+  unknownParked.stop();
 });
 
 test("evaluates close, discard, inspect/doctor/reconcile, and GC capability events", () => {

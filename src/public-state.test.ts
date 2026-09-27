@@ -45,6 +45,7 @@ test("classifyNawabariState/nawabariTransitionDecision/availableNawabariCommands
     "discard",
     "doctor",
     "inspect",
+    "park",
     "reconcile",
   ]);
 
@@ -55,6 +56,28 @@ test("classifyNawabariState/nawabariTransitionDecision/availableNawabariCommands
   const gcDecision = nawabariTransitionDecision(snapshot, "gc");
   assert.equal(gcDecision.allowed, false);
   assert.equal(gcDecision.reason, "age-is-not-destructive-authority");
+});
+
+test("public state projects parked decisions and operation availability from the canonical machine", () => {
+  const parked = classifyNawabariState({ sessionState: "parked", physicalState: "healthy" });
+  assert.equal(parked.state, "parked");
+  assert.deepEqual([...availableNawabariCommands(parked)].sort(), [
+    "close",
+    "discard",
+    "doctor",
+    "inspect",
+    "park",
+    "reconcile",
+    "resume",
+  ]);
+
+  const closeDecision = nawabariTransitionDecision(parked, "close");
+  assert.equal(closeDecision.allowed, true);
+  assert.equal(closeDecision.target, "close-ready");
+
+  const resumeDecision = nawabariTransitionDecision(parked, "resume");
+  assert.equal(resumeDecision.allowed, true);
+  assert.equal(resumeDecision.target, "active");
 });
 
 test("getNawabariSessionStateSnapshot observes a real session without CLI parsing or mutation", () => {

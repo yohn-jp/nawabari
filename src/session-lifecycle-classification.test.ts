@@ -82,6 +82,64 @@ test("explicit discard and closed records are terminal and distinguishable", () 
   assert.equal(lifecycleTransition(closed, "close").reason, "closed-terminal");
 });
 
+test("hydrates parked state after stale, discard, and closed precedence", () => {
+  const parked = classifySessionLifecycle({ sessionState: "parked", physicalState: "healthy" });
+  assert.equal(parked.state, "parked");
+  assert.deepEqual(lifecycleTransition(parked, "park"), {
+    operation: "park",
+    allowed: true,
+    target: "parked",
+    requiresExplicitIntent: true,
+    authority: "session-registry",
+    reason: "parked",
+  });
+  assert.deepEqual(lifecycleTransition(parked, "resume"), {
+    operation: "resume",
+    allowed: true,
+    target: "active",
+    requiresExplicitIntent: true,
+    authority: "caller",
+    reason: "resume-authorized",
+  });
+
+  assert.equal(
+    classifySessionLifecycle({ sessionState: "parked", physicalState: "unavailable" }).state,
+    "stale-inconsistent",
+  );
+  assert.equal(
+    classifySessionLifecycle({ sessionState: "parked", physicalState: "healthy", terminalOperation: "discard" }).state,
+    "discarded",
+  );
+  assert.equal(classifySessionLifecycle({ sessionState: "closed", physicalState: "closed" }).state, "closed");
+});
+
+test("parked termination keeps recoverable work and independent GC authorization guards", () => {
+  const recoverable = classifySessionLifecycle({
+    sessionState: "parked",
+    physicalState: "healthy",
+    closeReadiness: "external_evidence_required",
+    blockers: [{ code: "RECOVERABLE_COMMITS" }],
+    phase: "termination",
+    gcAuthorized: true,
+  });
+  assert.equal(recoverable.state, "parked");
+  assert.equal(lifecycleTransition(recoverable, "close").allowed, false);
+  assert.equal(lifecycleTransition(recoverable, "close").reason, "recoverable-work-must-be-retained-or-discarded");
+  assert.equal(lifecycleTransition(recoverable, "discard").allowed, true);
+  assert.equal(lifecycleTransition(recoverable, "gc").allowed, false);
+
+  const ready = classifySessionLifecycle({
+    sessionState: "parked",
+    physicalState: "healthy",
+    closeReadiness: "ready",
+    phase: "termination",
+    gcAuthorized: true,
+  });
+  assert.equal(ready.state, "parked");
+  assert.equal(lifecycleTransition(ready, "gc").allowed, true);
+  assert.equal(lifecycleTransition(ready, "gc").target, "closed");
+});
+
 test("age is diagnostic suspicion only for a healthy active session", () => {
   const classification = classifySessionLifecycle({
     sessionState: "active",
@@ -163,7 +221,9 @@ test("publishes a complete typed transition table", () => {
       "doctor",
       "gc",
       "inspect",
+      "park",
       "reconcile",
+      "resume",
     ]);
   }
 });
@@ -190,7 +250,7 @@ test("state-vocabulary alignment check deterministically detects drift instead o
   assert.deepEqual(drifted.missingFromMap, ["close-ready-renamed"]);
   assert.deepEqual(
     [...drifted.missingFromMachine].sort(),
-    ["blocked-recoverable", "close-ready", "closed", "discarded", "stale-inconsistent"].sort(),
+    ["blocked-recoverable", "close-ready", "closed", "discarded", "parked", "parking", "stale-inconsistent"].sort(),
   );
 
   const aligned = checkSessionLifecycleStateVocabularyAlignment(
