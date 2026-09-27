@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { runCli } from "./cli.js";
 import { repositoryKey } from "./control-repositories.js";
@@ -18,10 +19,13 @@ import {
 } from "./control-server.js";
 import { DomainError } from "./domain/errors.js";
 import { createLocalSessionBackend } from "./domain/session-backend.js";
+import { controlServerEndpointPath } from "./control-server-lease.js";
+import { RepositoryLock } from "./registry/lock.js";
 
 type Fixture = {
   readonly root: string;
   readonly catalog: string;
+  readonly operationalDirectory: string;
   readonly worktreeRoot: string;
 };
 
@@ -47,7 +51,12 @@ function fixture(t: test.TestContext): Fixture {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-control-server-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, "wt"));
-  return { root, catalog: path.join(root, "state", "control-repositories.json"), worktreeRoot: path.join(root, "wt") };
+  return {
+    root,
+    catalog: path.join(root, "state", "control-repositories.json"),
+    operationalDirectory: path.join(root, "control-server-operations"),
+    worktreeRoot: path.join(root, "wt"),
+  };
 }
 
 function repository(context: Fixture, name: string): string {
@@ -67,7 +76,7 @@ async function cli(context: Fixture, cwd: string, args: string[]): Promise<{ cod
   const stdout: string[] = [];
   const code = await runCli(["--json", ...args], {
     cwd,
-    controlServer: { catalogPath: context.catalog },
+    controlServer: { catalogPath: context.catalog, operationalDirectory: context.operationalDirectory },
     io: { stdout: (line) => stdout.push(line), stderr: () => undefined },
   });
   return { code, body: JSON.parse(stdout[0] ?? "{}") };
@@ -91,6 +100,7 @@ async function start(t: test.TestContext, context: Fixture, port = 0): Promise<T
     port,
     backend: createLocalSessionBackend(),
     catalogPath: context.catalog,
+    operationalDirectory: context.operationalDirectory,
   });
   if (!started.ok) throw started.error;
   const server = { ...started.value, token: fs.readFileSync(started.value.credentialFile, "utf8").trim() };
@@ -145,6 +155,94 @@ async function freePort(): Promise<number> {
   const port = (probe.address() as net.AddressInfo).port;
   await new Promise<void>((resolve) => probe.close(() => resolve()));
   return port;
+}
+
+type ServerWorkerReply =
+  | { readonly ok: true; readonly port: number; readonly url: string; readonly credentialFile: string }
+  | { readonly ok: false; readonly code: string; readonly reason?: string };
+
+function serverWorker(
+  operationalDirectory: string,
+  cwd: string,
+  port: number,
+): {
+  readonly child: ChildProcessWithoutNullStreams;
+  readonly firstReply: Promise<ServerWorkerReply>;
+} {
+  const moduleUrl = new URL("./control-server.ts", import.meta.url).href;
+  const tsxLoader = fileURLToPath(import.meta.resolve("tsx/esm"));
+  const script = `
+    const { startControlServer } = await import(process.env.NAWABARI_CONTROL_SERVER_MODULE);
+    const started = await startControlServer({
+      port: Number(process.env.NAWABARI_CONTROL_SERVER_PORT),
+      backend: {},
+      catalogPath: process.env.NAWABARI_CONTROL_SERVER_CATALOG,
+      operationalDirectory: process.env.NAWABARI_CONTROL_SERVER_OPERATIONAL_DIRECTORY,
+    });
+    if (!started.ok) {
+      process.stdout.write(JSON.stringify({ ok: false, code: started.error.code, reason: started.error.details?.reason }) + "\\n");
+    } else {
+      process.stdout.write(JSON.stringify({
+        ok: true,
+        port: started.value.port,
+        url: started.value.url,
+        credentialFile: started.value.credentialFile,
+      }) + "\\n");
+      process.on("SIGTERM", () => void started.value.close().then(() => process.exit(0)));
+    }
+  `;
+  const child = spawn(process.execPath, ["--import", tsxLoader, "--input-type=module", "-e", script], {
+    cwd,
+    env: {
+      ...process.env,
+      NAWABARI_CONTROL_SERVER_MODULE: moduleUrl,
+      NAWABARI_CONTROL_SERVER_PORT: String(port),
+      NAWABARI_CONTROL_SERVER_CATALOG: path.join(operationalDirectory, "catalog.json"),
+      NAWABARI_CONTROL_SERVER_OPERATIONAL_DIRECTORY: operationalDirectory,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stdin.end();
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  const firstReply = new Promise<ServerWorkerReply>((resolve, reject) => {
+    const onData = (chunk: string) => {
+      stdout += chunk;
+      const newline = stdout.indexOf("\n");
+      if (newline === -1) return;
+      child.stdout.off("data", onData);
+      try {
+        resolve(JSON.parse(stdout.slice(0, newline)) as ServerWorkerReply);
+      } catch (error: unknown) {
+        reject(new Error(`Control Server worker returned invalid JSON: ${stdout}; ${String(error)}`));
+      }
+    };
+    child.stdout.on("data", onData);
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (stdout.includes("\n")) return;
+      reject(new Error(`Control Server worker exited before replying (${code}): ${stderr}`));
+    });
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  return { child, firstReply };
+}
+
+function waitForWorkerClose(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => child.once("close", () => resolve()));
+}
+
+function stopWorkerAfterTest(t: test.TestContext, child: ChildProcessWithoutNullStreams): void {
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill("SIGKILL");
+    await waitForWorkerClose(child);
+  });
 }
 
 test("one loopback listener serves multiple repositories with isolated authority", async (t) => {
@@ -562,11 +660,16 @@ test("transport status mapping preserves domain error semantics", () => {
 test("port conflicts fail explicitly and shutdown releases the listener", async (t) => {
   const context = fixture(t);
   const port = await freePort();
-  const first = await start(t, context, port);
+  const occupier = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    occupier.once("error", reject);
+    occupier.listen(port, CONTROL_SERVER_HOST, resolve);
+  });
   const conflict = await startControlServer({
     port,
     backend: createLocalSessionBackend(),
     catalogPath: context.catalog,
+    operationalDirectory: context.operationalDirectory,
   });
   assert.equal(conflict.ok, false);
   if (!conflict.ok) {
@@ -577,9 +680,125 @@ test("port conflicts fail explicitly and shutdown releases the listener", async 
   assert.equal(conflictCli.code, 3);
   assert.equal(at(conflictCli.body, "details", "reason"), "address-in-use");
 
-  await first.close();
+  await new Promise<void>((resolve) => occupier.close(() => resolve()));
   const again = await start(t, context, port);
   assert.equal(again.port, port);
+});
+
+test("concurrent Control Server processes contend across ports and working directories", async (t) => {
+  const context = fixture(t);
+  const alternateCwd = path.join(context.root, "alternate-cwd");
+  fs.mkdirSync(alternateCwd);
+  const firstPort = await freePort();
+  let secondPort = await freePort();
+  while (secondPort === firstPort) secondPort = await freePort();
+
+  const first = serverWorker(context.operationalDirectory, context.root, firstPort);
+  const second = serverWorker(context.operationalDirectory, alternateCwd, secondPort);
+  stopWorkerAfterTest(t, first.child);
+  stopWorkerAfterTest(t, second.child);
+  const [firstReply, secondReply] = await Promise.all([first.firstReply, second.firstReply]);
+  const replies = [
+    { child: first.child, reply: firstReply },
+    { child: second.child, reply: secondReply },
+  ];
+  const active = replies.filter((entry) => entry.reply.ok);
+  assert.equal(active.length, 1, "only one process may publish an active listener");
+  const contender = replies.find((entry) => !entry.reply.ok);
+  assert.ok(contender);
+  if (!contender.reply.ok) {
+    assert.equal(contender.reply.code, "OPERATION_REJECTED");
+    assert.equal(contender.reply.reason, "server-already-running");
+  }
+  await waitForWorkerClose(contender.child);
+
+  const owner = active[0];
+  assert.ok(owner);
+  if (!owner.reply.ok) throw new Error("expected one active Control Server worker");
+  const token = fs.readFileSync(owner.reply.credentialFile, "utf8").trim();
+  assert.equal((await call({ port: owner.reply.port, token }, "/api/v1/health")).status, 200);
+  const endpointPath = controlServerEndpointPath(context.operationalDirectory);
+  const endpoint = JSON.parse(fs.readFileSync(endpointPath, "utf8")) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(endpoint).sort(), ["host", "owner", "port", "schema_version", "url"]);
+  assert.equal(endpoint.host, "127.0.0.1");
+  assert.equal(endpoint.port, owner.reply.port);
+  assert.equal(JSON.stringify(endpoint).includes(token), false, "the locator never stores the credential");
+  assert.equal("repository_id" in endpoint || "session_id" in endpoint, false);
+
+  owner.child.kill("SIGTERM");
+  await waitForWorkerClose(owner.child);
+  assert.equal(fs.existsSync(owner.reply.credentialFile), false, "signal shutdown removes the host credential");
+  assert.equal(fs.existsSync(endpointPath), false, "signal shutdown removes the owned endpoint locator");
+});
+
+test(
+  "Control Server crash recovery reclaims only the exact dead Linux process generation",
+  {
+    skip: process.platform !== "linux",
+  },
+  async (t) => {
+    const context = fixture(t);
+    const cwd = path.join(context.root, "first-cwd");
+    const restartCwd = path.join(context.root, "restart-cwd");
+    fs.mkdirSync(cwd);
+    fs.mkdirSync(restartCwd);
+    const first = serverWorker(context.operationalDirectory, cwd, await freePort());
+    stopWorkerAfterTest(t, first.child);
+    const firstReply = await first.firstReply;
+    assert.equal(firstReply.ok, true);
+    if (!firstReply.ok) throw new Error(`initial server failed: ${JSON.stringify(firstReply)}`);
+    const oldToken = fs.readFileSync(firstReply.credentialFile, "utf8").trim();
+    const endpointPath = controlServerEndpointPath(context.operationalDirectory);
+    const oldEndpoint = JSON.parse(fs.readFileSync(endpointPath, "utf8")) as {
+      owner: { generation: string };
+    };
+
+    first.child.kill("SIGKILL");
+    await waitForWorkerClose(first.child);
+    const restarted = serverWorker(context.operationalDirectory, restartCwd, await freePort());
+    stopWorkerAfterTest(t, restarted.child);
+    const restartReply = await restarted.firstReply;
+    assert.equal(restartReply.ok, true, JSON.stringify(restartReply));
+    if (!restartReply.ok) throw new Error(`restart failed: ${JSON.stringify(restartReply)}`);
+    const newToken = fs.readFileSync(restartReply.credentialFile, "utf8").trim();
+    assert.notEqual(newToken, oldToken, "each process lifetime receives a new credential");
+    const newEndpoint = JSON.parse(fs.readFileSync(endpointPath, "utf8")) as {
+      owner: { generation: string };
+    };
+    assert.notEqual(newEndpoint.owner.generation, oldEndpoint.owner.generation);
+    assert.equal((await call({ port: restartReply.port, token: oldToken }, "/api/v1/health")).status, 403);
+    assert.equal((await call({ port: restartReply.port, token: newToken }, "/api/v1/health")).status, 200);
+
+    restarted.child.kill("SIGTERM");
+    await waitForWorkerClose(restarted.child);
+  },
+);
+
+test("Control Server startup fails closed when the existing lease owner is unknown", async (t) => {
+  const context = fixture(t);
+  const unknownOwner = new RepositoryLock({
+    lockPath: path.join(context.operationalDirectory, "server.lock"),
+    staleAfterMs: 0,
+    acquireTimeoutMs: 0,
+    processStartTime: null,
+  });
+  const heldLease = await unknownOwner.acquire();
+  try {
+    const attempted = await startControlServer({
+      port: 0,
+      backend: createLocalSessionBackend(),
+      catalogPath: context.catalog,
+      operationalDirectory: context.operationalDirectory,
+    });
+    assert.equal(attempted.ok, false);
+    if (!attempted.ok) {
+      assert.equal(attempted.error.code, "OPERATION_REJECTED");
+      assert.equal(attempted.error.details?.reason, "server-owner-unknown");
+    }
+    assert.equal(fs.existsSync(controlServerEndpointPath(context.operationalDirectory)), false);
+  } finally {
+    await heldLease.release();
+  }
 });
 
 test("server CLI runs in the foreground on loopback, never prints the token, and stops on signal", async (t) => {
@@ -598,6 +817,7 @@ test("server CLI runs in the foreground on loopback, never prints the token, and
     io: { stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line) },
     controlServer: {
       catalogPath: context.catalog,
+      operationalDirectory: context.operationalDirectory,
       signal: controller.signal,
       onListening: (server) => {
         listening = server;

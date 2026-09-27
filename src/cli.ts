@@ -325,6 +325,7 @@ export type CliDependencies = {
   /** Optional Control Server composition; test/integration seam. */
   controlServer?: {
     readonly catalogPath?: string;
+    readonly operationalDirectory?: string;
     readonly signal?: AbortSignal;
     readonly onListening?: (server: ControlServer) => void;
   };
@@ -1819,7 +1820,14 @@ async function executeCommand(
     // Discovery metadata only: the current repository is recorded when it is
     // already Nawabari-managed; other known repositories stay visible.
     registerRepositoryLocator(catalogPath, dependencies.cwd);
-    const started = await startControlServer({ port, backend: dependencies.backend, catalogPath });
+    const started = await startControlServer({
+      port,
+      backend: dependencies.backend,
+      catalogPath,
+      ...(dependencies.controlServer?.operationalDirectory === undefined
+        ? {}
+        : { operationalDirectory: dependencies.controlServer.operationalDirectory }),
+    });
     if (!started.ok) return started;
     const endpoint: JsonObject = {
       schema: CONTROL_SERVER_SCHEMA,
