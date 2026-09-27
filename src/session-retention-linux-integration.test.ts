@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { runCli } from "./cli.js";
 import {
@@ -133,6 +134,25 @@ async function dispatchPark(
   return { exitCode, stdout, stderr, body: JSON.parse(output!) as Record<string, unknown> };
 }
 
+function runPublicCli(
+  args: readonly string[],
+  options: Readonly<{ cwd: string; stdout: string[]; stderr: string[] }>,
+): Promise<number> {
+  const cliEntry = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist/index.js");
+  const child = spawn(process.execPath, [cliEntry, ...args], {
+    cwd: options.cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string | Buffer) => options.stdout.push(String(chunk)));
+  child.stderr?.on("data", (chunk: string | Buffer) => options.stderr.push(String(chunk)));
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code ?? 1));
+  });
+}
+
 function latestExecution(registry: SessionRegistry, sessionId: string): PersistedSessionExecutionRecord | undefined {
   return registry.listSessionExecutions(sessionId).at(-1);
 }
@@ -236,13 +256,10 @@ test(LINUX_SYSTEM_TEST_TITLE, async (t) => {
     "child.once('exit', () => process.exit(0));",
     "setInterval(() => {}, 1000);",
   ].join("\n");
-  runPromise = runCli(["--json", "session", "run", "--session", sessionId, "--", "node", "-e", payload], {
+  runPromise = runPublicCli(["--json", "session", "run", "--session", sessionId, "--", "node", "-e", payload], {
     cwd: targetWorktreePath,
-    backend,
-    io: {
-      stdout: (line) => runStdout.push(line),
-      stderr: (line) => runStderr.push(line),
-    },
+    stdout: runStdout,
+    stderr: runStderr,
   }).then(
     (exitCode) => {
       runCompletion = { exitCode, rejected: false };
