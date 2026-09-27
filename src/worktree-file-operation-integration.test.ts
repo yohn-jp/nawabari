@@ -36,6 +36,8 @@ type Fixture = {
   readonly baseRevision: string;
   readonly repositoryIdentity: RepositoryIdentity;
   readonly paths: readonly string[];
+  readonly executionScope: unknown;
+  readonly candidateWorkingSet: unknown;
 };
 
 const PROFILE_DIGEST_A = "a".repeat(64);
@@ -53,7 +55,15 @@ function runGit(args: readonly string[], cwd: string): string {
   ).trim();
 }
 
-function createFixture(): Fixture {
+function createFixture(
+  options: {
+    readonly claimEnforcement?: boolean;
+    readonly initialClaims?: readonly {
+      readonly resource: string;
+      readonly mode: "read" | "write" | "exclusive-write";
+    }[];
+  } = {},
+): Fixture {
   const repository = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-file-operation-repository-"));
   const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-file-operation-worktrees-"));
   runGit(["init", "--quiet", "-b", "main"], repository);
@@ -113,9 +123,20 @@ function createFixture(): Fixture {
     baseRef: "main",
     executionScope,
     candidateWorkingSet,
-    initialClaims: [{ resource: "docs/**", mode: "write" }],
+    ...(options.claimEnforcement === true ? { claimEnforcement: true } : {}),
+    initialClaims: options.initialClaims ?? [{ resource: "docs/**", mode: "write" }],
   });
-  return { repository, worktreeRoot, registry, session, baseRevision, repositoryIdentity, paths };
+  return {
+    repository,
+    worktreeRoot,
+    registry,
+    session,
+    baseRevision,
+    repositoryIdentity,
+    paths,
+    executionScope,
+    candidateWorkingSet,
+  };
 }
 
 function cleanupFixture(fixture: Fixture): void {
@@ -214,8 +235,12 @@ function expectedAuthorityToken(
     repository: fixture.repositoryIdentity,
     base: { branch: "main", revision: fixture.baseRevision },
     working_set: inputs.working_set ?? session.workingSet,
-    claims: fixture.registry.listClaims(fixture.session.sessionId),
-    claim_set_generation: state.claim_set_generation,
+    ...(fixture.session.claimEnforcement === true
+      ? {
+          claims: fixture.registry.listClaims(fixture.session.sessionId),
+          claim_set_generation: state.claim_set_generation,
+        }
+      : {}),
     runtime_epoch: state.runtime_epoch,
     worktree_path: fixture.session.worktreePath,
   });
@@ -316,19 +341,20 @@ function fileIdentity(file: string): { dev: string; ino: string; size: number; d
 function successfulHelper(calls: { value: number }): (packet: string) => string {
   return (packet) => {
     calls.value += 1;
-    const request = JSON.parse(packet) as Record<string, string>;
-    const root = request.root;
-    const target = path.join(root, request.path);
+    const request = JSON.parse(packet) as Record<string, unknown>;
+    const root = request.root as string;
+    const requestPath = request.path as string;
+    const target = path.join(root, requestPath);
     if (request.operation === "CREATE") {
-      fs.writeFileSync(target, Buffer.from(request.payload_base64 ?? "", "base64"));
+      fs.writeFileSync(target, Buffer.from((request.payload_base64 as string | undefined) ?? "", "base64"));
     } else if (request.operation === "DELETE") {
       fs.unlinkSync(target);
     } else {
-      fs.renameSync(target, path.join(root, request.to_path));
+      fs.renameSync(target, path.join(root, request.to_path as string));
     }
-    const identityPath = request.operation === "DELETE" ? target : path.join(root, request.to_path ?? request.path);
-    const identity =
-      request.operation === "DELETE" ? JSON.parse(request.expected ?? "null") : fileIdentity(identityPath);
+    const identityPath =
+      request.operation === "DELETE" ? target : path.join(root, (request.to_path as string | undefined) ?? requestPath);
+    const identity = request.operation === "DELETE" ? request.expected : fileIdentity(identityPath);
     return JSON.stringify({ ok: true, identity });
   };
 }
@@ -341,6 +367,163 @@ function assertUncertain(error: unknown): boolean {
 
 test("file operations retain integrated registry features", () => {
   assert.ok(SUPPORTED_REGISTRY_FEATURES.includes(FILE_OPERATION_REQUIRED_FEATURE));
+});
+
+test("claims-off CREATE, DELETE, and RENAME use the real registry mutation path", () => {
+  const fixture = createFixture({ initialClaims: [] });
+  const source = python3Source();
+  try {
+    if (source === null) return;
+    assert.deepEqual(fixture.registry.listClaims(fixture.session.sessionId), []);
+    const policy = { ...policyFor(fixture, profileBoundary(PROFILE_DIGEST_A)), claims: [], resource_claims: [] };
+    const calls = { value: 0 };
+    const execution = () => executionOptions(source, successfulHelper(calls));
+
+    const create = operation(fixture, "claims-off-create", "docs/success.txt");
+    fixture.registry.executeFileOperation(create, { ...execution(), policy });
+    assert.equal(fs.existsSync(path.join(fixture.session.worktreePath, create.path)), true);
+    assert.equal(receipt(fixture.registry, create.operation_id).stage, "completed");
+
+    const deletePath = "docs/other.txt";
+    const deleteFile = path.join(fixture.session.worktreePath, deletePath);
+    fs.writeFileSync(deleteFile, "delete me\n");
+    const remove = operation(fixture, "claims-off-delete", deletePath, {
+      operation: "DELETE",
+      expected_identity: fileIdentity(deleteFile),
+      scope: { create: [], delete: [deletePath], deny: [] },
+      payload_ref: undefined,
+    });
+    fixture.registry.executeFileOperation(remove, { ...execution(), policy });
+    assert.equal(fs.existsSync(deleteFile), false);
+    assert.equal(receipt(fixture.registry, remove.operation_id).stage, "completed");
+
+    const renameSource = "docs/rename-source.txt";
+    const renameTarget = "docs/rename-target.txt";
+    const renameFile = path.join(fixture.session.worktreePath, renameSource);
+    fs.writeFileSync(renameFile, "rename me\n");
+    const rename = operation(fixture, "claims-off-rename", renameSource, {
+      operation: "RENAME",
+      to_path: renameTarget,
+      expected_identity: fileIdentity(renameFile),
+      scope: { create: [renameTarget], delete: [renameSource], deny: [] },
+      payload_ref: undefined,
+    });
+    const renameWorkingSet = {
+      ...fixture.session.workingSet,
+      scope: { ...fixture.session.workingSet?.scope, rename: [renameSource, renameTarget] },
+    };
+    fixture.registry.executeFileOperation(rename, {
+      ...execution(),
+      policy: policyFor(fixture, profileBoundary(PROFILE_DIGEST_A), renameWorkingSet),
+    });
+    assert.equal(fs.existsSync(renameFile), false);
+    assert.equal(fs.existsSync(path.join(fixture.session.worktreePath, renameTarget)), true);
+    assert.equal(receipt(fixture.registry, rename.operation_id).stage, "completed");
+    assert.equal(calls.value, 3);
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
+test("claims-off typed mutation still rejects an active other-session claim conflict", () => {
+  const fixture = createFixture({ initialClaims: [] });
+  try {
+    const candidateWorkingSet = {
+      ...(fixture.candidateWorkingSet as Record<string, unknown>),
+      workingSetId: "candidate-file-operation-conflict",
+    };
+    fixture.registry.provision({
+      worktreePath: path.join(fixture.worktreeRoot, "file-operation-conflicting-session"),
+      branchName: "feature/file-operation-conflict",
+      baseRef: "main",
+      executionScope: fixture.executionScope,
+      candidateWorkingSet,
+      initialClaims: [{ resource: "docs/success.txt", mode: "write" }],
+    });
+    const conflictingOperation = operation(fixture, "claims-off-conflict", "docs/success.txt");
+    assert.throws(
+      () =>
+        fixture.registry.executeFileOperation(conflictingOperation, {
+          landlock_helper: null,
+          runtime_projection: null,
+          policy: policyFor(fixture, profileBoundary(PROFILE_DIGEST_A)),
+        }),
+      (error: unknown) => error instanceof Error && "code" in error && error.code === "RESOURCE_CLAIM_CONFLICT",
+    );
+    assert.deepEqual(fixture.registry.fileOperations(fixture.session.sessionId), []);
+    assert.equal(fs.existsSync(path.join(fixture.session.worktreePath, conflictingOperation.path)), false);
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
+test("a completed receipt replays before a later claim conflict or stale claim generation", () => {
+  const fixture = createFixture({ initialClaims: [] });
+  const source = python3Source();
+  try {
+    if (source === null) return;
+    const operationValue = operation(fixture, "claims-off-response-loss", "docs/success.txt");
+    const policy = policyFor(fixture, profileBoundary(PROFILE_DIGEST_A));
+    const helperCalls = { value: 0 };
+    const first = fixture.registry.executeFileOperation(operationValue, {
+      ...executionOptions(source, successfulHelper(helperCalls)),
+      policy,
+    });
+
+    const candidateWorkingSet = {
+      ...(fixture.candidateWorkingSet as Record<string, unknown>),
+      workingSetId: "candidate-file-operation-after-completion",
+    };
+    fixture.registry.provision({
+      worktreePath: path.join(fixture.worktreeRoot, "file-operation-late-conflict"),
+      branchName: "feature/file-operation-late-conflict",
+      baseRef: "main",
+      executionScope: fixture.executionScope,
+      candidateWorkingSet,
+      initialClaims: [{ resource: operationValue.path, mode: "write" }],
+    });
+
+    const replay = fixture.registry.executeFileOperation(operationValue, {
+      ...executionOptions(source, () => {
+        helperCalls.value += 1;
+        throw new Error("a completed receipt must not replay physical I/O");
+      }),
+      policy,
+    });
+    assert.equal(first.operation_id, replay.operation_id);
+    assert.equal(first.operation, replay.operation);
+    assert.equal(first.state, replay.state);
+    assert.equal(helperCalls.value, 1);
+    assert.equal(receipt(fixture.registry, operationValue.operation_id).stage, "completed");
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
+test("claims-on typed mutation still requires sufficient own claim strength", () => {
+  for (const initialClaims of [[], [{ resource: "docs/success.txt", mode: "read" as const }]]) {
+    const fixture = createFixture({ claimEnforcement: true, initialClaims });
+    try {
+      const conflictingOperation = operation(
+        fixture,
+        initialClaims.length === 0 ? "claims-on-missing" : "claims-on-insufficient",
+        "docs/success.txt",
+      );
+      assert.throws(
+        () =>
+          fixture.registry.executeFileOperation(conflictingOperation, {
+            landlock_helper: null,
+            runtime_projection: null,
+            policy: policyFor(fixture, profileBoundary(PROFILE_DIGEST_A)),
+          }),
+        (error: unknown) => error instanceof Error && "code" in error && error.code === "OPERATION_REJECTED",
+      );
+      assert.deepEqual(fixture.registry.fileOperations(fixture.session.sessionId), []);
+      assert.equal(fs.existsSync(path.join(fixture.session.worktreePath, conflictingOperation.path)), false);
+    } finally {
+      cleanupFixture(fixture);
+    }
+  }
 });
 
 test("authority tokens hash applied, legacy, changed-scope, and changed-digest profile boundaries", () => {

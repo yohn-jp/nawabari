@@ -199,6 +199,41 @@ test("validation requires both typed authority and exact endpoint scope", () => 
   }
 });
 
+test("claims-off validation keeps exact scopes while making claim enforcement optional", () => {
+  const root = fixture();
+  try {
+    const unclaimedCreate = {
+      ...request(root, "CREATE", "docs/new.txt", null),
+      claims: [],
+    };
+    assert.equal(validateWorktreeFileOperation(unclaimedCreate).ok, false);
+    assert.equal(validateWorktreeFileOperation(unclaimedCreate, { requireClaim: false }).ok, true);
+    const generationZeroCreate = { ...unclaimedCreate, requested_generation: 0 };
+    assert.equal(validateWorktreeFileOperation(generationZeroCreate, { requireClaim: false }).ok, false);
+    assert.equal(
+      validateWorktreeFileOperation(generationZeroCreate, { requireClaim: false, allowZeroGeneration: true }).ok,
+      true,
+    );
+
+    const unclaimedRename = {
+      ...request(root, "RENAME", "docs/source.txt", digest("source")),
+      to_path: "renamed/target.txt",
+      scope: { create: ["renamed/**"], delete: ["docs/**"], deny: [] },
+      claims: [],
+    };
+    assert.equal(validateWorktreeFileOperation(unclaimedRename, { requireClaim: false }).ok, true);
+    assert.equal(
+      validateWorktreeFileOperation(
+        { ...unclaimedRename, scope: { create: [], delete: ["docs/**"], deny: [] } },
+        { requireClaim: false },
+      ).ok,
+      false,
+    );
+  } finally {
+    cleanup(root);
+  }
+});
+
 test("execution fails closed without the canonical materialized Landlock helper", () => {
   const root = fixture();
   try {

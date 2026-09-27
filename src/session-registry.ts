@@ -1477,6 +1477,12 @@ export class SessionRegistry {
       if (reservation.record.stage === "completed") return replayedFileOperationResult(reservation.record);
       throw uncertainFileOperation(operation.operation_id, "The durable receipt requires reconciliation.");
     }
+    const reservationToken = reservation.token;
+    if (reservationToken === null) {
+      throw new SessionRegistryError("REGISTRY_CORRUPT", "A new file-operation reservation has no authority token", {
+        operationId: operation.operation_id,
+      });
+    }
 
     let currentBeforeIo: FileOperationAuthorityContext;
     try {
@@ -1488,7 +1494,7 @@ export class SessionRegistry {
         error instanceof Error ? error.message : "Current file-operation authority could not be rebuilt.",
       );
     }
-    const beforeIoFence = validateFilesystemPolicyToken(reservation.token, currentBeforeIo.token);
+    const beforeIoFence = validateFilesystemPolicyToken(reservationToken, currentBeforeIo.token);
     if (!beforeIoFence.ok) {
       this.finalizeFileOperationUnresolved(operation.operation_id);
       throw uncertainFileOperation(operation.operation_id, "The file-operation authority changed before physical I/O.");
@@ -1496,7 +1502,10 @@ export class SessionRegistry {
 
     let prepared: ReturnType<typeof prepareWorktreeFileOperation>;
     try {
-      prepared = prepareWorktreeFileOperation(reservation.operation);
+      prepared = prepareWorktreeFileOperation(reservation.operation, {
+        requireClaim: reservation.requireClaim,
+        allowZeroGeneration: !reservation.requireClaim,
+      });
     } catch (error: unknown) {
       this.finalizeFileOperationUnresolved(operation.operation_id);
       throw uncertainFileOperation(
@@ -1515,9 +1524,10 @@ export class SessionRegistry {
     } catch (error: unknown) {
       this.finalizeFileOperation(
         operation.operation_id,
-        reservation.token,
+        reservationToken,
         reservation.operation,
         executionOptions,
+        reservation.requireClaim,
         observeFileOperationWithoutResult(reservation.record, prepared.value.request),
       );
       throw uncertainFileOperation(
@@ -1528,9 +1538,10 @@ export class SessionRegistry {
     if (!physical.ok) {
       this.finalizeFileOperation(
         operation.operation_id,
-        reservation.token,
+        reservationToken,
         reservation.operation,
         executionOptions,
+        reservation.requireClaim,
         observeFileOperationWithoutResult(reservation.record, prepared.value.request),
       );
       throw uncertainFileOperation(operation.operation_id, physical.error.message);
@@ -1539,15 +1550,16 @@ export class SessionRegistry {
     const observation = observeFileOperationEffect(reservation.record, physical.value, prepared.value.request);
     try {
       const currentAfterIo = this.fileOperationAuthority(operation, executionOptions);
-      validateFilesystemPolicyToken(reservation.token, currentAfterIo.token);
+      validateFilesystemPolicyToken(reservationToken, currentAfterIo.token);
     } catch {
       // The final locked authority read is the completion decision.
     }
     const reconciled = this.finalizeFileOperation(
       operation.operation_id,
-      reservation.token,
+      reservationToken,
       reservation.operation,
       executionOptions,
+      reservation.requireClaim,
       observation,
     );
     if (reconciled.disposition !== "completed") {
@@ -1958,6 +1970,7 @@ export class SessionRegistry {
       }
       const outcomes = evaluation.outcomes.map((outcome) => ({ ...outcome }));
       let blocked = outcomes.some((outcome) => outcome.status !== "granted");
+      const claimEnforcementEnabled = owner.claimEnforcement === true;
       for (const [index, outcome] of outcomes.entries()) {
         if (outcome.status !== "granted" || outcome.operation === "READONLY") continue;
         const activeClaims = state.claims.filter((claim) =>
@@ -1971,7 +1984,7 @@ export class SessionRegistry {
           (claim) =>
             claim.sessionId !== requestedSessionId && resourceClaimConflictsWithAccess(claim, outcome.path, "write"),
         );
-        if (grantingClaim === undefined || conflictingClaim !== undefined) {
+        if ((claimEnforcementEnabled && grantingClaim === undefined) || conflictingClaim !== undefined) {
           outcomes[index] = Object.freeze({
             ...outcome,
             status: "denied",
@@ -7247,16 +7260,54 @@ export class SessionRegistry {
     executionOptions: FileOperationExecutionOptions,
   ): FileOperationReservationContext {
     const state = this.readStateUnsafe();
-    return reserveFileOperationUnsafe(this, state, operation, executionOptions, (runtimeRecords, revision) => {
-      this.writeUnsafe(
-        state.sessions,
-        state.claims,
-        state.claimSetGeneration,
-        revision,
-        state.runtimeEpoch,
-        runtimeRecords,
-      );
-    });
+    return reserveFileOperationUnsafe(
+      this,
+      state,
+      operation,
+      executionOptions,
+      (runtimeRecords, revision) => {
+        this.writeUnsafe(
+          state.sessions,
+          state.claims,
+          state.claimSetGeneration,
+          revision,
+          state.runtimeEpoch,
+          runtimeRecords,
+        );
+      },
+      (currentState, session, currentOperation) =>
+        this.assertNoOtherSessionFileOperationConflict(currentState, session, currentOperation),
+    );
+  }
+
+  private assertNoOtherSessionFileOperationConflict(
+    state: RegistryState,
+    session: SessionRecord,
+    operation: WorktreeFileOperation,
+  ): void {
+    const activeSessionIds = new Set(
+      state.sessions.filter((record) => record.state === "active").map((record) => record.sessionId),
+    );
+    const paths = (operation.operation === "RENAME" ? [operation.path, operation.to_path ?? ""] : [operation.path]).map(
+      (resource) => resource.replaceAll("\\", "/").normalize("NFC"),
+    );
+    for (const resource of paths) {
+      const conflictingClaim = state.claims.find((claim) => {
+        if (claim.sessionId === session.sessionId || !activeSessionIds.has(claim.sessionId)) return false;
+        return resourceClaimConflictsWithAccess(claim, resource, "write");
+      });
+      if (conflictingClaim === undefined) continue;
+      const conflictDetails = this.resourceClaimConflictDetails({ resource, mode: "write" }, conflictingClaim, {
+        sessions: state.sessions,
+        claims: state.claims,
+      });
+      throw claimError("RESOURCE_CLAIM_CONFLICT", "File operation conflicts with an active session claim", {
+        operationId: operation.operation_id,
+        ...conflictDetails,
+        safeActions: [...safeActionsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails)],
+        recoveryHints: recoveryHintsForCode("RESOURCE_CLAIM_CONFLICT", conflictDetails),
+      });
+    }
   }
 
   private finalizeFileOperationUnresolved(operationId: string): void {
@@ -7296,6 +7347,7 @@ export class SessionRegistry {
     token: FilesystemPolicyToken,
     operation: WorktreeFileOperation,
     executionOptions: FileOperationExecutionOptions,
+    requireClaim: boolean,
     observation: FileOperationObservation,
   ): ReturnType<typeof reconcileFileOperationReceiptAuthority> {
     let finalPolicyInput: CollectedFileOperationPolicyInput | undefined;
@@ -7314,7 +7366,9 @@ export class SessionRegistry {
         });
       }
       let authorityCurrent = false;
-      if (finalPolicyInput !== undefined) {
+      const session = state.sessions.find((candidate) => candidate.sessionId === operation.session_id);
+      const claimModeUnchanged = session !== undefined && (session.claimEnforcement === true) === requireClaim;
+      if (claimModeUnchanged && finalPolicyInput !== undefined) {
         try {
           const current = currentFileOperationAuthority(this, state, operation, executionOptions, finalPolicyInput);
           authorityCurrent = validateFilesystemPolicyToken(token, current.token).ok;
@@ -7410,9 +7464,10 @@ export class SessionRegistry {
 
 interface FileOperationReservationContext {
   readonly record: FileOperationRecord;
-  readonly token: FilesystemPolicyToken;
+  readonly token: FilesystemPolicyToken | null;
   readonly operation: WorktreeFileOperation;
   readonly replay: boolean;
+  readonly requireClaim: boolean;
 }
 
 interface FileOperationAuthorityContext {
@@ -7487,6 +7542,7 @@ function reserveFileOperationUnsafe(
   operation: WorktreeFileOperation,
   executionOptions: FileOperationExecutionOptions,
   persist: (runtimeRecords: ParsedRuntimeRecords, registryRevision: number) => void,
+  assertNoClaimConflict: (state: RegistryState, session: SessionRecord, operation: WorktreeFileOperation) => void,
 ): FileOperationReservationContext {
   const session = state.sessions.find((candidate) => candidate.sessionId === operation.session_id);
   if (session === undefined) {
@@ -7503,6 +7559,32 @@ function reserveFileOperationUnsafe(
       },
     );
   }
+  const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
+  const existing = fileOperations.fileOperations.find((candidate) => candidate.operationId === operation.operation_id);
+  if (existing !== undefined && existing.stage !== "prepared") {
+    let existingRequest: FileOperationRequest;
+    try {
+      existingRequest = fileOperationRequest(operation, existing.authorityToken);
+      if (fileOperationRequestDigest(existingRequest) !== existing.requestDigest) {
+        throw new SessionRegistryError(
+          "FILE_OPERATION_ID_CONFLICT",
+          "operation_id is already bound to another request",
+          {
+            operationId: operation.operation_id,
+          },
+        );
+      }
+    } catch (error: unknown) {
+      throw error instanceof SessionRegistryError ? error : fileOperationRegistryError(error);
+    }
+    return {
+      record: existing,
+      token: null,
+      operation,
+      replay: true,
+      requireClaim: session.claimEnforcement === true,
+    };
+  }
   if (operation.requested_generation !== state.claimSetGeneration) {
     throw new SessionRegistryError("STALE_CLAIM_SET", "File-operation requested_generation is stale", {
       requestedGeneration: operation.requested_generation,
@@ -7511,6 +7593,7 @@ function reserveFileOperationUnsafe(
   }
 
   const authority = currentFileOperationAuthority(registry, state, operation, executionOptions);
+  assertNoClaimConflict(state, session, operation);
   const currentPolicy = authority.policy;
   const rebuilt = rebuildFileOperation(registry, state, session, operation, currentPolicy);
   const postReservationRevision = nextRegistryRevision(state);
@@ -7526,8 +7609,6 @@ function reserveFileOperationUnsafe(
   const token = tokenResult.value;
   const authorityToken = fileOperationAuthorityToken(token);
   let request = fileOperationRequest(rebuilt, authorityToken);
-  const fileOperations = fileOperationStateFromRuntimeRecords(state.runtimeRecords);
-  const existing = fileOperations.fileOperations.find((candidate) => candidate.operationId === request.operationId);
   if (existing !== undefined) {
     const existingRequest = fileOperationRequest(rebuilt, existing.authorityToken);
     if (fileOperationRequestDigest(existingRequest) !== existing.requestDigest) {
@@ -7536,7 +7617,14 @@ function reserveFileOperationUnsafe(
       });
     }
     request = existingRequest;
-    if (existing.stage !== "prepared") return { record: existing, token, operation: rebuilt, replay: true };
+    if (existing.stage !== "prepared")
+      return {
+        record: existing,
+        token,
+        operation: rebuilt,
+        replay: true,
+        requireClaim: session.claimEnforcement === true,
+      };
   }
   let record: FileOperationRecord;
   try {
@@ -7557,7 +7645,7 @@ function reserveFileOperationUnsafe(
   }
   const nextRuntimeRecords = runtimeRecordsWithFileOperations(state.runtimeRecords, fileOperations);
   persist(nextRuntimeRecords, postReservationRevision);
-  return { record: applied, token, operation: rebuilt, replay: false };
+  return { record: applied, token, operation: rebuilt, replay: false, requireClaim: session.claimEnforcement === true };
 }
 
 function currentFileOperationAuthority(
@@ -7634,11 +7722,16 @@ function compileFileOperationPolicy(
     workingSetRecord?.base ??
     supplied.base ??
     (session.baseRevision === undefined ? undefined : { branch: session.branchName, revision: session.baseRevision });
+  const claims =
+    session.claimEnforcement === true
+      ? state.claims.filter((claim) => claim.sessionId === session.sessionId)
+      : undefined;
   const result = compileEffectiveFilesystemPolicy({
     ...supplied,
     ...(workingSet === undefined ? { working_set: undefined } : { working_set: workingSet }),
-    claims: state.claims.filter((claim) => claim.sessionId === session.sessionId),
-    claim_set_generation: state.claimSetGeneration,
+    claims,
+    resource_claims: claims,
+    ...(session.claimEnforcement === true ? { claim_set_generation: state.claimSetGeneration } : {}),
     runtime_epoch: state.runtimeEpoch,
     repository,
     ...(base === undefined ? {} : { base }),
@@ -7666,9 +7759,13 @@ function rebuildFileOperation(
   operation: WorktreeFileOperation,
   policy: EffectiveFilesystemPolicy,
 ): WorktreeFileOperation {
-  const claims = state.claims
-    .filter((claim) => claim.sessionId === session.sessionId)
-    .map((claim) => ({ resource: claim.resource, mode: claim.mode }));
+  const claims =
+    session.claimEnforcement === true
+      ? state.claims
+          .filter((claim) => claim.sessionId === session.sessionId)
+          .filter((claim) => claimModeGrantsAccess(claim.mode, "write"))
+          .map((claim) => ({ resource: claim.resource, mode: claim.mode }))
+      : [];
   return {
     ...operation,
     worktree_root: session.worktreePath,

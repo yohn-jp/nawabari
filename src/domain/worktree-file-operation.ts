@@ -131,6 +131,11 @@ export type WorktreeFileOperationExecutionOptions = Readonly<{
 }>;
 
 type RecordValue = Record<string, unknown>;
+type WorktreeFileOperationValidationOptions = Readonly<{
+  readonly requireClaim?: boolean;
+  /** Registry-only allowance for its canonical, not-yet-mutated generation zero. */
+  readonly allowZeroGeneration?: boolean;
+}>;
 type HelperIdentity = Readonly<{
   readonly dev: string;
   readonly ino: string;
@@ -187,8 +192,8 @@ function operation(value: unknown): DomainResult<WorktreeFileOperationName> {
   return success(value as WorktreeFileOperationName);
 }
 
-function positiveGeneration(value: unknown): DomainResult<number> {
-  if (!Number.isSafeInteger(value) || (value as number) < 1)
+function positiveGeneration(value: unknown, allowZero = false): DomainResult<number> {
+  if (!Number.isSafeInteger(value) || (value as number) < (allowZero ? 0 : 1))
     return invalid("requested_generation", "expected a positive integer");
   return success(value as number);
 }
@@ -314,7 +319,10 @@ function parseRoot(value: unknown): DomainResult<string> {
   }
 }
 
-function parseOperation(input: unknown): DomainResult<WorktreeFileOperation> {
+function parseOperation(
+  input: unknown,
+  options: WorktreeFileOperationValidationOptions = {},
+): DomainResult<WorktreeFileOperation> {
   const value = objectValue(input);
   if (value === null) return invalid("operation", "expected an object");
   if (value.contract_id !== WORKTREE_FILE_OPERATION_CONTRACT_ID) return invalid("contract_id", "unsupported contract");
@@ -352,7 +360,7 @@ function parseOperation(input: unknown): DomainResult<WorktreeFileOperation> {
     expectedIdentity === undefined
   )
     return invalid("expected_digest", "DELETE and RENAME require an expected identity");
-  const generation = positiveGeneration(value.requested_generation);
+  const generation = positiveGeneration(value.requested_generation, options.allowZeroGeneration === true);
   if (!generation.ok) return generation;
   const scopeValue = scope(value.scope);
   if (!scopeValue.ok) return scopeValue;
@@ -435,23 +443,26 @@ function buildHelperPacket(request: WorktreeFileOperation): Readonly<Record<stri
 }
 
 /** Validate and freeze one transport-neutral operation request. */
-export function validateWorktreeFileOperation(input: unknown): DomainResult<WorktreeFileOperation> {
-  const parsed = parseOperation(input);
+export function validateWorktreeFileOperation(
+  input: unknown,
+  options: WorktreeFileOperationValidationOptions = {},
+): DomainResult<WorktreeFileOperation> {
+  const parsed = parseOperation(input, options);
   if (!parsed.ok) return parsed;
   const request = parsed.value;
+  const requireClaim = options.requireClaim !== false;
   if (request.operation === "CREATE") {
-    if (!operationScopeAllows(request, request.path, "create") || !claimAllows(request, request.path))
+    if (!operationScopeAllows(request, request.path, "create") || (requireClaim && !claimAllows(request, request.path)))
       return rejected("CREATE is outside the effective create scope or claim");
   } else if (request.operation === "DELETE") {
-    if (!operationScopeAllows(request, request.path, "delete") || !claimAllows(request, request.path))
+    if (!operationScopeAllows(request, request.path, "delete") || (requireClaim && !claimAllows(request, request.path)))
       return rejected("DELETE is outside the effective delete scope or claim");
   } else {
     if (
       request.to_path === undefined ||
       !operationScopeAllows(request, request.path, "delete") ||
       !operationScopeAllows(request, request.to_path, "create") ||
-      !claimAllows(request, request.path) ||
-      !claimAllows(request, request.to_path)
+      (requireClaim && (!claimAllows(request, request.path) || !claimAllows(request, request.to_path)))
     )
       return rejected("RENAME requires delete and create authority at both endpoints");
   }
@@ -459,8 +470,11 @@ export function validateWorktreeFileOperation(input: unknown): DomainResult<Work
 }
 
 /** Prepare a validated request and materialize its fixed helper packet. */
-export function prepareWorktreeFileOperation(input: unknown): DomainResult<PreparedWorktreeFileOperation> {
-  const request = validateWorktreeFileOperation(input);
+export function prepareWorktreeFileOperation(
+  input: unknown,
+  options: WorktreeFileOperationValidationOptions = {},
+): DomainResult<PreparedWorktreeFileOperation> {
+  const request = validateWorktreeFileOperation(input, options);
   if (!request.ok) return request;
   return success(
     Object.freeze({
