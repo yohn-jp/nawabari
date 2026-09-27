@@ -521,6 +521,9 @@ test("the default strict FHS projection keeps the development baseline functiona
   git(["commit", "--quiet", "-m", "initial"]);
 
   const backend = new LocalSessionBackend();
+  let homeSentinelDirectory: string | null = null;
+  let toolSentinelDirectory: string | null = null;
+  const missingUserToolDirectories: string[] = [];
   try {
     const created = await backend.createSession(
       { cwd: repository },
@@ -583,9 +586,27 @@ test("the default strict FHS projection keeps the development baseline functiona
       );
     }
 
-    const hostHome = discovered.user_home ?? "/home/host-user";
+    const hostHome = discovered.user_home;
+    if (hostHome === null || hostHome === undefined) {
+      throw new Error("strict FHS host visibility proof requires an absolute host HOME");
+    }
     const userToolPath = discovered.user_local_bin ?? path.join(hostHome, ".local", "bin");
-    const hiddenHostPaths = ["/usr/bin/sh", "/bin/ls", "/nix/store", hostHome, userToolPath];
+    if (userToolPath.startsWith(`${hostHome}${path.sep}`)) {
+      for (let directory = userToolPath; directory !== hostHome && !fs.existsSync(directory);) {
+        missingUserToolDirectories.push(directory);
+        const parent = path.dirname(directory);
+        if (parent === directory) break;
+        directory = parent;
+      }
+    }
+    fs.mkdirSync(userToolPath, { recursive: true });
+    homeSentinelDirectory = fs.mkdtempSync(path.join(hostHome, ".nawabari-fhs-home-visibility-"));
+    toolSentinelDirectory = fs.mkdtempSync(path.join(userToolPath, ".nawabari-fhs-tool-visibility-"));
+    const homeSentinel = path.join(homeSentinelDirectory, "host-only-sentinel");
+    const toolSentinel = path.join(toolSentinelDirectory, "host-only-sentinel");
+    fs.writeFileSync(homeSentinel, "host home sentinel\n");
+    fs.writeFileSync(toolSentinel, "host user tool sentinel\n");
+    const hiddenHostPaths = ["/usr/bin/sh", "/bin/ls", "/nix/store", homeSentinel, toolSentinel];
     const visibility = await runSandboxedCommand(request.value, {
       command: "/bin/sh",
       args: [
@@ -606,6 +627,15 @@ test("the default strict FHS projection keeps the development baseline functiona
       assert.equal(visibility.value.stdout, "strict-fhs-host-paths-hidden", JSON.stringify(visibility.value));
     }
   } finally {
+    if (homeSentinelDirectory !== null) fs.rmSync(homeSentinelDirectory, { recursive: true, force: true });
+    if (toolSentinelDirectory !== null) fs.rmSync(toolSentinelDirectory, { recursive: true, force: true });
+    for (const directory of missingUserToolDirectories) {
+      try {
+        fs.rmdirSync(directory);
+      } catch {
+        // Preserve any files concurrently added by the host user.
+      }
+    }
     try {
       git(["worktree", "remove", "--force", worktree]);
     } catch {
