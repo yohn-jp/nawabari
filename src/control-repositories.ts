@@ -5,6 +5,7 @@ import path from "node:path";
 import { DomainError, failure, success, type DomainResult } from "./domain/errors.js";
 import { resolveRepositoryContext, type GitCommandRunner } from "./git.js";
 import { writeJsonAtomicallySync } from "./registry/atomic.js";
+import { RepositoryLock } from "./registry/lock.js";
 import { REGISTRY_DIRECTORY_NAME, REGISTRY_FILE_NAME } from "./session-registry.js";
 
 /**
@@ -133,18 +134,53 @@ export function registerRepositoryLocator(
     return success(null);
   }
   if (!registryExists(locator.repository_id)) return success(null);
-  const current = readRepositoryLocators(catalogPath);
-  if (!current.ok) return current;
-  const existing = current.value.find((entry) => entry.repository_id === locator.repository_id);
-  if (existing?.worktree_path === locator.worktree_path) return success(existing);
-  const repositories = [...current.value.filter((entry) => entry.repository_id !== locator.repository_id), locator];
-  if (repositories.length > MAX_CONTROL_REPOSITORIES) return catalogFailure(catalogPath, "capacity");
+
+  let lease: ReturnType<RepositoryLock["acquireSync"]>;
   try {
-    writeJsonAtomicallySync(catalogPath, { schema_version: CONTROL_REPOSITORY_CATALOG_SCHEMA_VERSION, repositories });
+    lease = new RepositoryLock({ lockPath: `${catalogPath}.lock` }).acquireSync();
   } catch {
-    return catalogFailure(catalogPath, "unwritable");
+    return catalogFailure(catalogPath, "lock-unavailable");
   }
-  return success(locator);
+
+  let result: DomainResult<RepositoryLocator>;
+  try {
+    const current = readRepositoryLocators(catalogPath);
+    if (!current.ok) {
+      result = current;
+    } else {
+      const existing = current.value.find((entry) => entry.repository_id === locator.repository_id);
+      if (existing?.worktree_path === locator.worktree_path) {
+        result = success(existing);
+      } else {
+        const repositories = [
+          ...current.value.filter((entry) => entry.repository_id !== locator.repository_id),
+          locator,
+        ];
+        if (repositories.length > MAX_CONTROL_REPOSITORIES) {
+          result = catalogFailure(catalogPath, "capacity");
+        } else {
+          try {
+            writeJsonAtomicallySync(catalogPath, {
+              schema_version: CONTROL_REPOSITORY_CATALOG_SCHEMA_VERSION,
+              repositories,
+            });
+            result = success(locator);
+          } catch {
+            result = catalogFailure(catalogPath, "unwritable");
+          }
+        }
+      }
+    }
+  } catch {
+    result = catalogFailure(catalogPath, "unavailable");
+  }
+
+  try {
+    lease.release();
+  } catch {
+    return catalogFailure(catalogPath, "lock-release-failed");
+  }
+  return result;
 }
 
 /** Re-resolve each locator against current Git identity and repository persistence. */
