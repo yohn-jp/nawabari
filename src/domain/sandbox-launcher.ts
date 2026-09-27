@@ -1514,6 +1514,13 @@ export function compileSandboxInvocation(
   }
 
   const seenDirectories = new Set<string>();
+  if (compiledEnvironment.value !== null) {
+    // Mount private execution tmp before the exact worktree and policy mounts.
+    // A managed worktree can itself live below host /tmp; mounting the tmp
+    // parent afterward would mask that authorized destination before chdir.
+    addReadWriteBind(args, compiledEnvironment.value.manifest.execution.tmp.path, SANDBOX_TMPDIR, seenDirectories);
+    seenDirectories.add(SANDBOX_TMPDIR);
+  }
   const worktreeDestination = topology.value.worktree;
   if (filesystemEnforcement === undefined) {
     addReadWriteBind(args, topology.value.worktree, worktreeDestination, seenDirectories);
@@ -1547,7 +1554,6 @@ export function compileSandboxInvocation(
     }
     addReadWriteBind(args, manifest.session.xdg.data.path, SANDBOX_DATA_HOME, seenDirectories);
     addReadWriteBind(args, manifest.session.xdg.state.path, SANDBOX_STATE_HOME, seenDirectories);
-    addReadWriteBind(args, manifest.execution.tmp.path, SANDBOX_TMPDIR, seenDirectories);
   }
   addReadWriteBind(args, topology.value.persistent_home, SANDBOX_SHARED_HOME, seenDirectories);
   addReadWriteBind(args, topology.value.git_metadata, "/nawabari/git", seenDirectories);
