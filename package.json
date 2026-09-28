@@ -59,7 +59,7 @@
     "@types/node": "^26.6.2",
     "eslint": "10.11.0",
     "gh-inari": "0.13.2",
-    "prettier": "3.9.8",
+    "prettier": "3.9.9",
     "tsx": "^4.23.13",
     "typescript": "^6.0.3",
     "typescript-eslint": "8.70.0"
