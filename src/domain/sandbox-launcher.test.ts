@@ -1515,6 +1515,57 @@ test("compiled protected execution keeps a worktree under /tmp visible and hides
       fs.readFileSync(path.join(compiled.value.manifest.execution.tmp.path, "sandbox-write.txt"), "utf8"),
       "private",
     );
+    const boundedProjection = validateSessionRuntimeProjection({
+      ...runtimeProjection.value,
+      working_set: {
+        contract_id: "nawabari.working-set-runtime-projection.v1",
+        schema_version: 1,
+        working_set_id: "bounded-managed-scratch",
+        revision: 1,
+        repository: { repositoryHost: "local", repositoryId: request.repository },
+        base: { branch: request.branch, revision: "a".repeat(40) },
+        scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+      },
+    });
+    assert.equal(boundedProjection.ok, true, boundedProjection.ok ? "" : JSON.stringify(boundedProjection.error));
+    if (!boundedProjection.ok) return;
+    const protectedRequest = await resolveSandboxExecutionRequest(
+      new LocalSessionBackend(),
+      { cwd: worktree },
+      { session_id: request.session_id, enforce: true, runtime_projection: boundedProjection.value },
+      undefined,
+      layout,
+    );
+    assert.equal(protectedRequest.ok, true, protectedRequest.ok ? "" : JSON.stringify(protectedRequest.error));
+    if (!protectedRequest.ok) return;
+    const bounded = await runSandboxedCommand(
+      { ...protectedRequest.value, compiled_session_environment: compiled.value },
+      {
+        command: "node",
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs'), assert=require('node:assert/strict');",
+            "assert.ok(fs.readFileSync('README.md').length);",
+            "fs.writeFileSync(process.env.TMPDIR+'/bounded-private.txt','bounded-scratch');",
+            "assert.throws(()=>fs.writeFileSync('README.md','forbidden'));",
+            "assert.throws(()=>fs.writeFileSync('/tmp/outside-scratch.txt','forbidden'));",
+            "process.stdout.write('bounded-managed-scratch-ok');",
+          ].join(" "),
+        ],
+      },
+    );
+    assert.equal(bounded.ok, true, bounded.ok ? "" : JSON.stringify(bounded.error));
+    if (!bounded.ok) return;
+    assert.equal(bounded.value.exit_code, 0, JSON.stringify(bounded.value));
+    assert.equal(bounded.value.stdout, "bounded-managed-scratch-ok");
+    assert.equal(
+      fs.readFileSync(
+        path.join(compiled.value.manifest.execution.tmp.path, "nawabari-tmp/bounded-private.txt"),
+        "utf8",
+      ),
+      "bounded-scratch",
+    );
   } finally {
     if (controlServer !== undefined) await controlServer.close();
     removeWorktree(repository, worktree);
