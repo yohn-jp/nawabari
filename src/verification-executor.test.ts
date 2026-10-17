@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   VERIFICATION_PROFILE_CONTRACT_ID,
   VERIFICATION_PROFILE_SCHEMA_VERSION,
+  captureVerificationSourceWitness,
   executeSourceBoundVerification,
   executeVerification,
   isVerificationSourceWitnessCurrent,
@@ -16,6 +17,7 @@ import {
 import type { DomainResult } from "./domain/errors.js";
 import { createFilesystemPolicyToken } from "./domain/filesystem-policy-revision.js";
 import type { SandboxExecutionRequest } from "./domain/sandbox.js";
+import { captureGitSourceObservation } from "./git.js";
 import type { SandboxExecutionResult } from "./domain/sandbox-launcher.js";
 import { sandboxExecutionMockSuccess } from "./testing/sandbox-execution-evidence-mock.js";
 
@@ -381,6 +383,70 @@ test("source witness currentness tracks source, base, profile, policy, runtime, 
     runGit(["add", "src/later.js"], fixture.root);
     runGit(["commit", "--quiet", "-m", "advance head"], fixture.root);
     assert.equal(isVerificationSourceWitnessCurrent(witness, currentProfile, fixture.request, policyFence), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("candidate source witness observes only the deterministic staged repository and exact Git identities", () => {
+  const fixture = createSourceRepository();
+  try {
+    const head = runGit(["rev-parse", "HEAD"], fixture.root);
+    const tree = runGit(["rev-parse", "HEAD^{tree}"], fixture.root);
+    const candidateDigest = `sha256:${"c".repeat(64)}`;
+    const sourceKey = "d".repeat(24);
+    const candidateRoot = path.join(
+      fixture.root,
+      ".nawabari-verification-candidates",
+      "c".repeat(64),
+      sourceKey,
+      "repo",
+    );
+    fs.mkdirSync(path.dirname(candidateRoot), { recursive: true });
+    runGit(["clone", "--quiet", fixture.root, candidateRoot], fixture.root);
+    runGit(["checkout", "--quiet", "-B", `nawabari-candidate-${"c".repeat(64)}-${sourceKey}`, head], candidateRoot);
+    const observedCandidate = captureGitSourceObservation({ cwd: candidateRoot, read_selectors: ["**"] });
+    assert.equal(observedCandidate.head_id, head);
+    assert.equal(observedCandidate.tree_id, tree);
+    const ownerCandidateVerification = {
+      candidate_digest: candidateDigest,
+      source_key: sourceKey,
+      base_commit: head,
+      head_id: head,
+      tree_id: tree,
+    };
+    const candidateRequest = {
+      ...fixture.request,
+      owner_candidate_verification: ownerCandidateVerification,
+    } as SandboxExecutionRequest;
+    const candidateProfile = { ...profile, cwd: candidateRoot };
+    const result = captureVerificationSourceWitness(
+      candidateProfile,
+      candidateRequest,
+      sourcePolicyFence("019123e4-7abc-7def-8123-456789abcdef"),
+    );
+    assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+    if (!result.ok) return;
+    assert.equal(result.value.head_id, head);
+    assert.equal(result.value.tree_id, tree);
+    assert.equal(result.value.base_id, head);
+
+    const edited = path.join(candidateRoot, "src", "entry.js");
+    fs.writeFileSync(edited, "modified candidate\n");
+    const changed = captureVerificationSourceWitness(
+      candidateProfile,
+      candidateRequest,
+      sourcePolicyFence("019123e4-7abc-7def-8123-456789abcdef"),
+    );
+    assert.equal(changed.ok, true);
+    if (changed.ok) assert.notEqual(changed.value.source_sha256, result.value.source_sha256);
+
+    const outside = captureVerificationSourceWitness(
+      { ...candidateProfile, cwd: path.join(candidateRoot, "nested") },
+      candidateRequest,
+      sourcePolicyFence("019123e4-7abc-7def-8123-456789abcdef"),
+    );
+    assert.equal(outside.ok, false);
   } finally {
     fixture.cleanup();
   }

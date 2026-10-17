@@ -118,6 +118,7 @@ export type VerificationSourceWitness = Readonly<{
   readonly schema_version: typeof VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION;
   readonly identity_sha256: string;
   readonly head_id: string;
+  readonly tree_id: string;
   readonly base_id: string;
   readonly profile_sha256: string;
   readonly policy_sha256: string;
@@ -514,8 +515,42 @@ export function captureVerificationSourceWitness(
   ) {
     return failure(sourceUnavailable("Verification source provenance requires an absolute authoritative worktree."));
   }
+  const ownerCandidate = (
+    request as SandboxExecutionRequest & {
+      readonly owner_candidate_verification?: Readonly<{
+        candidate_digest: string;
+        source_key: string;
+        base_commit: string;
+        head_id: string;
+        tree_id: string;
+      }>;
+    }
+  ).owner_candidate_verification;
   if (profile.value.cwd !== request.worktree && !isWithin(request.worktree, profile.value.cwd)) {
     return failure(sourceUnavailable("The verification profile is outside the authoritative worktree."));
+  }
+  let sourceCwd = request.worktree;
+  if (ownerCandidate !== undefined) {
+    const candidateDigest = /^sha256:([0-9a-f]{64})$/u.exec(ownerCandidate.candidate_digest);
+    if (
+      !candidateDigest ||
+      !/^[0-9a-f]{24}$/u.test(ownerCandidate.source_key) ||
+      !SOURCE_REVISION.test(ownerCandidate.base_commit) ||
+      !SOURCE_REVISION.test(ownerCandidate.head_id) ||
+      !SOURCE_REVISION.test(ownerCandidate.tree_id)
+    ) {
+      return failure(sourceUnavailable("The Nawabari-owned candidate source identity is invalid."));
+    }
+    sourceCwd = path.join(
+      request.worktree,
+      ".nawabari-verification-candidates",
+      candidateDigest[1]!,
+      ownerCandidate.source_key,
+      "repo",
+    );
+    if (profile.value.cwd !== sourceCwd) {
+      return failure(sourceUnavailable("The verifier cwd does not match the staged owner candidate source."));
+    }
   }
   const runtimeProjection = validateSessionRuntimeProjection(request.runtime_projection);
   if (!runtimeProjection.ok || runtimeProjection.value.working_set === undefined) {
@@ -534,10 +569,14 @@ export function captureVerificationSourceWitness(
 
   try {
     const source = captureGitSourceObservation({
-      cwd: request.worktree,
+      cwd: sourceCwd,
       read_selectors: profile.value.read_visibility === "repository" ? ["**"] : profile.value.declared_read,
     });
-    if (source.branch_id !== normalizeBranchId(request.branch)) {
+    if (
+      ownerCandidate === undefined
+        ? source.branch_id !== normalizeBranchId(request.branch)
+        : source.head_id !== ownerCandidate.head_id || source.tree_id !== ownerCandidate.tree_id
+    ) {
       return failure(sourceUnavailable("The execution branch does not match the observed worktree branch."));
     }
     const runtimeIdentity = {
@@ -553,6 +592,7 @@ export function captureVerificationSourceWitness(
       landlock_required: request.landlock_required ?? null,
       seccomp_profile: request.seccomp_profile,
       capability_baseline: request.capability_baseline,
+      owner_candidate_verification: ownerCandidate ?? null,
     };
     const identitySha256 = digestJson(
       {
@@ -563,6 +603,8 @@ export function captureVerificationSourceWitness(
         request_session_id: request.session_id,
         request_branch: request.branch,
         observed_branch_id: source.branch_id,
+        owner_candidate_verification: ownerCandidate ?? null,
+        observed_tree_id: source.tree_id,
         working_set_repository: workingSet.repository,
         base_branch: workingSet.base.branch,
       },
@@ -573,7 +615,8 @@ export function captureVerificationSourceWitness(
       schema_version: VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
       identity_sha256: identitySha256,
       head_id: source.head_id,
-      base_id: workingSet.base.revision,
+      tree_id: source.tree_id,
+      base_id: ownerCandidate?.base_commit ?? workingSet.base.revision,
       profile_sha256: digestJson(profile.value, MAX_RUNTIME_IDENTITY_BYTES),
       policy_sha256: digestJson(token.value, MAX_RUNTIME_IDENTITY_BYTES),
       runtime_sha256: digestJson(runtimeIdentity, MAX_RUNTIME_IDENTITY_BYTES),
@@ -674,6 +717,8 @@ export function validateVerificationSourceWitness(input: unknown): DomainResult<
   if (
     typeof value.head_id !== "string" ||
     !SOURCE_REVISION.test(value.head_id) ||
+    typeof value.tree_id !== "string" ||
+    !SOURCE_REVISION.test(value.tree_id) ||
     typeof value.base_id !== "string" ||
     !SOURCE_REVISION.test(value.base_id)
   ) {
@@ -695,6 +740,7 @@ export function validateVerificationSourceWitness(input: unknown): DomainResult<
       schema_version: VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
       identity_sha256: value.identity_sha256 as string,
       head_id: value.head_id,
+      tree_id: value.tree_id,
       base_id: value.base_id,
       profile_sha256: value.profile_sha256 as string,
       policy_sha256: value.policy_sha256 as string,

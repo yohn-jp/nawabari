@@ -330,6 +330,14 @@ export async function launchManagedSessionCommand(
     verification?: Readonly<{
       profile: VerificationProfileInput;
       expected_snapshot: SessionVerificationSnapshot;
+      /** Internal candidate source binding emitted by the Nawabari-owned staging operation. */
+      owner_candidate_verification?: Readonly<{
+        candidate_digest: string;
+        source_key: string;
+        base_commit: string;
+        head_id: string;
+        tree_id: string;
+      }>;
     }>;
     /** Exact owner snapshot CAS for a fixed managed operation that is not a verifier invocation. */
     expected_session_snapshot?: SessionVerificationSnapshot;
@@ -626,6 +634,9 @@ export async function launchManagedSessionCommand(
     scope: scope.value,
     claim_set_generation: live.claim_set_generation,
     ...(input.owner_candidate_staging === undefined ? {} : { owner_candidate_staging: input.owner_candidate_staging }),
+    ...(input.verification?.owner_candidate_verification === undefined
+      ? {}
+      : { owner_candidate_verification: input.verification.owner_candidate_verification }),
   });
   const snapshot = {
     lifecycle: "active" as const,
@@ -653,6 +664,9 @@ export async function launchManagedSessionCommand(
   const protectedRequest: SandboxExecutionRequest = {
     ...request.value,
     ...(input.owner_candidate_staging === undefined ? {} : { owner_candidate_staging: input.owner_candidate_staging }),
+    ...(input.verification?.owner_candidate_verification === undefined
+      ? {}
+      : { owner_candidate_verification: input.verification.owner_candidate_verification }),
     git_profile: profile,
     hook_material: live.hook_material,
     runtime_resolution: {

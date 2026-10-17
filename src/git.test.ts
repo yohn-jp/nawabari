@@ -484,6 +484,7 @@ test("captures bounded verifier-visible staged, untracked, ignored, and same-pat
 
     const initial = captureGitSourceObservation({ cwd: fixture.repositoryPath, read_selectors: ["**"] });
     assert.match(initial.source_sha256, /^[0-9a-f]{64}$/u);
+    assert.match(initial.tree_id, /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u);
     assert.ok(initial.file_count > 0);
     assert.ok(initial.byte_count > 0);
 

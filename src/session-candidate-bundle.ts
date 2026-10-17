@@ -327,9 +327,29 @@ function candidatePath(
   request: SessionCandidateBundleRequest,
   source: SessionCandidateBundleSource,
 ): string {
-  const candidateHex = digest.exec(request.candidate_digest)![1]!;
-  const sourceKey = sha256(`${source.project_id}\0${source.source_id}`).slice(0, 24);
-  return path.join(snapshot.worktree, ".nawabari-verification-candidates", candidateHex, sourceKey, "repo");
+  return sessionCandidateBundleRepositoryPath(
+    snapshot.worktree,
+    request.candidate_digest,
+    source.project_id,
+    source.source_id,
+  );
+}
+
+/** Deterministic repository path owned by a Nawabari session candidate stage. */
+export function sessionCandidateBundleRepositoryPath(
+  worktree: string,
+  candidateDigest: string,
+  projectId: string,
+  sourceId: string,
+): string {
+  if (!path.isAbsolute(worktree) || path.resolve(worktree) !== worktree)
+    throw new TypeError("candidate bundle repository identity is invalid");
+  const candidate = digest.exec(candidateDigest);
+  if (!candidate || !projectId || !sourceId || projectId.length > 256 || sourceId.length > 256)
+    throw new TypeError("candidate bundle repository identity is invalid");
+  const candidateHex = candidate[1]!;
+  const sourceKey = sha256(`${projectId}\0${sourceId}`).slice(0, 24);
+  return path.join(worktree, ".nawabari-verification-candidates", candidateHex, sourceKey, "repo");
 }
 
 function requestFenceMatches(expected: SessionVerificationSnapshot, actual: SessionVerificationSnapshot): boolean {
@@ -426,7 +446,10 @@ if(!refExists){
  try{git(['merge-base','--is-ancestor',base,ref]);}catch{fail('candidate commit is not descended from its exact source base');}
 }
 if(git(['rev-parse','--verify',ref+'^{commit}'])!==head)fail('existing candidate ref differs from the exact source identity');
-git(['checkout','--detach','--force',head],candidatePath);
+// Keep an owner-generated local branch so the existing strict physical Git
+// observer can prove a complete worktree identity. The branch name is derived
+// only from the candidate/source key; the commit remains bound by full IDs.
+git(['checkout','--quiet','--force','-B','nawabari-candidate-'+candidateHex+'-'+sourceKey,head],candidatePath);
 const finalHead=git(['rev-parse','--verify','HEAD'],candidatePath);
 const finalTree=git(['rev-parse','--verify','HEAD^{tree}'],candidatePath);
 const clean=git(['status','--porcelain','--untracked-files=all'],candidatePath);
@@ -526,14 +549,35 @@ export async function stageSessionCandidateBundle(
     );
   const result = execution.value.result;
   const physical = execution.value.execution_evidence;
+  const physicalExecution = isSandboxExecutionEvidenceSnapshot(physical) ? physical.physical_execution : null;
+  const namespaces = physicalExecution === null ? [] : Object.values(physicalExecution.start.namespaces);
   if (
     result.exit_code !== 0 ||
     result.signal !== null ||
-    !isSandboxExecutionEvidenceSnapshot(physical) ||
-    physical.physical_execution.termination.state !== "observed-exited" ||
-    physical.physical_execution.cleanup.state !== "observed-empty" ||
+    physicalExecution === null ||
+    physical.execution_id !== execution.value.execution.execution_id ||
+    physicalExecution.correlation_id !== execution.value.execution.execution_id ||
+    physicalExecution.procfs.mode !== "private" ||
+    physicalExecution.start.state !== "observed" ||
+    physicalExecution.start.outer_pid === null ||
+    physicalExecution.start.process_start_ticks === null ||
+    namespaces.length !== 5 ||
+    !namespaces.every(
+      (namespace) => namespace.state === "observed" && namespace.identity !== null && namespace.distinct_from_caller,
+    ) ||
+    physicalExecution.termination.state !== "observed-exited" ||
+    physicalExecution.termination.reason !== "exited" ||
+    physicalExecution.cleanup.state !== "observed-empty" ||
+    physicalExecution.cleanup.process_count !== 0 ||
     physical.raw_output.complete !== true ||
-    physical.raw_output.truncated !== false
+    physical.raw_output.truncated !== false ||
+    physical.raw_output.observed_stdout_bytes !== physical.raw_output.stdout_bytes ||
+    physical.raw_output.observed_stderr_bytes !== physical.raw_output.stderr_bytes ||
+    execution.value.supervisor.status !== "completed" ||
+    execution.value.execution.state !== "exited" ||
+    execution.value.owned_execution?.state !== "empty" ||
+    execution.value.owned_execution.cgroups?.population.populated !== false ||
+    execution.value.owned_execution.cgroups?.population.processes?.length !== 0
   )
     return failure(
       new DomainError(

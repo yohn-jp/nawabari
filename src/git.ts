@@ -197,6 +197,8 @@ export type GitSourceObservation = Readonly<{
   readonly worktree_id: string;
   readonly branch_id: string;
   readonly head_id: string;
+  /** Full tree identity behind HEAD, independently resolved from the commit. */
+  readonly tree_id: string;
   /** SHA-256 over every resolved file/directory plus Git index/ref/config state. */
   readonly source_sha256: string;
   readonly file_count: number;
@@ -1164,6 +1166,12 @@ export function captureGitSourceObservation(options: {
   const limits = gitSourceLimits(options.limits);
   const git = options.git ?? createGitCommandRunner({ maxOutputBytes: GIT_SOURCE_MAX_METADATA_BYTES });
   const initial = verifyPhysicalExecutionContext({ cwd: options.cwd, worktreePath: options.cwd, git });
+  const initialTreeId = git.run(["rev-parse", "--verify", "HEAD^{tree}"], initial.worktreePath);
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(initialTreeId)) {
+    throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git source tree identity is not a full object ID", {
+      worktree: initial.worktreePath,
+    });
+  }
   const normalizedWorktree = path.resolve(options.cwd);
   if (initial.worktreePath !== normalizedWorktree) {
     throw new SessionRegistryError("WORKTREE_MISMATCH", "Git source observation resolved a different worktree", {
@@ -1256,6 +1264,7 @@ export function captureGitSourceObservation(options: {
   }
   assertSourceVersionsUnchanged(resolution, observedVersions);
   const final = verifyPhysicalExecutionContext({ cwd: options.cwd, worktreePath: options.cwd, git });
+  const finalTreeId = git.run(["rev-parse", "--verify", "HEAD^{tree}"], final.worktreePath);
   const finalControl = captureGitSourceControl(
     git,
     final.worktreePath,
@@ -1267,6 +1276,7 @@ export function captureGitSourceObservation(options: {
     initial.worktreeId !== final.worktreeId ||
     initial.branchId !== final.branchId ||
     initial.headId !== final.headId ||
+    initialTreeId !== finalTreeId ||
     control.sha256 !== finalControl.sha256
   ) {
     throw new SessionRegistryError("GIT_STATE_AMBIGUOUS", "Git source identity changed during observation", {
@@ -1279,6 +1289,7 @@ export function captureGitSourceObservation(options: {
     worktree_id: initial.worktreeId,
     branch_id: initial.branchId,
     head_id: initial.headId,
+    tree_id: initialTreeId,
     source_sha256: sourceHash.digest("hex"),
     file_count: fileCount,
     byte_count: byteCount,

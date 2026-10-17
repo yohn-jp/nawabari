@@ -190,6 +190,39 @@ test("a candidate cwd outside the owned session worktree is refused", async () =
   assert.equal(snapshotRead, false);
 });
 
+test("candidate-backed execution rejects an arbitrary nested Git cwd before staging", async () => {
+  const expected = snapshot();
+  let managedRuntimeRead = false;
+  const backend = {
+    getSessionVerificationSnapshot: async () => success(expected),
+    getSessionManagedRuntime: async () => {
+      managedRuntimeRead = true;
+      throw new Error("candidate staging must not run for a caller-selected path");
+    },
+  } as unknown as SessionBackend;
+  const candidateRequest = {
+    ...request(expected, "/repo/worktree/caller-selected-git"),
+    candidate_source: {
+      candidate_id: "candidate-1",
+      candidate_digest: `sha256:${"a".repeat(64)}`,
+      source: {
+        project_id: "project-1",
+        source_id: "source-1",
+        bundle_sha256: `sha256:${"b".repeat(64)}`,
+        base_commit: "1".repeat(40),
+        candidate_commit: "2".repeat(40),
+        candidate_tree: "3".repeat(40),
+      },
+    },
+  };
+
+  const result = await executeSessionBoundVerification(context, backend, candidateRequest);
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "INVALID_ARGUMENT");
+  assert.equal(managedRuntimeRead, false);
+});
+
 test("closed managed admission is refused before launch", async () => {
   const ownerSnapshot = snapshot({ managed: { ...snapshot().managed, admission: "closed" } });
   let managedRuntimeRead = false;

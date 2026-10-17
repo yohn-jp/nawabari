@@ -17,6 +17,14 @@ import {
   type SessionContext,
   type SessionVerificationSnapshot,
 } from "./domain/session.js";
+import {
+  SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+  sessionCandidateBundleRepositoryPath,
+  type SessionCandidateBundleSource,
+  type SessionCandidateBundleStageResult,
+  stageSessionCandidateBundle,
+} from "./session-candidate-bundle.js";
 import type { SessionExecutionRecord } from "./domain/session-execution-record.js";
 import type { SessionLaunchSupervisorResult } from "./domain/session-launch-supervisor.js";
 import type { OwnedExecutionObservation } from "./domain/session-process-observation.js";
@@ -34,6 +42,8 @@ export const SESSION_BOUND_VERIFICATION_SCHEMA_VERSION = 1 as const;
 export const SESSION_BOUND_VERIFICATION_RESULT_SCHEMA = "nawabari.session-bound-verification.v1" as const;
 
 const MAX_REQUEST_BYTES = 1 * 1_024 * 1_024;
+const sha256Digest = /^sha256:[0-9a-f]{64}$/u;
+const gitObjectId = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const packageMetadata = createRequire(import.meta.url)("../package.json") as { version: string };
 
 export type SessionBoundVerificationRequest = Readonly<{
@@ -42,6 +52,12 @@ export type SessionBoundVerificationRequest = Readonly<{
   session_id: string;
   snapshot: SessionVerificationSnapshot;
   profile: VerificationProfileInput;
+  /** Optional exact source-owner candidate that Nawabari stages and verifies atomically. */
+  candidate_source?: Readonly<{
+    candidate_id: string;
+    candidate_digest: string;
+    source: SessionCandidateBundleSource;
+  }>;
 }>;
 
 export type SessionBoundVerificationSource = Readonly<{
@@ -72,6 +88,10 @@ export type SessionBoundVerificationResult = Readonly<{
   producer: Readonly<{ package: "nawabari"; version: string }>;
   session_id: string;
   profile: VerificationProfile & Readonly<{ profile_sha256: string }>;
+  /** Owner-generated staging receipt and actual Git identity for candidate-backed runs. */
+  candidate_source?: Readonly<{
+    stage_receipt: SessionCandidateBundleStageResult;
+  }>;
   source: SessionBoundVerificationSource;
   verification: VerificationResult;
   managed_execution: ManagedVerificationExecution | null;
@@ -161,12 +181,54 @@ function parseRequest(value: unknown): DomainResult<SessionBoundVerificationRequ
   if (!isRecord(value.profile)) return invalid("Verification profile must be an object.", "profile");
   const profile = validateVerificationProfile(value.profile);
   if (!profile.ok) return profile;
+  let candidateSource: SessionBoundVerificationRequest["candidate_source"];
+  if (value.candidate_source !== undefined) {
+    if (!isRecord(value.candidate_source) || !isRecord(value.candidate_source.source))
+      return invalid("Candidate-backed verification requires an exact source-owner identity.", "candidate_source");
+    const candidate = value.candidate_source;
+    const source = candidate.source as Record<string, unknown>;
+    if (
+      typeof candidate.candidate_id !== "string" ||
+      candidate.candidate_id.length < 1 ||
+      candidate.candidate_id.length > 256 ||
+      typeof candidate.candidate_digest !== "string" ||
+      !sha256Digest.test(candidate.candidate_digest) ||
+      typeof source.project_id !== "string" ||
+      source.project_id.length < 1 ||
+      source.project_id.length > 256 ||
+      typeof source.source_id !== "string" ||
+      source.source_id.length < 1 ||
+      source.source_id.length > 256 ||
+      typeof source.bundle_sha256 !== "string" ||
+      !sha256Digest.test(source.bundle_sha256) ||
+      typeof source.base_commit !== "string" ||
+      !gitObjectId.test(source.base_commit) ||
+      typeof source.candidate_commit !== "string" ||
+      !gitObjectId.test(source.candidate_commit) ||
+      typeof source.candidate_tree !== "string" ||
+      !gitObjectId.test(source.candidate_tree)
+    )
+      return invalid("Candidate-backed verification source identity is invalid.", "candidate_source");
+    candidateSource = {
+      candidate_id: candidate.candidate_id,
+      candidate_digest: candidate.candidate_digest,
+      source: {
+        project_id: source.project_id,
+        source_id: source.source_id,
+        bundle_sha256: source.bundle_sha256,
+        base_commit: source.base_commit,
+        candidate_commit: source.candidate_commit,
+        candidate_tree: source.candidate_tree,
+      },
+    };
+  }
   return success({
     contract_id: SESSION_BOUND_VERIFICATION_CONTRACT_ID,
     schema_version: SESSION_BOUND_VERIFICATION_SCHEMA_VERSION,
     session_id: value.session_id,
     snapshot: value.snapshot as unknown as SessionVerificationSnapshot,
     profile: profile.value,
+    ...(candidateSource === undefined ? {} : { candidate_source: candidateSource }),
   });
 }
 
@@ -357,10 +419,88 @@ export async function executeSessionBoundVerification(
     );
   }
 
+  let executionSnapshot = request.snapshot;
+  let candidateStage: SessionCandidateBundleStageResult | undefined;
+  let ownerCandidateVerification:
+    | Readonly<{
+        candidate_digest: string;
+        source_key: string;
+        base_commit: string;
+        head_id: string;
+        tree_id: string;
+      }>
+    | undefined;
+  if (request.candidate_source !== undefined) {
+    const { candidate_id, candidate_digest, source } = request.candidate_source;
+    let expectedRepositoryPath: string;
+    try {
+      expectedRepositoryPath = sessionCandidateBundleRepositoryPath(
+        request.snapshot.worktree,
+        candidate_digest,
+        source.project_id,
+        source.source_id,
+      );
+    } catch {
+      return invalid("Candidate-backed verification repository identity is invalid.", "candidate_source");
+    }
+    if (profile.value.cwd !== expectedRepositoryPath) {
+      return invalid("Candidate-backed verifier cwd must be the deterministic Nawabari-owned staged repository.", "profile.cwd");
+    }
+    const staged = await stageSessionCandidateBundle(context, backend, {
+      contract_id: SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+      schema_version: SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+      session_id: request.session_id,
+      snapshot: request.snapshot,
+      candidate_id,
+      candidate_digest,
+      bundles: [source],
+    });
+    if (!staged.ok) return staged;
+    const stage = staged.value;
+    const { receipt_sha256: stageReceiptDigest, ...stageReceipt } = stage;
+    if (
+      stage.session_id !== request.session_id ||
+      stage.candidate_id !== candidate_id ||
+      stage.candidate_digest !== candidate_digest ||
+      stage.source.project_id !== source.project_id ||
+      stage.source.source_id !== source.source_id ||
+      stage.source.bundle_sha256 !== source.bundle_sha256 ||
+      stage.source.base_commit !== source.base_commit ||
+      stage.source.candidate_commit !== source.candidate_commit ||
+      stage.source.candidate_tree !== source.candidate_tree ||
+      stage.source.worktree !== expectedRepositoryPath ||
+      stage.source.head_id !== source.candidate_commit ||
+      stage.source.tree_id !== source.candidate_tree ||
+      stageReceiptDigest !== sha256(canonicalJson(stageReceipt))
+    ) {
+      return failure(
+        new DomainError("PHYSICAL_OBSERVATION_UNAVAILABLE", "Nawabari candidate staging did not bind its exact source receipt.", {
+          session_id: request.session_id,
+        }),
+      );
+    }
+    candidateStage = stage;
+    executionSnapshot = stage.snapshot;
+    ownerCandidateVerification = {
+      candidate_digest,
+      source_key: createHash("sha256")
+        .update(`${source.project_id}\0${source.source_id}`, "utf8")
+        .digest("hex")
+        .slice(0, 24),
+      base_commit: source.base_commit,
+      head_id: source.candidate_commit,
+      tree_id: source.candidate_tree,
+    };
+  }
+
   const launched = await launchManagedSessionCommand(context, backend, {
     session_id: request.session_id,
     command: { command: profile.value.executable, args: profile.value.argv, cwd: profile.value.cwd },
-    verification: { profile: profile.value, expected_snapshot: request.snapshot },
+    verification: {
+      profile: profile.value,
+      expected_snapshot: executionSnapshot,
+      ...(ownerCandidateVerification === undefined ? {} : { owner_candidate_verification: ownerCandidateVerification }),
+    },
     ...(dependencies.sandbox_probe === undefined ? {} : { sandbox_probe: dependencies.sandbox_probe }),
     ...(dependencies.sandbox_runtime_layout === undefined
       ? {}
@@ -386,7 +526,7 @@ export async function executeSessionBoundVerification(
   }
   const observedFinal = await getSessionVerificationSnapshot(context, backend, request.session_id);
   const finalSnapshot = observedFinal.ok ? observedFinal.value : null;
-  const source = sourceResult(managed, finalSnapshot, request.snapshot);
+  const source = sourceResult(managed, finalSnapshot, executionSnapshot);
   const executionEvidence = managed.execution_evidence ?? null;
   const ownerScopeEmpty =
     managed.owned_execution?.state === "empty" && managed.owned_execution.cgroups?.population.state === "empty";
@@ -413,6 +553,13 @@ export async function executeSessionBoundVerification(
       ...profile.value,
       profile_sha256: sha256(canonicalJson(profile.value)),
     },
+    ...(candidateStage === undefined
+      ? {}
+      : {
+          candidate_source: {
+            stage_receipt: candidateStage,
+          },
+        }),
     source,
     verification: verification.verification,
     managed_execution: {
