@@ -20,6 +20,7 @@ import {
 import { decideExecutionAdmission } from "./session-admission-decision.js";
 import { serializeTrustedSupervisorGoMessage, type SupervisorStartRequest } from "./session-launch-supervisor.js";
 import { runTrustedSessionSupervisorWorker } from "./session-launch-supervisor-worker.js";
+import type { SandboxExecutionEvidenceSnapshot } from "./sandbox-execution-evidence.js";
 import { sandboxExecutionMockSuccess } from "../testing/sandbox-execution-evidence-mock.js";
 import type { ObservedSandboxProcessResult } from "./sandbox-physical-execution.js";
 
@@ -186,7 +187,7 @@ test("executes only after GO and carries the actual bounded result", async () =>
   assert.equal(envelope.result.physical_execution.start.state, "unknown");
 });
 
-test("the real package entrypoint uses fd 4/5 without sharing payload stdio", async (t) => {
+test("the compiled worker rejects a non-Bubblewrap launch with unknown physical evidence", async (t) => {
   if (process.env.NAWABARI_TEST_LANE !== "compiled-worker") {
     t.skip("run via pnpm test:compiled-worker");
     return;
@@ -214,10 +215,32 @@ test("the real package entrypoint uses fd 4/5 without sharing payload stdio", as
     assert.equal(code, 0);
     const envelope = JSON.parse(Buffer.concat(wire).toString("utf8")) as {
       status: string;
-      result?: { stdout?: string };
+      error?: string;
+      result?: SandboxExecutionEvidenceSnapshot;
     };
     assert.equal(envelope.status, "failed", "a non-Bubblewrap child cannot produce a positive physical receipt");
-    assert.equal(envelope.result?.stdout, "");
+    assert.equal(typeof envelope.error, "string");
+    assert.ok(envelope.result, "the failed worker envelope retains the observer's evidence snapshot");
+    assert.equal(envelope.result.schema_version, 1);
+    assert.equal(envelope.result.execution_id, reservation.execution_id);
+    assert.equal(envelope.result.exit_code, 0);
+    assert.equal(envelope.result.signal, null);
+    assert.deepEqual(envelope.result.raw_output, {
+      encoding: "base64",
+      capture_mode: "pipes",
+      stdout: Buffer.from("worker-out").toString("base64"),
+      stderr: Buffer.from("worker-err").toString("base64"),
+      stdout_bytes: Buffer.byteLength("worker-out"),
+      stderr_bytes: Buffer.byteLength("worker-err"),
+      observed_stdout_bytes: Buffer.byteLength("worker-out"),
+      observed_stderr_bytes: Buffer.byteLength("worker-err"),
+      complete: true,
+      truncated: false,
+    });
+    assert.equal(envelope.result.physical_execution.correlation_id, reservation.execution_id);
+    assert.equal(envelope.result.physical_execution.start.state, "unknown");
+    assert.equal(envelope.result.physical_execution.termination.state, "unknown");
+    assert.equal(envelope.result.physical_execution.cleanup.state, "unknown");
   } finally {
     fs.closeSync(seccompFd);
   }
