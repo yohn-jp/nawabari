@@ -8,17 +8,36 @@ import {
   SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID,
   SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION,
   type SessionBackend,
+  type SessionCandidateScratchReleaseOptions,
   type SessionContext,
   type SessionVerificationSnapshot,
 } from "./domain/session.js";
+import type { SessionDrainFence } from "./domain/session-execution-control.js";
 import { isSuccessfulProtectedExecutionProven } from "./domain/sandbox-execution-evidence.js";
 import { isSessionId } from "./session-id.js";
+import {
+  inspectSessionCandidateBundleScratch,
+  removeSessionCandidateBundleScratch,
+  sessionCandidateBundleIdentityKeys,
+  sessionCandidateBundleRepositoryPath,
+  sessionCandidateBundleStagingRootPath,
+  sessionCandidateBundleTransferPath,
+  type SessionCandidateBundleStorageIdentity,
+} from "./session-candidate-bundle-storage.js";
+
+export {
+  sessionCandidateBundleRepositoryPath,
+  sessionCandidateBundleStagingRootPath,
+  sessionCandidateBundleTransferPath,
+} from "./session-candidate-bundle-storage.js";
 
 export const SESSION_CANDIDATE_BUNDLE_CONTRACT_ID = "nawabari.session-candidate-bundle.v1" as const;
 export const SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION = 1 as const;
 export const SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA = "nawabari.session-candidate-bundle.v1" as const;
 export const SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID = "nawabari.session-candidate-bundle-paths.v1" as const;
 export const SESSION_CANDIDATE_BUNDLE_PATHS_RESULT_SCHEMA = "nawabari.session-candidate-bundle-paths.v1" as const;
+export const SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID = "nawabari.session-candidate-bundle-release.v1" as const;
+export const SESSION_CANDIDATE_BUNDLE_RELEASE_RESULT_SCHEMA = "nawabari.session-candidate-bundle-release.v1" as const;
 export const MAX_SESSION_CANDIDATE_BUNDLE_BYTES = 64 * 1024 * 1024;
 
 export type SessionCandidateBundleSource = Readonly<{
@@ -75,6 +94,36 @@ export type SessionCandidateBundlePathsResult = Readonly<{
     transfer_path: string;
     repository_path: string;
   }>[];
+  receipt_sha256: string;
+}>;
+
+export type SessionCandidateBundleReleaseRequest = Readonly<{
+  contract_id: typeof SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID;
+  schema_version: typeof SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION;
+  session_id: string;
+  snapshot: SessionVerificationSnapshot;
+  candidate_id: string;
+  candidate_digest: string;
+  source: SessionCandidateBundleSource;
+}>;
+
+export type SessionCandidateBundleReleaseResult = Readonly<{
+  contract_id: typeof SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID;
+  schema_version: typeof SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION;
+  producer: Readonly<{ package: "nawabari"; version: string }>;
+  session_id: string;
+  candidate_id: string;
+  candidate_digest: string;
+  snapshot: SessionVerificationSnapshot;
+  source: SessionCandidateBundleSource;
+  release: Readonly<{
+    removed: true;
+    staging_root: string;
+    repository_path: string;
+    head_id: string;
+    tree_id: string;
+  }>;
+  drain_fence: SessionDrainFence;
   receipt_sha256: string;
 }>;
 
@@ -220,6 +269,55 @@ function parseRequest(value: unknown): DomainResult<SessionCandidateBundleReques
   });
 }
 
+function parseReleaseRequest(value: unknown): DomainResult<SessionCandidateBundleReleaseRequest> {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return invalid("Candidate release request must be an object.", "request");
+  let bytes: number;
+  try {
+    bytes = Buffer.byteLength(canonicalJson(value), "utf8");
+  } catch {
+    return invalid("Candidate release request must contain bounded JSON data.", "request");
+  }
+  if (bytes > MAX_REQUEST_BYTES) return invalid("Candidate release request exceeds its size bound.", "request");
+  const request = value as Record<string, unknown>;
+  const allowedKeys = new Set([
+    "contract_id",
+    "schema_version",
+    "session_id",
+    "snapshot",
+    "candidate_id",
+    "candidate_digest",
+    "source",
+  ]);
+  if (Object.keys(request).some((key) => !allowedKeys.has(key)))
+    return invalid("Candidate release request contains unsupported fields.", "request");
+  if (request.contract_id !== SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID)
+    return invalid("Candidate release contract is unsupported.", "contract_id");
+  if (request.schema_version !== SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION)
+    return invalid("Candidate release schema version is unsupported.", "schema_version");
+  if (typeof request.session_id !== "string" || !isSessionId(request.session_id))
+    return invalid("A canonical owned session identity is required.", "session_id");
+  const checked = parseRequest({
+    contract_id: SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+    schema_version: SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+    session_id: request.session_id,
+    snapshot: request.snapshot,
+    candidate_id: request.candidate_id,
+    candidate_digest: request.candidate_digest,
+    bundles: [request.source],
+  });
+  if (!checked.ok) return checked;
+  return success({
+    contract_id: SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID,
+    schema_version: SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+    session_id: checked.value.session_id,
+    snapshot: checked.value.snapshot,
+    candidate_id: checked.value.candidate_id,
+    candidate_digest: checked.value.candidate_digest,
+    source: checked.value.bundles[0]!,
+  });
+}
+
 /** Public deterministic transfer location; callers cannot choose a path or widen the owned worktree. */
 function candidateStagingIdentity(
   candidateDigest: string,
@@ -229,42 +327,11 @@ function candidateStagingIdentity(
   candidateHex: string;
   sourceKey: string;
 } {
-  const candidate = digest.exec(candidateDigest);
-  if (!candidate || projectId.length < 1 || sourceId.length < 1 || projectId.length > 256 || sourceId.length > 256)
-    throw new TypeError("candidate bundle transfer identity is invalid");
+  const identity = sessionCandidateBundleIdentityKeys(candidateDigest, projectId, sourceId);
   return {
-    candidateHex: candidate[1]!,
-    sourceKey: sha256(`${projectId}\0${sourceId}`).slice(0, 24),
+    candidateHex: identity.candidate_hex,
+    sourceKey: identity.source_key,
   };
-}
-
-/** Public deterministic root for owner-only candidate staging; callers cannot choose filesystem paths. */
-export function sessionCandidateBundleStagingRootPath(
-  worktree: string,
-  candidateDigest: string,
-  projectId: string,
-  sourceId: string,
-): string {
-  const identity = candidateStagingIdentity(candidateDigest, projectId, sourceId);
-  if (!path.isAbsolute(worktree) || path.resolve(worktree) !== worktree)
-    throw new TypeError("candidate bundle transfer identity is invalid");
-  return path.join(worktree, ".nawabari-verification-candidates", identity.candidateHex, identity.sourceKey);
-}
-
-/** Public deterministic transfer location, within the exact candidate/source-owned scratch root. */
-export function sessionCandidateBundleTransferPath(
-  worktree: string,
-  candidateDigest: string,
-  projectId: string,
-  sourceId: string,
-  bundleSha256: string,
-): string {
-  const bundle = digest.exec(bundleSha256);
-  if (!bundle) throw new TypeError("candidate bundle transfer identity is invalid");
-  return path.join(
-    sessionCandidateBundleStagingRootPath(worktree, candidateDigest, projectId, sourceId),
-    `.candidate-${bundle[1]}.bundle`,
-  );
 }
 
 /** Resolve exact transfer/repository paths only after verifying the owner snapshot. */
@@ -322,6 +389,133 @@ export async function describeSessionCandidateBundlePaths(
   return success({ ...payload, receipt_sha256: sha256(canonicalJson(payload)) });
 }
 
+/** Drain-fence and remove exactly one clean Nawabari-owned candidate scratch tree. */
+export async function releaseSessionCandidateBundleScratch(
+  context: SessionContext,
+  backend: SessionBackend,
+  requestInput: SessionCandidateBundleReleaseRequest | unknown,
+): Promise<DomainResult<SessionCandidateBundleReleaseResult>> {
+  const parsed = parseReleaseRequest(requestInput);
+  if (!parsed.ok) return parsed;
+  const request = parsed.value;
+  if (backend.getSessionVerificationSnapshot === undefined || backend.releaseSessionCandidateScratch === undefined)
+    return failure(
+      new DomainError("BACKEND_UNAVAILABLE", "The owned candidate scratch release authority is unavailable.", {
+        operation: "verification.release-candidate",
+      }),
+    );
+  const observed = await backend.getSessionVerificationSnapshot(context, request.session_id);
+  if (!observed.ok) return observed;
+  if (!isDeepStrictEqual(observed.value, request.snapshot))
+    return failure(
+      new DomainError("STALE_REGISTRY", "Candidate release requires the exact current owner snapshot.", {
+        session_id: request.session_id,
+      }),
+    );
+  let identity: SessionCandidateBundleStorageIdentity;
+  let expectedRoot: string;
+  let expectedRepository: string;
+  try {
+    identity = {
+      candidate_digest: request.candidate_digest,
+      project_id: request.source.project_id,
+      source_id: request.source.source_id,
+      bundle_sha256: request.source.bundle_sha256,
+      base_commit: request.source.base_commit,
+      candidate_commit: request.source.candidate_commit,
+      candidate_tree: request.source.candidate_tree,
+    };
+    expectedRoot = sessionCandidateBundleStagingRootPath(
+      request.snapshot.worktree,
+      request.candidate_digest,
+      request.source.project_id,
+      request.source.source_id,
+    );
+    expectedRepository = sessionCandidateBundleRepositoryPath(
+      request.snapshot.worktree,
+      request.candidate_digest,
+      request.source.project_id,
+      request.source.source_id,
+    );
+    inspectSessionCandidateBundleScratch(request.snapshot.worktree, identity);
+  } catch (error: unknown) {
+    return failure(
+      new DomainError(
+        "OPERATION_REJECTED",
+        error instanceof Error ? error.message : "Candidate scratch could not be verified safely.",
+        { session_id: request.session_id, candidate_id: request.candidate_id },
+      ),
+    );
+  }
+  const options: SessionCandidateScratchReleaseOptions = {
+    session_id: request.session_id,
+    snapshot: request.snapshot,
+    candidate_id: request.candidate_id,
+    candidate_digest: request.candidate_digest,
+    source: request.source,
+  };
+  const released = await backend.releaseSessionCandidateScratch(context, options);
+  if (!released.ok) return released;
+  const fence = released.value.drain_fence;
+  if (
+    released.value.session_id !== request.session_id ||
+    released.value.candidate_id !== request.candidate_id ||
+    released.value.candidate_digest !== request.candidate_digest ||
+    released.value.worktree !== request.snapshot.worktree ||
+    released.value.staging_root !== expectedRoot ||
+    released.value.repository_path !== expectedRepository ||
+    released.value.head_id !== request.source.candidate_commit ||
+    released.value.tree_id !== request.source.candidate_tree ||
+    released.value.removed !== true ||
+    released.value.snapshot.session_id !== request.session_id ||
+    released.value.snapshot.repository !== request.snapshot.repository ||
+    released.value.snapshot.worktree !== request.snapshot.worktree ||
+    released.value.snapshot.branch !== request.snapshot.branch ||
+    released.value.snapshot.managed.admission !== "closed" ||
+    fence.session_id !== request.session_id ||
+    fence.operation !== "close" ||
+    fence.policy !== "wait" ||
+    fence.admission !== "closed" ||
+    fence.status !== "drained" ||
+    !fence.completion_observed ||
+    !fence.kernel_empty ||
+    fence.active_execution_ids.length !== 0 ||
+    fence.unknown_execution_ids.length !== 0 ||
+    fence.executions.some(
+      ({ observation }) =>
+        observation.state !== "empty" ||
+        observation.cgroups === null ||
+        observation.cgroups.population.state !== "empty",
+    )
+  ) {
+    return failure(
+      new DomainError("OPERATION_REJECTED", "The owner did not return an exact drained candidate release receipt.", {
+        session_id: request.session_id,
+        candidate_id: request.candidate_id,
+      }),
+    );
+  }
+  const payload = {
+    contract_id: SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID,
+    schema_version: SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+    producer: { package: "nawabari" as const, version: packageMetadata.version },
+    session_id: request.session_id,
+    candidate_id: request.candidate_id,
+    candidate_digest: request.candidate_digest,
+    snapshot: released.value.snapshot,
+    source: request.source,
+    release: {
+      removed: true as const,
+      staging_root: released.value.staging_root,
+      repository_path: released.value.repository_path,
+      head_id: released.value.head_id,
+      tree_id: released.value.tree_id,
+    },
+    drain_fence: fence,
+  };
+  return success({ ...payload, receipt_sha256: sha256(canonicalJson(payload)) });
+}
+
 function candidatePath(
   snapshot: SessionVerificationSnapshot,
   request: SessionCandidateBundleRequest,
@@ -333,23 +527,6 @@ function candidatePath(
     source.project_id,
     source.source_id,
   );
-}
-
-/** Deterministic repository path owned by a Nawabari session candidate stage. */
-export function sessionCandidateBundleRepositoryPath(
-  worktree: string,
-  candidateDigest: string,
-  projectId: string,
-  sourceId: string,
-): string {
-  if (!path.isAbsolute(worktree) || path.resolve(worktree) !== worktree)
-    throw new TypeError("candidate bundle repository identity is invalid");
-  const candidate = digest.exec(candidateDigest);
-  if (!candidate || !projectId || !sourceId || projectId.length > 256 || sourceId.length > 256)
-    throw new TypeError("candidate bundle repository identity is invalid");
-  const candidateHex = candidate[1]!;
-  const sourceKey = sha256(`${projectId}\0${sourceId}`).slice(0, 24);
-  return path.join(worktree, ".nawabari-verification-candidates", candidateHex, sourceKey, "repo");
 }
 
 function requestFenceMatches(expected: SessionVerificationSnapshot, actual: SessionVerificationSnapshot): boolean {

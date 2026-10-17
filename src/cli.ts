@@ -93,8 +93,10 @@ import {
 } from "./session-bound-verification.js";
 import {
   describeSessionCandidateBundlePaths,
+  releaseSessionCandidateBundleScratch,
   stageSessionCandidateBundle,
   type SessionCandidateBundleRequest,
+  type SessionCandidateBundleReleaseRequest,
 } from "./session-candidate-bundle.js";
 import { readSessionVerificationRequestFile } from "./session-verification-cli-input.js";
 import { validateWorktreeProfileCatalog, type WorktreeProfileCatalog } from "./domain/worktree-profile-catalog.js";
@@ -1788,7 +1790,8 @@ async function executeCommand(
     (subcommand === "snapshot" ||
       subcommand === "execute" ||
       subcommand === "candidate-paths" ||
-      subcommand === "stage-candidate")
+      subcommand === "stage-candidate" ||
+      subcommand === "release-candidate")
   ) {
     const commandName = `verification ${subcommand}`;
     const parsed = parseOptions(rest, dispatcherAllowedOptions(commandName));
@@ -1826,11 +1829,17 @@ async function executeCommand(
               dependencies.backend,
               request.value as SessionCandidateBundleRequest,
             )
-          : await stageSessionCandidateBundle(
-              context,
-              dependencies.backend,
-              request.value as SessionCandidateBundleRequest,
-            );
+          : subcommand === "stage-candidate"
+            ? await stageSessionCandidateBundle(
+                context,
+                dependencies.backend,
+                request.value as SessionCandidateBundleRequest,
+              )
+            : await releaseSessionCandidateBundleScratch(
+                context,
+                dependencies.backend,
+                request.value as SessionCandidateBundleReleaseRequest,
+              );
     return result.ok ? success(result.value as unknown as JsonObject) : result;
   }
 

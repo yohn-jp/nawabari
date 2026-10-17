@@ -10,7 +10,7 @@ import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
 import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
 import type { SessionActionDispatcher } from "./session-actions.js";
-import type { SessionDrainPolicy } from "./session-execution-control.js";
+import type { SessionDrainFence, SessionDrainPolicy } from "./session-execution-control.js";
 import type {
   CoordinationPreviewOptions as RegistryCoordinationPreviewOptions,
   CoordinationPreviewResult as RegistryCoordinationPreviewResult,
@@ -109,6 +109,39 @@ export type SessionVerificationSnapshot = Readonly<{
     readonly claim_set_generation: number;
   }>;
 }>;
+
+/** Exact candidate/source identity for owner-side scratch release after verifier use. */
+export type SessionCandidateScratchReleaseOptions = Readonly<{
+  readonly session_id: string;
+  readonly snapshot: SessionVerificationSnapshot;
+  readonly candidate_id: string;
+  readonly candidate_digest: string;
+  readonly source: Readonly<{
+    readonly project_id: string;
+    readonly source_id: string;
+    readonly bundle_sha256: string;
+    readonly base_commit: string;
+    readonly candidate_commit: string;
+    readonly candidate_tree: string;
+  }>;
+}>;
+
+/** Receipt produced only after the canonical admission fence and owned drain complete. */
+export type SessionCandidateScratchReleaseResult = Readonly<{
+  readonly session_id: string;
+  readonly candidate_id: string;
+  readonly candidate_digest: string;
+  readonly worktree: string;
+  readonly snapshot: SessionVerificationSnapshot;
+  readonly staging_root: string;
+  readonly repository_path: string;
+  readonly head_id: string;
+  readonly tree_id: string;
+  readonly removed: true;
+  readonly drain_fence: SessionDrainFence;
+}>;
+
+export type SessionCandidateScratchReleaseMutationResult = Omit<SessionCandidateScratchReleaseResult, "drain_fence">;
 
 export type WorktreeProfileSessionCreateOptions = {
   selection: { profile: string };
@@ -1075,6 +1108,11 @@ export interface SessionBackend {
     context: SessionContext,
     sessionId: string,
   ): Promise<DomainResult<SessionVerificationSnapshot>>;
+  /** Drain-fenced removal of one exact Nawabari-owned candidate verifier scratch tree. */
+  releaseSessionCandidateScratch?(
+    context: SessionContext,
+    options: SessionCandidateScratchReleaseOptions,
+  ): Promise<DomainResult<SessionCandidateScratchReleaseResult>>;
   readSessionRuntimeEpoch?(context: SessionContext, sessionId: string): number;
   /** The single managed cgroup root retained by the backend for readiness and launch. */
   getManagedCgroupRoot?(): DomainResult<string>;

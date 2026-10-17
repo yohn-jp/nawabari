@@ -145,6 +145,21 @@ const REGISTRY_DATA = [
     ],
   },
   {
+    name: "verification release-candidate",
+    summary: "Drain the owned session and release one verified candidate scratch tree",
+    usage: `${CLI_NAME} verification release-candidate --request-file <path>`,
+    options: [
+      option("--request-file", "Bounded version 1 owner-bound candidate release request JSON", {
+        value: "<path>",
+        required: true,
+      }),
+    ],
+    notes: [
+      "Requires the exact current owner snapshot, waits for closed-admission owned-scope emptiness, and removes only the clean deterministic candidate source subtree.",
+      "Dirty, nested, symlinked, wrong-owner, or unexpected recoverable candidate data blocks release and remains available for recovery.",
+    ],
+  },
+  {
     name: "session create",
     summary: "Request a new Nawabari session",
     usage:

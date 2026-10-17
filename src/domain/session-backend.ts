@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { executeBootstrapAction, runBootstrapActions } from "./session-bootstrap.js";
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   SessionRegistry,
   type GarbageCollectResult as RegistryGarbageCollectResult,
@@ -45,6 +46,9 @@ import {
   type PushOptions,
   type PushResult,
   type SessionBackend,
+  type SessionCandidateScratchReleaseMutationResult,
+  type SessionCandidateScratchReleaseOptions,
+  type SessionCandidateScratchReleaseResult,
   type SessionCloseOptions,
   type SessionCloseResult,
   type SessionDiscardResult,
@@ -94,6 +98,7 @@ import {
   type CoordinationTransactionResult,
 } from "./session.js";
 import { collectRepositoryRuntimeSnapshot } from "./repository-observation-service.js";
+import { inspectSessionCandidateBundleScratch } from "../session-candidate-bundle-storage.js";
 import { createSessionActions, type SessionActionDispatcher } from "./session-actions.js";
 import {
   parseSessionExecutionRecord,
@@ -422,6 +427,78 @@ export class LocalSessionBackend implements SessionBackend {
   ): Promise<DomainResult<SessionVerificationSnapshot>> {
     try {
       return success(this.registryFor(context).getSessionVerificationSnapshot(sessionId));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async releaseSessionCandidateScratch(
+    context: SessionContext,
+    options: SessionCandidateScratchReleaseOptions,
+  ): Promise<DomainResult<SessionCandidateScratchReleaseResult>> {
+    try {
+      const registry = this.registryFor(context);
+      const currentSnapshot = registry.getSessionVerificationSnapshot(options.session_id);
+      if (!isDeepStrictEqual(currentSnapshot, options.snapshot)) {
+        return failure(
+          new DomainError("STALE_REGISTRY", "Candidate release requires the exact current owner snapshot.", {
+            session_id: options.session_id,
+          }),
+        );
+      }
+      if (registry.getSessionLaunchAdmission(options.session_id) === undefined) {
+        return failure(
+          new DomainError("OPERATION_REJECTED", "Candidate release requires tracked managed admission.", {
+            session_id: options.session_id,
+          }),
+        );
+      }
+      const identity = {
+        candidate_digest: options.candidate_digest,
+        project_id: options.source.project_id,
+        source_id: options.source.source_id,
+        bundle_sha256: options.source.bundle_sha256,
+        base_commit: options.source.base_commit,
+        candidate_commit: options.source.candidate_commit,
+        candidate_tree: options.source.candidate_tree,
+      };
+      try {
+        inspectSessionCandidateBundleScratch(options.snapshot.worktree, identity);
+      } catch (error: unknown) {
+        return failure(
+          new DomainError(
+            "OPERATION_REJECTED",
+            error instanceof Error ? error.message : "Candidate scratch could not be verified safely.",
+            { session_id: options.session_id, candidate_id: options.candidate_id },
+          ),
+        );
+      }
+      const drained = await closeSessionWithRuntimeDrain(
+        runtimeLifecycleAdapter(
+          registry,
+          ({ fence }) =>
+            registryMutation(() => registry.releaseSessionCandidateScratch(options, fence)),
+          this.managedCgroupRoot,
+          this.registryOptions.cgroupFilesystem,
+        ),
+        options.session_id,
+        options.snapshot.managed.runtime_epoch,
+        "wait",
+      );
+      if (!drained.ok) return drained;
+      if (drained.value.status !== "completed" || drained.value.value === undefined) {
+        return failure(
+          new DomainError("OPERATION_REJECTED", "Candidate scratch release is blocked until owned executions drain.", {
+            session_id: options.session_id,
+            status: drained.value.status,
+            active_execution_ids: drained.value.active_execution_ids,
+            unknown_execution_ids: drained.value.unknown_execution_ids,
+          }),
+        );
+      }
+      if (!drained.value.value.ok) return drained.value.value;
+      const mutation: SessionCandidateScratchReleaseMutationResult = drained.value.value.value;
+      return success({ ...mutation, drain_fence: drained.value.fence });
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }

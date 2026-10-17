@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   defaultGit,
@@ -233,7 +234,12 @@ import {
 import { resolveWorktreeProfileRuntime } from "./domain/worktree-profile-runtime.js";
 import { resolveProfileRuntimeScope } from "./domain/worktree-profile-scope.js";
 import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
-import type { SessionVerificationSnapshot, WorktreeProfileSessionCreateOptions } from "./domain/session.js";
+import type {
+  SessionCandidateScratchReleaseMutationResult,
+  SessionCandidateScratchReleaseOptions,
+  SessionVerificationSnapshot,
+  WorktreeProfileSessionCreateOptions,
+} from "./domain/session.js";
 import {
   parseSessionExecutionRecord,
   recordExecutionState,
@@ -250,6 +256,7 @@ import {
   type CgroupFileSystem,
 } from "./domain/cgroups-v2.js";
 import { observeSessionCgroupTree } from "./domain/session-cgroup-tree-observation.js";
+import { removeSessionCandidateBundleScratch } from "./session-candidate-bundle-storage.js";
 import {
   observeOwnedExecution,
   type SessionExecutionRecord as OwnedExecutionRecord,
@@ -1509,6 +1516,94 @@ export class SessionRegistry implements SessionRetentionAuthority {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
       return this.sessionVerificationSnapshotFromState(state, sessionId);
+    });
+  }
+
+  /** Remove one exact, clean owner candidate subtree only after the session close drain fence is revalidated. */
+  releaseSessionCandidateScratch(
+    options: SessionCandidateScratchReleaseOptions,
+    finalization: SessionDrainFinalization,
+  ): SessionCandidateScratchReleaseMutationResult {
+    assertSessionId(options.session_id);
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      this.assertDrainFinalizationUnsafe(state, finalization, options.session_id, "close");
+      const currentSnapshot = this.sessionVerificationSnapshotFromState(state, options.session_id);
+      const expectedEpoch = options.snapshot.managed.runtime_epoch + 1;
+      const expectedRevision = options.snapshot.managed.registry_revision + 1;
+      if (!Number.isSafeInteger(expectedEpoch) || !Number.isSafeInteger(expectedRevision)) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Candidate release owner snapshot is out of range", {
+          sessionId: options.session_id,
+        });
+      }
+      const expectedSnapshot: SessionVerificationSnapshot = {
+        ...options.snapshot,
+        filesystem_policy_token: {
+          ...options.snapshot.filesystem_policy_token,
+          registry_revision: expectedRevision,
+          session_runtime_epoch: expectedEpoch,
+        },
+        managed: {
+          ...options.snapshot.managed,
+          admission: "closed",
+          runtime_epoch: expectedEpoch,
+          registry_revision: expectedRevision,
+        },
+      };
+      if (!isDeepStrictEqual(currentSnapshot, expectedSnapshot)) {
+        throw new SessionRegistryError(
+          "STALE_REGISTRY",
+          "Candidate release owner snapshot changed after admission was closed.",
+          { sessionId: options.session_id },
+        );
+      }
+      const session = state.sessions.find((record) => record.sessionId === options.session_id);
+      if (
+        session === undefined ||
+        session.repositoryId !== currentSnapshot.repository ||
+        session.worktreePath !== currentSnapshot.worktree ||
+        session.branchName !== currentSnapshot.branch
+      ) {
+        throw new SessionRegistryError("STALE_REGISTRY", "Candidate release no longer matches its owner session.", {
+          sessionId: options.session_id,
+        });
+      }
+      const identity = {
+        candidate_digest: options.candidate_digest,
+        project_id: options.source.project_id,
+        source_id: options.source.source_id,
+        bundle_sha256: options.source.bundle_sha256,
+        base_commit: options.source.base_commit,
+        candidate_commit: options.source.candidate_commit,
+        candidate_tree: options.source.candidate_tree,
+      };
+      try {
+        const removed = removeSessionCandidateBundleScratch(session.worktreePath, identity);
+        return {
+          session_id: options.session_id,
+          candidate_id: options.candidate_id,
+          candidate_digest: options.candidate_digest,
+          worktree: session.worktreePath,
+          snapshot: currentSnapshot,
+          staging_root: removed.staging_root,
+          repository_path: removed.repository_path,
+          head_id: removed.head_id,
+          tree_id: removed.tree_id,
+          removed: true,
+        };
+      } catch (error: unknown) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Candidate scratch could not be removed without losing recoverable data.",
+          {
+            sessionId: options.session_id,
+            candidateDigest: options.candidate_digest,
+            sourceId: options.source.source_id,
+            reason: error instanceof Error ? error.message.slice(0, 240) : "unknown",
+          },
+          error,
+        );
+      }
     });
   }
 
