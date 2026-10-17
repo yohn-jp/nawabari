@@ -16,10 +16,13 @@ sibling attribution in the physical cgroup tree.
 
 `nawabari-oci-n1-run.py` uses only the public Nawabari CLI inside the selected
 OCI container. It runs a real strict Node payload that reads the claimed
-README, writes the claimed fixture, confirms the Git worktree change, and
-attempts reads from pre-created outer-container, peer-worktree, control-store,
-and secret sentinels. It checks the launch's raw bytes and physical namespace
-and cleanup receipt, a stale-snapshot refusal without a new execution record,
+README, writes and reads back the claimed fixture, confirms the Git executable
+is available while repository metadata access remains denied inside the
+payload, and attempts reads from pre-created outer-container, peer-worktree,
+control-store, and secret sentinels. After the payload, the public owner
+checkpoint must observe the exact changed path under the selected session's
+claim. The runner checks the launch's raw bytes and physical namespace and
+cleanup receipt, a stale-snapshot refusal without a new execution record,
 a verifier timeout with observed descendant cleanup, public owner close with
 `--drain-policy terminate` on the tested target, then publicly creates a
 replacement only after the closed target releases its exclusive write claim.

@@ -816,17 +816,21 @@ def main() -> int:
             failures.append("zero-record drain probe did not remain owner-observed closed after preserving the sibling")
 
         boundary_source = (
-            "const fs=require('node:fs'),cp=require('node:child_process'),assert=require('node:assert/strict');"
+            "const fs=require('node:fs'),cp=require('node:child_process'),assert=require('node:assert/strict'),crypto=require('node:crypto');"
             "const [owned,outerRoot,peer,control,secret]=process.argv.slice(1);"
             "assert.ok(fs.readFileSync('README.md','utf8').length>0,'bounded README read failed');"
             "const marker='OCI_NAWABARI_N1_OWNED_WRITE_'+process.pid+'\\n';"
             "fs.writeFileSync(owned,marker);"
-            "const git=cp.spawnSync('git',['status','--porcelain=v1','--',owned],{encoding:'utf8'});"
-            "assert.equal(git.status,0,git.stderr);assert.ok(git.stdout.includes(owned),'Git did not observe the claimed write');"
+            "assert.equal(fs.readFileSync(owned,'utf8'),marker,'protected payload could not read back its own write');"
+            "const gitVersion=cp.spawnSync('git',['--version'],{encoding:'utf8'});"
+            "assert.equal(gitVersion.status,0,gitVersion.stderr);"
+            "const gitMetadata=cp.spawnSync('git',['rev-parse','--show-toplevel'],{encoding:'utf8'});"
+            "assert.notEqual(gitMetadata.status,0,'strict payload unexpectedly accessed repository Git metadata');"
             "const probes={outer_oci_root:outerRoot,peer_worktree:peer,control_store:control,secret};"
             "const denials={};for(const [name,path] of Object.entries(probes)){let code=null;try{fs.readFileSync(path)}"
             "catch(error){code=error.code||error.name}assert.ok(code,`strict boundary exposed ${name}`);denials[name]={denied:true,code};}"
-            "const report={read:'README.md',write:owned,git_status:git.stdout,denials};"
+            "const report={read:'README.md',write:owned,write_sha256:crypto.createHash('sha256').update(marker).digest('hex'),"
+            "git_executable:gitVersion.stdout.trim(),git_metadata_denied:{status:gitMetadata.status,stderr:gitMetadata.stderr.trim()},denials};"
             "process.stdout.write(JSON.stringify(report)+'\\n');"
         )
         boundary_run, boundary_result = invoke(
@@ -868,7 +872,33 @@ def main() -> int:
         }
         (evidence / "network-isolation-observation.json").write_text(json.dumps(network_isolation, indent=2) + "\n")
         if boundary_run.returncode != 0 or not isinstance(boundary_result, dict) or boundary_result.get("ok") is not True:
-            failures.append(f"strict current-session read/write/Git/boundary payload failed (exit={boundary_run.returncode})")
+            failures.append(f"strict current-session read/write/boundary payload failed (exit={boundary_run.returncode})")
+        checkpoint_result = invoke(
+            "target-checkpoint-after-protected-write",
+            ["checkpoint", "--session", args.session],
+            30,
+            target_worktree,
+        )
+        if checkpoint_result[0].returncode != 0 or not isinstance(checkpoint_result[1], dict) or checkpoint_result[1].get("ok") is not True:
+            failures.append("public owner checkpoint did not complete after the protected write")
+            checkpoint_doc = None
+        else:
+            checkpoint_doc = checkpoint_result[1]
+            checkpoint_paths = checkpoint_doc.get("paths")
+            changed = checkpoint_paths.get("changed") if isinstance(checkpoint_paths, dict) else None
+            in_claim = checkpoint_doc.get("in_claim")
+            if (
+                checkpoint_doc.get("session_id") != args.session
+                or checkpoint_doc.get("worktree") != target_worktree
+                or not isinstance(changed, list)
+                or owned_file not in changed
+                or not isinstance(in_claim, list)
+                or owned_file not in in_claim
+            ):
+                failures.append("public owner checkpoint did not observe the protected write under its exact session claim")
+        (evidence / "target-owner-checkpoint-summary.json").write_text(
+            json.dumps(checkpoint_doc, indent=2) if checkpoint_doc is not None else "null"
+        )
         boundary_physical = recursively_find(boundary_result, "physical_execution") if isinstance(boundary_result, dict) else None
         if not isinstance(boundary_physical, dict):
             failures.append("strict boundary run omitted physical execution evidence")
@@ -912,10 +942,20 @@ def main() -> int:
                     for name in ("outer_oci_root", "peer_worktree", "control_store", "secret")
                 ):
                     failures.append("strict boundary payload reported a sentinel read without an observed denial code")
-                if boundary_report.get("write") != owned_file or owned_file not in boundary_report.get("git_status", ""):
-                    failures.append("strict boundary payload did not prove its own claimed write through Git")
+                if (
+                    boundary_report.get("write") != owned_file
+                    or not isinstance(boundary_report.get("write_sha256"), str)
+                    or boundary_report.get("git_executable", "").startswith("git version ") is not True
+                    or not isinstance(boundary_report.get("git_metadata_denied"), dict)
+                    or boundary_report["git_metadata_denied"].get("status") == 0
+                ):
+                    failures.append("strict payload did not prove its write/readback and the bounded Git metadata denial")
         (evidence / "target-strict-boundary-summary.json").write_text(
-            json.dumps({"physical_execution": boundary_physical, "payload": boundary_report}, indent=2) + "\n"
+            json.dumps(
+                {"physical_execution": boundary_physical, "payload": boundary_report, "owner_checkpoint": checkpoint_doc},
+                indent=2,
+            )
+            + "\n"
         )
 
         target_before = process_snapshot("target-processes-before-stale-test", args.session)
