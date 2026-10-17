@@ -1462,7 +1462,7 @@ test("the local backend exposes close and gc as stable automation results", asyn
   }
 });
 
-type ManagedFileOperationScope = "populated" | "unknown" | "none";
+type ManagedFileOperationScope = "populated" | "unknown" | "unattributed" | "none";
 
 function managedFileOperationFixture(scope: ManagedFileOperationScope) {
   const repositoryPath = createRepository();
@@ -1612,6 +1612,12 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
     cgroupFiles.set(path.join(scopePath, "cgroup.events"), "populated 1\n");
     cgroupFiles.set(path.join(scopePath, "cgroup.procs"), "");
     cgroupFiles.set(path.join(cgroupParent, "cgroup.events"), "populated 1\n");
+  } else if (scope === "unattributed") {
+    const scopePath = path.join(cgroupParent, `nawabari-${"a".repeat(48)}`);
+    directories.add(scopePath);
+    cgroupFiles.set(path.join(scopePath, "cgroup.events"), "populated 1\n");
+    cgroupFiles.set(path.join(scopePath, "cgroup.procs"), "");
+    cgroupFiles.set(path.join(cgroupParent, "cgroup.events"), "populated 1\n");
   }
 
   const helperCalls: { lockHeld: boolean }[] = [];
@@ -1715,6 +1721,7 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
 for (const [scope, status] of [
   ["populated", "waiting"],
   ["unknown", "blocked"],
+  ["unattributed", "blocked"],
 ] as const) {
   test(`managed file operations close admission and perform no I/O when owned scope is ${scope}`, async () => {
     const fixture = managedFileOperationFixture(scope);

@@ -83,12 +83,7 @@ function fixture(): VirtualCgroupFs {
   return filesystem;
 }
 
-function executionRecord(
-  sessionId: string,
-  executionId: string,
-  root = ROOT,
-  bootId = BOOT,
-): SessionExecutionRecord {
+function executionRecord(sessionId: string, executionId: string, root = ROOT, bootId = BOOT): SessionExecutionRecord {
   return {
     contract_id: SESSION_EXECUTION_RECORD_CONTRACT_ID,
     schema_version: SESSION_EXECUTION_RECORD_SCHEMA_VERSION,
@@ -109,11 +104,7 @@ function executionRecord(
   };
 }
 
-const observe = (
-  filesystem: CgroupFileSystem,
-  sessionId: string,
-  records: readonly SessionExecutionRecord[] = [],
-) =>
+const observe = (filesystem: CgroupFileSystem, sessionId: string, records: readonly SessionExecutionRecord[] = []) =>
   observeSessionCgroupTree({
     session_id: sessionId,
     root: ROOT,
@@ -177,4 +168,28 @@ test("wrong-boot owners and unavailable population files never prove sibling emp
   const unavailable = observe(filesystem, "target-session", []);
   assert.equal(unavailable.state, "unknown");
   assert.equal(unavailable.reason, "cgroup-observation-unavailable");
+});
+
+test("wrong-root owners cannot authorize ignoring a populated child scope", () => {
+  const filesystem = fixture();
+  const sibling = executionRecord("sibling-session", "sibling-run", `${ROOT}/different-root`);
+  filesystem.addScope(sibling.cgroup_identity, true);
+  filesystem.setParentPopulated(true);
+
+  const result = observe(filesystem, "target-session", [sibling]);
+  assert.equal(result.state, "unknown");
+  assert.equal(result.reason, "unattributed-scope-populated");
+});
+
+test("missing parent tree and parent occupancy mismatches remain unknown", () => {
+  const filesystem = fixture();
+  const noEnumeration = { ...filesystem, readdirSync: undefined } as unknown as CgroupFileSystem;
+  const unavailable = observe(noEnumeration, "target-session");
+  assert.equal(unavailable.state, "unknown");
+  assert.equal(unavailable.reason, "cgroup-observation-unavailable");
+
+  filesystem.setParentPopulated(true);
+  const inconsistent = observe(filesystem, "target-session");
+  assert.equal(inconsistent.state, "unknown");
+  assert.equal(inconsistent.reason, "cgroup-tree-inconsistent");
 });

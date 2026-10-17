@@ -146,7 +146,9 @@ export type CgroupFileSystem = {
   readonly realpathSync: (file: string) => string;
   readonly readFileSync: (file: string) => string;
   /** Enumerate direct cgroup children; absence is unknown for tree-wide drain proofs. */
-  readonly readdirSync?: (directory: string) => readonly { readonly name: string; readonly isDirectory: () => boolean }[];
+  readonly readdirSync?: (
+    directory: string,
+  ) => readonly { readonly name: string; readonly isDirectory: () => boolean }[];
   readonly writeFileSync: (file: string, value: string) => void;
   readonly mkdirSync: (file: string, options?: { readonly recursive?: boolean; readonly mode?: number }) => void;
   readonly rmdirSync: (file: string) => void;

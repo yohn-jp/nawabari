@@ -1,11 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import {
-  deriveCgroupScopeName,
-  isCanonicalManagedCgroupRoot,
-  type CgroupFileSystem,
-} from "./cgroups-v2.js";
+import { deriveCgroupScopeName, isCanonicalManagedCgroupRoot, type CgroupFileSystem } from "./cgroups-v2.js";
 import type { SessionExecutionRecord } from "./session-execution-record.js";
 
 export const SESSION_CGROUP_TREE_OBSERVATION_CONTRACT_ID = "nawabari.session-cgroup-tree-observation.v1" as const;
@@ -83,10 +79,7 @@ function readPopulation(directory: string, filesystem: Pick<CgroupFileSystem, "r
   const eventsPopulated = match === null ? null : (Number(match[1]) as 0 | 1);
   const processLines = processes.split(/\r?\n/u).filter((line) => line.trim().length > 0);
   const processIds = processLines.map((line) => Number(line.trim()));
-  if (
-    eventsPopulated === null ||
-    processIds.some((pid) => !Number.isSafeInteger(pid) || pid < 1)
-  ) {
+  if (eventsPopulated === null || processIds.some((pid) => !Number.isSafeInteger(pid) || pid < 1)) {
     return { state: "unknown", events_populated: eventsPopulated, process_count: null };
   }
   return {
@@ -262,12 +255,5 @@ export function observeSessionCgroupTree(
       knownOtherSessionScopes,
     );
   }
-  return result(
-    input.session_id,
-    input.root,
-    "empty",
-    "observed-empty",
-    observedScopes,
-    knownOtherSessionScopes,
-  );
+  return result(input.session_id, input.root, "empty", "observed-empty", observedScopes, knownOtherSessionScopes);
 }

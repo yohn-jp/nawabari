@@ -1447,12 +1447,7 @@ async function mutateClaimsWithRuntimeDrain<T>(
 ): Promise<DomainResult<T>> {
   if (registry.getSessionLaunchAdmission(sessionId) === undefined) return mutation();
   const drained = await releaseSessionClaimsWithRuntimeDrain(
-    runtimeLifecycleAdapter(
-      registry,
-      ({ fence }) => mutation(fence),
-      managedCgroupRoot,
-      cgroupFilesystem,
-    ),
+    runtimeLifecycleAdapter(registry, ({ fence }) => mutation(fence), managedCgroupRoot, cgroupFilesystem),
     sessionId,
     registry.runtimeEpoch,
   );
