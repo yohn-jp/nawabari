@@ -187,7 +187,7 @@ test("executes only after GO and carries the actual bounded result", async () =>
   assert.equal(envelope.result.physical_execution.start.state, "unknown");
 });
 
-test("the compiled worker rejects a non-Bubblewrap launch with unknown physical evidence", async (t) => {
+test("the real package entrypoint uses fd 4/5 without sharing payload stdio", async (t) => {
   if (process.env.NAWABARI_TEST_LANE !== "compiled-worker") {
     t.skip("run via pnpm test:compiled-worker");
     return;
