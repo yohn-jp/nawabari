@@ -223,6 +223,7 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
     assert.ok(compiled.value.args.includes("/proc"));
     assert.ok(compiled.value.args.includes("/tmp"));
     assert.ok(compiled.value.args.includes("--unshare-user"));
+    assert.equal(compiled.value.args.includes("--disable-userns"), false, "OCI-safe namespace denial uses seccomp");
     assert.ok(compiled.value.args.includes("--unshare-pid"));
     assert.ok(compiled.value.args.includes("--unshare-ipc"));
     assert.ok(compiled.value.args.includes("--unshare-uts"));

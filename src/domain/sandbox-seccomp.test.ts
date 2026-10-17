@@ -154,10 +154,11 @@ const EXPECTED_SYSCALLS = {
   },
 } as const;
 
-function compiledSyscallNumbers(bytes: Uint8Array): number[] {
+function compiledSyscallNumbers(bytes: Uint8Array, architecture: keyof typeof EXPECTED_SYSCALLS): number[] {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const numbers: number[] = [];
-  for (let index = 4; index < bytes.byteLength / INSTRUCTION_SIZE - 1; index += 2) {
+  const start = architecture === "x64" ? 8 : 4;
+  for (let index = start; index < start + Object.keys(EXPECTED_SYSCALLS[architecture]).length * 2; index += 2) {
     const code = view.getUint16(index * INSTRUCTION_SIZE, true);
     assert.equal(code, BPF_JMP_JEQ_K);
     numbers.push(view.getUint32(index * INSTRUCTION_SIZE + 4, true));
@@ -173,7 +174,7 @@ test("seccomp compilation uses the authoritative syscall mapping on every suppor
     assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
     if (!compiled.ok) continue;
 
-    assert.deepEqual(compiledSyscallNumbers(compiled.value), Object.values(expected));
+    assert.deepEqual(compiledSyscallNumbers(compiled.value, architecture), Object.values(expected));
     assert.deepEqual(sandboxSeccompProfileMetadata(architecture).denied_syscalls, SANDBOX_SECCOMP_DENIED_SYSCALLS);
   }
 });
@@ -183,4 +184,57 @@ test("unsupported seccomp architectures fail closed with the typed capability er
   const result = compileSandboxSeccompProfile("ia32");
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.error.code, "SANDBOX_CAPABILITY_UNAVAILABLE");
+});
+
+const RAW_CLONE_SYSCALLS = { x64: 56, arm64: 220, arm: 120, riscv64: 220 } as const;
+const AUDIT_ARCH = { x64: 0xc000003e, arm64: 0xc00000b7, arm: 0x40000028, riscv64: 0xc00000f3 } as const;
+
+/** Tiny classic-BPF interpreter for the opcodes emitted by the sandbox policy. */
+function evaluateFilter(bytes: Uint8Array, architecture: keyof typeof RAW_CLONE_SYSCALLS, nr: number, cloneFlags = 0): number {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let accumulator = 0;
+  for (let pc = 0; pc < bytes.byteLength / INSTRUCTION_SIZE;) {
+    const offset = pc * INSTRUCTION_SIZE;
+    const code = view.getUint16(offset, true);
+    const jt = view.getUint8(offset + 2);
+    const jf = view.getUint8(offset + 3);
+    const constant = view.getUint32(offset + 4, true);
+    if (code === 0x20) {
+      accumulator = constant === 0 ? nr : constant === 4 ? AUDIT_ARCH[architecture] : constant === 16 ? cloneFlags : 0;
+      pc++;
+    } else if (code === 0x54) {
+      accumulator &= constant;
+      pc++;
+    } else if (code === 0x15) {
+      pc += 1 + (accumulator === constant ? jt : jf);
+    } else if (code === 0x06) {
+      return constant;
+    } else {
+      assert.fail(`unexpected BPF opcode 0x${code.toString(16)}`);
+    }
+  }
+  assert.fail("BPF fell off the end without a decision");
+}
+
+test("payload seccomp denies namespace clone and clone3 while preserving ordinary fork/threads", () => {
+  const allow = 0x7fff0000;
+  const permissionDenied = 0x00050001;
+  const kernelFallback = 0x00050026;
+  for (const architecture of Object.keys(RAW_CLONE_SYSCALLS) as Array<keyof typeof RAW_CLONE_SYSCALLS>) {
+    const filter = compileSandboxSeccompProfile(architecture);
+    assert.equal(filter.ok, true);
+    if (!filter.ok) continue;
+    const clone = RAW_CLONE_SYSCALLS[architecture];
+    for (const flags of [0, 0x00000100, 0x00010000]) {
+      assert.equal(evaluateFilter(filter.value, architecture, clone, flags), allow);
+    }
+    for (const flags of [0x00000080, 0x00020000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000]) {
+      assert.equal(evaluateFilter(filter.value, architecture, clone, flags), permissionDenied);
+    }
+    assert.equal(evaluateFilter(filter.value, architecture, 435), kernelFallback, "clone3 must allow libc clone fallback");
+    assert.equal(evaluateFilter(filter.value, architecture, 999), allow, "unlisted ordinary syscalls stay allowed");
+  }
+  const x64 = compileSandboxSeccompProfile("x64");
+  assert.equal(x64.ok, true);
+  if (x64.ok) assert.equal(evaluateFilter(x64.value, "x64", 0x40000000 | 56), permissionDenied, "x32 namespace syscall alias must not bypass the filter");
 });

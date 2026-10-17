@@ -1560,7 +1560,8 @@ export function compileSandboxInvocation(
     "--unshare-pid",
     "--unshare-ipc",
     "--unshare-uts",
-    "--disable-userns",
+    // A strict inherited seccomp filter denies namespace-creating clone,
+    // clone3, unshare and setns without writing the OCI read-only userns sysctl.
     "--uid",
     "0",
     "--gid",
