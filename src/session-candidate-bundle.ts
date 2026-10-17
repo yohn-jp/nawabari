@@ -570,7 +570,9 @@ function bundleFileIsCurrent(worktree: string, candidateDigest: string, source: 
       stagingStat.isSymbolicLink() ||
       (stagingStat.mode & 0o077) !== 0 ||
       (typeof process.getuid === "function" && stagingStat.uid !== process.getuid())
-    ) return false;
+    ) {
+      return false;
+    }
     // Open once with O_NOFOLLOW: validation and hashing use the same inode,
     // not a pathname that can be replaced after lstat/realpath checks.
     const fd = fs.openSync(bundlePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
