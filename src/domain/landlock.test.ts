@@ -313,10 +313,7 @@ test("Landlock setup failure is reported once with bounded diagnostics and never
       "#!/bin/sh\nmessage='setup failed '; i=0; while [ $i -lt 1000 ]; do message=${message}x; i=$((i+1)); done\nprintf 'nawabari-landlock: %s\\n' \"$message\" >&2\nexit 125\n",
       { mode: 0o700 },
     );
-    const adapterDirectory = path.join(root, "landlock-adapter");
-    fs.mkdirSync(adapterDirectory, { mode: 0o700 });
-    const adapter = path.join(adapterDirectory, "launcher");
-    fs.writeFileSync(adapter, "#!/bin/sh\nexit 125\n", { mode: 0o700 });
+    const adapter = fs.realpathSync.native("/bin/sh");
     const request = {
       schema_version: 1,
       contract_id: "nawabari.sandbox-execution.v1",
@@ -329,11 +326,8 @@ test("Landlock setup failure is reported once with bounded diagnostics and never
       sandbox_executable: bwrap,
       identity: { real_uid: 1_000, real_gid: 1_000, namespace_uid: 0, namespace_gid: 0 },
       git_identity: { host_global_name: null, host_global_email: null },
-      filesystem: { ...topologyValue, system_paths: [...topologyValue.system_paths, path.dirname(adapter)] },
-      runtime_projection: compatibilityProjection({
-        ...topologyValue,
-        system_paths: [...topologyValue.system_paths, path.dirname(adapter)],
-      }),
+      filesystem: topologyValue,
+      runtime_projection: compatibilityProjection(topologyValue),
       required_capabilities: [
         "bubblewrap",
         "user_namespaces",

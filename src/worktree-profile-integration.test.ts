@@ -201,7 +201,7 @@ test("repository list/show preserves source identity and missing declared shell 
       4,
     );
     assert.equal(observed, null);
-    assert.equal(JSON.parse(create.stdout[0] ?? "").code, "RUNTIME_MATERIALIZATION_MISSING");
+    assert.equal(JSON.parse(create.stdout[0] ?? "").code, "RUNTIME_PROVIDER_MISSING");
 
     const collision = createRepository({ profiles: [repositoryProfile("minimal")] });
     try {
