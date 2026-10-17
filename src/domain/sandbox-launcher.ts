@@ -1543,6 +1543,7 @@ export function compileSandboxInvocation(
       XDG_CACHE_HOME: SANDBOX_CACHE_HOME,
       XDG_DATA_HOME: SANDBOX_DATA_HOME,
     }),
+    ...(boundedWorkingSet === undefined ? {} : { TMPDIR: tempDirectory }),
     USER: "nawabari",
     LOGNAME: "nawabari",
     NAWABARI_SESSION_ID: request.session_id,
@@ -1598,6 +1599,7 @@ export function compileSandboxInvocation(
     // parent afterward would mask that authorized destination before chdir.
     addReadWriteBind(args, compiledEnvironment.value.manifest.execution.tmp.path, SANDBOX_TMPDIR, seenDirectories);
     seenDirectories.add(SANDBOX_TMPDIR);
+    if (boundedWorkingSet !== undefined) args.push("--dir", tempDirectory);
   }
   const worktreeDestination = topology.value.worktree;
   if (filesystemEnforcement === undefined) {
