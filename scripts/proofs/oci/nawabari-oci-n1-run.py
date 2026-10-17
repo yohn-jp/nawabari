@@ -4,12 +4,11 @@
 This script is intentionally not run until the matching immutable Nawabari
 artifact is installed in the selected disposable OCI container. It consumes
 the prepared target/drain scope and existing live sibling created/selected by
-`nawabari-oci-n1-prepare.py` through Nawabari's public CLI. Closed target and
-drain records are replaced only through public session creation. The target
-itself is cancelled, then replaced publicly after its owned execution and
-claim lease close, leaving the tested replacement and original sibling active.
-It never uses host process signalling or stops/restarts the repository
-container.
+`nawabari-oci-n1-prepare.py` through Nawabari's public CLI. The target itself
+is cancelled through the public owner API. If close protects a dirty worktree,
+the target stays active and is preserved for the owner; a replacement is
+created only when the public API has actually closed it. The script never uses
+host process signalling or stops/restarts the repository container.
 """
 
 import argparse
@@ -484,6 +483,52 @@ def main() -> int:
         if len(fields) <= 19 or not fields[19].isdigit():
             raise RuntimeError("host process starttime could not be parsed")
         return fields[19]
+
+    def observe_known_payload_processes(expected_processes: list[dict]) -> list[dict]:
+        """Reobserve only the exact payload PIDs captured before cancellation."""
+        observations = []
+        for expected in expected_processes:
+            pid = expected.get("host_pid")
+            expected_starttime = expected.get("starttime")
+            observation = {
+                "role": expected.get("role"),
+                "host_pid": pid,
+                "expected_starttime": expected_starttime,
+            }
+            if not isinstance(pid, int) or not isinstance(expected_starttime, str):
+                observation.update({"state": "unknown", "reason": "invalid-pre-cancel-identity"})
+                observations.append(observation)
+                continue
+            try:
+                start_before = proc_starttime(pid)
+            except FileNotFoundError:
+                observation["state"] = "absent"
+                observations.append(observation)
+                continue
+            except (OSError, RuntimeError, ValueError) as error:
+                observation.update({"state": "unknown", "reason": type(error).__name__})
+                observations.append(observation)
+                continue
+            try:
+                start_after = proc_starttime(pid)
+            except FileNotFoundError:
+                observation["state"] = "absent"
+                observations.append(observation)
+                continue
+            except (OSError, RuntimeError, ValueError) as error:
+                observation.update({"state": "unknown", "reason": type(error).__name__})
+                observations.append(observation)
+                continue
+            if start_before != start_after:
+                observation.update({"state": "unknown", "reason": "pid-generation-changed-during-observation"})
+            else:
+                observation["current_starttime"] = start_before
+                observation["state"] = "present" if start_before == expected_starttime else "identity-reused"
+            observations.append(observation)
+        return observations
+
+    def owned_cancel_scope_observed(owner_empty: int, host_empty: int, payload_gone: int) -> bool:
+        return owner_empty >= 2 and host_empty >= 2 and payload_gone >= 1
 
     def observe_host_process(pid: int) -> dict | None:
         """Read a bounded identity for one PID named by the exact owned cgroup."""
@@ -1075,20 +1120,22 @@ def main() -> int:
         execution_id: str,
         owner_scope: str,
         pid_namespace: str,
+        known_payload_processes: list[dict],
     ) -> dict:
-        """Observe exact owner, host cgroup, and PID-namespace cleanup independently."""
+        """Wait for exact owner scope and payload PIDs; scan the namespace diagnostically once."""
         deadline = time.monotonic() + 20
         scope_path = pathlib.Path(owner_scope)
-        namespace_samples = []
         cgroup_samples = []
+        known_process_samples = []
         process_snapshot_doc = None
         owner_empty_observations = 0
         host_empty_observations = 0
-        namespace_empty_observations = 0
+        payload_gone_observations = 0
         owner_record = None
+        latest_known_processes = []
         while time.monotonic() < deadline:
             process_result, process_snapshot_doc = invoke(
-                f"{name}-processes-after-close-{len(namespace_samples) + 1:02d}",
+                f"{name}-processes-after-close-{len(cgroup_samples) + 1:02d}",
                 ["session", "processes", "--session", session_id],
                 15,
             )
@@ -1122,41 +1169,45 @@ def main() -> int:
                     "error": f"{type(error).__name__}: {error}",
                     "observed_at_unix": time.time(),
                 }
-            namespace_snapshot = observe_pid_namespace_members(pid_namespace)
             cgroup_samples.append(cgroup_snapshot)
-            namespace_samples.append(namespace_snapshot)
+            latest_known_processes = observe_known_payload_processes(known_payload_processes)
+            known_process_samples.append(latest_known_processes)
             if cgroup_snapshot.get("state") == "empty":
                 host_empty_observations += 1
             else:
                 host_empty_observations = 0
-            if namespace_snapshot.get("state") == "empty":
-                namespace_empty_observations += 1
-            else:
-                namespace_empty_observations = 0
-            if (
-                owner_empty_observations >= 2
-                and host_empty_observations >= 2
-                and namespace_empty_observations >= 2
+            if latest_known_processes and all(
+                item.get("state") in ("absent", "identity-reused")
+                for item in latest_known_processes
             ):
-                result = {
-                    "session_id": session_id,
-                    "execution_id": execution_id,
-                    "owner_scope_path": str(scope_path),
-                    "pid_namespace": pid_namespace,
-                    "owner_record": owner_record,
-                    "owner_cgroup_state": "empty",
-                    "host_cgroup_state": "empty",
-                    "pid_namespace_state": "empty",
-                    "owner_empty_observations": owner_empty_observations,
-                    "host_empty_observations": host_empty_observations,
-                    "pid_namespace_empty_observations": namespace_empty_observations,
-                    "host_cgroup_samples": cgroup_samples,
-                    "pid_namespace_samples": namespace_samples,
-                    "observed_at_unix": time.time(),
-                }
-                (evidence / f"{name}-physical-cleanup.json").write_text(json.dumps(result, indent=2) + "\n")
-                return result
+                payload_gone_observations += 1
+            else:
+                payload_gone_observations = 0
+            if owned_cancel_scope_observed(
+                owner_empty_observations,
+                host_empty_observations,
+                payload_gone_observations,
+            ):
+                break
             time.sleep(0.25)
+
+        try:
+            namespace_snapshot = observe_pid_namespace_members(pid_namespace)
+        except (OSError, RuntimeError, ValueError) as error:
+            namespace_snapshot = {
+                "pid_namespace": pid_namespace,
+                "state": "unknown",
+                "members": [],
+                "unobservable": [{"reason": type(error).__name__}],
+                "observed_at_unix": time.time(),
+            }
+        payload_process_state = (
+            "observed-gone"
+            if payload_gone_observations >= 1
+            else "present"
+            if any(item.get("state") == "present" for item in latest_known_processes)
+            else "unknown"
+        )
         result = {
             "session_id": session_id,
             "execution_id": execution_id,
@@ -1165,12 +1216,15 @@ def main() -> int:
             "owner_record": owner_record,
             "owner_cgroup_state": "empty" if owner_empty_observations >= 2 else "unknown",
             "host_cgroup_state": "empty" if host_empty_observations >= 2 else "unknown",
-            "pid_namespace_state": "empty" if namespace_empty_observations >= 2 else "unknown",
+            "known_payload_processes_state": payload_process_state,
+            "known_payload_processes": latest_known_processes,
             "owner_empty_observations": owner_empty_observations,
             "host_empty_observations": host_empty_observations,
-            "pid_namespace_empty_observations": namespace_empty_observations,
+            "known_payload_gone_observations": payload_gone_observations,
+            "pid_namespace_state": namespace_snapshot.get("state", "unknown"),
+            "pid_namespace_observation": namespace_snapshot,
             "host_cgroup_samples": cgroup_samples,
-            "pid_namespace_samples": namespace_samples,
+            "known_payload_process_samples": known_process_samples,
             "observed_at_unix": time.time(),
         }
         (evidence / f"{name}-physical-cleanup.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -1826,9 +1880,8 @@ def main() -> int:
                 )
 
         # Cancel the tested target itself after its successful positive and
-        # verifier checks. It is replaced publicly only after its close
-        # releases the exclusive write claim, so sibling sessions never race
-        # for the same write lease.
+        # verifier checks. A dirty-worktree close preserves the target; the
+        # owner may decide how to reconcile it after this proof.
         target_nonce = uuid.uuid4().hex
         target_marker_path = str(pathlib.PurePosixPath(target_worktree) / owned_file)
         target, _, _ = launch_persistent(
@@ -1849,12 +1902,14 @@ def main() -> int:
         target_cgroup_limits = None
         close_completed = False
         close_dirty_worktree = False
-        discard_completed = False
         target_cgroup_empty = False
-        target_pid_namespace_empty = False
+        target_payload_processes_gone = False
         target_cleanup = None
         target_process_observation = None
         expected_cancelled_execution = None
+        target_run_response_status = None
+        target_physical_receipt_present = False
+        replacement_session_id = None
         if target_started is None:
             failures.append(
                 "target cancellation was withheld because a payload-written nonce and matching live host parent/child were not observed in the exact owned cgroup"
@@ -1930,6 +1985,8 @@ def main() -> int:
             if run_evidence is None and isinstance(target_doc, dict):
                 run_evidence = recursively_find(target_doc, "physical_execution")
             target_physical = run_evidence.get("physical_execution") if isinstance(run_evidence, dict) else None
+            target_physical_receipt_present = isinstance(target_physical, dict)
+            target_run_response_status = target_doc.get("details", {}).get("status") if isinstance(target_doc, dict) else None
             if isinstance(target_physical, dict):
                 if target_physical.get("correlation_id") != expected_cancelled_execution:
                     failures.append("cancelled run receipt did not match the exact live owner execution")
@@ -1979,92 +2036,94 @@ def main() -> int:
                     expected_cancelled_execution,
                     scope_path,
                     pid_namespace,
+                    [
+                        {"role": "payload-parent", **target_pre_cancel["payload_parent"]},
+                        {"role": "payload-child", **target_pre_cancel["payload_child"]},
+                    ],
                 )
                 target_cgroup_empty = (
                     target_cleanup.get("owner_cgroup_state") == "empty"
                     and target_cleanup.get("host_cgroup_state") == "empty"
                 )
-                target_pid_namespace_empty = target_cleanup.get("pid_namespace_state") == "empty"
+                target_payload_processes_gone = target_cleanup.get("known_payload_processes_state") == "observed-gone"
                 if not target_cgroup_empty:
                     failures.append("public owner and host kernel did not both observe the exact cancelled cgroup empty")
-                if not target_pid_namespace_empty:
-                    failures.append("host kernel did not observe the exact cancelled payload PID namespace empty")
+                if not target_payload_processes_gone:
+                    failures.append("the exact pre-cancel payload parent and child were not both observed absent or PID-reused")
             else:
                 failures.append("cancelled execution could not be correlated to exact post-close owner cleanup observations")
             if close_dirty_worktree:
-                if not target_pid_namespace_empty or not target_cgroup_empty:
-                    failures.append("explicit discard was withheld because owner and PID-namespace cleanup were not both observed empty")
-                else:
-                    discard_result, discard_doc = invoke(
-                        "target-discard-after-proven-cancel",
-                        ["session", "discard", "--session", proof_target_session_id],
-                        60,
-                    )
-                    if discard_result.returncode != 0 or not isinstance(discard_doc, dict) or discard_doc.get("ok") is not True:
-                        failures.append(
-                            f"explicit discard after dirty-worktree protection failed (exit={discard_result.returncode}, code={discard_doc.get('code') if isinstance(discard_doc, dict) else 'unparseable'})"
-                        )
-                    else:
-                        discard_completed = (
-                            discard_doc.get("final_state") == "closed"
-                            and isinstance(discard_doc.get("session"), dict)
-                            and discard_doc["session"].get("session_id") == proof_target_session_id
-                        )
-                        if not discard_completed:
-                            failures.append("explicit discard returned without closing the exact disposable target session")
-                    (evidence / "target-dirty-close-and-discard.json").write_text(
-                        json.dumps(
-                            {
-                                "close_code": "DIRTY_WORKTREE",
-                                "physical_pid_namespace_empty": target_pid_namespace_empty,
-                                "owner_cgroup_empty": target_cgroup_empty,
-                                "owner_cleanup_observation": target_cleanup,
-                                "discard_exit_code": discard_result.returncode,
-                                "discard_response": discard_doc,
-                                "discard_completed": discard_completed,
-                            },
-                            indent=2,
-                        )
-                        + "\n"
-                    )
-            if close_completed or discard_completed:
-                closed_target = invoke_ok(
-                    "target-show-closed-after-cancel", ["session", "show", "--session", proof_target_session_id]
+                preserved_target = invoke_ok(
+                    "target-show-preserved-after-dirty-close",
+                    ["session", "show", "--session", proof_target_session_id],
                 )
-                closed_target_record = recursively_find(closed_target, "session")
-                if not isinstance(closed_target_record, dict) and isinstance(closed_target.get("session_id"), str):
-                    closed_target_record = closed_target
-                if not isinstance(closed_target_record, dict) or closed_target_record.get("state") != "closed":
-                    failures.append("target session did not remain owner-observed closed after termination/discard")
+                preserved_target_record = recursively_find(preserved_target, "session")
+                if not isinstance(preserved_target_record, dict) and isinstance(preserved_target.get("session_id"), str):
+                    preserved_target_record = preserved_target
+                if (
+                    not isinstance(preserved_target_record, dict)
+                    or preserved_target_record.get("session_id") != proof_target_session_id
+                    or preserved_target_record.get("state") != "active"
+                    or preserved_target_record.get("worktree") != target_worktree
+                ):
+                    failures.append("dirty-worktree close did not preserve the exact active target session and worktree")
+                (evidence / "target-dirty-close-preserved.json").write_text(
+                    json.dumps(
+                        {
+                            "close_response": close_doc,
+                            "target_state_after_close": preserved_target_record,
+                            "owner_cleanup_observation": target_cleanup,
+                            "discard_attempted": False,
+                            "pid_namespace_state": target_cleanup.get("pid_namespace_state") if target_cleanup else "unknown",
+                            "verification_pass_claimed": False,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+            else:
+                if not close_completed:
+                    # The default wait remains the public owner fallback; it
+                    # never signals payload processes from the host.
+                    wait_close, wait_doc = invoke(
+                        "target-close-wait-cleanup",
+                        ["session", "close", "--session", proof_target_session_id],
+                        30,
+                    )
+                    if wait_close.returncode != 0 or not isinstance(wait_doc, dict) or wait_doc.get("ok") is not True:
+                        failures.append("target session did not converge through default wait cleanup")
 
-        if not close_completed and not close_dirty_worktree and not discard_completed:
-            # Any fallback here is still the canonical default wait operation;
-            # it never signals the payload or treats host process exit as proof.
-            wait_close, wait_doc = invoke(
-                "target-close-wait-cleanup",
-                ["session", "close", "--session", proof_target_session_id],
-                30,
-            )
-            if wait_close.returncode != 0 or not isinstance(wait_doc, dict) or wait_doc.get("ok") is not True:
-                failures.append("target session did not converge through default wait cleanup")
+                closed_target_after_wait = invoke_ok(
+                    "target-show-closed-after-wait", ["session", "show", "--session", proof_target_session_id]
+                )
+                closed_target_after_wait_record = recursively_find(closed_target_after_wait, "session")
+                if not isinstance(closed_target_after_wait_record, dict) and isinstance(closed_target_after_wait.get("session_id"), str):
+                    closed_target_after_wait_record = closed_target_after_wait
+                if not isinstance(closed_target_after_wait_record, dict) or closed_target_after_wait_record.get("state") != "closed":
+                    failures.append("the tested target session was not owner-observed closed before replacement")
+                else:
+                    replacement = create_fresh_target("post-cancel-target")
+                    session_manifest["target"] = replacement
+                    target_session = replacement["session"]
+                    args.session = target_session.get("session_id")
+                    replacement_session_id = args.session
+                    target_worktree = target_session.get("worktree")
+                    (evidence / "fresh-target-after-cancel-creation.json").write_text(
+                        json.dumps(replacement, indent=2) + "\n"
+                    )
 
-        closed_target_after_wait = invoke_ok(
-            "target-show-closed-after-wait", ["session", "show", "--session", proof_target_session_id]
+        target_after_cancel = invoke_ok(
+            "target-show-left-active", ["session", "show", "--session", args.session]
         )
-        closed_target_after_wait_record = recursively_find(closed_target_after_wait, "session")
-        if not isinstance(closed_target_after_wait_record, dict) and isinstance(closed_target_after_wait.get("session_id"), str):
-            closed_target_after_wait_record = closed_target_after_wait
-        if not isinstance(closed_target_after_wait_record, dict) or closed_target_after_wait_record.get("state") != "closed":
-            failures.append("the tested target session was not owner-observed closed before replacement")
-        else:
-            replacement = create_fresh_target("post-cancel-target")
-            session_manifest["target"] = replacement
-            target_session = replacement["session"]
-            args.session = target_session.get("session_id")
-            target_worktree = target_session.get("worktree")
-            (evidence / "fresh-target-after-cancel-creation.json").write_text(
-                json.dumps(replacement, indent=2) + "\n"
-            )
+        target_after_cancel_record = recursively_find(target_after_cancel, "session")
+        if not isinstance(target_after_cancel_record, dict) and isinstance(target_after_cancel.get("session_id"), str):
+            target_after_cancel_record = target_after_cancel
+        if (
+            not isinstance(target_after_cancel_record, dict)
+            or target_after_cancel_record.get("state") != "active"
+            or target_after_cancel_record.get("worktree") != target_worktree
+        ):
+            failures.append("the target session and its worktree were not left active after cancellation handling")
 
         # Verify the unrelated session remained active and its owned execution
         # remained populated after cancellation. Never signal it from the host.
@@ -2127,8 +2186,8 @@ def main() -> int:
                 if b'"parent"' not in stdout or b'"child"' not in stdout:
                     failures.append("sibling strict payload did not report its parent and descendant identities")
 
-        # Keep the pre-existing sibling and tested target session/worktree
-        # active for the owner; only wait for the bounded sibling payload.
+        # Keep the sibling and whichever target session remains active for the
+        # owner; only wait for the bounded sibling payload.
         sibling_final = invoke_ok("sibling-show-left-active", ["session", "show", "--session", args.sibling_session])
         sibling_final_record = recursively_find(sibling_final, "session")
         if not isinstance(sibling_final_record, dict) and isinstance(sibling_final.get("session_id"), str):
@@ -2143,7 +2202,16 @@ def main() -> int:
         summary = {
             "package_sha256": args.package_sha256,
             "tested_target_session_id": proof_target_session_id,
-            "replacement_active_session_id": args.session,
+            "active_target_session_id": args.session,
+            "replacement_active_session_id": replacement_session_id,
+            "target_retained_after_dirty_close": close_dirty_worktree,
+            "target_cancellation_owner_cgroup_state": target_cleanup.get("owner_cgroup_state", "unknown") if target_cleanup else "unknown",
+            "target_cancellation_host_cgroup_state": target_cleanup.get("host_cgroup_state", "unknown") if target_cleanup else "unknown",
+            "target_cancellation_payload_processes_state": target_cleanup.get("known_payload_processes_state", "unknown") if target_cleanup else "unknown",
+            "target_cancellation_pid_namespace_diagnostic": target_cleanup.get("pid_namespace_state", "unknown") if target_cleanup else "unknown",
+            "target_cancellation_run_response_status": target_run_response_status,
+            "target_cancellation_physical_receipt_present": target_physical_receipt_present,
+            "target_cancellation_verification_pass_claimed": False,
             "drain_probe_session_id": args.drain_probe_session,
             "sibling_session_id": args.sibling_session,
             "engine_resources": engine_resources,
