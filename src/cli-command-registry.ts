@@ -93,6 +93,29 @@ const option = <
  */
 const REGISTRY_DATA = [
   {
+    name: "verification snapshot",
+    summary: "Read the current owned session verification policy fence",
+    usage: `${CLI_NAME} verification snapshot --session <id>`,
+    options: [option("--session", "Exact owned active session identity", { value: "<id>", required: true })],
+    notes: [
+      "Read-only; the returned snapshot grants no execution authority and is revalidated by the execution owner.",
+    ],
+  },
+  {
+    name: "verification execute",
+    summary: "Execute a source-bound verifier through the owned protected session",
+    usage: `${CLI_NAME} verification execute --request-file <path>`,
+    options: [
+      option("--request-file", "Bounded version 1 session-bound verification request JSON", {
+        value: "<path>",
+        required: true,
+      }),
+    ],
+    notes: [
+      "Uses strict managed admission and a read-only invocation-local profile. Unknown currentness or cleanup cannot pass; there is no unmanaged fallback.",
+    ],
+  },
+  {
     name: "session create",
     summary: "Request a new Nawabari session",
     usage:
