@@ -229,7 +229,9 @@ function observeProcessTermination(
     if (ticks === undefined || !/^\d+$/u.test(ticks)) {
       return { state: "unknown", reason: "unknown", method: "unknown", observed_at: null };
     }
-    if (ticks !== start.process_start_ticks) {
+    // A zombie/dead task has exited even while its parent retains the PID.
+    // Namespace cleanup remains independently measured, including that PID.
+    if (ticks !== start.process_start_ticks || fieldsAfterComm[0] === "Z" || fieldsAfterComm[0] === "X") {
       return {
         state: "observed-exited",
         reason: "unknown",

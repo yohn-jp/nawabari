@@ -89,6 +89,27 @@ test("start and termination evidence observes namespaces and cleanup from procfs
   }
 });
 
+test("an unreaped zombie proves exit but does not prove namespace cleanup", async () => {
+  const root = procRoot();
+  try {
+    writeProcess(root, 100, "300", TARGET_NAMESPACES);
+    writeProcess(root, 200, "400", CALLER_NAMESPACES);
+    const start = observeSandboxExecutionStart(100, root, 200);
+    const statPath = path.join(root, "100", "stat");
+    fs.writeFileSync(statPath, fs.readFileSync(statPath, "utf8").replace(") S ", ") Z "));
+    const result = await observeSandboxExecutionTermination(start, "exited", {
+      proc_root: root,
+      cleanup_timeout_ms: 1,
+      retry_ms: 1,
+    });
+    assert.equal(result.termination.state, "observed-exited");
+    assert.equal(result.cleanup.state, "observed-populated");
+    assert.equal(result.cleanup.process_count, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("an unobservable namespace remains unknown and raw streams preserve exact bytes", () => {
   const root = procRoot();
   try {
