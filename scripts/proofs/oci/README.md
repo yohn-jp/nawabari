@@ -21,8 +21,13 @@ attempts reads from pre-created outer-container, peer-worktree, control-store,
 and secret sentinels. It checks the launch's raw bytes and physical namespace
 and cleanup receipt, a stale-snapshot refusal without a new execution record,
 a verifier timeout with observed descendant cleanup, public owner close with
-`--drain-policy terminate` on a separate cancellation-probe session, and
-survival of the active sibling, tested target, and container. The bounded
+`--drain-policy terminate` on the tested target, then publicly creates a
+replacement only after the closed target releases its exclusive write claim.
+The runner records engine-inspected OCI CPU/memory/PID/network settings and
+the selected session's observed network mode. While target and sibling
+executions are active, it reads each owner-identified cgroup limit chain and
+records the effective inherited limits. This preserves the tested replacement,
+active sibling, and container without concurrent write ownership. The bounded
 sibling payload exits naturally, while its session and worktree remain active
 for the owner. Neither script signals a host process, restarts the container,
 or launches a host-side verifier.

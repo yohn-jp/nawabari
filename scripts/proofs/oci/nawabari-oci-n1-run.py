@@ -5,10 +5,11 @@ This script is intentionally not run until the matching immutable Nawabari
 artifact is installed in the selected disposable OCI container. It consumes
 the prepared target/drain scope and existing live sibling created/selected by
 `nawabari-oci-n1-prepare.py` through Nawabari's public CLI. Closed target and
-drain records are replaced only through public session creation. Cancellation
-uses a separate fresh session so both the tested target and original sibling
-remain active. It never uses host process signalling or stops/restarts the
-repository container.
+drain records are replaced only through public session creation. The target
+itself is cancelled, then replaced publicly after its owned execution and
+claim lease close, leaving the tested replacement and original sibling active.
+It never uses host process signalling or stops/restarts the repository
+container.
 """
 
 import argparse
@@ -346,6 +347,179 @@ def main() -> int:
             return None
         return stdout, stderr
 
+    def inspect_engine_resources() -> dict:
+        host = subprocess.run(
+            [args.podman_wrapper, "inspect", "--format", "{{json .HostConfig}}", args.container_id],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        network = subprocess.run(
+            [args.podman_wrapper, "inspect", "--format", "{{json .NetworkSettings}}", args.container_id],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save("engine-hostconfig-inspect.stdout", host.stdout)
+        save("engine-hostconfig-inspect.stderr", host.stderr)
+        save("engine-network-inspect.stdout", network.stdout)
+        save("engine-network-inspect.stderr", network.stderr)
+        if host.returncode != 0 or network.returncode != 0:
+            raise RuntimeError("repository container engine resource/network inspection failed")
+        try:
+            host_config = json.loads(host.stdout)
+            network_settings = json.loads(network.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("repository container engine inspection was not valid JSON") from error
+        if not isinstance(host_config, dict) or not isinstance(network_settings, dict):
+            raise RuntimeError("repository container engine inspection omitted host/network objects")
+        networks = network_settings.get("Networks")
+        observed = {
+            "memory_bytes": host_config.get("Memory"),
+            "nano_cpus": host_config.get("NanoCpus"),
+            "cpu_quota_usec": host_config.get("CpuQuota"),
+            "cpu_period_usec": host_config.get("CpuPeriod"),
+            "pids_limit": host_config.get("PidsLimit"),
+            "network_mode": host_config.get("NetworkMode"),
+            "networks": sorted(networks) if isinstance(networks, dict) else None,
+            "pid_mode": host_config.get("PidMode"),
+            "cgroup_mode": host_config.get("CgroupMode"),
+            "privileged": host_config.get("Privileged"),
+        }
+        (evidence / "engine-resource-observation.json").write_text(json.dumps(observed, indent=2) + "\n")
+        expected = {
+            "memory_bytes": 536_870_912,
+            "nano_cpus": 1_000_000_000,
+            "cpu_quota_usec": 100_000,
+            "cpu_period_usec": 100_000,
+            "pids_limit": 128,
+            "network_mode": "none",
+            "networks": ["none"],
+            "pid_mode": "private",
+            "cgroup_mode": "private",
+            "privileged": False,
+        }
+        mismatches = {key: {"expected": value, "observed": observed.get(key)} for key, value in expected.items() if observed.get(key) != value}
+        if mismatches:
+            failures.append(f"engine resource/isolation observation did not match the bounded OCI profile: {mismatches}")
+        return observed
+
+    def observe_owned_cgroup_limits(name: str, document: dict, session_id: str) -> dict | None:
+        processes = document.get("processes")
+        records = processes if isinstance(processes, list) else []
+        owned = [
+            item
+            for item in records
+            if isinstance(item, dict)
+            and isinstance(item.get("execution"), dict)
+            and item["execution"].get("session_id") == session_id
+            and isinstance(item.get("cgroups"), dict)
+            and item["cgroups"].get("state") in {"active", "empty"}
+            and isinstance(item["cgroups"].get("cgroups"), dict)
+        ]
+        if len(owned) != 1:
+            failures.append(f"{name} did not identify exactly one owner-backed execution cgroup for the selected session")
+            return None
+        item = owned[0]
+        execution = item["execution"]
+        cgroups = item["cgroups"]["cgroups"]
+        root = execution.get("cgroup_root")
+        scope = cgroups.get("scope")
+        execution_id = execution.get("execution_id")
+        if (
+            not isinstance(root, str)
+            or not root.startswith("/sys/fs/cgroup/")
+            or not isinstance(scope, str)
+            or not scope.startswith("nawabari-")
+            or any(char not in "0123456789abcdef" for char in scope.removeprefix("nawabari-"))
+            or len(scope.removeprefix("nawabari-")) != 48
+            or not isinstance(execution_id, str)
+        ):
+            failures.append(f"{name} public execution record omitted a canonical owner cgroup identity")
+            return None
+        script = (
+            "const fs=require('node:fs'),path=require('node:path');"
+            "const root=process.argv[1],scope=process.argv[2];"
+            "if(!root.startsWith('/sys/fs/cgroup/')||!/^nawabari-[0-9a-f]{48}$/.test(scope))process.exit(2);"
+            "const dirs=[root,path.join(root,'nawabari'),path.join(root,'nawabari',scope)];"
+            "const out=dirs.map(directory=>{const values={};for(const file of ['cpu.max','memory.max','pids.max']){"
+            "try{values[file]=fs.readFileSync(path.join(directory,file),'utf8').trim()}catch(e){values[file]=null}}"
+            "return {directory,values}});process.stdout.write(JSON.stringify(out)+'\\n');"
+        )
+        observed = subprocess.run(
+            [*prefix, "node", "-e", script, root, scope],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save(f"{name}-owned-cgroup-limits.stdout", observed.stdout)
+        save(f"{name}-owned-cgroup-limits.stderr", observed.stderr)
+        if observed.returncode != 0:
+            failures.append(f"{name} could not read its owner-backed cgroup limit chain from the OCI container")
+            return None
+        try:
+            chain = json.loads(observed.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            failures.append(f"{name} cgroup limit-chain output was not valid JSON")
+            return None
+        if not isinstance(chain, list) or len(chain) != 3 or any(not isinstance(level, dict) for level in chain):
+            failures.append(f"{name} cgroup limit-chain observation was incomplete")
+            return None
+
+        def parse_cpu(value: object) -> tuple[float, int, int] | None:
+            if not isinstance(value, str):
+                return None
+            parts = value.split()
+            if len(parts) != 2 or parts[0] == "max":
+                return None
+            try:
+                quota, period = int(parts[0]), int(parts[1])
+            except ValueError:
+                return None
+            if quota < 1 or period < 1:
+                return None
+            return quota / period, quota, period
+
+        cpu_limits = [parse_cpu(level.get("values", {}).get("cpu.max")) for level in chain]
+        cpu_limits = [limit for limit in cpu_limits if limit is not None]
+        scalar_limits: dict[str, list[int]] = {"memory.max": [], "pids.max": []}
+        for level in chain:
+            values = level.get("values")
+            if not isinstance(values, dict):
+                continue
+            for key, limits in scalar_limits.items():
+                value = values.get(key)
+                if isinstance(value, str) and value != "max" and value.isdigit() and int(value) > 0:
+                    limits.append(int(value))
+        effective = {
+            "cpu": None if not cpu_limits else {
+                "cores": min(cpu_limits)[0],
+                "quota_usec": min(cpu_limits)[1],
+                "period_usec": min(cpu_limits)[2],
+            },
+            "memory_bytes": min(scalar_limits["memory.max"]) if scalar_limits["memory.max"] else None,
+            "pids": min(scalar_limits["pids.max"]) if scalar_limits["pids.max"] else None,
+        }
+        result = {
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "cgroup_root": root,
+            "scope": scope,
+            "chain": chain,
+            "effective_inherited_limits": effective,
+        }
+        (evidence / f"{name}-owned-cgroup-limits.json").write_text(json.dumps(result, indent=2) + "\n")
+        if (
+            effective["cpu"] is None
+            or effective["cpu"]["cores"] > 1.0
+            or effective["memory_bytes"] is None
+            or effective["memory_bytes"] > 536_870_912
+            or effective["pids"] is None
+            or effective["pids"] > 128
+        ):
+            failures.append(f"{name} owner cgroup did not observe the bounded inherited 1 CPU/512 MiB/128 PID limits")
+        return result
+
     def active_cgroup(document: dict) -> bool:
         processes = document.get("processes")
         return isinstance(processes, list) and any(
@@ -399,6 +573,7 @@ def main() -> int:
         save("container-running-before.stderr", container_state.stderr)
         if container_state.returncode != 0 or container_state.stdout.strip() != b"true":
             raise RuntimeError("selected repository OCI container is not observed running")
+        engine_resources = inspect_engine_resources()
 
         target_show = invoke_ok("target-session-before-proof", ["session", "show", "--session", args.session])
         drain_probe_show = invoke_ok(
@@ -430,39 +605,28 @@ def main() -> int:
             args.drain_probe_session = drain_probe_session.get("session_id")
             drain_probe_worktree = drain_probe_session.get("worktree")
             (evidence / "fresh-drain-probe-creation.json").write_text(json.dumps(drain_probe, indent=2) + "\n")
-        cancel_probe = create_fresh_target("cancel-probe")
-        session_manifest["cancel_probe"] = cancel_probe
-        cancel_probe_session = cancel_probe["session"]
-        args.cancel_session = cancel_probe_session.get("session_id")
-        cancel_probe_worktree = cancel_probe_session.get("worktree")
-        (evidence / "fresh-cancel-probe-creation.json").write_text(json.dumps(cancel_probe, indent=2) + "\n")
         if not isinstance(drain_probe_session, dict) or drain_probe_session.get("state") != "active":
             raise RuntimeError("zero-execution drain probe session is not observed active before its close test")
         if not isinstance(sibling_session, dict) or sibling_session.get("state") != "active":
             raise RuntimeError("sibling public session is not observed active")
-        if not isinstance(cancel_probe_session, dict) or cancel_probe_session.get("state") != "active":
-            raise RuntimeError("fresh cancellation probe session is not observed active")
         active_ids = {
             target_session.get("session_id"),
             drain_probe_session.get("session_id"),
-            cancel_probe_session.get("session_id"),
             sibling_session.get("session_id"),
         }
         active_worktrees = {
             target_session.get("worktree"),
             drain_probe_session.get("worktree"),
-            cancel_probe_session.get("worktree"),
             sibling_session.get("worktree"),
         }
         if (
-            len(active_ids) != 4
+            len(active_ids) != 3
             or None in active_ids
-            or len(active_worktrees) != 4
+            or len(active_worktrees) != 3
             or None in active_worktrees
             or target_session.get("worktree") != target_worktree
             or drain_probe_session.get("worktree") != drain_probe_worktree
             or sibling_session.get("worktree") != sibling_worktree
-            or cancel_probe_session.get("worktree") != cancel_probe_worktree
         ):
             raise RuntimeError("public session owner records differ from the preparation manifest")
 
@@ -474,8 +638,6 @@ def main() -> int:
             "drain_probe_worktree": drain_probe_worktree,
             "sibling_session_id": args.sibling_session,
             "sibling_worktree": sibling_worktree,
-            "cancel_probe_session_id": args.cancel_session,
-            "cancel_probe_worktree": cancel_probe_worktree,
             "repository_base_revision": session_manifest.get("repository_head_after"),
             "package_sha256": args.package_sha256,
         }
@@ -549,6 +711,7 @@ def main() -> int:
             )
             + "\n"
         )
+        proof_target_session_id = args.session
 
         drain_claims = invoke_ok(
             "drain-probe-initial-claims", ["session", "claims", "--session", args.drain_probe_session]
@@ -598,8 +761,11 @@ def main() -> int:
         # cancellation fails.
         sibling, _, _ = launch_persistent("sibling-strict-run", args.sibling_session, sibling_worktree)
         sibling_active = wait_active("sibling", args.sibling_session, sibling)
+        sibling_cgroup_limits = None
         if sibling_active is None or not active_cgroup(sibling_active):
             failures.append("sibling strict execution never exposed an active observed owned cgroup")
+        else:
+            sibling_cgroup_limits = observe_owned_cgroup_limits("sibling-active", sibling_active, args.sibling_session)
 
         drain_before = process_snapshot("drain-probe-processes-before-close", args.drain_probe_session)
         if execution_ids(drain_before):
@@ -685,6 +851,22 @@ def main() -> int:
             90,
             target_worktree,
         )
+        session_request_identity = (
+            recursively_find(boundary_result, "request_identity") if isinstance(boundary_result, dict) else None
+        )
+        if not isinstance(session_request_identity, dict) or session_request_identity.get("network_mode") != "inherited":
+            failures.append("strict target session did not preserve its owner-observed inherited network mode")
+        network_isolation = {
+            "container_engine": engine_resources,
+            "session_request_identity": session_request_identity,
+            "effective_network_mode": (
+                "none" if engine_resources.get("network_mode") == "none"
+                and isinstance(session_request_identity, dict)
+                and session_request_identity.get("network_mode") == "inherited"
+                else "unknown"
+            ),
+        }
+        (evidence / "network-isolation-observation.json").write_text(json.dumps(network_isolation, indent=2) + "\n")
         if boundary_run.returncode != 0 or not isinstance(boundary_result, dict) or boundary_result.get("ok") is not True:
             failures.append(f"strict current-session read/write/Git/boundary payload failed (exit={boundary_run.returncode})")
         boundary_physical = recursively_find(boundary_result, "physical_execution") if isinstance(boundary_result, dict) else None
@@ -867,23 +1049,27 @@ def main() -> int:
             if timeout_streams is None or b"timeout-child-started" not in timeout_streams[0]:
                 failures.append("verifier timeout did not preserve complete byte-faithful output from the started payload")
 
-        # Use a separate, fresh bounded owner for cancellation so the tested
-        # target and the pre-existing sibling can both remain active afterward.
-        cancel_probe, _, _ = launch_persistent(
-            "cancel-probe-strict-run", args.cancel_session, cancel_probe_worktree
-        )
-        cancel_probe_active = wait_active("cancel-probe", args.cancel_session, cancel_probe)
+        # Cancel the tested target itself after its successful positive and
+        # verifier checks. It is replaced publicly only after its close
+        # releases the exclusive write claim, so sibling sessions never race
+        # for the same write lease.
+        target, _, _ = launch_persistent("target-strict-run", args.session, target_worktree)
+        target_active = wait_active("target", args.session, target)
+        target_cgroup_limits = None
         close_completed = False
-        if cancel_probe_active is None or not active_cgroup(cancel_probe_active):
-            failures.append("cancellation probe never exposed an active observed owned cgroup")
+        if target_active is None or not active_cgroup(target_active):
+            failures.append("target strict execution never exposed an active observed owned cgroup")
             try:
-                collect_process(cancel_probe, "cancel-probe-strict-run", 65)
+                collect_process(target, "target-strict-run", 55)
             except RuntimeError as error:
                 failures.append(str(error))
         else:
+            target_cgroup_limits = observe_owned_cgroup_limits(
+                "target-active-before-cancel", target_active, proof_target_session_id
+            )
             close_result, close_doc = invoke(
-                "cancel-probe-close-terminate",
-                ["session", "close", "--session", args.cancel_session, "--drain-policy", "terminate"],
+                "target-close-terminate",
+                ["session", "close", "--session", args.session, "--drain-policy", "terminate"],
                 30,
             )
             if close_result.returncode != 0 or not isinstance(close_doc, dict) or close_doc.get("ok") is not True:
@@ -896,39 +1082,39 @@ def main() -> int:
                 if not close_completed:
                     failures.append("public close termination returned success without a closed selected session")
             try:
-                collect_process(cancel_probe, "cancel-probe-strict-run", 65)
+                collect_process(target, "target-strict-run", 55)
             except RuntimeError as error:
                 failures.append(str(error))
-            cancel_doc = None
+            target_doc = None
             try:
-                cancel_doc = json.loads((evidence / "cancel-probe-strict-run.stdout").read_bytes())
+                target_doc = json.loads((evidence / "target-strict-run.stdout").read_bytes())
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 pass
-            run_evidence = recursively_find(cancel_doc, "execution_evidence") if isinstance(cancel_doc, dict) else None
-            if run_evidence is None and isinstance(cancel_doc, dict):
-                run_evidence = recursively_find(cancel_doc, "physical_execution")
-            cancel_physical = run_evidence.get("physical_execution") if isinstance(run_evidence, dict) else None
-            if not isinstance(cancel_physical, dict):
+            run_evidence = recursively_find(target_doc, "execution_evidence") if isinstance(target_doc, dict) else None
+            if run_evidence is None and isinstance(target_doc, dict):
+                run_evidence = recursively_find(target_doc, "physical_execution")
+            target_physical = run_evidence.get("physical_execution") if isinstance(run_evidence, dict) else None
+            if not isinstance(target_physical, dict):
                 failures.append("cancelled run did not preserve physical execution evidence")
             else:
-                if cancel_physical.get("procfs", {}).get("mode") != "denied":
+                if target_physical.get("procfs", {}).get("mode") != "denied":
                     failures.append("cancelled run did not preserve its selected inherited-masked procfs topology")
-                if cancel_physical.get("cleanup", {}).get("state") != "observed-empty":
+                if target_physical.get("cleanup", {}).get("state") != "observed-empty":
                     failures.append("cancelled run did not observe the owned PID namespace empty")
-                if cancel_physical.get("termination", {}).get("state") != "observed-exited":
+                if target_physical.get("termination", {}).get("state") != "observed-exited":
                     failures.append("cancelled run did not observe the payload exited")
-                if cancel_physical.get("termination", {}).get("reason") != "cancelled":
+                if target_physical.get("termination", {}).get("reason") != "cancelled":
                     failures.append("public close did not produce an observed cancelled termination reason")
-            cancel_raw = recursively_find(cancel_doc, "raw_output") if isinstance(cancel_doc, dict) else None
-            cancel_streams = complete_raw_streams(cancel_raw)
-            if cancel_streams is None or b'"parent"' not in cancel_streams[0] or b'"child"' not in cancel_streams[0]:
+            target_raw = recursively_find(target_doc, "raw_output") if isinstance(target_doc, dict) else None
+            target_streams = complete_raw_streams(target_raw)
+            if target_streams is None or b'"parent"' not in target_streams[0] or b'"child"' not in target_streams[0]:
                 failures.append("cancelled strict run did not preserve complete byte-faithful parent/descendant output")
 
-            cancel_after_close = process_snapshot("cancel-probe-processes-after-close", args.cancel_session)
+            target_after_close = process_snapshot("target-processes-after-close", proof_target_session_id)
             expected_cancelled_execution = (
-                cancel_physical.get("correlation_id") if isinstance(cancel_physical, dict) else None
+                target_physical.get("correlation_id") if isinstance(target_physical, dict) else None
             )
-            process_records = cancel_after_close.get("processes")
+            process_records = target_after_close.get("processes")
             matching_cancelled = [
                 item
                 for item in process_records
@@ -940,32 +1126,43 @@ def main() -> int:
                 failures.append("post-close session observation did not find the exact cancelled execution record")
             elif not isinstance(matching_cancelled[0].get("cgroups"), dict) or matching_cancelled[0]["cgroups"].get("state") != "empty":
                 failures.append("post-close owner observation did not prove the exact cancelled execution cgroup empty")
-            cancel_final = invoke_ok(
-                "cancel-probe-show-closed", ["session", "show", "--session", args.cancel_session]
+            closed_target = invoke_ok(
+                "target-show-closed-after-cancel", ["session", "show", "--session", proof_target_session_id]
             )
-            cancel_final_record = recursively_find(cancel_final, "session")
-            if not isinstance(cancel_final_record, dict) and isinstance(cancel_final.get("session_id"), str):
-                cancel_final_record = cancel_final
-            if not isinstance(cancel_final_record, dict) or cancel_final_record.get("state") != "closed":
-                failures.append("cancellation probe did not remain owner-observed closed after termination")
+            closed_target_record = recursively_find(closed_target, "session")
+            if not isinstance(closed_target_record, dict) and isinstance(closed_target.get("session_id"), str):
+                closed_target_record = closed_target
+            if not isinstance(closed_target_record, dict) or closed_target_record.get("state") != "closed":
+                failures.append("target session did not remain owner-observed closed after termination")
 
         if not close_completed:
             # Any fallback here is still the canonical default wait operation;
             # it never signals the payload or treats host process exit as proof.
             wait_close, wait_doc = invoke(
-                "cancel-probe-close-wait-cleanup",
-                ["session", "close", "--session", args.cancel_session],
+                "target-close-wait-cleanup",
+                ["session", "close", "--session", proof_target_session_id],
                 30,
             )
             if wait_close.returncode != 0 or not isinstance(wait_doc, dict) or wait_doc.get("ok") is not True:
-                failures.append("cancellation-probe session did not converge through default wait cleanup")
+                failures.append("target session did not converge through default wait cleanup")
 
-        target_after_cancel = invoke_ok("target-show-after-cancel", ["session", "show", "--session", args.session])
-        target_after_cancel_record = recursively_find(target_after_cancel, "session")
-        if not isinstance(target_after_cancel_record, dict) and isinstance(target_after_cancel.get("session_id"), str):
-            target_after_cancel_record = target_after_cancel
-        if not isinstance(target_after_cancel_record, dict) or target_after_cancel_record.get("state") != "active":
-            failures.append("the tested target session was not left active after cancellation of the separate probe")
+        closed_target_after_wait = invoke_ok(
+            "target-show-closed-after-wait", ["session", "show", "--session", proof_target_session_id]
+        )
+        closed_target_after_wait_record = recursively_find(closed_target_after_wait, "session")
+        if not isinstance(closed_target_after_wait_record, dict) and isinstance(closed_target_after_wait.get("session_id"), str):
+            closed_target_after_wait_record = closed_target_after_wait
+        if not isinstance(closed_target_after_wait_record, dict) or closed_target_after_wait_record.get("state") != "closed":
+            failures.append("the tested target session was not owner-observed closed before replacement")
+        else:
+            replacement = create_fresh_target("post-cancel-target")
+            session_manifest["target"] = replacement
+            target_session = replacement["session"]
+            args.session = target_session.get("session_id")
+            target_worktree = target_session.get("worktree")
+            (evidence / "fresh-target-after-cancel-creation.json").write_text(
+                json.dumps(replacement, indent=2) + "\n"
+            )
 
         # Verify the unrelated session remained active and its owned execution
         # remained populated after cancellation. Never signal it from the host.
@@ -1043,10 +1240,17 @@ def main() -> int:
 
         summary = {
             "package_sha256": args.package_sha256,
-            "session_id": args.session,
+            "tested_target_session_id": proof_target_session_id,
+            "replacement_active_session_id": args.session,
             "drain_probe_session_id": args.drain_probe_session,
-            "cancel_probe_session_id": args.cancel_session,
             "sibling_session_id": args.sibling_session,
+            "engine_resources": engine_resources,
+            "session_network_mode": session_request_identity.get("network_mode")
+            if isinstance(session_request_identity, dict)
+            else None,
+            "network_isolation": network_isolation,
+            "target_owned_cgroup_limits": target_cgroup_limits,
+            "sibling_owned_cgroup_limits": sibling_cgroup_limits,
             "failures": failures,
             "result": "passed" if not failures else "failed",
         }
