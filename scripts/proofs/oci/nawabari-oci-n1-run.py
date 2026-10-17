@@ -3,10 +3,12 @@
 
 This script is intentionally not run until the matching immutable Nawabari
 artifact is installed in the selected disposable OCI container. It consumes
-the fresh target and existing live sibling created/selected by
-`nawabari-oci-n1-prepare.py` through Nawabari's public CLI. It never uses host
-process signalling or stops/restarts the repository container, and it leaves
-the supplied sibling session active.
+the prepared target/drain scope and existing live sibling created/selected by
+`nawabari-oci-n1-prepare.py` through Nawabari's public CLI. Closed target and
+drain records are replaced only through public session creation. Cancellation
+uses a separate fresh session so both the tested target and original sibling
+remain active. It never uses host process signalling or stops/restarts the
+repository container.
 """
 
 import argparse
@@ -155,52 +157,93 @@ def main() -> int:
             raise RuntimeError(f"could not write public CLI request artifact {name}")
         return remote
 
-    def create_fresh_drain_probe() -> dict:
-        source = session_manifest.get("drain_probe")
+    def create_fresh_session(name: str, source_key: str, profile: str, claims: list[tuple[str, str]]) -> dict:
+        source = session_manifest.get(source_key)
         scope = source.get("scope") if isinstance(source, dict) else None
         working_set = source.get("working_set") if isinstance(source, dict) else None
         if not isinstance(scope, dict) or not isinstance(working_set, dict):
-            raise RuntimeError("session manifest omitted the bounded zero-record drain-probe artifacts")
-        candidate = json.loads(json.dumps(working_set))
-        candidate["workingSetId"] = f"oci-n1-physical-drain-probe-{uuid.uuid4()}"
-        scope_path = write_container_json("drain-probe-recreate-execution-scope", scope)
-        candidate_path = write_container_json("drain-probe-recreate-candidate-working-set", candidate)
-        created = invoke_ok(
-            "drain-probe-recreate-session-create",
-            [
-                "session",
-                "create",
-                "--base",
-                "main",
-                "--profile",
-                "builtin:minimal",
-                "--execution-scope-file",
-                scope_path,
-                "--candidate-working-set-file",
-                candidate_path,
-                "--resource",
-                "README.md",
-                "--mode",
-                "read",
-                "--enforce-claims",
-            ],
-            timeout=120,
+            raise RuntimeError(f"session manifest omitted the bounded {source_key} artifacts")
+        base = scope.get("base")
+        expected_revision = base.get("revision") if isinstance(base, dict) else None
+        head = subprocess.run(
+            [*prefix, "git", "rev-parse", "main"], capture_output=True, timeout=30, check=False
         )
+        save(f"{name}-repository-main-head.stdout", head.stdout)
+        save(f"{name}-repository-main-head.stderr", head.stderr)
+        if head.returncode != 0 or head.stdout.decode("ascii", errors="replace").strip() != expected_revision:
+            raise RuntimeError(f"current repository main no longer matches the {source_key} base revision")
+        candidate = json.loads(json.dumps(working_set))
+        candidate["workingSetId"] = f"oci-n1-physical-{name}-{uuid.uuid4()}"
+        scope_path = write_container_json(f"{name}-create-execution-scope", scope)
+        candidate_path = write_container_json(f"{name}-create-candidate-working-set", candidate)
+        create_argv = [
+            "session",
+            "create",
+            "--base",
+            "main",
+            "--profile",
+            profile,
+            "--execution-scope-file",
+            scope_path,
+            "--candidate-working-set-file",
+            candidate_path,
+        ]
+        for resource, mode in claims:
+            create_argv.extend(["--resource", resource, "--mode", mode])
+        create_argv.append("--enforce-claims")
+        created = invoke_ok(f"{name}-create-session", create_argv, timeout=120)
         created_session = recursively_find(created, "session")
         if not isinstance(created_session, dict) and isinstance(created.get("session_id"), str):
             created_session = created
         if not isinstance(created_session, dict) or not isinstance(created_session.get("session_id"), str):
-            raise RuntimeError("fresh drain-probe create omitted its canonical session identity")
+            raise RuntimeError(f"fresh {name} create omitted its canonical session identity")
         shown = invoke_ok(
-            "drain-probe-recreate-session-show",
-            ["session", "show", "--session", created_session["session_id"]],
+            f"{name}-show-session", ["session", "show", "--session", created_session["session_id"]]
         )
         record = recursively_find(shown, "session")
         if not isinstance(record, dict) and isinstance(shown.get("session_id"), str):
             record = shown
         if not isinstance(record, dict) or record.get("state") != "active":
-            raise RuntimeError("fresh drain-probe owner record is not active")
-        return {"create": created, "session": record, "scope": scope, "working_set": candidate}
+            raise RuntimeError(f"fresh {name} owner record is not active")
+        repository = scope.get("repository")
+        repository_id = repository.get("repositoryId") if isinstance(repository, dict) else None
+        if record.get("base_revision") != expected_revision or record.get("repository") != repository_id:
+            raise RuntimeError(f"fresh {name} owner record differs from the bounded source repository/base")
+        claimed = invoke_ok(
+            f"{name}-show-claims", ["session", "claims", "--session", record["session_id"]]
+        ).get("claims")
+        normalized_claims = {
+            (item.get("resource"), item.get("mode")) for item in claimed if isinstance(item, dict)
+        } if isinstance(claimed, list) else set()
+        if normalized_claims != set(claims):
+            raise RuntimeError(f"fresh {name} owner did not atomically retain its exact bounded claims")
+        snapshot_doc = invoke_ok(
+            f"{name}-initial-snapshot", ["verification", "snapshot", "--session", record["session_id"]]
+        )
+        snapshot = snapshot_doc.get("snapshot")
+        if not isinstance(snapshot, dict) or snapshot.get("session_id") != record["session_id"]:
+            raise RuntimeError(f"fresh {name} verification snapshot omitted its canonical session identity")
+        return {
+            "create": created,
+            "session": record,
+            "snapshot": snapshot,
+            "scope": scope,
+            "working_set": candidate,
+            "claims": claimed,
+        }
+
+    def create_fresh_drain_probe() -> dict:
+        return create_fresh_session(
+            "drain-probe", "drain_probe", "builtin:minimal", [("README.md", "read")]
+        )
+
+    def create_fresh_target(name: str) -> dict:
+        return create_fresh_session(
+            name,
+            "target",
+            session_manifest.get("profile_id", "repository:oci-n1-physical-v3"),
+            [("README.md", "read"), (owned_file, "write")],
+        )
 
     def recursively_find(value: object, key: str) -> object | None:
         if isinstance(value, dict):
@@ -371,6 +414,13 @@ def main() -> int:
             drain_probe_session = drain_probe_show
         if not isinstance(sibling_session, dict) and isinstance(sibling_show.get("session_id"), str):
             sibling_session = sibling_show
+        if isinstance(target_session, dict) and target_session.get("state") == "closed":
+            target = create_fresh_target("target")
+            session_manifest["target"] = target
+            target_session = target["session"]
+            args.session = target_session.get("session_id")
+            target_worktree = target_session.get("worktree")
+            (evidence / "fresh-target-creation.json").write_text(json.dumps(target, indent=2) + "\n")
         if not isinstance(target_session, dict) or target_session.get("state") != "active":
             raise RuntimeError("target public session is not observed active")
         if isinstance(drain_probe_session, dict) and drain_probe_session.get("state") == "closed":
@@ -380,14 +430,39 @@ def main() -> int:
             args.drain_probe_session = drain_probe_session.get("session_id")
             drain_probe_worktree = drain_probe_session.get("worktree")
             (evidence / "fresh-drain-probe-creation.json").write_text(json.dumps(drain_probe, indent=2) + "\n")
+        cancel_probe = create_fresh_target("cancel-probe")
+        session_manifest["cancel_probe"] = cancel_probe
+        cancel_probe_session = cancel_probe["session"]
+        args.cancel_session = cancel_probe_session.get("session_id")
+        cancel_probe_worktree = cancel_probe_session.get("worktree")
+        (evidence / "fresh-cancel-probe-creation.json").write_text(json.dumps(cancel_probe, indent=2) + "\n")
         if not isinstance(drain_probe_session, dict) or drain_probe_session.get("state") != "active":
             raise RuntimeError("zero-execution drain probe session is not observed active before its close test")
         if not isinstance(sibling_session, dict) or sibling_session.get("state") != "active":
             raise RuntimeError("sibling public session is not observed active")
+        if not isinstance(cancel_probe_session, dict) or cancel_probe_session.get("state") != "active":
+            raise RuntimeError("fresh cancellation probe session is not observed active")
+        active_ids = {
+            target_session.get("session_id"),
+            drain_probe_session.get("session_id"),
+            cancel_probe_session.get("session_id"),
+            sibling_session.get("session_id"),
+        }
+        active_worktrees = {
+            target_session.get("worktree"),
+            drain_probe_session.get("worktree"),
+            cancel_probe_session.get("worktree"),
+            sibling_session.get("worktree"),
+        }
         if (
-            target_session.get("worktree") != target_worktree
+            len(active_ids) != 4
+            or None in active_ids
+            or len(active_worktrees) != 4
+            or None in active_worktrees
+            or target_session.get("worktree") != target_worktree
             or drain_probe_session.get("worktree") != drain_probe_worktree
             or sibling_session.get("worktree") != sibling_worktree
+            or cancel_probe_session.get("worktree") != cancel_probe_worktree
         ):
             raise RuntimeError("public session owner records differ from the preparation manifest")
 
@@ -399,6 +474,8 @@ def main() -> int:
             "drain_probe_worktree": drain_probe_worktree,
             "sibling_session_id": args.sibling_session,
             "sibling_worktree": sibling_worktree,
+            "cancel_probe_session_id": args.cancel_session,
+            "cancel_probe_worktree": cancel_probe_worktree,
             "repository_base_revision": session_manifest.get("repository_head_after"),
             "package_sha256": args.package_sha256,
         }
@@ -516,8 +593,9 @@ def main() -> int:
             raise RuntimeError("sentinel setup did not observe every requested boundary path")
         (evidence / "boundary-sentinel-paths.json").write_text(json.dumps(sentinel_observation, indent=2) + "\n")
 
-        # Preserve an actually running strict sibling while the target is
-        # cancelled. Both payloads are finite if owner cancellation fails.
+        # Preserve an actually running strict sibling while the separate
+        # cancellation probe is closed. Both payloads are finite if owner
+        # cancellation fails.
         sibling, _, _ = launch_persistent("sibling-strict-run", args.sibling_session, sibling_worktree)
         sibling_active = wait_active("sibling", args.sibling_session, sibling)
         if sibling_active is None or not active_cgroup(sibling_active):
@@ -789,22 +867,23 @@ def main() -> int:
             if timeout_streams is None or b"timeout-child-started" not in timeout_streams[0]:
                 failures.append("verifier timeout did not preserve complete byte-faithful output from the started payload")
 
-        # Launch a second strict process in the target, wait for owner-visible
-        # populated cgroup evidence, then exercise only the new public close
-        # operation. The payload's own 45-second deadline bounds a denied close.
-        target, _, _ = launch_persistent("target-strict-run", args.session, target_worktree)
-        target_active = wait_active("target", args.session, target)
+        # Use a separate, fresh bounded owner for cancellation so the tested
+        # target and the pre-existing sibling can both remain active afterward.
+        cancel_probe, _, _ = launch_persistent(
+            "cancel-probe-strict-run", args.cancel_session, cancel_probe_worktree
+        )
+        cancel_probe_active = wait_active("cancel-probe", args.cancel_session, cancel_probe)
         close_completed = False
-        if target_active is None or not active_cgroup(target_active):
-            failures.append("target strict execution never exposed an active observed owned cgroup")
+        if cancel_probe_active is None or not active_cgroup(cancel_probe_active):
+            failures.append("cancellation probe never exposed an active observed owned cgroup")
             try:
-                collect_process(target, "target-strict-run", 55)
+                collect_process(cancel_probe, "cancel-probe-strict-run", 65)
             except RuntimeError as error:
                 failures.append(str(error))
         else:
             close_result, close_doc = invoke(
-                "target-close-terminate",
-                ["session", "close", "--session", args.session, "--drain-policy", "terminate"],
+                "cancel-probe-close-terminate",
+                ["session", "close", "--session", args.cancel_session, "--drain-policy", "terminate"],
                 30,
             )
             if close_result.returncode != 0 or not isinstance(close_doc, dict) or close_doc.get("ok") is not True:
@@ -817,39 +896,39 @@ def main() -> int:
                 if not close_completed:
                     failures.append("public close termination returned success without a closed selected session")
             try:
-                collect_process(target, "target-strict-run", 55)
+                collect_process(cancel_probe, "cancel-probe-strict-run", 65)
             except RuntimeError as error:
                 failures.append(str(error))
-            target_doc = None
+            cancel_doc = None
             try:
-                target_doc = json.loads((evidence / "target-strict-run.stdout").read_bytes())
+                cancel_doc = json.loads((evidence / "cancel-probe-strict-run.stdout").read_bytes())
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 pass
-            run_evidence = recursively_find(target_doc, "execution_evidence") if isinstance(target_doc, dict) else None
-            if run_evidence is None and isinstance(target_doc, dict):
-                run_evidence = recursively_find(target_doc, "physical_execution")
-            target_physical = run_evidence.get("physical_execution") if isinstance(run_evidence, dict) else None
-            if not isinstance(target_physical, dict):
+            run_evidence = recursively_find(cancel_doc, "execution_evidence") if isinstance(cancel_doc, dict) else None
+            if run_evidence is None and isinstance(cancel_doc, dict):
+                run_evidence = recursively_find(cancel_doc, "physical_execution")
+            cancel_physical = run_evidence.get("physical_execution") if isinstance(run_evidence, dict) else None
+            if not isinstance(cancel_physical, dict):
                 failures.append("cancelled run did not preserve physical execution evidence")
             else:
-                if target_physical.get("procfs", {}).get("mode") != "denied":
+                if cancel_physical.get("procfs", {}).get("mode") != "denied":
                     failures.append("cancelled run did not preserve its selected inherited-masked procfs topology")
-                if target_physical.get("cleanup", {}).get("state") != "observed-empty":
+                if cancel_physical.get("cleanup", {}).get("state") != "observed-empty":
                     failures.append("cancelled run did not observe the owned PID namespace empty")
-                if target_physical.get("termination", {}).get("state") != "observed-exited":
+                if cancel_physical.get("termination", {}).get("state") != "observed-exited":
                     failures.append("cancelled run did not observe the payload exited")
-                if target_physical.get("termination", {}).get("reason") != "cancelled":
+                if cancel_physical.get("termination", {}).get("reason") != "cancelled":
                     failures.append("public close did not produce an observed cancelled termination reason")
-            target_raw = recursively_find(target_doc, "raw_output") if isinstance(target_doc, dict) else None
-            target_streams = complete_raw_streams(target_raw)
-            if target_streams is None or b'"parent"' not in target_streams[0] or b'"child"' not in target_streams[0]:
+            cancel_raw = recursively_find(cancel_doc, "raw_output") if isinstance(cancel_doc, dict) else None
+            cancel_streams = complete_raw_streams(cancel_raw)
+            if cancel_streams is None or b'"parent"' not in cancel_streams[0] or b'"child"' not in cancel_streams[0]:
                 failures.append("cancelled strict run did not preserve complete byte-faithful parent/descendant output")
 
-            target_after_close = process_snapshot("target-processes-after-close", args.session)
+            cancel_after_close = process_snapshot("cancel-probe-processes-after-close", args.cancel_session)
             expected_cancelled_execution = (
-                target_physical.get("correlation_id") if isinstance(target_physical, dict) else None
+                cancel_physical.get("correlation_id") if isinstance(cancel_physical, dict) else None
             )
-            process_records = target_after_close.get("processes")
+            process_records = cancel_after_close.get("processes")
             matching_cancelled = [
                 item
                 for item in process_records
@@ -861,25 +940,40 @@ def main() -> int:
                 failures.append("post-close session observation did not find the exact cancelled execution record")
             elif not isinstance(matching_cancelled[0].get("cgroups"), dict) or matching_cancelled[0]["cgroups"].get("state") != "empty":
                 failures.append("post-close owner observation did not prove the exact cancelled execution cgroup empty")
+            cancel_final = invoke_ok(
+                "cancel-probe-show-closed", ["session", "show", "--session", args.cancel_session]
+            )
+            cancel_final_record = recursively_find(cancel_final, "session")
+            if not isinstance(cancel_final_record, dict) and isinstance(cancel_final.get("session_id"), str):
+                cancel_final_record = cancel_final
+            if not isinstance(cancel_final_record, dict) or cancel_final_record.get("state") != "closed":
+                failures.append("cancellation probe did not remain owner-observed closed after termination")
 
         if not close_completed:
             # Any fallback here is still the canonical default wait operation;
             # it never signals the payload or treats host process exit as proof.
             wait_close, wait_doc = invoke(
-                "target-close-wait-cleanup",
-                ["session", "close", "--session", args.session],
+                "cancel-probe-close-wait-cleanup",
+                ["session", "close", "--session", args.cancel_session],
                 30,
             )
             if wait_close.returncode != 0 or not isinstance(wait_doc, dict) or wait_doc.get("ok") is not True:
-                failures.append("target disposable session did not converge through default wait cleanup")
+                failures.append("cancellation-probe session did not converge through default wait cleanup")
+
+        target_after_cancel = invoke_ok("target-show-after-cancel", ["session", "show", "--session", args.session])
+        target_after_cancel_record = recursively_find(target_after_cancel, "session")
+        if not isinstance(target_after_cancel_record, dict) and isinstance(target_after_cancel.get("session_id"), str):
+            target_after_cancel_record = target_after_cancel
+        if not isinstance(target_after_cancel_record, dict) or target_after_cancel_record.get("state") != "active":
+            failures.append("the tested target session was not left active after cancellation of the separate probe")
 
         # Verify the unrelated session remained active and its owned execution
-        # remained populated after target close. Never signal it from the host.
-        sibling_after = process_snapshot("sibling-processes-after-target-close", args.sibling_session)
+        # remained populated after cancellation. Never signal it from the host.
+        sibling_after = process_snapshot("sibling-processes-after-cancel", args.sibling_session)
         if not active_cgroup(sibling_after):
             failures.append("sibling owned cgroup was not observed populated after target cancellation")
         save("sibling-active-owned-execution-count.json", json.dumps({"count": populated_execution_count(sibling_after)}, indent=2).encode() + b"\n")
-        sibling_show = invoke_ok("sibling-show-after-target-close", ["session", "show", "--session", args.sibling_session])
+        sibling_show = invoke_ok("sibling-show-after-cancel", ["session", "show", "--session", args.sibling_session])
         sibling_record = recursively_find(sibling_show, "session")
         if not isinstance(sibling_record, dict) and isinstance(sibling_show.get("session_id"), str):
             sibling_record = sibling_show
@@ -934,8 +1028,8 @@ def main() -> int:
                 if b'"parent"' not in stdout or b'"child"' not in stdout:
                     failures.append("sibling strict payload did not report its parent and descendant identities")
 
-        # Keep the pre-existing sibling session and worktree active for the
-        # owner; this proof only waits for its bounded payload to exit.
+        # Keep the pre-existing sibling and tested target session/worktree
+        # active for the owner; only wait for the bounded sibling payload.
         sibling_final = invoke_ok("sibling-show-left-active", ["session", "show", "--session", args.sibling_session])
         sibling_final_record = recursively_find(sibling_final, "session")
         if not isinstance(sibling_final_record, dict) and isinstance(sibling_final.get("session_id"), str):
@@ -951,6 +1045,7 @@ def main() -> int:
             "package_sha256": args.package_sha256,
             "session_id": args.session,
             "drain_probe_session_id": args.drain_probe_session,
+            "cancel_probe_session_id": args.cancel_session,
             "sibling_session_id": args.sibling_session,
             "failures": failures,
             "result": "passed" if not failures else "failed",

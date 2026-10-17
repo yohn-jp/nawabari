@@ -6,10 +6,13 @@ write claims, creates a zero-execution drain probe with an atomic README read
 claim, and binds an existing active sibling by its public session ID.
 The target's read-only baseline contains `README.md` and a separate stale
 claim trigger; its write-only fixture is not incorrectly required as a
-read-only baseline. The runner observes the sibling payload populated, closes
-the zero-execution probe through public `session close --drain-policy wait`,
-and confirms the exact sibling execution remains populated afterward. This
-exercises observed sibling attribution in the physical cgroup tree.
+read-only baseline. When an earlier guard-only attempt closed a target or
+drain probe, the runner creates a replacement through public `session create`
+using the preserved scope and candidate working-set artifacts. The runner
+observes the sibling payload populated, closes the zero-execution probe
+through public `session close --drain-policy wait`, and confirms the exact
+sibling execution remains populated afterward. This exercises observed
+sibling attribution in the physical cgroup tree.
 
 `nawabari-oci-n1-run.py` uses only the public Nawabari CLI inside the selected
 OCI container. It runs a real strict Node payload that reads the claimed
@@ -18,10 +21,11 @@ attempts reads from pre-created outer-container, peer-worktree, control-store,
 and secret sentinels. It checks the launch's raw bytes and physical namespace
 and cleanup receipt, a stale-snapshot refusal without a new execution record,
 a verifier timeout with observed descendant cleanup, public owner close with
-`--drain-policy terminate`, and survival of the active sibling and container.
-The bounded sibling payload exits naturally, while its session and worktree
-remain active for the owner. Neither script signals a host process, restarts
-the container, or launches a host-side verifier.
+`--drain-policy terminate` on a separate cancellation-probe session, and
+survival of the active sibling, tested target, and container. The bounded
+sibling payload exits naturally, while its session and worktree remain active
+for the owner. Neither script signals a host process, restarts the container,
+or launches a host-side verifier.
 
 For the 2026-10-17 g4 candidate, the exact Nawabari package SHA-256 is
 `cd4d3321d6f088bb509ac0f4bf6cec94452a552ae5605aa7f53e669bff0b5805`. The
