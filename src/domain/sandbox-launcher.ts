@@ -1,7 +1,9 @@
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import type { Readable, Writable } from "node:stream";
 
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import {
@@ -64,6 +66,17 @@ import {
 } from "./cgroups-v2.js";
 import type { FilesystemEnforcementIntegrationResult } from "./filesystem-enforcement-integration.js";
 import { validateFilesystemPolicyEnforcementRuntime } from "./filesystem-policy-enforcement.js";
+import {
+  makeSandboxRawOutput,
+  observeSandboxExecutionStart,
+  observeSandboxExecutionTermination,
+  parseBubblewrapInfo,
+  type SandboxExecutionEvidenceSnapshot,
+  type SandboxExecutionStartObservation,
+  type SandboxExecutionTerminationReason,
+  type SandboxPhysicalExecutionEvidence,
+  type SandboxRawOutput,
+} from "./sandbox-execution-evidence.js";
 
 const SANDBOX_HOME = SESSION_RUNTIME_LOGICAL_HOME;
 const SANDBOX_CONFIG_HOME = SESSION_RUNTIME_LOGICAL_CONFIG_HOME;
@@ -80,6 +93,7 @@ const COMPATIBILITY_USER_TOOL_TARGETS = new Set([
 ]);
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_024 * 1_024;
+const START_OBSERVATION_TIMEOUT_MS = 10_000;
 
 export type SandboxCommand = {
   readonly command: string;
@@ -106,11 +120,17 @@ export type SandboxInvocation = {
 };
 
 export type SandboxExecutionResult = {
+  /** Stable request execution identity, or a launcher-generated identity when no cgroup identity exists. */
+  readonly execution_id: string;
   readonly exit_code: number | null;
   readonly signal: string | null;
   readonly stdout: string;
   readonly stderr: string;
   readonly duration_ms: number;
+  /** Byte-faithful bounded output, serialized without UTF-8 replacement. */
+  readonly raw_output: SandboxRawOutput;
+  /** Owner-observed start namespaces, termination, and descendant cleanup. */
+  readonly physical_execution: SandboxPhysicalExecutionEvidence;
   /** Applied policy identity, retained as bounded machine-readable evidence. */
   readonly seccomp_profile?: SandboxSeccompProfileMetadata;
   readonly resources?: {
@@ -135,6 +155,8 @@ export type SandboxFilesystemEnforcementOptions = Readonly<{
 export type SandboxLauncherOptions = SandboxFilesystemEnforcementOptions & {
   readonly timeout_ms?: number;
   readonly max_output_bytes?: number;
+  /** Abort only this protected execution. The owner re-observes its process namespace before returning. */
+  readonly signal?: AbortSignal;
   /** Attach the caller's existing stdio and use no bounded-output timeout. */
   readonly interactive?: boolean;
 };
@@ -1266,6 +1288,18 @@ export function compileSandboxInvocation(
   if (!compiledEnvironment.ok) return compiledEnvironment;
   const topology = validateTopology(request, compiledEnvironment.value?.manifest ?? null);
   if (!topology.ok) return topology;
+  const procfsPolicy = request.procfs ?? { mode: "private", reason: null };
+  if (
+    (procfsPolicy.mode !== "private" && procfsPolicy.mode !== "denied") ||
+    (procfsPolicy.mode === "private" && procfsPolicy.reason !== null) ||
+    (procfsPolicy.mode === "denied" &&
+      (typeof procfsPolicy.reason !== "string" || procfsPolicy.reason.length === 0 || procfsPolicy.reason.includes("\0")))
+  ) {
+    return topologyError("The selected procfs policy is invalid.", {
+      session_id: request.session_id,
+      mode: procfsPolicy.mode,
+    });
+  }
   const profilePaths = validateProfilePaths(request);
   if (!profilePaths.ok) return profilePaths;
   const runtimeProjection =
@@ -1504,10 +1538,22 @@ export function compileSandboxInvocation(
     "ALL",
     "--seccomp",
     "3",
+    "--info-fd",
+    "4",
+    "--block-fd",
+    "5",
     "--clearenv",
   ];
   for (const [key, value] of Object.entries(argsEnvironment)) args.push("--setenv", key, value);
-  args.push("--tmpfs", "/", "--dev", "/dev", "--proc", "/proc");
+  args.push("--tmpfs", "/", "--dev", "/dev");
+  if (procfsPolicy.mode === "denied") {
+    // Keep the parent proc tree entirely outside the sandbox. A private empty
+    // mount avoids Linux's mount-too-revealing rejection when the parent proc
+    // has inherited masked children; it does not expose host or sibling PIDs.
+    args.push("--tmpfs", "/proc", "--remount-ro", "/proc");
+  } else {
+    args.push("--proc", "/proc");
+  }
   if (compiledEnvironment.value === null) {
     args.push("--tmpfs", "/tmp");
     if (boundedWorkingSet !== undefined) args.push("--dir", tempDirectory);
@@ -1702,42 +1748,21 @@ function requirementTempDirectory(): string {
   return process.env.TMPDIR !== undefined && path.isAbsolute(process.env.TMPDIR) ? process.env.TMPDIR : "/tmp";
 }
 
-function boundedOutput(
-  chunks: string[],
-  bytes: number,
+function boundedRawOutputChunk(
+  chunks: Buffer[],
+  bytesCaptured: number,
   maxBytes: number,
   value: Buffer | string,
-): { readonly bytes: number; readonly exceeded: boolean } {
+): { readonly bytes_captured: number; readonly exceeded: boolean; readonly observed_bytes: number } {
   const encoded = typeof value === "string" ? Buffer.from(value, "utf8") : value;
-  const textBytes = encoded.byteLength;
-  const remaining = maxBytes - bytes;
-  if (remaining <= 0) return { bytes, exceeded: textBytes > 0 };
-  if (textBytes <= remaining) {
-    chunks.push(encoded.toString("utf8"));
-    return { bytes: bytes + textBytes, exceeded: false };
-  }
-  // Do not let a partial UTF-8 code point turn into U+FFFD and exceed the
-  // advertised byte bound.  The launcher reports text, but the bound is
-  // defined in bytes so that machine callers can rely on it for arbitrary
-  // child output.
-  let end = remaining;
-  while (end > 0) {
-    const last = encoded[end - 1] ?? 0;
-    if ((last & 0x80) === 0) break;
-    if ((last & 0xc0) === 0x80) {
-      let start = end - 1;
-      while (start > 0 && ((encoded[start - 1] ?? 0) & 0xc0) === 0x80) start -= 1;
-      const lead = encoded[start] ?? 0;
-      const width = (lead & 0xe0) === 0xc0 ? 2 : (lead & 0xf0) === 0xe0 ? 3 : (lead & 0xf8) === 0xf0 ? 4 : 1;
-      if (start + width > end) {
-        end = start;
-        continue;
-      }
-    }
-    break;
-  }
-  chunks.push(encoded.subarray(0, end).toString("utf8"));
-  return { bytes: bytes + end, exceeded: true };
+  const remaining = Math.max(0, maxBytes - bytesCaptured);
+  const retained = encoded.subarray(0, remaining);
+  if (retained.byteLength > 0) chunks.push(Buffer.from(retained));
+  return {
+    bytes_captured: bytesCaptured + retained.byteLength,
+    exceeded: retained.byteLength < encoded.byteLength,
+    observed_bytes: encoded.byteLength,
+  };
 }
 
 function landlockSetupDiagnostic(stderr: string): string | null {
@@ -1777,6 +1802,7 @@ export function runSandboxedCommand(
   }
 
   const started = Date.now();
+  const executionId = request.cgroups?.execution_id ?? randomUUID();
   const profile = openSeccompProfile(invocation.value.seccomp_profile);
   if (!profile.ok) return Promise.resolve(profile);
   let cgroupScope: CgroupScope | null = null;
@@ -1799,8 +1825,8 @@ export function runSandboxedCommand(
       env: { ...invocation.value.env },
       shell: false,
       stdio: interactive
-        ? ["inherit", "inherit", "inherit", profile.value.fd]
-        : ["ignore", "pipe", "pipe", profile.value.fd],
+        ? ["inherit", "inherit", "inherit", profile.value.fd, "pipe", "pipe"]
+        : ["ignore", "pipe", "pipe", profile.value.fd, "pipe", "pipe"],
     });
     profile.value.close();
   } catch (error: unknown) {
@@ -1839,20 +1865,112 @@ export function runSandboxedCommand(
   }
 
   return new Promise((resolve) => {
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    let outputBytes = 0;
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let capturedOutputBytes = 0;
+    let observedStdoutBytes = 0;
+    let observedStderrBytes = 0;
     let timedOut = false;
+    let cancelled = false;
     let outputExceeded = false;
     let spawnError: Error | null = null;
+    let startFailure: string | null = null;
     let settled = false;
+    let startObservation: SandboxExecutionStartObservation = observeSandboxExecutionStart(null);
+    let terminationReason: SandboxExecutionTerminationReason = "unknown";
+    let gateReleased = false;
+    let infoDocument = "";
     let timer: NodeJS.Timeout | null = null;
-    if (!interactive) {
-      timer = setTimeout(() => {
-        timedOut = true;
+    let startTimer: NodeJS.Timeout | null = null;
+    const childStreams = child.stdio as Array<Readable | Writable | null>;
+    const infoStream = childStreams[4] as Readable | null | undefined;
+    const blockStream = childStreams[5] as Writable | null | undefined;
+
+    const killChild = (): void => {
+      try {
         child.kill("SIGKILL");
-      }, timeoutMs);
-    }
+      } catch {
+        // The child may have exited between the state update and signal delivery.
+      }
+    };
+
+    const failBeforeRelease = (reason: string): void => {
+      if (gateReleased || startFailure !== null) return;
+      startFailure = reason;
+      if (startTimer !== null) clearTimeout(startTimer);
+      killChild();
+    };
+
+    const releasePayload = (): void => {
+      if (gateReleased || startFailure !== null || settled) return;
+      gateReleased = true;
+      if (startTimer !== null) clearTimeout(startTimer);
+      try {
+        // Bubblewrap reads one byte from --block-fd after establishing its
+        // namespaces and mount tree but before it executes the payload.
+        blockStream?.end(Buffer.from([1]));
+      } catch (error: unknown) {
+        gateReleased = false;
+        failBeforeRelease(error instanceof Error ? error.message.slice(0, 200) : "block-fd write failed");
+      }
+    };
+
+    const consumeInfo = (): void => {
+      if (gateReleased || startFailure !== null || settled) return;
+      const outerPid = parseBubblewrapInfo(infoDocument);
+      if (outerPid === null) {
+        failBeforeRelease("Bubblewrap did not publish a valid --info-fd child PID.");
+        return;
+      }
+      startObservation = observeSandboxExecutionStart(outerPid);
+      if (startObservation.state !== "observed") {
+        failBeforeRelease("The payload PID namespaces could not be observed as distinct before release.");
+        return;
+      }
+      releasePayload();
+    };
+
+    const makeRawOutput = (): SandboxRawOutput =>
+      makeSandboxRawOutput({
+        stdout: Buffer.concat(stdout),
+        stderr: Buffer.concat(stderr),
+        observed_stdout_bytes: observedStdoutBytes,
+        observed_stderr_bytes: observedStderrBytes,
+        complete: !interactive && !timedOut && !cancelled && !outputExceeded && startFailure === null,
+        capture_mode: interactive ? "inherited" : "pipes",
+      });
+
+    const makePhysicalEvidence = async (): Promise<SandboxPhysicalExecutionEvidence> => {
+      const observed = await observeSandboxExecutionTermination(startObservation, terminationReason);
+      const procfsPolicy = request.procfs ?? { mode: "private" as const, reason: null };
+      return {
+        schema_version: 1,
+        correlation_id: executionId,
+        procfs: { mode: procfsPolicy.mode, reason: procfsPolicy.reason },
+        start: startObservation,
+        termination: observed.termination,
+        cleanup: observed.cleanup,
+      };
+    };
+
+    const captureChunk = (stream: "stdout" | "stderr", value: Buffer | string): void => {
+      if (interactive) return;
+      const encoded = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+      if (stream === "stdout") observedStdoutBytes += encoded.byteLength;
+      else observedStderrBytes += encoded.byteLength;
+      const collected = boundedRawOutputChunk(
+        stream === "stdout" ? stdout : stderr,
+        capturedOutputBytes,
+        maxOutputBytes,
+        encoded,
+      );
+      capturedOutputBytes = collected.bytes_captured;
+      if (collected.exceeded && !outputExceeded) {
+        outputExceeded = true;
+        terminationReason = "output-limit";
+        killChild();
+      }
+    };
 
     const signalHandlers = new Map<NodeJS.Signals, () => void>();
     const removeSignalHandlers = (): void => {
@@ -1874,16 +1992,81 @@ export function runSandboxedCommand(
       }
     }
 
-    const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
+    const onAbort = (): void => {
+      if (settled || cancelled || timedOut || outputExceeded || startFailure !== null) return;
+      cancelled = true;
+      terminationReason = "cancelled";
+      killChild();
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
+
+    if (infoStream == null || blockStream == null) {
+      failBeforeRelease("Bubblewrap did not provide the required --info-fd and --block-fd streams.");
+    } else {
+      infoStream.setEncoding("utf8");
+      infoStream.on("data", (value: string | Buffer) => {
+        const chunk = typeof value === "string" ? value : value.toString("utf8");
+        infoDocument += chunk;
+        if (infoDocument.length > 4_096) {
+          failBeforeRelease("Bubblewrap --info-fd output exceeded the bounded observation size.");
+          return;
+        }
+        if (infoDocument.includes("\n}")) consumeInfo();
+      });
+      infoStream.on("end", () => {
+        if (!gateReleased && startFailure === null && infoDocument.trim().length > 0) consumeInfo();
+      });
+      infoStream.on("error", (error: Error) => {
+        failBeforeRelease(error.message.slice(0, 200));
+      });
+      blockStream.on("error", (error: Error) => {
+        if (gateReleased) {
+          startFailure = error.message.slice(0, 200);
+          killChild();
+        } else {
+          failBeforeRelease(error.message.slice(0, 200));
+        }
+      });
+      startTimer = setTimeout(() => {
+        failBeforeRelease("Bubblewrap did not publish an observable namespace before the deadline.");
+      }, START_OBSERVATION_TIMEOUT_MS);
+    }
+
+    const finish = async (code: number | null, signal: NodeJS.Signals | null): Promise<void> => {
       if (settled) return;
       settled = true;
       if (timer !== null) clearTimeout(timer);
+      if (startTimer !== null) clearTimeout(startTimer);
       removeSignalHandlers();
+      options.signal?.removeEventListener("abort", onAbort);
+      if (terminationReason === "unknown" && startFailure === null) terminationReason = "exited";
       const accounting = cgroupScope === null ? null : readCgroupAccounting(cgroupScope);
+      const physicalExecution = await makePhysicalEvidence();
+      const capturedRawOutput = makeRawOutput();
+      const evidenceSnapshot: SandboxExecutionEvidenceSnapshot = {
+        schema_version: 1,
+        execution_id: executionId,
+        exit_code: code,
+        signal,
+        raw_output: capturedRawOutput,
+        physical_execution: physicalExecution,
+      };
+      const evidenceDetails: JsonObject = {
+        execution_id: executionId,
+        execution_evidence: evidenceSnapshot as unknown as JsonObject,
+      };
       if (cgroupScope !== null) {
         const cleaned = cleanupCgroupScope(cgroupScope);
         if (!cleaned.ok) {
-          resolve(cleaned);
+          resolve(
+            failure(
+              new DomainError(cleaned.error.code, cleaned.error.message, {
+                ...(cleaned.error.details ?? {}),
+                ...evidenceDetails,
+              }),
+            ),
+          );
           return;
         }
       }
@@ -1901,7 +2084,20 @@ export function runSandboxedCommand(
             new DomainError("SANDBOX_EXECUTION_FAILED", "Bubblewrap failed before the command could run.", {
               reason: spawnError.message.slice(0, 200),
               ...resourceDetails,
+              ...evidenceDetails,
             }),
+          ),
+        );
+        return;
+      }
+      if (startFailure !== null) {
+        resolve(
+          failure(
+            new DomainError(
+              "SANDBOX_EXECUTION_FAILED",
+              "Bubblewrap did not establish an observable protected execution before payload release.",
+              { reason: startFailure, ...resourceDetails, ...evidenceDetails },
+            ),
           ),
         );
         return;
@@ -1912,6 +2108,7 @@ export function runSandboxedCommand(
             new DomainError("SANDBOX_EXECUTION_TIMEOUT", "The sandboxed command exceeded its execution timeout.", {
               timeout_ms: timeoutMs,
               ...resourceDetails,
+              ...evidenceDetails,
             }),
           ),
         );
@@ -1923,12 +2120,25 @@ export function runSandboxedCommand(
             new DomainError("SANDBOX_OUTPUT_LIMIT", "The sandboxed command exceeded its output limit.", {
               max_output_bytes: maxOutputBytes,
               ...resourceDetails,
+              ...evidenceDetails,
             }),
           ),
         );
         return;
       }
-      const diagnostic = stderr.join("");
+      if (cancelled) {
+        resolve(
+          failure(
+            new DomainError("SANDBOX_EXECUTION_FAILED", "The protected execution was cancelled by its owner.", {
+              reason: "cancelled",
+              ...resourceDetails,
+              ...evidenceDetails,
+            }),
+          ),
+        );
+        return;
+      }
+      const diagnostic = Buffer.concat(stderr).toString("utf8");
       if (code !== 0 && /^bwrap:/mu.test(diagnostic)) {
         const seccompFailure = /seccomp/u.test(diagnostic);
         resolve(
@@ -1942,6 +2152,7 @@ export function runSandboxedCommand(
                 profile_id: invocation.value.seccomp_profile_metadata.id,
                 profile_version: invocation.value.seccomp_profile_metadata.version,
                 stderr: diagnostic.slice(0, maxOutputBytes),
+                ...evidenceDetails,
               },
             ),
           ),
@@ -1962,6 +2173,7 @@ export function runSandboxedCommand(
                 effective_state: "error",
                 retryable: false,
                 diagnostic: landlockDiagnostic,
+                ...evidenceDetails,
               },
             ),
           ),
@@ -1970,11 +2182,14 @@ export function runSandboxedCommand(
       }
       resolve(
         success({
+          execution_id: executionId,
           exit_code: code,
           signal,
-          stdout: stdout.join(""),
-          stderr: stderr.join(""),
+          stdout: Buffer.concat(stdout).toString("utf8"),
+          stderr: Buffer.concat(stderr).toString("utf8"),
           duration_ms: Date.now() - started,
+          raw_output: capturedRawOutput,
+          physical_execution: physicalExecution,
           seccomp_profile: invocation.value.seccomp_profile_metadata,
           ...(cgroupScope === null || accounting === null
             ? {}
@@ -1993,27 +2208,21 @@ export function runSandboxedCommand(
     };
 
     if (!interactive) {
-      child.stdout?.on("data", (value: Buffer | string) => {
-        const collected = boundedOutput(stdout, outputBytes, maxOutputBytes, value);
-        outputBytes = collected.bytes;
-        if (collected.exceeded) {
-          outputExceeded = true;
-          child.kill("SIGKILL");
-        }
-      });
-      child.stderr?.on("data", (value: Buffer | string) => {
-        const collected = boundedOutput(stderr, outputBytes, maxOutputBytes, value);
-        outputBytes = collected.bytes;
-        if (collected.exceeded) {
-          outputExceeded = true;
-          child.kill("SIGKILL");
-        }
-      });
+      child.stdout?.on("data", (value: Buffer | string) => captureChunk("stdout", value));
+      child.stderr?.on("data", (value: Buffer | string) => captureChunk("stderr", value));
     }
     child.on("error", (error: Error) => {
       spawnError = error;
     });
-    child.on("close", (code, signal) => finish(code, signal));
+    child.on("close", (code, signal) => void finish(code, signal));
+
+    if (!interactive) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        terminationReason = "timeout";
+        killChild();
+      }, timeoutMs);
+    }
   });
 }
 
