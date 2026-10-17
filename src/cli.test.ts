@@ -355,7 +355,13 @@ test("session run and exec project the advertised protected identities from the 
           };
           observedRuntimeResolution = request.runtime_resolution;
           observedCommand = [command.command, ...(command.args ?? [])];
-          return sandboxExecutionMockSuccess({ exit_code: childExitCode, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({
+            exit_code: childExitCode,
+            signal: null,
+            stdout: "ok",
+            stderr: "",
+            duration_ms: 1,
+          });
         },
       },
     );
@@ -539,7 +545,8 @@ test("session shell propagates a projected shell exit status or signal", async (
       io: nonzeroOutput.io,
       sandboxProbe: readySandboxProbe(),
       sandboxRuntimeLayout: strictRuntimeLayout(),
-      sandboxRunner: async () => sandboxExecutionMockSuccess({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
+      sandboxRunner: async () =>
+        sandboxExecutionMockSuccess({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
     },
   );
   assert.equal(nonzero, 7);
@@ -552,7 +559,8 @@ test("session shell propagates a projected shell exit status or signal", async (
     io: signalOutput.io,
     sandboxProbe: readySandboxProbe(),
     sandboxRuntimeLayout: strictRuntimeLayout(),
-    sandboxRunner: async () => sandboxExecutionMockSuccess({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
+    sandboxRunner: async () =>
+      sandboxExecutionMockSuccess({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
   });
   assert.equal(signal, 3);
   assert.deepEqual(signalOutput.stdout, []);
@@ -840,7 +848,13 @@ test("session run returns a rejected exit status for a signaled child and never 
       sandboxProbe: readySandboxProbe({ hasBubblewrap: () => false }),
       sandboxRunner: async () => {
         runnerInvocations += 1;
-        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({
+          exit_code: 0,
+          signal: null,
+          stdout: "ambient",
+          stderr: "",
+          duration_ms: 1,
+        });
       },
     },
   );

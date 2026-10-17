@@ -1322,7 +1322,9 @@ export function compileSandboxInvocation(
     (procfsPolicy.mode !== "private" && procfsPolicy.mode !== "denied") ||
     (procfsPolicy.mode === "private" && procfsPolicy.reason !== null) ||
     (procfsPolicy.mode === "denied" &&
-      (typeof procfsPolicy.reason !== "string" || procfsPolicy.reason.length === 0 || procfsPolicy.reason.includes("\0")))
+      (typeof procfsPolicy.reason !== "string" ||
+        procfsPolicy.reason.length === 0 ||
+        procfsPolicy.reason.includes("\0")))
   ) {
     return topologyError("The selected procfs policy is invalid.", {
       session_id: request.session_id,

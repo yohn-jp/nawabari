@@ -121,7 +121,10 @@ function processStartTicks(pid: number, procRoot: string): string | null {
     const stat = fs.readFileSync(`${procRoot}/${pid}/stat`, "utf8");
     const close = stat.lastIndexOf(")");
     if (close === -1) return null;
-    const fieldsAfterComm = stat.slice(close + 1).trim().split(/\s+/u);
+    const fieldsAfterComm = stat
+      .slice(close + 1)
+      .trim()
+      .split(/\s+/u);
     const ticks = fieldsAfterComm[19]; // field 22 (starttime), with field 3 at index 0.
     return ticks !== undefined && /^\d+$/u.test(ticks) ? ticks : null;
   } catch {
@@ -215,7 +218,13 @@ function observeProcessTermination(
   try {
     const stat = fs.readFileSync(`${procRoot}/${start.outer_pid}/stat`, "utf8");
     const close = stat.lastIndexOf(")");
-    const fieldsAfterComm = close < 0 ? [] : stat.slice(close + 1).trim().split(/\s+/u);
+    const fieldsAfterComm =
+      close < 0
+        ? []
+        : stat
+            .slice(close + 1)
+            .trim()
+            .split(/\s+/u);
     const ticks = fieldsAfterComm[19];
     if (ticks === undefined || !/^\d+$/u.test(ticks)) {
       return { state: "unknown", reason: "unknown", method: "unknown", observed_at: null };
@@ -287,14 +296,16 @@ export async function observeSandboxExecutionTermination(
   };
 }
 
-export function makeSandboxRawOutput(input: Readonly<{
-  stdout: Buffer;
-  stderr: Buffer;
-  observed_stdout_bytes: number;
-  observed_stderr_bytes: number;
-  complete: boolean;
-  capture_mode: "pipes" | "inherited";
-}>): SandboxRawOutput {
+export function makeSandboxRawOutput(
+  input: Readonly<{
+    stdout: Buffer;
+    stderr: Buffer;
+    observed_stdout_bytes: number;
+    observed_stderr_bytes: number;
+    complete: boolean;
+    capture_mode: "pipes" | "inherited";
+  }>,
+): SandboxRawOutput {
   return {
     encoding: "base64",
     capture_mode: input.capture_mode,

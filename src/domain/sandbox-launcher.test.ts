@@ -203,8 +203,12 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
   const repository = createRepository();
   const worktree = `${repository}-owned`;
   const fixture = createControlledSandboxFixture();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-command-cwd-outside-"));
+  const nested = path.join(worktree, "nested");
+  const nestedAlias = path.join(worktree, "nested-alias");
   try {
     const request = await resolvedRequest(repository, worktree, fixture.layout);
+    fs.mkdirSync(nested);
     assert.equal(request.sandbox_executable, fixture.executable);
     const compiled = compileSandboxInvocation(request, {
       command: "printf",
@@ -222,6 +226,26 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
     assert.ok(compiled.value.args.includes("--unshare-ipc"));
     assert.ok(compiled.value.args.includes("--unshare-uts"));
     assert.deepEqual(
+      compiled.value.args.slice(compiled.value.args.indexOf("--info-fd"), compiled.value.args.indexOf("--info-fd") + 2),
+      ["--info-fd", "4"],
+    );
+    assert.deepEqual(
+      compiled.value.args.slice(
+        compiled.value.args.indexOf("--block-fd"),
+        compiled.value.args.indexOf("--block-fd") + 2,
+      ),
+      ["--block-fd", "5"],
+    );
+    assert.ok(
+      compiled.value.args.some((value, index, args) => value === "--proc" && args[index + 1] === "/proc"),
+      "the ordinary proc policy still receives a fresh private procfs",
+    );
+    assert.deepEqual(
+      compiled.value.args.slice(compiled.value.args.indexOf("--chdir"), compiled.value.args.indexOf("--chdir") + 2),
+      ["--chdir", worktree],
+    );
+    assert.equal(compiled.value.cwd, worktree);
+    assert.deepEqual(
       compiled.value.args.slice(compiled.value.args.indexOf("--seccomp"), compiled.value.args.indexOf("--seccomp") + 2),
       ["--seccomp", "3"],
     );
@@ -230,8 +254,45 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
     assert.ok(terminator > 0);
     assert.deepEqual(compiled.value.args.slice(terminator), ["--", "printf", "%s", "literal; not shell syntax"]);
     assert.ok(compiled.value.args.includes(worktree));
+
+    const nestedCwd = compileSandboxInvocation(request, { command: "true", cwd: nested });
+    assert.equal(nestedCwd.ok, true, nestedCwd.ok ? "" : JSON.stringify(nestedCwd.error));
+    if (nestedCwd.ok) {
+      assert.equal(nestedCwd.value.cwd, worktree, "Bubblewrap itself starts from the owned worktree");
+      assert.deepEqual(
+        nestedCwd.value.args.slice(
+          nestedCwd.value.args.indexOf("--chdir"),
+          nestedCwd.value.args.indexOf("--chdir") + 2,
+        ),
+        ["--chdir", nested],
+      );
+    }
+
+    const deniedProc = compileSandboxInvocation(
+      { ...request, procfs: { mode: "denied", reason: "parent-procfs-has-overmounts" } },
+      { command: "true" },
+    );
+    assert.equal(deniedProc.ok, true, deniedProc.ok ? "" : JSON.stringify(deniedProc.error));
+    if (deniedProc.ok) {
+      assert.ok(deniedProc.value.args.some((value, index, args) => value === "--tmpfs" && args[index + 1] === "/proc"));
+      assert.ok(
+        deniedProc.value.args.some((value, index, args) => value === "--remount-ro" && args[index + 1] === "/proc"),
+      );
+      assert.equal(deniedProc.value.args.includes("--proc"), false);
+      assert.equal(
+        deniedProc.value.args.some((value, index, args) => value === "--bind" && args[index + 1] === "/proc"),
+        false,
+      );
+    }
+
+    assert.equal(compileSandboxInvocation(request, { command: "true", cwd: outside }).ok, false);
+    assert.equal(compileSandboxInvocation(request, { command: "true", cwd: `${worktree}/nested/..` }).ok, false);
+    fs.symlinkSync(nested, nestedAlias, "dir");
+    assert.equal(compileSandboxInvocation(request, { command: "true", cwd: nestedAlias }).ok, false);
   } finally {
     fixture.cleanup();
+    fs.rmSync(nestedAlias, { force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
     removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
   }

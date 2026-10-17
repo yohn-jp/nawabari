@@ -279,7 +279,8 @@ test("verification authority delegates protected execution without changing agen
 
 test("verification serialization validates the nested result and keeps its explicit key", async () => {
   const authority = new VerificationExecutionAuthority({
-    execute: async () => sandboxExecutionMockSuccess({ exit_code: 1, signal: null, stdout: "", stderr: "failed", duration_ms: 1 }),
+    execute: async () =>
+      sandboxExecutionMockSuccess({ exit_code: 1, signal: null, stdout: "", stderr: "failed", duration_ms: 1 }),
   });
   const evidence = await authority.executeEvidence(profile, request);
   assert.equal(evidence.ok, true);

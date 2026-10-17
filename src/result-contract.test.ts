@@ -352,7 +352,13 @@ test("protected-execution public output remains reachable through the canonical 
       sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
       sandboxRunner: async (_request, command) => {
         assert.deepEqual([command.command, ...(command.args ?? [])], ["printf", "literal; $HOME"]);
-        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "literal; $HOME", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({
+          exit_code: 0,
+          signal: null,
+          stdout: "literal; $HOME",
+          stderr: "",
+          duration_ms: 1,
+        });
       },
       io: output.io,
     },

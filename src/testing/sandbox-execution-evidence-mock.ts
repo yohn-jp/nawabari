@@ -14,11 +14,12 @@ const UNKNOWN_NAMESPACES = {
 export function withSandboxExecutionEvidence<T extends Readonly<{ stdout: string; stderr: string }>>(
   result: T,
   executionId = "mock-execution",
-): T & Readonly<{
-  execution_id: string;
-  raw_output: SandboxRawOutput;
-  physical_execution: SandboxPhysicalExecutionEvidence;
-}> {
+): T &
+  Readonly<{
+    execution_id: string;
+    raw_output: SandboxRawOutput;
+    physical_execution: SandboxPhysicalExecutionEvidence;
+  }> {
   const stdout = Buffer.from(result.stdout, "utf8");
   const stderr = Buffer.from(result.stderr, "utf8");
   return {
@@ -64,9 +65,8 @@ export function withSandboxExecutionEvidence<T extends Readonly<{ stdout: string
 }
 
 /** Build a typed fake runner result while leaving all physical claims unknown. */
-export function sandboxExecutionMockSuccess<T extends Pick<
-  SandboxExecutionResult,
-  "exit_code" | "signal" | "stdout" | "stderr" | "duration_ms"
->>(result: T): DomainResult<SandboxExecutionResult> {
+export function sandboxExecutionMockSuccess<
+  T extends Pick<SandboxExecutionResult, "exit_code" | "signal" | "stdout" | "stderr" | "duration_ms">,
+>(result: T): DomainResult<SandboxExecutionResult> {
   return success(withSandboxExecutionEvidence(result));
 }

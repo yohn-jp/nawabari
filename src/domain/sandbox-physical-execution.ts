@@ -132,7 +132,7 @@ export function runObservedSandboxChild(
     };
 
     const releasePayload = (): void => {
-      if (gateReleased || startFailure !== null || settled) return;
+      if (gateReleased || startFailure !== null || settled || timedOut || cancelled || outputExceeded) return;
       gateReleased = true;
       if (startTimer !== null) clearTimeout(startTimer);
       try {
@@ -145,7 +145,7 @@ export function runObservedSandboxChild(
     };
 
     const consumeInfo = (): void => {
-      if (gateReleased || startFailure !== null || settled) return;
+      if (gateReleased || startFailure !== null || settled || timedOut || cancelled || outputExceeded) return;
       const outerPid = parseBubblewrapInfo(infoDocument);
       if (outerPid === null) {
         failBeforeRelease("Bubblewrap did not publish a valid --info-fd child PID.");
@@ -303,59 +303,73 @@ export function runObservedSandboxChild(
         };
 
         if (spawnError !== null) {
-          fail(new DomainError("SANDBOX_EXECUTION_FAILED", "Bubblewrap failed before the command could run.", {
-            reason: spawnError.message.slice(0, 200),
-          }));
+          fail(
+            new DomainError("SANDBOX_EXECUTION_FAILED", "Bubblewrap failed before the command could run.", {
+              reason: spawnError.message.slice(0, 200),
+            }),
+          );
           return;
         }
         if (timedOut) {
-          fail(new DomainError("SANDBOX_EXECUTION_TIMEOUT", "The sandboxed command exceeded its execution timeout.", {
-            timeout_ms: timeoutMs,
-          }));
+          fail(
+            new DomainError("SANDBOX_EXECUTION_TIMEOUT", "The sandboxed command exceeded its execution timeout.", {
+              timeout_ms: timeoutMs,
+            }),
+          );
           return;
         }
         if (outputExceeded) {
-          fail(new DomainError("SANDBOX_OUTPUT_LIMIT", "The sandboxed command exceeded its output limit.", {
-            max_output_bytes: maxOutputBytes,
-          }));
+          fail(
+            new DomainError("SANDBOX_OUTPUT_LIMIT", "The sandboxed command exceeded its output limit.", {
+              max_output_bytes: maxOutputBytes,
+            }),
+          );
           return;
         }
         if (cancelled) {
-          fail(new DomainError("SANDBOX_EXECUTION_FAILED", "The protected execution was cancelled by its owner.", {
-            reason: "cancelled",
-          }));
+          fail(
+            new DomainError("SANDBOX_EXECUTION_FAILED", "The protected execution was cancelled by its owner.", {
+              reason: "cancelled",
+            }),
+          );
           return;
         }
         if (code !== 0 && /^bwrap:/mu.test(diagnostic)) {
           const seccompFailure = /seccomp/u.test(diagnostic);
-          fail(new DomainError(
-            seccompFailure ? "SANDBOX_CAPABILITY_UNAVAILABLE" : "SANDBOX_EXECUTION_FAILED",
-            seccompFailure
-              ? "The required seccomp baseline could not be applied by bubblewrap."
-              : "Bubblewrap could not establish the protected execution boundary.",
-            { stderr: diagnostic },
-          ));
+          fail(
+            new DomainError(
+              seccompFailure ? "SANDBOX_CAPABILITY_UNAVAILABLE" : "SANDBOX_EXECUTION_FAILED",
+              seccompFailure
+                ? "The required seccomp baseline could not be applied by bubblewrap."
+                : "Bubblewrap could not establish the protected execution boundary.",
+              { stderr: diagnostic },
+            ),
+          );
           return;
         }
         if (startFailure !== null) {
-          fail(new DomainError(
-            "SANDBOX_EXECUTION_FAILED",
-            "Bubblewrap did not establish an observable protected execution before payload release.",
-            { reason: startFailure },
-          ));
+          fail(
+            new DomainError(
+              "SANDBOX_EXECUTION_FAILED",
+              "Bubblewrap did not establish an observable protected execution before payload release.",
+              { reason: startFailure },
+            ),
+          );
           return;
         }
 
-        resolve(success({
-          execution_id: options.execution_id,
-          exit_code: code,
-          signal,
-          stdout: stdoutText,
-          stderr: stderrText,
-          duration_ms: Date.now() - started,
-          raw_output: rawOutput,
-          physical_execution: physicalExecution,
-        }));
+        resolve(
+          success({
+            execution_id: options.execution_id,
+            exit_code: code,
+            signal,
+            stdout: stdoutText,
+            stderr: stderrText,
+            duration_ms: Date.now() - started,
+            raw_output: rawOutput,
+            physical_execution: physicalExecution,
+          }),
+        );
       })();
     });
 
@@ -368,4 +382,3 @@ export function runObservedSandboxChild(
     }
   });
 }
-
