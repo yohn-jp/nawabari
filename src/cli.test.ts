@@ -298,7 +298,7 @@ test("bounded session run carries the persisted working-set boundary into the pr
     },
   );
 
-  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
   assert.equal(observedWorkingSet?.working_set_id, "ews-cli-test");
   assert.equal(observedWorkingSet?.revision, 1);
   assert.deepEqual(observedWorkingSet?.scope.readOnly, ["README.md"]);
