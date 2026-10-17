@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   defaultSandboxProbe,
@@ -46,7 +47,13 @@ import type {
 import type { ResolvedRuntimeProfile, RuntimeProfileSelection } from "./runtime-profile.js";
 import type { RuntimeResolutionFhsOptions } from "./runtime-resolution.js";
 import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
-import type { SessionBackend, SessionContext, SessionManagedRuntimeState, SessionRecord } from "./session.js";
+import type {
+  SessionBackend,
+  SessionContext,
+  SessionManagedRuntimeState,
+  SessionRecord,
+  SessionVerificationSnapshot,
+} from "./session.js";
 import {
   cleanupSessionRuntimeDirectories,
   compileSessionEnvironment,
@@ -58,9 +65,21 @@ import { resolveProfileRuntimeScope } from "./worktree-profile-scope.js";
 import { resolveWorktreeProfileRuntime } from "./worktree-profile-runtime.js";
 import { runSessionLaunchSupervisor } from "./session-launch-supervisor.js";
 import type { SessionLaunchSupervisorResult, SupervisorStdioValue } from "./session-launch-supervisor.js";
+import type { SessionProtectedLaunchResult } from "./session-protected-launch.js";
 import { BASH_REQUIREMENT, BASH_STARTUP_ARGS } from "./shell-runtime.js";
 import { CANONICAL_EXECUTABLE_ROOT } from "./runtime-executable-projection.js";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
+import {
+  captureVerificationSourceWitness,
+  executeSourceBoundVerification,
+  validateVerificationProfile,
+  type SourceBoundVerificationResult,
+  type VerificationFilesystemPolicyFence,
+  type VerificationProfile,
+  type VerificationProfileInput,
+  type VerificationSourceWitness,
+} from "../verification-executor.js";
+import type { SandboxExecutionEvidenceSnapshot } from "./sandbox-execution-evidence.js";
 
 /** Versioned identity for the interactive session console producer. */
 export const SESSION_CONSOLE_CONTRACT_ID = "nawabari.session-console.v1" as const;
@@ -305,6 +324,11 @@ export async function launchManagedSessionCommand(
     runtime_policy?: RuntimePolicy;
     sandbox_probe?: SandboxProbe;
     sandbox_runtime_layout?: SandboxRuntimeLayout;
+    /** Owner snapshot required for the additive session-bound verifier operation. */
+    verification?: Readonly<{
+      profile: VerificationProfileInput;
+      expected_snapshot: SessionVerificationSnapshot;
+    }>;
     now?: () => string;
   }>,
 ): Promise<
@@ -316,10 +340,62 @@ export async function launchManagedSessionCommand(
       SandboxExecutionRequest,
       "session_id" | "repository" | "worktree" | "branch" | "network_mode"
     >;
+    verification?: SourceBoundVerificationResult;
+    source_before?: VerificationSourceWitness;
+    source_after?: VerificationSourceWitness;
+    execution_evidence?: SandboxExecutionEvidenceSnapshot;
+    owned_execution?: OwnedExecutionObservation;
     result?: SandboxExecutionResult;
   }> | null>
 > {
   const executionId = input.execution_id ?? crypto.randomUUID();
+  let verificationProfile: VerificationProfile | null = null;
+  if (input.verification !== undefined) {
+    const parsedProfile = validateVerificationProfile(input.verification.profile);
+    if (!parsedProfile.ok) return parsedProfile;
+    verificationProfile = parsedProfile.value;
+    if (input.verification.expected_snapshot.session_id !== input.session_id) {
+      return failure(
+        new DomainError("INVALID_ARGUMENT", "The verification snapshot belongs to a different session.", {
+          expected_session_id: input.session_id,
+          snapshot_session_id: input.verification.expected_snapshot.session_id,
+        }),
+      );
+    }
+    if (backend.getSessionVerificationSnapshot === undefined) return managedRuntimeUnavailable(input.session_id);
+    const currentSnapshot = await backend.getSessionVerificationSnapshot(context, input.session_id);
+    if (!currentSnapshot.ok) return currentSnapshot;
+    if (!isDeepStrictEqual(currentSnapshot.value, input.verification.expected_snapshot)) {
+      return failure(
+        new DomainError("STALE_REGISTRY", "The owner-issued verification snapshot is stale.", {
+          session_id: input.session_id,
+        }),
+      );
+    }
+    if (currentSnapshot.value.managed.admission !== "open" || currentSnapshot.value.managed.profile_digest === null) {
+      return failure(
+        new DomainError("OPERATION_REJECTED", "Session-bound verification requires an open managed session.", {
+          session_id: input.session_id,
+          admission: currentSnapshot.value.managed.admission,
+          profile_digest: currentSnapshot.value.managed.profile_digest,
+        }),
+      );
+    }
+    if (
+      input.command.command !== verificationProfile.executable ||
+      !isDeepStrictEqual(input.command.args, verificationProfile.argv) ||
+      input.command.cwd !== verificationProfile.cwd ||
+      (verificationProfile.cwd !== currentSnapshot.value.worktree &&
+        !verificationProfile.cwd.startsWith(`${currentSnapshot.value.worktree}${path.sep}`))
+    ) {
+      return failure(
+        new DomainError("INVALID_ARGUMENT", "The managed verifier command differs from its approved profile.", {
+          session_id: input.session_id,
+          profile_id: verificationProfile.profile_id,
+        }),
+      );
+    }
+  }
   if (backend.getSessionManagedRuntime === undefined) return success(null);
   const observed = await backend.getSessionManagedRuntime(context, input.session_id, executionId);
   if (!observed.ok) return observed;
@@ -489,6 +565,18 @@ export async function launchManagedSessionCommand(
       }),
     );
   }
+  if (input.verification !== undefined) {
+    const snapshotCheck = await backend.getSessionVerificationSnapshot!(context, input.session_id);
+    if (!snapshotCheck.ok) return snapshotCheck;
+    if (!isDeepStrictEqual(snapshotCheck.value, input.verification.expected_snapshot)) {
+      return failure(
+        new DomainError("STALE_REGISTRY", "The owner-issued verification snapshot changed before reservation.", {
+          session_id: input.session_id,
+          execution_id: executionId,
+        }),
+      );
+    }
+  }
   const live = fresh.value;
   const filesystemToken = digest({ scope: scope.value, claim_set_generation: live.claim_set_generation });
   const snapshot = {
@@ -525,44 +613,138 @@ export async function launchManagedSessionCommand(
     },
   };
   const { launchProtectedSessionExecution } = await import("./session-protected-launch.js");
-  const launched = await launchProtectedSessionExecution(
-    {
-      profile,
-      compiled_environment: compiled.value,
-      request: protectedRequest,
-      command: input.command,
-      ...(input.stdio === undefined ? {} : { stdio: input.stdio }),
-      admission: { session_id: input.session_id, execution_id: executionId, current: snapshot, expected: snapshot },
-      starting_record: reservation.value,
-      supervisor: {
-        trusted: { entrypoint: process.execPath, cwd: path.dirname(process.execPath) },
-        cgroup: { required: true, retain_scope: true, root: cgroupRoot.value },
+  const launch = (
+    launchRequest: SandboxExecutionRequest,
+    command: SandboxCommand,
+    limits?: Readonly<{ timeout_ms: number; max_output_bytes: number }>,
+  ): Promise<DomainResult<SessionProtectedLaunchResult>> =>
+    launchProtectedSessionExecution(
+      {
+        profile,
+        compiled_environment: compiled.value,
+        request: launchRequest,
+        command,
+        ...(limits === undefined ? {} : { sandbox_limits: limits }),
+        ...(input.stdio === undefined ? {} : { stdio: input.stdio }),
+        ...(input.verification === undefined
+          ? {}
+          : { expected_verification_snapshot: input.verification.expected_snapshot }),
+        admission: { session_id: input.session_id, execution_id: executionId, current: snapshot, expected: snapshot },
+        starting_record: reservation.value,
+        supervisor: {
+          trusted: { entrypoint: process.execPath, cwd: path.dirname(process.execPath) },
+          cgroup: { required: true, retain_scope: true, root: cgroupRoot.value },
+        },
       },
-    },
-    {
-      materializeSessionRuntimeDirectories,
-      compileSandboxInvocation,
-      runSessionLaunchSupervisor,
-      persist_execution: async (record) => {
-        const persisted = await backend.persistSessionExecution!(context, record);
-        if (!persisted.ok) throw persisted.error;
+      {
+        materializeSessionRuntimeDirectories,
+        compileSandboxInvocation,
+        runSessionLaunchSupervisor,
+        persist_execution: async (record, expectedVerificationSnapshot) => {
+          const persisted = await backend.persistSessionExecution!(context, record, expectedVerificationSnapshot);
+          if (!persisted.ok) throw persisted.error;
+        },
+        read_process_starttime: processStarttime,
+        read_runtime_epoch: () => backend.readSessionRuntimeEpoch!(context, input.session_id),
       },
-      read_process_starttime: processStarttime,
-      read_runtime_epoch: () => backend.readSessionRuntimeEpoch!(context, input.session_id),
-    },
-  );
+    );
+
+  let launched: DomainResult<SessionProtectedLaunchResult> | undefined;
+  let verification: SourceBoundVerificationResult | undefined;
+  let sourceBefore: VerificationSourceWitness | undefined;
+  let sourceAfter: VerificationSourceWitness | undefined;
+  if (input.verification === undefined || verificationProfile === null) {
+    launched = await launch(protectedRequest, input.command);
+  } else {
+    const fence: VerificationFilesystemPolicyFence = {
+      policy_token: input.verification.expected_snapshot.filesystem_policy_token,
+      expected_policy_token: input.verification.expected_snapshot.filesystem_policy_token,
+    };
+    const before = captureVerificationSourceWitness(verificationProfile, protectedRequest, fence);
+    if (!before.ok) return before;
+    sourceBefore = before.value;
+
+    const sourceBound = await executeSourceBoundVerification(verificationProfile, protectedRequest, fence, {
+      execute: async (verifierRequest, command, limits) => {
+        launched = await launch(
+          { ...protectedRequest, runtime_projection: verifierRequest.runtime_projection },
+          { ...command, cwd: verificationProfile.cwd },
+          limits,
+        );
+        if (!launched.ok) return launched;
+        if (launched.value.supervisor.status === "completed" && launched.value.result !== undefined) {
+          return success(launched.value.result);
+        }
+        return failure(
+          new DomainError("SANDBOX_EXECUTION_FAILED", "The managed verifier did not complete successfully.", {
+            session_id: input.session_id,
+            execution_id: launched.value.execution.execution_id,
+            status: launched.value.supervisor.status,
+            ...(launched.value.execution_evidence === undefined
+              ? {}
+              : { execution_evidence: launched.value.execution_evidence as unknown as JsonObject }),
+          }),
+        );
+      },
+    });
+    if (!sourceBound.ok) return sourceBound;
+    verification = sourceBound.value;
+    const after = captureVerificationSourceWitness(verificationProfile, protectedRequest, fence);
+    if (after.ok) {
+      sourceAfter = after.value;
+      if (!isDeepStrictEqual(sourceBefore, sourceAfter)) {
+        verification = {
+          ...verification,
+          status: "unavailable",
+          source: { status: "unresolved", reason: "source-changed" },
+        };
+      }
+    } else {
+      verification = {
+        ...verification,
+        status: "unavailable",
+        source: { status: "unresolved", reason: "post-observation-unavailable" },
+      };
+    }
+  }
+  if (launched === undefined) {
+    return failure(
+      new DomainError("PHYSICAL_OBSERVATION_UNAVAILABLE", "Source currentness changed before verifier launch.", {
+        session_id: input.session_id,
+        execution_id: executionId,
+      }),
+    );
+  }
   if (!launched.ok) return launched;
+  let ownedExecution: OwnedExecutionObservation | undefined;
   if (launched.value.execution.state === "exited" && launched.value.supervisor.started) {
     const owned = observeOwnedExecution(cgroupObservationRecord(launched.value.execution), {
       current_boot_id: boot.value,
     });
-    if (!owned.ok) return owned;
+    if (!owned.ok) {
+      return failure(
+        new DomainError(owned.error.code, owned.error.message, {
+          ...owned.error.details,
+          ...(launched.value.execution_evidence === undefined
+            ? {}
+            : { execution_evidence: launched.value.execution_evidence as unknown as JsonObject }),
+        }),
+      );
+    }
+    ownedExecution = owned.value;
     if (owned.value.state !== "empty" || owned.value.cgroups?.population.state !== "empty") {
       return failure(
         new DomainError(
           "SANDBOX_CGROUP_CLEANUP_FAILED",
           "The completed managed execution did not provide fresh owned-scope emptiness for runtime cleanup.",
-          { session_id: input.session_id, execution_id: executionId, state: owned.value.state },
+          {
+            session_id: input.session_id,
+            execution_id: executionId,
+            state: owned.value.state,
+            ...(launched.value.execution_evidence === undefined
+              ? {}
+              : { execution_evidence: launched.value.execution_evidence as unknown as JsonObject }),
+          },
         ),
       );
     }
@@ -571,6 +753,10 @@ export async function launchManagedSessionCommand(
   }
   return success({
     ...launched.value,
+    ...(verification === undefined ? {} : { verification }),
+    ...(sourceBefore === undefined ? {} : { source_before: sourceBefore }),
+    ...(sourceAfter === undefined ? {} : { source_after: sourceAfter }),
+    ...(ownedExecution === undefined ? {} : { owned_execution: ownedExecution }),
     effective_revision: live.registry_revision,
     request_identity: {
       session_id: protectedRequest.session_id,

@@ -417,7 +417,11 @@ export async function executeVerification(
   // This request is invocation-local. It never writes the verifier scope back
   // to the caller's agent Effective Working Set or session registry.
   const verifierRequest = { ...request, runtime_projection: verifierProjection.value };
-  const command: SandboxCommand = { command: profile.value.executable, args: profile.value.argv };
+  const command: SandboxCommand = {
+    command: profile.value.executable,
+    args: profile.value.argv,
+    cwd: profile.value.cwd,
+  };
   const execute =
     dependencies.execute ??
     ((sandboxRequest, sandboxCommand, options) => runSandboxedCommand(sandboxRequest, sandboxCommand, options));

@@ -41,6 +41,32 @@ import {
   SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
   SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
 } from "./domain/filesystem-policy-evidence.js";
+import {
+  SESSION_BOUND_VERIFICATION_CONTRACT_ID,
+  SESSION_BOUND_VERIFICATION_RESULT_SCHEMA,
+  SESSION_BOUND_VERIFICATION_SCHEMA_VERSION,
+  executeSessionBoundVerification,
+  getSessionVerificationSnapshot,
+} from "./session-bound-verification.js";
+import {
+  SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID,
+  SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION,
+} from "./domain/session.js";
+
+export {
+  SESSION_BOUND_VERIFICATION_CONTRACT_ID,
+  SESSION_BOUND_VERIFICATION_RESULT_SCHEMA,
+  SESSION_BOUND_VERIFICATION_SCHEMA_VERSION,
+  executeSessionBoundVerification,
+  getSessionVerificationSnapshot,
+};
+export type {
+  ManagedVerificationExecution,
+  SessionBoundVerificationDependencies,
+  SessionBoundVerificationRequest,
+  SessionBoundVerificationResult,
+  SessionBoundVerificationSource,
+} from "./session-bound-verification.js";
 
 export {
   captureVerificationSourceWitness,
@@ -145,6 +171,12 @@ export function nawabariVerificationContract(): JsonObject {
     source_witness_schema_version: VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
     source_bound_evidence_contract_id: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
     source_bound_evidence_schema_version: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+    session_snapshot_contract_id: SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID,
+    session_snapshot_schema_version: SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION,
+    session_bound_execution_contract_id: SESSION_BOUND_VERIFICATION_CONTRACT_ID,
+    session_bound_execution_schema_version: SESSION_BOUND_VERIFICATION_SCHEMA_VERSION,
+    session_bound_execution_result_schema: SESSION_BOUND_VERIFICATION_RESULT_SCHEMA,
+    session_bound_operations: ["snapshot", "execute"],
     legacy_result_freshness: "unproven",
     read_visibility: ["declared", "repository"],
     write_policy: "deny",
