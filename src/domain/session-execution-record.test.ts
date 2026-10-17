@@ -200,6 +200,48 @@ test("missing supervisor evidence remains unresolved instead of becoming active"
   }
 });
 
+test("an exited execution with a vanished supervisor stays unresolved instead of failing or proving cleanup", () => {
+  const terminal = recordExecutionState(attached(), {
+    state: "exited",
+    now: "2026-09-21T00:00:02.000Z",
+  });
+  assert.equal(terminal.ok, true);
+  if (!terminal.ok) return;
+  const missingProcess = Object.assign(new Error("process disappeared"), { code: "ENOENT" });
+  const observed = observeExecutionIdentity(terminal.value, {
+    reader: {
+      read_boot_id: () => terminal.value.boot_id,
+      read_process_starttime: () => {
+        throw missingProcess;
+      },
+      read_process_cgroup: () => "/unobserved",
+    },
+  });
+  assert.equal(observed.ok, true, observed.ok ? "" : JSON.stringify(observed.error));
+  if (!observed.ok) return;
+  assert.equal(observed.value.classification, "unresolved");
+  assert.equal(observed.value.matches, false);
+  assert.equal(observed.value.active, false);
+  assert.equal(observed.value.observed, null);
+  assert.equal(observed.value.expected.pid, terminal.value.supervisor_pid);
+});
+
+test("an attached execution with an unobservable supervisor remains a physical observation failure", () => {
+  const active = attached();
+  const missingProcess = Object.assign(new Error("process disappeared"), { code: "ENOENT" });
+  const observed = observeExecutionIdentity(active, {
+    reader: {
+      read_boot_id: () => active.boot_id,
+      read_process_starttime: () => {
+        throw missingProcess;
+      },
+      read_process_cgroup: () => "/unobserved",
+    },
+  });
+  assert.equal(observed.ok, false);
+  if (!observed.ok) assert.equal(observed.error.code, "PHYSICAL_OBSERVATION_UNAVAILABLE");
+});
+
 test("missing execution records are legacy-untracked and never active", () => {
   const result = observeMissingExecutionRecord("session-legacy");
   assert.equal(result.ok, true);

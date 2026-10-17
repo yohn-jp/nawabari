@@ -645,12 +645,27 @@ export function observeExecutionIdentity(
     cgroup_name: deriveCgroupScopeName(validated.value.cgroup_identity),
   });
   const reader = options.reader ?? nativeIdentityReader;
+  let bootId: string;
+  try {
+    bootId = reader.read_boot_id();
+  } catch (error: unknown) {
+    return observationError("Execution boot identity could not be observed.", {
+      session_id: validated.value.session_id,
+      execution_id: validated.value.execution_id,
+      reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+    });
+  }
+  if (!isSafeText(bootId, 256)) {
+    return observationError("Execution identity observation returned malformed evidence.", {
+      session_id: validated.value.session_id,
+      execution_id: validated.value.execution_id,
+    });
+  }
   let observed: SessionExecutionProcessObservation;
   try {
-    const bootId = reader.read_boot_id();
     const starttime = reader.read_process_starttime(expected.pid);
     const cgroupPath = reader.read_process_cgroup(expected.pid);
-    if (!isSafeText(bootId, 256) || !isStarttime(starttime) || !isSafeText(cgroupPath, 4_096)) {
+    if (!isStarttime(starttime) || !isSafeText(cgroupPath, 4_096)) {
       return observationError("Execution identity observation returned malformed evidence.", {
         session_id: validated.value.session_id,
         execution_id: validated.value.execution_id,
@@ -658,6 +673,28 @@ export function observeExecutionIdentity(
     }
     observed = Object.freeze({ pid: expected.pid, starttime, boot_id: bootId, cgroup_path: cgroupPath });
   } catch (error: unknown) {
+    // A durable terminal record can outlive its supervisor's /proc entry.
+    // Preserve that as unresolved identity evidence; the independently
+    // observed cgroup population remains the only physical cleanup evidence.
+    if (
+      validated.value.state === "exited" &&
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "ENOENT"
+    ) {
+      return success(
+        Object.freeze({
+          session_id: validated.value.session_id,
+          execution_id: validated.value.execution_id,
+          classification: "unresolved",
+          matches: false,
+          active: false,
+          expected,
+          observed: null,
+        }),
+      );
+    }
     return observationError("Execution identity could not be observed.", {
       session_id: validated.value.session_id,
       execution_id: validated.value.execution_id,
