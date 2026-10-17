@@ -23,6 +23,7 @@ import {
   type SandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
+import { resolveOwnerCandidateStagingRoot } from "./sandbox-candidate-staging.js";
 import {
   materializeSessionGitConfig,
   resolveSessionHookSet,
@@ -1392,6 +1393,8 @@ export function compileSandboxInvocation(
       : landlockAbi === null
         ? "reduced-defense"
         : "incompatible";
+  const stagingRoot = resolveOwnerCandidateStagingRoot(request);
+  if (!stagingRoot.ok) return stagingRoot;
   const boundedWorkingSet = runtimeProjection.value?.working_set;
   if (boundedWorkingSet !== undefined && runtimeProjection.value?.policy.mode !== "strict") {
     return failure(
@@ -1521,10 +1524,15 @@ export function compileSandboxInvocation(
     boundedWorkingSet === undefined
       ? existingLandlockRules
       : [...boundedBaselineRules(existingLandlockRules), ...deriveWorkingSetRules(topology.value, boundedWorkingSet)];
-  const boundedLandlockRules =
-    filesystemEnforcement === undefined
-      ? boundedExistingLandlockRules
-      : [...boundedExistingLandlockRules, ...filesystemEnforcement.landlock_rules];
+  const boundedLandlockRules = [...boundedExistingLandlockRules, ...(filesystemEnforcement?.landlock_rules ?? [])];
+  if (stagingRoot.value !== null) {
+    // This fixed owner operation imports into its private repository; it may
+    // read sanitized session Git metadata but cannot mutate that metadata.
+    boundedLandlockRules.push(
+      { path: stagingRoot.value, allowed_access: LANDLOCK_ACCESS_FS_ABI3 },
+      { path: "/nawabari/git", allowed_access: WORKING_SET_DIRECTORY_TRAVERSE | WORKING_SET_FILE_READ },
+    );
+  }
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
   // An explicit strict projection exposes one canonical executable surface;
@@ -1619,6 +1627,11 @@ export function compileSandboxInvocation(
       }
       args.push(argument);
     }
+  }
+  if (stagingRoot.value !== null) {
+    // The ordinary bounded worktree view remains read-only outside this
+    // deterministic private subtree, even during trusted bundle import.
+    addReadWriteBind(args, stagingRoot.value, stagingRoot.value, seenDirectories);
   }
   if (compiledEnvironment.value === null) {
     addReadWriteBind(args, topology.value.home, SANDBOX_HOME, seenDirectories);
