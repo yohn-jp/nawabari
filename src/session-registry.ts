@@ -233,7 +233,7 @@ import {
 import { resolveWorktreeProfileRuntime } from "./domain/worktree-profile-runtime.js";
 import { resolveProfileRuntimeScope } from "./domain/worktree-profile-scope.js";
 import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
-import type { WorktreeProfileSessionCreateOptions } from "./domain/session.js";
+import type { SessionVerificationSnapshot, WorktreeProfileSessionCreateOptions } from "./domain/session.js";
 import {
   parseSessionExecutionRecord,
   recordExecutionState,
@@ -1458,6 +1458,64 @@ export class SessionRegistry implements SessionRetentionAuthority {
       ...(executionId === undefined
         ? {}
         : { runtime_environment_identity: this.sessionRuntimeEnvironmentIdentity(sessionId, executionId) }),
+    });
+  }
+
+  /**
+   * Return the canonical session and filesystem-policy fence used to bind a
+   * verifier request. This is observation only: it does not reserve an
+   * execution or grant filesystem access.
+   */
+  getSessionVerificationSnapshot(sessionId: string): SessionVerificationSnapshot {
+    assertSessionId(sessionId);
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+      if (session === undefined) {
+        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+      }
+      if (session.state !== "active") {
+        throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Verification requires an active session: ${sessionId}`, {
+          sessionId,
+          state: session.state,
+        });
+      }
+      if (session.workingSet === undefined) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Verification requires the session's persisted bounded working set.",
+          { sessionId },
+        );
+      }
+
+      const policy = compileSessionFilesystemPolicy(this, state, session, {});
+      const policyToken = canonicalFilesystemPolicyToken(state, session.sessionId, policy);
+      const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+        (candidate) => candidate.session_id === sessionId,
+      );
+      const pinnedValue = (state.runtimeRecords.records.pinned_profiles ?? []).find(
+        (candidate) => candidate.session_id === sessionId,
+      );
+      const admission = admissionValue === undefined ? null : parseSessionAdmissionRecord(admissionValue);
+      const pinned = pinnedValue === undefined ? null : parsePinnedProfileRecord(pinnedValue);
+
+      return Object.freeze({
+        contract_id: "nawabari.session-verification-snapshot.v1",
+        schema_version: 1,
+        session_id: session.sessionId,
+        repository: this.repository.repositoryId,
+        worktree: session.worktreePath,
+        branch: session.branchName,
+        state: "active" as const,
+        filesystem_policy_token: policyToken,
+        managed: Object.freeze({
+          profile_digest: pinned?.digest ?? null,
+          admission: admission?.admission ?? null,
+          runtime_epoch: state.runtimeEpoch,
+          registry_revision: state.registryRevision,
+          claim_set_generation: state.claimSetGeneration,
+        }),
+      });
     });
   }
 
@@ -8723,27 +8781,10 @@ function currentFileOperationAuthority(
       },
     );
   }
-  const workingSetRevision = policy.provenance.working_set_revision;
-  if (!Number.isSafeInteger(workingSetRevision) || (workingSetRevision as number) < 1) {
-    throw new SessionRegistryError(
-      "OPERATION_REJECTED",
-      "Current filesystem policy has no positive working-set revision",
-      {
-        operationId: operation.operation_id,
-        field: "policy.provenance.working_set_revision",
-      },
-    );
-  }
-  const tokenResult = createFilesystemPolicyToken({
-    registry_revision: state.registryRevision,
-    session_runtime_epoch: state.runtimeEpoch,
-    claim_set_generation: state.claimSetGeneration,
-    working_set_revision: workingSetRevision as number,
-    profile_digest: effectiveFilesystemProfileBoundaryDigest(policy),
-    session_id: operation.session_id,
-  });
-  if (!tokenResult.ok) throw sessionRegistryOperationError(tokenResult.error.message, tokenResult.error.details);
-  return { policy, token: tokenResult.value };
+  return {
+    policy,
+    token: canonicalFilesystemPolicyToken(state, operation.session_id, policy, operation.operation_id),
+  };
 }
 
 function compileFileOperationPolicy(
@@ -8755,6 +8796,15 @@ function compileFileOperationPolicy(
   policyInput?: CollectedFileOperationPolicyInput,
 ): EffectiveFilesystemPolicy {
   const supplied = policyInput === undefined ? resolveFileOperationPolicyInput(executionOptions) : policyInput.value;
+  return compileSessionFilesystemPolicy(registry, state, session, supplied);
+}
+
+function compileSessionFilesystemPolicy(
+  registry: SessionRegistry,
+  state: RegistryState,
+  session: SessionRecord,
+  supplied: EffectiveFilesystemPolicyInputs,
+): EffectiveFilesystemPolicy {
   const suppliedWorkingSet = supplied.working_set ?? supplied.workingSet;
   const workingSet = suppliedWorkingSet ?? session.workingSet;
   const workingSetRecord = isRecordValue(workingSet) ? workingSet : undefined;
@@ -8783,6 +8833,35 @@ function compileFileOperationPolicy(
   });
   if (!result.ok) throw sessionRegistryOperationError(result.error.message, result.error.details);
   return result.value;
+}
+
+function canonicalFilesystemPolicyToken(
+  state: RegistryState,
+  sessionId: string,
+  policy: EffectiveFilesystemPolicy,
+  operationId?: string,
+): FilesystemPolicyToken {
+  const workingSetRevision = policy.provenance.working_set_revision;
+  if (!Number.isSafeInteger(workingSetRevision) || (workingSetRevision as number) < 1) {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "Current filesystem policy has no positive working-set revision",
+      {
+        ...(operationId === undefined ? {} : { operationId }),
+        field: "policy.provenance.working_set_revision",
+      },
+    );
+  }
+  const token = createFilesystemPolicyToken({
+    registry_revision: state.registryRevision,
+    session_runtime_epoch: state.runtimeEpoch,
+    claim_set_generation: state.claimSetGeneration,
+    working_set_revision: workingSetRevision as number,
+    profile_digest: effectiveFilesystemProfileBoundaryDigest(policy),
+    session_id: sessionId,
+  });
+  if (!token.ok) throw sessionRegistryOperationError(token.error.message, token.error.details);
+  return token.value;
 }
 
 function resolveFileOperationPolicyInput(

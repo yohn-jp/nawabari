@@ -29,6 +29,7 @@ import type {
 } from "../resource-handoff.js";
 import type { ResourceHandoffFenceController } from "../resource-handoff.js";
 import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
+import type { FilesystemPolicyToken } from "./filesystem-policy-revision.js";
 import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
 import type { SessionHookMaterial } from "./session-git-hooks.js";
 import type { SessionRuntimeEnvironmentIdentity } from "./session-environment.js";
@@ -84,6 +85,28 @@ export type SessionManagedRuntimeState = Readonly<{
   /** Ephemeral approved material from the caller-owned authority; never persisted. */
   readonly hook_material?: SessionHookMaterial | null;
   readonly runtime_environment_identity?: SessionRuntimeEnvironmentIdentity;
+}>;
+
+/** Read-only, owner-issued identity for a session-bound verification request. */
+export const SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID = "nawabari.session-verification-snapshot.v1" as const;
+export const SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION = 1 as const;
+
+export type SessionVerificationSnapshot = Readonly<{
+  readonly contract_id: typeof SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID;
+  readonly schema_version: typeof SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION;
+  readonly session_id: string;
+  readonly repository: string;
+  readonly worktree: string;
+  readonly branch: string;
+  readonly state: "active";
+  readonly filesystem_policy_token: FilesystemPolicyToken;
+  readonly managed: Readonly<{
+    readonly profile_digest: string | null;
+    readonly admission: "open" | "closed" | null;
+    readonly runtime_epoch: number;
+    readonly registry_revision: number;
+    readonly claim_set_generation: number;
+  }>;
 }>;
 
 export type WorktreeProfileSessionCreateOptions = {
@@ -1043,6 +1066,11 @@ export interface SessionBackend {
     sessionId: string,
     executionId?: string,
   ): Promise<DomainResult<SessionManagedRuntimeState>>;
+  /** Canonical read-only session, managed-runtime, and filesystem-policy CAS snapshot. */
+  getSessionVerificationSnapshot?(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<DomainResult<SessionVerificationSnapshot>>;
   readSessionRuntimeEpoch?(context: SessionContext, sessionId: string): number;
   /** The single managed cgroup root retained by the backend for readiness and launch. */
   getManagedCgroupRoot?(): DomainResult<string>;

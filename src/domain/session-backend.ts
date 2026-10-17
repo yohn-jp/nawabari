@@ -55,6 +55,7 @@ import {
   type SessionContext,
   type SessionCreateOptions,
   type SessionManagedRuntimeState,
+  type SessionVerificationSnapshot,
   type WorkingSetExpansionOptions,
   type WorkingSetExpansionResult,
   type SessionDiagnostic,
@@ -405,6 +406,17 @@ export class LocalSessionBackend implements SessionBackend {
   ): Promise<DomainResult<SessionManagedRuntimeState>> {
     try {
       return success(this.registryFor(context).getSessionManagedRuntime(sessionId, executionId));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async getSessionVerificationSnapshot(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<DomainResult<SessionVerificationSnapshot>> {
+    try {
+      return success(this.registryFor(context).getSessionVerificationSnapshot(sessionId));
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
