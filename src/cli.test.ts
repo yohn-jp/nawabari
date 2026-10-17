@@ -195,8 +195,6 @@ function strictRuntimeLayout(): SandboxRuntimeLayout {
   const layout = discoverSandboxRuntimeLayout();
   return {
     ...layout,
-    // These dispatcher tests explicitly exercise the FHS fixture materializer.
-    nix: null,
     fhs_executable_candidates: [
       {
         requirement_id: "node-runtime",
