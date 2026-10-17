@@ -1097,6 +1097,9 @@ def main() -> int:
         target_active = wait_active("target", args.session, target)
         target_cgroup_limits = None
         close_completed = False
+        close_dirty_worktree = False
+        discard_completed = False
+        target_cgroup_empty = False
         if target_active is None or not active_cgroup(target_active):
             failures.append("target strict execution never exposed an active observed owned cgroup")
             try:
@@ -1113,9 +1116,16 @@ def main() -> int:
                 30,
             )
             if close_result.returncode != 0 or not isinstance(close_doc, dict) or close_doc.get("ok") is not True:
-                failures.append(
-                    f"public close termination did not complete (exit={close_result.returncode}, code={close_doc.get('code') if isinstance(close_doc, dict) else 'unparseable'})"
-                )
+                close_code = close_doc.get("code") if isinstance(close_doc, dict) else None
+                if close_code == "DIRTY_WORKTREE":
+                    # The owner correctly protects uncommitted work at close.
+                    # Preserve this result and use explicit discard only after
+                    # both physical cleanup authorities prove the payload gone.
+                    close_dirty_worktree = True
+                else:
+                    failures.append(
+                        f"public close termination did not complete (exit={close_result.returncode}, code={close_code or 'unparseable'})"
+                    )
             else:
                 closed_session = recursively_find(close_doc, "session")
                 close_completed = isinstance(closed_session, dict) and closed_session.get("state") == "closed"
@@ -1166,16 +1176,59 @@ def main() -> int:
                 failures.append("post-close session observation did not find the exact cancelled execution record")
             elif not isinstance(matching_cancelled[0].get("cgroups"), dict) or matching_cancelled[0]["cgroups"].get("state") != "empty":
                 failures.append("post-close owner observation did not prove the exact cancelled execution cgroup empty")
-            closed_target = invoke_ok(
-                "target-show-closed-after-cancel", ["session", "show", "--session", proof_target_session_id]
-            )
-            closed_target_record = recursively_find(closed_target, "session")
-            if not isinstance(closed_target_record, dict) and isinstance(closed_target.get("session_id"), str):
-                closed_target_record = closed_target
-            if not isinstance(closed_target_record, dict) or closed_target_record.get("state") != "closed":
-                failures.append("target session did not remain owner-observed closed after termination")
+            else:
+                target_cgroup_empty = True
 
-        if not close_completed:
+            target_pid_namespace_empty = (
+                isinstance(target_physical, dict)
+                and target_physical.get("cleanup", {}).get("state") == "observed-empty"
+            )
+            if close_dirty_worktree:
+                if not target_pid_namespace_empty or not target_cgroup_empty:
+                    failures.append("explicit discard was withheld because owner and PID-namespace cleanup were not both observed empty")
+                else:
+                    discard_result, discard_doc = invoke(
+                        "target-discard-after-proven-cancel",
+                        ["session", "discard", "--session", proof_target_session_id],
+                        60,
+                    )
+                    if discard_result.returncode != 0 or not isinstance(discard_doc, dict) or discard_doc.get("ok") is not True:
+                        failures.append(
+                            f"explicit discard after dirty-worktree protection failed (exit={discard_result.returncode}, code={discard_doc.get('code') if isinstance(discard_doc, dict) else 'unparseable'})"
+                        )
+                    else:
+                        discard_completed = (
+                            discard_doc.get("final_state") == "closed"
+                            and isinstance(discard_doc.get("session"), dict)
+                            and discard_doc["session"].get("session_id") == proof_target_session_id
+                        )
+                        if not discard_completed:
+                            failures.append("explicit discard returned without closing the exact disposable target session")
+                    (evidence / "target-dirty-close-and-discard.json").write_text(
+                        json.dumps(
+                            {
+                                "close_code": "DIRTY_WORKTREE",
+                                "physical_pid_namespace_empty": target_pid_namespace_empty,
+                                "owner_cgroup_empty": target_cgroup_empty,
+                                "discard_exit_code": discard_result.returncode,
+                                "discard_response": discard_doc,
+                                "discard_completed": discard_completed,
+                            },
+                            indent=2,
+                        )
+                        + "\n"
+                    )
+            if close_completed or discard_completed:
+                closed_target = invoke_ok(
+                    "target-show-closed-after-cancel", ["session", "show", "--session", proof_target_session_id]
+                )
+                closed_target_record = recursively_find(closed_target, "session")
+                if not isinstance(closed_target_record, dict) and isinstance(closed_target.get("session_id"), str):
+                    closed_target_record = closed_target
+                if not isinstance(closed_target_record, dict) or closed_target_record.get("state") != "closed":
+                    failures.append("target session did not remain owner-observed closed after termination/discard")
+
+        if not close_completed and not close_dirty_worktree and not discard_completed:
             # Any fallback here is still the canonical default wait operation;
             # it never signals the payload or treats host process exit as proof.
             wait_close, wait_doc = invoke(
