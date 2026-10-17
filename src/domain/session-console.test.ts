@@ -14,6 +14,7 @@ import {
 import type { SessionBackend, SessionContext, SessionRecord } from "./session.js";
 import { recordExecutionState, reserveExecution, type SessionExecutionRecord } from "./session-execution-record.js";
 import type { SessionRuntimeProjection } from "./runtime-projection.js";
+import { sandboxExecutionMockSuccess } from "../testing/sandbox-execution-evidence-mock.js";
 
 const session: SessionRecord = {
   schema_version: 1,
@@ -137,7 +138,7 @@ test("enter reserves execution before protected interactive launch and keeps ses
       args: command.args ?? [],
       interactive: options.interactive === true,
     });
-    return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 2 });
+    return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 2 });
   };
   const result = await enterSessionConsole(context, backend(), {
     session_id: session.session_id,
@@ -202,7 +203,7 @@ test("entry rejects a non-canonical Bash requirement version before launch", asy
     sandbox_probe: readyProbe(),
     sandbox_runner: async () => {
       launches += 1;
-      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
     },
     persist_execution: async () => undefined,
   });
@@ -452,7 +453,7 @@ test("managed interactive entry reaches the protected capability gate without us
     sandbox_probe: { hasCgroupsV2: () => false } as unknown as import("./sandbox.js").SandboxProbe,
     sandbox_runner: async () => {
       runnerCalls += 1;
-      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
     },
   });
 

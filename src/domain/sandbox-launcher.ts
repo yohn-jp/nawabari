@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import type { Readable, Writable } from "node:stream";
 
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import {
@@ -66,17 +65,8 @@ import {
 } from "./cgroups-v2.js";
 import type { FilesystemEnforcementIntegrationResult } from "./filesystem-enforcement-integration.js";
 import { validateFilesystemPolicyEnforcementRuntime } from "./filesystem-policy-enforcement.js";
-import {
-  makeSandboxRawOutput,
-  observeSandboxExecutionStart,
-  observeSandboxExecutionTermination,
-  parseBubblewrapInfo,
-  type SandboxExecutionEvidenceSnapshot,
-  type SandboxExecutionStartObservation,
-  type SandboxExecutionTerminationReason,
-  type SandboxPhysicalExecutionEvidence,
-  type SandboxRawOutput,
-} from "./sandbox-execution-evidence.js";
+import { runObservedSandboxChild } from "./sandbox-physical-execution.js";
+import type { SandboxPhysicalExecutionEvidence, SandboxRawOutput } from "./sandbox-execution-evidence.js";
 
 const SANDBOX_HOME = SESSION_RUNTIME_LOGICAL_HOME;
 const SANDBOX_CONFIG_HOME = SESSION_RUNTIME_LOGICAL_CONFIG_HOME;
@@ -93,11 +83,12 @@ const COMPATIBILITY_USER_TOOL_TARGETS = new Set([
 ]);
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_024 * 1_024;
-const START_OBSERVATION_TIMEOUT_MS = 10_000;
 
 export type SandboxCommand = {
   readonly command: string;
   readonly args?: readonly string[];
+  /** Optional protected working directory, confined to the owned worktree. */
+  readonly cwd?: string;
 };
 
 /**
@@ -214,6 +205,42 @@ function canonicalPath(candidate: string, label: string): DomainResult<string> {
       reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
     });
   }
+}
+
+function validateCommandWorkingDirectory(candidate: string | undefined, worktree: string): DomainResult<string> {
+  if (candidate === undefined) return success(worktree);
+  if (
+    typeof candidate !== "string" ||
+    !path.isAbsolute(candidate) ||
+    path.normalize(candidate) !== candidate ||
+    candidate.includes("\0")
+  ) {
+    return topologyError("The command working directory must be a normalized absolute path.", {
+      cwd: typeof candidate === "string" ? candidate : null,
+    });
+  }
+  const canonical = canonicalPath(candidate, "command working directory");
+  if (!canonical.ok) return canonical;
+  if (!isWithin(worktree, canonical.value)) {
+    return topologyError("The command working directory must remain inside the authoritative worktree.", {
+      cwd: canonical.value,
+      worktree,
+    });
+  }
+  try {
+    const stat = fs.lstatSync(canonical.value);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      return topologyError("The command working directory must be an existing real directory.", {
+        cwd: canonical.value,
+      });
+    }
+  } catch (error: unknown) {
+    return topologyError("The command working directory could not be observed safely.", {
+      cwd: canonical.value,
+      reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+    });
+  }
+  return success(canonical.value);
 }
 
 function preparePrivateDirectory(candidate: string, repository: string, label: string): DomainResult<string> {
@@ -1288,6 +1315,8 @@ export function compileSandboxInvocation(
   if (!compiledEnvironment.ok) return compiledEnvironment;
   const topology = validateTopology(request, compiledEnvironment.value?.manifest ?? null);
   if (!topology.ok) return topology;
+  const commandWorkingDirectory = validateCommandWorkingDirectory(command.cwd, topology.value.worktree);
+  if (!commandWorkingDirectory.ok) return commandWorkingDirectory;
   const procfsPolicy = request.procfs ?? { mode: "private", reason: null };
   if (
     (procfsPolicy.mode !== "private" && procfsPolicy.mode !== "denied") ||
@@ -1660,7 +1689,7 @@ export function compileSandboxInvocation(
         ...commandArgs,
       ]
     : [command.command, ...commandArgs];
-  args.push("--chdir", worktreeDestination, "--", ...commandArgv);
+  args.push("--chdir", commandWorkingDirectory.value, "--", ...commandArgv);
 
   return success({
     executable: executable.value,
@@ -1748,23 +1777,6 @@ function requirementTempDirectory(): string {
   return process.env.TMPDIR !== undefined && path.isAbsolute(process.env.TMPDIR) ? process.env.TMPDIR : "/tmp";
 }
 
-function boundedRawOutputChunk(
-  chunks: Buffer[],
-  bytesCaptured: number,
-  maxBytes: number,
-  value: Buffer | string,
-): { readonly bytes_captured: number; readonly exceeded: boolean; readonly observed_bytes: number } {
-  const encoded = typeof value === "string" ? Buffer.from(value, "utf8") : value;
-  const remaining = Math.max(0, maxBytes - bytesCaptured);
-  const retained = encoded.subarray(0, remaining);
-  if (retained.byteLength > 0) chunks.push(Buffer.from(retained));
-  return {
-    bytes_captured: bytesCaptured + retained.byteLength,
-    exceeded: retained.byteLength < encoded.byteLength,
-    observed_bytes: encoded.byteLength,
-  };
-}
-
 function landlockSetupDiagnostic(stderr: string): string | null {
   const marker = stderr.indexOf(LANDLOCK_SETUP_FAILURE_PREFIX);
   if (marker === -1) return null;
@@ -1801,7 +1813,6 @@ export function runSandboxedCommand(
     );
   }
 
-  const started = Date.now();
   const executionId = request.cgroups?.execution_id ?? randomUUID();
   const profile = openSeccompProfile(invocation.value.seccomp_profile);
   if (!profile.ok) return Promise.resolve(profile);
@@ -1864,366 +1875,100 @@ export function runSandboxedCommand(
     }
   }
 
-  return new Promise((resolve) => {
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    let capturedOutputBytes = 0;
-    let observedStdoutBytes = 0;
-    let observedStderrBytes = 0;
-    let timedOut = false;
-    let cancelled = false;
-    let outputExceeded = false;
-    let spawnError: Error | null = null;
-    let startFailure: string | null = null;
-    let settled = false;
-    let startObservation: SandboxExecutionStartObservation = observeSandboxExecutionStart(null);
-    let terminationReason: SandboxExecutionTerminationReason = "unknown";
-    let gateReleased = false;
-    let infoDocument = "";
-    let timer: NodeJS.Timeout | null = null;
-    let startTimer: NodeJS.Timeout | null = null;
-    const childStreams = child.stdio as Array<Readable | Writable | null>;
-    const infoStream = childStreams[4] as Readable | null | undefined;
-    const blockStream = childStreams[5] as Writable | null | undefined;
-
-    const killChild = (): void => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // The child may have exited between the state update and signal delivery.
-      }
-    };
-
-    const failBeforeRelease = (reason: string): void => {
-      if (gateReleased || startFailure !== null) return;
-      startFailure = reason;
-      if (startTimer !== null) clearTimeout(startTimer);
-      killChild();
-    };
-
-    const releasePayload = (): void => {
-      if (gateReleased || startFailure !== null || settled) return;
-      gateReleased = true;
-      if (startTimer !== null) clearTimeout(startTimer);
-      try {
-        // Bubblewrap reads one byte from --block-fd after establishing its
-        // namespaces and mount tree but before it executes the payload.
-        blockStream?.end(Buffer.from([1]));
-      } catch (error: unknown) {
-        gateReleased = false;
-        failBeforeRelease(error instanceof Error ? error.message.slice(0, 200) : "block-fd write failed");
-      }
-    };
-
-    const consumeInfo = (): void => {
-      if (gateReleased || startFailure !== null || settled) return;
-      const outerPid = parseBubblewrapInfo(infoDocument);
-      if (outerPid === null) {
-        failBeforeRelease("Bubblewrap did not publish a valid --info-fd child PID.");
-        return;
-      }
-      startObservation = observeSandboxExecutionStart(outerPid);
-      if (startObservation.state !== "observed") {
-        failBeforeRelease("The payload PID namespaces could not be observed as distinct before release.");
-        return;
-      }
-      releasePayload();
-    };
-
-    const makeRawOutput = (): SandboxRawOutput =>
-      makeSandboxRawOutput({
-        stdout: Buffer.concat(stdout),
-        stderr: Buffer.concat(stderr),
-        observed_stdout_bytes: observedStdoutBytes,
-        observed_stderr_bytes: observedStderrBytes,
-        complete: !interactive && !timedOut && !cancelled && !outputExceeded && startFailure === null,
-        capture_mode: interactive ? "inherited" : "pipes",
-      });
-
-    const makePhysicalEvidence = async (): Promise<SandboxPhysicalExecutionEvidence> => {
-      const observed = await observeSandboxExecutionTermination(startObservation, terminationReason);
-      const procfsPolicy = request.procfs ?? { mode: "private" as const, reason: null };
-      return {
-        schema_version: 1,
-        correlation_id: executionId,
-        procfs: { mode: procfsPolicy.mode, reason: procfsPolicy.reason },
-        start: startObservation,
-        termination: observed.termination,
-        cleanup: observed.cleanup,
-      };
-    };
-
-    const captureChunk = (stream: "stdout" | "stderr", value: Buffer | string): void => {
-      if (interactive) return;
-      const encoded = typeof value === "string" ? Buffer.from(value, "utf8") : value;
-      if (stream === "stdout") observedStdoutBytes += encoded.byteLength;
-      else observedStderrBytes += encoded.byteLength;
-      const collected = boundedRawOutputChunk(
-        stream === "stdout" ? stdout : stderr,
-        capturedOutputBytes,
-        maxOutputBytes,
-        encoded,
-      );
-      capturedOutputBytes = collected.bytes_captured;
-      if (collected.exceeded && !outputExceeded) {
-        outputExceeded = true;
-        terminationReason = "output-limit";
-        killChild();
-      }
-    };
-
-    const signalHandlers = new Map<NodeJS.Signals, () => void>();
-    const removeSignalHandlers = (): void => {
-      for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler);
-      signalHandlers.clear();
-    };
-    if (interactive) {
-      for (const signal of ["SIGINT", "SIGTERM"] as const) {
-        const handler = (): void => {
-          if (settled) return;
-          try {
-            child.kill(signal);
-          } catch {
-            // The child may have exited between signal delivery and forwarding.
-          }
-        };
-        signalHandlers.set(signal, handler);
-        process.on(signal, handler);
-      }
-    }
-
-    const onAbort = (): void => {
-      if (settled || cancelled || timedOut || outputExceeded || startFailure !== null) return;
-      cancelled = true;
-      terminationReason = "cancelled";
-      killChild();
-    };
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    if (options.signal?.aborted) onAbort();
-
-    if (infoStream == null || blockStream == null) {
-      failBeforeRelease("Bubblewrap did not provide the required --info-fd and --block-fd streams.");
-    } else {
-      infoStream.setEncoding("utf8");
-      infoStream.on("data", (value: string | Buffer) => {
-        const chunk = typeof value === "string" ? value : value.toString("utf8");
-        infoDocument += chunk;
-        if (infoDocument.length > 4_096) {
-          failBeforeRelease("Bubblewrap --info-fd output exceeded the bounded observation size.");
-          return;
+  return (async () => {
+    const procfs = request.procfs ?? { mode: "private" as const, reason: null };
+    const execution = await runObservedSandboxChild(child, {
+      execution_id: executionId,
+      procfs,
+      interactive,
+      timeout_ms: timeoutMs,
+      max_output_bytes: maxOutputBytes,
+      signal: options.signal,
+      forward_parent_signals: interactive,
+    });
+    const accounting = cgroupScope === null ? null : readCgroupAccounting(cgroupScope);
+    const resourceDetails: JsonObject =
+      cgroupScope === null || accounting === null
+        ? {}
+        : {
+            cgroup_scope: cgroupScope.name,
+            cgroup_accounting: accounting as unknown as JsonObject,
+            cgroup_limit_events: cgroupLimitEvents(accounting),
+          };
+    const resultEvidence: JsonObject = execution.ok
+      ? {
+          execution_id: execution.value.execution_id,
+          execution_evidence: {
+            schema_version: 1,
+            execution_id: execution.value.execution_id,
+            exit_code: execution.value.exit_code,
+            signal: execution.value.signal,
+            raw_output: execution.value.raw_output,
+            physical_execution: execution.value.physical_execution,
+          } as unknown as JsonObject,
         }
-        if (infoDocument.includes("\n}")) consumeInfo();
-      });
-      infoStream.on("end", () => {
-        if (!gateReleased && startFailure === null && infoDocument.trim().length > 0) consumeInfo();
-      });
-      infoStream.on("error", (error: Error) => {
-        failBeforeRelease(error.message.slice(0, 200));
-      });
-      blockStream.on("error", (error: Error) => {
-        if (gateReleased) {
-          startFailure = error.message.slice(0, 200);
-          killChild();
-        } else {
-          failBeforeRelease(error.message.slice(0, 200));
-        }
-      });
-      startTimer = setTimeout(() => {
-        failBeforeRelease("Bubblewrap did not publish an observable namespace before the deadline.");
-      }, START_OBSERVATION_TIMEOUT_MS);
-    }
-
-    const finish = async (code: number | null, signal: NodeJS.Signals | null): Promise<void> => {
-      if (settled) return;
-      settled = true;
-      if (timer !== null) clearTimeout(timer);
-      if (startTimer !== null) clearTimeout(startTimer);
-      removeSignalHandlers();
-      options.signal?.removeEventListener("abort", onAbort);
-      if (terminationReason === "unknown" && startFailure === null) terminationReason = "exited";
-      const accounting = cgroupScope === null ? null : readCgroupAccounting(cgroupScope);
-      const physicalExecution = await makePhysicalEvidence();
-      const capturedRawOutput = makeRawOutput();
-      const evidenceSnapshot: SandboxExecutionEvidenceSnapshot = {
-        schema_version: 1,
-        execution_id: executionId,
-        exit_code: code,
-        signal,
-        raw_output: capturedRawOutput,
-        physical_execution: physicalExecution,
-      };
-      const evidenceDetails: JsonObject = {
-        execution_id: executionId,
-        execution_evidence: evidenceSnapshot as unknown as JsonObject,
-      };
-      if (cgroupScope !== null) {
-        const cleaned = cleanupCgroupScope(cgroupScope);
-        if (!cleaned.ok) {
-          resolve(
-            failure(
-              new DomainError(cleaned.error.code, cleaned.error.message, {
-                ...(cleaned.error.details ?? {}),
-                ...evidenceDetails,
-              }),
-            ),
-          );
-          return;
-        }
-      }
-      const resourceDetails: JsonObject =
-        cgroupScope === null || accounting === null
-          ? {}
-          : {
-              cgroup_scope: cgroupScope.name,
-              cgroup_accounting: accounting as unknown as JsonObject,
-              cgroup_limit_events: cgroupLimitEvents(accounting),
-            };
-      if (spawnError !== null) {
-        resolve(
-          failure(
-            new DomainError("SANDBOX_EXECUTION_FAILED", "Bubblewrap failed before the command could run.", {
-              reason: spawnError.message.slice(0, 200),
-              ...resourceDetails,
-              ...evidenceDetails,
-            }),
-          ),
-        );
-        return;
-      }
-      if (startFailure !== null) {
-        resolve(
-          failure(
-            new DomainError(
-              "SANDBOX_EXECUTION_FAILED",
-              "Bubblewrap did not establish an observable protected execution before payload release.",
-              { reason: startFailure, ...resourceDetails, ...evidenceDetails },
-            ),
-          ),
-        );
-        return;
-      }
-      if (timedOut) {
-        resolve(
-          failure(
-            new DomainError("SANDBOX_EXECUTION_TIMEOUT", "The sandboxed command exceeded its execution timeout.", {
-              timeout_ms: timeoutMs,
-              ...resourceDetails,
-              ...evidenceDetails,
-            }),
-          ),
-        );
-        return;
-      }
-      if (outputExceeded) {
-        resolve(
-          failure(
-            new DomainError("SANDBOX_OUTPUT_LIMIT", "The sandboxed command exceeded its output limit.", {
-              max_output_bytes: maxOutputBytes,
-              ...resourceDetails,
-              ...evidenceDetails,
-            }),
-          ),
-        );
-        return;
-      }
-      if (cancelled) {
-        resolve(
-          failure(
-            new DomainError("SANDBOX_EXECUTION_FAILED", "The protected execution was cancelled by its owner.", {
-              reason: "cancelled",
-              ...resourceDetails,
-              ...evidenceDetails,
-            }),
-          ),
-        );
-        return;
-      }
-      const diagnostic = Buffer.concat(stderr).toString("utf8");
-      if (code !== 0 && /^bwrap:/mu.test(diagnostic)) {
-        const seccompFailure = /seccomp/u.test(diagnostic);
-        resolve(
-          failure(
-            new DomainError(
-              seccompFailure ? "SANDBOX_CAPABILITY_UNAVAILABLE" : "SANDBOX_EXECUTION_FAILED",
-              seccompFailure
-                ? "The required seccomp baseline could not be applied by bubblewrap."
-                : "Bubblewrap could not establish the protected execution boundary.",
-              {
-                profile_id: invocation.value.seccomp_profile_metadata.id,
-                profile_version: invocation.value.seccomp_profile_metadata.version,
-                stderr: diagnostic.slice(0, maxOutputBytes),
-                ...evidenceDetails,
-              },
-            ),
-          ),
-        );
-        return;
-      }
-      const landlockDiagnostic =
-        invocation.value.landlock.state === "enforced" ? landlockSetupDiagnostic(diagnostic) : null;
-      if (landlockDiagnostic !== null) {
-        resolve(
-          failure(
-            new DomainError(
-              "SANDBOX_EXECUTION_FAILED",
-              "Landlock setup failed; the protected command was not executed.",
-              {
-                session_id: request.session_id,
-                abi: invocation.value.landlock.abi,
-                effective_state: "error",
-                retryable: false,
-                diagnostic: landlockDiagnostic,
-                ...evidenceDetails,
-              },
-            ),
-          ),
-        );
-        return;
-      }
-      resolve(
-        success({
-          execution_id: executionId,
-          exit_code: code,
-          signal,
-          stdout: Buffer.concat(stdout).toString("utf8"),
-          stderr: Buffer.concat(stderr).toString("utf8"),
-          duration_ms: Date.now() - started,
-          raw_output: capturedRawOutput,
-          physical_execution: physicalExecution,
-          seccomp_profile: invocation.value.seccomp_profile_metadata,
-          ...(cgroupScope === null || accounting === null
+      : {
+          execution_id: execution.error.details?.execution_id ?? executionId,
+          ...(execution.error.details?.execution_evidence === undefined
             ? {}
-            : {
-                resources: {
-                  cgroup_contract_id: cgroupScope.contract_id,
-                  scope: cgroupScope.name,
-                  accounting,
-                  limit_events: cgroupLimitEvents(accounting),
-                },
-              }),
-          landlock: invocation.value.landlock,
-          ...(request.runtime_resolution === undefined ? {} : { runtime_resolution: request.runtime_resolution }),
+            : { execution_evidence: execution.error.details.execution_evidence as JsonObject }),
+        };
+
+    if (cgroupScope !== null) {
+      const cleaned = cleanupCgroupScope(cgroupScope);
+      if (!cleaned.ok) {
+        return failure(
+          new DomainError(cleaned.error.code, cleaned.error.message, {
+            ...(cleaned.error.details ?? {}),
+            ...resourceDetails,
+            ...resultEvidence,
+          }),
+        );
+      }
+    }
+    if (!execution.ok) {
+      return failure(
+        new DomainError(execution.error.code, execution.error.message, {
+          ...(execution.error.details ?? {}),
+          ...resourceDetails,
         }),
       );
-    };
-
-    if (!interactive) {
-      child.stdout?.on("data", (value: Buffer | string) => captureChunk("stdout", value));
-      child.stderr?.on("data", (value: Buffer | string) => captureChunk("stderr", value));
     }
-    child.on("error", (error: Error) => {
-      spawnError = error;
+
+    const diagnostic = execution.value.stderr;
+    const landlockDiagnostic =
+      invocation.value.landlock.state === "enforced" ? landlockSetupDiagnostic(diagnostic) : null;
+    if (landlockDiagnostic !== null) {
+      return failure(
+        new DomainError("SANDBOX_EXECUTION_FAILED", "Landlock setup failed; the protected command was not executed.", {
+          session_id: request.session_id,
+          abi: invocation.value.landlock.abi,
+          effective_state: "error",
+          retryable: false,
+          diagnostic: landlockDiagnostic,
+          ...resourceDetails,
+          ...resultEvidence,
+        }),
+      );
+    }
+
+    return success({
+      ...execution.value,
+      seccomp_profile: invocation.value.seccomp_profile_metadata,
+      ...(cgroupScope === null || accounting === null
+        ? {}
+        : {
+            resources: {
+              cgroup_contract_id: cgroupScope.contract_id,
+              scope: cgroupScope.name,
+              accounting,
+              limit_events: cgroupLimitEvents(accounting),
+            },
+          }),
+      landlock: invocation.value.landlock,
+      ...(request.runtime_resolution === undefined ? {} : { runtime_resolution: request.runtime_resolution }),
     });
-    child.on("close", (code, signal) => void finish(code, signal));
-
-    if (!interactive) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        terminationReason = "timeout";
-        killChild();
-      }, timeoutMs);
-    }
-  });
+  })();
 }
 
 /** Execute one projected command with the caller's existing terminal streams. */

@@ -16,6 +16,7 @@ import {
 } from "./cli.js";
 import { machineContract } from "./contract.js";
 import { DomainError, failure, success } from "./domain/errors.js";
+import { sandboxExecutionMockSuccess } from "./testing/sandbox-execution-evidence-mock.js";
 import { SESSION_ACTION_IDS } from "./domain/session-actions.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import type {
@@ -289,7 +290,7 @@ test("bounded session run carries the persisted working-set boundary into the pr
       sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async (request) => {
         observedWorkingSet = request.runtime_projection?.working_set;
-        return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
       },
     },
   );
@@ -354,7 +355,7 @@ test("session run and exec project the advertised protected identities from the 
           };
           observedRuntimeResolution = request.runtime_resolution;
           observedCommand = [command.command, ...(command.args ?? [])];
-          return success({ exit_code: childExitCode, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({ exit_code: childExitCode, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
         },
       },
     );
@@ -410,7 +411,7 @@ test("session run does not interpret a child --json argument as a Nawabari globa
     sandboxRuntimeLayout: strictRuntimeLayout(),
     sandboxRunner: async (_request, command) => {
       assert.deepEqual([command.command, ...(command.args ?? [])], ["printf", "--json"]);
-      return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
     },
   });
 
@@ -429,7 +430,7 @@ test("session run and merged session shell carry explicit compatibility policy t
     sandboxRuntimeLayout: strictRuntimeLayout(),
     sandboxRunner: async (request, command) => {
       observed.push({ policy: request.runtime_projection?.policy.mode ?? "missing", command: command.command });
-      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
     },
   };
 
@@ -466,7 +467,7 @@ test("runtime policy parser rejects unknown and duplicate values before protecte
       io: output.io,
       sandboxRunner: async () => {
         runnerCalls += 1;
-        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
       },
     });
     assert.equal(exitCode, 2, arguments_.join(" "));
@@ -492,7 +493,7 @@ test("session shell requires -- and passes only the projected shell argv to the 
         assert.equal(request.session_id, sampleSession.session_id);
         observedCommand = [command.command, ...(command.args ?? [])];
         observedInteractive = options?.interactive === true;
-        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
       },
     },
   );
@@ -518,7 +519,7 @@ test("session shell rejects a missing terminator, missing shell, and non-basenam
       io: output.io,
       sandboxRunner: async () => {
         launcherCalls += 1;
-        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
       },
     });
 
@@ -538,7 +539,7 @@ test("session shell propagates a projected shell exit status or signal", async (
       io: nonzeroOutput.io,
       sandboxProbe: readySandboxProbe(),
       sandboxRuntimeLayout: strictRuntimeLayout(),
-      sandboxRunner: async () => success({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
+      sandboxRunner: async () => sandboxExecutionMockSuccess({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
     },
   );
   assert.equal(nonzero, 7);
@@ -551,7 +552,7 @@ test("session shell propagates a projected shell exit status or signal", async (
     io: signalOutput.io,
     sandboxProbe: readySandboxProbe(),
     sandboxRuntimeLayout: strictRuntimeLayout(),
-    sandboxRunner: async () => success({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
+    sandboxRunner: async () => sandboxExecutionMockSuccess({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
   });
   assert.equal(signal, 3);
   assert.deepEqual(signalOutput.stdout, []);
@@ -598,7 +599,7 @@ test("typed pre-launch protected failure does not emit successful identity evide
     sandboxProbe: readySandboxProbe({ hasBubblewrap: () => false }),
     sandboxRunner: async () => {
       runnerCalls += 1;
-      return success({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
     },
   });
 
@@ -660,7 +661,7 @@ test("managed run, exec, and shell dispatch to the protected lifecycle before an
       sandboxProbe: readySandboxProbe({ hasCgroupsV2: () => false }),
       sandboxRunner: async () => {
         legacyRunnerCalls += 1;
-        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
       },
     });
 
@@ -753,7 +754,7 @@ test("session run and session shell dispatch the identical projected rg provider
         sandboxRunner: async (_request, command, options) => {
           runObservedCommand = [command.command, ...(command.args ?? [])];
           assert.equal(options?.interactive ?? false, false);
-          return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
         },
       },
     );
@@ -775,7 +776,7 @@ test("session run and session shell dispatch the identical projected rg provider
         sandboxRunner: async (_request, command, options) => {
           shellObservedCommand = [command.command, ...(command.args ?? [])];
           shellObservedInteractive = options?.interactive === true;
-          return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
         },
       },
     );
@@ -798,7 +799,7 @@ test("session run returns a rejected exit status for a signaled child and never 
       sandboxProbe: readySandboxProbe(),
       sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async () =>
-        success({ exit_code: null, signal: "SIGTERM", stdout: "", stderr: "", duration_ms: 1 }),
+        sandboxExecutionMockSuccess({ exit_code: null, signal: "SIGTERM", stdout: "", stderr: "", duration_ms: 1 }),
     },
   );
 
@@ -839,7 +840,7 @@ test("session run returns a rejected exit status for a signaled child and never 
       sandboxProbe: readySandboxProbe({ hasBubblewrap: () => false }),
       sandboxRunner: async () => {
         runnerInvocations += 1;
-        return success({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
       },
     },
   );
