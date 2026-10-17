@@ -84,6 +84,7 @@ import {
   type RuntimePolicyMode,
 } from "./domain/runtime-projection.js";
 import { enterProtectedSession } from "./domain/session-protected-launch.js";
+import { resolveWorktreeProfileRuntime } from "./domain/worktree-profile-runtime.js";
 import { launchManagedSessionCommand, listSessionProcesses } from "./domain/session-console.js";
 import {
   executeSessionBoundVerification,
@@ -2176,7 +2177,14 @@ async function executeCommand(
         profileResolution = resolveWorktreeProfileSessionCreate(profileRequest, sources.value);
       }
       if (!profileResolution.ok) return profileResolution;
-      const profileReady = requireWorktreeProfileReady(profileResolution.value);
+      const selectedProfile = profileResolution.value.profile;
+      // Repository catalog discovery intentionally reports material as unknown.
+      // Resolve its actual strict material before dispatch, then let registry
+      // admission recheck material, working-set, claim and managed authority.
+      const profileReady =
+        selectedProfile?.namespace === "repository" && selectedProfile.availability === "unknown"
+          ? resolveWorktreeProfileRuntime(selectedProfile.resolved, discoverSandboxRuntimeLayout())
+          : requireWorktreeProfileReady(profileResolution.value);
       if (!profileReady.ok) return profileReady;
       if (parsed.value.worktree !== null && parsed.value.worktree_root !== null) {
         return failure(usageError("INVALID_ARGUMENT", "--worktree and --worktree-root cannot be used together."));
