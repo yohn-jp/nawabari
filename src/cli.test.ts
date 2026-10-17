@@ -16,7 +16,10 @@ import {
 } from "./cli.js";
 import { machineContract } from "./contract.js";
 import { DomainError, failure, success } from "./domain/errors.js";
-import { sandboxExecutionMockSuccess } from "./testing/sandbox-execution-evidence-mock.js";
+import {
+  sandboxExecutionMockSuccess,
+  withSandboxExecutionEvidence,
+} from "./testing/sandbox-execution-evidence-mock.js";
 import { SESSION_ACTION_IDS } from "./domain/session-actions.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import type {
@@ -192,6 +195,8 @@ function strictRuntimeLayout(): SandboxRuntimeLayout {
   const layout = discoverSandboxRuntimeLayout();
   return {
     ...layout,
+    // These dispatcher tests explicitly exercise the FHS fixture materializer.
+    nix: null,
     fhs_executable_candidates: [
       {
         requirement_id: "node-runtime",
@@ -372,11 +377,13 @@ test("session run and exec project the advertised protected identities from the 
     assert.deepEqual(response, {
       ok: true,
       command: `session ${subcommand}`,
-      exit_code: childExitCode,
-      signal: null,
-      stdout: "ok",
-      stderr: "",
-      duration_ms: 1,
+      ...withSandboxExecutionEvidence({
+        exit_code: childExitCode,
+        signal: null,
+        stdout: "ok",
+        stderr: "",
+        duration_ms: 1,
+      }),
       session_id: sampleSession.session_id,
       repository: sampleSession.repository,
       worktree: sampleSession.worktree,
@@ -967,6 +974,8 @@ test("canonical command registry resolves aliases without duplicating option def
   assert.deepEqual(actionValues, SESSION_ACTION_IDS);
 
   assert.deepEqual(publicNames, [
+    "verification snapshot",
+    "verification execute",
     "session create",
     "session id",
     "profile list",
@@ -1293,6 +1302,8 @@ test("JSON help separates global, session, and garbage-collection options", asyn
     command: "help",
     usage: "Usage: nawabari <command> [options]",
     commands: [
+      "verification snapshot",
+      "verification execute",
       "session create",
       "session id",
       "profile list",
