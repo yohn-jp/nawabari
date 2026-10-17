@@ -291,7 +291,21 @@ export async function getSessionVerificationSnapshot(
       }),
     );
   }
-  return backend.getSessionVerificationSnapshot(context, sessionId);
+  const snapshot = await backend.getSessionVerificationSnapshot(context, sessionId);
+  if (!snapshot.ok) return snapshot;
+  if (
+    snapshot.value.session_id !== sessionId ||
+    snapshot.value.contract_id !== SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID ||
+    snapshot.value.schema_version !== SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION
+  ) {
+    return failure(
+      new DomainError("RUNTIME_PROJECTION_INVALID", "The session owner returned a mismatched verification snapshot.", {
+        requested_session_id: sessionId,
+        observed_session_id: snapshot.value.session_id,
+      }),
+    );
+  }
+  return success(snapshot.value);
 }
 
 /**

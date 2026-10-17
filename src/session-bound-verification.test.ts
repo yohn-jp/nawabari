@@ -84,6 +84,18 @@ test("session snapshot operation returns the exact active owner projection", asy
   if (result.ok) assert.deepEqual(result.value, expected);
 });
 
+test("snapshot operation rejects an owner response for a different session", async () => {
+  const wrongSession = snapshot({ session_id: "0190f1e0-0000-7000-8000-000000000002" });
+  const backend = {
+    getSessionVerificationSnapshot: async () => success(wrongSession),
+  } as unknown as SessionBackend;
+
+  const result = await getSessionVerificationSnapshot(context, backend, sessionId);
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "RUNTIME_PROJECTION_INVALID");
+});
+
 test("a stale owner snapshot is refused before entering managed launch", async () => {
   const expected = snapshot();
   const live = snapshot({
