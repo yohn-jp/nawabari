@@ -35,8 +35,9 @@ export function procfsPolicyFromMountInfo(mountInfo: string, uidMap?: string): S
     // the existing Node/Git and /proc security contract. A rootless OCI user
     // namespace does not have the full initial-userns UID mapping and keeps
     // the narrower denied view when the parent procfs has overmounts.
-    if (uidMap !== undefined && /^\s*0\s+0\s+4294967295\s*$/u.test(uidMap))
+    if (uidMap !== undefined && /^\s*0\s+0\s+4294967295\s*$/u.test(uidMap)) {
       return { mode: "private", reason: null };
+    }
     return { mode: "denied", reason: "parent-procfs-has-overmounts" };
   }
   return { mode: "private", reason: null };
@@ -44,10 +45,7 @@ export function procfsPolicyFromMountInfo(mountInfo: string, uidMap?: string): S
 
 export function observeSandboxProcfsPolicy(): SandboxProcfsPolicy {
   try {
-    return procfsPolicyFromMountInfo(
-      readFileSync("/proc/self/mountinfo", "utf8"),
-      readFileSync("/proc/self/uid_map", "utf8"),
-    );
+    return procfsPolicyFromMountInfo(readFileSync("/proc/self/mountinfo", "utf8"), readFileSync("/proc/self/uid_map", "utf8"));
   } catch {
     return { mode: "denied", reason: "parent-procfs-unobservable" };
   }
