@@ -95,8 +95,21 @@ def main() -> int:
     def save(name: str, data: bytes) -> None:
         (evidence / name).write_bytes(data)
 
-    def invoke(name: str, argv: list[str], timeout: int = 30) -> tuple[subprocess.CompletedProcess[bytes], dict | None]:
-        command = [*prefix, args.nawabari, "--json", *argv]
+    def invoke(
+        name: str,
+        argv: list[str],
+        timeout: int = 30,
+        workdir: str | None = None,
+    ) -> tuple[subprocess.CompletedProcess[bytes], dict | None]:
+        selected_prefix = prefix if workdir is None else [
+            args.podman_wrapper,
+            "exec",
+            "--workdir",
+            workdir,
+            args.container_id,
+            *env,
+        ]
+        command = [*selected_prefix, args.nawabari, "--json", *argv]
         result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
         save(f"{name}.stdout", result.stdout)
         save(f"{name}.stderr", result.stderr)
@@ -107,13 +120,87 @@ def main() -> int:
             document = None
         return result, document
 
-    def invoke_ok(name: str, argv: list[str], timeout: int = 30) -> dict:
-        result, document = invoke(name, argv, timeout)
+    def invoke_ok(name: str, argv: list[str], timeout: int = 30, workdir: str | None = None) -> dict:
+        result, document = invoke(name, argv, timeout, workdir)
         if result.returncode != 0 or not isinstance(document, dict) or document.get("ok") is not True:
             raise RuntimeError(
                 f"{name} failed: exit={result.returncode}, code={document.get('code') if isinstance(document, dict) else 'unparseable'}"
             )
         return document
+
+    def write_container_json(name: str, value: dict) -> str:
+        remote = f"/tmp/nawabari-n1-{uuid.uuid4()}.json"
+        command = [
+            args.podman_wrapper,
+            "exec",
+            "-i",
+            args.container_id,
+            *env,
+            "node",
+            "-e",
+            "const fs=require('node:fs');fs.writeFileSync(process.argv[1],fs.readFileSync(0),{mode:0o600})",
+            remote,
+        ]
+        result = subprocess.run(
+            command,
+            input=json.dumps(value, separators=(",", ":")).encode(),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save(f"{name}.stdout", result.stdout)
+        save(f"{name}.stderr", result.stderr)
+        save(f"{name}.argv.json", json.dumps(command).encode() + b"\n")
+        if result.returncode != 0:
+            raise RuntimeError(f"could not write public CLI request artifact {name}")
+        return remote
+
+    def create_fresh_drain_probe() -> dict:
+        source = session_manifest.get("drain_probe")
+        scope = source.get("scope") if isinstance(source, dict) else None
+        working_set = source.get("working_set") if isinstance(source, dict) else None
+        if not isinstance(scope, dict) or not isinstance(working_set, dict):
+            raise RuntimeError("session manifest omitted the bounded zero-record drain-probe artifacts")
+        candidate = json.loads(json.dumps(working_set))
+        candidate["workingSetId"] = f"oci-n1-physical-drain-probe-{uuid.uuid4()}"
+        scope_path = write_container_json("drain-probe-recreate-execution-scope", scope)
+        candidate_path = write_container_json("drain-probe-recreate-candidate-working-set", candidate)
+        created = invoke_ok(
+            "drain-probe-recreate-session-create",
+            [
+                "session",
+                "create",
+                "--base",
+                "main",
+                "--profile",
+                "builtin:minimal",
+                "--execution-scope-file",
+                scope_path,
+                "--candidate-working-set-file",
+                candidate_path,
+                "--resource",
+                "README.md",
+                "--mode",
+                "read",
+                "--enforce-claims",
+            ],
+            timeout=120,
+        )
+        created_session = recursively_find(created, "session")
+        if not isinstance(created_session, dict) and isinstance(created.get("session_id"), str):
+            created_session = created
+        if not isinstance(created_session, dict) or not isinstance(created_session.get("session_id"), str):
+            raise RuntimeError("fresh drain-probe create omitted its canonical session identity")
+        shown = invoke_ok(
+            "drain-probe-recreate-session-show",
+            ["session", "show", "--session", created_session["session_id"]],
+        )
+        record = recursively_find(shown, "session")
+        if not isinstance(record, dict) and isinstance(shown.get("session_id"), str):
+            record = shown
+        if not isinstance(record, dict) or record.get("state") != "active":
+            raise RuntimeError("fresh drain-probe owner record is not active")
+        return {"create": created, "session": record, "scope": scope, "working_set": candidate}
 
     def recursively_find(value: object, key: str) -> object | None:
         if isinstance(value, dict):
@@ -130,10 +217,20 @@ def main() -> int:
                     return found
         return None
 
-    def command_line(argv: list[str]) -> list[str]:
-        return [*prefix, args.nawabari, "--json", *argv]
+    def command_line(argv: list[str], workdir: str | None = None) -> list[str]:
+        selected_prefix = prefix if workdir is None else [
+            args.podman_wrapper,
+            "exec",
+            "--workdir",
+            workdir,
+            args.container_id,
+            *env,
+        ]
+        return [*selected_prefix, args.nawabari, "--json", *argv]
 
-    def launch_persistent(name: str, session_id: str) -> tuple[subprocess.Popen[bytes], pathlib.Path, pathlib.Path]:
+    def launch_persistent(
+        name: str, session_id: str, session_worktree: str
+    ) -> tuple[subprocess.Popen[bytes], pathlib.Path, pathlib.Path]:
         # A finite in-sandbox deadline is a safety bound if owner cancellation
         # is rejected; the host never signals the payload or its descendants.
         child = "setInterval(()=>{},1000)"
@@ -156,7 +253,8 @@ def main() -> int:
                 "node",
                 "-e",
                 payload,
-            ]
+            ],
+            session_worktree,
         )
         stdout_path = evidence / f"{name}.stdout"
         stderr_path = evidence / f"{name}.stderr"
@@ -248,27 +346,6 @@ def main() -> int:
         return latest
 
     try:
-        (evidence / "run-identity.json").write_text(
-            json.dumps(
-                {
-                    "container_id": args.container_id,
-                    "repository": args.repository,
-                    "session_id": args.session,
-                    "drain_probe_session_id": args.drain_probe_session,
-                    "sibling_session_id": args.sibling_session,
-                    "target_worktree": target_worktree,
-                    "drain_probe_worktree": drain_probe_worktree,
-                    "sibling_worktree": sibling_worktree,
-                    "sessions_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-                    "repository_base_revision": session_manifest.get("repository_head_after"),
-                    "package_sha256": args.package_sha256,
-                    "installed_proof": installed_proof,
-                    "started_at_unix": time.time(),
-                },
-                indent=2,
-            )
-            + "\n"
-        )
         container_state = subprocess.run(
             [args.podman_wrapper, "inspect", "--format", "{{.State.Running}}", args.container_id],
             capture_output=True,
@@ -296,6 +373,13 @@ def main() -> int:
             sibling_session = sibling_show
         if not isinstance(target_session, dict) or target_session.get("state") != "active":
             raise RuntimeError("target public session is not observed active")
+        if isinstance(drain_probe_session, dict) and drain_probe_session.get("state") == "closed":
+            drain_probe = create_fresh_drain_probe()
+            session_manifest["drain_probe"] = drain_probe
+            drain_probe_session = drain_probe["session"]
+            args.drain_probe_session = drain_probe_session.get("session_id")
+            drain_probe_worktree = drain_probe_session.get("worktree")
+            (evidence / "fresh-drain-probe-creation.json").write_text(json.dumps(drain_probe, indent=2) + "\n")
         if not isinstance(drain_probe_session, dict) or drain_probe_session.get("state") != "active":
             raise RuntimeError("zero-execution drain probe session is not observed active before its close test")
         if not isinstance(sibling_session, dict) or sibling_session.get("state") != "active":
@@ -307,7 +391,20 @@ def main() -> int:
         ):
             raise RuntimeError("public session owner records differ from the preparation manifest")
 
-        claims = invoke_ok("target-initial-claims", ["session", "claims", "--session", args.session]).get("claims")
+        effective_manifest = {
+            "source_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "target_session_id": args.session,
+            "target_worktree": target_worktree,
+            "drain_probe_session_id": args.drain_probe_session,
+            "drain_probe_worktree": drain_probe_worktree,
+            "sibling_session_id": args.sibling_session,
+            "sibling_worktree": sibling_worktree,
+            "repository_base_revision": session_manifest.get("repository_head_after"),
+            "package_sha256": args.package_sha256,
+        }
+        (evidence / "effective-session-identities.json").write_text(json.dumps(effective_manifest, indent=2) + "\n")
+
+        claims = invoke_ok("target-claims-before-reset", ["session", "claims", "--session", args.session]).get("claims")
         if not isinstance(claims, list):
             raise RuntimeError("target public session claims response omitted claims")
         normalized_claims = {
@@ -315,9 +412,66 @@ def main() -> int:
             for item in claims
             if isinstance(item, dict)
         }
-        if ("README.md", "read") not in normalized_claims or (owned_file, "write") not in normalized_claims:
-            failures.append("target session did not retain its exact atomic initial read/write claims")
+        expected_claims = {("README.md", "read"), (owned_file, "write")}
+        if normalized_claims != expected_claims:
+            current_snapshot = invoke_ok(
+                "target-snapshot-before-claim-reset", ["verification", "snapshot", "--session", args.session]
+            ).get("snapshot")
+            generation = (
+                current_snapshot.get("filesystem_policy_token", {}).get("claim_set_generation")
+                if isinstance(current_snapshot, dict)
+                else None
+            )
+            if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+                raise RuntimeError("could not bind target claim reset to a current owner generation")
+            reset_result, reset_doc = invoke(
+                "target-claims-reset-to-pretest-baseline",
+                [
+                    "session",
+                    "update",
+                    "--session",
+                    args.session,
+                    "--resource",
+                    "README.md",
+                    "--mode",
+                    "read",
+                    "--resource",
+                    owned_file,
+                    "--mode",
+                    "write",
+                    "--if-generation",
+                    str(generation),
+                ],
+                30,
+            )
+            if reset_result.returncode != 0 or not isinstance(reset_doc, dict) or reset_doc.get("ok") is not True:
+                raise RuntimeError("could not CAS-reset the disposable target to its original exact claim set")
+            claims = invoke_ok(
+                "target-initial-claims", ["session", "claims", "--session", args.session]
+            ).get("claims")
+            if not isinstance(claims, list):
+                raise RuntimeError("target public session claims response omitted claims after reset")
+            normalized_claims = {
+                (item.get("resource"), item.get("mode"))
+                for item in claims
+                if isinstance(item, dict)
+            }
+        if normalized_claims != expected_claims:
+            raise RuntimeError("target did not return to its exact README-read and fixture-write baseline")
         save("target-initial-claims-normalized.json", json.dumps(sorted([list(item) for item in normalized_claims]), indent=2).encode() + b"\n")
+
+        (evidence / "run-identity.json").write_text(
+            json.dumps(
+                {
+                    **effective_manifest,
+                    "sessions_manifest_sha256": effective_manifest["source_manifest_sha256"],
+                    "installed_proof": installed_proof,
+                    "started_at_unix": time.time(),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
 
         drain_claims = invoke_ok(
             "drain-probe-initial-claims", ["session", "claims", "--session", args.drain_probe_session]
@@ -364,7 +518,7 @@ def main() -> int:
 
         # Preserve an actually running strict sibling while the target is
         # cancelled. Both payloads are finite if owner cancellation fails.
-        sibling, _, _ = launch_persistent("sibling-strict-run", args.sibling_session)
+        sibling, _, _ = launch_persistent("sibling-strict-run", args.sibling_session, sibling_worktree)
         sibling_active = wait_active("sibling", args.sibling_session, sibling)
         if sibling_active is None or not active_cgroup(sibling_active):
             failures.append("sibling strict execution never exposed an active observed owned cgroup")
@@ -451,6 +605,7 @@ def main() -> int:
                 boundary_paths["secret"],
             ],
             90,
+            target_worktree,
         )
         if boundary_run.returncode != 0 or not isinstance(boundary_result, dict) or boundary_result.get("ok") is not True:
             failures.append(f"strict current-session read/write/Git/boundary payload failed (exit={boundary_run.returncode})")
@@ -541,7 +696,7 @@ def main() -> int:
             "executable": "node",
             "argv": ["-e", "process.stdout.write('STALE_SNAPSHOT_MUST_NOT_START\\n')"],
             "cwd": stale_snapshot.get("worktree"),
-            "read_visibility": "repository",
+            "read_visibility": "declared",
             "declared_read": [],
             "write_policy": "deny",
             "timeout_ms": 5000,
@@ -570,6 +725,7 @@ def main() -> int:
         stale_result, stale_doc = invoke(
             "stale-verification-execution",
             ["verification", "execute", "--request-file", request_path],
+            workdir=target_worktree,
         )
         after_stale = process_snapshot("target-processes-after-stale-test", args.session)
         stale_code = stale_doc.get("code") if isinstance(stale_doc, dict) else None
@@ -609,7 +765,12 @@ def main() -> int:
         save("timeout-request-write.stderr", writer.stderr)
         if writer.returncode != 0:
             raise RuntimeError("could not write bounded timeout request")
-        timeout_result, timeout_doc = invoke("timeout-verification-execution", ["verification", "execute", "--request-file", timeout_path], 45)
+        timeout_result, timeout_doc = invoke(
+            "timeout-verification-execution",
+            ["verification", "execute", "--request-file", timeout_path],
+            45,
+            target_worktree,
+        )
         timeout_evidence = recursively_find(timeout_doc, "execution_evidence") if isinstance(timeout_doc, dict) else None
         physical = timeout_evidence.get("physical_execution") if isinstance(timeout_evidence, dict) else None
         if not isinstance(physical, dict):
@@ -631,7 +792,7 @@ def main() -> int:
         # Launch a second strict process in the target, wait for owner-visible
         # populated cgroup evidence, then exercise only the new public close
         # operation. The payload's own 45-second deadline bounds a denied close.
-        target, _, _ = launch_persistent("target-strict-run", args.session)
+        target, _, _ = launch_persistent("target-strict-run", args.session, target_worktree)
         target_active = wait_active("target", args.session, target)
         close_completed = False
         if target_active is None or not active_cgroup(target_active):
