@@ -3,6 +3,6 @@
 # dependency of tsx) is a known-safe, widely used build tool.
 allowBuilds:
   esbuild: true
+  # gh-inari ships prebuilt dist; its source-worktree preinstall is unnecessary.
+  gh-inari: false
 enableGlobalVirtualStore: true
-minimumReleaseAgeExclude:
-  - gh-inari@0.13.2

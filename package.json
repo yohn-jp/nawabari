@@ -1,6 +1,6 @@
 {
   "name": "nawabari",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "A stable local Git session CLI exposed as git nawabari.",
   "type": "module",
   "bin": {
@@ -56,18 +56,18 @@
     "prepublishOnly": "pnpm run typecheck && pnpm test"
   },
   "devDependencies": {
-    "@types/node": "^26.6.2",
-    "eslint": "10.11.0",
-    "gh-inari": "0.13.2",
-    "prettier": "3.9.8",
-    "tsx": "^4.23.13",
+    "@types/node": "^26.6.5",
+    "eslint": "10.12.0",
+    "gh-inari": "0.19.1",
+    "prettier": "3.9.10",
+    "tsx": "^4.23.15",
     "typescript": "^6.0.3",
-    "typescript-eslint": "8.70.0"
+    "typescript-eslint": "8.71.2"
   },
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@12.5.1+sha512.e3f305bc784a2bc89f5ad3b6138889470fae8d2af5f36b61216ec91c2c3d64089775f9de38aac331044ea40f245cb0d5666392dfdf65824e1907ef6a2c62de5f",
+  "packageManager": "pnpm@12.14.0+sha512.wYum2HmT09Fky16JSPMrLAbuhUSH4GzY2GeBNC+z5btGNDZwNHEehoArqpw3vqkGzhkprQjXCITJfYAd8TOJpg==",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
