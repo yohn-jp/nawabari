@@ -25,6 +25,9 @@ test("public verification CLI requires explicit bounded requests without invokin
   for (const args of [
     ["verification", "snapshot"],
     ["verification", "execute"],
+    ["verification", "candidate-paths"],
+    ["verification", "candidate-paths", "--request-file", invalid],
+    ["verification", "stage-candidate"],
     ["verification", "execute", "--session", "untrusted"],
     ["verification", "execute", "--request-file", invalid],
   ]) {
@@ -81,6 +84,20 @@ test("machine discovery maps each verification command to its versioned owner re
     schemas.some(
       (entry) =>
         entry.schema === "nawabari.session-bound-verification.v1" && entry.commands.includes("verification execute"),
+    ),
+  );
+  assert.ok(
+    schemas.some(
+      (entry) =>
+        entry.schema === "nawabari.session-candidate-bundle-paths.v1" &&
+        entry.commands.includes("verification candidate-paths"),
+    ),
+  );
+  assert.ok(
+    schemas.some(
+      (entry) =>
+        entry.schema === "nawabari.session-candidate-bundle.v1" &&
+        entry.commands.includes("verification stage-candidate"),
     ),
   );
 });
