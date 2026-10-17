@@ -1566,6 +1566,35 @@ test("compiled protected execution keeps a worktree under /tmp visible and hides
       ),
       "bounded-scratch",
     );
+    const scratch = path.join(worktree, ".nawabari-verification-candidates", "a".repeat(64), "b".repeat(24));
+    fs.mkdirSync(scratch, { recursive: true, mode: 0o700 });
+    const stage = await runSandboxedCommand(
+      {
+        ...protectedRequest.value,
+        compiled_session_environment: compiled.value,
+        git_profile: profileResult.value,
+        owner_candidate_staging: { candidate_digest: `sha256:${"a".repeat(64)}`, source_key: "b".repeat(24) },
+      },
+      {
+        command: "node",
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs'), assert=require('node:assert/strict'), path=require('node:path');",
+            "const root=process.argv[1]; fs.mkdirSync(path.join(root,'repo/objects'),{recursive:true});",
+            "fs.writeFileSync(path.join(root,'repo/objects/pack'),'exact-stage');",
+            "assert.throws(()=>fs.writeFileSync('README.md','forbidden'));",
+            "assert.throws(()=>fs.writeFileSync(path.dirname(root)+'/outside-stage','forbidden'));",
+            "process.stdout.write('bounded-owner-stage-ok');",
+          ].join(" "),
+          scratch,
+        ],
+      },
+    );
+    assert.equal(stage.ok, true, stage.ok ? "" : JSON.stringify(stage.error));
+    if (!stage.ok) return;
+    assert.equal(stage.value.exit_code, 0, JSON.stringify(stage.value));
+    assert.equal(stage.value.stdout, "bounded-owner-stage-ok");
   } finally {
     if (controlServer !== undefined) await controlServer.close();
     removeWorktree(repository, worktree);

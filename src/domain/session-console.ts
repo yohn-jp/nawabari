@@ -62,6 +62,7 @@ import {
 import { compileWorkingSetRuntimeProjection } from "./working-set-runtime-projection.js";
 import type { EffectiveWorkingSet } from "../working-set.js";
 import { resolveProfileRuntimeScope } from "./worktree-profile-scope.js";
+import { candidateStagingSelectorMayOverlap } from "./sandbox-candidate-staging.js";
 import { resolveWorktreeProfileRuntime } from "./worktree-profile-runtime.js";
 import { runSessionLaunchSupervisor } from "./session-launch-supervisor.js";
 import type { SessionLaunchSupervisorResult, SupervisorStdioValue } from "./session-launch-supervisor.js";
@@ -313,31 +314,6 @@ function managedRuntimeUnavailable(sessionId: string): DomainResult<never> {
 }
 
 /** Conservatively refuse an owner scratch root when a persisted selector can intersect it. */
-function selectorMayOverlap(selector: string, scratchRoot: string): boolean {
-  const normalized = selector.replaceAll("\\", "/").replace(/\/+$/u, "");
-  if (normalized.length === 0 || normalized.startsWith("/") || normalized.split("/").includes("..")) return true;
-  const wildcard = normalized.search(/[?*]/u);
-  const literalPrefix = wildcard === -1 ? normalized : normalized.slice(0, wildcard).replace(/\/+$/u, "");
-  if (literalPrefix.length === 0) return true;
-  const within = (parent: string, candidate: string) => candidate === parent || candidate.startsWith(`${parent}/`);
-  if (within(scratchRoot, literalPrefix) || within(literalPrefix, scratchRoot)) return true;
-  const glob = (value: string): RegExp => {
-    let source = "^";
-    for (let index = 0; index < value.length; index += 1) {
-      const character = value[index] as string;
-      if (character === "*" && value[index + 1] === "*") {
-        source += ".*";
-        index += 1;
-      } else if (character === "*") source += "[^/]*";
-      else if (character === "?") source += "[^/]";
-      else source += character.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-    }
-    return new RegExp(`${source}$`, "u");
-  };
-  const matches = glob(normalized);
-  return matches.test(scratchRoot) || matches.test(`${scratchRoot}/__nawabari_owner_scratch__`);
-}
-
 /** Launch one pinned managed command through the durable #498 composition. */
 export async function launchManagedSessionCommand(
   context: SessionContext,
@@ -510,7 +486,7 @@ export async function launchManagedSessionCommand(
     const candidateHex = operation.candidate_digest.slice("sha256:".length);
     const scratchRoot = `.nawabari-verification-candidates/${candidateHex}/${operation.source_key}`;
     const forbidden = [...workingSet.value.scope.deny, ...profile.filesystem.deny, ...profile.filesystem.immutable];
-    if (forbidden.some((selector) => selectorMayOverlap(selector, scratchRoot))) {
+    if (forbidden.some((selector) => candidateStagingSelectorMayOverlap(selector, scratchRoot))) {
       return failure(
         new DomainError(
           "OPERATION_REJECTED",
