@@ -320,12 +320,16 @@ export class LocalSessionBackend implements SessionBackend {
   public async persistSessionExecution(
     context: SessionContext,
     record: PersistedSessionExecutionRecord,
+    expectedVerificationSnapshot?: SessionVerificationSnapshot,
   ): Promise<DomainResult<PersistedSessionExecutionRecord>> {
     try {
       const registry = this.registryFor(context);
       const desired = parseSessionExecutionRecord(record);
       if (!desired.ok) return desired;
       const wanted = toPersistedSessionExecutionRecord(desired.value);
+      if (expectedVerificationSnapshot !== undefined) {
+        return success(registry.persistSessionExecution(wanted, expectedVerificationSnapshot));
+      }
       const currentRecord = registry
         .listSessionExecutions(desired.value.session_id)
         .find((candidate) => candidate.execution_id === desired.value.execution_id);

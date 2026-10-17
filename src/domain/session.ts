@@ -1050,6 +1050,7 @@ export interface SessionBackend {
   persistSessionExecution?(
     context: SessionContext,
     record: PersistedSessionExecutionRecord,
+    expectedVerificationSnapshot?: SessionVerificationSnapshot,
   ): Promise<DomainResult<PersistedSessionExecutionRecord>>;
   transitionSessionExecution?(
     context: SessionContext,

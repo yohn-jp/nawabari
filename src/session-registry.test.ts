@@ -88,7 +88,10 @@ test("verification snapshot is a read-only active-session filesystem policy fenc
     assert.equal(snapshot.filesystem_policy_token.session_id, session.sessionId);
     assert.equal(snapshot.filesystem_policy_token.registry_revision, beforeRevision);
     assert.equal(snapshot.filesystem_policy_token.session_runtime_epoch, registry.runtimeEpoch);
-    assert.equal(snapshot.filesystem_policy_token.claim_set_generation, registry.readRepositoryView().claimSetGeneration);
+    assert.equal(
+      snapshot.filesystem_policy_token.claim_set_generation,
+      registry.readRepositoryView().claimSetGeneration,
+    );
     assert.equal(snapshot.filesystem_policy_token.working_set_revision, session.workingSet?.revision);
     assert.match(snapshot.filesystem_policy_token.profile_digest, /^[0-9a-f]{64}$/u);
     assert.deepEqual(snapshot.managed, {
@@ -99,6 +102,31 @@ test("verification snapshot is a read-only active-session filesystem policy fenc
       claim_set_generation: registry.readRepositoryView().claimSetGeneration,
     });
     assert.equal(registry.readRepositoryView().registryRevision, beforeRevision);
+
+    const reservation = reserveExecution({
+      session_id: session.sessionId,
+      execution_id: "stale-verification-policy-reservation",
+      profile_digest: "d".repeat(64),
+      filesystem_token: "e".repeat(64),
+      runtime_epoch: snapshot.managed.runtime_epoch,
+      boot_id: "verification-snapshot-cas-boot",
+      now: "2026-10-17T00:00:00.000Z",
+    });
+    assert.equal(reservation.ok, true);
+    if (!reservation.ok) return;
+
+    registry.claimResources({
+      sessionId: session.sessionId,
+      claims: [{ resource: "README.md", mode: "read" }],
+    });
+    assert.throws(
+      () => registry.persistSessionExecution(toPersistedSessionExecutionRecord(reservation.value), snapshot),
+      (error: unknown) =>
+        error instanceof SessionRegistryError &&
+        error.code === "OPERATION_REJECTED" &&
+        error.message.includes("Verification policy changed before the durable execution reservation"),
+    );
+    assert.deepEqual(registry.listSessionExecutions(session.sessionId), []);
   } finally {
     try {
       runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);

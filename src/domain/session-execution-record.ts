@@ -154,7 +154,10 @@ export type SessionExecutionIdentityReader = Readonly<{
   readonly read_process_cgroup: (pid: number) => string;
 }>;
 
-export type SessionExecutionDurableWriter = (record: PersistedSessionExecutionRecord) => void | Promise<void>;
+export type SessionExecutionDurableWriter = (
+  record: PersistedSessionExecutionRecord,
+  expectedVerificationSnapshot?: import("./session.js").SessionVerificationSnapshot,
+) => void | Promise<void>;
 
 export type SessionExecutionReservationResult<T> = Readonly<{
   readonly record: SessionExecutionRecord;

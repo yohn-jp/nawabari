@@ -362,6 +362,31 @@ const MIGRATION_RECOVERY_HINTS = Object.freeze([
   "Do not hand-edit or delete the registry; retry `nawabari migrate --json` after authoritative state is restored.",
 ]);
 
+function stableSnapshotJson(value: unknown): string {
+  const visit = (current: unknown, ancestors: Set<object>): unknown => {
+    if (current === null || typeof current === "string" || typeof current === "boolean") return current;
+    if (typeof current === "number" && Number.isFinite(current)) return current;
+    if (Array.isArray(current)) {
+      if (ancestors.has(current)) throw new TypeError("cyclic verification snapshot");
+      ancestors.add(current);
+      const result = current.map((entry) => visit(entry, ancestors));
+      ancestors.delete(current);
+      return result;
+    }
+    if (typeof current === "object") {
+      if (ancestors.has(current)) throw new TypeError("cyclic verification snapshot");
+      ancestors.add(current);
+      const source = current as Record<string, unknown>;
+      const result: Record<string, unknown> = {};
+      for (const key of Object.keys(source).sort()) result[key] = visit(source[key], ancestors);
+      ancestors.delete(current);
+      return result;
+    }
+    throw new TypeError("verification snapshot contains non-JSON data");
+  };
+  return JSON.stringify(visit(value, new Set()));
+}
+
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
 export type SessionRecordSchemaVersion = typeof SESSION_RECORD_SCHEMA_VERSION;
 export type SessionState = "new" | "active" | "closing" | "closed" | "stale" | "parked";
@@ -1470,52 +1495,56 @@ export class SessionRegistry implements SessionRetentionAuthority {
     assertSessionId(sessionId);
     return this.withLock(() => {
       const state = this.readStateUnsafe();
-      const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
-      if (session === undefined) {
-        throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
-      }
-      if (session.state !== "active") {
-        throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Verification requires an active session: ${sessionId}`, {
-          sessionId,
-          state: session.state,
-        });
-      }
-      if (session.workingSet === undefined) {
-        throw new SessionRegistryError(
-          "OPERATION_REJECTED",
-          "Verification requires the session's persisted bounded working set.",
-          { sessionId },
-        );
-      }
+      return this.sessionVerificationSnapshotFromState(state, sessionId);
+    });
+  }
 
-      const policy = compileSessionFilesystemPolicy(this, state, session, {});
-      const policyToken = canonicalFilesystemPolicyToken(state, session.sessionId, policy);
-      const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
-        (candidate) => candidate.session_id === sessionId,
-      );
-      const pinnedValue = (state.runtimeRecords.records.pinned_profiles ?? []).find(
-        (candidate) => candidate.session_id === sessionId,
-      );
-      const admission = admissionValue === undefined ? null : parseSessionAdmissionRecord(admissionValue);
-      const pinned = pinnedValue === undefined ? null : parsePinnedProfileRecord(pinnedValue);
-
-      return Object.freeze({
-        contract_id: "nawabari.session-verification-snapshot.v1",
-        schema_version: 1,
-        session_id: session.sessionId,
-        repository: this.repository.repositoryId,
-        worktree: session.worktreePath,
-        branch: session.branchName,
-        state: "active" as const,
-        filesystem_policy_token: policyToken,
-        managed: Object.freeze({
-          profile_digest: pinned?.digest ?? null,
-          admission: admission?.admission ?? null,
-          runtime_epoch: state.runtimeEpoch,
-          registry_revision: state.registryRevision,
-          claim_set_generation: state.claimSetGeneration,
-        }),
+  private sessionVerificationSnapshotFromState(state: RegistryState, sessionId: string): SessionVerificationSnapshot {
+    const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+    if (session === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    if (session.state !== "active") {
+      throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Verification requires an active session: ${sessionId}`, {
+        sessionId,
+        state: session.state,
       });
+    }
+    if (session.workingSet === undefined) {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "Verification requires the session's persisted bounded working set.",
+        { sessionId },
+      );
+    }
+
+    const policy = compileSessionFilesystemPolicy(this, state, session, {});
+    const policyToken = canonicalFilesystemPolicyToken(state, session.sessionId, policy);
+    const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    const pinnedValue = (state.runtimeRecords.records.pinned_profiles ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    const admission = admissionValue === undefined ? null : parseSessionAdmissionRecord(admissionValue);
+    const pinned = pinnedValue === undefined ? null : parsePinnedProfileRecord(pinnedValue);
+
+    return Object.freeze({
+      contract_id: "nawabari.session-verification-snapshot.v1",
+      schema_version: 1,
+      session_id: session.sessionId,
+      repository: this.repository.repositoryId,
+      worktree: session.worktreePath,
+      branch: session.branchName,
+      state: "active" as const,
+      filesystem_policy_token: policyToken,
+      managed: Object.freeze({
+        profile_digest: pinned?.digest ?? null,
+        admission: admission?.admission ?? null,
+        runtime_epoch: state.runtimeEpoch,
+        registry_revision: state.registryRevision,
+        claim_set_generation: state.claimSetGeneration,
+      }),
     });
   }
 
@@ -1809,13 +1838,17 @@ export class SessionRegistry implements SessionRetentionAuthority {
   }
 
   /** Persist a new execution reservation, advancing only registry_revision. */
-  persistSessionExecution(record: PersistedSessionExecutionRecord): PersistedSessionExecutionRecord {
-    return this.persistExecutionRecord(record);
+  persistSessionExecution(
+    record: PersistedSessionExecutionRecord,
+    expectedVerificationSnapshot?: SessionVerificationSnapshot,
+  ): PersistedSessionExecutionRecord {
+    return this.persistExecutionRecord(record, undefined, expectedVerificationSnapshot);
   }
 
   private persistExecutionRecord(
     record: PersistedSessionExecutionRecord,
     bootstrapSessionId?: string,
+    expectedVerificationSnapshot?: SessionVerificationSnapshot,
   ): PersistedSessionExecutionRecord {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
@@ -1835,6 +1868,22 @@ export class SessionRegistry implements SessionRetentionAuthority {
           sessionId: parsed.value.session_id,
           state: session.state,
         });
+      }
+      if (expectedVerificationSnapshot !== undefined) {
+        const current = this.sessionVerificationSnapshotFromState(state, parsed.value.session_id);
+        if (stableSnapshotJson(current) !== stableSnapshotJson(expectedVerificationSnapshot)) {
+          throw new SessionRegistryError(
+            "OPERATION_REJECTED",
+            "Verification policy changed before the durable execution reservation.",
+            {
+              sessionId: parsed.value.session_id,
+              expected_registry_revision: expectedVerificationSnapshot.managed.registry_revision,
+              current_registry_revision: current.managed.registry_revision,
+              expected_claim_set_generation: expectedVerificationSnapshot.managed.claim_set_generation,
+              current_claim_set_generation: current.managed.claim_set_generation,
+            },
+          );
+        }
       }
       const admission = this.getSessionLaunchAdmission(parsed.value.session_id);
       if (

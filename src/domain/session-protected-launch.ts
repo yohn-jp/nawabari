@@ -38,7 +38,7 @@ import {
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import { validateWorktreeRuntimeProfile, type ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 import { resolveSessionHookSet } from "./session-git-hooks.js";
-import type { SessionBackend, SessionContext } from "./session.js";
+import type { SessionBackend, SessionContext, SessionVerificationSnapshot } from "./session.js";
 import { enterSessionConsole, type SessionConsoleEnterOptions } from "./session-console.js";
 
 export {
@@ -68,6 +68,8 @@ export type SessionProtectedLaunchInput = Readonly<{
   readonly command: SandboxCommand;
   readonly stdio?: readonly [SupervisorStdioValue, SupervisorStdioValue, SupervisorStdioValue];
   readonly admission: ExecutionAdmissionFacts;
+  /** Exact owner snapshot checked atomically with the durable starting record. */
+  readonly expected_verification_snapshot?: SessionVerificationSnapshot;
   readonly starting_record: SessionExecutionRecord;
   readonly supervisor: Omit<SessionLaunchSupervisorPacket, "admission" | "payload" | "durability">;
 }>;
@@ -163,10 +165,11 @@ async function persistRecord(
   writer: SessionExecutionDurableWriter,
   record: SessionExecutionRecord,
   operation: string,
+  expectedVerificationSnapshot?: SessionVerificationSnapshot,
 ): Promise<DomainResult<SessionExecutionRecord>> {
   const persisted: PersistedSessionExecutionRecord = serializeSessionExecutionRecord(record);
   try {
-    await writer(persisted);
+    await writer(persisted, expectedVerificationSnapshot);
   } catch (error: unknown) {
     return compositionFailure(
       "REGISTRY_DURABILITY_UNCERTAIN",
@@ -319,7 +322,12 @@ export async function launchProtectedSessionExecution(
   }
 
   let current = identities.value.record;
-  const starting = await persistRecord(deps.persist_execution, current, "starting");
+  const starting = await persistRecord(
+    deps.persist_execution,
+    current,
+    "starting",
+    input.expected_verification_snapshot,
+  );
   if (!starting.ok) return starting;
   current = starting.value;
 
