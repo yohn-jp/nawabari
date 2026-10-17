@@ -6645,6 +6645,46 @@ export class SessionRegistry implements SessionRetentionAuthority {
       if (!parsed.ok) throw parsed.error;
       return parsed.value;
     });
+    const owned = records.filter((record) => record.session_id === sessionId);
+    if (owned.length === 0) {
+      if (this.cgroupRoot === undefined) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "No owned execution records are available to prove kernel quiescence",
+          { sessionId, observation: "unknown", owned_record_count: owned.length },
+        );
+      }
+      let currentBootId: string;
+      try {
+        currentBootId = readCurrentKernelBootId();
+      } catch (error: unknown) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Current kernel boot identity is unavailable during drain finalization",
+          { sessionId, reason: error instanceof Error ? error.message.slice(0, 200) : "unknown" },
+        );
+      }
+      const tree = observeSessionCgroupTree({
+        session_id: sessionId,
+        root: this.cgroupRoot,
+        current_boot_id: currentBootId,
+        execution_records: records,
+        ...(this.cgroupFilesystem === undefined ? {} : { filesystem: this.cgroupFilesystem }),
+      });
+      if (tree.state !== "empty") {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "The managed cgroup tree does not prove session quiescence",
+          {
+            sessionId,
+            observation: tree.state,
+            reason: tree.reason,
+            observed_scopes: tree.observed_scopes,
+          },
+        );
+      }
+      return;
+    }
     let currentBootId: string;
     try {
       currentBootId = readCurrentKernelBootId();
@@ -6655,34 +6695,6 @@ export class SessionRegistry implements SessionRetentionAuthority {
         { sessionId, reason: error instanceof Error ? error.message.slice(0, 200) : "unknown" },
       );
     }
-    const owned = records.filter((record) => record.session_id === sessionId);
-    if (this.cgroupRoot === undefined) {
-      throw new SessionRegistryError(
-        "OPERATION_REJECTED",
-        "No owned execution records are available to prove kernel quiescence",
-        { sessionId, observation: "unknown", owned_record_count: owned.length },
-      );
-    }
-    const tree = observeSessionCgroupTree({
-      session_id: sessionId,
-      root: this.cgroupRoot,
-      current_boot_id: currentBootId,
-      execution_records: records,
-      ...(this.cgroupFilesystem === undefined ? {} : { filesystem: this.cgroupFilesystem }),
-    });
-    if (tree.state !== "empty") {
-      throw new SessionRegistryError(
-        "OPERATION_REJECTED",
-        "The managed cgroup tree does not prove session quiescence",
-        {
-          sessionId,
-          observation: tree.state,
-          reason: tree.reason,
-          observed_scopes: tree.observed_scopes,
-        },
-      );
-    }
-    if (owned.length === 0) return;
     for (const record of owned) {
       const observed = observeOwnedExecution(ownedExecutionObservationRecord(record), {
         current_boot_id: currentBootId,

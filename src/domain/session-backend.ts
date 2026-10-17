@@ -1323,7 +1323,7 @@ function runtimeLifecycleAdapter<T>(
     }
     const trackedAdmission = registry.getSessionLaunchAdmission(sessionId);
     const treeObservation =
-      managedCgroupRoot.ok && currentBootId !== null
+      executions.length === 0 && managedCgroupRoot.ok && currentBootId !== null
         ? observeSessionCgroupTree({
             session_id: sessionId,
             root: managedCgroupRoot.value,
@@ -1338,13 +1338,14 @@ function runtimeLifecycleAdapter<T>(
       executions,
       kernel_empty:
         trackedAdmission !== undefined &&
-        treeObservation?.state === "empty" &&
-        executions.every(
-          ({ observation }) =>
-            observation.state === "empty" &&
-            observation.cgroups !== null &&
-            observation.cgroups.population.state === "empty",
-        ),
+        (executions.length === 0
+          ? treeObservation?.state === "empty"
+          : executions.every(
+              ({ observation }) =>
+                observation.state === "empty" &&
+                observation.cgroups !== null &&
+                observation.cgroups.population.state === "empty",
+            )),
     };
   };
   return {
