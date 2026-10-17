@@ -476,8 +476,7 @@ export class LocalSessionBackend implements SessionBackend {
       const drained = await closeSessionWithRuntimeDrain(
         runtimeLifecycleAdapter(
           registry,
-          ({ fence }) =>
-            registryMutation(() => registry.releaseSessionCandidateScratch(options, fence)),
+          ({ fence }) => registryMutation(() => registry.releaseSessionCandidateScratch(options, fence)),
           this.managedCgroupRoot,
           this.registryOptions.cgroupFilesystem,
         ),

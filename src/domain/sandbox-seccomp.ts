@@ -342,9 +342,11 @@ export function compileSandboxSeccompProfile(architecture: string = process.arch
 
   const cloneSyscall = CLONE_SYSCALLS[architecture];
   if (cloneSyscall === undefined) {
-    return failure(new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "No namespace-safe clone profile exists.", {
-      architecture,
-    }));
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "No namespace-safe clone profile exists.", {
+        architecture,
+      }),
+    );
   }
   const instructions: BpfInstruction[] = [
     statement(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET),
