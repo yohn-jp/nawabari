@@ -93,7 +93,9 @@ function readyProbe() {
   };
 }
 
-function executionRecord(state: "starting" | "attached" | "unresolved" | "exited" = "starting"): SessionExecutionRecord {
+function executionRecord(
+  state: "starting" | "attached" | "unresolved" | "exited" = "starting",
+): SessionExecutionRecord {
   const reserved = reserveExecution({
     session_id: session.session_id,
     execution_id: "execution-console-1",
