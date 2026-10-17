@@ -929,7 +929,8 @@ test("bounded Landlock scopes /tmp scratch access away from a worktree mounted u
     assert.notEqual(scratchDirectoryIndex, -1);
     const trampolineIndex = compiled.value.args.indexOf(LANDLOCK_TRAMPOLINE);
     assert.notEqual(trampolineIndex, -1);
-    const rules = JSON.parse(compiled.value.args[trampolineIndex + 1]);
+    const chunks = Number(compiled.value.args[trampolineIndex + 1]);
+    const rules = JSON.parse(compiled.value.args.slice(trampolineIndex + 2, trampolineIndex + 2 + chunks).join(""));
     const tempParent = rules.find((rule: { path: string }) => rule.path === "/tmp");
     const tempScratch = rules.find((rule: { path: string }) => rule.path === "/tmp/nawabari-tmp");
     const worktreeFile = rules.find((rule: { path: string }) => rule.path === path.join(worktree, "README.md"));

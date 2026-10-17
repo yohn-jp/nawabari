@@ -7,6 +7,7 @@ import process from "node:process";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import {
   deriveLandlockRules,
+  landlockRuleArguments,
   LANDLOCK_ACCESS_FS_ABI3,
   LANDLOCK_ABI_MINIMUM,
   LANDLOCK_SETUP_FAILURE_PREFIX,
@@ -67,7 +68,11 @@ import {
 import type { FilesystemEnforcementIntegrationResult } from "./filesystem-enforcement-integration.js";
 import { validateFilesystemPolicyEnforcementRuntime } from "./filesystem-policy-enforcement.js";
 import { runObservedSandboxChild } from "./sandbox-physical-execution.js";
-import type { SandboxPhysicalExecutionEvidence, SandboxRawOutput } from "./sandbox-execution-evidence.js";
+import {
+  sandboxExecutionEvidenceFromError,
+  type SandboxPhysicalExecutionEvidence,
+  type SandboxRawOutput,
+} from "./sandbox-execution-evidence.js";
 
 const SANDBOX_HOME = SESSION_RUNTIME_LOGICAL_HOME;
 const SANDBOX_CONFIG_HOME = SESSION_RUNTIME_LOGICAL_CONFIG_HOME;
@@ -1536,7 +1541,8 @@ export function compileSandboxInvocation(
     const readAccess = WORKING_SET_DIRECTORY_TRAVERSE | WORKING_SET_FILE_READ;
     boundedLandlockRules.push({
       path: stagingRoot.value,
-      allowed_access: request.owner_candidate_staging === undefined ? readAccess : LANDLOCK_ACCESS_FS_ABI3,
+      allowed_access:
+        request.owner_candidate_staging === undefined ? WORKING_SET_DIRECTORY_TRAVERSE : LANDLOCK_ACCESS_FS_ABI3,
     });
     // Only the fixed importer may read the sanitized session base metadata.
     if (request.owner_candidate_staging !== undefined)
@@ -1713,12 +1719,17 @@ export function compileSandboxInvocation(
     seenDirectories.add(parent);
     args.push("--dir", parent);
   }
+  const ruleArguments = landlockEnabled ? landlockRuleArguments(boundedLandlockRules) : [];
+  if (ruleArguments.length > 513)
+    return topologyError("Derived Landlock rules exceed the bounded launch transport.", {
+      session_id: request.session_id,
+    });
   const commandArgv = landlockEnabled
     ? [
         landlockExecutable.value as string,
         "-c",
         LANDLOCK_TRAMPOLINE,
-        JSON.stringify(boundedLandlockRules),
+        ...ruleArguments,
         "--",
         command.command,
         ...commandArgs,
@@ -1962,10 +1973,16 @@ export function runSandboxedCommand(
       }
     }
     if (!execution.ok) {
+      const evidence = sandboxExecutionEvidenceFromError(execution.error);
+      const setupDiagnostic =
+        invocation.value.landlock.state === "enforced" && evidence?.exit_code === 125 && evidence.signal === null
+          ? landlockSetupDiagnostic(Buffer.from(evidence.raw_output.stderr, "base64").toString("utf8"))
+          : null;
       return failure(
         new DomainError(execution.error.code, execution.error.message, {
           ...(execution.error.details ?? {}),
           ...resourceDetails,
+          ...(setupDiagnostic === null ? {} : { retryable: false, diagnostic: setupDiagnostic }),
         }),
       );
     }

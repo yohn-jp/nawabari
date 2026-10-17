@@ -269,15 +269,19 @@ def fail(message):
     raise SystemExit(125)
 
 def main():
-    if len(sys.argv) < 4 or sys.argv[2] != "--":
-        fail("invalid trampoline arguments")
     try:
-        rules = json.loads(sys.argv[1])
+        count = int(sys.argv[1])
+        if count < 1 or count > 512 or len(sys.argv) < count + 4 or sys.argv[count + 2] != "--":
+            fail("invalid trampoline arguments")
+        chunks = sys.argv[2:count + 2]
+        if any(len(chunk.encode("utf-8")) > 3000 for chunk in chunks):
+            fail("oversized rule chunk")
+        rules = json.loads("".join(chunks))
     except Exception as error:
         fail("invalid derived rules: " + str(error))
     if not isinstance(rules, list):
         fail("invalid derived rules")
-    command = sys.argv[3:]
+    command = sys.argv[count + 3:]
     if not command or any("\x00" in item for item in command):
         fail("invalid command arguments")
 
@@ -335,4 +339,23 @@ export function landlockHandledAccessForAbi(abi: number): number {
   if (abi >= 3) return LANDLOCK_ACCESS_FS_ABI3;
   if (abi >= 2) return LANDLOCK_ACCESS_FS_ABI2;
   return LANDLOCK_ACCESS_FS_ABI1;
+}
+
+/** Transport derived rules without exceeding the supervisor's per-argument bound. */
+export function landlockRuleArguments(rules: readonly LandlockRule[]): readonly string[] {
+  const chunks: string[] = [];
+  let chunk = "";
+  let bytes = 0;
+  for (const character of JSON.stringify(rules)) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (bytes + size > 3000) {
+      chunks.push(chunk);
+      chunk = "";
+      bytes = 0;
+    }
+    chunk += character;
+    bytes += size;
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return [String(chunks.length), ...chunks];
 }
