@@ -208,7 +208,8 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
   const nested = path.join(worktree, "nested");
   const nestedAlias = path.join(worktree, "nested-alias");
   try {
-    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const originalRequest = await resolvedRequest(repository, worktree, fixture.layout);
+    const request = { ...originalRequest, procfs: { mode: "private" as const, reason: null } };
     fs.mkdirSync(nested);
     assert.equal(request.sandbox_executable, fixture.executable);
     const compiled = compileSandboxInvocation(request, {

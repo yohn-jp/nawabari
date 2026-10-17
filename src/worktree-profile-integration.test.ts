@@ -55,8 +55,8 @@ function createRepository(catalog: unknown): { root: string; cleanup(): void } {
   };
 }
 
-function repositoryProfile(id: string): Record<string, unknown> {
-  const builtin = getBuiltinWorktreeProfile("minimal");
+function repositoryProfile(id: string, preset: "minimal" | "standard-shell" = "minimal"): Record<string, unknown> {
+  const builtin = getBuiltinWorktreeProfile(preset);
   if (!builtin.ok) throw builtin.error;
   return { ...builtin.value, id, extends: [] };
 }
@@ -162,8 +162,8 @@ test("omitted profile create bypasses a malformed catalog and preserves backend 
   }
 });
 
-test("repository list/show preserves source identity and create fails closed before backend", async () => {
-  const profile = repositoryProfile("repository-profile");
+test("repository list/show preserves source identity and missing declared shell material refuses create", async () => {
+  const profile = repositoryProfile("repository-profile", "standard-shell");
   const repository = createRepository({ profiles: [profile] });
   try {
     let observed: SessionCreateOptions | null = null;

@@ -139,6 +139,7 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
     "session shell",
     "verification snapshot",
     "verification execute",
+    "verification candidate-paths",
     "verification stage-candidate",
     "verification release-candidate",
   ],

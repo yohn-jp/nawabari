@@ -321,6 +321,7 @@ test("source-bound verification evidence serializes hashes only and does not upg
         schema_version: 1,
         identity_sha256: "1".repeat(64),
         head_id: "a".repeat(40),
+        tree_id: "c".repeat(40),
         base_id: "b".repeat(40),
         profile_sha256: "2".repeat(64),
         policy_sha256: "3".repeat(64),

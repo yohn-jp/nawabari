@@ -817,7 +817,32 @@ test("session run returns a rejected exit status for a signaled child and never 
   );
 
   assert.equal(signalExitCode, 3);
-  assert.deepEqual(JSON.parse(signalOutput.stdout[0] ?? ""), {
+  const signaled = JSON.parse(signalOutput.stdout[0] ?? "") as Record<string, unknown>;
+  const { execution_id, raw_output, physical_execution, ...signaledEnvelope } = signaled;
+  assert.equal(execution_id, "mock-execution");
+  assert.deepEqual(raw_output, {
+    encoding: "base64",
+    capture_mode: "pipes",
+    stdout: "",
+    stderr: "",
+    stdout_bytes: 0,
+    stderr_bytes: 0,
+    observed_stdout_bytes: 0,
+    observed_stderr_bytes: 0,
+    complete: true,
+    truncated: false,
+  });
+  assert.deepEqual(
+    {
+      correlation_id: (physical_execution as { correlation_id: string }).correlation_id,
+      start: (physical_execution as { start: { state: string } }).start.state,
+      termination: (physical_execution as { termination: { state: string } }).termination.state,
+      cleanup: (physical_execution as { cleanup: { state: string } }).cleanup.state,
+    },
+    { correlation_id: "mock-execution", start: "unknown", termination: "unknown", cleanup: "unknown" },
+    "a fixture must not claim physical owner evidence",
+  );
+  assert.deepEqual(signaledEnvelope, {
     ok: true,
     command: "session run",
     exit_code: null,

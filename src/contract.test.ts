@@ -440,7 +440,16 @@ test("protected-execution capability publishes the sandbox contract and canonica
   const capability = protectedExecutionCapability();
   assert.equal(capability.contract_id, SANDBOX_CONTRACT_ID);
   assert.equal(capability.schema_version, SANDBOX_CONTRACT_SCHEMA_VERSION);
-  assert.deepEqual(capability.commands, ["session run", "session exec", "session shell"]);
+  assert.deepEqual(capability.commands, [
+    "session run",
+    "session exec",
+    "session shell",
+    "verification snapshot",
+    "verification execute",
+    "verification candidate-paths",
+    "verification stage-candidate",
+    "verification release-candidate",
+  ]);
   assert.deepEqual(capability.command_aliases, [{ alias: "session exec", canonical: "session run" }]);
   assert.deepEqual(capability.required_capabilities, [...SANDBOX_REQUIRED_CAPABILITIES]);
   assert.deepEqual(capability.optional_capabilities, [...SANDBOX_OPTIONAL_CAPABILITIES]);
