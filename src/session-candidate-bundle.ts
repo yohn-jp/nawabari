@@ -145,7 +145,8 @@ function parseSnapshot(value: unknown, sessionId: string): SessionVerificationSn
     typeof managed !== "object" ||
     managed === null ||
     managed.admission !== "open" ||
-    managed.profile_digest !== token.profile_digest ||
+    typeof managed.profile_digest !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(managed.profile_digest) ||
     managed.registry_revision !== token.registry_revision ||
     managed.claim_set_generation !== token.claim_set_generation ||
     managed.runtime_epoch !== token.session_runtime_epoch
@@ -412,7 +413,7 @@ if(!fs.existsSync(path.join(candidatePath,'.git')))git(['init','--quiet'],candid
 const baseRef='refs/nawabari/bases/'+candidateHex;
 const ref='refs/nawabari/candidates/'+candidateHex+'/'+sourceKey;
 const baseExists=(()=>{try{return git(['rev-parse','--verify',baseRef])===base}catch{return false}})();
-if(!baseExists){git(['fetch','--no-tags','--no-write-fetch-head',worktree,base+':'+baseRef],candidatePath);if(git(['rev-parse','--verify',baseRef])!==base)fail('owned source base differs from the declared exact base');}
+if(!baseExists){git(['fetch','--no-tags','--no-write-fetch-head','/nawabari/git',base+':'+baseRef],candidatePath);if(git(['rev-parse','--verify',baseRef])!==base)fail('owned source base differs from the declared exact base');}
 git(['bundle','verify',bundlePath]);
 const heads=git(['bundle','list-heads',bundlePath]).split('\n').filter(Boolean);
 if(heads.length!==1||heads[0]!==head+' refs/heads/mottainai-candidate')fail('bundle advertises a different candidate ref');
