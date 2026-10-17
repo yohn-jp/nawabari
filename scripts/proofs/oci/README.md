@@ -40,8 +40,14 @@ sibling payload exits naturally, while its session and worktree remain active
 for the owner. Neither script signals a host process, restarts the container,
 or launches a host-side verifier.
 
+When continuing a run whose exact package and target already have a successful
+strict-boundary receipt, `nawabari-oci-n1-run.py --reuse-positive-evidence`
+validates and byte-copies that receipt instead of starting the successful
+payload again. The remaining checks still obtain fresh public owner and
+kernel observations.
+
 For the 2026-10-17 g4 candidate, the exact Nawabari package SHA-256 is
-`cd4d3321d6f088bb509ac0f4bf6cec94452a552ae5605aa7f53e669bff0b5805`. The
+`7747e92aacbca9d167a2b9328042d444db604dfd4a1a2097c0c3d7181bcc711d`. The
 installer proof is produced separately and must match this package digest.
 Keep each preparation and run evidence directory unique and retain failed
-evidence; do not reuse or overwrite earlier profile probes.
+evidence; never overwrite earlier profile probes.
