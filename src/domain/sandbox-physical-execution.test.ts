@@ -77,7 +77,8 @@ test("owner cancellation preserves captured bytes and marks physical termination
     timeout_ms: 2_000,
     max_output_bytes: 1_024,
   });
-  setTimeout(() => controller.abort(), 30);
+  // Cancel after the bytes exist, independently of host startup scheduling.
+  child.stdout!.once("data", () => controller.abort());
   const result = await pending;
 
   assert.equal(result.ok, false);
