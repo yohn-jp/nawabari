@@ -46,6 +46,7 @@ import type { ResolvedRuntimeProfile, RuntimeProfileSelection } from "./runtime-
 import type { ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 import type { SessionHookMaterial } from "./session-git-hooks.js";
 import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
+import { observeSandboxProcfsPolicy, type SandboxProcfsPolicy } from "./sandbox-procfs.js";
 
 /**
  * Versioned identity for the Linux sandbox execution contract (Issue #81).
@@ -194,6 +195,8 @@ export type SandboxExecutionRequest = {
   network_mode: SandboxNetworkMode;
   /** Resolved host path to bubblewrap; null is valid only for advisory requests. */
   sandbox_executable: string | null;
+  /** Parent topology may require a narrower empty proc view; never bind parent processes. */
+  procfs?: SandboxProcfsPolicy;
   identity: SandboxIdentity;
   /** Minimum host Git author identity projected for commit semantics; never a full config file. */
   git_identity: SandboxGitIdentity;
@@ -982,6 +985,7 @@ export async function resolveSandboxExecutionRequest(
     branch: decision.branch,
     network_mode: doctor.network_mode,
     sandbox_executable: runtimeLayout.bubblewrap,
+    procfs: observeSandboxProcfsPolicy(),
     identity: resolveIdentity(probe),
     git_identity: {
       host_global_name: runtimeLayout.git_user_name,
