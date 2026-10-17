@@ -145,6 +145,8 @@ export type CgroupFileSystem = {
   readonly statSync: (file: string) => { readonly isDirectory: () => boolean; readonly isFile: () => boolean };
   readonly realpathSync: (file: string) => string;
   readonly readFileSync: (file: string) => string;
+  /** Enumerate direct cgroup children; absence is unknown for tree-wide drain proofs. */
+  readonly readdirSync?: (directory: string) => readonly { readonly name: string; readonly isDirectory: () => boolean }[];
   readonly writeFileSync: (file: string, value: string) => void;
   readonly mkdirSync: (file: string, options?: { readonly recursive?: boolean; readonly mode?: number }) => void;
   readonly rmdirSync: (file: string) => void;
@@ -154,6 +156,7 @@ const nativeFileSystem: CgroupFileSystem = {
   statSync: (file) => fs.statSync(file),
   realpathSync: (file) => fs.realpathSync.native(file),
   readFileSync: (file) => fs.readFileSync(file, { encoding: "utf8", flag: "r" }),
+  readdirSync: (directory) => fs.readdirSync(directory, { withFileTypes: true }),
   writeFileSync: (file, value) => fs.writeFileSync(file, value, { encoding: "utf8" }),
   mkdirSync: (file, options) => fs.mkdirSync(file, options),
   rmdirSync: (file) => fs.rmdirSync(file),

@@ -9,9 +9,10 @@ import { test } from "node:test";
 import { runCli } from "../cli.js";
 import { defaultGit, resolveRepositoryContext, type GitCommandRunner } from "../git.js";
 import { SessionRegistry } from "../session-registry.js";
-import { resolveManagedCgroupRoot, type CgroupFileSystem } from "./cgroups-v2.js";
+import { deriveCgroupScopeName, resolveManagedCgroupRoot, type CgroupFileSystem } from "./cgroups-v2.js";
 import { withDirectoryFsyncFailure } from "../testing/fs-fault-injection.js";
 import {
+  parseSessionExecutionRecord,
   recordExecutionState,
   reserveExecution,
   toPersistedSessionExecutionRecord,
@@ -133,7 +134,7 @@ test("local session backend binds default managed readiness to protected sandbox
       cgroupRoot: usableCgroups.root,
       registry: { cgroupFilesystem: usableCgroups.filesystem },
     }).createSession({ cwd: repositoryPath }, options);
-    assert.equal(authorized.ok, true);
+    assert.equal(authorized.ok, true, authorized.ok ? "" : JSON.stringify(authorized.error));
     if (authorized.ok) assert.equal(authorized.value.branch, options.branch);
     assert.equal(usableCgroups.scopeCreateCount, 1);
     assert.equal(usableCgroups.scopeCleanupCount, 1);
@@ -248,7 +249,7 @@ test("local session backend preserves an explicitly injected managed readiness a
         profile: { selection: { profile } },
       },
     );
-    assert.equal(result.ok, true);
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
     assert.equal(readinessCalls, 1);
     assert.equal(unusableCgroups.scopeCreateCount, 0);
   } finally {
@@ -1461,7 +1462,7 @@ test("the local backend exposes close and gc as stable automation results", asyn
   }
 });
 
-type ManagedFileOperationScope = "empty" | "populated" | "unknown" | "none";
+type ManagedFileOperationScope = "populated" | "unknown" | "none";
 
 function managedFileOperationFixture(scope: ManagedFileOperationScope) {
   const repositoryPath = createRepository();
@@ -1471,6 +1472,8 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
   runGit(["add", "docs/.keep"], repositoryPath);
   runGit(["commit", "-m", "docs"], repositoryPath);
   const registry = new SessionRegistry({ cwd: repositoryPath });
+  const cgroupRoot = "/sys/fs/cgroup/user.slice/managed-file-operation";
+  const cgroupParent = path.join(cgroupRoot, "nawabari");
   const repositoryIdentity = { repositoryHost: "local", repositoryId: registry.repository.repositoryId };
   const baseRevision = runGit(["rev-parse", "HEAD"], repositoryPath);
   const paths = ["docs/managed.txt"];
@@ -1516,7 +1519,7 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
     const starting = reserveExecution({
       session_id: session.sessionId,
       execution_id: `managed-file-operation-${scope}`,
-      ...(scope === "unknown" ? {} : { cgroup_root: "/sys/fs/cgroup/user.slice/test.scope" }),
+      ...(scope === "unknown" ? {} : { cgroup_root: cgroupRoot }),
       profile_digest: "a".repeat(64),
       filesystem_token: "b".repeat(64),
       runtime_epoch: runtimeEpoch,
@@ -1547,21 +1550,69 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
   );
 
   const observations: { lockHeld: boolean }[] = [];
-  const cgroupFilesystem = {
-    statSync: () => ({ isDirectory: () => true, isFile: () => true }),
-    realpathSync: (file: string) => file,
+  const directories = new Set([cgroupRoot, cgroupParent]);
+  const cgroupFiles = new Map<string, string>([
+    [path.join(cgroupRoot, "cgroup.controllers"), "cpu memory pids\n"],
+    [path.join(cgroupParent, "cgroup.events"), "populated 0\n"],
+    [path.join(cgroupParent, "cgroup.procs"), ""],
+    [path.join(cgroupParent, "cgroup.subtree_control"), "+cpu +memory +pids\n"],
+  ]);
+  const cgroupFilesystem: CgroupFileSystem = {
+    statSync: (file) => ({
+      isDirectory: () => directories.has(file),
+      isFile: () => cgroupFiles.has(file),
+    }),
+    realpathSync: (file) => {
+      if (!directories.has(file) && !cgroupFiles.has(file)) throw new Error(`missing cgroup path: ${file}`);
+      return file;
+    },
     readFileSync: (file: string) => {
       if (file.endsWith("cgroup.events")) {
         observations.push({ lockHeld: fs.existsSync(registry.paths.lock) });
-        return scope === "populated" ? "populated 1\n" : "populated 0\n";
       }
-      if (file.endsWith("cgroup.procs")) return "";
-      throw new Error("unobserved cgroup file");
+      const value = cgroupFiles.get(file);
+      if (value === undefined) throw new Error("unobserved cgroup file");
+      return value;
     },
-    writeFileSync: () => undefined,
-    mkdirSync: () => undefined,
-    rmdirSync: () => undefined,
-  } as unknown as CgroupFileSystem;
+    readdirSync: (directory: string) => {
+      if (!directories.has(directory)) throw new Error(`missing cgroup directory: ${directory}`);
+      const names = new Set<string>();
+      for (const candidate of directories) {
+        if (candidate.startsWith(`${directory}/`)) {
+          const relative = candidate.slice(directory.length + 1);
+          if (!relative.includes("/")) names.add(relative);
+        }
+      }
+      for (const candidate of cgroupFiles.keys()) {
+        if (candidate.startsWith(`${directory}/`)) {
+          const relative = candidate.slice(directory.length + 1);
+          if (!relative.includes("/")) names.add(relative);
+        }
+      }
+      return [...names].map((name) => ({ name, isDirectory: () => directories.has(path.join(directory, name)) }));
+    },
+    writeFileSync: (file, value) => {
+      cgroupFiles.set(file, value);
+    },
+    mkdirSync: (directory) => {
+      directories.add(directory);
+    },
+    rmdirSync: (directory) => {
+      directories.delete(directory);
+    },
+  };
+
+  if (scope === "populated") {
+    const record = executions[0];
+    if (record === undefined) throw new Error("populated fixture requires an execution record");
+    const parsed = parseSessionExecutionRecord(record);
+    if (!parsed.ok) throw parsed.error;
+    const scopePath = path.join(cgroupParent, deriveCgroupScopeName(parsed.value.cgroup_identity));
+    directories.add(scopePath);
+    cgroupFiles.set(path.join(scopePath, "cgroup.events"), "populated 1\n");
+    cgroupFiles.set(path.join(scopePath, "cgroup.procs"), "");
+    cgroupFiles.set(path.join(cgroupParent, "cgroup.events"), "populated 1\n");
+  }
 
   const helperCalls: { lockHeld: boolean }[] = [];
   const source = fs.realpathSync(execFileSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).trim());
@@ -1645,7 +1696,10 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
     worktreePath,
     session,
     runtimeEpoch,
-    backend: new LocalSessionBackend({ registry: { cgroupFilesystem } }),
+    backend: new LocalSessionBackend({
+      cgroupRoot,
+      registry: { cgroupFilesystem },
+    }),
     executionOptions,
     operation,
     observations,
@@ -1661,7 +1715,6 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
 for (const [scope, status] of [
   ["populated", "waiting"],
   ["unknown", "blocked"],
-  ["none", "waiting"],
 ] as const) {
   test(`managed file operations close admission and perform no I/O when owned scope is ${scope}`, async () => {
     const fixture = managedFileOperationFixture(scope);
@@ -1691,10 +1744,10 @@ for (const [scope, status] of [
   });
 }
 
-test("managed file operations execute only after proven-empty owned scopes and reopen admission", async () => {
-  const fixture = managedFileOperationFixture("empty");
+test("managed file operations execute after the kernel proves a never-launched session is empty", async () => {
+  const fixture = managedFileOperationFixture("none");
   try {
-    const operation = fixture.operation("managed-empty");
+    const operation = fixture.operation("managed-none");
     const result = await fixture.backend.fileOperation(
       { cwd: fixture.repositoryPath },
       { operation, execution_options: fixture.executionOptions },
@@ -1706,7 +1759,7 @@ test("managed file operations execute only after proven-empty owned scopes and r
       fixture.observations.some((observation) => !observation.lockHeld),
       true,
     );
-    assert.equal(fs.readFileSync(path.join(fixture.worktreePath, "docs/managed.txt"), "utf8"), "payload:managed-empty");
+    assert.equal(fs.readFileSync(path.join(fixture.worktreePath, "docs/managed.txt"), "utf8"), "payload:managed-none");
     const registry = fixture.registry();
     const [receipt] = registry.fileOperations(fixture.session.sessionId);
     assert.equal(receipt?.stage, "completed");
@@ -1838,7 +1891,7 @@ function readinessCgroupFixture(
       isFile: () => files.has(file),
     }),
     realpathSync: (file) => {
-      if (!directories.has(file)) throw new Error(`missing directory: ${file}`);
+      if (!directories.has(file) && !files.has(file)) throw new Error(`missing path: ${file}`);
       return file;
     },
     readFileSync: (file) => {
@@ -1861,6 +1914,8 @@ function readinessCgroupFixture(
       directories.add(file);
       if (path.basename(file) === "nawabari") {
         files.set(path.join(file, "cgroup.subtree_control"), "");
+        files.set(path.join(file, "cgroup.events"), "populated 0\n");
+        files.set(path.join(file, "cgroup.procs"), "");
       } else if (path.basename(file).startsWith("nawabari-")) {
         scopeCreateCount += 1;
         scopes.add(file);
@@ -1878,6 +1933,23 @@ function readinessCgroupFixture(
         }
       }
       directories.delete(file);
+    },
+    readdirSync: (directory) => {
+      if (!directories.has(directory)) throw new Error(`missing directory: ${directory}`);
+      const names = new Set<string>();
+      for (const candidate of directories) {
+        if (candidate.startsWith(`${directory}${path.sep}`)) {
+          const relative = candidate.slice(directory.length + 1);
+          if (!relative.includes(path.sep)) names.add(relative);
+        }
+      }
+      for (const candidate of files.keys()) {
+        if (candidate.startsWith(`${directory}${path.sep}`)) {
+          const relative = candidate.slice(directory.length + 1);
+          if (!relative.includes(path.sep)) names.add(relative);
+        }
+      }
+      return [...names].map((name) => ({ name, isDirectory: () => directories.has(path.join(directory, name)) }));
     },
   };
   return {

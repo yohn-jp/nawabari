@@ -243,7 +243,13 @@ import {
 } from "./domain/session-execution-record.js";
 import type { SessionDrainFinalization, SessionDrainExecution } from "./domain/session-execution-control.js";
 import type { SessionRuntimeEnvironmentIdentity } from "./domain/session-environment.js";
-import { CGROUPS_V2_CONTRACT_ID, deriveCgroupScopeName, type CgroupFileSystem } from "./domain/cgroups-v2.js";
+import {
+  CGROUPS_V2_CONTRACT_ID,
+  deriveCgroupScopeName,
+  isCanonicalManagedCgroupRoot,
+  type CgroupFileSystem,
+} from "./domain/cgroups-v2.js";
+import { observeSessionCgroupTree } from "./domain/session-cgroup-tree-observation.js";
 import {
   observeOwnedExecution,
   type SessionExecutionRecord as OwnedExecutionRecord,
@@ -1174,6 +1180,8 @@ export interface SessionRegistryOptions {
   readonly protectedWorktreePaths?: readonly string[];
   readonly worktreeRoot?: string;
   readonly staleAfterMs?: number;
+  /** Exact delegated root used to confirm empty sessions against the live managed cgroup tree. */
+  readonly cgroupRoot?: string;
   /** Canonical owned-execution observation filesystem; injectable for controlled runtimes. */
   readonly cgroupFilesystem?: CgroupFileSystem;
   /**
@@ -1314,6 +1322,7 @@ export class SessionRegistry implements SessionRetentionAuthority {
   private readonly worktreeRootIsDefault: boolean;
   private readonly staleAfterMs: number;
   private readonly cgroupFilesystem?: CgroupFileSystem;
+  private readonly cgroupRoot: string | undefined;
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
   private readonly stateBoundary: RepositoryStateBoundary;
@@ -1349,6 +1358,10 @@ export class SessionRegistry implements SessionRetentionAuthority {
     }
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.cgroupFilesystem = options.cgroupFilesystem;
+    if (options.cgroupRoot !== undefined && !isCanonicalManagedCgroupRoot(options.cgroupRoot)) {
+      throw new RangeError("cgroupRoot must be a canonical managed cgroups v2 path");
+    }
+    this.cgroupRoot = options.cgroupRoot;
     this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
     this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
     this.managedExecutionReadiness = options.managedExecutionReadiness;
@@ -6627,18 +6640,11 @@ export class SessionRegistry implements SessionRetentionAuthority {
 
   private assertOwnedExecutionsEmptyUnsafe(state: RegistryState, sessionId: string): void {
     const executionValues = state.runtimeRecords.records.executions ?? [];
-    const owned = executionValues.flatMap((value) => {
+    const records = executionValues.map((value) => {
       const parsed = parseSessionExecutionRecord(value);
       if (!parsed.ok) throw parsed.error;
-      return parsed.value.session_id === sessionId ? [parsed.value] : [];
+      return parsed.value;
     });
-    if (owned.length === 0) {
-      throw new SessionRegistryError(
-        "OPERATION_REJECTED",
-        "No owned execution records are available to prove kernel quiescence",
-        { sessionId, observation: "unknown" },
-      );
-    }
     let currentBootId: string;
     try {
       currentBootId = readCurrentKernelBootId();
@@ -6649,6 +6655,34 @@ export class SessionRegistry implements SessionRetentionAuthority {
         { sessionId, reason: error instanceof Error ? error.message.slice(0, 200) : "unknown" },
       );
     }
+    const owned = records.filter((record) => record.session_id === sessionId);
+    if (this.cgroupRoot === undefined) {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "No owned execution records are available to prove kernel quiescence",
+        { sessionId, observation: "unknown", owned_record_count: owned.length },
+      );
+    }
+    const tree = observeSessionCgroupTree({
+      session_id: sessionId,
+      root: this.cgroupRoot,
+      current_boot_id: currentBootId,
+      execution_records: records,
+      ...(this.cgroupFilesystem === undefined ? {} : { filesystem: this.cgroupFilesystem }),
+    });
+    if (tree.state !== "empty") {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "The managed cgroup tree does not prove session quiescence",
+        {
+          sessionId,
+          observation: tree.state,
+          reason: tree.reason,
+          observed_scopes: tree.observed_scopes,
+        },
+      );
+    }
+    if (owned.length === 0) return;
     for (const record of owned) {
       const observed = observeOwnedExecution(ownedExecutionObservationRecord(record), {
         current_boot_id: currentBootId,
