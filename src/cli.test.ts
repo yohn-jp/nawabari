@@ -974,6 +974,7 @@ test("canonical command registry resolves aliases without duplicating option def
   assert.deepEqual(publicNames, [
     "verification snapshot",
     "verification execute",
+    "verification stage-candidate",
     "session create",
     "session id",
     "profile list",
@@ -1302,6 +1303,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
     commands: [
       "verification snapshot",
       "verification execute",
+      "verification stage-candidate",
       "session create",
       "session id",
       "profile list",

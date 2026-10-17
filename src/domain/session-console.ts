@@ -329,6 +329,8 @@ export async function launchManagedSessionCommand(
       profile: VerificationProfileInput;
       expected_snapshot: SessionVerificationSnapshot;
     }>;
+    /** Exact owner snapshot CAS for a fixed managed operation that is not a verifier invocation. */
+    expected_session_snapshot?: SessionVerificationSnapshot;
     now?: () => string;
   }>,
 ): Promise<
@@ -565,12 +567,21 @@ export async function launchManagedSessionCommand(
       }),
     );
   }
-  if (input.verification !== undefined) {
+  if (input.verification !== undefined && input.expected_session_snapshot !== undefined) {
+    return failure(
+      new DomainError("INVALID_ARGUMENT", "Managed execution may carry only one owner snapshot precondition.", {
+        session_id: input.session_id,
+      }),
+    );
+  }
+  const expectedSnapshot = input.verification?.expected_snapshot ?? input.expected_session_snapshot;
+  if (expectedSnapshot !== undefined) {
+    if (backend.getSessionVerificationSnapshot === undefined) return managedRuntimeUnavailable(input.session_id);
     const snapshotCheck = await backend.getSessionVerificationSnapshot!(context, input.session_id);
     if (!snapshotCheck.ok) return snapshotCheck;
-    if (!isDeepStrictEqual(snapshotCheck.value, input.verification.expected_snapshot)) {
+    if (!isDeepStrictEqual(snapshotCheck.value, expectedSnapshot)) {
       return failure(
-        new DomainError("STALE_REGISTRY", "The owner-issued verification snapshot changed before reservation.", {
+        new DomainError("STALE_REGISTRY", "The owner-issued session snapshot changed before reservation.", {
           session_id: input.session_id,
           execution_id: executionId,
         }),
@@ -626,9 +637,7 @@ export async function launchManagedSessionCommand(
         command,
         ...(limits === undefined ? {} : { sandbox_limits: limits }),
         ...(input.stdio === undefined ? {} : { stdio: input.stdio }),
-        ...(input.verification === undefined
-          ? {}
-          : { expected_verification_snapshot: input.verification.expected_snapshot }),
+        ...(expectedSnapshot === undefined ? {} : { expected_verification_snapshot: expectedSnapshot }),
         admission: { session_id: input.session_id, execution_id: executionId, current: snapshot, expected: snapshot },
         starting_record: reservation.value,
         supervisor: {

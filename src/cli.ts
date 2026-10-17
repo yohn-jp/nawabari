@@ -90,6 +90,7 @@ import {
   getSessionVerificationSnapshot,
   type SessionBoundVerificationRequest,
 } from "./session-bound-verification.js";
+import { stageSessionCandidateBundle, type SessionCandidateBundleRequest } from "./session-candidate-bundle.js";
 import { readSessionVerificationRequestFile } from "./session-verification-cli-input.js";
 import { validateWorktreeProfileCatalog, type WorktreeProfileCatalog } from "./domain/worktree-profile-catalog.js";
 import { defaultGit, resolveRepositoryContext } from "./git.js";
@@ -1765,7 +1766,10 @@ async function executeCommand(
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
 
-  if (command === "verification" && (subcommand === "snapshot" || subcommand === "execute")) {
+  if (
+    command === "verification" &&
+    (subcommand === "snapshot" || subcommand === "execute" || subcommand === "stage-candidate")
+  ) {
     const commandName = `verification ${subcommand}`;
     const parsed = parseOptions(rest, dispatcherAllowedOptions(commandName));
     if (!parsed.ok) return parsed;
@@ -1783,17 +1787,24 @@ async function executeCommand(
         : result;
     }
     if (parsed.value.request_file === null) {
-      return failure(usageError("MISSING_ARGUMENT", "verification execute requires --request-file."));
+      return failure(usageError("MISSING_ARGUMENT", `verification ${subcommand} requires --request-file.`));
     }
     const text = readSessionVerificationRequestFile(parsed.value.request_file);
     if (!text.ok) return text;
     const request = boundedJsonInput(text.value, "--request-file");
     if (!request.ok) return request;
-    const result = await executeSessionBoundVerification(
-      context,
-      dependencies.backend,
-      request.value as SessionBoundVerificationRequest,
-    );
+    const result =
+      subcommand === "execute"
+        ? await executeSessionBoundVerification(
+            context,
+            dependencies.backend,
+            request.value as SessionBoundVerificationRequest,
+          )
+        : await stageSessionCandidateBundle(
+            context,
+            dependencies.backend,
+            request.value as SessionCandidateBundleRequest,
+          );
     return result.ok ? success(result.value as unknown as JsonObject) : result;
   }
 

@@ -116,6 +116,21 @@ const REGISTRY_DATA = [
     ],
   },
   {
+    name: "verification stage-candidate",
+    summary: "Stage an exact Git candidate into the owned session verifier working set",
+    usage: `${CLI_NAME} verification stage-candidate --request-file <path>`,
+    options: [
+      option("--request-file", "Bounded version 1 owner-bound Git candidate bundle request JSON", {
+        value: "<path>",
+        required: true,
+      }),
+    ],
+    notes: [
+      "Imports only the declared current bundle through strict managed execution after an exact session snapshot CAS.",
+      "The request contains no filesystem path; the bundle location is derived from the owned session worktree and SHA-256 identity.",
+    ],
+  },
+  {
     name: "session create",
     summary: "Request a new Nawabari session",
     usage:

@@ -52,6 +52,28 @@ import {
   SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID,
   SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION,
 } from "./domain/session.js";
+import {
+  SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+  MAX_SESSION_CANDIDATE_BUNDLE_BYTES,
+  sessionCandidateBundleTransferPath,
+  stageSessionCandidateBundle,
+} from "./session-candidate-bundle.js";
+
+export {
+  SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+  MAX_SESSION_CANDIDATE_BUNDLE_BYTES,
+  sessionCandidateBundleTransferPath,
+  stageSessionCandidateBundle,
+};
+export type {
+  SessionCandidateBundleRequest,
+  SessionCandidateBundleSource,
+  SessionCandidateBundleStageResult,
+} from "./session-candidate-bundle.js";
 
 export {
   SESSION_BOUND_VERIFICATION_CONTRACT_ID,
@@ -176,7 +198,16 @@ export function nawabariVerificationContract(): JsonObject {
     session_bound_execution_contract_id: SESSION_BOUND_VERIFICATION_CONTRACT_ID,
     session_bound_execution_schema_version: SESSION_BOUND_VERIFICATION_SCHEMA_VERSION,
     session_bound_execution_result_schema: SESSION_BOUND_VERIFICATION_RESULT_SCHEMA,
-    session_bound_operations: ["snapshot", "execute"],
+    session_bound_operations: ["snapshot", "execute", "stage-candidate"],
+    candidate_bundle_contract_id: SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+    candidate_bundle_schema_version: SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+    candidate_bundle_result_schema: SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA,
+    candidate_bundle_max_bytes: MAX_SESSION_CANDIDATE_BUNDLE_BYTES,
+    candidate_staging: {
+      mutates_working_set: true,
+      scope: "deterministic-owned-session-candidate-worktree",
+      verifier_write_policy: "deny",
+    },
     legacy_result_freshness: "unproven",
     read_visibility: ["declared", "repository"],
     write_policy: "deny",
