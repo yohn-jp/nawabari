@@ -19,9 +19,9 @@ test("masked parent proc selects a denied view without exposing parent processes
 });
 
 test("ordinary host procfs submounts preserve the existing private /proc contract", () => {
-  const hostUidMap = "         0          0 4294967295\\n";
+  const hostUidMap = "         0          0 4294967295\n";
   for (const child of ["/proc/bus", "/proc/irq", "/proc/sys", "/proc/kcore"]) {
-    const mountInfo = `${proc}\\n41 40 0:35 / ${child} ro - tmpfs tmpfs ro`;
+    const mountInfo = `${proc}\n41 40 0:35 / ${child} ro - tmpfs tmpfs ro`;
     assert.deepEqual(procfsPolicyFromMountInfo(mountInfo, hostUidMap), {
       mode: "private",
       reason: null,
@@ -30,8 +30,8 @@ test("ordinary host procfs submounts preserve the existing private /proc contrac
 });
 
 test("rootless OCI procfs overmounts remain denied instead of exposing parent processes", () => {
-  const rootlessUidMap = "         0       1000          1\\n         1     100000      65536\\n";
-  const masked = `${proc}\\n41 40 0:35 / /proc/sys ro - tmpfs tmpfs ro`;
+  const rootlessUidMap = "         0       1000          1\n         1     100000      65536\n";
+  const masked = `${proc}\n41 40 0:35 / /proc/sys ro - tmpfs tmpfs ro`;
   assert.deepEqual(procfsPolicyFromMountInfo(masked, rootlessUidMap), {
     mode: "denied",
     reason: "parent-procfs-has-overmounts",
