@@ -484,3 +484,23 @@ test("parent disconnect after GO surfaces a throwing cleanup callback", async ()
   assert.equal(result.error.details?.uncertainty, "parent-disconnected-after-go");
   assert.equal(result.error.details?.reason, "cleanup callback failed");
 });
+
+test("invalid supervisor arguments report bounds without exposing argument contents", async () => {
+  const result = await runSessionLaunchSupervisor({
+    ...packet(),
+    payload: { ...payload, args: ["private-secret".repeat(400)] },
+    process_factory: () => {
+      throw new Error("invalid arguments must not start the supervisor");
+    },
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.deepEqual(result.error.details, {
+      field: "sandbox argument list",
+      argument_index: 0,
+      argument_length: 5600,
+      max_argument_length: 4096,
+    });
+    assert.equal(JSON.stringify(result.error).includes("private-secret"), false);
+  }
+});

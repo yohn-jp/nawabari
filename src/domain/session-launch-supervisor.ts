@@ -228,8 +228,15 @@ function isSafeFd(value: unknown): value is number {
 
 function validateArgs(args: readonly string[] | undefined, field: string): DomainResult<readonly string[]> {
   const values = args ?? [];
-  if (values.some((value) => !isBoundedText(value))) {
-    return invalid(`The trusted supervisor ${field} contains an invalid argument.`, { field });
+  const invalidIndex = values.findIndex((value) => !isBoundedText(value));
+  if (invalidIndex !== -1) {
+    const value = values[invalidIndex];
+    return invalid(`The trusted supervisor ${field} contains an invalid argument.`, {
+      field,
+      argument_index: invalidIndex,
+      argument_length: typeof value === "string" ? value.length : null,
+      max_argument_length: MAX_TEXT_LENGTH,
+    });
   }
   return success([...values]);
 }
