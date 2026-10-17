@@ -45,7 +45,10 @@ export function procfsPolicyFromMountInfo(mountInfo: string, uidMap?: string): S
 
 export function observeSandboxProcfsPolicy(): SandboxProcfsPolicy {
   try {
-    return procfsPolicyFromMountInfo(readFileSync("/proc/self/mountinfo", "utf8"), readFileSync("/proc/self/uid_map", "utf8"));
+    return procfsPolicyFromMountInfo(
+      readFileSync("/proc/self/mountinfo", "utf8"),
+      readFileSync("/proc/self/uid_map", "utf8"),
+    );
   } catch {
     return { mode: "denied", reason: "parent-procfs-unobservable" };
   }
