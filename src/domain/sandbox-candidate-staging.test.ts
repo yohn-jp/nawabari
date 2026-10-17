@@ -33,6 +33,32 @@ test("candidate scratch is fixed, owner-private, and cannot override immutable o
     const noWorkingSet = { ...request, runtime_projection: { ...request.runtime_projection!, working_set: undefined } };
     assert.equal(resolveOwnerCandidateStagingRoot(noWorkingSet).ok, false);
     assert.equal(resolveOwnerCandidateStagingRoot({ ...request, owner_candidate_staging: undefined }).ok, true);
+    fs.mkdirSync(path.join(scratch, "repo/.git"), { recursive: true, mode: 0o700 });
+    const verification = {
+      candidate_digest: `sha256:${"a".repeat(64)}`,
+      source_key: "b".repeat(24),
+      head_id: "c".repeat(40),
+      tree_id: "d".repeat(40),
+      base_commit: "e".repeat(40),
+    };
+    const readonlyRequest = {
+      ...request,
+      owner_candidate_staging: undefined,
+      owner_candidate_verification: verification,
+    };
+    assert.deepEqual(resolveOwnerCandidateStagingRoot(readonlyRequest), { ok: true, value: scratch });
+    assert.equal(
+      resolveOwnerCandidateStagingRoot({ ...request, owner_candidate_verification: verification }).ok,
+      false,
+    );
+    assert.equal(
+      resolveOwnerCandidateStagingRoot({
+        ...readonlyRequest,
+        owner_candidate_verification: { ...verification, base_commit: "unknown" },
+      }).ok,
+      false,
+    );
+    fs.rmSync(path.join(scratch, "repo"), { recursive: true, force: true });
     fs.chmodSync(scratch, 0o755);
     assert.equal(resolveOwnerCandidateStagingRoot(request).ok, false);
     fs.chmodSync(scratch, 0o700);
