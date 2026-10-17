@@ -1774,7 +1774,13 @@ async function executeCommand(
         return failure(usageError("MISSING_ARGUMENT", "verification snapshot requires --session."));
       }
       const result = await getSessionVerificationSnapshot(context, dependencies.backend, parsed.value.session_id);
-      return result.ok ? success(result.value as unknown as JsonObject) : result;
+      return result.ok
+        ? success({
+            contract_id: "nawabari.session-verification-snapshot.v1",
+            schema_version: 1,
+            snapshot: result.value as unknown as JsonObject,
+          })
+        : result;
     }
     if (parsed.value.request_file === null) {
       return failure(usageError("MISSING_ARGUMENT", "verification execute requires --request-file."));
