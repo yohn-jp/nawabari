@@ -277,18 +277,36 @@ def main() -> int:
         return [*selected_prefix, args.nawabari, "--json", *argv]
 
     def launch_persistent(
-        name: str, session_id: str, session_worktree: str
+        name: str,
+        session_id: str,
+        session_worktree: str,
+        cancellation_marker: tuple[str, str] | None = None,
     ) -> tuple[subprocess.Popen[bytes], pathlib.Path, pathlib.Path]:
         # A finite in-sandbox deadline is a safety bound if owner cancellation
         # is rejected; the host never signals the payload or its descendants.
-        child = "setInterval(()=>{},1000)"
-        payload = (
-            "const {spawn}=require('node:child_process');"
-            f"const child=spawn(process.execPath,['-e',{json.dumps(child)}],{{stdio:'ignore'}});"
-            "process.stdout.write(JSON.stringify({parent:process.pid,child:child.pid})+'\\n');"
-            f"setTimeout(()=>{{try{{child.kill()}}catch{{}};process.exit(0)}},{45000 if name.startswith('target') else 60000});"
-            "setInterval(()=>{},1000);"
-        )
+        if cancellation_marker is None:
+            child = "setInterval(()=>{},1000)"
+            payload = (
+                "const {spawn}=require('node:child_process');"
+                f"const child=spawn(process.execPath,['-e',{json.dumps(child)}],{{stdio:'ignore'}});"
+                "process.stdout.write(JSON.stringify({parent:process.pid,child:child.pid})+'\\n');"
+                f"setTimeout(()=>{{try{{child.kill()}}catch{{}};process.exit(0)}},{45000 if name.startswith('target') else 60000});"
+                "setInterval(()=>{},1000);"
+            )
+            command_arguments = ["node", "-e", payload]
+        else:
+            owned_path, nonce = cancellation_marker
+            child = "setInterval(()=>{},1000)"
+            payload = (
+                "const fs=require('node:fs'),{spawn}=require('node:child_process');"
+                "const [owned,nonce]=process.argv.slice(1);"
+                f"const child=spawn(process.execPath,['-e',{json.dumps(child)}],{{stdio:'ignore'}});"
+                "child.once('spawn',()=>{const marker={nonce,parent:process.pid,child:child.pid};"
+                "const raw=JSON.stringify(marker)+'\\n';fs.writeFileSync(owned,raw);process.stdout.write(raw);});"
+                "setTimeout(()=>{try{child.kill()}catch{};process.exit(0)},45000);"
+                "setInterval(()=>{},1000);"
+            )
+            command_arguments = ["node", "-e", payload, owned_path, nonce]
         command = command_line(
             [
                 "session",
@@ -298,9 +316,7 @@ def main() -> int:
                 "--runtime-policy",
                 "strict",
                 "--",
-                "node",
-                "-e",
-                payload,
+                *command_arguments,
             ],
             session_worktree,
         )
@@ -364,6 +380,25 @@ def main() -> int:
         if value.get("stdout_bytes") != len(stdout) or value.get("stderr_bytes") != len(stderr):
             return None
         if value.get("observed_stdout_bytes") != len(stdout) or value.get("observed_stderr_bytes") != len(stderr):
+            return None
+        return stdout, stderr
+
+    def observed_raw_streams(value: object) -> tuple[bytes, bytes] | None:
+        """Validate the bytes actually captured, even when termination truncated the stream."""
+        if not isinstance(value, dict) or value.get("encoding") != "base64":
+            return None
+        try:
+            stdout = base64.b64decode(value.get("stdout", ""), validate=True)
+            stderr = base64.b64decode(value.get("stderr", ""), validate=True)
+        except (ValueError, TypeError):
+            return None
+        if value.get("stdout_bytes") != len(stdout) or value.get("stderr_bytes") != len(stderr):
+            return None
+        if value.get("observed_stdout_bytes") != len(stdout) or value.get("observed_stderr_bytes") != len(stderr):
+            return None
+        complete = value.get("complete")
+        truncated = value.get("truncated")
+        if not ((complete is True and truncated is False) or (complete is False and truncated is True)):
             return None
         return stdout, stderr
 
@@ -449,6 +484,125 @@ def main() -> int:
         if len(fields) <= 19 or not fields[19].isdigit():
             raise RuntimeError("host process starttime could not be parsed")
         return fields[19]
+
+    def observe_host_process(pid: int) -> dict | None:
+        """Read a bounded identity for one PID named by the exact owned cgroup."""
+        stat_path = pathlib.Path(f"/proc/{pid}/stat")
+        status_path = pathlib.Path(f"/proc/{pid}/status")
+        try:
+            stat_before = stat_path.read_text()
+            command_end = stat_before.rfind(")")
+            if command_end < 0:
+                raise RuntimeError("host process stat did not contain a command boundary")
+            fields = stat_before[command_end + 1 :].strip().split()
+            if len(fields) <= 19 or not fields[1].isdigit() or not fields[19].isdigit():
+                raise RuntimeError("host process stat omitted its parent or generation")
+            starttime = fields[19]
+            parent_pid = int(fields[1])
+            comm = pathlib.Path(f"/proc/{pid}/comm").read_text().strip()
+            nspid_line = next(
+                (line for line in status_path.read_text().splitlines() if line.startswith("NSpid:")),
+                None,
+            )
+            if nspid_line is None:
+                raise RuntimeError("host process status omitted its PID namespace mapping")
+            namespace_pids = [int(value) for value in nspid_line.split()[1:]]
+            if not namespace_pids or any(value < 1 for value in namespace_pids):
+                raise RuntimeError("host process status contained invalid namespace PIDs")
+            pid_namespace = pathlib.Path(f"/proc/{pid}/ns/pid").readlink().as_posix()
+            cgroup = proc_unified_cgroup(pid)
+            executable = pathlib.Path(f"/proc/{pid}/exe").readlink().as_posix()
+            stat_after = stat_path.read_text()
+            command_end_after = stat_after.rfind(")")
+            if command_end_after < 0:
+                raise RuntimeError("host process stat lost its command boundary")
+            fields_after = stat_after[command_end_after + 1 :].strip().split()
+            if (
+                len(fields_after) <= 19
+                or fields_after[19] != starttime
+                or not fields_after[1].isdigit()
+                or int(fields_after[1]) != parent_pid
+                or pathlib.Path(f"/proc/{pid}/ns/pid").readlink().as_posix() != pid_namespace
+                or proc_unified_cgroup(pid) != cgroup
+            ):
+                raise RuntimeError("host process identity changed during bounded observation")
+        except FileNotFoundError:
+            return None
+        return {
+            "host_pid": pid,
+            "host_parent_pid": parent_pid,
+            "starttime": starttime,
+            "comm": comm,
+            "executable_basename": pathlib.PurePosixPath(executable).name,
+            "namespace_pids_outer_to_inner": namespace_pids,
+            "pid_namespace": pid_namespace,
+            "cgroup": cgroup,
+        }
+
+    def observe_pid_namespace_members(namespace_identity: str) -> dict:
+        """Return a fail-closed snapshot of processes in one observed PID namespace."""
+        members = []
+        unobservable = []
+        for entry in pathlib.Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                start_before = proc_starttime(pid)
+                identity = pathlib.Path(f"/proc/{pid}/ns/pid").readlink().as_posix()
+                if identity != namespace_identity:
+                    continue
+                cgroup = proc_unified_cgroup(pid)
+                start_after = proc_starttime(pid)
+                identity_after = pathlib.Path(f"/proc/{pid}/ns/pid").readlink().as_posix()
+                if start_before != start_after or identity_after != identity:
+                    unobservable.append({"host_pid": pid, "reason": "identity-changed-during-observation"})
+                    continue
+                members.append({"host_pid": pid, "starttime": start_before, "cgroup": cgroup})
+            except FileNotFoundError:
+                # Process exit during the read is a race; the next complete
+                # scan decides whether the namespace is empty.
+                continue
+            except (PermissionError, OSError, RuntimeError, ValueError) as error:
+                unobservable.append({"host_pid": pid, "reason": type(error).__name__})
+        members.sort(key=lambda item: item["host_pid"])
+        unobservable.sort(key=lambda item: item["host_pid"])
+        return {
+            "pid_namespace": namespace_identity,
+            "state": "unknown" if unobservable else ("populated" if members else "empty"),
+            "members": members,
+            "unobservable": unobservable,
+            "observed_at_unix": time.time(),
+        }
+
+    def observe_host_scope_population(scope_path: pathlib.Path) -> dict:
+        if any(path.is_symlink() for path in (scope_path, scope_path.parent, scope_path.parent.parent)):
+            raise RuntimeError("exact owner scope path contains a symlink")
+        if not scope_path.is_dir():
+            raise RuntimeError("exact owner scope disappeared before physical cleanup could be observed")
+        events = read_bounded_text(scope_path / "cgroup.events", 4 * 1024)
+        procs_text = read_bounded_text(scope_path / "cgroup.procs", 64 * 1024)
+        pids_text = read_bounded_text(scope_path / "pids.current", 4 * 1024)
+        event_values = {
+            key: value
+            for line in events.splitlines()
+            if len((parts := line.split())) == 2
+            for key, value in [parts]
+        }
+        host_pids = [int(value) for value in procs_text.splitlines() if value.isdigit()]
+        if len(host_pids) != len(procs_text.splitlines()):
+            raise RuntimeError("exact owner scope contained malformed cgroup.procs data")
+        return {
+            "scope_path": str(scope_path),
+            "events": events,
+            "population": event_values.get("populated"),
+            "host_pids": host_pids,
+            "pids_current": pids_text,
+            "state": "empty"
+            if event_values.get("populated") == "0" and not host_pids and pids_text == "0"
+            else "populated",
+            "observed_at_unix": time.time(),
+        }
 
     def proc_unified_cgroup(pid: int) -> str:
         raw = pathlib.Path(f"/proc/{pid}/cgroup").read_text()
@@ -551,6 +705,8 @@ def main() -> int:
                 raise RuntimeError("container init process identity or cgroup changed during observation")
             netns = pathlib.Path(f"/proc/{host_pid}/ns/net").readlink().as_posix()
             caller_netns = pathlib.Path("/proc/self/ns/net").readlink().as_posix()
+            pidns = pathlib.Path(f"/proc/{host_pid}/ns/pid").readlink().as_posix()
+            caller_pidns = pathlib.Path("/proc/self/ns/pid").readlink().as_posix()
             net_prefix = pathlib.Path(f"/proc/{host_pid}/net")
             net_devices = read_bounded_text(net_prefix / "dev", 16 * 1024)
             ipv4_routes = read_bounded_text(net_prefix / "route", 16 * 1024)
@@ -573,6 +729,9 @@ def main() -> int:
                 "network_namespace": netns,
                 "caller_network_namespace": caller_netns,
                 "network_namespace_distinct_from_caller": netns != caller_netns,
+                "pid_namespace": pidns,
+                "caller_pid_namespace": caller_pidns,
+                "pid_namespace_distinct_from_caller": pidns != caller_pidns,
                 "network_observation": {
                     "interfaces": interface_names,
                     "ipv4_route_rows": ipv4_route_rows,
@@ -767,6 +926,255 @@ def main() -> int:
                 failures.append(f"{name} process observation: {error}")
             time.sleep(0.5)
         return latest
+
+    def wait_for_started_payload(
+        name: str,
+        session_id: str,
+        session_worktree: str,
+        process: subprocess.Popen[bytes],
+        marker_path: str,
+        nonce: str,
+        host_container: dict | None,
+    ) -> tuple[dict, dict] | None:
+        """Require a payload-written nonce and matching host PIDs before cancellation."""
+        if not isinstance(host_container, dict):
+            failures.append(f"{name} has no host-observed container identity for process correlation")
+            return None
+        deadline = time.monotonic() + max(5, min(args.timeout_seconds, 30))
+        marker_reader = (
+            "const fs=require('node:fs');let out;try{const raw=fs.readFileSync(process.argv[1],'utf8');"
+            "out={state:'observed',marker:JSON.parse(raw)}}catch(e){out={state:e&&e.code==='ENOENT'?'absent':'unreadable'};}"
+            "process.stdout.write(JSON.stringify(out)+'\\n');"
+        )
+        selected_prefix = [
+            args.podman_wrapper,
+            "exec",
+            "--workdir",
+            session_worktree,
+            args.container_id,
+            *env,
+        ]
+        marker_observation: dict | None = None
+        owner_observation: dict | None = None
+        attempt = 0
+        while time.monotonic() < deadline and process.poll() is None:
+            attempt += 1
+            owner_observation = process_snapshot(f"{name}-processes-before-cancel-{attempt:02d}", session_id)
+            marker_result = subprocess.run(
+                [*selected_prefix, "node", "-e", marker_reader, marker_path],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            save(f"{name}-payload-marker-{attempt:02d}.stdout", marker_result.stdout)
+            save(f"{name}-payload-marker-{attempt:02d}.stderr", marker_result.stderr)
+            try:
+                parsed_marker_observation = json.loads(marker_result.stdout)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                parsed_marker_observation = None
+            if isinstance(parsed_marker_observation, dict):
+                marker_observation = parsed_marker_observation
+            marker = marker_observation.get("marker") if isinstance(marker_observation, dict) else None
+            if (
+                marker_result.returncode == 0
+                and isinstance(marker_observation, dict)
+                and marker_observation.get("state") == "observed"
+                and isinstance(marker, dict)
+                and marker.get("nonce") == nonce
+                and isinstance(marker.get("parent"), int)
+                and not isinstance(marker.get("parent"), bool)
+                and isinstance(marker.get("child"), int)
+                and not isinstance(marker.get("child"), bool)
+                and marker.get("parent") > 0
+                and marker.get("child") > 0
+                and marker.get("parent") != marker.get("child")
+            ):
+                processes = owner_observation.get("processes")
+                active_records = [
+                    item
+                    for item in processes
+                    if isinstance(item, dict)
+                    and isinstance(item.get("execution"), dict)
+                    and item["execution"].get("session_id") == session_id
+                    and item["execution"].get("state") == "attached"
+                    and isinstance(item.get("cgroups"), dict)
+                    and item["cgroups"].get("state") == "active"
+                    and isinstance(item["cgroups"].get("cgroups"), dict)
+                    and item["cgroups"]["cgroups"].get("population", {}).get("state") == "populated"
+                ] if isinstance(processes, list) else []
+                if len(active_records) == 1:
+                    scope_document = observe_owned_cgroup_limits(
+                        f"{name}-active-before-cancel",
+                        owner_observation,
+                        session_id,
+                        host_container,
+                    )
+                    if isinstance(scope_document, dict):
+                        observed_processes = []
+                        for host_pid in scope_document["host_scope_population"]["host_process_ids"]:
+                            observed = observe_host_process(host_pid)
+                            if observed is not None:
+                                observed_processes.append(observed)
+                        inner_to_host = {}
+                        for inner_pid in (marker["parent"], marker["child"]):
+                            matches = [
+                                item
+                                for item in observed_processes
+                                if item["namespace_pids_outer_to_inner"][-1] == inner_pid
+                            ]
+                            if len(matches) == 1:
+                                inner_to_host[inner_pid] = matches[0]
+                        parent = inner_to_host.get(marker["parent"])
+                        child = inner_to_host.get(marker["child"])
+                        expected_scope = scope_document.get("host_scope_path")
+                        if not isinstance(expected_scope, str) or not expected_scope.startswith("/sys/fs/cgroup/"):
+                            time.sleep(0.5)
+                            continue
+                        expected_cgroup = "/" + pathlib.Path(expected_scope).relative_to("/sys/fs/cgroup").as_posix()
+                        if (
+                            isinstance(parent, dict)
+                            and isinstance(child, dict)
+                            and parent.get("host_pid") != child.get("host_pid")
+                            and child.get("host_parent_pid") == parent.get("host_pid")
+                            and parent.get("pid_namespace") == child.get("pid_namespace")
+                            and parent.get("pid_namespace") != host_container.get("pid_namespace")
+                            and parent.get("cgroup") == expected_cgroup
+                            and child.get("cgroup") == parent.get("cgroup")
+                            and parent.get("executable_basename") == "node"
+                            and child.get("executable_basename") == "node"
+                        ):
+                            result = {
+                                "session_id": session_id,
+                                "execution_id": active_records[0]["execution"].get("execution_id"),
+                                "payload_marker": marker,
+                                "marker_path": marker_path,
+                                "host_scope_path": expected_scope,
+                                "host_scope_population": scope_document["host_scope_population"],
+                                "payload_parent": parent,
+                                "payload_child": child,
+                                "all_scope_processes": observed_processes,
+                                "container_pid_namespace": host_container.get("pid_namespace"),
+                                "payload_pid_namespace": parent["pid_namespace"],
+                                "namespace_distinct_from_container": True,
+                                "observed_at_unix": time.time(),
+                            }
+                            (evidence / f"{name}-payload-processes-before-cancel.json").write_text(
+                                json.dumps(result, indent=2) + "\n"
+                            )
+                            return owner_observation, result
+            time.sleep(0.5)
+        if isinstance(marker_observation, dict):
+            (evidence / f"{name}-last-payload-marker-observation.json").write_text(
+                json.dumps(marker_observation, indent=2) + "\n"
+            )
+        return None
+
+    def wait_for_owner_scope_empty(
+        name: str,
+        session_id: str,
+        execution_id: str,
+        owner_scope: str,
+        pid_namespace: str,
+    ) -> dict:
+        """Observe exact owner, host cgroup, and PID-namespace cleanup independently."""
+        deadline = time.monotonic() + 20
+        scope_path = pathlib.Path(owner_scope)
+        namespace_samples = []
+        cgroup_samples = []
+        process_snapshot_doc = None
+        owner_empty_observations = 0
+        host_empty_observations = 0
+        namespace_empty_observations = 0
+        owner_record = None
+        while time.monotonic() < deadline:
+            process_result, process_snapshot_doc = invoke(
+                f"{name}-processes-after-close-{len(namespace_samples) + 1:02d}",
+                ["session", "processes", "--session", session_id],
+                15,
+            )
+            processes = process_snapshot_doc.get("processes") if isinstance(process_snapshot_doc, dict) else None
+            matches = [
+                item
+                for item in processes
+                if isinstance(item, dict)
+                and isinstance(item.get("execution"), dict)
+                and item["execution"].get("execution_id") == execution_id
+                and item["execution"].get("session_id") == session_id
+            ] if isinstance(processes, list) else []
+            if process_result.returncode == 0 and len(matches) == 1:
+                owner_record = matches[0]
+                cgroups = owner_record.get("cgroups")
+                nested_cgroups = cgroups.get("cgroups") if isinstance(cgroups, dict) else None
+                exact_scope = nested_cgroups.get("scope") if isinstance(nested_cgroups, dict) else None
+                if exact_scope == scope_path.name and isinstance(cgroups, dict) and cgroups.get("state") == "empty":
+                    owner_empty_observations += 1
+                else:
+                    owner_empty_observations = 0
+            else:
+                owner_empty_observations = 0
+
+            try:
+                cgroup_snapshot = observe_host_scope_population(scope_path)
+            except (OSError, RuntimeError, ValueError) as error:
+                cgroup_snapshot = {
+                    "scope_path": str(scope_path),
+                    "state": "unknown",
+                    "error": f"{type(error).__name__}: {error}",
+                    "observed_at_unix": time.time(),
+                }
+            namespace_snapshot = observe_pid_namespace_members(pid_namespace)
+            cgroup_samples.append(cgroup_snapshot)
+            namespace_samples.append(namespace_snapshot)
+            if cgroup_snapshot.get("state") == "empty":
+                host_empty_observations += 1
+            else:
+                host_empty_observations = 0
+            if namespace_snapshot.get("state") == "empty":
+                namespace_empty_observations += 1
+            else:
+                namespace_empty_observations = 0
+            if (
+                owner_empty_observations >= 2
+                and host_empty_observations >= 2
+                and namespace_empty_observations >= 2
+            ):
+                result = {
+                    "session_id": session_id,
+                    "execution_id": execution_id,
+                    "owner_scope_path": str(scope_path),
+                    "pid_namespace": pid_namespace,
+                    "owner_record": owner_record,
+                    "owner_cgroup_state": "empty",
+                    "host_cgroup_state": "empty",
+                    "pid_namespace_state": "empty",
+                    "owner_empty_observations": owner_empty_observations,
+                    "host_empty_observations": host_empty_observations,
+                    "pid_namespace_empty_observations": namespace_empty_observations,
+                    "host_cgroup_samples": cgroup_samples,
+                    "pid_namespace_samples": namespace_samples,
+                    "observed_at_unix": time.time(),
+                }
+                (evidence / f"{name}-physical-cleanup.json").write_text(json.dumps(result, indent=2) + "\n")
+                return result
+            time.sleep(0.25)
+        result = {
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "owner_scope_path": str(scope_path),
+            "pid_namespace": pid_namespace,
+            "owner_record": owner_record,
+            "owner_cgroup_state": "empty" if owner_empty_observations >= 2 else "unknown",
+            "host_cgroup_state": "empty" if host_empty_observations >= 2 else "unknown",
+            "pid_namespace_state": "empty" if namespace_empty_observations >= 2 else "unknown",
+            "owner_empty_observations": owner_empty_observations,
+            "host_empty_observations": host_empty_observations,
+            "pid_namespace_empty_observations": namespace_empty_observations,
+            "host_cgroup_samples": cgroup_samples,
+            "pid_namespace_samples": namespace_samples,
+            "observed_at_unix": time.time(),
+        }
+        (evidence / f"{name}-physical-cleanup.json").write_text(json.dumps(result, indent=2) + "\n")
+        return result
 
     try:
         container_state = subprocess.run(
@@ -1396,30 +1804,97 @@ def main() -> int:
             if not isinstance(owned_execution, dict) or owned_execution.get("state") != "empty":
                 failures.append("verifier timeout did not preserve observed-empty owner cgroup evidence")
             timeout_raw = timeout_evidence.get("raw_output") if isinstance(timeout_evidence, dict) else None
-            timeout_streams = complete_raw_streams(timeout_raw)
-            if timeout_streams is None or b"timeout-child-started" not in timeout_streams[0]:
-                failures.append("verifier timeout did not preserve complete byte-faithful output from the started payload")
+            timeout_streams = observed_raw_streams(timeout_raw)
+            if timeout_streams is None or b"timeout-child-started\n" not in timeout_streams[0]:
+                failures.append("verifier timeout did not preserve the observed byte-faithful start marker")
+            elif isinstance(timeout_raw, dict):
+                (evidence / "timeout-raw-output-observation.json").write_text(
+                    json.dumps(
+                        {
+                            "complete": timeout_raw.get("complete"),
+                            "truncated": timeout_raw.get("truncated"),
+                            "stdout_bytes": timeout_raw.get("stdout_bytes"),
+                            "observed_stdout_bytes": timeout_raw.get("observed_stdout_bytes"),
+                            "stderr_bytes": timeout_raw.get("stderr_bytes"),
+                            "observed_stderr_bytes": timeout_raw.get("observed_stderr_bytes"),
+                            "observed_marker": True,
+                            "verification_pass_claimed": False,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
 
         # Cancel the tested target itself after its successful positive and
         # verifier checks. It is replaced publicly only after its close
         # releases the exclusive write claim, so sibling sessions never race
         # for the same write lease.
-        target, _, _ = launch_persistent("target-strict-run", args.session, target_worktree)
-        target_active = wait_active("target", args.session, target)
+        target_nonce = uuid.uuid4().hex
+        target_marker_path = str(pathlib.PurePosixPath(target_worktree) / owned_file)
+        target, _, _ = launch_persistent(
+            "target-strict-run",
+            args.session,
+            target_worktree,
+            (target_marker_path, target_nonce),
+        )
+        target_started = wait_for_started_payload(
+            "target",
+            args.session,
+            target_worktree,
+            target,
+            target_marker_path,
+            target_nonce,
+            container_host_cgroup,
+        )
         target_cgroup_limits = None
         close_completed = False
         close_dirty_worktree = False
         discard_completed = False
         target_cgroup_empty = False
-        if target_active is None or not active_cgroup(target_active):
-            failures.append("target strict execution never exposed an active observed owned cgroup")
+        target_pid_namespace_empty = False
+        target_cleanup = None
+        target_process_observation = None
+        expected_cancelled_execution = None
+        if target_started is None:
+            failures.append(
+                "target cancellation was withheld because a payload-written nonce and matching live host parent/child were not observed in the exact owned cgroup"
+            )
             try:
                 collect_process(target, "target-strict-run", 55)
             except RuntimeError as error:
                 failures.append(str(error))
         else:
-            target_cgroup_limits = observe_owned_cgroup_limits(
-                "target-active-before-cancel", target_active, proof_target_session_id, container_host_cgroup
+            target_process_observation, target_pre_cancel = target_started
+            expected_cancelled_execution = target_pre_cancel.get("execution_id")
+            scope_path = target_pre_cancel.get("host_scope_path")
+            pid_namespace = target_pre_cancel.get("payload_pid_namespace")
+            target_cgroup_limits_path = evidence / "target-active-before-cancel-owned-cgroup-limits.json"
+            if target_cgroup_limits_path.exists():
+                target_cgroup_limits = json.loads(target_cgroup_limits_path.read_text())
+            if (
+                not isinstance(expected_cancelled_execution, str)
+                or not isinstance(scope_path, str)
+                or not isinstance(pid_namespace, str)
+            ):
+                failures.append("pre-cancel live payload evidence omitted its exact execution/cgroup/PID namespace correlation")
+            (evidence / "target-before-public-cancel.json").write_text(
+                json.dumps(
+                    {
+                        "execution_id": expected_cancelled_execution,
+                        "session_id": proof_target_session_id,
+                        "payload_start_observed": True,
+                        "marker_nonce": target_nonce,
+                        "marker_path": target_marker_path,
+                        "parent_host_pid": target_pre_cancel["payload_parent"]["host_pid"],
+                        "child_host_pid": target_pre_cancel["payload_child"]["host_pid"],
+                        "host_scope_path": scope_path,
+                        "payload_pid_namespace": pid_namespace,
+                        "owner_snapshot": target_process_observation,
+                        "host_process_observation": target_pre_cancel,
+                    },
+                    indent=2,
+                )
+                + "\n"
             )
             close_result, close_doc = invoke(
                 "target-close-terminate",
@@ -1455,45 +1930,67 @@ def main() -> int:
             if run_evidence is None and isinstance(target_doc, dict):
                 run_evidence = recursively_find(target_doc, "physical_execution")
             target_physical = run_evidence.get("physical_execution") if isinstance(run_evidence, dict) else None
-            if not isinstance(target_physical, dict):
-                failures.append("cancelled run did not preserve physical execution evidence")
-            else:
+            if isinstance(target_physical, dict):
+                if target_physical.get("correlation_id") != expected_cancelled_execution:
+                    failures.append("cancelled run receipt did not match the exact live owner execution")
                 if target_physical.get("procfs", {}).get("mode") != "denied":
-                    failures.append("cancelled run did not preserve its selected inherited-masked procfs topology")
-                if target_physical.get("cleanup", {}).get("state") != "observed-empty":
-                    failures.append("cancelled run did not observe the owned PID namespace empty")
-                if target_physical.get("termination", {}).get("state") != "observed-exited":
-                    failures.append("cancelled run did not observe the payload exited")
-                if target_physical.get("termination", {}).get("reason") != "cancelled":
-                    failures.append("public close did not produce an observed cancelled termination reason")
+                    failures.append("cancelled run receipt did not preserve the selected inherited-masked procfs topology")
+                if target_physical.get("cleanup", {}).get("state") not in ("observed-empty", "unknown"):
+                    failures.append("cancelled run receipt reported unexpected PID namespace cleanup state")
+            (evidence / "target-run-cancellation-response.json").write_text(
+                json.dumps(
+                    {
+                        "execution_id": expected_cancelled_execution,
+                        "run_command_response": target_doc,
+                        "physical_execution_receipt": target_physical,
+                        "physical_receipt_present": isinstance(target_physical, dict),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
             target_raw = recursively_find(target_doc, "raw_output") if isinstance(target_doc, dict) else None
-            target_streams = complete_raw_streams(target_raw)
-            if target_streams is None or b'"parent"' not in target_streams[0] or b'"child"' not in target_streams[0]:
-                failures.append("cancelled strict run did not preserve complete byte-faithful parent/descendant output")
-
-            target_after_close = process_snapshot("target-processes-after-close", proof_target_session_id)
-            expected_cancelled_execution = (
-                target_physical.get("correlation_id") if isinstance(target_physical, dict) else None
-            )
-            process_records = target_after_close.get("processes")
-            matching_cancelled = [
-                item
-                for item in process_records
-                if isinstance(item, dict)
-                and isinstance(item.get("execution"), dict)
-                and item["execution"].get("execution_id") == expected_cancelled_execution
-            ] if isinstance(process_records, list) else []
-            if not isinstance(expected_cancelled_execution, str) or len(matching_cancelled) != 1:
-                failures.append("post-close session observation did not find the exact cancelled execution record")
-            elif not isinstance(matching_cancelled[0].get("cgroups"), dict) or matching_cancelled[0]["cgroups"].get("state") != "empty":
-                failures.append("post-close owner observation did not prove the exact cancelled execution cgroup empty")
+            target_streams = observed_raw_streams(target_raw)
+            if target_raw is not None:
+                if target_streams is None:
+                    failures.append("cancelled run raw output failed byte-count/base64 integrity validation")
+                else:
+                    (evidence / "target-cancelled-raw-output-observation.json").write_text(
+                        json.dumps(
+                            {
+                                "encoding": target_raw.get("encoding") if isinstance(target_raw, dict) else None,
+                                "complete": target_raw.get("complete") if isinstance(target_raw, dict) else None,
+                                "truncated": target_raw.get("truncated") if isinstance(target_raw, dict) else None,
+                                "stdout_bytes": target_raw.get("stdout_bytes") if isinstance(target_raw, dict) else None,
+                                "observed_stdout_bytes": target_raw.get("observed_stdout_bytes") if isinstance(target_raw, dict) else None,
+                                "stderr_bytes": target_raw.get("stderr_bytes") if isinstance(target_raw, dict) else None,
+                                "observed_stderr_bytes": target_raw.get("observed_stderr_bytes") if isinstance(target_raw, dict) else None,
+                                "payload_start_marker_observed": b'"nonce"' in target_streams[0],
+                                "complete_output_claimed": False,
+                            },
+                            indent=2,
+                        )
+                        + "\n"
+                    )
+            if isinstance(expected_cancelled_execution, str) and isinstance(scope_path, str) and isinstance(pid_namespace, str):
+                target_cleanup = wait_for_owner_scope_empty(
+                    "target-cancelled",
+                    proof_target_session_id,
+                    expected_cancelled_execution,
+                    scope_path,
+                    pid_namespace,
+                )
+                target_cgroup_empty = (
+                    target_cleanup.get("owner_cgroup_state") == "empty"
+                    and target_cleanup.get("host_cgroup_state") == "empty"
+                )
+                target_pid_namespace_empty = target_cleanup.get("pid_namespace_state") == "empty"
+                if not target_cgroup_empty:
+                    failures.append("public owner and host kernel did not both observe the exact cancelled cgroup empty")
+                if not target_pid_namespace_empty:
+                    failures.append("host kernel did not observe the exact cancelled payload PID namespace empty")
             else:
-                target_cgroup_empty = True
-
-            target_pid_namespace_empty = (
-                isinstance(target_physical, dict)
-                and target_physical.get("cleanup", {}).get("state") == "observed-empty"
-            )
+                failures.append("cancelled execution could not be correlated to exact post-close owner cleanup observations")
             if close_dirty_worktree:
                 if not target_pid_namespace_empty or not target_cgroup_empty:
                     failures.append("explicit discard was withheld because owner and PID-namespace cleanup were not both observed empty")
@@ -1521,6 +2018,7 @@ def main() -> int:
                                 "close_code": "DIRTY_WORKTREE",
                                 "physical_pid_namespace_empty": target_pid_namespace_empty,
                                 "owner_cgroup_empty": target_cgroup_empty,
+                                "owner_cleanup_observation": target_cleanup,
                                 "discard_exit_code": discard_result.returncode,
                                 "discard_response": discard_doc,
                                 "discard_completed": discard_completed,
