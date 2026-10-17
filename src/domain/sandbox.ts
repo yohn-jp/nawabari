@@ -223,6 +223,12 @@ export type SandboxExecutionRequest = {
   runtime_resolution?: RuntimeResolutionEvidence;
   /** Accepted #448 environment; protected composition supplies this additively. */
   compiled_session_environment?: CompiledSessionEnvironment;
+  /**
+   * Fixed owner-only scratch allowance for the candidate-bundle import operation.
+   * The caller supplies identities only; the launcher derives the path below the
+   * canonical session worktree and grants no such allowance to agent commands.
+   */
+  owner_candidate_staging?: Readonly<{ candidate_digest: string; source_key: string }>;
 };
 
 export type SandboxCgroupConfig = {

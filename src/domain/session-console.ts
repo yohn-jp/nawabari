@@ -312,6 +312,32 @@ function managedRuntimeUnavailable(sessionId: string): DomainResult<never> {
   );
 }
 
+/** Conservatively refuse an owner scratch root when a persisted selector can intersect it. */
+function selectorMayOverlap(selector: string, scratchRoot: string): boolean {
+  const normalized = selector.replaceAll("\\", "/").replace(/\/+$/u, "");
+  if (normalized.length === 0 || normalized.startsWith("/") || normalized.split("/").includes("..")) return true;
+  const wildcard = normalized.search(/[?*]/u);
+  const literalPrefix = wildcard === -1 ? normalized : normalized.slice(0, wildcard).replace(/\/+$/u, "");
+  if (literalPrefix.length === 0) return true;
+  const within = (parent: string, candidate: string) => candidate === parent || candidate.startsWith(`${parent}/`);
+  if (within(scratchRoot, literalPrefix) || within(literalPrefix, scratchRoot)) return true;
+  const glob = (value: string): RegExp => {
+    let source = "^";
+    for (let index = 0; index < value.length; index += 1) {
+      const character = value[index] as string;
+      if (character === "*" && value[index + 1] === "*") {
+        source += ".*";
+        index += 1;
+      } else if (character === "*") source += "[^/]*";
+      else if (character === "?") source += "[^/]";
+      else source += character.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    }
+    return new RegExp(`${source}$`, "u");
+  };
+  const matches = glob(normalized);
+  return matches.test(scratchRoot) || matches.test(`${scratchRoot}/__nawabari_owner_scratch__`);
+}
+
 /** Launch one pinned managed command through the durable #498 composition. */
 export async function launchManagedSessionCommand(
   context: SessionContext,
@@ -331,6 +357,8 @@ export async function launchManagedSessionCommand(
     }>;
     /** Exact owner snapshot CAS for a fixed managed operation that is not a verifier invocation. */
     expected_session_snapshot?: SessionVerificationSnapshot;
+    /** @internal Fixed Nawabari-owned candidate staging scratch; never accepts a path. */
+    owner_candidate_staging?: Readonly<{ candidate_digest: string; source_key: string }>;
     now?: () => string;
   }>,
 ): Promise<
@@ -457,12 +485,41 @@ export async function launchManagedSessionCommand(
   }
   const claimsResult = await backend.listClaims(context, input.session_id);
   if (!claimsResult.ok) return claimsResult;
+  const profile = pin.resolved;
   const workingSet =
     session.value.working_set === undefined
       ? undefined
       : compileWorkingSetRuntimeProjection(session.value.working_set as unknown as EffectiveWorkingSet);
   if (workingSet !== undefined && !workingSet.ok) return workingSet;
-  const profile = pin.resolved;
+  if (input.owner_candidate_staging !== undefined) {
+    const operation = input.owner_candidate_staging;
+    if (
+      workingSet === undefined ||
+      !workingSet.ok ||
+      !/^sha256:[0-9a-f]{64}$/u.test(operation.candidate_digest) ||
+      !/^[0-9a-f]{24}$/u.test(operation.source_key)
+    ) {
+      return failure(
+        new DomainError(
+          "RUNTIME_PROJECTION_INVALID",
+          "Candidate staging requires a canonical identity and the current bounded owner working set.",
+          { session_id: input.session_id },
+        ),
+      );
+    }
+    const candidateHex = operation.candidate_digest.slice("sha256:".length);
+    const scratchRoot = `.nawabari-verification-candidates/${candidateHex}/${operation.source_key}`;
+    const forbidden = [...workingSet.value.scope.deny, ...profile.filesystem.deny, ...profile.filesystem.immutable];
+    if (forbidden.some((selector) => selectorMayOverlap(selector, scratchRoot))) {
+      return failure(
+        new DomainError(
+          "OPERATION_REJECTED",
+          "The owner candidate staging area overlaps a denied or immutable session path.",
+          { session_id: input.session_id },
+        ),
+      );
+    }
+  }
   const claims = claimsResult.value.claims.map((claim) => ({
     resource: claim.resource,
     repositoryId: claim.repository,
@@ -589,7 +646,11 @@ export async function launchManagedSessionCommand(
     }
   }
   const live = fresh.value;
-  const filesystemToken = digest({ scope: scope.value, claim_set_generation: live.claim_set_generation });
+  const filesystemToken = digest({
+    scope: scope.value,
+    claim_set_generation: live.claim_set_generation,
+    ...(input.owner_candidate_staging === undefined ? {} : { owner_candidate_staging: input.owner_candidate_staging }),
+  });
   const snapshot = {
     lifecycle: "active" as const,
     launch_permitted: true,
@@ -615,6 +676,7 @@ export async function launchManagedSessionCommand(
   if (!compiled.ok) return compiled;
   const protectedRequest: SandboxExecutionRequest = {
     ...request.value,
+    ...(input.owner_candidate_staging === undefined ? {} : { owner_candidate_staging: input.owner_candidate_staging }),
     git_profile: profile,
     hook_material: live.hook_material,
     runtime_resolution: {

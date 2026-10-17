@@ -116,6 +116,20 @@ const REGISTRY_DATA = [
     ],
   },
   {
+    name: "verification candidate-paths",
+    summary: "Resolve deterministic owner-bound candidate bundle transfer paths",
+    usage: `${CLI_NAME} verification candidate-paths --request-file <path>`,
+    options: [
+      option("--request-file", "Bounded version 1 owner-bound Git candidate bundle request JSON", {
+        value: "<path>",
+        required: true,
+      }),
+    ],
+    notes: [
+      "Read-only; requires the exact current session snapshot and returns only paths derived from the owned worktree and candidate identities.",
+    ],
+  },
+  {
     name: "verification stage-candidate",
     summary: "Stage an exact Git candidate into the owned session verifier working set",
     usage: `${CLI_NAME} verification stage-candidate --request-file <path>`,

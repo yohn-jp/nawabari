@@ -90,7 +90,11 @@ import {
   getSessionVerificationSnapshot,
   type SessionBoundVerificationRequest,
 } from "./session-bound-verification.js";
-import { stageSessionCandidateBundle, type SessionCandidateBundleRequest } from "./session-candidate-bundle.js";
+import {
+  describeSessionCandidateBundlePaths,
+  stageSessionCandidateBundle,
+  type SessionCandidateBundleRequest,
+} from "./session-candidate-bundle.js";
 import { readSessionVerificationRequestFile } from "./session-verification-cli-input.js";
 import { validateWorktreeProfileCatalog, type WorktreeProfileCatalog } from "./domain/worktree-profile-catalog.js";
 import { defaultGit, resolveRepositoryContext } from "./git.js";
@@ -1768,7 +1772,10 @@ async function executeCommand(
 
   if (
     command === "verification" &&
-    (subcommand === "snapshot" || subcommand === "execute" || subcommand === "stage-candidate")
+    (subcommand === "snapshot" ||
+      subcommand === "execute" ||
+      subcommand === "candidate-paths" ||
+      subcommand === "stage-candidate")
   ) {
     const commandName = `verification ${subcommand}`;
     const parsed = parseOptions(rest, dispatcherAllowedOptions(commandName));
@@ -1800,11 +1807,17 @@ async function executeCommand(
             dependencies.backend,
             request.value as SessionBoundVerificationRequest,
           )
-        : await stageSessionCandidateBundle(
-            context,
-            dependencies.backend,
-            request.value as SessionCandidateBundleRequest,
-          );
+        : subcommand === "candidate-paths"
+          ? await describeSessionCandidateBundlePaths(
+              context,
+              dependencies.backend,
+              request.value as SessionCandidateBundleRequest,
+            )
+          : await stageSessionCandidateBundle(
+              context,
+              dependencies.backend,
+              request.value as SessionCandidateBundleRequest,
+            );
     return result.ok ? success(result.value as unknown as JsonObject) : result;
   }
 

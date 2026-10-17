@@ -161,6 +161,11 @@ const PROTECTED_EXECUTION_CAPABILITY = Object.freeze({
       commands: ["verification execute"],
     },
     {
+      schema: "nawabari.session-candidate-bundle-paths.v1",
+      version: 1,
+      commands: ["verification candidate-paths"],
+    },
+    {
       schema: "nawabari.session-candidate-bundle.v1",
       version: 1,
       commands: ["verification stage-candidate"],

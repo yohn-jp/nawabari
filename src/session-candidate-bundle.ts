@@ -17,6 +17,8 @@ import { isSessionId } from "./session-id.js";
 export const SESSION_CANDIDATE_BUNDLE_CONTRACT_ID = "nawabari.session-candidate-bundle.v1" as const;
 export const SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION = 1 as const;
 export const SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA = "nawabari.session-candidate-bundle.v1" as const;
+export const SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID = "nawabari.session-candidate-bundle-paths.v1" as const;
+export const SESSION_CANDIDATE_BUNDLE_PATHS_RESULT_SCHEMA = "nawabari.session-candidate-bundle-paths.v1" as const;
 export const MAX_SESSION_CANDIDATE_BUNDLE_BYTES = 64 * 1024 * 1024;
 
 export type SessionCandidateBundleSource = Readonly<{
@@ -54,6 +56,25 @@ export type SessionCandidateBundleStageResult = Readonly<{
     physical_execution: JsonObject;
     owned_scope: JsonObject;
   }>;
+  receipt_sha256: string;
+}>;
+
+export type SessionCandidateBundlePathsResult = Readonly<{
+  contract_id: typeof SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID;
+  schema_version: typeof SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION;
+  producer: Readonly<{ package: "nawabari"; version: string }>;
+  session_id: string;
+  candidate_id: string;
+  candidate_digest: string;
+  snapshot: SessionVerificationSnapshot;
+  transfers: readonly Readonly<{
+    project_id: string;
+    source_id: string;
+    bundle_sha256: string;
+    staging_root: string;
+    transfer_path: string;
+    repository_path: string;
+  }>[];
   receipt_sha256: string;
 }>;
 
@@ -199,11 +220,105 @@ function parseRequest(value: unknown): DomainResult<SessionCandidateBundleReques
 }
 
 /** Public deterministic transfer location; callers cannot choose a path or widen the owned worktree. */
-export function sessionCandidateBundleTransferPath(worktree: string, bundleSha256: string): string {
-  const match = digest.exec(bundleSha256);
-  if (!match || !path.isAbsolute(worktree) || path.resolve(worktree) !== worktree)
+function candidateStagingIdentity(
+  candidateDigest: string,
+  projectId: string,
+  sourceId: string,
+): {
+  candidateHex: string;
+  sourceKey: string;
+} {
+  const candidate = digest.exec(candidateDigest);
+  if (!candidate || projectId.length < 1 || sourceId.length < 1 || projectId.length > 256 || sourceId.length > 256)
     throw new TypeError("candidate bundle transfer identity is invalid");
-  return path.join(worktree, `.nawabari-candidate-bundle-${match[1]}.bundle`);
+  return {
+    candidateHex: candidate[1]!,
+    sourceKey: sha256(`${projectId}\0${sourceId}`).slice(0, 24),
+  };
+}
+
+/** Public deterministic root for owner-only candidate staging; callers cannot choose filesystem paths. */
+export function sessionCandidateBundleStagingRootPath(
+  worktree: string,
+  candidateDigest: string,
+  projectId: string,
+  sourceId: string,
+): string {
+  const identity = candidateStagingIdentity(candidateDigest, projectId, sourceId);
+  if (!path.isAbsolute(worktree) || path.resolve(worktree) !== worktree)
+    throw new TypeError("candidate bundle transfer identity is invalid");
+  return path.join(worktree, ".nawabari-verification-candidates", identity.candidateHex, identity.sourceKey);
+}
+
+/** Public deterministic transfer location, within the exact candidate/source-owned scratch root. */
+export function sessionCandidateBundleTransferPath(
+  worktree: string,
+  candidateDigest: string,
+  projectId: string,
+  sourceId: string,
+  bundleSha256: string,
+): string {
+  const bundle = digest.exec(bundleSha256);
+  if (!bundle) throw new TypeError("candidate bundle transfer identity is invalid");
+  return path.join(
+    sessionCandidateBundleStagingRootPath(worktree, candidateDigest, projectId, sourceId),
+    `.candidate-${bundle[1]}.bundle`,
+  );
+}
+
+/** Resolve exact transfer/repository paths only after verifying the owner snapshot. */
+export async function describeSessionCandidateBundlePaths(
+  context: SessionContext,
+  backend: SessionBackend,
+  requestInput: SessionCandidateBundleRequest | unknown,
+): Promise<DomainResult<SessionCandidateBundlePathsResult>> {
+  const parsed = parseRequest(requestInput);
+  if (!parsed.ok) return parsed;
+  const request = parsed.value;
+  if (backend.getSessionVerificationSnapshot === undefined)
+    return failure(
+      new DomainError("BACKEND_UNAVAILABLE", "The owned session snapshot authority is unavailable.", {
+        operation: "verification.candidate-paths",
+      }),
+    );
+  const observed = await backend.getSessionVerificationSnapshot(context, request.session_id);
+  if (!observed.ok) return observed;
+  if (!isDeepStrictEqual(observed.value, request.snapshot))
+    return failure(
+      new DomainError("STALE_REGISTRY", "Candidate transfer paths require the exact current owner snapshot.", {
+        session_id: request.session_id,
+      }),
+    );
+  const transfers = request.bundles.map((source) => ({
+    project_id: source.project_id,
+    source_id: source.source_id,
+    bundle_sha256: source.bundle_sha256,
+    staging_root: sessionCandidateBundleStagingRootPath(
+      request.snapshot.worktree,
+      request.candidate_digest,
+      source.project_id,
+      source.source_id,
+    ),
+    transfer_path: sessionCandidateBundleTransferPath(
+      request.snapshot.worktree,
+      request.candidate_digest,
+      source.project_id,
+      source.source_id,
+      source.bundle_sha256,
+    ),
+    repository_path: candidatePath(request.snapshot, request, source),
+  }));
+  const payload = {
+    contract_id: SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID,
+    schema_version: SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+    producer: { package: "nawabari" as const, version: packageMetadata.version },
+    session_id: request.session_id,
+    candidate_id: request.candidate_id,
+    candidate_digest: request.candidate_digest,
+    snapshot: request.snapshot,
+    transfers,
+  };
+  return success({ ...payload, receipt_sha256: sha256(canonicalJson(payload)) });
 }
 
 function candidatePath(
@@ -213,7 +328,7 @@ function candidatePath(
 ): string {
   const candidateHex = digest.exec(request.candidate_digest)![1]!;
   const sourceKey = sha256(`${source.project_id}\0${source.source_id}`).slice(0, 24);
-  return path.join(snapshot.worktree, ".nawabari-verification-candidates", candidateHex, sourceKey);
+  return path.join(snapshot.worktree, ".nawabari-verification-candidates", candidateHex, sourceKey, "repo");
 }
 
 function requestFenceMatches(expected: SessionVerificationSnapshot, actual: SessionVerificationSnapshot): boolean {
@@ -234,17 +349,35 @@ function requestFenceMatches(expected: SessionVerificationSnapshot, actual: Sess
   );
 }
 
-function bundleFileIsCurrent(worktree: string, source: SessionCandidateBundleSource): boolean {
-  const bundlePath = sessionCandidateBundleTransferPath(worktree, source.bundle_sha256);
+function bundleFileIsCurrent(worktree: string, candidateDigest: string, source: SessionCandidateBundleSource): boolean {
+  const stagingRoot = sessionCandidateBundleStagingRootPath(
+    worktree,
+    candidateDigest,
+    source.project_id,
+    source.source_id,
+  );
+  const bundlePath = sessionCandidateBundleTransferPath(
+    worktree,
+    candidateDigest,
+    source.project_id,
+    source.source_id,
+    source.bundle_sha256,
+  );
   try {
     const root = fs.realpathSync(worktree);
+    const stagingStat = fs.lstatSync(stagingRoot);
     const realBundlePath = fs.realpathSync(bundlePath);
     const stat = fs.lstatSync(bundlePath);
     const expected = digest.exec(source.bundle_sha256)![1]!;
     return (
       root === worktree &&
+      fs.realpathSync(stagingRoot) === stagingRoot &&
+      stagingStat.isDirectory() &&
+      !stagingStat.isSymbolicLink() &&
+      (stagingStat.mode & 0o077) === 0 &&
+      (typeof process.getuid !== "function" || stagingStat.uid === process.getuid()) &&
       realBundlePath === bundlePath &&
-      path.dirname(realBundlePath) === root &&
+      path.dirname(realBundlePath) === stagingRoot &&
       stat.isFile() &&
       !stat.isSymbolicLink() &&
       (stat.mode & 0o077) === 0 &&
@@ -266,43 +399,39 @@ const {createHash}=require('node:crypto');
 const [worktree,bundlePath,candidateRoot,candidatePath,candidateHex,sourceKey,expectedSha,base,head,tree]=process.argv.slice(1);
 const fail=(message)=>{process.stderr.write(message+'\n');process.exit(41)};
 const within=(root,value)=>{const rel=path.relative(root,value);return rel!==''&&rel!=='..'&&!rel.startsWith('..'+path.sep)&&!path.isAbsolute(rel)};
-if(fs.realpathSync(worktree)!==worktree||!within(worktree,bundlePath)||!within(worktree,candidateRoot)||!within(worktree,candidatePath))fail('candidate stage path escaped the owned worktree');
+const expectedRoot=path.join(worktree,'.nawabari-verification-candidates',candidateHex,sourceKey);
+if(fs.realpathSync(worktree)!==worktree||candidateRoot!==expectedRoot||candidatePath!==path.join(candidateRoot,'repo')||bundlePath!==path.join(candidateRoot,'.candidate-'+expectedSha+'.bundle')||!within(worktree,bundlePath)||!within(worktree,candidateRoot)||!within(worktree,candidatePath))fail('candidate stage path escaped the owned worktree');
+const rootStat=fs.lstatSync(candidateRoot);if(!rootStat.isDirectory()||rootStat.isSymbolicLink()||(rootStat.mode&0o077)!==0)fail('candidate stage root is not a private owner directory');
 const st=fs.lstatSync(bundlePath);if(!st.isFile()||st.isSymbolicLink()||(st.mode&0o077)!==0||st.size<1||st.size>67108864)fail('candidate bundle file is not bounded and owner-private');
 const bytes=fs.readFileSync(bundlePath);if(createHash('sha256').update(bytes).digest('hex')!==expectedSha)fail('candidate bundle digest changed before import');
-const ignoreDir=path.join(candidateRoot,'..');
-if(fs.existsSync(ignoreDir)){const d=fs.lstatSync(ignoreDir);if(!d.isDirectory()||d.isSymbolicLink())fail('candidate parent is not a regular directory');}else fs.mkdirSync(ignoreDir,{mode:0o700,recursive:true});
-const ignore=path.join(ignoreDir,'.gitignore');
-if(fs.existsSync(ignore)){const x=fs.lstatSync(ignore);if(!x.isFile()||x.isSymbolicLink()||fs.readFileSync(ignore,'utf8')!=='*\n')fail('candidate ignore fence changed');}else{const fd=fs.openSync(ignore,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);fs.writeFileSync(fd,'*\n');fs.fsyncSync(fd);fs.closeSync(fd);}
-const git=(args,cwd=worktree)=>execFileSync('/nawabari/bin/git',['-c','core.hooksPath=/dev/null',...args],{cwd,stdio:['ignore','pipe','pipe'],encoding:'utf8',maxBuffer:1048576,env:{PATH:'/nawabari/bin:/usr/bin:/bin',HOME:'/home/nawabari',GIT_CONFIG_NOSYSTEM:'1',GIT_TERMINAL_PROMPT:'0'}}).trim();
+const git=(args,cwd=candidatePath)=>execFileSync('/nawabari/bin/git',['-c','core.hooksPath=/dev/null',...args],{cwd,stdio:['ignore','pipe','pipe'],encoding:'utf8',maxBuffer:1048576,env:{PATH:'/nawabari/bin:/usr/bin:/bin',HOME:'/home/nawabari',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_TERMINAL_PROMPT:'0'}}).trim();
+const repoExists=fs.existsSync(candidatePath);
+if(repoExists){const repoStat=fs.lstatSync(candidatePath);if(!repoStat.isDirectory()||repoStat.isSymbolicLink()||(repoStat.mode&0o077)!==0)fail('existing candidate repository is not owner-private');}
+else fs.mkdirSync(candidatePath,{mode:0o700});
+if(!fs.existsSync(path.join(candidatePath,'.git')))git(['init','--quiet'],candidatePath);
+const baseRef='refs/nawabari/bases/'+candidateHex;
+const ref='refs/nawabari/candidates/'+candidateHex+'/'+sourceKey;
+const baseExists=(()=>{try{return git(['rev-parse','--verify',baseRef])===base}catch{return false}})();
+if(!baseExists){git(['fetch','--no-tags','--no-write-fetch-head',worktree,base+':'+baseRef],candidatePath);if(git(['rev-parse','--verify',baseRef])!==base)fail('owned source base differs from the declared exact base');}
 git(['bundle','verify',bundlePath]);
 const heads=git(['bundle','list-heads',bundlePath]).split('\n').filter(Boolean);
 if(heads.length!==1||heads[0]!==head+' refs/heads/mottainai-candidate')fail('bundle advertises a different candidate ref');
-const ref='refs/nawabari/candidates/'+candidateHex+'/'+sourceKey;
-const rootExists=fs.existsSync(candidatePath);
 let refExists=false;try{git(['show-ref','--verify','--quiet',ref]);refExists=true}catch{}
-if(rootExists||refExists){
- if(!rootExists||!refExists)fail('candidate staging is partial and requires owner reconciliation');
- const existingHead=git(['rev-parse','--verify','HEAD'],candidatePath);
- const existingTree=git(['rev-parse','--verify','HEAD^{tree}'],candidatePath);
- const refHead=git(['rev-parse','--verify',ref]);
- if(existingHead!==head||existingTree!==tree||refHead!==head)fail('existing staged candidate does not match this exact source identity');
- const status=git(['status','--porcelain','--untracked-files=all'],candidatePath);
- if(status!=='')fail('existing staged candidate worktree is dirty');
-}else{
- const baseType=git(['cat-file','-t',base]);if(baseType!=='commit')fail('candidate base commit is absent from the owned repository');
- git(['fetch','--no-tags',bundlePath,'refs/heads/mottainai-candidate:'+ref]);
+if(!refExists){
+ git(['fetch','--no-tags','--no-write-fetch-head',bundlePath,'refs/heads/mottainai-candidate:'+ref]);
  const importedHead=git(['rev-parse','--verify',ref+'^{commit}']);
  const importedTree=git(['rev-parse','--verify',ref+'^{tree}']);
  if(importedHead!==head||importedTree!==tree)fail('imported candidate commit or tree differs from the source owner');
  try{git(['merge-base','--is-ancestor',base,ref]);}catch{fail('candidate commit is not descended from its exact source base');}
- git(['worktree','add','--detach','--no-checkout',candidatePath,ref]);
- git(['checkout','--detach','--force',head],candidatePath);
 }
+if(git(['rev-parse','--verify',ref+'^{commit}'])!==head)fail('existing candidate ref differs from the exact source identity');
+git(['checkout','--detach','--force',head],candidatePath);
 const finalHead=git(['rev-parse','--verify','HEAD'],candidatePath);
 const finalTree=git(['rev-parse','--verify','HEAD^{tree}'],candidatePath);
 const clean=git(['status','--porcelain','--untracked-files=all'],candidatePath);
 if(finalHead!==head||finalTree!==tree||clean!=='')fail('staged candidate checkout failed exact clean-tree verification');
-process.stdout.write(JSON.stringify({worktree:candidatePath,head_id:finalHead,tree_id:finalTree})+'\n');
+fs.unlinkSync(bundlePath);
+process.stdout.write(JSON.stringify({worktree:candidatePath,head_id:finalHead,tree_id:finalTree,bundle_removed:true})+'\n');
 `;
 
 export async function stageSessionCandidateBundle(
@@ -328,7 +457,7 @@ export async function stageSessionCandidateBundle(
       }),
     );
   const source = request.bundles[0]!;
-  if (!bundleFileIsCurrent(request.snapshot.worktree, source))
+  if (!bundleFileIsCurrent(request.snapshot.worktree, request.candidate_digest, source))
     return failure(
       new DomainError(
         "INVALID_ARGUMENT",
@@ -336,9 +465,22 @@ export async function stageSessionCandidateBundle(
         { field: "bundle_sha256" },
       ),
     );
-  const candidateHex = digest.exec(request.candidate_digest)![1]!;
-  const sourceKey = sha256(`${source.project_id}\0${source.source_id}`).slice(0, 24);
-  const bundlePath = sessionCandidateBundleTransferPath(request.snapshot.worktree, source.bundle_sha256);
+  const identity = candidateStagingIdentity(request.candidate_digest, source.project_id, source.source_id);
+  const candidateHex = identity.candidateHex;
+  const sourceKey = identity.sourceKey;
+  const stagingRoot = sessionCandidateBundleStagingRootPath(
+    request.snapshot.worktree,
+    request.candidate_digest,
+    source.project_id,
+    source.source_id,
+  );
+  const bundlePath = sessionCandidateBundleTransferPath(
+    request.snapshot.worktree,
+    request.candidate_digest,
+    source.project_id,
+    source.source_id,
+    source.bundle_sha256,
+  );
   const stagedPath = candidatePath(request.snapshot, request, source);
   const execution = await launchManagedSessionCommand(context, backend, {
     session_id: request.session_id,
@@ -350,7 +492,7 @@ export async function stageSessionCandidateBundle(
         stageScript,
         request.snapshot.worktree,
         bundlePath,
-        path.dirname(stagedPath),
+        stagingRoot,
         stagedPath,
         candidateHex,
         sourceKey,
@@ -360,6 +502,10 @@ export async function stageSessionCandidateBundle(
         source.candidate_tree,
       ],
       cwd: request.snapshot.worktree,
+    },
+    owner_candidate_staging: {
+      candidate_digest: request.candidate_digest,
+      source_key: sourceKey,
     },
   });
   if (!execution.ok) return execution;
@@ -417,7 +563,9 @@ export async function stageSessionCandidateBundle(
     stageOutput === null ||
     (stageOutput as Record<string, unknown>).worktree !== stagedPath ||
     (stageOutput as Record<string, unknown>).head_id !== source.candidate_commit ||
-    (stageOutput as Record<string, unknown>).tree_id !== source.candidate_tree
+    (stageOutput as Record<string, unknown>).tree_id !== source.candidate_tree ||
+    (stageOutput as Record<string, unknown>).bundle_removed !== true ||
+    fs.existsSync(bundlePath)
   )
     return failure(
       new DomainError(
