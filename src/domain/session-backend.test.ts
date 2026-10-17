@@ -9,9 +9,10 @@ import { test } from "node:test";
 import { runCli } from "../cli.js";
 import { defaultGit, resolveRepositoryContext, type GitCommandRunner } from "../git.js";
 import { SessionRegistry } from "../session-registry.js";
-import { resolveManagedCgroupRoot, type CgroupFileSystem } from "./cgroups-v2.js";
+import { deriveCgroupScopeName, resolveManagedCgroupRoot, type CgroupFileSystem } from "./cgroups-v2.js";
 import { withDirectoryFsyncFailure } from "../testing/fs-fault-injection.js";
 import {
+  parseSessionExecutionRecord,
   recordExecutionState,
   reserveExecution,
   toPersistedSessionExecutionRecord,
@@ -28,6 +29,12 @@ import { LocalSessionBackend, probeLocalManagedExecutionReadiness } from "./sess
 import { DomainError, failure } from "./errors.js";
 import { resolveBuiltinWorktreeProfile } from "./worktree-profile-builtins.js";
 import type { SessionHookMaterialAuthority } from "../session-registry.js";
+import type { SessionCandidateScratchReleaseOptions } from "./session.js";
+import {
+  sessionCandidateBundleIdentityKeys,
+  sessionCandidateBundleRepositoryPath,
+  sessionCandidateBundleStagingRootPath,
+} from "../session-candidate-bundle-storage.js";
 
 test("failed protected bootstrap keeps durable ownership pending and normal guard denied", async () => {
   const repositoryPath = createRepository();
@@ -133,7 +140,7 @@ test("local session backend binds default managed readiness to protected sandbox
       cgroupRoot: usableCgroups.root,
       registry: { cgroupFilesystem: usableCgroups.filesystem },
     }).createSession({ cwd: repositoryPath }, options);
-    assert.equal(authorized.ok, true);
+    assert.equal(authorized.ok, true, authorized.ok ? "" : JSON.stringify(authorized.error));
     if (authorized.ok) assert.equal(authorized.value.branch, options.branch);
     assert.equal(usableCgroups.scopeCreateCount, 1);
     assert.equal(usableCgroups.scopeCleanupCount, 1);
@@ -248,7 +255,7 @@ test("local session backend preserves an explicitly injected managed readiness a
         profile: { selection: { profile } },
       },
     );
-    assert.equal(result.ok, true);
+    assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
     assert.equal(readinessCalls, 1);
     assert.equal(unusableCgroups.scopeCreateCount, 0);
   } finally {
@@ -1461,7 +1468,7 @@ test("the local backend exposes close and gc as stable automation results", asyn
   }
 });
 
-type ManagedFileOperationScope = "empty" | "populated" | "unknown" | "none";
+type ManagedFileOperationScope = "populated" | "unknown" | "unattributed" | "none";
 
 function managedFileOperationFixture(scope: ManagedFileOperationScope) {
   const repositoryPath = createRepository();
@@ -1471,6 +1478,8 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
   runGit(["add", "docs/.keep"], repositoryPath);
   runGit(["commit", "-m", "docs"], repositoryPath);
   const registry = new SessionRegistry({ cwd: repositoryPath });
+  const cgroupRoot = "/sys/fs/cgroup/user.slice/managed-file-operation";
+  const cgroupParent = path.join(cgroupRoot, "nawabari");
   const repositoryIdentity = { repositoryHost: "local", repositoryId: registry.repository.repositoryId };
   const baseRevision = runGit(["rev-parse", "HEAD"], repositoryPath);
   const paths = ["docs/managed.txt"];
@@ -1516,7 +1525,7 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
     const starting = reserveExecution({
       session_id: session.sessionId,
       execution_id: `managed-file-operation-${scope}`,
-      ...(scope === "unknown" ? {} : { cgroup_root: "/sys/fs/cgroup/user.slice/test.scope" }),
+      ...(scope === "unknown" ? {} : { cgroup_root: cgroupRoot }),
       profile_digest: "a".repeat(64),
       filesystem_token: "b".repeat(64),
       runtime_epoch: runtimeEpoch,
@@ -1547,21 +1556,75 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
   );
 
   const observations: { lockHeld: boolean }[] = [];
-  const cgroupFilesystem = {
-    statSync: () => ({ isDirectory: () => true, isFile: () => true }),
-    realpathSync: (file: string) => file,
+  const directories = new Set([cgroupRoot, cgroupParent]);
+  const cgroupFiles = new Map<string, string>([
+    [path.join(cgroupRoot, "cgroup.controllers"), "cpu memory pids\n"],
+    [path.join(cgroupParent, "cgroup.events"), "populated 0\n"],
+    [path.join(cgroupParent, "cgroup.procs"), ""],
+    [path.join(cgroupParent, "cgroup.subtree_control"), "+cpu +memory +pids\n"],
+  ]);
+  const cgroupFilesystem: CgroupFileSystem = {
+    statSync: (file) => ({
+      isDirectory: () => directories.has(file),
+      isFile: () => cgroupFiles.has(file),
+    }),
+    realpathSync: (file) => {
+      if (!directories.has(file) && !cgroupFiles.has(file)) throw new Error(`missing cgroup path: ${file}`);
+      return file;
+    },
     readFileSync: (file: string) => {
       if (file.endsWith("cgroup.events")) {
         observations.push({ lockHeld: fs.existsSync(registry.paths.lock) });
-        return scope === "populated" ? "populated 1\n" : "populated 0\n";
       }
-      if (file.endsWith("cgroup.procs")) return "";
-      throw new Error("unobserved cgroup file");
+      const value = cgroupFiles.get(file);
+      if (value === undefined) throw new Error("unobserved cgroup file");
+      return value;
     },
-    writeFileSync: () => undefined,
-    mkdirSync: () => undefined,
-    rmdirSync: () => undefined,
-  } as unknown as CgroupFileSystem;
+    readdirSync: (directory: string) => {
+      if (!directories.has(directory)) throw new Error(`missing cgroup directory: ${directory}`);
+      const names = new Set<string>();
+      for (const candidate of directories) {
+        if (candidate.startsWith(`${directory}/`)) {
+          const relative = candidate.slice(directory.length + 1);
+          if (!relative.includes("/")) names.add(relative);
+        }
+      }
+      for (const candidate of cgroupFiles.keys()) {
+        if (candidate.startsWith(`${directory}/`)) {
+          const relative = candidate.slice(directory.length + 1);
+          if (!relative.includes("/")) names.add(relative);
+        }
+      }
+      return [...names].map((name) => ({ name, isDirectory: () => directories.has(path.join(directory, name)) }));
+    },
+    writeFileSync: (file, value) => {
+      cgroupFiles.set(file, value);
+    },
+    mkdirSync: (directory) => {
+      directories.add(directory);
+    },
+    rmdirSync: (directory) => {
+      directories.delete(directory);
+    },
+  };
+
+  if (scope === "populated") {
+    const record = executions[0];
+    if (record === undefined) throw new Error("populated fixture requires an execution record");
+    const parsed = parseSessionExecutionRecord(record);
+    if (!parsed.ok) throw parsed.error;
+    const scopePath = path.join(cgroupParent, deriveCgroupScopeName(parsed.value.cgroup_identity));
+    directories.add(scopePath);
+    cgroupFiles.set(path.join(scopePath, "cgroup.events"), "populated 1\n");
+    cgroupFiles.set(path.join(scopePath, "cgroup.procs"), "");
+    cgroupFiles.set(path.join(cgroupParent, "cgroup.events"), "populated 1\n");
+  } else if (scope === "unattributed") {
+    const scopePath = path.join(cgroupParent, `nawabari-${"a".repeat(48)}`);
+    directories.add(scopePath);
+    cgroupFiles.set(path.join(scopePath, "cgroup.events"), "populated 1\n");
+    cgroupFiles.set(path.join(scopePath, "cgroup.procs"), "");
+    cgroupFiles.set(path.join(cgroupParent, "cgroup.events"), "populated 1\n");
+  }
 
   const helperCalls: { lockHeld: boolean }[] = [];
   const source = fs.realpathSync(execFileSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).trim());
@@ -1645,7 +1708,10 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
     worktreePath,
     session,
     runtimeEpoch,
-    backend: new LocalSessionBackend({ registry: { cgroupFilesystem } }),
+    backend: new LocalSessionBackend({
+      cgroupRoot,
+      registry: { cgroupFilesystem },
+    }),
     executionOptions,
     operation,
     observations,
@@ -1661,7 +1727,7 @@ function managedFileOperationFixture(scope: ManagedFileOperationScope) {
 for (const [scope, status] of [
   ["populated", "waiting"],
   ["unknown", "blocked"],
-  ["none", "waiting"],
+  ["unattributed", "blocked"],
 ] as const) {
   test(`managed file operations close admission and perform no I/O when owned scope is ${scope}`, async () => {
     const fixture = managedFileOperationFixture(scope);
@@ -1691,10 +1757,10 @@ for (const [scope, status] of [
   });
 }
 
-test("managed file operations execute only after proven-empty owned scopes and reopen admission", async () => {
-  const fixture = managedFileOperationFixture("empty");
+test("managed file operations execute after the kernel proves a never-launched session is empty", async () => {
+  const fixture = managedFileOperationFixture("none");
   try {
-    const operation = fixture.operation("managed-empty");
+    const operation = fixture.operation("managed-none");
     const result = await fixture.backend.fileOperation(
       { cwd: fixture.repositoryPath },
       { operation, execution_options: fixture.executionOptions },
@@ -1706,7 +1772,7 @@ test("managed file operations execute only after proven-empty owned scopes and r
       fixture.observations.some((observation) => !observation.lockHeld),
       true,
     );
-    assert.equal(fs.readFileSync(path.join(fixture.worktreePath, "docs/managed.txt"), "utf8"), "payload:managed-empty");
+    assert.equal(fs.readFileSync(path.join(fixture.worktreePath, "docs/managed.txt"), "utf8"), "payload:managed-none");
     const registry = fixture.registry();
     const [receipt] = registry.fileOperations(fixture.session.sessionId);
     assert.equal(receipt?.stage, "completed");
@@ -1725,6 +1791,106 @@ test("managed file operations execute only after proven-empty owned scopes and r
     fixture.cleanup();
   }
 });
+
+for (const scope of ["populated", "none"] as const) {
+  test(`candidate scratch release uses the owner drain fence when owned scope is ${scope}`, async () => {
+    const fixture = managedFileOperationFixture(scope);
+    try {
+      const options = await candidateScratchReleaseFixture(fixture);
+      const result = await fixture.backend.releaseSessionCandidateScratch({ cwd: fixture.repositoryPath }, options);
+
+      if (scope === "populated") {
+        assert.equal(result.ok, false);
+        if (result.ok) return;
+        assert.equal(result.error.code, "OPERATION_REJECTED");
+        assert.equal(result.error.details?.status, "waiting");
+        assert.equal(fs.existsSync(path.join(options.snapshot.worktree, ".nawabari-verification-candidates")), true);
+        const admission = fixture.registry().getSessionLaunchAdmission(options.session_id);
+        assert.equal(admission?.admission, "closed");
+        assert.ok((admission?.runtime_epoch ?? 0) > options.snapshot.managed.runtime_epoch);
+      } else {
+        assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+        if (!result.ok) return;
+        assert.equal(result.value.removed, true);
+        assert.equal(result.value.session_id, options.session_id);
+        assert.equal(result.value.candidate_id, options.candidate_id);
+        assert.equal(result.value.candidate_digest, options.candidate_digest);
+        assert.equal(result.value.head_id, options.source.candidate_commit);
+        assert.equal(result.value.tree_id, options.source.candidate_tree);
+        assert.equal(fs.existsSync(result.value.staging_root), false);
+        assert.equal(result.value.snapshot.managed.admission, "closed");
+        assert.equal(result.value.snapshot.managed.runtime_epoch, options.snapshot.managed.runtime_epoch + 1);
+        assert.equal(result.value.drain_fence.operation, "close");
+        assert.equal(result.value.drain_fence.policy, "wait");
+        assert.equal(result.value.drain_fence.completion_observed, true);
+        assert.equal(result.value.drain_fence.kernel_empty, true);
+        assert.deepEqual(result.value.drain_fence.active_execution_ids, []);
+        assert.deepEqual(result.value.drain_fence.unknown_execution_ids, []);
+        assert.equal(
+          fixture.observations.some((observation) => !observation.lockHeld),
+          true,
+        );
+        assert.equal(fixture.registry().getSessionLaunchAdmission(options.session_id)?.admission, "closed");
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+async function candidateScratchReleaseFixture(
+  fixture: ReturnType<typeof managedFileOperationFixture>,
+): Promise<SessionCandidateScratchReleaseOptions> {
+  const sessionId = fixture.session.sessionId;
+  const snapshotResult = await fixture.backend.getSessionVerificationSnapshot(
+    { cwd: fixture.repositoryPath },
+    sessionId,
+  );
+  if (!snapshotResult.ok) throw snapshotResult.error;
+  const snapshot = snapshotResult.value;
+  const candidateDigest = `sha256:${"c".repeat(64)}`;
+  const projectId = "project-release-test";
+  const sourceId = "source-release-test";
+  const keys = sessionCandidateBundleIdentityKeys(candidateDigest, projectId, sourceId);
+  const stagingRoot = sessionCandidateBundleStagingRootPath(snapshot.worktree, candidateDigest, projectId, sourceId);
+  const repositoryPath = sessionCandidateBundleRepositoryPath(snapshot.worktree, candidateDigest, projectId, sourceId);
+  const candidateRoot = path.dirname(stagingRoot);
+  const candidateScratchRoot = path.dirname(candidateRoot);
+  for (const directory of [candidateScratchRoot, candidateRoot, stagingRoot, repositoryPath]) {
+    fs.mkdirSync(directory, { mode: 0o700 });
+  }
+  const branch = `nawabari-candidate-${keys.candidate_hex}-${keys.source_key}`;
+  runGit(["init", "--quiet", "-b", branch], repositoryPath);
+  runGit(["config", "user.email", "candidate-release@example.invalid"], repositoryPath);
+  runGit(["config", "user.name", "Candidate Release Test"], repositoryPath);
+  fs.writeFileSync(path.join(repositoryPath, "README.md"), "base\n");
+  runGit(["add", "README.md"], repositoryPath);
+  runGit(["commit", "--quiet", "-m", "base"], repositoryPath);
+  const baseCommit = runGit(["rev-parse", "HEAD"], repositoryPath);
+  fs.writeFileSync(path.join(repositoryPath, "README.md"), "candidate\n");
+  runGit(["commit", "--quiet", "-am", "candidate"], repositoryPath);
+  const candidateCommit = runGit(["rev-parse", "HEAD"], repositoryPath);
+  const candidateTree = runGit(["rev-parse", "HEAD^{tree}"], repositoryPath);
+  runGit(["update-ref", `refs/nawabari/bases/${keys.candidate_hex}`, baseCommit], repositoryPath);
+  runGit(
+    ["update-ref", `refs/nawabari/candidates/${keys.candidate_hex}/${keys.source_key}`, candidateCommit],
+    repositoryPath,
+  );
+  return {
+    session_id: sessionId,
+    snapshot,
+    candidate_id: "candidate-release-test",
+    candidate_digest: candidateDigest,
+    source: {
+      project_id: projectId,
+      source_id: sourceId,
+      bundle_sha256: `sha256:${"d".repeat(64)}`,
+      base_commit: baseCommit,
+      candidate_commit: candidateCommit,
+      candidate_tree: candidateTree,
+    },
+  };
+}
 
 function createRepository(): string {
   const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-domain-"));
@@ -1838,7 +2004,7 @@ function readinessCgroupFixture(
       isFile: () => files.has(file),
     }),
     realpathSync: (file) => {
-      if (!directories.has(file)) throw new Error(`missing directory: ${file}`);
+      if (!directories.has(file) && !files.has(file)) throw new Error(`missing path: ${file}`);
       return file;
     },
     readFileSync: (file) => {
@@ -1861,6 +2027,8 @@ function readinessCgroupFixture(
       directories.add(file);
       if (path.basename(file) === "nawabari") {
         files.set(path.join(file, "cgroup.subtree_control"), "");
+        files.set(path.join(file, "cgroup.events"), "populated 0\n");
+        files.set(path.join(file, "cgroup.procs"), "");
       } else if (path.basename(file).startsWith("nawabari-")) {
         scopeCreateCount += 1;
         scopes.add(file);
@@ -1878,6 +2046,23 @@ function readinessCgroupFixture(
         }
       }
       directories.delete(file);
+    },
+    readdirSync: (directory) => {
+      if (!directories.has(directory)) throw new Error(`missing directory: ${directory}`);
+      const names = new Set<string>();
+      for (const candidate of directories) {
+        if (candidate.startsWith(`${directory}${path.sep}`)) {
+          const relative = candidate.slice(directory.length + 1);
+          if (!relative.includes(path.sep)) names.add(relative);
+        }
+      }
+      for (const candidate of files.keys()) {
+        if (candidate.startsWith(`${directory}${path.sep}`)) {
+          const relative = candidate.slice(directory.length + 1);
+          if (!relative.includes(path.sep)) names.add(relative);
+        }
+      }
+      return [...names].map((name) => ({ name, isDirectory: () => directories.has(path.join(directory, name)) }));
     },
   };
   return {

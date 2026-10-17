@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -6,6 +7,7 @@ import process from "node:process";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
 import {
   deriveLandlockRules,
+  landlockRuleArguments,
   LANDLOCK_ACCESS_FS_ABI3,
   LANDLOCK_ABI_MINIMUM,
   LANDLOCK_SETUP_FAILURE_PREFIX,
@@ -22,6 +24,7 @@ import {
   type SandboxSeccompProfileMetadata,
 } from "./sandbox-seccomp.js";
 import type { SandboxExecutionRequest } from "./sandbox.js";
+import { resolveOwnerCandidateStagingRoot } from "./sandbox-candidate-staging.js";
 import {
   materializeSessionGitConfig,
   resolveSessionHookSet,
@@ -64,6 +67,12 @@ import {
 } from "./cgroups-v2.js";
 import type { FilesystemEnforcementIntegrationResult } from "./filesystem-enforcement-integration.js";
 import { validateFilesystemPolicyEnforcementRuntime } from "./filesystem-policy-enforcement.js";
+import { runObservedSandboxChild } from "./sandbox-physical-execution.js";
+import {
+  sandboxExecutionEvidenceFromError,
+  type SandboxPhysicalExecutionEvidence,
+  type SandboxRawOutput,
+} from "./sandbox-execution-evidence.js";
 
 const SANDBOX_HOME = SESSION_RUNTIME_LOGICAL_HOME;
 const SANDBOX_CONFIG_HOME = SESSION_RUNTIME_LOGICAL_CONFIG_HOME;
@@ -84,6 +93,8 @@ const DEFAULT_MAX_OUTPUT_BYTES = 1_024 * 1_024;
 export type SandboxCommand = {
   readonly command: string;
   readonly args?: readonly string[];
+  /** Optional protected working directory, confined to the owned worktree. */
+  readonly cwd?: string;
 };
 
 /**
@@ -106,11 +117,17 @@ export type SandboxInvocation = {
 };
 
 export type SandboxExecutionResult = {
+  /** Stable request execution identity, or a launcher-generated identity when no cgroup identity exists. */
+  readonly execution_id: string;
   readonly exit_code: number | null;
   readonly signal: string | null;
   readonly stdout: string;
   readonly stderr: string;
   readonly duration_ms: number;
+  /** Byte-faithful bounded output, serialized without UTF-8 replacement. */
+  readonly raw_output: SandboxRawOutput;
+  /** Owner-observed start namespaces, termination, and descendant cleanup. */
+  readonly physical_execution: SandboxPhysicalExecutionEvidence;
   /** Applied policy identity, retained as bounded machine-readable evidence. */
   readonly seccomp_profile?: SandboxSeccompProfileMetadata;
   readonly resources?: {
@@ -135,6 +152,8 @@ export type SandboxFilesystemEnforcementOptions = Readonly<{
 export type SandboxLauncherOptions = SandboxFilesystemEnforcementOptions & {
   readonly timeout_ms?: number;
   readonly max_output_bytes?: number;
+  /** Abort only this protected execution. The owner re-observes its process namespace before returning. */
+  readonly signal?: AbortSignal;
   /** Attach the caller's existing stdio and use no bounded-output timeout. */
   readonly interactive?: boolean;
 };
@@ -192,6 +211,42 @@ function canonicalPath(candidate: string, label: string): DomainResult<string> {
       reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
     });
   }
+}
+
+function validateCommandWorkingDirectory(candidate: string | undefined, worktree: string): DomainResult<string> {
+  if (candidate === undefined) return success(worktree);
+  if (
+    typeof candidate !== "string" ||
+    !path.isAbsolute(candidate) ||
+    path.normalize(candidate) !== candidate ||
+    candidate.includes("\0")
+  ) {
+    return topologyError("The command working directory must be a normalized absolute path.", {
+      cwd: typeof candidate === "string" ? candidate : null,
+    });
+  }
+  const canonical = canonicalPath(candidate, "command working directory");
+  if (!canonical.ok) return canonical;
+  if (!isWithin(worktree, canonical.value)) {
+    return topologyError("The command working directory must remain inside the authoritative worktree.", {
+      cwd: canonical.value,
+      worktree,
+    });
+  }
+  try {
+    const stat = fs.lstatSync(canonical.value);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      return topologyError("The command working directory must be an existing real directory.", {
+        cwd: canonical.value,
+      });
+    }
+  } catch (error: unknown) {
+    return topologyError("The command working directory could not be observed safely.", {
+      cwd: canonical.value,
+      reason: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+    });
+  }
+  return success(canonical.value);
 }
 
 function preparePrivateDirectory(candidate: string, repository: string, label: string): DomainResult<string> {
@@ -1266,6 +1321,22 @@ export function compileSandboxInvocation(
   if (!compiledEnvironment.ok) return compiledEnvironment;
   const topology = validateTopology(request, compiledEnvironment.value?.manifest ?? null);
   if (!topology.ok) return topology;
+  const commandWorkingDirectory = validateCommandWorkingDirectory(command.cwd, topology.value.worktree);
+  if (!commandWorkingDirectory.ok) return commandWorkingDirectory;
+  const procfsPolicy = request.procfs ?? { mode: "private", reason: null };
+  if (
+    (procfsPolicy.mode !== "private" && procfsPolicy.mode !== "denied") ||
+    (procfsPolicy.mode === "private" && procfsPolicy.reason !== null) ||
+    (procfsPolicy.mode === "denied" &&
+      (typeof procfsPolicy.reason !== "string" ||
+        procfsPolicy.reason.length === 0 ||
+        procfsPolicy.reason.includes("\0")))
+  ) {
+    return topologyError("The selected procfs policy is invalid.", {
+      session_id: request.session_id,
+      mode: procfsPolicy.mode,
+    });
+  }
   const profilePaths = validateProfilePaths(request);
   if (!profilePaths.ok) return profilePaths;
   const runtimeProjection =
@@ -1327,6 +1398,15 @@ export function compileSandboxInvocation(
       : landlockAbi === null
         ? "reduced-defense"
         : "incompatible";
+  const stagingRoot = resolveOwnerCandidateStagingRoot(request);
+  if (!stagingRoot.ok) return stagingRoot;
+  if (
+    request.owner_candidate_verification !== undefined &&
+    commandWorkingDirectory.value !== path.join(stagingRoot.value as string, "repo")
+  )
+    return topologyError("Candidate verification must execute in its exact owner-staged repository.", {
+      session_id: request.session_id,
+    });
   const boundedWorkingSet = runtimeProjection.value?.working_set;
   if (boundedWorkingSet !== undefined && runtimeProjection.value?.policy.mode !== "strict") {
     return failure(
@@ -1456,10 +1536,18 @@ export function compileSandboxInvocation(
     boundedWorkingSet === undefined
       ? existingLandlockRules
       : [...boundedBaselineRules(existingLandlockRules), ...deriveWorkingSetRules(topology.value, boundedWorkingSet)];
-  const boundedLandlockRules =
-    filesystemEnforcement === undefined
-      ? boundedExistingLandlockRules
-      : [...boundedExistingLandlockRules, ...filesystemEnforcement.landlock_rules];
+  const boundedLandlockRules = [...boundedExistingLandlockRules, ...(filesystemEnforcement?.landlock_rules ?? [])];
+  if (stagingRoot.value !== null) {
+    const readAccess = WORKING_SET_DIRECTORY_TRAVERSE | WORKING_SET_FILE_READ;
+    boundedLandlockRules.push({
+      path: stagingRoot.value,
+      allowed_access:
+        request.owner_candidate_staging === undefined ? WORKING_SET_DIRECTORY_TRAVERSE : LANDLOCK_ACCESS_FS_ABI3,
+    });
+    // Only the fixed importer may read the sanitized session base metadata.
+    if (request.owner_candidate_staging !== undefined)
+      boundedLandlockRules.push({ path: "/nawabari/git", allowed_access: readAccess });
+  }
   const gitMetadata = prepareGitMetadata(request, topology.value);
   if (!gitMetadata.ok) return gitMetadata;
   // An explicit strict projection exposes one canonical executable surface;
@@ -1478,14 +1566,21 @@ export function compileSandboxInvocation(
       XDG_CACHE_HOME: SANDBOX_CACHE_HOME,
       XDG_DATA_HOME: SANDBOX_DATA_HOME,
     }),
+    ...(boundedWorkingSet === undefined ? {} : { TMPDIR: tempDirectory }),
     USER: "nawabari",
     LOGNAME: "nawabari",
     NAWABARI_SESSION_ID: request.session_id,
   };
   const argsEnvironment = {
     ...launchEnvironment,
-    GIT_DIR: "/nawabari/git",
-    GIT_WORK_TREE: topology.value.worktree,
+    GIT_DIR:
+      request.owner_candidate_verification === undefined
+        ? "/nawabari/git"
+        : path.join(stagingRoot.value as string, "repo", ".git"),
+    GIT_WORK_TREE:
+      request.owner_candidate_verification === undefined
+        ? topology.value.worktree
+        : path.join(stagingRoot.value as string, "repo"),
   };
 
   const args: string[] = [
@@ -1495,7 +1590,8 @@ export function compileSandboxInvocation(
     "--unshare-pid",
     "--unshare-ipc",
     "--unshare-uts",
-    "--disable-userns",
+    // A strict inherited seccomp filter denies namespace-creating clone,
+    // clone3, unshare and setns without writing the OCI read-only userns sysctl.
     "--uid",
     "0",
     "--gid",
@@ -1504,10 +1600,22 @@ export function compileSandboxInvocation(
     "ALL",
     "--seccomp",
     "3",
+    "--info-fd",
+    "4",
+    "--block-fd",
+    "5",
     "--clearenv",
   ];
   for (const [key, value] of Object.entries(argsEnvironment)) args.push("--setenv", key, value);
-  args.push("--tmpfs", "/", "--dev", "/dev", "--proc", "/proc");
+  args.push("--tmpfs", "/", "--dev", "/dev");
+  if (procfsPolicy.mode === "denied") {
+    // Keep the parent proc tree entirely outside the sandbox. A private empty
+    // mount avoids Linux's mount-too-revealing rejection when the parent proc
+    // has inherited masked children; it does not expose host or sibling PIDs.
+    args.push("--tmpfs", "/proc", "--remount-ro", "/proc");
+  } else {
+    args.push("--proc", "/proc");
+  }
   if (compiledEnvironment.value === null) {
     args.push("--tmpfs", "/tmp");
     if (boundedWorkingSet !== undefined) args.push("--dir", tempDirectory);
@@ -1520,6 +1628,7 @@ export function compileSandboxInvocation(
     // parent afterward would mask that authorized destination before chdir.
     addReadWriteBind(args, compiledEnvironment.value.manifest.execution.tmp.path, SANDBOX_TMPDIR, seenDirectories);
     seenDirectories.add(SANDBOX_TMPDIR);
+    if (boundedWorkingSet !== undefined) args.push("--dir", tempDirectory);
   }
   const worktreeDestination = topology.value.worktree;
   if (filesystemEnforcement === undefined) {
@@ -1539,6 +1648,13 @@ export function compileSandboxInvocation(
       }
       args.push(argument);
     }
+  }
+  if (stagingRoot.value !== null) {
+    // The ordinary bounded worktree view remains read-only outside this
+    // deterministic private subtree, even during trusted bundle import.
+    if (request.owner_candidate_staging !== undefined)
+      addReadWriteBind(args, stagingRoot.value, stagingRoot.value, seenDirectories);
+    else addReadOnlyBind(args, stagingRoot.value, stagingRoot.value, seenDirectories);
   }
   if (compiledEnvironment.value === null) {
     addReadWriteBind(args, topology.value.home, SANDBOX_HOME, seenDirectories);
@@ -1603,18 +1719,23 @@ export function compileSandboxInvocation(
     seenDirectories.add(parent);
     args.push("--dir", parent);
   }
+  const ruleArguments = landlockEnabled ? landlockRuleArguments(boundedLandlockRules) : [];
+  if (ruleArguments.length > 513)
+    return topologyError("Derived Landlock rules exceed the bounded launch transport.", {
+      session_id: request.session_id,
+    });
   const commandArgv = landlockEnabled
     ? [
         landlockExecutable.value as string,
         "-c",
         LANDLOCK_TRAMPOLINE,
-        JSON.stringify(boundedLandlockRules),
+        ...ruleArguments,
         "--",
         command.command,
         ...commandArgs,
       ]
     : [command.command, ...commandArgs];
-  args.push("--chdir", worktreeDestination, "--", ...commandArgv);
+  args.push("--chdir", commandWorkingDirectory.value, "--", ...commandArgv);
 
   return success({
     executable: executable.value,
@@ -1702,44 +1823,6 @@ function requirementTempDirectory(): string {
   return process.env.TMPDIR !== undefined && path.isAbsolute(process.env.TMPDIR) ? process.env.TMPDIR : "/tmp";
 }
 
-function boundedOutput(
-  chunks: string[],
-  bytes: number,
-  maxBytes: number,
-  value: Buffer | string,
-): { readonly bytes: number; readonly exceeded: boolean } {
-  const encoded = typeof value === "string" ? Buffer.from(value, "utf8") : value;
-  const textBytes = encoded.byteLength;
-  const remaining = maxBytes - bytes;
-  if (remaining <= 0) return { bytes, exceeded: textBytes > 0 };
-  if (textBytes <= remaining) {
-    chunks.push(encoded.toString("utf8"));
-    return { bytes: bytes + textBytes, exceeded: false };
-  }
-  // Do not let a partial UTF-8 code point turn into U+FFFD and exceed the
-  // advertised byte bound.  The launcher reports text, but the bound is
-  // defined in bytes so that machine callers can rely on it for arbitrary
-  // child output.
-  let end = remaining;
-  while (end > 0) {
-    const last = encoded[end - 1] ?? 0;
-    if ((last & 0x80) === 0) break;
-    if ((last & 0xc0) === 0x80) {
-      let start = end - 1;
-      while (start > 0 && ((encoded[start - 1] ?? 0) & 0xc0) === 0x80) start -= 1;
-      const lead = encoded[start] ?? 0;
-      const width = (lead & 0xe0) === 0xc0 ? 2 : (lead & 0xf0) === 0xe0 ? 3 : (lead & 0xf8) === 0xf0 ? 4 : 1;
-      if (start + width > end) {
-        end = start;
-        continue;
-      }
-    }
-    break;
-  }
-  chunks.push(encoded.subarray(0, end).toString("utf8"));
-  return { bytes: bytes + end, exceeded: true };
-}
-
 function landlockSetupDiagnostic(stderr: string): string | null {
   const marker = stderr.indexOf(LANDLOCK_SETUP_FAILURE_PREFIX);
   if (marker === -1) return null;
@@ -1776,7 +1859,7 @@ export function runSandboxedCommand(
     );
   }
 
-  const started = Date.now();
+  const executionId = request.cgroups?.execution_id ?? randomUUID();
   const profile = openSeccompProfile(invocation.value.seccomp_profile);
   if (!profile.ok) return Promise.resolve(profile);
   let cgroupScope: CgroupScope | null = null;
@@ -1799,8 +1882,8 @@ export function runSandboxedCommand(
       env: { ...invocation.value.env },
       shell: false,
       stdio: interactive
-        ? ["inherit", "inherit", "inherit", profile.value.fd]
-        : ["ignore", "pipe", "pipe", profile.value.fd],
+        ? ["inherit", "inherit", "inherit", profile.value.fd, "pipe", "pipe"]
+        : ["ignore", "pipe", "pipe", profile.value.fd, "pipe", "pipe"],
     });
     profile.value.close();
   } catch (error: unknown) {
@@ -1838,183 +1921,106 @@ export function runSandboxedCommand(
     }
   }
 
-  return new Promise((resolve) => {
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    let outputBytes = 0;
-    let timedOut = false;
-    let outputExceeded = false;
-    let spawnError: Error | null = null;
-    let settled = false;
-    let timer: NodeJS.Timeout | null = null;
-    if (!interactive) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGKILL");
-      }, timeoutMs);
-    }
-
-    const signalHandlers = new Map<NodeJS.Signals, () => void>();
-    const removeSignalHandlers = (): void => {
-      for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler);
-      signalHandlers.clear();
-    };
-    if (interactive) {
-      for (const signal of ["SIGINT", "SIGTERM"] as const) {
-        const handler = (): void => {
-          if (settled) return;
-          try {
-            child.kill(signal);
-          } catch {
-            // The child may have exited between signal delivery and forwarding.
-          }
-        };
-        signalHandlers.set(signal, handler);
-        process.on(signal, handler);
-      }
-    }
-
-    const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
-      if (settled) return;
-      settled = true;
-      if (timer !== null) clearTimeout(timer);
-      removeSignalHandlers();
-      const accounting = cgroupScope === null ? null : readCgroupAccounting(cgroupScope);
-      if (cgroupScope !== null) {
-        const cleaned = cleanupCgroupScope(cgroupScope);
-        if (!cleaned.ok) {
-          resolve(cleaned);
-          return;
+  return (async () => {
+    const procfs = request.procfs ?? { mode: "private" as const, reason: null };
+    const execution = await runObservedSandboxChild(child, {
+      execution_id: executionId,
+      procfs,
+      interactive,
+      timeout_ms: timeoutMs,
+      max_output_bytes: maxOutputBytes,
+      signal: options.signal,
+      forward_parent_signals: interactive,
+    });
+    const accounting = cgroupScope === null ? null : readCgroupAccounting(cgroupScope);
+    const resourceDetails: JsonObject =
+      cgroupScope === null || accounting === null
+        ? {}
+        : {
+            cgroup_scope: cgroupScope.name,
+            cgroup_accounting: accounting as unknown as JsonObject,
+            cgroup_limit_events: cgroupLimitEvents(accounting),
+          };
+    const resultEvidence: JsonObject = execution.ok
+      ? {
+          execution_id: execution.value.execution_id,
+          execution_evidence: {
+            schema_version: 1,
+            execution_id: execution.value.execution_id,
+            exit_code: execution.value.exit_code,
+            signal: execution.value.signal,
+            raw_output: execution.value.raw_output,
+            physical_execution: execution.value.physical_execution,
+          } as unknown as JsonObject,
         }
-      }
-      const resourceDetails: JsonObject =
-        cgroupScope === null || accounting === null
-          ? {}
-          : {
-              cgroup_scope: cgroupScope.name,
-              cgroup_accounting: accounting as unknown as JsonObject,
-              cgroup_limit_events: cgroupLimitEvents(accounting),
-            };
-      if (spawnError !== null) {
-        resolve(
-          failure(
-            new DomainError("SANDBOX_EXECUTION_FAILED", "Bubblewrap failed before the command could run.", {
-              reason: spawnError.message.slice(0, 200),
-              ...resourceDetails,
-            }),
-          ),
-        );
-        return;
-      }
-      if (timedOut) {
-        resolve(
-          failure(
-            new DomainError("SANDBOX_EXECUTION_TIMEOUT", "The sandboxed command exceeded its execution timeout.", {
-              timeout_ms: timeoutMs,
-              ...resourceDetails,
-            }),
-          ),
-        );
-        return;
-      }
-      if (outputExceeded) {
-        resolve(
-          failure(
-            new DomainError("SANDBOX_OUTPUT_LIMIT", "The sandboxed command exceeded its output limit.", {
-              max_output_bytes: maxOutputBytes,
-              ...resourceDetails,
-            }),
-          ),
-        );
-        return;
-      }
-      const diagnostic = stderr.join("");
-      if (code !== 0 && /^bwrap:/mu.test(diagnostic)) {
-        const seccompFailure = /seccomp/u.test(diagnostic);
-        resolve(
-          failure(
-            new DomainError(
-              seccompFailure ? "SANDBOX_CAPABILITY_UNAVAILABLE" : "SANDBOX_EXECUTION_FAILED",
-              seccompFailure
-                ? "The required seccomp baseline could not be applied by bubblewrap."
-                : "Bubblewrap could not establish the protected execution boundary.",
-              {
-                profile_id: invocation.value.seccomp_profile_metadata.id,
-                profile_version: invocation.value.seccomp_profile_metadata.version,
-                stderr: diagnostic.slice(0, maxOutputBytes),
-              },
-            ),
-          ),
-        );
-        return;
-      }
-      const landlockDiagnostic =
-        invocation.value.landlock.state === "enforced" ? landlockSetupDiagnostic(diagnostic) : null;
-      if (landlockDiagnostic !== null) {
-        resolve(
-          failure(
-            new DomainError(
-              "SANDBOX_EXECUTION_FAILED",
-              "Landlock setup failed; the protected command was not executed.",
-              {
-                session_id: request.session_id,
-                abi: invocation.value.landlock.abi,
-                effective_state: "error",
-                retryable: false,
-                diagnostic: landlockDiagnostic,
-              },
-            ),
-          ),
-        );
-        return;
-      }
-      resolve(
-        success({
-          exit_code: code,
-          signal,
-          stdout: stdout.join(""),
-          stderr: stderr.join(""),
-          duration_ms: Date.now() - started,
-          seccomp_profile: invocation.value.seccomp_profile_metadata,
-          ...(cgroupScope === null || accounting === null
+      : {
+          execution_id: execution.error.details?.execution_id ?? executionId,
+          ...(execution.error.details?.execution_evidence === undefined
             ? {}
-            : {
-                resources: {
-                  cgroup_contract_id: cgroupScope.contract_id,
-                  scope: cgroupScope.name,
-                  accounting,
-                  limit_events: cgroupLimitEvents(accounting),
-                },
-              }),
-          landlock: invocation.value.landlock,
-          ...(request.runtime_resolution === undefined ? {} : { runtime_resolution: request.runtime_resolution }),
+            : { execution_evidence: execution.error.details.execution_evidence as JsonObject }),
+        };
+
+    if (cgroupScope !== null) {
+      const cleaned = cleanupCgroupScope(cgroupScope);
+      if (!cleaned.ok) {
+        return failure(
+          new DomainError(cleaned.error.code, cleaned.error.message, {
+            ...(cleaned.error.details ?? {}),
+            ...resourceDetails,
+            ...resultEvidence,
+          }),
+        );
+      }
+    }
+    if (!execution.ok) {
+      const evidence = sandboxExecutionEvidenceFromError(execution.error);
+      const setupDiagnostic =
+        invocation.value.landlock.state === "enforced" && evidence?.exit_code === 125 && evidence.signal === null
+          ? landlockSetupDiagnostic(Buffer.from(evidence.raw_output.stderr, "base64").toString("utf8"))
+          : null;
+      return failure(
+        new DomainError(execution.error.code, execution.error.message, {
+          ...(execution.error.details ?? {}),
+          ...resourceDetails,
+          ...(setupDiagnostic === null ? {} : { retryable: false, diagnostic: setupDiagnostic }),
         }),
       );
-    };
-
-    if (!interactive) {
-      child.stdout?.on("data", (value: Buffer | string) => {
-        const collected = boundedOutput(stdout, outputBytes, maxOutputBytes, value);
-        outputBytes = collected.bytes;
-        if (collected.exceeded) {
-          outputExceeded = true;
-          child.kill("SIGKILL");
-        }
-      });
-      child.stderr?.on("data", (value: Buffer | string) => {
-        const collected = boundedOutput(stderr, outputBytes, maxOutputBytes, value);
-        outputBytes = collected.bytes;
-        if (collected.exceeded) {
-          outputExceeded = true;
-          child.kill("SIGKILL");
-        }
-      });
     }
-    child.on("error", (error: Error) => {
-      spawnError = error;
+
+    const diagnostic = execution.value.stderr;
+    const landlockDiagnostic =
+      invocation.value.landlock.state === "enforced" ? landlockSetupDiagnostic(diagnostic) : null;
+    if (landlockDiagnostic !== null) {
+      return failure(
+        new DomainError("SANDBOX_EXECUTION_FAILED", "Landlock setup failed; the protected command was not executed.", {
+          session_id: request.session_id,
+          abi: invocation.value.landlock.abi,
+          effective_state: "error",
+          retryable: false,
+          diagnostic: landlockDiagnostic,
+          ...resourceDetails,
+          ...resultEvidence,
+        }),
+      );
+    }
+
+    return success({
+      ...execution.value,
+      seccomp_profile: invocation.value.seccomp_profile_metadata,
+      ...(cgroupScope === null || accounting === null
+        ? {}
+        : {
+            resources: {
+              cgroup_contract_id: cgroupScope.contract_id,
+              scope: cgroupScope.name,
+              accounting,
+              limit_events: cgroupLimitEvents(accounting),
+            },
+          }),
+      landlock: invocation.value.landlock,
+      ...(request.runtime_resolution === undefined ? {} : { runtime_resolution: request.runtime_resolution }),
     });
-    child.on("close", (code, signal) => finish(code, signal));
-  });
+  })();
 }
 
 /** Execute one projected command with the caller's existing terminal streams. */

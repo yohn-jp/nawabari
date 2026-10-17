@@ -93,6 +93,73 @@ const option = <
  */
 const REGISTRY_DATA = [
   {
+    name: "verification snapshot",
+    summary: "Read the current owned session verification policy fence",
+    usage: `${CLI_NAME} verification snapshot --session <id>`,
+    options: [option("--session", "Exact owned active session identity", { value: "<id>", required: true })],
+    notes: [
+      "Read-only; the returned snapshot grants no execution authority and is revalidated by the execution owner.",
+    ],
+  },
+  {
+    name: "verification execute",
+    summary: "Execute a source-bound verifier through the owned protected session",
+    usage: `${CLI_NAME} verification execute --request-file <path>`,
+    options: [
+      option("--request-file", "Bounded version 1 session-bound verification request JSON", {
+        value: "<path>",
+        required: true,
+      }),
+    ],
+    notes: [
+      "Uses strict managed admission and a read-only invocation-local profile. Unknown currentness or cleanup cannot pass; there is no unmanaged fallback.",
+    ],
+  },
+  {
+    name: "verification candidate-paths",
+    summary: "Resolve deterministic owner-bound candidate bundle transfer paths",
+    usage: `${CLI_NAME} verification candidate-paths --request-file <path>`,
+    options: [
+      option("--request-file", "Bounded version 1 owner-bound Git candidate bundle request JSON", {
+        value: "<path>",
+        required: true,
+      }),
+    ],
+    notes: [
+      "Read-only; requires the exact current session snapshot and returns only paths derived from the owned worktree and candidate identities.",
+    ],
+  },
+  {
+    name: "verification stage-candidate",
+    summary: "Stage an exact Git candidate into the owned session verifier working set",
+    usage: `${CLI_NAME} verification stage-candidate --request-file <path>`,
+    options: [
+      option("--request-file", "Bounded version 1 owner-bound Git candidate bundle request JSON", {
+        value: "<path>",
+        required: true,
+      }),
+    ],
+    notes: [
+      "Imports only the declared current bundle through strict managed execution after an exact session snapshot CAS.",
+      "The request contains no filesystem path; the bundle location is derived from the owned session worktree and SHA-256 identity.",
+    ],
+  },
+  {
+    name: "verification release-candidate",
+    summary: "Drain the owned session and release one verified candidate scratch tree",
+    usage: `${CLI_NAME} verification release-candidate --request-file <path>`,
+    options: [
+      option("--request-file", "Bounded version 1 owner-bound candidate release request JSON", {
+        value: "<path>",
+        required: true,
+      }),
+    ],
+    notes: [
+      "Requires the exact current owner snapshot, waits for closed-admission owned-scope emptiness, and removes only the clean deterministic candidate source subtree.",
+      "Dirty, nested, symlinked, wrong-owner, or unexpected recoverable candidate data blocks release and remains available for recovery.",
+    ],
+  },
+  {
     name: "session create",
     summary: "Request a new Nawabari session",
     usage:
@@ -617,7 +684,7 @@ const REGISTRY_DATA = [
   {
     name: "session close",
     summary: "Close the current or selected session",
-    usage: `${CLI_NAME} session close [<session-id>|--session <id>] [--integrated-revision <rev>] [--fetch-remote <name> --fetch-branch <branch>]`,
+    usage: `${CLI_NAME} session close [<session-id>|--session <id>] [--drain-policy <wait|terminate>] [--integrated-revision <rev>] [--fetch-remote <name> --fetch-branch <branch>]`,
     options: [
       option("--session", "Select a session instead of the current worktree owner", { value: "<id>" }),
       option(
@@ -629,9 +696,15 @@ const REGISTRY_DATA = [
         value: "<name>",
       }),
       option("--fetch-branch", "Integration branch to fetch; requires --fetch-remote", { value: "<branch>" }),
+      option(
+        "--drain-policy",
+        "Wait for this session's owned executions (default), or explicitly terminate their exact owned scopes before closing",
+        { value: "<wait|terminate>", default: "wait", values: ["wait", "terminate"] },
+      ),
     ],
     notes: [
       "Ordinary ancestry-based close remains the cheap/default path and requires no flags.",
+      "The default drain policy waits; terminate is explicit and targets only exact owned execution scopes after session admission is closed and ownership is revalidated.",
       "Network access is never implicit; --fetch-remote and --fetch-branch are accepted only with a full lowercase --integrated-revision SHA.",
       "Fetch updates only a disposable internal proof ref with no tags, FETCH_HEAD, tracking-ref, or local integration-branch changes; remote tip races fail closed.",
       "Nawabari never calls provider APIs such as GitHub; only explicit --fetch-remote/--fetch-branch options connect to the configured Git remote.",

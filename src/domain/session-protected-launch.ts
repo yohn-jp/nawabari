@@ -29,6 +29,10 @@ import {
   type TrustedSandboxPayload,
 } from "./session-launch-supervisor.js";
 import {
+  isSandboxExecutionEvidenceSnapshot,
+  type SandboxExecutionEvidenceSnapshot,
+} from "./sandbox-execution-evidence.js";
+import {
   compileSandboxInvocation,
   openSeccompProfile,
   type SandboxCommand,
@@ -38,7 +42,7 @@ import {
 import type { SandboxExecutionRequest } from "./sandbox.js";
 import { validateWorktreeRuntimeProfile, type ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 import { resolveSessionHookSet } from "./session-git-hooks.js";
-import type { SessionBackend, SessionContext } from "./session.js";
+import type { SessionBackend, SessionContext, SessionVerificationSnapshot } from "./session.js";
 import { enterSessionConsole, type SessionConsoleEnterOptions } from "./session-console.js";
 
 export {
@@ -66,8 +70,11 @@ export type SessionProtectedLaunchInput = Readonly<{
   readonly compiled_environment: CompiledSessionEnvironment;
   readonly request: SandboxExecutionRequest;
   readonly command: SandboxCommand;
+  readonly sandbox_limits?: Readonly<{ timeout_ms: number; max_output_bytes: number }>;
   readonly stdio?: readonly [SupervisorStdioValue, SupervisorStdioValue, SupervisorStdioValue];
   readonly admission: ExecutionAdmissionFacts;
+  /** Exact owner snapshot checked atomically with the durable starting record. */
+  readonly expected_verification_snapshot?: SessionVerificationSnapshot;
   readonly starting_record: SessionExecutionRecord;
   readonly supervisor: Omit<SessionLaunchSupervisorPacket, "admission" | "payload" | "durability">;
 }>;
@@ -87,6 +94,8 @@ export type SessionProtectedLaunchResult = Readonly<{
   readonly execution: SessionExecutionRecord;
   /** Present only when the trusted worker proved a completed payload result. */
   readonly result?: SandboxExecutionResult;
+  /** Launcher-owned raw output and physical execution observation on any observed exit. */
+  readonly execution_evidence?: SandboxExecutionEvidenceSnapshot;
 }>;
 
 function compositionFailure(
@@ -163,10 +172,11 @@ async function persistRecord(
   writer: SessionExecutionDurableWriter,
   record: SessionExecutionRecord,
   operation: string,
+  expectedVerificationSnapshot?: SessionVerificationSnapshot,
 ): Promise<DomainResult<SessionExecutionRecord>> {
   const persisted: PersistedSessionExecutionRecord = serializeSessionExecutionRecord(record);
   try {
-    await writer(persisted);
+    await writer(persisted, expectedVerificationSnapshot);
   } catch (error: unknown) {
     return compositionFailure(
       "REGISTRY_DURABILITY_UNCERTAIN",
@@ -319,7 +329,12 @@ export async function launchProtectedSessionExecution(
   }
 
   let current = identities.value.record;
-  const starting = await persistRecord(deps.persist_execution, current, "starting");
+  const starting = await persistRecord(
+    deps.persist_execution,
+    current,
+    "starting",
+    input.expected_verification_snapshot,
+  );
   if (!starting.ok) return starting;
   current = starting.value;
 
@@ -367,6 +382,8 @@ export async function launchProtectedSessionExecution(
     args: invocation.value.args,
     cwd: invocation.value.cwd,
     env: invocation.value.env,
+    procfs: input.request.procfs ?? { mode: "private", reason: null },
+    ...(input.sandbox_limits === undefined ? {} : { ...input.sandbox_limits }),
     stdio: [identities.value.stdio[0], identities.value.stdio[1], identities.value.stdio[2], profile.value.fd],
     seccomp_fd: profile.value.fd,
   };
@@ -450,13 +467,28 @@ export async function launchProtectedSessionExecution(
   if (!persistedTerminal.ok) return persistedTerminal;
 
   if (supervised.value.status === "completed" && supervised.value.result !== undefined) {
+    const result = supervised.value.result as SandboxExecutionResult;
     return success({
       supervisor: supervised.value,
       execution: persistedTerminal.value,
-      result: supervised.value.result as SandboxExecutionResult,
+      result,
+      execution_evidence: {
+        schema_version: 1,
+        execution_id: result.execution_id,
+        exit_code: result.exit_code,
+        signal: result.signal,
+        raw_output: result.raw_output,
+        physical_execution: result.physical_execution,
+      },
     });
   }
-  return success({ supervisor: supervised.value, execution: persistedTerminal.value });
+  const supervisorResult = "result" in supervised.value ? supervised.value.result : undefined;
+  const evidence = isSandboxExecutionEvidenceSnapshot(supervisorResult) ? supervisorResult : undefined;
+  return success({
+    supervisor: supervised.value,
+    execution: persistedTerminal.value,
+    ...(evidence === undefined ? {} : { execution_evidence: evidence }),
+  });
 }
 
 /** Protected launch composition consumed by the session-enter integration. */

@@ -46,6 +46,7 @@ import type { ResolvedRuntimeProfile, RuntimeProfileSelection } from "./runtime-
 import type { ResolvedWorktreeRuntimeProfile } from "./worktree-runtime-profile.js";
 import type { SessionHookMaterial } from "./session-git-hooks.js";
 import type { NixRuntimeClosureOptions } from "./nix-runtime-closure.js";
+import { observeSandboxProcfsPolicy, type SandboxProcfsPolicy } from "./sandbox-procfs.js";
 
 /**
  * Versioned identity for the Linux sandbox execution contract (Issue #81).
@@ -194,6 +195,8 @@ export type SandboxExecutionRequest = {
   network_mode: SandboxNetworkMode;
   /** Resolved host path to bubblewrap; null is valid only for advisory requests. */
   sandbox_executable: string | null;
+  /** Parent topology may require a narrower empty proc view; never bind parent processes. */
+  procfs?: SandboxProcfsPolicy;
   identity: SandboxIdentity;
   /** Minimum host Git author identity projected for commit semantics; never a full config file. */
   git_identity: SandboxGitIdentity;
@@ -220,6 +223,20 @@ export type SandboxExecutionRequest = {
   runtime_resolution?: RuntimeResolutionEvidence;
   /** Accepted #448 environment; protected composition supplies this additively. */
   compiled_session_environment?: CompiledSessionEnvironment;
+  /**
+   * Fixed owner-only scratch allowance for the candidate-bundle import operation.
+   * The caller supplies identities only; the launcher derives the path below the
+   * canonical session worktree and grants no such allowance to agent commands.
+   */
+  owner_candidate_staging?: Readonly<{ candidate_digest: string; source_key: string }>;
+  /** @internal Issued only after the fixed owner staging operation succeeds. */
+  owner_candidate_verification?: Readonly<{
+    candidate_digest: string;
+    source_key: string;
+    head_id: string;
+    tree_id: string;
+    base_commit: string;
+  }>;
 };
 
 export type SandboxCgroupConfig = {
@@ -982,6 +999,7 @@ export async function resolveSandboxExecutionRequest(
     branch: decision.branch,
     network_mode: doctor.network_mode,
     sandbox_executable: runtimeLayout.bubblewrap,
+    procfs: observeSandboxProcfsPolicy(),
     identity: resolveIdentity(probe),
     git_identity: {
       host_global_name: runtimeLayout.git_user_name,

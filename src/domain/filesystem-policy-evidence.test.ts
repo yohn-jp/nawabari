@@ -18,6 +18,7 @@ import {
 } from "./filesystem-policy-evidence.js";
 import { success, type DomainResult } from "./errors.js";
 import type { SandboxExecutionResult } from "./sandbox-launcher.js";
+import { sandboxExecutionMockSuccess } from "../testing/sandbox-execution-evidence-mock.js";
 
 const policy = {
   contract_id: FILESYSTEM_POLICY_CONTRACT_ID,
@@ -255,7 +256,7 @@ test("verification authority delegates protected execution without changing agen
   let observedRequest: SandboxExecutionRequest | null = null;
   const execute = async (sandboxRequest: SandboxExecutionRequest): Promise<DomainResult<SandboxExecutionResult>> => {
     observedRequest = sandboxRequest;
-    return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 2 });
+    return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 2 });
   };
   const authority = new VerificationExecutionAuthority({ execute });
   const evidence = await authority.executeEvidence(profile, request);
@@ -278,7 +279,8 @@ test("verification authority delegates protected execution without changing agen
 
 test("verification serialization validates the nested result and keeps its explicit key", async () => {
   const authority = new VerificationExecutionAuthority({
-    execute: async () => success({ exit_code: 1, signal: null, stdout: "", stderr: "failed", duration_ms: 1 }),
+    execute: async () =>
+      sandboxExecutionMockSuccess({ exit_code: 1, signal: null, stdout: "", stderr: "failed", duration_ms: 1 }),
   });
   const evidence = await authority.executeEvidence(profile, request);
   assert.equal(evidence.ok, true);
@@ -319,6 +321,7 @@ test("source-bound verification evidence serializes hashes only and does not upg
         schema_version: 1,
         identity_sha256: "1".repeat(64),
         head_id: "a".repeat(40),
+        tree_id: "c".repeat(40),
         base_id: "b".repeat(40),
         profile_sha256: "2".repeat(64),
         policy_sha256: "3".repeat(64),

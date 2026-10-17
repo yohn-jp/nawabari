@@ -16,6 +16,10 @@ import {
 } from "./cli.js";
 import { machineContract } from "./contract.js";
 import { DomainError, failure, success } from "./domain/errors.js";
+import {
+  sandboxExecutionMockSuccess,
+  withSandboxExecutionEvidence,
+} from "./testing/sandbox-execution-evidence-mock.js";
 import { SESSION_ACTION_IDS } from "./domain/session-actions.js";
 import { OPERATION_VOCABULARY } from "./operation-authorization.js";
 import type {
@@ -289,12 +293,12 @@ test("bounded session run carries the persisted working-set boundary into the pr
       sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async (request) => {
         observedWorkingSet = request.runtime_projection?.working_set;
-        return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
       },
     },
   );
 
-  assert.equal(exitCode, 0, output.stderr.join("\n"));
+  assert.equal(exitCode, 0, output.stderr.join("\n") || output.stdout.join("\n"));
   assert.equal(observedWorkingSet?.working_set_id, "ews-cli-test");
   assert.equal(observedWorkingSet?.revision, 1);
   assert.deepEqual(observedWorkingSet?.scope.readOnly, ["README.md"]);
@@ -354,7 +358,13 @@ test("session run and exec project the advertised protected identities from the 
           };
           observedRuntimeResolution = request.runtime_resolution;
           observedCommand = [command.command, ...(command.args ?? [])];
-          return success({ exit_code: childExitCode, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({
+            exit_code: childExitCode,
+            signal: null,
+            stdout: "ok",
+            stderr: "",
+            duration_ms: 1,
+          });
         },
       },
     );
@@ -365,11 +375,13 @@ test("session run and exec project the advertised protected identities from the 
     assert.deepEqual(response, {
       ok: true,
       command: `session ${subcommand}`,
-      exit_code: childExitCode,
-      signal: null,
-      stdout: "ok",
-      stderr: "",
-      duration_ms: 1,
+      ...withSandboxExecutionEvidence({
+        exit_code: childExitCode,
+        signal: null,
+        stdout: "ok",
+        stderr: "",
+        duration_ms: 1,
+      }),
       session_id: sampleSession.session_id,
       repository: sampleSession.repository,
       worktree: sampleSession.worktree,
@@ -410,7 +422,7 @@ test("session run does not interpret a child --json argument as a Nawabari globa
     sandboxRuntimeLayout: strictRuntimeLayout(),
     sandboxRunner: async (_request, command) => {
       assert.deepEqual([command.command, ...(command.args ?? [])], ["printf", "--json"]);
-      return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
     },
   });
 
@@ -429,7 +441,7 @@ test("session run and merged session shell carry explicit compatibility policy t
     sandboxRuntimeLayout: strictRuntimeLayout(),
     sandboxRunner: async (request, command) => {
       observed.push({ policy: request.runtime_projection?.policy.mode ?? "missing", command: command.command });
-      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
     },
   };
 
@@ -466,7 +478,7 @@ test("runtime policy parser rejects unknown and duplicate values before protecte
       io: output.io,
       sandboxRunner: async () => {
         runnerCalls += 1;
-        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
       },
     });
     assert.equal(exitCode, 2, arguments_.join(" "));
@@ -492,7 +504,7 @@ test("session shell requires -- and passes only the projected shell argv to the 
         assert.equal(request.session_id, sampleSession.session_id);
         observedCommand = [command.command, ...(command.args ?? [])];
         observedInteractive = options?.interactive === true;
-        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
       },
     },
   );
@@ -518,7 +530,7 @@ test("session shell rejects a missing terminator, missing shell, and non-basenam
       io: output.io,
       sandboxRunner: async () => {
         launcherCalls += 1;
-        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
       },
     });
 
@@ -538,7 +550,8 @@ test("session shell propagates a projected shell exit status or signal", async (
       io: nonzeroOutput.io,
       sandboxProbe: readySandboxProbe(),
       sandboxRuntimeLayout: strictRuntimeLayout(),
-      sandboxRunner: async () => success({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
+      sandboxRunner: async () =>
+        sandboxExecutionMockSuccess({ exit_code: 7, signal: null, stdout: "", stderr: "", duration_ms: 1 }),
     },
   );
   assert.equal(nonzero, 7);
@@ -551,7 +564,8 @@ test("session shell propagates a projected shell exit status or signal", async (
     io: signalOutput.io,
     sandboxProbe: readySandboxProbe(),
     sandboxRuntimeLayout: strictRuntimeLayout(),
-    sandboxRunner: async () => success({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
+    sandboxRunner: async () =>
+      sandboxExecutionMockSuccess({ exit_code: null, signal: "SIGINT", stdout: "", stderr: "", duration_ms: 1 }),
   });
   assert.equal(signal, 3);
   assert.deepEqual(signalOutput.stdout, []);
@@ -598,7 +612,7 @@ test("typed pre-launch protected failure does not emit successful identity evide
     sandboxProbe: readySandboxProbe({ hasBubblewrap: () => false }),
     sandboxRunner: async () => {
       runnerCalls += 1;
-      return success({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
     },
   });
 
@@ -660,7 +674,7 @@ test("managed run, exec, and shell dispatch to the protected lifecycle before an
       sandboxProbe: readySandboxProbe({ hasCgroupsV2: () => false }),
       sandboxRunner: async () => {
         legacyRunnerCalls += 1;
-        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
       },
     });
 
@@ -753,7 +767,7 @@ test("session run and session shell dispatch the identical projected rg provider
         sandboxRunner: async (_request, command, options) => {
           runObservedCommand = [command.command, ...(command.args ?? [])];
           assert.equal(options?.interactive ?? false, false);
-          return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
         },
       },
     );
@@ -775,7 +789,7 @@ test("session run and session shell dispatch the identical projected rg provider
         sandboxRunner: async (_request, command, options) => {
           shellObservedCommand = [command.command, ...(command.args ?? [])];
           shellObservedInteractive = options?.interactive === true;
-          return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
         },
       },
     );
@@ -798,12 +812,37 @@ test("session run returns a rejected exit status for a signaled child and never 
       sandboxProbe: readySandboxProbe(),
       sandboxRuntimeLayout: strictRuntimeLayout(),
       sandboxRunner: async () =>
-        success({ exit_code: null, signal: "SIGTERM", stdout: "", stderr: "", duration_ms: 1 }),
+        sandboxExecutionMockSuccess({ exit_code: null, signal: "SIGTERM", stdout: "", stderr: "", duration_ms: 1 }),
     },
   );
 
   assert.equal(signalExitCode, 3);
-  assert.deepEqual(JSON.parse(signalOutput.stdout[0] ?? ""), {
+  const signaled = JSON.parse(signalOutput.stdout[0] ?? "") as Record<string, unknown>;
+  const { execution_id, raw_output, physical_execution, ...signaledEnvelope } = signaled;
+  assert.equal(execution_id, "mock-execution");
+  assert.deepEqual(raw_output, {
+    encoding: "base64",
+    capture_mode: "pipes",
+    stdout: "",
+    stderr: "",
+    stdout_bytes: 0,
+    stderr_bytes: 0,
+    observed_stdout_bytes: 0,
+    observed_stderr_bytes: 0,
+    complete: true,
+    truncated: false,
+  });
+  assert.deepEqual(
+    {
+      correlation_id: (physical_execution as { correlation_id: string }).correlation_id,
+      start: (physical_execution as { start: { state: string } }).start.state,
+      termination: (physical_execution as { termination: { state: string } }).termination.state,
+      cleanup: (physical_execution as { cleanup: { state: string } }).cleanup.state,
+    },
+    { correlation_id: "mock-execution", start: "unknown", termination: "unknown", cleanup: "unknown" },
+    "a fixture must not claim physical owner evidence",
+  );
+  assert.deepEqual(signaledEnvelope, {
     ok: true,
     command: "session run",
     exit_code: null,
@@ -839,7 +878,13 @@ test("session run returns a rejected exit status for a signaled child and never 
       sandboxProbe: readySandboxProbe({ hasBubblewrap: () => false }),
       sandboxRunner: async () => {
         runnerInvocations += 1;
-        return success({ exit_code: 0, signal: null, stdout: "ambient", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({
+          exit_code: 0,
+          signal: null,
+          stdout: "ambient",
+          stderr: "",
+          duration_ms: 1,
+        });
       },
     },
   );
@@ -951,7 +996,18 @@ test("canonical command registry resolves aliases without duplicating option def
   )?.values;
   assert.deepEqual(actionValues, SESSION_ACTION_IDS);
 
+  const closeDrainPolicy = resolveCliCommandDefinition("session close")?.options.find(
+    (option) => option.name === "--drain-policy",
+  );
+  assert.deepEqual(closeDrainPolicy?.values, ["wait", "terminate"]);
+  assert.equal(closeDrainPolicy?.default, "wait");
+
   assert.deepEqual(publicNames, [
+    "verification snapshot",
+    "verification execute",
+    "verification candidate-paths",
+    "verification stage-candidate",
+    "verification release-candidate",
     "session create",
     "session id",
     "profile list",
@@ -1278,6 +1334,11 @@ test("JSON help separates global, session, and garbage-collection options", asyn
     command: "help",
     usage: "Usage: nawabari <command> [options]",
     commands: [
+      "verification snapshot",
+      "verification execute",
+      "verification candidate-paths",
+      "verification stage-candidate",
+      "verification release-candidate",
       "session create",
       "session id",
       "profile list",
@@ -1380,6 +1441,7 @@ test("JSON help separates global, session, and garbage-collection options", asyn
       "--claim-id",
       "--fetch-remote",
       "--fetch-branch",
+      "--drain-policy",
       "--expect-absent",
       "--payload-file",
       "--payload-stdin",
@@ -1865,7 +1927,7 @@ test("session reconcile requires an explicit target and apply flag, then delegat
   });
 });
 
-test("session close forwards explicit integration fetch metadata and rejects incomplete fetch options", async () => {
+test("session close forwards explicit drain policy and integration fetch metadata, with wait as default", async () => {
   let receivedOptions: SessionCloseOptions | null = null;
   let closeCalls = 0;
   const backend = backendForTests({
@@ -1889,6 +1951,8 @@ test("session close forwards explicit integration fetch metadata and rejects inc
       "origin",
       "--fetch-branch",
       "main",
+      "--drain-policy",
+      "terminate",
       "--json",
     ],
     { backend, io: output.io },
@@ -1899,7 +1963,28 @@ test("session close forwards explicit integration fetch metadata and rejects inc
     integrated_revision: integratedRevision,
     fetch_remote: "origin",
     fetch_branch: "main",
+    drain_policy: "terminate",
   });
+
+  const defaultOutput = capture();
+  const defaultExitCode = await runCli(["session", "close", "--json"], { backend, io: defaultOutput.io });
+  assert.equal(defaultExitCode, 0, defaultOutput.stderr.join("\n"));
+  assert.deepEqual(receivedOptions, {
+    session_id: null,
+    integrated_revision: null,
+    fetch_remote: null,
+    fetch_branch: null,
+    drain_policy: "wait",
+  });
+
+  const invalidPolicyOutput = capture();
+  const invalidPolicyExitCode = await runCli(["session", "close", "--drain-policy", "kill-all", "--json"], {
+    backend,
+    io: invalidPolicyOutput.io,
+  });
+  assert.equal(invalidPolicyExitCode, 2);
+  assert.equal(JSON.parse(invalidPolicyOutput.stdout[0]).code, "INVALID_ARGUMENT");
+  assert.equal(closeCalls, 2);
 
   const incompleteOutput = capture();
   const incompleteExitCode = await runCli(["session", "close", "--fetch-remote", "origin", "--json"], {
@@ -1907,7 +1992,7 @@ test("session close forwards explicit integration fetch metadata and rejects inc
     io: incompleteOutput.io,
   });
   assert.equal(incompleteExitCode, 2);
-  assert.equal(closeCalls, 1);
+  assert.equal(closeCalls, 2);
   assert.equal(JSON.parse(incompleteOutput.stdout[0]).code, "INVALID_ARGUMENT");
 });
 
@@ -1916,9 +2001,17 @@ test("session close help distinguishes provider APIs from explicit Git remote fe
   const exitCode = await runCli(["session", "close", "--help", "--json"], { io: output.io });
 
   assert.equal(exitCode, 0);
-  const response = JSON.parse(output.stdout[0] ?? "") as { notes: string[] };
+  const response = JSON.parse(output.stdout[0] ?? "") as {
+    notes: string[];
+    options: Array<{ name: string; values?: string[]; default?: string }>;
+  };
   assert.ok(response.notes.some((note) => note.includes("never calls provider APIs")));
   assert.ok(response.notes.some((note) => note.includes("only explicit --fetch-remote/--fetch-branch")));
+  assert.ok(response.notes.some((note) => note.includes("default drain policy waits")));
+  const drainPolicy = response.options.find((option) => option.name === "--drain-policy");
+  assert.ok(drainPolicy, "session close help should expose its explicit drain policy");
+  assert.deepEqual(drainPolicy.values, ["wait", "terminate"]);
+  assert.equal(drainPolicy.default, "wait");
 });
 
 test("session-scoped commands accept one consistent positional target and discard requires it", async () => {

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { executeBootstrapAction, runBootstrapActions } from "./session-bootstrap.js";
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   SessionRegistry,
   type GarbageCollectResult as RegistryGarbageCollectResult,
@@ -45,6 +46,9 @@ import {
   type PushOptions,
   type PushResult,
   type SessionBackend,
+  type SessionCandidateScratchReleaseMutationResult,
+  type SessionCandidateScratchReleaseOptions,
+  type SessionCandidateScratchReleaseResult,
   type SessionCloseOptions,
   type SessionCloseResult,
   type SessionDiscardResult,
@@ -55,6 +59,7 @@ import {
   type SessionContext,
   type SessionCreateOptions,
   type SessionManagedRuntimeState,
+  type SessionVerificationSnapshot,
   type WorkingSetExpansionOptions,
   type WorkingSetExpansionResult,
   type SessionDiagnostic,
@@ -93,6 +98,7 @@ import {
   type CoordinationTransactionResult,
 } from "./session.js";
 import { collectRepositoryRuntimeSnapshot } from "./repository-observation-service.js";
+import { inspectSessionCandidateBundleScratch } from "../session-candidate-bundle-storage.js";
 import { createSessionActions, type SessionActionDispatcher } from "./session-actions.js";
 import {
   parseSessionExecutionRecord,
@@ -122,6 +128,7 @@ import {
   type OwnedExecutionObservation,
   type SessionExecutionRecord as OwnedSessionExecutionRecord,
 } from "./session-process-observation.js";
+import { observeSessionCgroupTree } from "./session-cgroup-tree-observation.js";
 import {
   CGROUPS_V2_CONTRACT_ID,
   cleanupCgroupScope,
@@ -154,7 +161,7 @@ export interface LocalSessionBackendOptions {
   readonly hookMaterialAuthority?: SessionHookMaterialAuthority;
   readonly registry?: Omit<
     SessionRegistryOptions,
-    "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority"
+    "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority" | "cgroupRoot"
   >;
   /** Explicit override for the managed-runtime handoff fence (tests/custom composition). */
   readonly resourceHandoffExecution?: ResourceHandoffFenceController;
@@ -273,7 +280,7 @@ export class LocalSessionBackend implements SessionBackend {
   private readonly hookMaterialAuthority: SessionHookMaterialAuthority | undefined;
   private readonly registryOptions: Omit<
     SessionRegistryOptions,
-    "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority"
+    "cwd" | "git" | "gitIdentity" | "managedExecutionReadiness" | "hookMaterialAuthority" | "cgroupRoot"
   >;
   private readonly resourceHandoffExecution: ResourceHandoffFenceController | undefined;
   private readonly implementationExecutionScopeResolver: ImplementationExecutionScopeResolver | undefined;
@@ -319,12 +326,16 @@ export class LocalSessionBackend implements SessionBackend {
   public async persistSessionExecution(
     context: SessionContext,
     record: PersistedSessionExecutionRecord,
+    expectedVerificationSnapshot?: SessionVerificationSnapshot,
   ): Promise<DomainResult<PersistedSessionExecutionRecord>> {
     try {
       const registry = this.registryFor(context);
       const desired = parseSessionExecutionRecord(record);
       if (!desired.ok) return desired;
       const wanted = toPersistedSessionExecutionRecord(desired.value);
+      if (expectedVerificationSnapshot !== undefined) {
+        return success(registry.persistSessionExecution(wanted, expectedVerificationSnapshot));
+      }
       const currentRecord = registry
         .listSessionExecutions(desired.value.session_id)
         .find((candidate) => candidate.execution_id === desired.value.execution_id);
@@ -405,6 +416,88 @@ export class LocalSessionBackend implements SessionBackend {
   ): Promise<DomainResult<SessionManagedRuntimeState>> {
     try {
       return success(this.registryFor(context).getSessionManagedRuntime(sessionId, executionId));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async getSessionVerificationSnapshot(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<DomainResult<SessionVerificationSnapshot>> {
+    try {
+      return success(this.registryFor(context).getSessionVerificationSnapshot(sessionId));
+    } catch (error: unknown) {
+      return failure(toDomainError(error));
+    }
+  }
+
+  public async releaseSessionCandidateScratch(
+    context: SessionContext,
+    options: SessionCandidateScratchReleaseOptions,
+  ): Promise<DomainResult<SessionCandidateScratchReleaseResult>> {
+    try {
+      const registry = this.registryFor(context);
+      const currentSnapshot = registry.getSessionVerificationSnapshot(options.session_id);
+      if (!isDeepStrictEqual(currentSnapshot, options.snapshot)) {
+        return failure(
+          new DomainError("STALE_REGISTRY", "Candidate release requires the exact current owner snapshot.", {
+            session_id: options.session_id,
+          }),
+        );
+      }
+      if (registry.getSessionLaunchAdmission(options.session_id) === undefined) {
+        return failure(
+          new DomainError("OPERATION_REJECTED", "Candidate release requires tracked managed admission.", {
+            session_id: options.session_id,
+          }),
+        );
+      }
+      const identity = {
+        candidate_digest: options.candidate_digest,
+        project_id: options.source.project_id,
+        source_id: options.source.source_id,
+        bundle_sha256: options.source.bundle_sha256,
+        base_commit: options.source.base_commit,
+        candidate_commit: options.source.candidate_commit,
+        candidate_tree: options.source.candidate_tree,
+      };
+      try {
+        inspectSessionCandidateBundleScratch(options.snapshot.worktree, identity);
+      } catch (error: unknown) {
+        return failure(
+          new DomainError(
+            "OPERATION_REJECTED",
+            error instanceof Error ? error.message : "Candidate scratch could not be verified safely.",
+            { session_id: options.session_id, candidate_id: options.candidate_id },
+          ),
+        );
+      }
+      const drained = await closeSessionWithRuntimeDrain(
+        runtimeLifecycleAdapter(
+          registry,
+          ({ fence }) => registryMutation(() => registry.releaseSessionCandidateScratch(options, fence)),
+          this.managedCgroupRoot,
+          this.registryOptions.cgroupFilesystem,
+        ),
+        options.session_id,
+        options.snapshot.managed.runtime_epoch,
+        "wait",
+      );
+      if (!drained.ok) return drained;
+      if (drained.value.status !== "completed" || drained.value.value === undefined) {
+        return failure(
+          new DomainError("OPERATION_REJECTED", "Candidate scratch release is blocked until owned executions drain.", {
+            session_id: options.session_id,
+            status: drained.value.status,
+            active_execution_ids: [...drained.value.active_execution_ids],
+            unknown_execution_ids: [...drained.value.unknown_execution_ids],
+          }),
+        );
+      }
+      if (!drained.value.value.ok) return drained.value.value;
+      const mutation: SessionCandidateScratchReleaseMutationResult = drained.value.value.value;
+      return success({ ...mutation, drain_fence: drained.value.fence });
     } catch (error: unknown) {
       return failure(toDomainError(error));
     }
@@ -638,6 +731,7 @@ export class LocalSessionBackend implements SessionBackend {
           registry,
           ({ fence }) =>
             registryMutation(() => registry.executeFileOperation(options.operation, options.execution_options, fence)),
+          this.managedCgroupRoot,
           this.registryOptions.cgroupFilesystem,
         ),
         sessionId,
@@ -877,9 +971,15 @@ export class LocalSessionBackend implements SessionBackend {
         return Promise.resolve(mutation.ok ? success(toDomainCloseSessionResult(mutation.value)) : mutation);
       }
       const drained = closeSessionWithRuntimeDrain(
-        runtimeLifecycleAdapter(registry, ({ fence }) => close(fence), this.registryOptions.cgroupFilesystem),
+        runtimeLifecycleAdapter(
+          registry,
+          ({ fence }) => close(fence),
+          this.managedCgroupRoot,
+          this.registryOptions.cgroupFilesystem,
+        ),
         sessionId,
         registry.runtimeEpoch,
+        options.drain_policy ?? "wait",
       );
       return drained.then((outcome) => {
         if (!outcome.ok) return outcome as DomainResult<SessionCloseResult>;
@@ -913,6 +1013,7 @@ export class LocalSessionBackend implements SessionBackend {
           registry,
           ({ session_id: mutationSessionId, fence }) =>
             registryMutation(() => registry.discard({ sessionId: mutationSessionId, approvalWitness }, fence)),
+          this.managedCgroupRoot,
           this.registryOptions.cgroupFilesystem,
         ),
         sessionId,
@@ -990,6 +1091,7 @@ export class LocalSessionBackend implements SessionBackend {
       const result = await mutateClaimsWithRuntimeDrain(
         registry,
         sessionId,
+        this.managedCgroupRoot,
         this.registryOptions.cgroupFilesystem,
         (fence) =>
           registryMutation(() =>
@@ -1019,6 +1121,7 @@ export class LocalSessionBackend implements SessionBackend {
       const result = await mutateClaimsWithRuntimeDrain(
         registry,
         sessionId,
+        this.managedCgroupRoot,
         this.registryOptions.cgroupFilesystem,
         (fence) =>
           registryMutation(() =>
@@ -1050,6 +1153,7 @@ export class LocalSessionBackend implements SessionBackend {
       const result = await mutateClaimsWithRuntimeDrain(
         registry,
         sessionId,
+        this.managedCgroupRoot,
         this.registryOptions.cgroupFilesystem,
         (fence) =>
           registryMutation(() =>
@@ -1081,6 +1185,7 @@ export class LocalSessionBackend implements SessionBackend {
       const result = await mutateClaimsWithRuntimeDrain(
         registry,
         sessionId,
+        this.managedCgroupRoot,
         this.registryOptions.cgroupFilesystem,
         (fence) =>
           registryMutation(() =>
@@ -1191,6 +1296,7 @@ export class LocalSessionBackend implements SessionBackend {
   private registryFor(context: SessionContext): SessionRegistry {
     return new SessionRegistry({
       ...this.registryOptions,
+      ...(this.managedCgroupRoot.ok ? { cgroupRoot: this.managedCgroupRoot.value } : {}),
       cwd: context.cwd,
       git: this.git,
       gitIdentity: this.gitIdentity,
@@ -1266,14 +1372,19 @@ export function createLocalSessionBackend(options: LocalSessionBackendOptions = 
 function runtimeLifecycleAdapter<T>(
   registry: SessionRegistry,
   mutate: (mutation: SessionRuntimeLifecycleMutation) => T | Promise<T>,
+  managedCgroupRoot: DomainResult<string>,
   cgroupFilesystem?: CgroupFileSystem,
 ): SessionRuntimeLifecycleAdapter<T> {
   const snapshot = (sessionId: string) => {
     const executions: SessionDrainExecution[] = [];
     const currentBootId = observeKernelBootId();
-    for (const persisted of registry.listSessionExecutions(sessionId)) {
+    const persistedRecords = registry.readRepositoryView().runtimeRecords.records.executions ?? [];
+    const records: SessionExecutionRecord[] = [];
+    for (const persisted of persistedRecords) {
       const parsed = parseSessionExecutionRecord(persisted);
       if (!parsed.ok) throw parsed.error;
+      records.push(parsed.value);
+      if (parsed.value.session_id !== sessionId) continue;
       const owned =
         currentBootId === null
           ? null
@@ -1287,19 +1398,30 @@ function runtimeLifecycleAdapter<T>(
       });
     }
     const trackedAdmission = registry.getSessionLaunchAdmission(sessionId);
+    const treeObservation =
+      executions.length === 0 && managedCgroupRoot.ok && currentBootId !== null
+        ? observeSessionCgroupTree({
+            session_id: sessionId,
+            root: managedCgroupRoot.value,
+            current_boot_id: currentBootId,
+            execution_records: records,
+            ...(cgroupFilesystem === undefined ? {} : { filesystem: cgroupFilesystem }),
+          })
+        : null;
     return {
       session_id: sessionId,
       runtime_epoch: registry.runtimeEpoch,
       executions,
       kernel_empty:
         trackedAdmission !== undefined &&
-        executions.length > 0 &&
-        executions.every(
-          ({ observation }) =>
-            observation.state === "empty" &&
-            observation.cgroups !== null &&
-            observation.cgroups.population.state === "empty",
-        ),
+        (executions.length === 0
+          ? treeObservation?.state === "empty"
+          : executions.every(
+              ({ observation }) =>
+                observation.state === "empty" &&
+                observation.cgroups !== null &&
+                observation.cgroups.population.state === "empty",
+            )),
     };
   };
   return {
@@ -1396,12 +1518,13 @@ function runtimeLifecycleAdapter<T>(
 async function mutateClaimsWithRuntimeDrain<T>(
   registry: SessionRegistry,
   sessionId: string,
+  managedCgroupRoot: DomainResult<string>,
   cgroupFilesystem: CgroupFileSystem | undefined,
   mutation: (fence?: SessionDrainFinalization) => DomainResult<T>,
 ): Promise<DomainResult<T>> {
   if (registry.getSessionLaunchAdmission(sessionId) === undefined) return mutation();
   const drained = await releaseSessionClaimsWithRuntimeDrain(
-    runtimeLifecycleAdapter(registry, ({ fence }) => mutation(fence), cgroupFilesystem),
+    runtimeLifecycleAdapter(registry, ({ fence }) => mutation(fence), managedCgroupRoot, cgroupFilesystem),
     sessionId,
     registry.runtimeEpoch,
   );

@@ -41,6 +41,73 @@ import {
   SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
   SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
 } from "./domain/filesystem-policy-evidence.js";
+import {
+  SESSION_BOUND_VERIFICATION_CONTRACT_ID,
+  SESSION_BOUND_VERIFICATION_RESULT_SCHEMA,
+  SESSION_BOUND_VERIFICATION_SCHEMA_VERSION,
+  executeSessionBoundVerification,
+  getSessionVerificationSnapshot,
+} from "./session-bound-verification.js";
+import {
+  SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID,
+  SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION,
+} from "./domain/session.js";
+import {
+  SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_PATHS_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_RELEASE_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+  MAX_SESSION_CANDIDATE_BUNDLE_BYTES,
+  sessionCandidateBundleRepositoryPath,
+  sessionCandidateBundleTransferPath,
+  sessionCandidateBundleStagingRootPath,
+  describeSessionCandidateBundlePaths,
+  releaseSessionCandidateBundleScratch,
+  stageSessionCandidateBundle,
+} from "./session-candidate-bundle.js";
+
+export {
+  SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_PATHS_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_RELEASE_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+  MAX_SESSION_CANDIDATE_BUNDLE_BYTES,
+  sessionCandidateBundleRepositoryPath,
+  sessionCandidateBundleTransferPath,
+  sessionCandidateBundleStagingRootPath,
+  describeSessionCandidateBundlePaths,
+  releaseSessionCandidateBundleScratch,
+  stageSessionCandidateBundle,
+};
+export type {
+  SessionCandidateBundleRequest,
+  SessionCandidateBundleSource,
+  SessionCandidateBundlePathsResult,
+  SessionCandidateBundleReleaseRequest,
+  SessionCandidateBundleReleaseResult,
+  SessionCandidateBundleStageResult,
+} from "./session-candidate-bundle.js";
+
+export {
+  SESSION_BOUND_VERIFICATION_CONTRACT_ID,
+  SESSION_BOUND_VERIFICATION_RESULT_SCHEMA,
+  SESSION_BOUND_VERIFICATION_SCHEMA_VERSION,
+  executeSessionBoundVerification,
+  getSessionVerificationSnapshot,
+};
+export type {
+  ManagedVerificationExecution,
+  SessionBoundVerificationDependencies,
+  SessionBoundVerificationRequest,
+  SessionBoundVerificationResult,
+  SessionBoundVerificationSource,
+} from "./session-bound-verification.js";
 
 export {
   captureVerificationSourceWitness,
@@ -145,11 +212,40 @@ export function nawabariVerificationContract(): JsonObject {
     source_witness_schema_version: VERIFICATION_SOURCE_WITNESS_SCHEMA_VERSION,
     source_bound_evidence_contract_id: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_CONTRACT_ID,
     source_bound_evidence_schema_version: SOURCE_BOUND_VERIFICATION_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+    session_snapshot_contract_id: SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID,
+    session_snapshot_schema_version: SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION,
+    session_bound_execution_contract_id: SESSION_BOUND_VERIFICATION_CONTRACT_ID,
+    session_bound_execution_schema_version: SESSION_BOUND_VERIFICATION_SCHEMA_VERSION,
+    session_bound_execution_result_schema: SESSION_BOUND_VERIFICATION_RESULT_SCHEMA,
+    session_bound_operations: ["snapshot", "execute", "candidate-paths", "stage-candidate", "release-candidate"],
+    candidate_bundle_contract_id: SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+    candidate_bundle_schema_version: SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
+    candidate_bundle_result_schema: SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA,
+    candidate_bundle_paths_contract_id: SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID,
+    candidate_bundle_paths_result_schema: SESSION_CANDIDATE_BUNDLE_PATHS_RESULT_SCHEMA,
+    candidate_bundle_release_contract_id: SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID,
+    candidate_bundle_release_result_schema: SESSION_CANDIDATE_BUNDLE_RELEASE_RESULT_SCHEMA,
+    candidate_bundle_max_bytes: MAX_SESSION_CANDIDATE_BUNDLE_BYTES,
+    candidate_bundle_path_operation: "candidate-paths",
+    candidate_staging: {
+      mutates_agent_working_set: false,
+      owner_operation_scratch: "deterministic-candidate-source-subtree-under-owned-session-worktree",
+      stage_write_policy: "owner-operation-only",
+      verifier_read_visibility: "invocation-local",
+      verifier_write_policy: "deny",
+    },
+    candidate_release: {
+      requires_exact_snapshot: true,
+      admission: "closed-during-owned-empty-drain-and-release",
+      finalization: "existing-session-close-drain-authority",
+      removes_only: "clean-deterministic-candidate-source-subtree",
+      rejects_dirty_or_unexpected_recoverable_data: true,
+    },
     legacy_result_freshness: "unproven",
     read_visibility: ["declared", "repository"],
     write_policy: "deny",
     execution: "fixed-argv-no-shell",
-    filesystem_boundary: "invocation-local-read-only-working-set",
+    filesystem_boundary: "owner-operation-bounded-scratch-and-invocation-local-read-only-verifier",
     enforcement: "strict-protected-execution-landlock",
     bounded_diagnostics: true,
     mutates_working_set: false,

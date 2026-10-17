@@ -10,6 +10,7 @@ import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
 import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
 import type { SessionActionDispatcher } from "./session-actions.js";
+import type { SessionDrainFence, SessionDrainPolicy } from "./session-execution-control.js";
 import type {
   CoordinationPreviewOptions as RegistryCoordinationPreviewOptions,
   CoordinationPreviewResult as RegistryCoordinationPreviewResult,
@@ -29,6 +30,7 @@ import type {
 } from "../resource-handoff.js";
 import type { ResourceHandoffFenceController } from "../resource-handoff.js";
 import type { PersistedSessionExecutionRecord, SessionExecutionStateInput } from "./session-execution-record.js";
+import type { FilesystemPolicyToken } from "./filesystem-policy-revision.js";
 import type { PinnedWorktreeProfile } from "./worktree-profile-pinning.js";
 import type { SessionHookMaterial } from "./session-git-hooks.js";
 import type { SessionRuntimeEnvironmentIdentity } from "./session-environment.js";
@@ -85,6 +87,61 @@ export type SessionManagedRuntimeState = Readonly<{
   readonly hook_material?: SessionHookMaterial | null;
   readonly runtime_environment_identity?: SessionRuntimeEnvironmentIdentity;
 }>;
+
+/** Read-only, owner-issued identity for a session-bound verification request. */
+export const SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID = "nawabari.session-verification-snapshot.v1" as const;
+export const SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION = 1 as const;
+
+export type SessionVerificationSnapshot = Readonly<{
+  readonly contract_id: typeof SESSION_VERIFICATION_SNAPSHOT_CONTRACT_ID;
+  readonly schema_version: typeof SESSION_VERIFICATION_SNAPSHOT_SCHEMA_VERSION;
+  readonly session_id: string;
+  readonly repository: string;
+  readonly worktree: string;
+  readonly branch: string;
+  readonly state: "active";
+  readonly filesystem_policy_token: FilesystemPolicyToken;
+  readonly managed: Readonly<{
+    readonly profile_digest: string | null;
+    readonly admission: "open" | "closed" | null;
+    readonly runtime_epoch: number;
+    readonly registry_revision: number;
+    readonly claim_set_generation: number;
+  }>;
+}>;
+
+/** Exact candidate/source identity for owner-side scratch release after verifier use. */
+export type SessionCandidateScratchReleaseOptions = Readonly<{
+  readonly session_id: string;
+  readonly snapshot: SessionVerificationSnapshot;
+  readonly candidate_id: string;
+  readonly candidate_digest: string;
+  readonly source: Readonly<{
+    readonly project_id: string;
+    readonly source_id: string;
+    readonly bundle_sha256: string;
+    readonly base_commit: string;
+    readonly candidate_commit: string;
+    readonly candidate_tree: string;
+  }>;
+}>;
+
+/** Receipt produced only after the canonical admission fence and owned drain complete. */
+export type SessionCandidateScratchReleaseResult = Readonly<{
+  readonly session_id: string;
+  readonly candidate_id: string;
+  readonly candidate_digest: string;
+  readonly worktree: string;
+  readonly snapshot: SessionVerificationSnapshot;
+  readonly staging_root: string;
+  readonly repository_path: string;
+  readonly head_id: string;
+  readonly tree_id: string;
+  readonly removed: true;
+  readonly drain_fence: SessionDrainFence;
+}>;
+
+export type SessionCandidateScratchReleaseMutationResult = Omit<SessionCandidateScratchReleaseResult, "drain_fence">;
 
 export type WorktreeProfileSessionCreateOptions = {
   selection: { profile: string };
@@ -255,6 +312,8 @@ export type ClaimDeltasResult = {
 
 export type SessionCloseOptions = {
   session_id: string | null;
+  /** Explicitly terminate this session's exact owned execution scopes before closing; omitted means wait. */
+  drain_policy?: SessionDrainPolicy;
   /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently re-verified by exact Git tree-object equivalence; never trusted blindly. */
   integrated_revision?: string | null;
   /** Explicit opt-in remote used only to obtain missing integration-proof objects. */
@@ -1027,6 +1086,7 @@ export interface SessionBackend {
   persistSessionExecution?(
     context: SessionContext,
     record: PersistedSessionExecutionRecord,
+    expectedVerificationSnapshot?: SessionVerificationSnapshot,
   ): Promise<DomainResult<PersistedSessionExecutionRecord>>;
   transitionSessionExecution?(
     context: SessionContext,
@@ -1043,6 +1103,16 @@ export interface SessionBackend {
     sessionId: string,
     executionId?: string,
   ): Promise<DomainResult<SessionManagedRuntimeState>>;
+  /** Canonical read-only session, managed-runtime, and filesystem-policy CAS snapshot. */
+  getSessionVerificationSnapshot?(
+    context: SessionContext,
+    sessionId: string,
+  ): Promise<DomainResult<SessionVerificationSnapshot>>;
+  /** Drain-fenced removal of one exact Nawabari-owned candidate verifier scratch tree. */
+  releaseSessionCandidateScratch?(
+    context: SessionContext,
+    options: SessionCandidateScratchReleaseOptions,
+  ): Promise<DomainResult<SessionCandidateScratchReleaseResult>>;
   readSessionRuntimeEpoch?(context: SessionContext, sessionId: string): number;
   /** The single managed cgroup root retained by the backend for readiness and launch. */
   getManagedCgroupRoot?(): DomainResult<string>;

@@ -14,6 +14,7 @@ import {
 import type { SessionBackend, SessionContext, SessionRecord } from "./session.js";
 import { recordExecutionState, reserveExecution, type SessionExecutionRecord } from "./session-execution-record.js";
 import type { SessionRuntimeProjection } from "./runtime-projection.js";
+import { sandboxExecutionMockSuccess } from "../testing/sandbox-execution-evidence-mock.js";
 
 const session: SessionRecord = {
   schema_version: 1,
@@ -92,7 +93,9 @@ function readyProbe() {
   };
 }
 
-function executionRecord(state: "starting" | "attached" | "unresolved" = "starting"): SessionExecutionRecord {
+function executionRecord(
+  state: "starting" | "attached" | "unresolved" | "exited" = "starting",
+): SessionExecutionRecord {
   const reserved = reserveExecution({
     session_id: session.session_id,
     execution_id: "execution-console-1",
@@ -119,6 +122,14 @@ function executionRecord(state: "starting" | "attached" | "unresolved" = "starti
     if (!unresolved.ok) throw unresolved.error;
     return unresolved.value;
   }
+  if (state === "exited") {
+    const exited = recordExecutionState(attached.value, {
+      state: "exited",
+      now: "2026-09-21T00:00:02.000Z",
+    });
+    if (!exited.ok) throw exited.error;
+    return exited.value;
+  }
   return attached.value;
 }
 
@@ -137,7 +148,7 @@ test("enter reserves execution before protected interactive launch and keeps ses
       args: command.args ?? [],
       interactive: options.interactive === true,
     });
-    return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 2 });
+    return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 2 });
   };
   const result = await enterSessionConsole(context, backend(), {
     session_id: session.session_id,
@@ -202,7 +213,7 @@ test("entry rejects a non-canonical Bash requirement version before launch", asy
     sandbox_probe: readyProbe(),
     sandbox_runner: async () => {
       launches += 1;
-      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
     },
     persist_execution: async () => undefined,
   });
@@ -288,6 +299,37 @@ test("process inspection retains cgroup observation for unresolved executions", 
   assert.equal(observedRecords.length, 1);
   assert.equal(observedRecords[0]?.cgroups?.identity.execution_id, record.execution_id);
   assert.equal(result.value.processes[0]?.cgroups?.state, "empty");
+});
+
+test("public process inspection preserves an exited record when its supervisor proc entry is gone", async () => {
+  const record = executionRecord("exited");
+  const result = await listSessionProcesses(context, backend(), {
+    session_id: session.session_id,
+    read_executions: () => [record],
+    identity_reader: {
+      read_boot_id: () => record.boot_id,
+      read_process_starttime: () => {
+        throw Object.assign(new Error("process disappeared"), { code: "ENOENT" });
+      },
+      read_process_cgroup: () => "/unobserved",
+    },
+    observe_owned_execution: () =>
+      success({
+        contract_id: "nawabari.session-process-observation.v1" as const,
+        session_id: record.session_id,
+        execution_id: record.execution_id,
+        boot_id: record.boot_id,
+        state: "unknown" as const,
+        cgroups: null,
+      }),
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+  if (!result.ok) return;
+  assert.equal(result.value.processes.length, 1);
+  assert.equal(result.value.processes[0]?.execution.state, "exited");
+  assert.equal(result.value.processes[0]?.observation.classification, "unresolved");
+  assert.equal(result.value.processes[0]?.observation.active, false);
+  assert.equal(result.value.processes[0]?.cgroups?.state, "unknown");
 });
 
 test("managed command path fails closed before launch when cgroups are unavailable", async () => {
@@ -452,7 +494,7 @@ test("managed interactive entry reaches the protected capability gate without us
     sandbox_probe: { hasCgroupsV2: () => false } as unknown as import("./sandbox.js").SandboxProbe,
     sandbox_runner: async () => {
       runnerCalls += 1;
-      return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+      return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
     },
   });
 

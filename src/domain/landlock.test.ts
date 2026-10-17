@@ -6,7 +6,13 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { LocalSessionBackend } from "./session-backend.js";
-import { deriveLandlockRules, LANDLOCK_ACCESS_FS, LANDLOCK_ABI_MINIMUM, LANDLOCK_TRAMPOLINE } from "./landlock.js";
+import {
+  landlockRuleArguments,
+  deriveLandlockRules,
+  LANDLOCK_ACCESS_FS,
+  LANDLOCK_ABI_MINIMUM,
+  LANDLOCK_TRAMPOLINE,
+} from "./landlock.js";
 import {
   buildExplicitCompatibilityRuntimeProjection,
   compileSandboxInvocation,
@@ -304,9 +310,10 @@ test("Landlock setup failure is reported once with bounded diagnostics and never
     }
     fs.writeFileSync(
       bwrap,
-      "#!/bin/sh\nprintf 'nawabari-landlock: %s\\n' 'setup failed '$(printf x%.0s $(seq 1 1000)) >&2\nexit 125\n",
+      "#!/bin/sh\nmessage='setup failed '; i=0; while [ $i -lt 1000 ]; do message=${message}x; i=$((i+1)); done\nprintf 'nawabari-landlock: %s\\n' \"$message\" >&2\nexit 125\n",
       { mode: 0o700 },
     );
+    const adapter = fs.realpathSync.native("/bin/sh");
     const request = {
       schema_version: 1,
       contract_id: "nawabari.sandbox-execution.v1",
@@ -332,13 +339,17 @@ test("Landlock setup failure is reported once with bounded diagnostics and never
       seccomp_profile: sandboxSeccompProfileMetadata(),
       capability_baseline: sandboxCapabilityBaseline,
       landlock_abi: 3,
-      landlock_executable: "/bin/sh",
+      landlock_executable: adapter,
     };
+    const compiled = compileSandboxInvocation(request, { command: "touch", args: ["ambient-marker"] });
+    assert.ok(compiled.ok);
+    if (!compiled.ok) return;
+    assert.equal(compiled.value.landlock.state, "enforced");
     const result = await runSandboxedCommand(request, { command: "touch", args: ["ambient-marker"] });
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.equal(result.error.code, "SANDBOX_EXECUTION_FAILED");
-      assert.equal(result.error.details?.retryable, false);
+      assert.equal(result.error.details?.retryable, false, JSON.stringify(result.error));
       const diagnostic = result.error.details?.diagnostic;
       assert.equal(typeof diagnostic, "string");
       assert.ok((diagnostic as string).length <= 240);
@@ -430,3 +441,17 @@ function allFilesystemAccess(): number {
 function runGit(args: readonly string[], cwd: string): string {
   return String(execFileSync("git", [...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
 }
+
+test("derived Landlock rule transport preserves large Unicode policies within argument bounds", () => {
+  const rules = Array.from({ length: 300 }, (_, index) => ({
+    path: `/owned/資料/😀/${index}/${"x".repeat(100)}`,
+    allowed_access: 4,
+  }));
+  const args = landlockRuleArguments(rules);
+  const count = Number(args[0]);
+  assert.ok(count > 1);
+  assert.equal(args.length, count + 1);
+  assert.ok(args.slice(1).every((chunk) => Buffer.byteLength(chunk, "utf8") <= 3000 && chunk.length <= 4096));
+  assert.deepEqual(JSON.parse(args.slice(1).join("")), rules);
+  assert.ok(LANDLOCK_TRAMPOLINE.length <= 4096);
+});

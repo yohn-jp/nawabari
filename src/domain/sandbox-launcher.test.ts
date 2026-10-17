@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { runCli } from "../cli.js";
 import { startControlServer } from "../control-server.js";
+import { sandboxExecutionEvidenceFromError } from "./sandbox-execution-evidence.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import { compileSessionEnvironment, materializeSessionRuntimeDirectories } from "./session-environment.js";
 import {
@@ -203,8 +204,13 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
   const repository = createRepository();
   const worktree = `${repository}-owned`;
   const fixture = createControlledSandboxFixture();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-command-cwd-outside-"));
+  const nested = path.join(worktree, "nested");
+  const nestedAlias = path.join(worktree, "nested-alias");
   try {
-    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const originalRequest = await resolvedRequest(repository, worktree, fixture.layout);
+    const request = { ...originalRequest, procfs: { mode: "private" as const, reason: null } };
+    fs.mkdirSync(nested);
     assert.equal(request.sandbox_executable, fixture.executable);
     const compiled = compileSandboxInvocation(request, {
       command: "printf",
@@ -218,9 +224,30 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
     assert.ok(compiled.value.args.includes("/proc"));
     assert.ok(compiled.value.args.includes("/tmp"));
     assert.ok(compiled.value.args.includes("--unshare-user"));
+    assert.equal(compiled.value.args.includes("--disable-userns"), false, "OCI-safe namespace denial uses seccomp");
     assert.ok(compiled.value.args.includes("--unshare-pid"));
     assert.ok(compiled.value.args.includes("--unshare-ipc"));
     assert.ok(compiled.value.args.includes("--unshare-uts"));
+    assert.deepEqual(
+      compiled.value.args.slice(compiled.value.args.indexOf("--info-fd"), compiled.value.args.indexOf("--info-fd") + 2),
+      ["--info-fd", "4"],
+    );
+    assert.deepEqual(
+      compiled.value.args.slice(
+        compiled.value.args.indexOf("--block-fd"),
+        compiled.value.args.indexOf("--block-fd") + 2,
+      ),
+      ["--block-fd", "5"],
+    );
+    assert.ok(
+      compiled.value.args.some((value, index, args) => value === "--proc" && args[index + 1] === "/proc"),
+      "the ordinary proc policy still receives a fresh private procfs",
+    );
+    assert.deepEqual(
+      compiled.value.args.slice(compiled.value.args.indexOf("--chdir"), compiled.value.args.indexOf("--chdir") + 2),
+      ["--chdir", worktree],
+    );
+    assert.equal(compiled.value.cwd, worktree);
     assert.deepEqual(
       compiled.value.args.slice(compiled.value.args.indexOf("--seccomp"), compiled.value.args.indexOf("--seccomp") + 2),
       ["--seccomp", "3"],
@@ -230,8 +257,45 @@ test("compileSandboxInvocation emits fixed namespace/topology argv and terminate
     assert.ok(terminator > 0);
     assert.deepEqual(compiled.value.args.slice(terminator), ["--", "printf", "%s", "literal; not shell syntax"]);
     assert.ok(compiled.value.args.includes(worktree));
+
+    const nestedCwd = compileSandboxInvocation(request, { command: "true", cwd: nested });
+    assert.equal(nestedCwd.ok, true, nestedCwd.ok ? "" : JSON.stringify(nestedCwd.error));
+    if (nestedCwd.ok) {
+      assert.equal(nestedCwd.value.cwd, worktree, "Bubblewrap itself starts from the owned worktree");
+      assert.deepEqual(
+        nestedCwd.value.args.slice(
+          nestedCwd.value.args.indexOf("--chdir"),
+          nestedCwd.value.args.indexOf("--chdir") + 2,
+        ),
+        ["--chdir", nested],
+      );
+    }
+
+    const deniedProc = compileSandboxInvocation(
+      { ...request, procfs: { mode: "denied", reason: "parent-procfs-has-overmounts" } },
+      { command: "true" },
+    );
+    assert.equal(deniedProc.ok, true, deniedProc.ok ? "" : JSON.stringify(deniedProc.error));
+    if (deniedProc.ok) {
+      assert.ok(deniedProc.value.args.some((value, index, args) => value === "--tmpfs" && args[index + 1] === "/proc"));
+      assert.ok(
+        deniedProc.value.args.some((value, index, args) => value === "--remount-ro" && args[index + 1] === "/proc"),
+      );
+      assert.equal(deniedProc.value.args.includes("--proc"), false);
+      assert.equal(
+        deniedProc.value.args.some((value, index, args) => value === "--bind" && args[index + 1] === "/proc"),
+        false,
+      );
+    }
+
+    assert.equal(compileSandboxInvocation(request, { command: "true", cwd: outside }).ok, false);
+    assert.equal(compileSandboxInvocation(request, { command: "true", cwd: `${worktree}/nested/..` }).ok, false);
+    fs.symlinkSync(nested, nestedAlias, "dir");
+    assert.equal(compileSandboxInvocation(request, { command: "true", cwd: nestedAlias }).ok, false);
   } finally {
     fixture.cleanup();
+    fs.rmSync(nestedAlias, { force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
     removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
   }
@@ -714,7 +778,7 @@ test("explicit compatibility projection is the only enforced legacy visibility a
     assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
     if (!compiled.ok) return;
 
-    assert.equal(request.filesystem.system_paths.includes("/usr"), true);
+    assert.equal(request.filesystem.system_paths.includes("/usr"), fixture.layout.usr === "/usr");
     assert.equal(
       compiled.value.args.some(
         (value, index, args) => (value === "--ro-bind" || value === "--bind") && args[index + 2] === "/usr",
@@ -866,7 +930,8 @@ test("bounded Landlock scopes /tmp scratch access away from a worktree mounted u
     assert.notEqual(scratchDirectoryIndex, -1);
     const trampolineIndex = compiled.value.args.indexOf(LANDLOCK_TRAMPOLINE);
     assert.notEqual(trampolineIndex, -1);
-    const rules = JSON.parse(compiled.value.args[trampolineIndex + 1]);
+    const chunks = Number(compiled.value.args[trampolineIndex + 1]);
+    const rules = JSON.parse(compiled.value.args.slice(trampolineIndex + 2, trampolineIndex + 2 + chunks).join(""));
     const tempParent = rules.find((rule: { path: string }) => rule.path === "/tmp");
     const tempScratch = rules.find((rule: { path: string }) => rule.path === "/tmp/nawabari-tmp");
     const worktreeFile = rules.find((rule: { path: string }) => rule.path === path.join(worktree, "README.md"));
@@ -954,40 +1019,49 @@ test("protected launcher fails closed when bubblewrap is unavailable or the work
   }
 });
 
-test("sandboxed child limits are bounded and fail with stable errors", async () => {
+test("controlled bubblewrap preserves bounded errors and cannot claim physical success", async () => {
   const repository = createRepository();
   const worktree = `${repository}-owned`;
   const fixture = createControlledSandboxFixture();
   try {
     const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const assertUnknownPhysicalRefusal = (
+      result: Awaited<ReturnType<typeof runSandboxedCommand>>,
+      expected: Readonly<{ code: string; exit_code?: number | null; signal?: string | null }>,
+    ): void => {
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.equal(result.error.code, expected.code);
+      const evidence = sandboxExecutionEvidenceFromError(result.error);
+      assert.ok(evidence);
+      if ("exit_code" in expected) assert.equal(evidence.exit_code, expected.exit_code);
+      if ("signal" in expected) assert.equal(evidence.signal, expected.signal);
+      assert.equal(evidence.physical_execution.start.state, "unknown");
+      assert.equal(evidence.physical_execution.termination.state, "unknown");
+      assert.equal(evidence.physical_execution.cleanup.state, "unknown");
+    };
     const output = await runSandboxedCommand(
       request,
       { command: "node", args: ["-e", "process.stdout.write('0123456789')"] },
       { max_output_bytes: 5 },
     );
-    assert.equal(output.ok, false);
-    if (!output.ok) assert.equal(output.error.code, "SANDBOX_OUTPUT_LIMIT");
+    assertUnknownPhysicalRefusal(output, { code: "SANDBOX_OUTPUT_LIMIT" });
 
     const timeout = await runSandboxedCommand(request, { command: "sh", args: ["-c", "sleep 1"] }, { timeout_ms: 20 });
-    assert.equal(timeout.ok, false);
-    if (!timeout.ok) assert.equal(timeout.error.code, "SANDBOX_EXECUTION_TIMEOUT");
+    assertUnknownPhysicalRefusal(timeout, { code: "SANDBOX_EXECUTION_TIMEOUT" });
 
     const nonzero = await runSandboxedCommand(request, { command: "node", args: ["-e", "process.exit(7)"] });
-    assert.equal(nonzero.ok, true, nonzero.ok ? "" : JSON.stringify(nonzero.error));
-    if (nonzero.ok) {
-      assert.equal(nonzero.value.exit_code, 7);
-      assert.equal(nonzero.value.signal, null);
-    }
+    assertUnknownPhysicalRefusal(nonzero, { code: "SANDBOX_EXECUTION_FAILED", exit_code: 7, signal: null });
 
     const signal = await runSandboxedCommand(request, {
       command: "node",
       args: ["-e", "process.kill(process.pid, 'SIGTERM')"],
     });
-    assert.equal(signal.ok, true, signal.ok ? "" : JSON.stringify(signal.error));
-    if (signal.ok) {
-      assert.equal(signal.value.exit_code, null);
-      assert.equal(signal.value.signal, "SIGTERM");
-    }
+    assertUnknownPhysicalRefusal(signal, {
+      code: "SANDBOX_EXECUTION_FAILED",
+      exit_code: null,
+      signal: "SIGTERM",
+    });
 
     const combinedOutput = await runSandboxedCommand(
       request,
@@ -997,16 +1071,14 @@ test("sandboxed child limits are bounded and fail with stable errors", async () 
       },
       { max_output_bytes: 5 },
     );
-    assert.equal(combinedOutput.ok, false);
-    if (!combinedOutput.ok) assert.equal(combinedOutput.error.code, "SANDBOX_OUTPUT_LIMIT");
+    assertUnknownPhysicalRefusal(combinedOutput, { code: "SANDBOX_OUTPUT_LIMIT" });
 
     const unicodeOutput = await runSandboxedCommand(
       request,
       { command: "node", args: ["-e", "process.stdout.write('あ')"] },
       { max_output_bytes: 2 },
     );
-    assert.equal(unicodeOutput.ok, false);
-    if (!unicodeOutput.ok) assert.equal(unicodeOutput.error.code, "SANDBOX_OUTPUT_LIMIT");
+    assertUnknownPhysicalRefusal(unicodeOutput, { code: "SANDBOX_OUTPUT_LIMIT" });
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
@@ -1019,12 +1091,16 @@ test("interactive execution inherits the caller streams and skips bounded limits
     t.skip("run via pnpm test:linux:system");
     return;
   }
+  const layout = discoverSandboxRuntimeLayout();
+  if (layout.bubblewrap === null) {
+    t.skip("bubblewrap is unavailable in this test environment");
+    return;
+  }
   const repository = createRepository();
   const worktree = `${repository}-owned`;
-  const fixture = createControlledSandboxFixture();
   const marker = path.join(worktree, "interactive-marker.json");
   try {
-    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const request = await resolvedRequest(repository, worktree, layout);
     const parentStdout = fs.fstatSync(1);
     const script = [
       "const fs = require('node:fs')",
@@ -1046,27 +1122,29 @@ test("interactive execution inherits the caller streams and skips bounded limits
     };
     assert.equal(observed.cwd, worktree);
     assert.equal(observed.home, "/home/nawabari");
-    assert.match(observed.path, /(?:^|:)\/usr\/bin(?:$|:)/u);
+    const invocation = compileSandboxInvocation(request, { command: "node", args: ["-e", script] });
+    assert.equal(invocation.ok, true);
+    if (invocation.ok) assert.equal(observed.path, invocation.value.env.PATH);
     assert.deepEqual(observed.stdout, { dev: parentStdout.dev, ino: parentStdout.ino });
 
     const signal = await runInteractiveSandboxedCommand(request, {
       command: "node",
-      args: ["-e", "process.kill(process.ppid, 'SIGTERM'); setTimeout(() => {}, 1000)"],
+      args: ["-e", "process.kill(process.pid, 'SIGTERM'); setTimeout(() => {}, 1000)"],
     });
     assert.equal(signal.ok, true, signal.ok ? "" : JSON.stringify(signal.error));
     if (signal.ok) {
-      assert.equal(signal.value.exit_code, null);
-      assert.equal(signal.value.signal, "SIGTERM");
+      assert.equal(signal.value.exit_code, 128 + os.constants.signals.SIGTERM);
+      assert.equal(signal.value.signal, null);
     }
 
     const interrupt = await runInteractiveSandboxedCommand(request, {
       command: "node",
-      args: ["-e", "process.kill(process.ppid, 'SIGINT'); setTimeout(() => {}, 1000)"],
+      args: ["-e", "process.kill(process.pid, 'SIGINT'); setTimeout(() => {}, 1000)"],
     });
     assert.equal(interrupt.ok, true, interrupt.ok ? "" : JSON.stringify(interrupt.error));
     if (interrupt.ok) {
-      assert.equal(interrupt.value.exit_code, null);
-      assert.equal(interrupt.value.signal, "SIGINT");
+      assert.equal(interrupt.value.exit_code, 128 + os.constants.signals.SIGINT);
+      assert.equal(interrupt.value.signal, null);
     }
 
     const invalidLimits = await runSandboxedCommand(
@@ -1076,7 +1154,6 @@ test("interactive execution inherits the caller streams and skips bounded limits
     );
     assert.equal(invalidLimits.ok, true, invalidLimits.ok ? "" : JSON.stringify(invalidLimits.error));
   } finally {
-    fixture.cleanup();
     removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
   }
@@ -1440,6 +1517,144 @@ test("compiled protected execution keeps a worktree under /tmp visible and hides
       fs.readFileSync(path.join(compiled.value.manifest.execution.tmp.path, "sandbox-write.txt"), "utf8"),
       "private",
     );
+    const boundedProjection = validateSessionRuntimeProjection({
+      ...runtimeProjection.value,
+      working_set: {
+        contract_id: "nawabari.working-set-runtime-projection.v1",
+        schema_version: 1,
+        working_set_id: "bounded-managed-scratch",
+        revision: 1,
+        repository: { repositoryHost: "local", repositoryId: request.repository },
+        base: { branch: request.branch, revision: "a".repeat(40) },
+        scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+      },
+    });
+    assert.equal(boundedProjection.ok, true, boundedProjection.ok ? "" : JSON.stringify(boundedProjection.error));
+    if (!boundedProjection.ok) return;
+    const protectedRequest = await resolveSandboxExecutionRequest(
+      new LocalSessionBackend(),
+      { cwd: worktree },
+      { session_id: request.session_id, enforce: true, runtime_projection: boundedProjection.value },
+      undefined,
+      layout,
+    );
+    assert.equal(protectedRequest.ok, true, protectedRequest.ok ? "" : JSON.stringify(protectedRequest.error));
+    if (!protectedRequest.ok) return;
+    const bounded = await runSandboxedCommand(
+      { ...protectedRequest.value, compiled_session_environment: compiled.value },
+      {
+        command: "node",
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs'), assert=require('node:assert/strict');",
+            "assert.ok(fs.readFileSync('README.md').length);",
+            "fs.writeFileSync(process.env.TMPDIR+'/bounded-private.txt','bounded-scratch');",
+            "assert.throws(()=>fs.writeFileSync('README.md','forbidden'));",
+            "assert.throws(()=>fs.writeFileSync('/tmp/outside-scratch.txt','forbidden'));",
+            "process.stdout.write('bounded-managed-scratch-ok');",
+          ].join(" "),
+        ],
+      },
+    );
+    assert.equal(bounded.ok, true, bounded.ok ? "" : JSON.stringify(bounded.error));
+    if (!bounded.ok) return;
+    assert.equal(bounded.value.exit_code, 0, JSON.stringify(bounded.value));
+    assert.equal(bounded.value.stdout, "bounded-managed-scratch-ok");
+    assert.equal(
+      fs.readFileSync(
+        path.join(compiled.value.manifest.execution.tmp.path, "nawabari-tmp/bounded-private.txt"),
+        "utf8",
+      ),
+      "bounded-scratch",
+    );
+    const scratch = path.join(worktree, ".nawabari-verification-candidates", "a".repeat(64), "b".repeat(24));
+    fs.mkdirSync(scratch, { recursive: true, mode: 0o700 });
+    const stage = await runSandboxedCommand(
+      {
+        ...protectedRequest.value,
+        compiled_session_environment: compiled.value,
+        git_profile: profileResult.value,
+        owner_candidate_staging: { candidate_digest: `sha256:${"a".repeat(64)}`, source_key: "b".repeat(24) },
+      },
+      {
+        command: "node",
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs'), assert=require('node:assert/strict'), path=require('node:path');",
+            "const root=process.argv[1]; fs.mkdirSync(path.join(root,'repo/objects'),{recursive:true});",
+            "fs.writeFileSync(path.join(root,'repo/objects/pack'),'exact-stage');",
+            "assert.throws(()=>fs.writeFileSync('README.md','forbidden'));",
+            "assert.throws(()=>fs.writeFileSync(path.dirname(root)+'/outside-stage','forbidden'));",
+            "process.stdout.write('bounded-owner-stage-ok');",
+          ].join(" "),
+          scratch,
+        ],
+      },
+    );
+    assert.equal(stage.ok, true, stage.ok ? "" : JSON.stringify(stage.error));
+    if (!stage.ok) return;
+    assert.equal(stage.value.exit_code, 0, JSON.stringify(stage.value));
+    assert.equal(stage.value.stdout, "bounded-owner-stage-ok");
+    fs.mkdirSync(path.join(scratch, "repo/.git"), { mode: 0o700 });
+    fs.writeFileSync(path.join(scratch, "repo/undeclared.txt"), "private-unselected");
+    const runtime = protectedRequest.value.runtime_projection;
+    assert.ok(runtime?.working_set);
+    if (runtime?.working_set === undefined) return;
+    const candidateRuntime = validateSessionRuntimeProjection({
+      ...runtime,
+      working_set: {
+        ...runtime.working_set,
+        scope: {
+          readOnly: [path.relative(worktree, path.join(scratch, "repo/objects/pack")).split(path.sep).join("/")],
+          write: [],
+          create: [],
+          delete: [],
+          deny: [],
+        },
+      },
+    });
+    assert.ok(candidateRuntime.ok);
+    if (!candidateRuntime.ok) return;
+    const candidateRead = await runSandboxedCommand(
+      {
+        ...protectedRequest.value,
+        runtime_projection: candidateRuntime.value,
+        compiled_session_environment: compiled.value,
+        git_profile: profileResult.value,
+        owner_candidate_verification: {
+          candidate_digest: `sha256:${"a".repeat(64)}`,
+          source_key: "b".repeat(24),
+          head_id: "c".repeat(40),
+          tree_id: "d".repeat(40),
+          base_commit: "e".repeat(40),
+        },
+      },
+      {
+        command: "node",
+        cwd: path.join(scratch, "repo"),
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs'), assert=require('node:assert/strict'), path=require('node:path');",
+            "assert.equal(fs.readFileSync('objects/pack','utf8'),'exact-stage');",
+            "assert.throws(()=>fs.readFileSync('undeclared.txt'));",
+            "assert.throws(()=>fs.readFileSync(process.argv[1]));",
+            "assert.equal(process.env.GIT_DIR,path.join(process.cwd(),'.git'));",
+            "assert.equal(process.env.GIT_WORK_TREE,process.cwd());",
+            "assert.throws(()=>fs.writeFileSync('objects/pack','forbidden'));",
+            "assert.throws(()=>fs.writeFileSync('new-file','forbidden'));",
+            "process.stdout.write('owner-candidate-read-only-ok');",
+          ].join(" "),
+          path.join(worktree, "README.md"),
+        ],
+      },
+    );
+    assert.equal(candidateRead.ok, true, candidateRead.ok ? "" : JSON.stringify(candidateRead.error));
+    if (!candidateRead.ok) return;
+    assert.equal(candidateRead.value.exit_code, 0, JSON.stringify(candidateRead.value));
+    assert.equal(candidateRead.value.stdout, "owner-candidate-read-only-ok");
   } finally {
     if (controlServer !== undefined) await controlServer.close();
     removeWorktree(repository, worktree);

@@ -84,7 +84,21 @@ import {
   type RuntimePolicyMode,
 } from "./domain/runtime-projection.js";
 import { enterProtectedSession } from "./domain/session-protected-launch.js";
+import { resolveWorktreeProfileRuntime } from "./domain/worktree-profile-runtime.js";
 import { launchManagedSessionCommand, listSessionProcesses } from "./domain/session-console.js";
+import {
+  executeSessionBoundVerification,
+  getSessionVerificationSnapshot,
+  type SessionBoundVerificationRequest,
+} from "./session-bound-verification.js";
+import {
+  describeSessionCandidateBundlePaths,
+  releaseSessionCandidateBundleScratch,
+  stageSessionCandidateBundle,
+  type SessionCandidateBundleRequest,
+  type SessionCandidateBundleReleaseRequest,
+} from "./session-candidate-bundle.js";
+import { readSessionVerificationRequestFile } from "./session-verification-cli-input.js";
 import { validateWorktreeProfileCatalog, type WorktreeProfileCatalog } from "./domain/worktree-profile-catalog.js";
 import { defaultGit, resolveRepositoryContext } from "./git.js";
 import {
@@ -375,6 +389,7 @@ type ParsedOptions = {
   reason: string | null;
   evidence: string | null;
   execution_scope_file: string | null;
+  request_file: string | null;
   apply: boolean;
   force: boolean;
   create_upstream: boolean;
@@ -392,6 +407,7 @@ type ParsedOptions = {
   integrated_revision: string | null;
   fetch_remote: string | null;
   fetch_branch: string | null;
+  drain_policy: "wait" | "terminate" | null;
   preview: boolean;
   runtime_policy: RuntimePolicyMode | null;
   schema_version: SessionDiagnosticSchemaVersion | null;
@@ -553,6 +569,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     reason: null,
     evidence: null,
     execution_scope_file: null,
+    request_file: null,
     apply: false,
     force: false,
     create_upstream: false,
@@ -570,6 +587,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     integrated_revision: null,
     fetch_remote: null,
     fetch_branch: null,
+    drain_policy: null,
     preview: false,
     runtime_policy: null,
     schema_version: null,
@@ -698,6 +716,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     else if (name === "--reason") options.reason = value;
     else if (name === "--evidence") options.evidence = value;
     else if (name === "--execution-scope-file") options.execution_scope_file = value;
+    else if (name === "--request-file") options.request_file = value;
     else if (name === "--limit") options.limit = value;
     else if (name === "--offset") options.offset = value;
     else if (name === "--path") options.paths.push(value);
@@ -718,7 +737,17 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       options.schema_version = value === "1" ? 1 : 2;
     } else if (name === "--fetch-remote") options.fetch_remote = value;
     else if (name === "--fetch-branch") options.fetch_branch = value;
-    else if (name === "--port") options.port = value;
+    else if (name === "--drain-policy") {
+      if (value !== "wait" && value !== "terminate") {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--drain-policy requires wait or terminate.", {
+            option: "--drain-policy",
+            values: ["wait", "terminate"],
+          }),
+        );
+      }
+      options.drain_policy = value;
+    } else if (name === "--port") options.port = value;
   }
 
   if (options.apply && dryRun) {
@@ -1756,6 +1785,64 @@ async function executeCommand(
   const [command, subcommand, ...rest] = commandArguments;
   const context = sessionContext(dependencies.cwd);
 
+  if (
+    command === "verification" &&
+    (subcommand === "snapshot" ||
+      subcommand === "execute" ||
+      subcommand === "candidate-paths" ||
+      subcommand === "stage-candidate" ||
+      subcommand === "release-candidate")
+  ) {
+    const commandName = `verification ${subcommand}`;
+    const parsed = parseOptions(rest, dispatcherAllowedOptions(commandName));
+    if (!parsed.ok) return parsed;
+    if (subcommand === "snapshot") {
+      if (parsed.value.session_id === null) {
+        return failure(usageError("MISSING_ARGUMENT", "verification snapshot requires --session."));
+      }
+      const result = await getSessionVerificationSnapshot(context, dependencies.backend, parsed.value.session_id);
+      return result.ok
+        ? success({
+            contract_id: "nawabari.session-verification-snapshot.v1",
+            schema_version: 1,
+            snapshot: result.value as unknown as JsonObject,
+          })
+        : result;
+    }
+    if (parsed.value.request_file === null) {
+      return failure(usageError("MISSING_ARGUMENT", `verification ${subcommand} requires --request-file.`));
+    }
+    const text = readSessionVerificationRequestFile(parsed.value.request_file);
+    if (!text.ok) return text;
+    const request = boundedJsonInput(text.value, "--request-file");
+    if (!request.ok) return request;
+    const result =
+      subcommand === "execute"
+        ? await executeSessionBoundVerification(
+            context,
+            dependencies.backend,
+            request.value as SessionBoundVerificationRequest,
+          )
+        : subcommand === "candidate-paths"
+          ? await describeSessionCandidateBundlePaths(
+              context,
+              dependencies.backend,
+              request.value as SessionCandidateBundleRequest,
+            )
+          : subcommand === "stage-candidate"
+            ? await stageSessionCandidateBundle(
+                context,
+                dependencies.backend,
+                request.value as SessionCandidateBundleRequest,
+              )
+            : await releaseSessionCandidateBundleScratch(
+                context,
+                dependencies.backend,
+                request.value as SessionCandidateBundleReleaseRequest,
+              );
+    return result.ok ? success(result.value as unknown as JsonObject) : result;
+  }
+
   if (command === "ui") {
     const parsed = noOptions([subcommand, ...rest].filter((argument): argument is string => argument !== undefined));
     if (!parsed.ok) return parsed;
@@ -2135,7 +2222,14 @@ async function executeCommand(
         profileResolution = resolveWorktreeProfileSessionCreate(profileRequest, sources.value);
       }
       if (!profileResolution.ok) return profileResolution;
-      const profileReady = requireWorktreeProfileReady(profileResolution.value);
+      const selectedProfile = profileResolution.value.profile;
+      // Repository catalog discovery intentionally reports material as unknown.
+      // Resolve its actual strict material before dispatch, then let registry
+      // admission recheck material, working-set, claim and managed authority.
+      const profileReady =
+        selectedProfile?.namespace === "repository" && selectedProfile.availability === "unknown"
+          ? resolveWorktreeProfileRuntime(selectedProfile.resolved, discoverSandboxRuntimeLayout())
+          : requireWorktreeProfileReady(profileResolution.value);
       if (!profileReady.ok) return profileReady;
       if (parsed.value.worktree !== null && parsed.value.worktree_root !== null) {
         return failure(usageError("INVALID_ARGUMENT", "--worktree and --worktree-root cannot be used together."));
@@ -2280,6 +2374,7 @@ async function executeCommand(
           integrated_revision: parsed.value.integrated_revision,
           fetch_remote: parsed.value.fetch_remote,
           fetch_branch: parsed.value.fetch_branch,
+          drain_policy: parsed.value.drain_policy ?? "wait",
         };
         const selected = await dependencies.backend.closeSession(context, closeOptions);
         return selected.ok ? { ok: true, value: selected.value } : selected;

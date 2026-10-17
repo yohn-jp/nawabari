@@ -1,0 +1,190 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+
+import { runCli } from "./cli.js";
+import { machineContract } from "./contract.js";
+import { DomainError, failure } from "./domain/errors.js";
+import type { SessionBackend } from "./domain/session.js";
+
+test("public verification CLI requires explicit bounded requests without invoking an execution backend", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-verifier-cli-dispatch-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const invalid = path.join(root, "request.json");
+  fs.writeFileSync(invalid, "{}\n");
+  const backend = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error("invalid requests must not reach backend execution");
+      },
+    },
+  ) as SessionBackend;
+  for (const args of [
+    ["verification", "snapshot"],
+    ["verification", "execute"],
+    ["verification", "candidate-paths"],
+    ["verification", "candidate-paths", "--request-file", invalid],
+    ["verification", "stage-candidate"],
+    ["verification", "release-candidate"],
+    ["verification", "execute", "--session", "untrusted"],
+    ["verification", "execute", "--request-file", invalid],
+    ["verification", "release-candidate", "--request-file", invalid],
+  ]) {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const exit = await runCli(["--json", ...args], {
+      cwd: root,
+      backend,
+      io: { stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line) },
+    });
+    assert.equal(exit, 2, stdout.join("\n"));
+    assert.equal(stdout.length, 1);
+    assert.deepEqual(stderr, []);
+    assert.equal(JSON.parse(stdout[0]).ok, false);
+  }
+});
+
+test("verification snapshot dispatches only to the canonical read-only session owner", async () => {
+  const sessionId = "0190f1e0-0000-7000-8000-000000000001";
+  const observed: string[] = [];
+  const backend = {
+    async getSessionVerificationSnapshot(context, id) {
+      assert.equal(context.cwd, "/owned/repository");
+      observed.push(id);
+      return failure(new DomainError("OPERATION_REJECTED", "The session is closed.", {}));
+    },
+  } as SessionBackend;
+  const stdout: string[] = [];
+  const exit = await runCli(["--json", "verification", "snapshot", "--session", sessionId], {
+    cwd: "/owned/repository",
+    backend,
+    io: { stdout: (line) => stdout.push(line), stderr: () => assert.fail("machine errors use stdout") },
+  });
+  assert.equal(exit, 3);
+  assert.deepEqual(observed, [sessionId]);
+  assert.equal(JSON.parse(stdout[0]).code, "OPERATION_REJECTED");
+});
+
+test("candidate transfer paths accept separately validated managed and filesystem profile digests", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-candidate-paths-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const sessionId = "0190f1e0-0000-7000-8000-000000000001";
+  const snapshot = {
+    contract_id: "nawabari.session-verification-snapshot.v1",
+    schema_version: 1,
+    session_id: sessionId,
+    repository: "/owned/repository",
+    worktree: "/owned/repository/.worktrees/verifier",
+    branch: "mottainai/candidate",
+    state: "active",
+    filesystem_policy_token: {
+      contract_id: "nawabari.filesystem-policy-token.v1",
+      schema_version: 1,
+      serialization_key: "filesystem-policy-token",
+      registry_revision: 7,
+      session_runtime_epoch: 4,
+      claim_set_generation: 9,
+      working_set_revision: 3,
+      profile_digest: "b".repeat(64),
+      session_id: sessionId,
+    },
+    managed: {
+      profile_digest: "a".repeat(64),
+      admission: "open",
+      runtime_epoch: 4,
+      registry_revision: 7,
+      claim_set_generation: 9,
+    },
+  };
+  const requestFile = path.join(root, "request.json");
+  fs.writeFileSync(
+    requestFile,
+    JSON.stringify({
+      contract_id: "nawabari.session-candidate-bundle.v1",
+      schema_version: 1,
+      session_id: sessionId,
+      snapshot,
+      candidate_id: "candidate-1",
+      candidate_digest: `sha256:${"c".repeat(64)}`,
+      bundles: [
+        {
+          project_id: "project-1",
+          source_id: "source-1",
+          bundle_sha256: `sha256:${"d".repeat(64)}`,
+          base_commit: "1".repeat(40),
+          candidate_commit: "2".repeat(40),
+          candidate_tree: "3".repeat(40),
+        },
+      ],
+    }) + "\n",
+  );
+  const backend = {
+    async getSessionVerificationSnapshot(context, id) {
+      assert.equal(context.cwd, "/owned/repository");
+      assert.equal(id, sessionId);
+      return { ok: true as const, value: snapshot };
+    },
+  } as SessionBackend;
+  const stdout: string[] = [];
+  const exit = await runCli(["--json", "verification", "candidate-paths", "--request-file", requestFile], {
+    cwd: "/owned/repository",
+    backend,
+    io: { stdout: (line) => stdout.push(line), stderr: () => assert.fail("machine errors use stdout") },
+  });
+  assert.equal(exit, 0, stdout.join("\n"));
+  const response = JSON.parse(stdout[0]);
+  assert.equal(response.ok, true);
+  assert.equal(
+    response.transfers[0].repository_path,
+    "/owned/repository/.worktrees/verifier/.nawabari-verification-candidates/" +
+      "c".repeat(64) +
+      "/" +
+      "5ed398f09f95e6d261e49020/repo",
+  );
+});
+
+test("machine discovery maps each verification command to its versioned owner result", () => {
+  const contract = machineContract("0.14.0");
+  const protectedCapability = (contract.capabilities as Array<Record<string, unknown>>).find(
+    (capability) => capability.id === "protected-execution",
+  );
+  assert.ok(protectedCapability);
+  const schemas = protectedCapability.result_schemas as Array<{ schema: string; commands: string[] }>;
+  assert.ok(
+    schemas.some(
+      (entry) =>
+        entry.schema === "nawabari.session-verification-snapshot.v1" &&
+        entry.commands.includes("verification snapshot"),
+    ),
+  );
+  assert.ok(
+    schemas.some(
+      (entry) =>
+        entry.schema === "nawabari.session-bound-verification.v1" && entry.commands.includes("verification execute"),
+    ),
+  );
+  assert.ok(
+    schemas.some(
+      (entry) =>
+        entry.schema === "nawabari.session-candidate-bundle-paths.v1" &&
+        entry.commands.includes("verification candidate-paths"),
+    ),
+  );
+  assert.ok(
+    schemas.some(
+      (entry) =>
+        entry.schema === "nawabari.session-candidate-bundle.v1" &&
+        entry.commands.includes("verification stage-candidate"),
+    ),
+  );
+  assert.ok(
+    schemas.some(
+      (entry) =>
+        entry.schema === "nawabari.session-candidate-bundle-release.v1" &&
+        entry.commands.includes("verification release-candidate"),
+    ),
+  );
+});

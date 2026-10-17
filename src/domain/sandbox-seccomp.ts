@@ -115,6 +115,8 @@ type BpfInstruction = {
 const BPF_LD = 0x00;
 const BPF_W = 0x00;
 const BPF_ABS = 0x20;
+const BPF_ALU = 0x04;
+const BPF_AND = 0x50;
 const BPF_JMP = 0x05;
 const BPF_JEQ = 0x10;
 const BPF_K = 0x00;
@@ -123,6 +125,12 @@ const SECCOMP_RET_KILL_PROCESS = 0x80000000;
 const SECCOMP_RET_ERRNO = 0x00050000;
 const SECCOMP_RET_ALLOW = 0x7fff0000;
 const EPERM = 1;
+const ENOSYS = 38;
+const X32_SYSCALL_BIT = 0x40000000;
+// Mask only namespace-creating clone flags. Ordinary fork/thread clone
+// remains available; clone3 cannot be safely filtered by pointer contents.
+export const CLONE_NAMESPACE_FLAGS = 0x7e020080;
+const SECCOMP_DATA_ARG0_LO_OFFSET = 16;
 const SECCOMP_DATA_NR_OFFSET = 0;
 const SECCOMP_DATA_ARCH_OFFSET = 4;
 
@@ -133,6 +141,15 @@ const AUDIT_ARCH: Readonly<Record<string, number>> = Object.freeze({
   ia32: 0x40000003,
   riscv64: 0xc00000f3,
 });
+
+/** Architecture-specific raw clone; clone3 uses the generic Linux number. */
+const CLONE_SYSCALLS: Readonly<Record<string, number>> = Object.freeze({
+  x64: 56,
+  arm64: 220,
+  arm: 120,
+  riscv64: 220,
+});
+const CLONE3_SYSCALL = 435;
 
 /** Syscall numbers needed by the compatibility profile on supported hosts. */
 const SYSCALLS: Readonly<Record<string, SeccompSyscallMapping>> = Object.freeze({
@@ -323,12 +340,29 @@ export function compileSandboxSeccompProfile(architecture: string = process.arch
     );
   }
 
+  const cloneSyscall = CLONE_SYSCALLS[architecture];
+  if (cloneSyscall === undefined) {
+    return failure(
+      new DomainError("SANDBOX_CAPABILITY_UNAVAILABLE", "No namespace-safe clone profile exists.", {
+        architecture,
+      }),
+    );
+  }
   const instructions: BpfInstruction[] = [
     statement(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET),
     jumpIfEqual(selected.audit, 1, 0),
     statement(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
     statement(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET),
   ];
+  if (architecture === "x64") {
+    // AUDIT_ARCH_X86_64 alone does not exclude the x32 syscall ABI.
+    instructions.push(
+      statement(BPF_ALU | BPF_AND | BPF_K, X32_SYSCALL_BIT),
+      jumpIfEqual(0, 1, 0),
+      statement(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      statement(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET),
+    );
+  }
   for (const name of SANDBOX_SECCOMP_DENIED_SYSCALLS) {
     const syscall = selected.syscalls[name];
     if (syscall === null) continue;
@@ -348,7 +382,21 @@ export function compileSandboxSeccompProfile(architecture: string = process.arch
     }
     instructions.push(jumpIfEqual(syscall, 0, 1), statement(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM));
   }
-  instructions.push(statement(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+  // This filter is inherited by the payload and all descendants. Unlike
+  // bubblewrap --disable-userns it does not write /proc/sys/user/*, which is
+  // read-only in the supported rootless OCI profile. Deny *all* clone-based
+  // namespace creation, not merely CLONE_NEWUSER.
+  instructions.push(
+    jumpIfEqual(cloneSyscall, 0, 4),
+    statement(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARG0_LO_OFFSET),
+    statement(BPF_ALU | BPF_AND | BPF_K, CLONE_NAMESPACE_FLAGS),
+    jumpIfEqual(0, 1, 0),
+    statement(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+    statement(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET),
+    jumpIfEqual(CLONE3_SYSCALL, 0, 1),
+    statement(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    statement(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  );
 
   const bytes = new Uint8Array(instructions.length * 8);
   const view = new DataView(bytes.buffer);

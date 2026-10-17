@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   defaultGit,
@@ -233,7 +234,12 @@ import {
 import { resolveWorktreeProfileRuntime } from "./domain/worktree-profile-runtime.js";
 import { resolveProfileRuntimeScope } from "./domain/worktree-profile-scope.js";
 import { discoverSandboxRuntimeLayout } from "./domain/sandbox.js";
-import type { WorktreeProfileSessionCreateOptions } from "./domain/session.js";
+import type {
+  SessionCandidateScratchReleaseMutationResult,
+  SessionCandidateScratchReleaseOptions,
+  SessionVerificationSnapshot,
+  WorktreeProfileSessionCreateOptions,
+} from "./domain/session.js";
 import {
   parseSessionExecutionRecord,
   recordExecutionState,
@@ -243,7 +249,14 @@ import {
 } from "./domain/session-execution-record.js";
 import type { SessionDrainFinalization, SessionDrainExecution } from "./domain/session-execution-control.js";
 import type { SessionRuntimeEnvironmentIdentity } from "./domain/session-environment.js";
-import { CGROUPS_V2_CONTRACT_ID, deriveCgroupScopeName, type CgroupFileSystem } from "./domain/cgroups-v2.js";
+import {
+  CGROUPS_V2_CONTRACT_ID,
+  deriveCgroupScopeName,
+  isCanonicalManagedCgroupRoot,
+  type CgroupFileSystem,
+} from "./domain/cgroups-v2.js";
+import { observeSessionCgroupTree } from "./domain/session-cgroup-tree-observation.js";
+import { removeSessionCandidateBundleScratch } from "./session-candidate-bundle-storage.js";
 import {
   observeOwnedExecution,
   type SessionExecutionRecord as OwnedExecutionRecord,
@@ -361,6 +374,31 @@ const MIGRATION_RECOVERY_HINTS = Object.freeze([
   "Resolve the reported legacy registry ambiguity or corruption before retrying migration.",
   "Do not hand-edit or delete the registry; retry `nawabari migrate --json` after authoritative state is restored.",
 ]);
+
+function stableSnapshotJson(value: unknown): string {
+  const visit = (current: unknown, ancestors: Set<object>): unknown => {
+    if (current === null || typeof current === "string" || typeof current === "boolean") return current;
+    if (typeof current === "number" && Number.isFinite(current)) return current;
+    if (Array.isArray(current)) {
+      if (ancestors.has(current)) throw new TypeError("cyclic verification snapshot");
+      ancestors.add(current);
+      const result = current.map((entry) => visit(entry, ancestors));
+      ancestors.delete(current);
+      return result;
+    }
+    if (typeof current === "object") {
+      if (ancestors.has(current)) throw new TypeError("cyclic verification snapshot");
+      ancestors.add(current);
+      const source = current as Record<string, unknown>;
+      const result: Record<string, unknown> = {};
+      for (const key of Object.keys(source).sort()) result[key] = visit(source[key], ancestors);
+      ancestors.delete(current);
+      return result;
+    }
+    throw new TypeError("verification snapshot contains non-JSON data");
+  };
+  return JSON.stringify(visit(value, new Set()));
+}
 
 export type RegistrySchemaVersion = typeof REGISTRY_SCHEMA_VERSION;
 export type SessionRecordSchemaVersion = typeof SESSION_RECORD_SCHEMA_VERSION;
@@ -1149,6 +1187,8 @@ export interface SessionRegistryOptions {
   readonly protectedWorktreePaths?: readonly string[];
   readonly worktreeRoot?: string;
   readonly staleAfterMs?: number;
+  /** Exact delegated root used to confirm empty sessions against the live managed cgroup tree. */
+  readonly cgroupRoot?: string;
   /** Canonical owned-execution observation filesystem; injectable for controlled runtimes. */
   readonly cgroupFilesystem?: CgroupFileSystem;
   /**
@@ -1289,6 +1329,7 @@ export class SessionRegistry implements SessionRetentionAuthority {
   private readonly worktreeRootIsDefault: boolean;
   private readonly staleAfterMs: number;
   private readonly cgroupFilesystem?: CgroupFileSystem;
+  private readonly cgroupRoot: string | undefined;
   private readonly lockStaleAfterMs: number;
   private readonly lockMetadataGraceMs: number;
   private readonly stateBoundary: RepositoryStateBoundary;
@@ -1324,6 +1365,10 @@ export class SessionRegistry implements SessionRetentionAuthority {
     }
     this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.cgroupFilesystem = options.cgroupFilesystem;
+    if (options.cgroupRoot !== undefined && !isCanonicalManagedCgroupRoot(options.cgroupRoot)) {
+      throw new RangeError("cgroupRoot must be a canonical managed cgroups v2 path");
+    }
+    this.cgroupRoot = options.cgroupRoot;
     this.lockStaleAfterMs = options.lockStaleAfterMs ?? this.lockTimeoutMs;
     this.lockMetadataGraceMs = options.lockMetadataGraceMs ?? DEFAULT_LOCK_METADATA_GRACE_MS;
     this.managedExecutionReadiness = options.managedExecutionReadiness;
@@ -1458,6 +1503,169 @@ export class SessionRegistry implements SessionRetentionAuthority {
       ...(executionId === undefined
         ? {}
         : { runtime_environment_identity: this.sessionRuntimeEnvironmentIdentity(sessionId, executionId) }),
+    });
+  }
+
+  /**
+   * Return the canonical session and filesystem-policy fence used to bind a
+   * verifier request. This is observation only: it does not reserve an
+   * execution or grant filesystem access.
+   */
+  getSessionVerificationSnapshot(sessionId: string): SessionVerificationSnapshot {
+    assertSessionId(sessionId);
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      return this.sessionVerificationSnapshotFromState(state, sessionId);
+    });
+  }
+
+  /** Remove one exact, clean owner candidate subtree only after the session close drain fence is revalidated. */
+  releaseSessionCandidateScratch(
+    options: SessionCandidateScratchReleaseOptions,
+    finalization: SessionDrainFinalization,
+  ): SessionCandidateScratchReleaseMutationResult {
+    assertSessionId(options.session_id);
+    return this.withLock(() => {
+      const state = this.readStateUnsafe();
+      this.assertDrainFinalizationUnsafe(state, finalization, options.session_id, "close");
+      const currentSnapshot = this.sessionVerificationSnapshotFromState(state, options.session_id);
+      const expectedEpoch = options.snapshot.managed.runtime_epoch + 1;
+      const expectedRevision = options.snapshot.managed.registry_revision + 1;
+      if (!Number.isSafeInteger(expectedEpoch) || !Number.isSafeInteger(expectedRevision)) {
+        throw new SessionRegistryError("OPERATION_REJECTED", "Candidate release owner snapshot is out of range", {
+          sessionId: options.session_id,
+        });
+      }
+      // The effective filesystem-policy digest includes the runtime epoch, so
+      // the canonical digest is expected to change as admission closes. All
+      // other owner identities and policy generations must remain exact.
+      const comparableCurrentSnapshot: SessionVerificationSnapshot = {
+        ...currentSnapshot,
+        filesystem_policy_token: {
+          ...currentSnapshot.filesystem_policy_token,
+          profile_digest: options.snapshot.filesystem_policy_token.profile_digest,
+        },
+      };
+      const expectedSnapshot: SessionVerificationSnapshot = {
+        ...options.snapshot,
+        filesystem_policy_token: {
+          ...options.snapshot.filesystem_policy_token,
+          registry_revision: expectedRevision,
+          session_runtime_epoch: expectedEpoch,
+        },
+        managed: {
+          ...options.snapshot.managed,
+          admission: "closed",
+          runtime_epoch: expectedEpoch,
+          registry_revision: expectedRevision,
+        },
+      };
+      if (
+        !/^[0-9a-f]{64}$/u.test(currentSnapshot.filesystem_policy_token.profile_digest) ||
+        !isDeepStrictEqual(comparableCurrentSnapshot, expectedSnapshot)
+      ) {
+        throw new SessionRegistryError(
+          "STALE_REGISTRY",
+          "Candidate release owner snapshot changed after admission was closed.",
+          { sessionId: options.session_id },
+        );
+      }
+      const session = state.sessions.find((record) => record.sessionId === options.session_id);
+      if (
+        session === undefined ||
+        session.repositoryId !== currentSnapshot.repository ||
+        session.worktreePath !== currentSnapshot.worktree ||
+        session.branchName !== currentSnapshot.branch
+      ) {
+        throw new SessionRegistryError("STALE_REGISTRY", "Candidate release no longer matches its owner session.", {
+          sessionId: options.session_id,
+        });
+      }
+      const identity = {
+        candidate_digest: options.candidate_digest,
+        project_id: options.source.project_id,
+        source_id: options.source.source_id,
+        bundle_sha256: options.source.bundle_sha256,
+        base_commit: options.source.base_commit,
+        candidate_commit: options.source.candidate_commit,
+        candidate_tree: options.source.candidate_tree,
+      };
+      try {
+        const removed = removeSessionCandidateBundleScratch(session.worktreePath, identity);
+        return {
+          session_id: options.session_id,
+          candidate_id: options.candidate_id,
+          candidate_digest: options.candidate_digest,
+          worktree: session.worktreePath,
+          snapshot: currentSnapshot,
+          staging_root: removed.staging_root,
+          repository_path: removed.repository_path,
+          head_id: removed.head_id,
+          tree_id: removed.tree_id,
+          removed: true,
+        };
+      } catch (error: unknown) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Candidate scratch could not be removed without losing recoverable data.",
+          {
+            sessionId: options.session_id,
+            candidateDigest: options.candidate_digest,
+            sourceId: options.source.source_id,
+            reason: error instanceof Error ? error.message.slice(0, 240) : "unknown",
+          },
+          error,
+        );
+      }
+    });
+  }
+
+  private sessionVerificationSnapshotFromState(state: RegistryState, sessionId: string): SessionVerificationSnapshot {
+    const session = state.sessions.find((candidate) => candidate.sessionId === sessionId);
+    if (session === undefined) {
+      throw new SessionRegistryError("SESSION_NOT_FOUND", `Session was not found: ${sessionId}`, { sessionId });
+    }
+    if (session.state !== "active") {
+      throw new SessionRegistryError("SESSION_NOT_ACTIVE", `Verification requires an active session: ${sessionId}`, {
+        sessionId,
+        state: session.state,
+      });
+    }
+    if (session.workingSet === undefined) {
+      throw new SessionRegistryError(
+        "OPERATION_REJECTED",
+        "Verification requires the session's persisted bounded working set.",
+        { sessionId },
+      );
+    }
+
+    const policy = compileSessionFilesystemPolicy(this, state, session, {});
+    const policyToken = canonicalFilesystemPolicyToken(state, session.sessionId, policy);
+    const admissionValue = (state.runtimeRecords.records.runtime_sessions ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    const pinnedValue = (state.runtimeRecords.records.pinned_profiles ?? []).find(
+      (candidate) => candidate.session_id === sessionId,
+    );
+    const admission = admissionValue === undefined ? null : parseSessionAdmissionRecord(admissionValue);
+    const pinned = pinnedValue === undefined ? null : parsePinnedProfileRecord(pinnedValue);
+
+    return Object.freeze({
+      contract_id: "nawabari.session-verification-snapshot.v1",
+      schema_version: 1,
+      session_id: session.sessionId,
+      repository: this.repository.repositoryId,
+      worktree: session.worktreePath,
+      branch: session.branchName,
+      state: "active" as const,
+      filesystem_policy_token: policyToken,
+      managed: Object.freeze({
+        profile_digest: pinned?.digest ?? null,
+        admission: admission?.admission ?? null,
+        runtime_epoch: state.runtimeEpoch,
+        registry_revision: state.registryRevision,
+        claim_set_generation: state.claimSetGeneration,
+      }),
     });
   }
 
@@ -1751,13 +1959,17 @@ export class SessionRegistry implements SessionRetentionAuthority {
   }
 
   /** Persist a new execution reservation, advancing only registry_revision. */
-  persistSessionExecution(record: PersistedSessionExecutionRecord): PersistedSessionExecutionRecord {
-    return this.persistExecutionRecord(record);
+  persistSessionExecution(
+    record: PersistedSessionExecutionRecord,
+    expectedVerificationSnapshot?: SessionVerificationSnapshot,
+  ): PersistedSessionExecutionRecord {
+    return this.persistExecutionRecord(record, undefined, expectedVerificationSnapshot);
   }
 
   private persistExecutionRecord(
     record: PersistedSessionExecutionRecord,
     bootstrapSessionId?: string,
+    expectedVerificationSnapshot?: SessionVerificationSnapshot,
   ): PersistedSessionExecutionRecord {
     return this.withLock(() => {
       const state = this.readStateUnsafe();
@@ -1777,6 +1989,22 @@ export class SessionRegistry implements SessionRetentionAuthority {
           sessionId: parsed.value.session_id,
           state: session.state,
         });
+      }
+      if (expectedVerificationSnapshot !== undefined) {
+        const current = this.sessionVerificationSnapshotFromState(state, parsed.value.session_id);
+        if (stableSnapshotJson(current) !== stableSnapshotJson(expectedVerificationSnapshot)) {
+          throw new SessionRegistryError(
+            "OPERATION_REJECTED",
+            "Verification policy changed before the durable execution reservation.",
+            {
+              sessionId: parsed.value.session_id,
+              expected_registry_revision: expectedVerificationSnapshot.managed.registry_revision,
+              current_registry_revision: current.managed.registry_revision,
+              expected_claim_set_generation: expectedVerificationSnapshot.managed.claim_set_generation,
+              current_claim_set_generation: current.managed.claim_set_generation,
+            },
+          );
+        }
       }
       const admission = this.getSessionLaunchAdmission(parsed.value.session_id);
       if (
@@ -6520,17 +6748,50 @@ export class SessionRegistry implements SessionRetentionAuthority {
 
   private assertOwnedExecutionsEmptyUnsafe(state: RegistryState, sessionId: string): void {
     const executionValues = state.runtimeRecords.records.executions ?? [];
-    const owned = executionValues.flatMap((value) => {
+    const records = executionValues.map((value) => {
       const parsed = parseSessionExecutionRecord(value);
       if (!parsed.ok) throw parsed.error;
-      return parsed.value.session_id === sessionId ? [parsed.value] : [];
+      return parsed.value;
     });
+    const owned = records.filter((record) => record.session_id === sessionId);
     if (owned.length === 0) {
-      throw new SessionRegistryError(
-        "OPERATION_REJECTED",
-        "No owned execution records are available to prove kernel quiescence",
-        { sessionId, observation: "unknown" },
-      );
+      if (this.cgroupRoot === undefined) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "No owned execution records are available to prove kernel quiescence",
+          { sessionId, observation: "unknown", owned_record_count: owned.length },
+        );
+      }
+      let currentBootId: string;
+      try {
+        currentBootId = readCurrentKernelBootId();
+      } catch (error: unknown) {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "Current kernel boot identity is unavailable during drain finalization",
+          { sessionId, reason: error instanceof Error ? error.message.slice(0, 200) : "unknown" },
+        );
+      }
+      const tree = observeSessionCgroupTree({
+        session_id: sessionId,
+        root: this.cgroupRoot,
+        current_boot_id: currentBootId,
+        execution_records: records,
+        ...(this.cgroupFilesystem === undefined ? {} : { filesystem: this.cgroupFilesystem }),
+      });
+      if (tree.state !== "empty") {
+        throw new SessionRegistryError(
+          "OPERATION_REJECTED",
+          "The managed cgroup tree does not prove session quiescence",
+          {
+            sessionId,
+            observation: tree.state,
+            reason: tree.reason,
+            observed_scopes: tree.observed_scopes,
+          },
+        );
+      }
+      return;
     }
     let currentBootId: string;
     try {
@@ -8723,27 +8984,10 @@ function currentFileOperationAuthority(
       },
     );
   }
-  const workingSetRevision = policy.provenance.working_set_revision;
-  if (!Number.isSafeInteger(workingSetRevision) || (workingSetRevision as number) < 1) {
-    throw new SessionRegistryError(
-      "OPERATION_REJECTED",
-      "Current filesystem policy has no positive working-set revision",
-      {
-        operationId: operation.operation_id,
-        field: "policy.provenance.working_set_revision",
-      },
-    );
-  }
-  const tokenResult = createFilesystemPolicyToken({
-    registry_revision: state.registryRevision,
-    session_runtime_epoch: state.runtimeEpoch,
-    claim_set_generation: state.claimSetGeneration,
-    working_set_revision: workingSetRevision as number,
-    profile_digest: effectiveFilesystemProfileBoundaryDigest(policy),
-    session_id: operation.session_id,
-  });
-  if (!tokenResult.ok) throw sessionRegistryOperationError(tokenResult.error.message, tokenResult.error.details);
-  return { policy, token: tokenResult.value };
+  return {
+    policy,
+    token: canonicalFilesystemPolicyToken(state, operation.session_id, policy, operation.operation_id),
+  };
 }
 
 function compileFileOperationPolicy(
@@ -8755,6 +8999,15 @@ function compileFileOperationPolicy(
   policyInput?: CollectedFileOperationPolicyInput,
 ): EffectiveFilesystemPolicy {
   const supplied = policyInput === undefined ? resolveFileOperationPolicyInput(executionOptions) : policyInput.value;
+  return compileSessionFilesystemPolicy(registry, state, session, supplied);
+}
+
+function compileSessionFilesystemPolicy(
+  registry: SessionRegistry,
+  state: RegistryState,
+  session: SessionRecord,
+  supplied: EffectiveFilesystemPolicyInputs,
+): EffectiveFilesystemPolicy {
   const suppliedWorkingSet = supplied.working_set ?? supplied.workingSet;
   const workingSet = suppliedWorkingSet ?? session.workingSet;
   const workingSetRecord = isRecordValue(workingSet) ? workingSet : undefined;
@@ -8783,6 +9036,35 @@ function compileFileOperationPolicy(
   });
   if (!result.ok) throw sessionRegistryOperationError(result.error.message, result.error.details);
   return result.value;
+}
+
+function canonicalFilesystemPolicyToken(
+  state: RegistryState,
+  sessionId: string,
+  policy: EffectiveFilesystemPolicy,
+  operationId?: string,
+): FilesystemPolicyToken {
+  const workingSetRevision = policy.provenance.working_set_revision;
+  if (!Number.isSafeInteger(workingSetRevision) || (workingSetRevision as number) < 1) {
+    throw new SessionRegistryError(
+      "OPERATION_REJECTED",
+      "Current filesystem policy has no positive working-set revision",
+      {
+        ...(operationId === undefined ? {} : { operationId }),
+        field: "policy.provenance.working_set_revision",
+      },
+    );
+  }
+  const token = createFilesystemPolicyToken({
+    registry_revision: state.registryRevision,
+    session_runtime_epoch: state.runtimeEpoch,
+    claim_set_generation: state.claimSetGeneration,
+    working_set_revision: workingSetRevision as number,
+    profile_digest: effectiveFilesystemProfileBoundaryDigest(policy),
+    session_id: sessionId,
+  });
+  if (!token.ok) throw sessionRegistryOperationError(token.error.message, token.error.details);
+  return token.value;
 }
 
 function resolveFileOperationPolicyInput(

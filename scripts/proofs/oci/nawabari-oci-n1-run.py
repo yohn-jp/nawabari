@@ -1,0 +1,2236 @@
+#!/usr/bin/env python3
+"""Bounded public-CLI N1 proof for strict OCI execution and owned cancellation.
+
+This script is intentionally not run until the matching immutable Nawabari
+artifact is installed in the selected disposable OCI container. It consumes
+the prepared target/drain scope and existing live sibling created/selected by
+`nawabari-oci-n1-prepare.py` through Nawabari's public CLI. The target itself
+is cancelled through the public owner API. If close protects a dirty worktree,
+the target stays active and is preserved for the owner; a replacement is
+created only when the public API has actually closed it. The script never uses
+host process signalling or stops/restarts the repository container.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+import time
+import uuid
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--podman-wrapper", required=True)
+    parser.add_argument("--container-id", required=True)
+    parser.add_argument("--repository", required=True, help="Repository path inside the container")
+    parser.add_argument("--sessions-manifest", required=True, help="Public-CLI bounded session preparation manifest")
+    parser.add_argument("--evidence", required=True)
+    parser.add_argument("--nawabari", default="/opt/nawabari/node_modules/.bin/nawabari")
+    parser.add_argument("--package-tar", required=True, help="Exact local Nawabari tarball installed in this consumer")
+    parser.add_argument("--installed-proof", required=True, help="Installer-produced exact artifact integrity proof")
+    parser.add_argument("--package-sha256", required=True, help="SHA-256 of the exact installed package tarball")
+    parser.add_argument(
+        "--reuse-positive-evidence",
+        help="Reuse a byte-preserved successful strict-boundary receipt instead of starting that payload again",
+    )
+    parser.add_argument("--timeout-seconds", type=int, default=20)
+    args = parser.parse_args()
+
+    if not (len(args.package_sha256) == 64 and all(char in "0123456789abcdef" for char in args.package_sha256)):
+        parser.error("--package-sha256 must be lowercase SHA-256 hex")
+    actual_digest = hashlib.sha256(pathlib.Path(args.package_tar).read_bytes()).hexdigest()
+    if actual_digest != args.package_sha256:
+        parser.error(f"package tarball digest differs: expected {args.package_sha256}, got {actual_digest}")
+    installed_proof = json.loads(pathlib.Path(args.installed_proof).read_text())
+    proof_digest = installed_proof.get("sha256", installed_proof.get("tar_sha256"))
+    proof_result = installed_proof.get("result")
+    if proof_digest != actual_digest or (proof_result is not None and proof_result != "passed"):
+        parser.error("installed package integrity proof does not match the exact local tarball")
+    manifest_path = pathlib.Path(args.sessions_manifest)
+    session_manifest = json.loads(manifest_path.read_text())
+    if (
+        session_manifest.get("package_sha256") != actual_digest
+        or session_manifest.get("container_id") != args.container_id
+        or session_manifest.get("repository") != args.repository
+    ):
+        parser.error("bounded session manifest does not match the exact package/container/repository candidate")
+    target_record = session_manifest.get("target", {}).get("session")
+    drain_probe_record = session_manifest.get("drain_probe", {}).get("session")
+    sibling_record = session_manifest.get("sibling", {}).get("session")
+    owned_file = session_manifest.get("owned_file")
+    stale_trigger_file = session_manifest.get("stale_trigger_file")
+    if owned_file != "nawabari-n1-owned-proof-v3.txt" or stale_trigger_file != "nawabari-n1-stale-trigger-v3.txt":
+        parser.error("bounded session manifest does not contain the reviewed v3 proof fixture paths")
+    args.session = target_record.get("session_id") if isinstance(target_record, dict) else None
+    args.drain_probe_session = drain_probe_record.get("session_id") if isinstance(drain_probe_record, dict) else None
+    args.sibling_session = sibling_record.get("session_id") if isinstance(sibling_record, dict) else None
+    target_worktree = target_record.get("worktree") if isinstance(target_record, dict) else None
+    drain_probe_worktree = drain_probe_record.get("worktree") if isinstance(drain_probe_record, dict) else None
+    sibling_worktree = sibling_record.get("worktree") if isinstance(sibling_record, dict) else None
+    if (
+        not isinstance(args.session, str)
+        or not isinstance(args.drain_probe_session, str)
+        or not isinstance(args.sibling_session, str)
+        or len({args.session, args.drain_probe_session, args.sibling_session}) != 3
+        or not isinstance(target_worktree, str)
+        or not isinstance(drain_probe_worktree, str)
+        or not isinstance(sibling_worktree, str)
+        or len({target_worktree, drain_probe_worktree, sibling_worktree}) != 3
+    ):
+        parser.error("bounded session manifest omits distinct target/drain-probe/sibling identities")
+
+    evidence = pathlib.Path(args.evidence)
+    evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
+    env = [
+        "env",
+        "-i",
+        "HOME=/root",
+        "PATH=/opt/node-v24.17.0/bin:/usr/bin:/bin",
+        "NAWABARI_FHS_NODE_EXECUTABLE=/opt/node-v24.17.0/bin/node",
+        "NAWABARI_FHS_GIT_EXECUTABLE=/usr/bin/git",
+        "NAWABARI_FHS_LS_EXECUTABLE=/usr/bin/ls",
+    ]
+    prefix = [args.podman_wrapper, "exec", "--workdir", args.repository, args.container_id, *env]
+
+    failures: list[str] = []
+
+    def save(name: str, data: bytes) -> None:
+        (evidence / name).write_bytes(data)
+
+    def invoke(
+        name: str,
+        argv: list[str],
+        timeout: int = 30,
+        workdir: str | None = None,
+    ) -> tuple[subprocess.CompletedProcess[bytes], dict | None]:
+        selected_prefix = prefix if workdir is None else [
+            args.podman_wrapper,
+            "exec",
+            "--workdir",
+            workdir,
+            args.container_id,
+            *env,
+        ]
+        command = [*selected_prefix, args.nawabari, "--json", *argv]
+        result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
+        save(f"{name}.stdout", result.stdout)
+        save(f"{name}.stderr", result.stderr)
+        save(f"{name}.argv.json", json.dumps(command).encode() + b"\n")
+        try:
+            document = json.loads(result.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            document = None
+        return result, document
+
+    def invoke_ok(name: str, argv: list[str], timeout: int = 30, workdir: str | None = None) -> dict:
+        result, document = invoke(name, argv, timeout, workdir)
+        if result.returncode != 0 or not isinstance(document, dict) or document.get("ok") is not True:
+            raise RuntimeError(
+                f"{name} failed: exit={result.returncode}, code={document.get('code') if isinstance(document, dict) else 'unparseable'}"
+            )
+        return document
+
+    def write_container_json(name: str, value: dict) -> str:
+        remote = f"/tmp/nawabari-n1-{uuid.uuid4()}.json"
+        command = [
+            args.podman_wrapper,
+            "exec",
+            "-i",
+            args.container_id,
+            *env,
+            "node",
+            "-e",
+            "const fs=require('node:fs');fs.writeFileSync(process.argv[1],fs.readFileSync(0),{mode:0o600})",
+            remote,
+        ]
+        result = subprocess.run(
+            command,
+            input=json.dumps(value, separators=(",", ":")).encode(),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save(f"{name}.stdout", result.stdout)
+        save(f"{name}.stderr", result.stderr)
+        save(f"{name}.argv.json", json.dumps(command).encode() + b"\n")
+        if result.returncode != 0:
+            raise RuntimeError(f"could not write public CLI request artifact {name}")
+        return remote
+
+    def create_fresh_session(name: str, source_key: str, profile: str, claims: list[tuple[str, str]]) -> dict:
+        source = session_manifest.get(source_key)
+        scope = source.get("scope") if isinstance(source, dict) else None
+        working_set = source.get("working_set") if isinstance(source, dict) else None
+        if not isinstance(scope, dict) or not isinstance(working_set, dict):
+            raise RuntimeError(f"session manifest omitted the bounded {source_key} artifacts")
+        base = scope.get("base")
+        expected_revision = base.get("revision") if isinstance(base, dict) else None
+        head = subprocess.run(
+            [*prefix, "git", "rev-parse", "main"], capture_output=True, timeout=30, check=False
+        )
+        save(f"{name}-repository-main-head.stdout", head.stdout)
+        save(f"{name}-repository-main-head.stderr", head.stderr)
+        if head.returncode != 0 or head.stdout.decode("ascii", errors="replace").strip() != expected_revision:
+            raise RuntimeError(f"current repository main no longer matches the {source_key} base revision")
+        candidate = json.loads(json.dumps(working_set))
+        candidate["workingSetId"] = f"oci-n1-physical-{name}-{uuid.uuid4()}"
+        scope_path = write_container_json(f"{name}-create-execution-scope", scope)
+        candidate_path = write_container_json(f"{name}-create-candidate-working-set", candidate)
+        create_argv = [
+            "session",
+            "create",
+            "--base",
+            "main",
+            "--profile",
+            profile,
+            "--execution-scope-file",
+            scope_path,
+            "--candidate-working-set-file",
+            candidate_path,
+        ]
+        for resource, mode in claims:
+            create_argv.extend(["--resource", resource, "--mode", mode])
+        create_argv.append("--enforce-claims")
+        created = invoke_ok(f"{name}-create-session", create_argv, timeout=120)
+        created_session = recursively_find(created, "session")
+        if not isinstance(created_session, dict) and isinstance(created.get("session_id"), str):
+            created_session = created
+        if not isinstance(created_session, dict) or not isinstance(created_session.get("session_id"), str):
+            raise RuntimeError(f"fresh {name} create omitted its canonical session identity")
+        shown = invoke_ok(
+            f"{name}-show-session", ["session", "show", "--session", created_session["session_id"]]
+        )
+        record = recursively_find(shown, "session")
+        if not isinstance(record, dict) and isinstance(shown.get("session_id"), str):
+            record = shown
+        if not isinstance(record, dict) or record.get("state") != "active":
+            raise RuntimeError(f"fresh {name} owner record is not active")
+        repository = scope.get("repository")
+        repository_id = repository.get("repositoryId") if isinstance(repository, dict) else None
+        if record.get("base_revision") != expected_revision or record.get("repository") != repository_id:
+            raise RuntimeError(f"fresh {name} owner record differs from the bounded source repository/base")
+        claimed = invoke_ok(
+            f"{name}-show-claims", ["session", "claims", "--session", record["session_id"]]
+        ).get("claims")
+        normalized_claims = {
+            (item.get("resource"), item.get("mode")) for item in claimed if isinstance(item, dict)
+        } if isinstance(claimed, list) else set()
+        if normalized_claims != set(claims):
+            raise RuntimeError(f"fresh {name} owner did not atomically retain its exact bounded claims")
+        snapshot_doc = invoke_ok(
+            f"{name}-initial-snapshot", ["verification", "snapshot", "--session", record["session_id"]]
+        )
+        snapshot = snapshot_doc.get("snapshot")
+        if not isinstance(snapshot, dict) or snapshot.get("session_id") != record["session_id"]:
+            raise RuntimeError(f"fresh {name} verification snapshot omitted its canonical session identity")
+        return {
+            "create": created,
+            "session": record,
+            "snapshot": snapshot,
+            "scope": scope,
+            "working_set": candidate,
+            "claims": claimed,
+        }
+
+    def create_fresh_drain_probe() -> dict:
+        return create_fresh_session(
+            "drain-probe", "drain_probe", "builtin:minimal", [("README.md", "read")]
+        )
+
+    def create_fresh_target(name: str) -> dict:
+        return create_fresh_session(
+            name,
+            "target",
+            session_manifest.get("profile_id", "repository:oci-n1-physical-v3"),
+            [("README.md", "read"), (owned_file, "write")],
+        )
+
+    def recursively_find(value: object, key: str) -> object | None:
+        if isinstance(value, dict):
+            if key in value:
+                return value[key]
+            for child in value.values():
+                found = recursively_find(child, key)
+                if found is not None:
+                    return found
+        if isinstance(value, list):
+            for child in value:
+                found = recursively_find(child, key)
+                if found is not None:
+                    return found
+        return None
+
+    def command_line(argv: list[str], workdir: str | None = None) -> list[str]:
+        selected_prefix = prefix if workdir is None else [
+            args.podman_wrapper,
+            "exec",
+            "--workdir",
+            workdir,
+            args.container_id,
+            *env,
+        ]
+        return [*selected_prefix, args.nawabari, "--json", *argv]
+
+    def launch_persistent(
+        name: str,
+        session_id: str,
+        session_worktree: str,
+        cancellation_marker: tuple[str, str] | None = None,
+    ) -> tuple[subprocess.Popen[bytes], pathlib.Path, pathlib.Path]:
+        # A finite in-sandbox deadline is a safety bound if owner cancellation
+        # is rejected; the host never signals the payload or its descendants.
+        if cancellation_marker is None:
+            child = "setInterval(()=>{},1000)"
+            payload = (
+                "const {spawn}=require('node:child_process');"
+                f"const child=spawn(process.execPath,['-e',{json.dumps(child)}],{{stdio:'ignore'}});"
+                "process.stdout.write(JSON.stringify({parent:process.pid,child:child.pid})+'\\n');"
+                f"setTimeout(()=>{{try{{child.kill()}}catch{{}};process.exit(0)}},{45000 if name.startswith('target') else 60000});"
+                "setInterval(()=>{},1000);"
+            )
+            command_arguments = ["node", "-e", payload]
+        else:
+            owned_path, nonce = cancellation_marker
+            child = "setInterval(()=>{},1000)"
+            payload = (
+                "const fs=require('node:fs'),{spawn}=require('node:child_process');"
+                "const [owned,nonce]=process.argv.slice(1);"
+                f"const child=spawn(process.execPath,['-e',{json.dumps(child)}],{{stdio:'ignore'}});"
+                "child.once('spawn',()=>{const marker={nonce,parent:process.pid,child:child.pid};"
+                "const raw=JSON.stringify(marker)+'\\n';fs.writeFileSync(owned,raw);process.stdout.write(raw);});"
+                "setTimeout(()=>{try{child.kill()}catch{};process.exit(0)},45000);"
+                "setInterval(()=>{},1000);"
+            )
+            command_arguments = ["node", "-e", payload, owned_path, nonce]
+        command = command_line(
+            [
+                "session",
+                "run",
+                "--session",
+                session_id,
+                "--runtime-policy",
+                "strict",
+                "--",
+                *command_arguments,
+            ],
+            session_worktree,
+        )
+        stdout_path = evidence / f"{name}.stdout"
+        stderr_path = evidence / f"{name}.stderr"
+        stdout_file = stdout_path.open("wb")
+        stderr_file = stderr_path.open("wb")
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout_file, stderr=stderr_file)
+        save(f"{name}.argv.json", json.dumps(command).encode() + b"\n")
+        # Keep the file handles reachable until the caller has collected exit.
+        setattr(process, "_evidence_files", (stdout_file, stderr_file))
+        return process, stdout_path, stderr_path
+
+    def collect_process(process: subprocess.Popen[bytes], name: str, timeout: int = 55) -> int:
+        try:
+            code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"{name} did not return within {timeout}s; no host-side signal was sent") from error
+        for handle in getattr(process, "_evidence_files", ()):
+            handle.close()
+        save(f"{name}.exit.txt", f"{code}\n".encode())
+        return code
+
+    def process_snapshot(name: str, session_id: str) -> dict:
+        return invoke_ok(name, ["session", "processes", "--session", session_id])
+
+    def execution_ids(document: dict) -> list[str]:
+        processes = document.get("processes")
+        if not isinstance(processes, list):
+            return []
+        return sorted(
+            item.get("execution", {}).get("execution_id")
+            for item in processes
+            if isinstance(item, dict) and isinstance(item.get("execution"), dict)
+        )
+
+    def active_execution_ids(document: dict) -> list[str]:
+        processes = document.get("processes")
+        if not isinstance(processes, list):
+            return []
+        return sorted(
+            item.get("execution", {}).get("execution_id")
+            for item in processes
+            if isinstance(item, dict)
+            and isinstance(item.get("execution"), dict)
+            and item["execution"].get("state") == "attached"
+            and isinstance(item.get("cgroups"), dict)
+            and item["cgroups"].get("state") == "active"
+            and isinstance(item["cgroups"].get("cgroups"), dict)
+            and item["cgroups"]["cgroups"].get("population", {}).get("state") == "populated"
+        )
+
+    def complete_raw_streams(value: object) -> tuple[bytes, bytes] | None:
+        if not isinstance(value, dict) or value.get("encoding") != "base64" or value.get("complete") is not True or value.get("truncated") is not False:
+            return None
+        try:
+            stdout = base64.b64decode(value.get("stdout", ""), validate=True)
+            stderr = base64.b64decode(value.get("stderr", ""), validate=True)
+        except (ValueError, TypeError):
+            return None
+        if value.get("stdout_bytes") != len(stdout) or value.get("stderr_bytes") != len(stderr):
+            return None
+        if value.get("observed_stdout_bytes") != len(stdout) or value.get("observed_stderr_bytes") != len(stderr):
+            return None
+        return stdout, stderr
+
+    def observed_raw_streams(value: object) -> tuple[bytes, bytes] | None:
+        """Validate the bytes actually captured, even when termination truncated the stream."""
+        if not isinstance(value, dict) or value.get("encoding") != "base64":
+            return None
+        try:
+            stdout = base64.b64decode(value.get("stdout", ""), validate=True)
+            stderr = base64.b64decode(value.get("stderr", ""), validate=True)
+        except (ValueError, TypeError):
+            return None
+        if value.get("stdout_bytes") != len(stdout) or value.get("stderr_bytes") != len(stderr):
+            return None
+        if value.get("observed_stdout_bytes") != len(stdout) or value.get("observed_stderr_bytes") != len(stderr):
+            return None
+        complete = value.get("complete")
+        truncated = value.get("truncated")
+        if not ((complete is True and truncated is False) or (complete is False and truncated is True)):
+            return None
+        return stdout, stderr
+
+    def inspect_engine_resources() -> dict:
+        host = subprocess.run(
+            [args.podman_wrapper, "inspect", "--format", "{{json .HostConfig}}", args.container_id],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        network = subprocess.run(
+            [args.podman_wrapper, "inspect", "--format", "{{json .NetworkSettings}}", args.container_id],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        state_pid = subprocess.run(
+            [args.podman_wrapper, "inspect", "--format", "{{.State.Pid}}", args.container_id],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save("engine-hostconfig-inspect.stdout", host.stdout)
+        save("engine-hostconfig-inspect.stderr", host.stderr)
+        save("engine-state-pid-inspect.stdout", state_pid.stdout)
+        save("engine-state-pid-inspect.stderr", state_pid.stderr)
+        save("engine-network-inspect.stdout", network.stdout)
+        save("engine-network-inspect.stderr", network.stderr)
+        if host.returncode != 0 or network.returncode != 0 or state_pid.returncode != 0:
+            raise RuntimeError("repository container engine resource/network inspection failed")
+        try:
+            host_config = json.loads(host.stdout)
+            network_settings = json.loads(network.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("repository container engine inspection was not valid JSON") from error
+        if not isinstance(host_config, dict) or not isinstance(network_settings, dict):
+            raise RuntimeError("repository container engine inspection omitted host/network objects")
+        try:
+            host_pid = int(state_pid.stdout.decode("ascii").strip())
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RuntimeError("repository container engine did not report its running init PID") from error
+        if host_pid < 1:
+            raise RuntimeError("repository container engine reported a non-running init PID")
+        networks = network_settings.get("Networks")
+        observed = {
+            "container_id": args.container_id,
+            "host_init_pid": host_pid,
+            "memory_bytes": host_config.get("Memory"),
+            "nano_cpus": host_config.get("NanoCpus"),
+            "cpu_quota_usec": host_config.get("CpuQuota"),
+            "cpu_period_usec": host_config.get("CpuPeriod"),
+            "pids_limit": host_config.get("PidsLimit"),
+            "network_mode": host_config.get("NetworkMode"),
+            "networks": sorted(networks) if isinstance(networks, dict) else None,
+            "pid_mode": host_config.get("PidMode"),
+            "cgroup_mode": host_config.get("CgroupMode"),
+            "privileged": host_config.get("Privileged"),
+        }
+        (evidence / "engine-resource-observation.json").write_text(json.dumps(observed, indent=2) + "\n")
+        expected = {
+            "memory_bytes": 536_870_912,
+            "nano_cpus": 1_000_000_000,
+            "cpu_quota_usec": 100_000,
+            "cpu_period_usec": 100_000,
+            "pids_limit": 128,
+            "network_mode": "none",
+            "networks": ["none"],
+            "pid_mode": "private",
+            "cgroup_mode": "private",
+            "privileged": False,
+        }
+        mismatches = {key: {"expected": value, "observed": observed.get(key)} for key, value in expected.items() if observed.get(key) != value}
+        if mismatches:
+            failures.append(f"engine configuration did not match the bounded OCI profile: {mismatches}")
+        return observed
+
+    def proc_starttime(pid: int) -> str:
+        raw = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        command_end = raw.rfind(")")
+        if command_end < 0:
+            raise RuntimeError("host process stat did not contain a command boundary")
+        fields = raw[command_end + 1 :].strip().split()
+        if len(fields) <= 19 or not fields[19].isdigit():
+            raise RuntimeError("host process starttime could not be parsed")
+        return fields[19]
+
+    def observe_known_payload_processes(expected_processes: list[dict]) -> list[dict]:
+        """Reobserve only the exact payload PIDs captured before cancellation."""
+        observations = []
+        for expected in expected_processes:
+            pid = expected.get("host_pid")
+            expected_starttime = expected.get("starttime")
+            observation = {
+                "role": expected.get("role"),
+                "host_pid": pid,
+                "expected_starttime": expected_starttime,
+            }
+            if not isinstance(pid, int) or not isinstance(expected_starttime, str):
+                observation.update({"state": "unknown", "reason": "invalid-pre-cancel-identity"})
+                observations.append(observation)
+                continue
+            try:
+                start_before = proc_starttime(pid)
+            except FileNotFoundError:
+                observation["state"] = "absent"
+                observations.append(observation)
+                continue
+            except (OSError, RuntimeError, ValueError) as error:
+                observation.update({"state": "unknown", "reason": type(error).__name__})
+                observations.append(observation)
+                continue
+            try:
+                start_after = proc_starttime(pid)
+            except FileNotFoundError:
+                observation["state"] = "absent"
+                observations.append(observation)
+                continue
+            except (OSError, RuntimeError, ValueError) as error:
+                observation.update({"state": "unknown", "reason": type(error).__name__})
+                observations.append(observation)
+                continue
+            if start_before != start_after:
+                observation.update({"state": "unknown", "reason": "pid-generation-changed-during-observation"})
+            else:
+                observation["current_starttime"] = start_before
+                observation["state"] = "present" if start_before == expected_starttime else "identity-reused"
+            observations.append(observation)
+        return observations
+
+    def owned_cancel_scope_observed(owner_empty: int, host_empty: int, payload_gone: int) -> bool:
+        return owner_empty >= 2 and host_empty >= 2 and payload_gone >= 1
+
+    def observe_host_process(pid: int) -> dict | None:
+        """Read a bounded identity for one PID named by the exact owned cgroup."""
+        stat_path = pathlib.Path(f"/proc/{pid}/stat")
+        status_path = pathlib.Path(f"/proc/{pid}/status")
+        try:
+            stat_before = stat_path.read_text()
+            command_end = stat_before.rfind(")")
+            if command_end < 0:
+                raise RuntimeError("host process stat did not contain a command boundary")
+            fields = stat_before[command_end + 1 :].strip().split()
+            if len(fields) <= 19 or not fields[1].isdigit() or not fields[19].isdigit():
+                raise RuntimeError("host process stat omitted its parent or generation")
+            starttime = fields[19]
+            parent_pid = int(fields[1])
+            comm = pathlib.Path(f"/proc/{pid}/comm").read_text().strip()
+            nspid_line = next(
+                (line for line in status_path.read_text().splitlines() if line.startswith("NSpid:")),
+                None,
+            )
+            if nspid_line is None:
+                raise RuntimeError("host process status omitted its PID namespace mapping")
+            namespace_pids = [int(value) for value in nspid_line.split()[1:]]
+            if not namespace_pids or any(value < 1 for value in namespace_pids):
+                raise RuntimeError("host process status contained invalid namespace PIDs")
+            pid_namespace = pathlib.Path(f"/proc/{pid}/ns/pid").readlink().as_posix()
+            cgroup = proc_unified_cgroup(pid)
+            executable = pathlib.Path(f"/proc/{pid}/exe").readlink().as_posix()
+            stat_after = stat_path.read_text()
+            command_end_after = stat_after.rfind(")")
+            if command_end_after < 0:
+                raise RuntimeError("host process stat lost its command boundary")
+            fields_after = stat_after[command_end_after + 1 :].strip().split()
+            if (
+                len(fields_after) <= 19
+                or fields_after[19] != starttime
+                or not fields_after[1].isdigit()
+                or int(fields_after[1]) != parent_pid
+                or pathlib.Path(f"/proc/{pid}/ns/pid").readlink().as_posix() != pid_namespace
+                or proc_unified_cgroup(pid) != cgroup
+            ):
+                raise RuntimeError("host process identity changed during bounded observation")
+        except FileNotFoundError:
+            return None
+        return {
+            "host_pid": pid,
+            "host_parent_pid": parent_pid,
+            "starttime": starttime,
+            "comm": comm,
+            "executable_basename": pathlib.PurePosixPath(executable).name,
+            "namespace_pids_outer_to_inner": namespace_pids,
+            "pid_namespace": pid_namespace,
+            "cgroup": cgroup,
+        }
+
+    def observe_pid_namespace_members(namespace_identity: str) -> dict:
+        """Return a fail-closed snapshot of processes in one observed PID namespace."""
+        members = []
+        unobservable = []
+        for entry in pathlib.Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                start_before = proc_starttime(pid)
+                identity = pathlib.Path(f"/proc/{pid}/ns/pid").readlink().as_posix()
+                if identity != namespace_identity:
+                    continue
+                cgroup = proc_unified_cgroup(pid)
+                start_after = proc_starttime(pid)
+                identity_after = pathlib.Path(f"/proc/{pid}/ns/pid").readlink().as_posix()
+                if start_before != start_after or identity_after != identity:
+                    unobservable.append({"host_pid": pid, "reason": "identity-changed-during-observation"})
+                    continue
+                members.append({"host_pid": pid, "starttime": start_before, "cgroup": cgroup})
+            except FileNotFoundError:
+                # Process exit during the read is a race; the next complete
+                # scan decides whether the namespace is empty.
+                continue
+            except (PermissionError, OSError, RuntimeError, ValueError) as error:
+                unobservable.append({"host_pid": pid, "reason": type(error).__name__})
+        members.sort(key=lambda item: item["host_pid"])
+        unobservable.sort(key=lambda item: item["host_pid"])
+        return {
+            "pid_namespace": namespace_identity,
+            "state": "unknown" if unobservable else ("populated" if members else "empty"),
+            "members": members,
+            "unobservable": unobservable,
+            "observed_at_unix": time.time(),
+        }
+
+    def observe_host_scope_population(scope_path: pathlib.Path) -> dict:
+        if any(path.is_symlink() for path in (scope_path, scope_path.parent, scope_path.parent.parent)):
+            raise RuntimeError("exact owner scope path contains a symlink")
+        if not scope_path.is_dir():
+            raise RuntimeError("exact owner scope disappeared before physical cleanup could be observed")
+        events = read_bounded_text(scope_path / "cgroup.events", 4 * 1024)
+        procs_text = read_bounded_text(scope_path / "cgroup.procs", 64 * 1024)
+        pids_text = read_bounded_text(scope_path / "pids.current", 4 * 1024)
+        event_values = {
+            key: value
+            for line in events.splitlines()
+            if len((parts := line.split())) == 2
+            for key, value in [parts]
+        }
+        host_pids = [int(value) for value in procs_text.splitlines() if value.isdigit()]
+        if len(host_pids) != len(procs_text.splitlines()):
+            raise RuntimeError("exact owner scope contained malformed cgroup.procs data")
+        return {
+            "scope_path": str(scope_path),
+            "events": events,
+            "population": event_values.get("populated"),
+            "host_pids": host_pids,
+            "pids_current": pids_text,
+            "state": "empty"
+            if event_values.get("populated") == "0" and not host_pids and pids_text == "0"
+            else "populated",
+            "observed_at_unix": time.time(),
+        }
+
+    def proc_unified_cgroup(pid: int) -> str:
+        raw = pathlib.Path(f"/proc/{pid}/cgroup").read_text()
+        unified = next((line[3:] for line in raw.splitlines() if line.startswith("0::")), None)
+        if not isinstance(unified, str) or not unified.startswith("/") or "\0" in unified or ".." in pathlib.PurePosixPath(unified).parts:
+            raise RuntimeError("host process did not expose a canonical unified cgroup identity")
+        return unified
+
+    def read_bounded_text(file: pathlib.Path, max_bytes: int = 64 * 1024) -> str:
+        with file.open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise RuntimeError(f"host cgroup observation exceeded {max_bytes} bytes: {file}")
+        return raw.decode("ascii").strip()
+
+    def read_host_cgroup_chain(leaf: pathlib.Path) -> list[dict]:
+        mount = pathlib.Path("/sys/fs/cgroup")
+        relative = leaf.relative_to(mount)
+        paths = [mount]
+        for index in range(1, len(relative.parts) + 1):
+            paths.append(mount.joinpath(*relative.parts[:index]))
+        chain = []
+        for directory in paths:
+            values = {}
+            for filename in ("cpu.max", "memory.max", "pids.max"):
+                try:
+                    values[filename] = read_bounded_text(directory / filename, 4 * 1024)
+                except OSError as error:
+                    values[filename] = None
+                    values[f"{filename}_error"] = type(error).__name__
+            chain.append({"path": str(directory), "values": values})
+        return chain
+
+    def parse_cgroup_limits(chain: list[dict]) -> tuple[dict, list[dict]]:
+        cpu_limits: list[tuple[float, int, int]] = []
+        memory_limits: list[int] = []
+        pids_limits: list[int] = []
+        unknown = []
+        for level in chain:
+            values = level.get("values")
+            if not isinstance(values, dict):
+                unknown.append({"path": level.get("path"), "controller": "all"})
+                continue
+            cpu_value = values.get("cpu.max")
+            if isinstance(cpu_value, str):
+                parts = cpu_value.split()
+                if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0:
+                    if parts[0] == "max":
+                        pass
+                    elif parts[0].isdigit() and int(parts[0]) > 0:
+                        quota, period = int(parts[0]), int(parts[1])
+                        cpu_limits.append((quota / period, quota, period))
+                    else:
+                        unknown.append({"path": level.get("path"), "controller": "cpu.max", "value": cpu_value})
+                else:
+                    unknown.append({"path": level.get("path"), "controller": "cpu.max", "value": cpu_value})
+            else:
+                if level.get("path") != "/sys/fs/cgroup":
+                    unknown.append({"path": level.get("path"), "controller": "cpu.max", "value": cpu_value})
+            for controller, limits in (("memory.max", memory_limits), ("pids.max", pids_limits)):
+                value = values.get(controller)
+                if value == "max":
+                    continue
+                if isinstance(value, str) and value.isdigit() and int(value) > 0:
+                    limits.append(int(value))
+                elif not (level.get("path") == "/sys/fs/cgroup" and value is None):
+                    unknown.append({"path": level.get("path"), "controller": controller, "value": value})
+        limits = {
+            "cpu": None if not cpu_limits else {
+                "cores": min(cpu_limits)[0],
+                "quota_usec": min(cpu_limits)[1],
+                "period_usec": min(cpu_limits)[2],
+            },
+            "memory_bytes": min(memory_limits) if memory_limits else None,
+            "pids": min(pids_limits) if pids_limits else None,
+        }
+        return limits, unknown
+
+    def observe_host_container_cgroup(engine_observation: dict) -> dict | None:
+        host_pid = engine_observation.get("host_init_pid")
+        if not isinstance(host_pid, int) or host_pid < 1:
+            failures.append("engine inspection omitted a valid owned container init PID")
+            return None
+        try:
+            starttime_before = proc_starttime(host_pid)
+            cgroup_before = proc_unified_cgroup(host_pid)
+            parts = pathlib.PurePosixPath(cgroup_before).parts
+            if (
+                len(parts) < 4
+                or parts[-3:] != ("container", "repository.scope", "init.scope")
+                or f"libpod-{args.container_id}.scope" not in parts
+            ):
+                raise RuntimeError("container init cgroup did not match the selected Podman identity and repository scope")
+            init_path = pathlib.Path("/sys/fs/cgroup").joinpath(*parts[1:])
+            repository_path = init_path.parent
+            chain = read_host_cgroup_chain(init_path)
+            starttime_after = proc_starttime(host_pid)
+            cgroup_after = proc_unified_cgroup(host_pid)
+            if starttime_after != starttime_before or cgroup_after != cgroup_before:
+                raise RuntimeError("container init process identity or cgroup changed during observation")
+            netns = pathlib.Path(f"/proc/{host_pid}/ns/net").readlink().as_posix()
+            caller_netns = pathlib.Path("/proc/self/ns/net").readlink().as_posix()
+            pidns = pathlib.Path(f"/proc/{host_pid}/ns/pid").readlink().as_posix()
+            caller_pidns = pathlib.Path("/proc/self/ns/pid").readlink().as_posix()
+            net_prefix = pathlib.Path(f"/proc/{host_pid}/net")
+            net_devices = read_bounded_text(net_prefix / "dev", 16 * 1024)
+            ipv4_routes = read_bounded_text(net_prefix / "route", 16 * 1024)
+            ipv6_routes = read_bounded_text(net_prefix / "ipv6_route", 16 * 1024)
+            interface_names = [
+                line.split(":", 1)[0].strip()
+                for line in net_devices.splitlines()[2:]
+                if ":" in line
+            ]
+            ipv4_route_rows = ipv4_routes.splitlines()[1:]
+            ipv6_route_interfaces = [line.split()[-1] for line in ipv6_routes.splitlines() if line.split()]
+            limits, unknown = parse_cgroup_limits(chain)
+            result = {
+                "container_id": args.container_id,
+                "host_init_pid": host_pid,
+                "host_init_starttime": starttime_before,
+                "proc_cgroup": f"0::{cgroup_before}",
+                "init_cgroup_path": str(init_path),
+                "repository_cgroup_path": str(repository_path),
+                "network_namespace": netns,
+                "caller_network_namespace": caller_netns,
+                "network_namespace_distinct_from_caller": netns != caller_netns,
+                "pid_namespace": pidns,
+                "caller_pid_namespace": caller_pidns,
+                "pid_namespace_distinct_from_caller": pidns != caller_pidns,
+                "network_observation": {
+                    "interfaces": interface_names,
+                    "ipv4_route_rows": ipv4_route_rows,
+                    "ipv6_route_interfaces": ipv6_route_interfaces,
+                    "only_loopback_observed": interface_names == ["lo"]
+                    and not ipv4_route_rows
+                    and set(ipv6_route_interfaces) <= {"lo"},
+                },
+                "observed_chain": chain,
+                "effective_host_container_limits": limits,
+                "unobserved_or_invalid_controllers": unknown,
+            }
+            (evidence / "host-physical-cgroup-limits.json").write_text(json.dumps(result, indent=2) + "\n")
+            if unknown or limits["cpu"] is None or limits["memory_bytes"] is None or limits["pids"] is None:
+                failures.append("host kernel cgroup ancestors did not expose all physical CPU/memory/PID limits")
+            if (
+                netns == caller_netns
+                or not result["network_observation"]["only_loopback_observed"]
+                or limits["cpu"] is None
+                or limits["cpu"]["cores"] > 1.0
+                or limits["memory_bytes"] is None
+                or limits["memory_bytes"] > 536_870_912
+                or limits["pids"] is None
+                or limits["pids"] > 128
+            ):
+                failures.append("actual host container cgroup/network boundary exceeded or failed to prove the bounded OCI profile")
+            return result
+        except (OSError, RuntimeError, ValueError) as error:
+            failures.append(f"host physical container identity/cgroup observation unavailable: {error}")
+            return None
+
+    def observe_owned_cgroup_limits(
+        name: str,
+        document: dict,
+        session_id: str,
+        host_container: dict | None,
+    ) -> dict | None:
+        if not isinstance(host_container, dict):
+            failures.append(f"{name} has no host-observed repository cgroup identity")
+            return None
+        processes = document.get("processes")
+        records = processes if isinstance(processes, list) else []
+        owned = [
+            item
+            for item in records
+            if isinstance(item, dict)
+            and isinstance(item.get("execution"), dict)
+            and item["execution"].get("session_id") == session_id
+            and isinstance(item.get("cgroups"), dict)
+            and item["cgroups"].get("state") == "active"
+            and isinstance(item["cgroups"].get("cgroups"), dict)
+        ]
+        if len(owned) != 1:
+            failures.append(f"{name} did not identify exactly one owner-backed execution cgroup for the selected session")
+            return None
+        item = owned[0]
+        execution = item["execution"]
+        cgroups = item["cgroups"]["cgroups"]
+        root = execution.get("cgroup_root")
+        scope = cgroups.get("scope")
+        execution_id = execution.get("execution_id")
+        if (
+            root != "/sys/fs/cgroup/repository.scope"
+            or not isinstance(scope, str)
+            or not scope.startswith("nawabari-")
+            or any(char not in "0123456789abcdef" for char in scope.removeprefix("nawabari-"))
+            or len(scope.removeprefix("nawabari-")) != 48
+            or not isinstance(execution_id, str)
+        ):
+            failures.append(f"{name} public execution record omitted a canonical owner cgroup identity")
+            return None
+        identity = item.get("cgroups", {}).get("cgroups", {})
+        population = identity.get("population")
+        if (
+            identity.get("scope") != scope
+            or not isinstance(population, dict)
+            or population.get("state") != "populated"
+            or population.get("populated") is not True
+        ):
+            failures.append(f"{name} public owner observation did not report the exact session scope populated")
+            return None
+        repository_path = host_container.get("repository_cgroup_path")
+        if not isinstance(repository_path, str) or not repository_path.startswith("/sys/fs/cgroup/"):
+            failures.append(f"{name} host container observation omitted the canonical repository cgroup path")
+            return None
+        repository_cgroup = pathlib.Path(repository_path)
+        scope_path = repository_cgroup / "nawabari" / scope
+        try:
+            if any(path.is_symlink() for path in (repository_cgroup, repository_cgroup / "nawabari", scope_path)):
+                raise RuntimeError("host repository/session cgroup path contains a symlink")
+            if not scope_path.is_dir():
+                raise RuntimeError("owner-identified session cgroup directory is absent from the host kernel hierarchy")
+            chain = read_host_cgroup_chain(scope_path)
+            leaf_values = chain[-1].get("values")
+            if not isinstance(leaf_values, dict):
+                raise RuntimeError("host kernel did not expose the exact session cgroup controllers")
+            cgroup_events = read_bounded_text(scope_path / "cgroup.events", 4 * 1024)
+            cgroup_procs_text = read_bounded_text(scope_path / "cgroup.procs", 64 * 1024)
+            host_pids = [int(line) for line in cgroup_procs_text.splitlines() if line.isdigit()]
+            if len(host_pids) != len(cgroup_procs_text.splitlines()) or not host_pids:
+                raise RuntimeError("host session cgroup did not expose a bounded non-empty process list")
+            event_map = {
+                key: value
+                for line in cgroup_events.splitlines()
+                if len((parts := line.split())) == 2
+                for key, value in [parts]
+            }
+            if event_map.get("populated") != "1":
+                raise RuntimeError("host kernel did not observe the exact owner session cgroup populated")
+            host_pid = host_container.get("host_init_pid")
+            expected_starttime = host_container.get("host_init_starttime")
+            expected_cgroup = host_container.get("proc_cgroup", "").removeprefix("0::")
+            if (
+                not isinstance(host_pid, int)
+                or proc_starttime(host_pid) != expected_starttime
+                or proc_unified_cgroup(host_pid) != expected_cgroup
+            ):
+                raise RuntimeError("container init identity changed during session cgroup observation")
+        except (OSError, RuntimeError, ValueError) as error:
+            failures.append(f"{name} host owner cgroup observation unavailable: {error}")
+            return None
+        limits, invalid_values = parse_cgroup_limits(chain)
+        result = {
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "container_cgroup_root": root,
+            "host_repository_cgroup_path": repository_path,
+            "scope": scope,
+            "host_scope_path": str(scope_path),
+            "host_scope_population": {
+                "state": "populated",
+                "process_count": len(host_pids),
+                "host_process_ids": host_pids,
+                "events": cgroup_events,
+            },
+            "chain": chain,
+            "observed_session_scope_values": leaf_values,
+            "effective_physical_limits": limits,
+            "invalid_or_unobserved_controllers": invalid_values,
+        }
+        (evidence / f"{name}-owned-cgroup-limits.json").write_text(json.dumps(result, indent=2) + "\n")
+        if (
+            invalid_values
+            or limits["cpu"] is None
+            or limits["cpu"]["cores"] > 1.0
+            or limits["memory_bytes"] is None
+            or limits["memory_bytes"] > 536_870_912
+            or limits["pids"] is None
+            or limits["pids"] > 128
+        ):
+            failures.append(f"{name} could not prove the bounded host ancestor/session cgroup limits")
+        return result
+
+    def active_cgroup(document: dict) -> bool:
+        processes = document.get("processes")
+        return isinstance(processes, list) and any(
+            isinstance(item, dict)
+            and isinstance(item.get("cgroups"), dict)
+            and item["cgroups"].get("state") == "active"
+            and isinstance(item["cgroups"].get("cgroups"), dict)
+            and isinstance(item["cgroups"]["cgroups"].get("population"), dict)
+            and item["cgroups"]["cgroups"]["population"].get("state") == "populated"
+            for item in processes
+        )
+
+    def populated_execution_count(document: dict) -> int:
+        processes = document.get("processes")
+        if not isinstance(processes, list):
+            return 0
+        return sum(
+            1
+            for item in processes
+            if isinstance(item, dict)
+            and isinstance(item.get("cgroups"), dict)
+            and item["cgroups"].get("state") == "active"
+            and isinstance(item["cgroups"].get("cgroups"), dict)
+            and isinstance(item["cgroups"]["cgroups"].get("population"), dict)
+            and item["cgroups"]["cgroups"]["population"].get("state") == "populated"
+        )
+
+    def wait_active(name: str, session_id: str, process: subprocess.Popen[bytes]) -> dict | None:
+        deadline = time.monotonic() + args.timeout_seconds
+        latest: dict | None = None
+        attempt = 0
+        while time.monotonic() < deadline and process.poll() is None:
+            attempt += 1
+            try:
+                latest = process_snapshot(f"{name}-processes-{attempt:02d}", session_id)
+                if active_cgroup(latest):
+                    return latest
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                failures.append(f"{name} process observation: {error}")
+            time.sleep(0.5)
+        return latest
+
+    def wait_for_started_payload(
+        name: str,
+        session_id: str,
+        session_worktree: str,
+        process: subprocess.Popen[bytes],
+        marker_path: str,
+        nonce: str,
+        host_container: dict | None,
+    ) -> tuple[dict, dict] | None:
+        """Require a payload-written nonce and matching host PIDs before cancellation."""
+        if not isinstance(host_container, dict):
+            failures.append(f"{name} has no host-observed container identity for process correlation")
+            return None
+        deadline = time.monotonic() + max(5, min(args.timeout_seconds, 30))
+        marker_reader = (
+            "const fs=require('node:fs');let out;try{const raw=fs.readFileSync(process.argv[1],'utf8');"
+            "out={state:'observed',marker:JSON.parse(raw)}}catch(e){out={state:e&&e.code==='ENOENT'?'absent':'unreadable'};}"
+            "process.stdout.write(JSON.stringify(out)+'\\n');"
+        )
+        selected_prefix = [
+            args.podman_wrapper,
+            "exec",
+            "--workdir",
+            session_worktree,
+            args.container_id,
+            *env,
+        ]
+        marker_observation: dict | None = None
+        owner_observation: dict | None = None
+        attempt = 0
+        while time.monotonic() < deadline and process.poll() is None:
+            attempt += 1
+            owner_observation = process_snapshot(f"{name}-processes-before-cancel-{attempt:02d}", session_id)
+            marker_result = subprocess.run(
+                [*selected_prefix, "node", "-e", marker_reader, marker_path],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            save(f"{name}-payload-marker-{attempt:02d}.stdout", marker_result.stdout)
+            save(f"{name}-payload-marker-{attempt:02d}.stderr", marker_result.stderr)
+            try:
+                parsed_marker_observation = json.loads(marker_result.stdout)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                parsed_marker_observation = None
+            if isinstance(parsed_marker_observation, dict):
+                marker_observation = parsed_marker_observation
+            marker = marker_observation.get("marker") if isinstance(marker_observation, dict) else None
+            if (
+                marker_result.returncode == 0
+                and isinstance(marker_observation, dict)
+                and marker_observation.get("state") == "observed"
+                and isinstance(marker, dict)
+                and marker.get("nonce") == nonce
+                and isinstance(marker.get("parent"), int)
+                and not isinstance(marker.get("parent"), bool)
+                and isinstance(marker.get("child"), int)
+                and not isinstance(marker.get("child"), bool)
+                and marker.get("parent") > 0
+                and marker.get("child") > 0
+                and marker.get("parent") != marker.get("child")
+            ):
+                processes = owner_observation.get("processes")
+                active_records = [
+                    item
+                    for item in processes
+                    if isinstance(item, dict)
+                    and isinstance(item.get("execution"), dict)
+                    and item["execution"].get("session_id") == session_id
+                    and item["execution"].get("state") == "attached"
+                    and isinstance(item.get("cgroups"), dict)
+                    and item["cgroups"].get("state") == "active"
+                    and isinstance(item["cgroups"].get("cgroups"), dict)
+                    and item["cgroups"]["cgroups"].get("population", {}).get("state") == "populated"
+                ] if isinstance(processes, list) else []
+                if len(active_records) == 1:
+                    scope_document = observe_owned_cgroup_limits(
+                        f"{name}-active-before-cancel",
+                        owner_observation,
+                        session_id,
+                        host_container,
+                    )
+                    if isinstance(scope_document, dict):
+                        observed_processes = []
+                        for host_pid in scope_document["host_scope_population"]["host_process_ids"]:
+                            observed = observe_host_process(host_pid)
+                            if observed is not None:
+                                observed_processes.append(observed)
+                        inner_to_host = {}
+                        for inner_pid in (marker["parent"], marker["child"]):
+                            matches = [
+                                item
+                                for item in observed_processes
+                                if item["namespace_pids_outer_to_inner"][-1] == inner_pid
+                            ]
+                            if len(matches) == 1:
+                                inner_to_host[inner_pid] = matches[0]
+                        parent = inner_to_host.get(marker["parent"])
+                        child = inner_to_host.get(marker["child"])
+                        expected_scope = scope_document.get("host_scope_path")
+                        if not isinstance(expected_scope, str) or not expected_scope.startswith("/sys/fs/cgroup/"):
+                            time.sleep(0.5)
+                            continue
+                        expected_cgroup = "/" + pathlib.Path(expected_scope).relative_to("/sys/fs/cgroup").as_posix()
+                        if (
+                            isinstance(parent, dict)
+                            and isinstance(child, dict)
+                            and parent.get("host_pid") != child.get("host_pid")
+                            and child.get("host_parent_pid") == parent.get("host_pid")
+                            and parent.get("pid_namespace") == child.get("pid_namespace")
+                            and parent.get("pid_namespace") != host_container.get("pid_namespace")
+                            and parent.get("cgroup") == expected_cgroup
+                            and child.get("cgroup") == parent.get("cgroup")
+                            and parent.get("executable_basename") == "node"
+                            and child.get("executable_basename") == "node"
+                        ):
+                            result = {
+                                "session_id": session_id,
+                                "execution_id": active_records[0]["execution"].get("execution_id"),
+                                "payload_marker": marker,
+                                "marker_path": marker_path,
+                                "host_scope_path": expected_scope,
+                                "host_scope_population": scope_document["host_scope_population"],
+                                "payload_parent": parent,
+                                "payload_child": child,
+                                "all_scope_processes": observed_processes,
+                                "container_pid_namespace": host_container.get("pid_namespace"),
+                                "payload_pid_namespace": parent["pid_namespace"],
+                                "namespace_distinct_from_container": True,
+                                "observed_at_unix": time.time(),
+                            }
+                            (evidence / f"{name}-payload-processes-before-cancel.json").write_text(
+                                json.dumps(result, indent=2) + "\n"
+                            )
+                            return owner_observation, result
+            time.sleep(0.5)
+        if isinstance(marker_observation, dict):
+            (evidence / f"{name}-last-payload-marker-observation.json").write_text(
+                json.dumps(marker_observation, indent=2) + "\n"
+            )
+        return None
+
+    def wait_for_owner_scope_empty(
+        name: str,
+        session_id: str,
+        execution_id: str,
+        owner_scope: str,
+        pid_namespace: str,
+        known_payload_processes: list[dict],
+    ) -> dict:
+        """Wait for exact owner scope and payload PIDs; scan the namespace diagnostically once."""
+        deadline = time.monotonic() + 20
+        scope_path = pathlib.Path(owner_scope)
+        cgroup_samples = []
+        known_process_samples = []
+        process_snapshot_doc = None
+        owner_empty_observations = 0
+        host_empty_observations = 0
+        payload_gone_observations = 0
+        owner_record = None
+        latest_known_processes = []
+        while time.monotonic() < deadline:
+            process_result, process_snapshot_doc = invoke(
+                f"{name}-processes-after-close-{len(cgroup_samples) + 1:02d}",
+                ["session", "processes", "--session", session_id],
+                15,
+            )
+            processes = process_snapshot_doc.get("processes") if isinstance(process_snapshot_doc, dict) else None
+            matches = [
+                item
+                for item in processes
+                if isinstance(item, dict)
+                and isinstance(item.get("execution"), dict)
+                and item["execution"].get("execution_id") == execution_id
+                and item["execution"].get("session_id") == session_id
+            ] if isinstance(processes, list) else []
+            if process_result.returncode == 0 and len(matches) == 1:
+                owner_record = matches[0]
+                cgroups = owner_record.get("cgroups")
+                nested_cgroups = cgroups.get("cgroups") if isinstance(cgroups, dict) else None
+                exact_scope = nested_cgroups.get("scope") if isinstance(nested_cgroups, dict) else None
+                if exact_scope == scope_path.name and isinstance(cgroups, dict) and cgroups.get("state") == "empty":
+                    owner_empty_observations += 1
+                else:
+                    owner_empty_observations = 0
+            else:
+                owner_empty_observations = 0
+
+            try:
+                cgroup_snapshot = observe_host_scope_population(scope_path)
+            except (OSError, RuntimeError, ValueError) as error:
+                cgroup_snapshot = {
+                    "scope_path": str(scope_path),
+                    "state": "unknown",
+                    "error": f"{type(error).__name__}: {error}",
+                    "observed_at_unix": time.time(),
+                }
+            cgroup_samples.append(cgroup_snapshot)
+            latest_known_processes = observe_known_payload_processes(known_payload_processes)
+            known_process_samples.append(latest_known_processes)
+            if cgroup_snapshot.get("state") == "empty":
+                host_empty_observations += 1
+            else:
+                host_empty_observations = 0
+            if latest_known_processes and all(
+                item.get("state") in ("absent", "identity-reused")
+                for item in latest_known_processes
+            ):
+                payload_gone_observations += 1
+            else:
+                payload_gone_observations = 0
+            if owned_cancel_scope_observed(
+                owner_empty_observations,
+                host_empty_observations,
+                payload_gone_observations,
+            ):
+                break
+            time.sleep(0.25)
+
+        try:
+            namespace_snapshot = observe_pid_namespace_members(pid_namespace)
+        except (OSError, RuntimeError, ValueError) as error:
+            namespace_snapshot = {
+                "pid_namespace": pid_namespace,
+                "state": "unknown",
+                "members": [],
+                "unobservable": [{"reason": type(error).__name__}],
+                "observed_at_unix": time.time(),
+            }
+        payload_process_state = (
+            "observed-gone"
+            if payload_gone_observations >= 1
+            else "present"
+            if any(item.get("state") == "present" for item in latest_known_processes)
+            else "unknown"
+        )
+        result = {
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "owner_scope_path": str(scope_path),
+            "pid_namespace": pid_namespace,
+            "owner_record": owner_record,
+            "owner_cgroup_state": "empty" if owner_empty_observations >= 2 else "unknown",
+            "host_cgroup_state": "empty" if host_empty_observations >= 2 else "unknown",
+            "known_payload_processes_state": payload_process_state,
+            "known_payload_processes": latest_known_processes,
+            "owner_empty_observations": owner_empty_observations,
+            "host_empty_observations": host_empty_observations,
+            "known_payload_gone_observations": payload_gone_observations,
+            "pid_namespace_state": namespace_snapshot.get("state", "unknown"),
+            "pid_namespace_observation": namespace_snapshot,
+            "host_cgroup_samples": cgroup_samples,
+            "known_payload_process_samples": known_process_samples,
+            "observed_at_unix": time.time(),
+        }
+        (evidence / f"{name}-physical-cleanup.json").write_text(json.dumps(result, indent=2) + "\n")
+        return result
+
+    try:
+        container_state = subprocess.run(
+            [args.podman_wrapper, "inspect", "--format", "{{.State.Running}}", args.container_id],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save("container-running-before.stdout", container_state.stdout)
+        save("container-running-before.stderr", container_state.stderr)
+        if container_state.returncode != 0 or container_state.stdout.strip() != b"true":
+            raise RuntimeError("selected repository OCI container is not observed running")
+        engine_resources = inspect_engine_resources()
+        container_host_cgroup = observe_host_container_cgroup(engine_resources)
+
+        target_show = invoke_ok("target-session-before-proof", ["session", "show", "--session", args.session])
+        drain_probe_show = invoke_ok(
+            "drain-probe-session-before-proof", ["session", "show", "--session", args.drain_probe_session]
+        )
+        sibling_show = invoke_ok("sibling-session-before-proof", ["session", "show", "--session", args.sibling_session])
+        target_session = recursively_find(target_show, "session")
+        drain_probe_session = recursively_find(drain_probe_show, "session")
+        sibling_session = recursively_find(sibling_show, "session")
+        if not isinstance(target_session, dict) and isinstance(target_show.get("session_id"), str):
+            target_session = target_show
+        if not isinstance(drain_probe_session, dict) and isinstance(drain_probe_show.get("session_id"), str):
+            drain_probe_session = drain_probe_show
+        if not isinstance(sibling_session, dict) and isinstance(sibling_show.get("session_id"), str):
+            sibling_session = sibling_show
+        if isinstance(target_session, dict) and target_session.get("state") == "closed":
+            target = create_fresh_target("target")
+            session_manifest["target"] = target
+            target_session = target["session"]
+            args.session = target_session.get("session_id")
+            target_worktree = target_session.get("worktree")
+            (evidence / "fresh-target-creation.json").write_text(json.dumps(target, indent=2) + "\n")
+        if not isinstance(target_session, dict) or target_session.get("state") != "active":
+            raise RuntimeError("target public session is not observed active")
+        if isinstance(drain_probe_session, dict) and drain_probe_session.get("state") == "closed":
+            drain_probe = create_fresh_drain_probe()
+            session_manifest["drain_probe"] = drain_probe
+            drain_probe_session = drain_probe["session"]
+            args.drain_probe_session = drain_probe_session.get("session_id")
+            drain_probe_worktree = drain_probe_session.get("worktree")
+            (evidence / "fresh-drain-probe-creation.json").write_text(json.dumps(drain_probe, indent=2) + "\n")
+        if not isinstance(drain_probe_session, dict) or drain_probe_session.get("state") != "active":
+            raise RuntimeError("zero-execution drain probe session is not observed active before its close test")
+        if not isinstance(sibling_session, dict) or sibling_session.get("state") != "active":
+            raise RuntimeError("sibling public session is not observed active")
+        active_ids = {
+            target_session.get("session_id"),
+            drain_probe_session.get("session_id"),
+            sibling_session.get("session_id"),
+        }
+        active_worktrees = {
+            target_session.get("worktree"),
+            drain_probe_session.get("worktree"),
+            sibling_session.get("worktree"),
+        }
+        if (
+            len(active_ids) != 3
+            or None in active_ids
+            or len(active_worktrees) != 3
+            or None in active_worktrees
+            or target_session.get("worktree") != target_worktree
+            or drain_probe_session.get("worktree") != drain_probe_worktree
+            or sibling_session.get("worktree") != sibling_worktree
+        ):
+            raise RuntimeError("public session owner records differ from the preparation manifest")
+
+        effective_manifest = {
+            "source_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "target_session_id": args.session,
+            "target_worktree": target_worktree,
+            "drain_probe_session_id": args.drain_probe_session,
+            "drain_probe_worktree": drain_probe_worktree,
+            "sibling_session_id": args.sibling_session,
+            "sibling_worktree": sibling_worktree,
+            "repository_base_revision": session_manifest.get("repository_head_after"),
+            "package_sha256": args.package_sha256,
+        }
+        (evidence / "effective-session-identities.json").write_text(json.dumps(effective_manifest, indent=2) + "\n")
+
+        claims = invoke_ok("target-claims-before-reset", ["session", "claims", "--session", args.session]).get("claims")
+        if not isinstance(claims, list):
+            raise RuntimeError("target public session claims response omitted claims")
+        normalized_claims = {
+            (item.get("resource"), item.get("mode"))
+            for item in claims
+            if isinstance(item, dict)
+        }
+        expected_claims = {("README.md", "read"), (owned_file, "write")}
+        if normalized_claims != expected_claims:
+            current_snapshot = invoke_ok(
+                "target-snapshot-before-claim-reset", ["verification", "snapshot", "--session", args.session]
+            ).get("snapshot")
+            generation = (
+                current_snapshot.get("filesystem_policy_token", {}).get("claim_set_generation")
+                if isinstance(current_snapshot, dict)
+                else None
+            )
+            if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+                raise RuntimeError("could not bind target claim reset to a current owner generation")
+            reset_result, reset_doc = invoke(
+                "target-claims-reset-to-pretest-baseline",
+                [
+                    "session",
+                    "update",
+                    "--session",
+                    args.session,
+                    "--resource",
+                    "README.md",
+                    "--mode",
+                    "read",
+                    "--resource",
+                    owned_file,
+                    "--mode",
+                    "write",
+                    "--if-generation",
+                    str(generation),
+                ],
+                30,
+            )
+            if reset_result.returncode != 0 or not isinstance(reset_doc, dict) or reset_doc.get("ok") is not True:
+                raise RuntimeError("could not CAS-reset the disposable target to its original exact claim set")
+            claims = invoke_ok(
+                "target-initial-claims", ["session", "claims", "--session", args.session]
+            ).get("claims")
+            if not isinstance(claims, list):
+                raise RuntimeError("target public session claims response omitted claims after reset")
+            normalized_claims = {
+                (item.get("resource"), item.get("mode"))
+                for item in claims
+                if isinstance(item, dict)
+            }
+        if normalized_claims != expected_claims:
+            raise RuntimeError("target did not return to its exact README-read and fixture-write baseline")
+        save("target-initial-claims-normalized.json", json.dumps(sorted([list(item) for item in normalized_claims]), indent=2).encode() + b"\n")
+
+        (evidence / "run-identity.json").write_text(
+            json.dumps(
+                {
+                    **effective_manifest,
+                    "sessions_manifest_sha256": effective_manifest["source_manifest_sha256"],
+                    "installed_proof": installed_proof,
+                    "started_at_unix": time.time(),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        proof_target_session_id = args.session
+
+        drain_claims = invoke_ok(
+            "drain-probe-initial-claims", ["session", "claims", "--session", args.drain_probe_session]
+        ).get("claims")
+        if not isinstance(drain_claims, list) or not any(
+            isinstance(item, dict) and item.get("resource") == "README.md" and item.get("mode") == "read"
+            for item in drain_claims
+        ):
+            failures.append("zero-execution drain probe did not retain its atomic README read claim")
+        save("drain-probe-initial-claims.json", json.dumps(drain_claims, indent=2).encode() + b"\n")
+
+        sentinel_id = uuid.uuid4().hex
+        boundary_paths = {
+            "outer_oci_root": f"/root/nawabari-n1-outer-root-{sentinel_id}",
+            "peer_worktree": f"{sibling_worktree}/nawabari-n1-peer-sentinel-{sentinel_id}",
+            "control_store": f"{args.repository}/.git/nawabari/session-registry.json",
+            "secret": f"/run/nawabari-n1-secret-{sentinel_id}",
+        }
+        boundary_setup = (
+            "const fs=require('node:fs');const p=JSON.parse(process.argv[1]);"
+            "fs.writeFileSync(p.outer_oci_root,'N1_OUTER_OCI_ROOT_SENTINEL\\n',{mode:0o600});"
+            "fs.writeFileSync(p.peer_worktree,'N1_PEER_WORKTREE_SENTINEL\\n',{mode:0o600});"
+            "fs.writeFileSync(p.secret,'N1_SECRET_SENTINEL\\n',{mode:0o600});"
+            "const out={};for(const [name,path] of Object.entries(p)){const stat=fs.statSync(path);"
+            "out[name]={path,size:stat.size,mode:stat.mode};}process.stdout.write(JSON.stringify(out)+'\\n');"
+        )
+        setup = subprocess.run(
+            [*prefix, "node", "-e", boundary_setup, json.dumps(boundary_paths)],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save("boundary-sentinel-setup.stdout", setup.stdout)
+        save("boundary-sentinel-setup.stderr", setup.stderr)
+        if setup.returncode != 0:
+            raise RuntimeError("could not establish existing OCI/peer/control/secret sentinels for the strict boundary proof")
+        try:
+            sentinel_observation = json.loads(setup.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("sentinel setup did not return a parseable existence observation") from error
+        if not isinstance(sentinel_observation, dict) or set(sentinel_observation) != set(boundary_paths):
+            raise RuntimeError("sentinel setup did not observe every requested boundary path")
+        (evidence / "boundary-sentinel-paths.json").write_text(json.dumps(sentinel_observation, indent=2) + "\n")
+
+        # Preserve an actually running strict sibling while the separate
+        # cancellation probe is closed. Both payloads are finite if owner
+        # cancellation fails.
+        sibling, _, _ = launch_persistent("sibling-strict-run", args.sibling_session, sibling_worktree)
+        sibling_active = wait_active("sibling", args.sibling_session, sibling)
+        sibling_cgroup_limits = None
+        if sibling_active is None or not active_cgroup(sibling_active):
+            failures.append("sibling strict execution never exposed an active observed owned cgroup")
+        else:
+            sibling_cgroup_limits = observe_owned_cgroup_limits(
+                "sibling-active", sibling_active, args.sibling_session, container_host_cgroup
+            )
+
+        drain_before = process_snapshot("drain-probe-processes-before-close", args.drain_probe_session)
+        if execution_ids(drain_before):
+            failures.append("zero-execution drain probe unexpectedly had a recorded payload before close")
+        sibling_execution_ids_before_drain = execution_ids(sibling_active) if isinstance(sibling_active, dict) else []
+        sibling_active_ids_before_drain = active_execution_ids(sibling_active or {})
+        if len(sibling_active_ids_before_drain) != 1 or not active_cgroup(sibling_active or {}):
+            failures.append("could not bind zero-record close test to one observed populated sibling execution")
+        drain_close, drain_close_doc = invoke(
+            "drain-probe-close-wait",
+            ["session", "close", "--session", args.drain_probe_session, "--drain-policy", "wait"],
+            30,
+        )
+        if drain_close.returncode != 0 or not isinstance(drain_close_doc, dict) or drain_close_doc.get("ok") is not True:
+            failures.append(
+                f"zero-record session did not close against the observed live sibling scope (exit={drain_close.returncode}, code={drain_close_doc.get('code') if isinstance(drain_close_doc, dict) else 'unparseable'})"
+            )
+        else:
+            drained_session = recursively_find(drain_close_doc, "session")
+            if not isinstance(drained_session, dict) or drained_session.get("state") != "closed":
+                failures.append("zero-record drain close returned success without observing the probe session closed")
+        sibling_after_drain = process_snapshot("sibling-processes-after-zero-record-close", args.sibling_session)
+        sibling_execution_ids_after_drain = execution_ids(sibling_after_drain)
+        if not active_cgroup(sibling_after_drain) or sibling_execution_ids_after_drain != sibling_execution_ids_before_drain:
+            failures.append("zero-record close did not preserve the exact populated sibling execution")
+        save(
+            "zero-record-close-sibling-preservation.json",
+            json.dumps(
+                {
+                    "drain_probe_execution_ids_before": execution_ids(drain_before),
+                    "sibling_execution_ids_before": sibling_execution_ids_before_drain,
+                    "sibling_active_execution_ids_before": sibling_active_ids_before_drain,
+                    "sibling_execution_ids_after": sibling_execution_ids_after_drain,
+                    "sibling_active_execution_ids_after": active_execution_ids(sibling_after_drain),
+                    "sibling_active_before": active_cgroup(sibling_active or {}),
+                    "sibling_active_after": active_cgroup(sibling_after_drain),
+                    "drain_close_return_code": drain_close.returncode,
+                    "drain_close_response": drain_close_doc,
+                },
+                indent=2,
+            ).encode()
+            + b"\n",
+        )
+        drain_final = invoke_ok(
+            "drain-probe-show-closed", ["session", "show", "--session", args.drain_probe_session]
+        )
+        drain_final_record = recursively_find(drain_final, "session")
+        if not isinstance(drain_final_record, dict) and isinstance(drain_final.get("session_id"), str):
+            drain_final_record = drain_final
+        if not isinstance(drain_final_record, dict) or drain_final_record.get("state") != "closed":
+            failures.append("zero-record drain probe did not remain owner-observed closed after preserving the sibling")
+
+        boundary_source = (
+            "const fs=require('node:fs'),cp=require('node:child_process'),assert=require('node:assert/strict'),crypto=require('node:crypto');"
+            "const [owned,outerRoot,peer,control,secret]=process.argv.slice(1);"
+            "assert.ok(fs.readFileSync('README.md','utf8').length>0,'bounded README read failed');"
+            "const marker='OCI_NAWABARI_N1_OWNED_WRITE_'+process.pid+'\\n';"
+            "fs.writeFileSync(owned,marker);"
+            "assert.equal(fs.readFileSync(owned,'utf8'),marker,'protected payload could not read back its own write');"
+            "const gitVersion=cp.spawnSync('git',['--version'],{encoding:'utf8'});"
+            "assert.equal(gitVersion.status,0,gitVersion.stderr);"
+            "const gitMetadata=cp.spawnSync('git',['rev-parse','--show-toplevel'],{encoding:'utf8'});"
+            "assert.notEqual(gitMetadata.status,0,'strict payload unexpectedly accessed repository Git metadata');"
+            "const probes={outer_oci_root:outerRoot,peer_worktree:peer,control_store:control,secret};"
+            "const denials={};for(const [name,path] of Object.entries(probes)){let code=null;try{fs.readFileSync(path)}"
+            "catch(error){code=error.code||error.name}assert.ok(code,`strict boundary exposed ${name}`);denials[name]={denied:true,code};}"
+            "const report={read:'README.md',write:owned,write_sha256:crypto.createHash('sha256').update(marker).digest('hex'),"
+            "git_executable:gitVersion.stdout.trim(),git_metadata_denied:{status:gitMetadata.status,stderr:gitMetadata.stderr.trim()},denials};"
+            "process.stdout.write(JSON.stringify(report)+'\\n');"
+        )
+        if args.reuse_positive_evidence:
+            prior_evidence = pathlib.Path(args.reuse_positive_evidence)
+            try:
+                prior_result_bytes = (prior_evidence / "target-strict-boundary-run.stdout").read_bytes()
+                prior_result = json.loads(prior_result_bytes)
+                prior_identity = json.loads((prior_evidence / "run-identity.json").read_text())
+                prior_argv = (prior_evidence / "target-strict-boundary-run.argv.json").read_bytes()
+                prior_stderr = (prior_evidence / "target-strict-boundary-run.stderr").read_bytes()
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError(f"could not load the prior successful strict-boundary receipt: {error}") from error
+            prior_physical = prior_result.get("physical_execution") if isinstance(prior_result, dict) else None
+            prior_cleanup = prior_physical.get("cleanup") if isinstance(prior_physical, dict) else None
+            if (
+                not isinstance(prior_identity, dict)
+                or not isinstance(prior_result, dict)
+                or not isinstance(prior_physical, dict)
+                or not isinstance(prior_cleanup, dict)
+                or prior_identity.get("package_sha256") != args.package_sha256
+                or prior_identity.get("target_session_id") != args.session
+                or prior_result.get("ok") is not True
+                or prior_result.get("exit_code") != 0
+                or prior_result.get("session_id") != args.session
+                or prior_result.get("execution_id") != prior_physical.get("correlation_id")
+                or prior_cleanup.get("state") != "observed-empty"
+            ):
+                raise RuntimeError("prior boundary evidence is not a successful, cleaned run for this exact package and session")
+            boundary_result = prior_result
+            boundary_returncode = 0
+            save("target-strict-boundary-run.stdout", prior_result_bytes)
+            save("target-strict-boundary-run.stderr", prior_stderr)
+            save("target-strict-boundary-run.argv.json", prior_argv)
+            save(
+                "target-strict-boundary-run-reused-from.json",
+                json.dumps(
+                    {
+                        "evidence_directory": str(prior_evidence),
+                        "execution_id": prior_result.get("execution_id"),
+                        "package_sha256": args.package_sha256,
+                        "started_again": False,
+                    },
+                    indent=2,
+                ).encode()
+                + b"\n",
+            )
+        else:
+            boundary_run, boundary_result = invoke(
+                "target-strict-boundary-run",
+                [
+                    "session",
+                    "run",
+                    "--session",
+                    args.session,
+                    "--runtime-policy",
+                    "strict",
+                    "--",
+                    "node",
+                    "-e",
+                    boundary_source,
+                    owned_file,
+                    boundary_paths["outer_oci_root"],
+                    boundary_paths["peer_worktree"],
+                    boundary_paths["control_store"],
+                    boundary_paths["secret"],
+                ],
+                90,
+                target_worktree,
+            )
+            boundary_returncode = boundary_run.returncode
+        session_network_mode = boundary_result.get("network_mode") if isinstance(boundary_result, dict) else None
+        if session_network_mode != "inherited":
+            failures.append("strict target session did not preserve its owner-observed inherited network mode")
+        network_isolation = {
+            "container_engine_configuration": engine_resources,
+            "host_kernel_container_observation": container_host_cgroup,
+            "session_network_mode": session_network_mode,
+            "effective_network_mode": (
+                "none" if engine_resources.get("network_mode") == "none"
+                and isinstance(container_host_cgroup, dict)
+                and container_host_cgroup.get("network_namespace_distinct_from_caller") is True
+                and container_host_cgroup.get("network_observation", {}).get("only_loopback_observed") is True
+                and session_network_mode == "inherited"
+                else "unknown"
+            ),
+        }
+        (evidence / "network-isolation-observation.json").write_text(json.dumps(network_isolation, indent=2) + "\n")
+        if network_isolation["effective_network_mode"] != "none":
+            failures.append("network isolation was not jointly observed through OCI configuration, host net namespace, and session inheritance")
+        if boundary_returncode != 0 or not isinstance(boundary_result, dict) or boundary_result.get("ok") is not True:
+            failures.append(f"strict current-session read/write/boundary payload failed (exit={boundary_returncode})")
+        checkpoint_result = invoke(
+            "target-checkpoint-after-protected-write",
+            ["checkpoint", "--session", args.session],
+            30,
+            target_worktree,
+        )
+        if checkpoint_result[0].returncode != 0 or not isinstance(checkpoint_result[1], dict) or checkpoint_result[1].get("ok") is not True:
+            failures.append("public owner checkpoint did not complete after the protected write")
+            checkpoint_doc = None
+        else:
+            checkpoint_doc = checkpoint_result[1]
+            checkpoint_paths = checkpoint_doc.get("paths")
+            changed = checkpoint_paths.get("changed") if isinstance(checkpoint_paths, dict) else None
+            in_claim = checkpoint_doc.get("in_claim")
+            if (
+                checkpoint_doc.get("session_id") != args.session
+                or checkpoint_doc.get("worktree") != target_worktree
+                or not isinstance(changed, list)
+                or owned_file not in changed
+                or not isinstance(in_claim, list)
+                or owned_file not in in_claim
+            ):
+                failures.append("public owner checkpoint did not observe the protected write under its exact session claim")
+        (evidence / "target-owner-checkpoint-summary.json").write_text(
+            json.dumps(checkpoint_doc, indent=2) if checkpoint_doc is not None else "null"
+        )
+        boundary_physical = recursively_find(boundary_result, "physical_execution") if isinstance(boundary_result, dict) else None
+        if not isinstance(boundary_physical, dict):
+            failures.append("strict boundary run omitted physical execution evidence")
+        else:
+            if boundary_physical.get("procfs", {}).get("mode") != "denied":
+                failures.append("strict boundary run did not record the selected inherited-masked procfs topology")
+            start = boundary_physical.get("start", {})
+            namespaces = start.get("namespaces", {}) if isinstance(start, dict) else {}
+            if not isinstance(start, dict) or start.get("state") != "observed" or any(
+                not isinstance(namespaces.get(name), dict)
+                or namespaces[name].get("state") != "observed"
+                or namespaces[name].get("distinct_from_caller") is not True
+                for name in ("pid", "user", "mount", "ipc", "uts")
+            ):
+                failures.append("strict boundary run did not observe distinct PID/user/mount/IPC/UTS namespaces")
+            if boundary_physical.get("termination", {}).get("reason") != "exited":
+                failures.append("strict boundary run did not observe normal payload termination")
+            if boundary_physical.get("cleanup", {}).get("state") != "observed-empty":
+                failures.append("strict boundary run did not observe its PID namespace empty")
+        boundary_raw = recursively_find(boundary_result, "raw_output") if isinstance(boundary_result, dict) else None
+        boundary_report = None
+        boundary_streams = complete_raw_streams(boundary_raw)
+        if boundary_streams is None:
+            failures.append("strict boundary run did not preserve complete byte-faithful stdout/stderr")
+        else:
+            try:
+                boundary_stdout, _ = boundary_streams
+                boundary_report = json.loads(boundary_stdout)
+            except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                boundary_report = None
+            if not isinstance(boundary_report, dict):
+                failures.append("strict boundary payload output could not be decoded from the physical raw-output receipt")
+            else:
+                denials = boundary_report.get("denials")
+                if not isinstance(denials, dict) or set(denials) != {"outer_oci_root", "peer_worktree", "control_store", "secret"}:
+                    failures.append("strict boundary payload did not report all four explicit denial probes")
+                elif any(
+                    not isinstance(denials.get(name), dict)
+                    or denials[name].get("denied") is not True
+                    or not isinstance(denials[name].get("code"), str)
+                    for name in ("outer_oci_root", "peer_worktree", "control_store", "secret")
+                ):
+                    failures.append("strict boundary payload reported a sentinel read without an observed denial code")
+                if (
+                    boundary_report.get("write") != owned_file
+                    or not isinstance(boundary_report.get("write_sha256"), str)
+                    or boundary_report.get("git_executable", "").startswith("git version ") is not True
+                    or not isinstance(boundary_report.get("git_metadata_denied"), dict)
+                    or boundary_report["git_metadata_denied"].get("status") == 0
+                ):
+                    failures.append("strict payload did not prove its write/readback and the bounded Git metadata denial")
+        (evidence / "target-strict-boundary-summary.json").write_text(
+            json.dumps(
+                {"physical_execution": boundary_physical, "payload": boundary_report, "owner_checkpoint": checkpoint_doc},
+                indent=2,
+            )
+            + "\n"
+        )
+
+        target_before = process_snapshot("target-processes-before-stale-test", args.session)
+        stale_snapshot_doc = invoke_ok(
+            "target-verification-snapshot-stale",
+            ["verification", "snapshot", "--session", args.session],
+        )
+        stale_snapshot = stale_snapshot_doc.get("snapshot")
+        if not isinstance(stale_snapshot, dict):
+            raise RuntimeError("owner snapshot response omitted snapshot")
+
+        # Advance this disposable session's claim generation once with a
+        # known tracked path, then submit the pre-change snapshot exactly once.
+        claim_result, claim_doc = invoke(
+            "target-stale-trigger-claim",
+            ["session", "claim", "--session", args.session, "--resource", stale_trigger_file, "--mode", "read"],
+        )
+        if claim_result.returncode != 0 or not isinstance(claim_doc, dict) or claim_doc.get("ok") is not True:
+            raise RuntimeError("the single bounded public stale-trigger claim was not accepted")
+        fresh_snapshot = invoke_ok(
+            "target-verification-snapshot-after-claim",
+            ["verification", "snapshot", "--session", args.session],
+        ).get("snapshot")
+        stale_generation = stale_snapshot.get("filesystem_policy_token", {}).get("claim_set_generation")
+        candidate_generation = (
+            fresh_snapshot.get("filesystem_policy_token", {}).get("claim_set_generation")
+            if isinstance(fresh_snapshot, dict)
+            else None
+        )
+        if not isinstance(fresh_snapshot, dict) or candidate_generation == stale_generation:
+            raise RuntimeError("the single public claim did not advance the owner snapshot generation")
+
+        stale_profile = {
+            "contract_id": "nawabari.verification-profile.v1",
+            "schema_version": 1,
+            "profile_id": "physical-stale-snapshot-refusal",
+            "profile_version": "1",
+            "executable": "node",
+            "argv": ["-e", "process.stdout.write('STALE_SNAPSHOT_MUST_NOT_START\\n')"],
+            "cwd": stale_snapshot.get("worktree"),
+            "read_visibility": "declared",
+            "declared_read": ["README.md"],
+            "write_policy": "deny",
+            "timeout_ms": 5000,
+            "max_output_bytes": 8192,
+        }
+        stale_request = {
+            "contract_id": "nawabari.session-bound-verification.v1",
+            "schema_version": 1,
+            "session_id": args.session,
+            "snapshot": stale_snapshot,
+            "profile": stale_profile,
+        }
+        request_path = f"/tmp/nawabari-oci-proof-{uuid.uuid4()}.json"
+        write_script = "const fs=require('node:fs');fs.writeFileSync(process.argv[1],fs.readFileSync(0),{mode:0o600})"
+        writer = subprocess.run(
+            [args.podman_wrapper, "exec", "-i", args.container_id, *env, "node", "-e", write_script, request_path],
+            input=json.dumps(stale_request).encode(),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save("stale-request-write.stdout", writer.stdout)
+        save("stale-request-write.stderr", writer.stderr)
+        if writer.returncode != 0:
+            raise RuntimeError("could not write bounded stale-snapshot request")
+        stale_result, stale_doc = invoke(
+            "stale-verification-execution",
+            ["verification", "execute", "--request-file", request_path],
+            workdir=target_worktree,
+        )
+        after_stale = process_snapshot("target-processes-after-stale-test", args.session)
+        stale_code = stale_doc.get("code") if isinstance(stale_doc, dict) else None
+        if stale_result.returncode == 0 or stale_code != "STALE_REGISTRY":
+            failures.append(f"stale snapshot was not refused as STALE_REGISTRY (exit={stale_result.returncode}, code={stale_code})")
+        if execution_ids(target_before) != execution_ids(after_stale):
+            failures.append("stale snapshot attempt added or removed a durable execution record")
+        save("stale-snapshot-comparison.json", json.dumps({"before": execution_ids(target_before), "after": execution_ids(after_stale)}, indent=2).encode() + b"\n")
+
+        # Return to the exact original claim ceiling after the intentional
+        # stale-generation mutation. Otherwise the temporary stale-trigger
+        # read claim would exceed the session profile's filesystem ceiling.
+        reset_result, reset_doc = invoke(
+            "target-claims-reset-after-stale-test",
+            [
+                "session",
+                "update",
+                "--session",
+                args.session,
+                "--resource",
+                "README.md",
+                "--mode",
+                "read",
+                "--resource",
+                owned_file,
+                "--mode",
+                "write",
+                "--if-generation",
+                str(candidate_generation),
+            ],
+            30,
+        )
+        if reset_result.returncode != 0 or not isinstance(reset_doc, dict) or reset_doc.get("ok") is not True:
+            raise RuntimeError("could not CAS-restore the exact original target claim set after stale refusal")
+        reset_claims = invoke_ok(
+            "target-claims-after-stale-reset", ["session", "claims", "--session", args.session]
+        ).get("claims")
+        normalized_reset_claims = {
+            (item.get("resource"), item.get("mode")) for item in reset_claims if isinstance(item, dict)
+        } if isinstance(reset_claims, list) else set()
+        if normalized_reset_claims != {("README.md", "read"), (owned_file, "write")}:
+            raise RuntimeError("target claims did not return to the exact pretest read/write baseline")
+        timeout_snapshot = invoke_ok(
+            "target-verification-snapshot-after-stale-reset",
+            ["verification", "snapshot", "--session", args.session],
+        ).get("snapshot")
+        timeout_generation = (
+            timeout_snapshot.get("filesystem_policy_token", {}).get("claim_set_generation")
+            if isinstance(timeout_snapshot, dict)
+            else None
+        )
+        if (
+            not isinstance(timeout_snapshot, dict)
+            or timeout_snapshot.get("session_id") != args.session
+            or not isinstance(timeout_generation, int)
+            or isinstance(timeout_generation, bool)
+            or timeout_generation <= candidate_generation
+        ):
+            raise RuntimeError("the fresh post-reset verifier snapshot did not bind the restored owner claim generation")
+
+        timeout_profile = {
+            **stale_profile,
+            "profile_id": "physical-timeout-descendant-cleanup",
+            "argv": [
+                "-e",
+                "const {spawn}=require('node:child_process');spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});process.stdout.write('timeout-child-started\\n');setInterval(()=>{},1000)",
+            ],
+            "timeout_ms": 1500,
+            "max_output_bytes": 16384,
+        }
+        timeout_request = {
+            "contract_id": "nawabari.session-bound-verification.v1",
+            "schema_version": 1,
+            "session_id": args.session,
+            "snapshot": timeout_snapshot,
+            "profile": timeout_profile,
+        }
+        timeout_path = f"/tmp/nawabari-oci-proof-{uuid.uuid4()}.json"
+        writer = subprocess.run(
+            [args.podman_wrapper, "exec", "-i", args.container_id, *env, "node", "-e", write_script, timeout_path],
+            input=json.dumps(timeout_request).encode(),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save("timeout-request-write.stdout", writer.stdout)
+        save("timeout-request-write.stderr", writer.stderr)
+        if writer.returncode != 0:
+            raise RuntimeError("could not write bounded timeout request")
+        timeout_result, timeout_doc = invoke(
+            "timeout-verification-execution",
+            ["verification", "execute", "--request-file", timeout_path],
+            45,
+            target_worktree,
+        )
+        timeout_evidence = recursively_find(timeout_doc, "execution_evidence") if isinstance(timeout_doc, dict) else None
+        physical = timeout_evidence.get("physical_execution") if isinstance(timeout_evidence, dict) else None
+        if not isinstance(physical, dict):
+            failures.append(f"timeout receipt omitted physical execution evidence (exit={timeout_result.returncode})")
+        else:
+            if physical.get("termination", {}).get("reason") != "timeout":
+                failures.append("verifier timeout did not record termination.reason=timeout")
+            if physical.get("cleanup", {}).get("state") != "observed-empty":
+                failures.append("verifier timeout did not observe the PID namespace empty")
+            managed_execution = timeout_doc.get("managed_execution") if isinstance(timeout_doc, dict) else None
+            owned_execution = managed_execution.get("owned_execution") if isinstance(managed_execution, dict) else None
+            if not isinstance(owned_execution, dict) or owned_execution.get("state") != "empty":
+                failures.append("verifier timeout did not preserve observed-empty owner cgroup evidence")
+            timeout_raw = timeout_evidence.get("raw_output") if isinstance(timeout_evidence, dict) else None
+            timeout_streams = observed_raw_streams(timeout_raw)
+            if timeout_streams is None or b"timeout-child-started\n" not in timeout_streams[0]:
+                failures.append("verifier timeout did not preserve the observed byte-faithful start marker")
+            elif isinstance(timeout_raw, dict):
+                (evidence / "timeout-raw-output-observation.json").write_text(
+                    json.dumps(
+                        {
+                            "complete": timeout_raw.get("complete"),
+                            "truncated": timeout_raw.get("truncated"),
+                            "stdout_bytes": timeout_raw.get("stdout_bytes"),
+                            "observed_stdout_bytes": timeout_raw.get("observed_stdout_bytes"),
+                            "stderr_bytes": timeout_raw.get("stderr_bytes"),
+                            "observed_stderr_bytes": timeout_raw.get("observed_stderr_bytes"),
+                            "observed_marker": True,
+                            "verification_pass_claimed": False,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+
+        # Cancel the tested target itself after its successful positive and
+        # verifier checks. A dirty-worktree close preserves the target; the
+        # owner may decide how to reconcile it after this proof.
+        target_nonce = uuid.uuid4().hex
+        target_marker_path = str(pathlib.PurePosixPath(target_worktree) / owned_file)
+        target, _, _ = launch_persistent(
+            "target-strict-run",
+            args.session,
+            target_worktree,
+            (target_marker_path, target_nonce),
+        )
+        target_started = wait_for_started_payload(
+            "target",
+            args.session,
+            target_worktree,
+            target,
+            target_marker_path,
+            target_nonce,
+            container_host_cgroup,
+        )
+        target_cgroup_limits = None
+        close_completed = False
+        close_dirty_worktree = False
+        target_cgroup_empty = False
+        target_payload_processes_gone = False
+        target_cleanup = None
+        target_process_observation = None
+        expected_cancelled_execution = None
+        target_run_response_status = None
+        target_physical_receipt_present = False
+        replacement_session_id = None
+        if target_started is None:
+            failures.append(
+                "target cancellation was withheld because a payload-written nonce and matching live host parent/child were not observed in the exact owned cgroup"
+            )
+            try:
+                collect_process(target, "target-strict-run", 55)
+            except RuntimeError as error:
+                failures.append(str(error))
+        else:
+            target_process_observation, target_pre_cancel = target_started
+            expected_cancelled_execution = target_pre_cancel.get("execution_id")
+            scope_path = target_pre_cancel.get("host_scope_path")
+            pid_namespace = target_pre_cancel.get("payload_pid_namespace")
+            target_cgroup_limits_path = evidence / "target-active-before-cancel-owned-cgroup-limits.json"
+            if target_cgroup_limits_path.exists():
+                target_cgroup_limits = json.loads(target_cgroup_limits_path.read_text())
+            if (
+                not isinstance(expected_cancelled_execution, str)
+                or not isinstance(scope_path, str)
+                or not isinstance(pid_namespace, str)
+            ):
+                failures.append("pre-cancel live payload evidence omitted its exact execution/cgroup/PID namespace correlation")
+            (evidence / "target-before-public-cancel.json").write_text(
+                json.dumps(
+                    {
+                        "execution_id": expected_cancelled_execution,
+                        "session_id": proof_target_session_id,
+                        "payload_start_observed": True,
+                        "marker_nonce": target_nonce,
+                        "marker_path": target_marker_path,
+                        "parent_host_pid": target_pre_cancel["payload_parent"]["host_pid"],
+                        "child_host_pid": target_pre_cancel["payload_child"]["host_pid"],
+                        "host_scope_path": scope_path,
+                        "payload_pid_namespace": pid_namespace,
+                        "owner_snapshot": target_process_observation,
+                        "host_process_observation": target_pre_cancel,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            close_result, close_doc = invoke(
+                "target-close-terminate",
+                ["session", "close", "--session", args.session, "--drain-policy", "terminate"],
+                30,
+            )
+            if close_result.returncode != 0 or not isinstance(close_doc, dict) or close_doc.get("ok") is not True:
+                close_code = close_doc.get("code") if isinstance(close_doc, dict) else None
+                if close_code == "DIRTY_WORKTREE":
+                    # The owner correctly protects uncommitted work at close.
+                    # Preserve this result and use explicit discard only after
+                    # both physical cleanup authorities prove the payload gone.
+                    close_dirty_worktree = True
+                else:
+                    failures.append(
+                        f"public close termination did not complete (exit={close_result.returncode}, code={close_code or 'unparseable'})"
+                    )
+            else:
+                closed_session = recursively_find(close_doc, "session")
+                close_completed = isinstance(closed_session, dict) and closed_session.get("state") == "closed"
+                if not close_completed:
+                    failures.append("public close termination returned success without a closed selected session")
+            try:
+                collect_process(target, "target-strict-run", 55)
+            except RuntimeError as error:
+                failures.append(str(error))
+            target_doc = None
+            try:
+                target_doc = json.loads((evidence / "target-strict-run.stdout").read_bytes())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                pass
+            run_evidence = recursively_find(target_doc, "execution_evidence") if isinstance(target_doc, dict) else None
+            if run_evidence is None and isinstance(target_doc, dict):
+                run_evidence = recursively_find(target_doc, "physical_execution")
+            target_physical = run_evidence.get("physical_execution") if isinstance(run_evidence, dict) else None
+            target_physical_receipt_present = isinstance(target_physical, dict)
+            target_run_response_status = target_doc.get("details", {}).get("status") if isinstance(target_doc, dict) else None
+            if isinstance(target_physical, dict):
+                if target_physical.get("correlation_id") != expected_cancelled_execution:
+                    failures.append("cancelled run receipt did not match the exact live owner execution")
+                if target_physical.get("procfs", {}).get("mode") != "denied":
+                    failures.append("cancelled run receipt did not preserve the selected inherited-masked procfs topology")
+                if target_physical.get("cleanup", {}).get("state") not in ("observed-empty", "unknown"):
+                    failures.append("cancelled run receipt reported unexpected PID namespace cleanup state")
+            (evidence / "target-run-cancellation-response.json").write_text(
+                json.dumps(
+                    {
+                        "execution_id": expected_cancelled_execution,
+                        "run_command_response": target_doc,
+                        "physical_execution_receipt": target_physical,
+                        "physical_receipt_present": isinstance(target_physical, dict),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            target_raw = recursively_find(target_doc, "raw_output") if isinstance(target_doc, dict) else None
+            target_streams = observed_raw_streams(target_raw)
+            if target_raw is not None:
+                if target_streams is None:
+                    failures.append("cancelled run raw output failed byte-count/base64 integrity validation")
+                else:
+                    (evidence / "target-cancelled-raw-output-observation.json").write_text(
+                        json.dumps(
+                            {
+                                "encoding": target_raw.get("encoding") if isinstance(target_raw, dict) else None,
+                                "complete": target_raw.get("complete") if isinstance(target_raw, dict) else None,
+                                "truncated": target_raw.get("truncated") if isinstance(target_raw, dict) else None,
+                                "stdout_bytes": target_raw.get("stdout_bytes") if isinstance(target_raw, dict) else None,
+                                "observed_stdout_bytes": target_raw.get("observed_stdout_bytes") if isinstance(target_raw, dict) else None,
+                                "stderr_bytes": target_raw.get("stderr_bytes") if isinstance(target_raw, dict) else None,
+                                "observed_stderr_bytes": target_raw.get("observed_stderr_bytes") if isinstance(target_raw, dict) else None,
+                                "payload_start_marker_observed": b'"nonce"' in target_streams[0],
+                                "complete_output_claimed": False,
+                            },
+                            indent=2,
+                        )
+                        + "\n"
+                    )
+            if isinstance(expected_cancelled_execution, str) and isinstance(scope_path, str) and isinstance(pid_namespace, str):
+                target_cleanup = wait_for_owner_scope_empty(
+                    "target-cancelled",
+                    proof_target_session_id,
+                    expected_cancelled_execution,
+                    scope_path,
+                    pid_namespace,
+                    [
+                        {"role": "payload-parent", **target_pre_cancel["payload_parent"]},
+                        {"role": "payload-child", **target_pre_cancel["payload_child"]},
+                    ],
+                )
+                target_cgroup_empty = (
+                    target_cleanup.get("owner_cgroup_state") == "empty"
+                    and target_cleanup.get("host_cgroup_state") == "empty"
+                )
+                target_payload_processes_gone = target_cleanup.get("known_payload_processes_state") == "observed-gone"
+                if not target_cgroup_empty:
+                    failures.append("public owner and host kernel did not both observe the exact cancelled cgroup empty")
+                if not target_payload_processes_gone:
+                    failures.append("the exact pre-cancel payload parent and child were not both observed absent or PID-reused")
+            else:
+                failures.append("cancelled execution could not be correlated to exact post-close owner cleanup observations")
+            if close_dirty_worktree:
+                preserved_target = invoke_ok(
+                    "target-show-preserved-after-dirty-close",
+                    ["session", "show", "--session", proof_target_session_id],
+                )
+                preserved_target_record = recursively_find(preserved_target, "session")
+                if not isinstance(preserved_target_record, dict) and isinstance(preserved_target.get("session_id"), str):
+                    preserved_target_record = preserved_target
+                if (
+                    not isinstance(preserved_target_record, dict)
+                    or preserved_target_record.get("session_id") != proof_target_session_id
+                    or preserved_target_record.get("state") != "active"
+                    or preserved_target_record.get("worktree") != target_worktree
+                ):
+                    failures.append("dirty-worktree close did not preserve the exact active target session and worktree")
+                (evidence / "target-dirty-close-preserved.json").write_text(
+                    json.dumps(
+                        {
+                            "close_response": close_doc,
+                            "target_state_after_close": preserved_target_record,
+                            "owner_cleanup_observation": target_cleanup,
+                            "discard_attempted": False,
+                            "pid_namespace_state": target_cleanup.get("pid_namespace_state") if target_cleanup else "unknown",
+                            "verification_pass_claimed": False,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+            else:
+                if not close_completed:
+                    # The default wait remains the public owner fallback; it
+                    # never signals payload processes from the host.
+                    wait_close, wait_doc = invoke(
+                        "target-close-wait-cleanup",
+                        ["session", "close", "--session", proof_target_session_id],
+                        30,
+                    )
+                    if wait_close.returncode != 0 or not isinstance(wait_doc, dict) or wait_doc.get("ok") is not True:
+                        failures.append("target session did not converge through default wait cleanup")
+
+                closed_target_after_wait = invoke_ok(
+                    "target-show-closed-after-wait", ["session", "show", "--session", proof_target_session_id]
+                )
+                closed_target_after_wait_record = recursively_find(closed_target_after_wait, "session")
+                if not isinstance(closed_target_after_wait_record, dict) and isinstance(closed_target_after_wait.get("session_id"), str):
+                    closed_target_after_wait_record = closed_target_after_wait
+                if not isinstance(closed_target_after_wait_record, dict) or closed_target_after_wait_record.get("state") != "closed":
+                    failures.append("the tested target session was not owner-observed closed before replacement")
+                else:
+                    replacement = create_fresh_target("post-cancel-target")
+                    session_manifest["target"] = replacement
+                    target_session = replacement["session"]
+                    args.session = target_session.get("session_id")
+                    replacement_session_id = args.session
+                    target_worktree = target_session.get("worktree")
+                    (evidence / "fresh-target-after-cancel-creation.json").write_text(
+                        json.dumps(replacement, indent=2) + "\n"
+                    )
+
+        target_after_cancel = invoke_ok(
+            "target-show-left-active", ["session", "show", "--session", args.session]
+        )
+        target_after_cancel_record = recursively_find(target_after_cancel, "session")
+        if not isinstance(target_after_cancel_record, dict) and isinstance(target_after_cancel.get("session_id"), str):
+            target_after_cancel_record = target_after_cancel
+        if (
+            not isinstance(target_after_cancel_record, dict)
+            or target_after_cancel_record.get("state") != "active"
+            or target_after_cancel_record.get("worktree") != target_worktree
+        ):
+            failures.append("the target session and its worktree were not left active after cancellation handling")
+
+        # Verify the unrelated session remained active and its owned execution
+        # remained populated after cancellation. Never signal it from the host.
+        sibling_after = process_snapshot("sibling-processes-after-cancel", args.sibling_session)
+        if not active_cgroup(sibling_after):
+            failures.append("sibling owned cgroup was not observed populated after target cancellation")
+        save("sibling-active-owned-execution-count.json", json.dumps({"count": populated_execution_count(sibling_after)}, indent=2).encode() + b"\n")
+        sibling_show = invoke_ok("sibling-show-after-cancel", ["session", "show", "--session", args.sibling_session])
+        sibling_record = recursively_find(sibling_show, "session")
+        if not isinstance(sibling_record, dict) and isinstance(sibling_show.get("session_id"), str):
+            sibling_record = sibling_show
+        if not isinstance(sibling_record, dict) or sibling_record.get("state") != "active":
+            failures.append("sibling session did not remain active after target cancellation")
+
+        inspect = subprocess.run(
+            [args.podman_wrapper, "inspect", "--format", "{{.State.Running}}", args.container_id],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        save("container-running-after-target-close.stdout", inspect.stdout)
+        save("container-running-after-target-close.stderr", inspect.stderr)
+        if inspect.returncode != 0 or inspect.stdout.strip() != b"true":
+            failures.append("repository OCI container was not observed running after target cancellation")
+
+        # The sibling payload is bounded in its own namespace and exits itself;
+        # this wait does not cancel or signal it.
+        try:
+            sibling_code = collect_process(sibling, "sibling-strict-run", 65)
+            if sibling_code != 0:
+                failures.append(f"sibling strict process did not complete normally (exit={sibling_code})")
+        except RuntimeError as error:
+            failures.append(str(error))
+        sibling_output = (evidence / "sibling-strict-run.stdout").read_bytes()
+        try:
+            sibling_doc = json.loads(sibling_output)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            sibling_doc = None
+        sibling_physical = recursively_find(sibling_doc, "physical_execution") if isinstance(sibling_doc, dict) else None
+        if not isinstance(sibling_physical, dict):
+            failures.append("sibling strict run did not preserve physical execution evidence")
+        else:
+            if sibling_physical.get("cleanup", {}).get("state") != "observed-empty":
+                failures.append("sibling strict run did not observe its own PID namespace empty after natural exit")
+            start = sibling_physical.get("start", {})
+            namespaces = start.get("namespaces", {}) if isinstance(start, dict) else {}
+            if not isinstance(start, dict) or start.get("state") != "observed" or any(
+                not isinstance(namespaces.get(name), dict)
+                or namespaces[name].get("state") != "observed"
+                or namespaces[name].get("distinct_from_caller") is not True
+                for name in ("pid", "user", "mount", "ipc", "uts")
+            ):
+                failures.append("sibling strict run did not observe distinct PID/user/mount/IPC/UTS namespaces")
+            raw = recursively_find(sibling_doc, "raw_output")
+            sibling_streams = complete_raw_streams(raw)
+            if sibling_streams is None:
+                failures.append("sibling strict run did not preserve complete raw output")
+            else:
+                stdout, _ = sibling_streams
+                if b'"parent"' not in stdout or b'"child"' not in stdout:
+                    failures.append("sibling strict payload did not report its parent and descendant identities")
+
+        # Keep the sibling and whichever target session remains active for the
+        # owner; only wait for the bounded sibling payload.
+        sibling_final = invoke_ok("sibling-show-left-active", ["session", "show", "--session", args.sibling_session])
+        sibling_final_record = recursively_find(sibling_final, "session")
+        if not isinstance(sibling_final_record, dict) and isinstance(sibling_final.get("session_id"), str):
+            sibling_final_record = sibling_final
+        if (
+            not isinstance(sibling_final_record, dict)
+            or sibling_final_record.get("state") != "active"
+            or sibling_final_record.get("worktree") != sibling_worktree
+        ):
+            failures.append("the original sibling session and worktree were not left active")
+
+        summary = {
+            "package_sha256": args.package_sha256,
+            "tested_target_session_id": proof_target_session_id,
+            "active_target_session_id": args.session,
+            "replacement_active_session_id": replacement_session_id,
+            "target_retained_after_dirty_close": close_dirty_worktree,
+            "target_cancellation_owner_cgroup_state": target_cleanup.get("owner_cgroup_state", "unknown") if target_cleanup else "unknown",
+            "target_cancellation_host_cgroup_state": target_cleanup.get("host_cgroup_state", "unknown") if target_cleanup else "unknown",
+            "target_cancellation_payload_processes_state": target_cleanup.get("known_payload_processes_state", "unknown") if target_cleanup else "unknown",
+            "target_cancellation_pid_namespace_diagnostic": target_cleanup.get("pid_namespace_state", "unknown") if target_cleanup else "unknown",
+            "target_cancellation_run_response_status": target_run_response_status,
+            "target_cancellation_physical_receipt_present": target_physical_receipt_present,
+            "target_cancellation_verification_pass_claimed": False,
+            "drain_probe_session_id": args.drain_probe_session,
+            "sibling_session_id": args.sibling_session,
+            "engine_resources": engine_resources,
+            "host_container_cgroup": container_host_cgroup,
+            "session_network_mode": session_network_mode,
+            "network_isolation": network_isolation,
+            "target_owned_cgroup_limits": target_cgroup_limits,
+            "sibling_owned_cgroup_limits": sibling_cgroup_limits,
+            "failures": failures,
+            "result": "passed" if not failures else "failed",
+        }
+        (evidence / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        print(json.dumps(summary, indent=2))
+        return 0 if not failures else 1
+    except Exception as error:  # Preserve evidence and precise failure; never synthesize a pass.
+        (evidence / "failure.txt").write_text(f"{type(error).__name__}: {error}\n")
+        print(f"proof harness blocked: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

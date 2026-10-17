@@ -13,6 +13,7 @@ import {
 } from "./contract.js";
 import { publicCliCommandNames, runCli } from "./cli.js";
 import { success } from "./domain/errors.js";
+import { sandboxExecutionMockSuccess } from "./testing/sandbox-execution-evidence-mock.js";
 import { IMPLEMENTATION_FAILURE_CODE_VOCABULARY } from "./failure-code-vocabulary.js";
 import { SESSION_CONSOLE_CONTRACT_ID, SESSION_CONSOLE_SCHEMA_VERSION } from "./domain/session-console.js";
 import { SESSION_EXECUTION_CONTROL_CONTRACT_ID } from "./domain/session-execution-control.js";
@@ -351,7 +352,13 @@ test("protected-execution public output remains reachable through the canonical 
       sandboxRuntimeLayout: discoverSandboxRuntimeLayout(),
       sandboxRunner: async (_request, command) => {
         assert.deepEqual([command.command, ...(command.args ?? [])], ["printf", "literal; $HOME"]);
-        return success({ exit_code: 0, signal: null, stdout: "literal; $HOME", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({
+          exit_code: 0,
+          signal: null,
+          stdout: "literal; $HOME",
+          stderr: "",
+          duration_ms: 1,
+        });
       },
       io: output.io,
     },

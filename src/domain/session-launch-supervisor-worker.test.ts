@@ -20,6 +20,9 @@ import {
 import { decideExecutionAdmission } from "./session-admission-decision.js";
 import { serializeTrustedSupervisorGoMessage, type SupervisorStartRequest } from "./session-launch-supervisor.js";
 import { runTrustedSessionSupervisorWorker } from "./session-launch-supervisor-worker.js";
+import type { SandboxExecutionEvidenceSnapshot } from "./sandbox-execution-evidence.js";
+import { sandboxExecutionMockSuccess } from "../testing/sandbox-execution-evidence-mock.js";
+import type { ObservedSandboxProcessResult } from "./sandbox-physical-execution.js";
 
 type CompiledSupervisorModule = typeof import("./session-launch-supervisor.js");
 type CompiledSupervisorResult = Awaited<ReturnType<CompiledSupervisorModule["runSessionLaunchSupervisor"]>>;
@@ -73,6 +76,7 @@ function request(overrides: Partial<SupervisorStartRequest["payload"]> = {}): Su
       args: ["-e", "process.stdout.write('worker-out'); process.stderr.write('worker-err')"],
       cwd: process.cwd(),
       env: { PATH: process.env.PATH ?? "/usr/bin" },
+      procfs: { mode: "private", reason: null },
       stdio: ["ignore", "pipe", "pipe", 3],
       seccomp_fd: 3,
       ...overrides,
@@ -136,7 +140,36 @@ test("executes only after GO and carries the actual bounded result", async () =>
   const result = new PassThrough();
   const wire: Buffer[] = [];
   result.on("data", (value) => wire.push(Buffer.from(value)));
-  const worker = runTrustedSessionSupervisorWorker({ control, result });
+  let spawnedPayload = false;
+  const worker = runTrustedSessionSupervisorWorker({
+    control,
+    result,
+    spawn_process: ((...args: Parameters<typeof spawn>) => {
+      spawnedPayload = true;
+      return spawn(...args);
+    }) as typeof spawn,
+    run_observed_child: async (_child, options) => {
+      assert.equal(spawnedPayload, true, "the payload may spawn only after the valid GO message");
+      assert.equal(options.procfs.mode, "private");
+      const mocked = sandboxExecutionMockSuccess({
+        exit_code: 0,
+        signal: null,
+        stdout: "worker-out",
+        stderr: "worker-err",
+        duration_ms: 3,
+      });
+      if (!mocked.ok) return mocked;
+      const value: ObservedSandboxProcessResult = {
+        ...mocked.value,
+        execution_id: options.execution_id,
+        physical_execution: {
+          ...mocked.value.physical_execution,
+          correlation_id: options.execution_id,
+        },
+      };
+      return { ok: true, value };
+    },
+  });
   control.end(`${serializeTrustedSupervisorGoMessage(request())}\n`);
   const outcome = await worker;
   assert.equal(outcome.status, "completed");
@@ -145,12 +178,13 @@ test("executes only after GO and carries the actual bounded result", async () =>
   assert.equal((outcome.result as { stderr: string }).stderr, "worker-err");
   const envelope = JSON.parse(Buffer.concat(wire).toString("utf8")) as {
     status: string;
-    result: { exit_code: number; stdout: string; stderr: string };
+    result: { exit_code: number; stdout: string; stderr: string; physical_execution: { start: { state: string } } };
   };
   assert.equal(envelope.status, "completed");
   assert.equal(envelope.result.exit_code, 0);
   assert.equal(envelope.result.stdout, "worker-out");
   assert.equal(envelope.result.stderr, "worker-err");
+  assert.equal(envelope.result.physical_execution.start.state, "unknown");
 });
 
 test("the real package entrypoint uses fd 4/5 without sharing payload stdio", async (t) => {
@@ -181,10 +215,32 @@ test("the real package entrypoint uses fd 4/5 without sharing payload stdio", as
     assert.equal(code, 0);
     const envelope = JSON.parse(Buffer.concat(wire).toString("utf8")) as {
       status: string;
-      result?: { stdout?: string };
+      error?: string;
+      result?: SandboxExecutionEvidenceSnapshot;
     };
-    assert.equal(envelope.status, "completed");
-    assert.equal(envelope.result?.stdout, "worker-out");
+    assert.equal(envelope.status, "failed", "a non-Bubblewrap child cannot produce a positive physical receipt");
+    assert.equal(typeof envelope.error, "string");
+    assert.ok(envelope.result, "the failed worker envelope retains the observer's evidence snapshot");
+    assert.equal(envelope.result.schema_version, 1);
+    assert.equal(envelope.result.execution_id, reservation.execution_id);
+    assert.equal(envelope.result.exit_code, 0);
+    assert.equal(envelope.result.signal, null);
+    assert.deepEqual(envelope.result.raw_output, {
+      encoding: "base64",
+      capture_mode: "pipes",
+      stdout: Buffer.from("worker-out").toString("base64"),
+      stderr: Buffer.from("worker-err").toString("base64"),
+      stdout_bytes: Buffer.byteLength("worker-out"),
+      stderr_bytes: Buffer.byteLength("worker-err"),
+      observed_stdout_bytes: Buffer.byteLength("worker-out"),
+      observed_stderr_bytes: Buffer.byteLength("worker-err"),
+      complete: true,
+      truncated: false,
+    });
+    assert.equal(envelope.result.physical_execution.correlation_id, reservation.execution_id);
+    assert.equal(envelope.result.physical_execution.start.state, "unknown");
+    assert.equal(envelope.result.physical_execution.termination.state, "unknown");
+    assert.equal(envelope.result.physical_execution.cleanup.state, "unknown");
   } finally {
     fs.closeSync(seccompFd);
   }
@@ -263,6 +319,7 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
         ],
         cwd: process.cwd(),
         env: { PATH: process.env.PATH ?? "/usr/bin" },
+        procfs: { mode: "private", reason: null },
         stdio: ["ignore", "pipe", "pipe", seccompFd],
         seccomp_fd: seccompFd,
       },
@@ -328,7 +385,16 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
       }
     }
     assert.equal(outcome.ok, true, outcome.ok ? "" : outcome.error.message);
-    if (outcome.ok) assert.equal(outcome.value.status, "completed");
+    if (outcome.ok) {
+      // This cgroup fixture deliberately spawns plain Node, not Bubblewrap.
+      // It proves descendant ownership above; it must not produce protected
+      // execution success without independently observed namespaces.
+      assert.equal(outcome.value.status, "failed", JSON.stringify(outcome.value));
+      assert.equal(
+        (outcome.value.result as SandboxExecutionEvidenceSnapshot).physical_execution.start.state,
+        "unknown",
+      );
+    }
   } finally {
     fs.writeFileSync(release, "release");
     if (runPromise !== null) await runPromise.catch(() => undefined);

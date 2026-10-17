@@ -751,7 +751,8 @@ async function main() {
       protectedExecution?.network_mode !== "inherited" ||
       protectedExecution?.fail_closed !== true ||
       protectedExecution?.ambient_fallback !== false ||
-      protectedExecution?.commands?.join(",") !== "session run,session exec,session shell" ||
+      protectedExecution?.commands?.join(",") !==
+        "session run,session exec,session shell,verification snapshot,verification execute,verification candidate-paths,verification stage-candidate,verification release-candidate" ||
       protectedExecution?.command_aliases?.[0]?.alias !== "session exec" ||
       JSON.stringify(protectedExecution?.identities) !== JSON.stringify(protectedIdentityKeys)
     ) {

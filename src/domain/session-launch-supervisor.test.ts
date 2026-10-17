@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { sessionCandidateBundleStageArgs } from "../session-candidate-bundle.js";
 import { createCgroupScope, readCgroupPopulation, type CgroupFileSystem } from "./cgroups-v2.js";
 import { DomainError, failure, success } from "./errors.js";
 import { decideExecutionAdmission, type ExecutionAdmissionReservation } from "./session-admission-decision.js";
@@ -49,6 +50,7 @@ const payload = {
   args: ["--die-with-parent", "--", "node", "script.js"],
   cwd: "/tmp/worktree",
   env: { PATH: "/usr/bin", NAWABARI_SESSION_ID: "session-1" },
+  procfs: { mode: "private" as const, reason: null },
   stdio: ["ignore", "pipe", "pipe", 9] as ["ignore", "pipe", "pipe", number],
   seccomp_fd: 9,
 };
@@ -143,6 +145,31 @@ function packet(overrides: Partial<SessionLaunchSupervisorPacket> = {}): Session
     ...overrides,
   };
 }
+
+test("candidate staging argv passes the trusted supervisor per-argument bound", async () => {
+  const stageArgs = sessionCandidateBundleStageArgs({
+    worktree: "/tmp/worktree",
+    candidateDigest: `sha256:${"a".repeat(64)}`,
+    projectId: "project-1",
+    sourceId: "source-1",
+    bundleSha256: `sha256:${"b".repeat(64)}`,
+    baseCommit: "c".repeat(40),
+    candidateCommit: "d".repeat(40),
+    candidateTree: "e".repeat(40),
+  });
+  assert.ok(stageArgs.every((argument) => argument.length <= 4_096));
+  const events: string[] = [];
+  const result = await runSessionLaunchSupervisor({
+    ...packet({ payload: { ...payload, args: stageArgs } }),
+    process_factory: async (request) => {
+      assert.deepEqual(request.payload.args, stageArgs);
+      return fakeProcess(events);
+    },
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+  if (result.ok) assert.equal(result.value.status, "completed");
+  assert.deepEqual(events, ["go", "wait"]);
+});
 
 test("attaches the supervisor, durably revalidates, and sends one GO before waiting for payload result", async () => {
   const events: string[] = [];
@@ -456,4 +483,24 @@ test("parent disconnect after GO surfaces a throwing cleanup callback", async ()
   assert.equal(result.error.code, "SANDBOX_CGROUP_CLEANUP_FAILED");
   assert.equal(result.error.details?.uncertainty, "parent-disconnected-after-go");
   assert.equal(result.error.details?.reason, "cleanup callback failed");
+});
+
+test("invalid supervisor arguments report bounds without exposing argument contents", async () => {
+  const result = await runSessionLaunchSupervisor({
+    ...packet(),
+    payload: { ...payload, args: ["private-secret".repeat(400)] },
+    process_factory: () => {
+      throw new Error("invalid arguments must not start the supervisor");
+    },
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.deepEqual(result.error.details, {
+      field: "sandbox argument list",
+      argument_index: 0,
+      argument_length: 5600,
+      max_argument_length: 4096,
+    });
+    assert.equal(JSON.stringify(result.error).includes("private-secret"), false);
+  }
 });

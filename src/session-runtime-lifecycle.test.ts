@@ -166,6 +166,58 @@ test("explicit terminate runs only the caller supplied ownership operation, then
   assert.deepEqual(events, ["observe", "close-admission", "observe", "terminate", "observe", "mutate:ready:5"]);
 });
 
+test("close terminates only after explicit policy and finalizes after empty re-observation", async () => {
+  const events: string[] = [];
+  let runtimeEpoch = 4;
+  let observations = 0;
+  const result = await closeSessionWithRuntimeDrain(
+    {
+      observe: () => {
+        events.push("observe");
+        observations += 1;
+        return snapshot(observations < 3 ? "active" : "empty", runtimeEpoch);
+      },
+      close_admission: ({ expected_epoch }) => {
+        events.push("close-admission");
+        runtimeEpoch = Number(expected_epoch) + 1;
+        return { ok: true, value: { admission: "closed", runtime_epoch: runtimeEpoch } };
+      },
+      terminate: (sessionId, fence) => {
+        assert.equal(sessionId, "session-1");
+        assert.equal(fence.policy, "terminate");
+        assert.equal(fence.admission, "closed");
+        assert.equal(fence.admission_epoch, runtimeEpoch);
+        events.push("terminate-owned-scope");
+        return {
+          observed_epoch: runtimeEpoch,
+          executions: [snapshot("empty", runtimeEpoch).executions[0]!],
+          kernel_empty: true,
+        };
+      },
+      mutate: ({ admission_epoch, fence }) => {
+        assert.equal(admission_epoch, runtimeEpoch);
+        assert.equal(fence.admission_epoch, runtimeEpoch);
+        events.push("close-session");
+        return "closed";
+      },
+    },
+    "session-1",
+    4,
+    "terminate",
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.value.status, "completed");
+  assert.deepEqual(events, [
+    "observe",
+    "close-admission",
+    "observe",
+    "terminate-owned-scope",
+    "observe",
+    "close-session",
+  ]);
+});
+
 test("claim release is blocked by unknown occupancy and never reaches mutation", async () => {
   let mutated = false;
   let runtimeEpoch = 4;

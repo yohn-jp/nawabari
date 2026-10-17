@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { success } from "./domain/errors.js";
+import { sandboxExecutionMockSuccess } from "./testing/sandbox-execution-evidence-mock.js";
 import { parseSessionConsoleCommand, executeSessionConsoleCommand } from "./session-console-cli.js";
 import type { SessionBackend, SessionContext, SessionRecord } from "./domain/session.js";
 import type { SessionRuntimeProjection } from "./domain/runtime-projection.js";
@@ -108,7 +109,7 @@ test("session-console CLI delegates enter to the protected domain surface", asyn
       },
       sandbox_runner: async (_request, _command, options) => {
         interactive = options.interactive === true;
-        return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+        return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
       },
       persist_execution: async (record) => {
         persisted.push(record.state);

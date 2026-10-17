@@ -8,15 +8,18 @@ import test from "node:test";
 import {
   VERIFICATION_PROFILE_CONTRACT_ID,
   VERIFICATION_PROFILE_SCHEMA_VERSION,
+  captureVerificationSourceWitness,
   executeSourceBoundVerification,
   executeVerification,
   isVerificationSourceWitnessCurrent,
   validateVerificationProfile,
 } from "./verification-executor.js";
-import { success, type DomainResult } from "./domain/errors.js";
+import type { DomainResult } from "./domain/errors.js";
 import { createFilesystemPolicyToken } from "./domain/filesystem-policy-revision.js";
 import type { SandboxExecutionRequest } from "./domain/sandbox.js";
+import { captureGitSourceObservation } from "./git.js";
 import type { SandboxExecutionResult } from "./domain/sandbox-launcher.js";
+import { sandboxExecutionMockSuccess } from "./testing/sandbox-execution-evidence-mock.js";
 
 const agentWorkingSet = {
   contract_id: "nawabari.working-set-runtime-projection.v1" as const,
@@ -191,7 +194,7 @@ test("verification derives a repository read-only projection without mutating ag
   let receivedRequest: SandboxExecutionRequest | null = null;
   const execute = async (sandboxRequest: SandboxExecutionRequest): Promise<DomainResult<SandboxExecutionResult>> => {
     receivedRequest = sandboxRequest;
-    return success({
+    return sandboxExecutionMockSuccess({
       exit_code: 1,
       signal: null,
       stdout: source,
@@ -225,7 +228,7 @@ test("declared verification visibility is the only read grant and keeps writes d
   let receivedRequest: SandboxExecutionRequest | null = null;
   const execute = async (sandboxRequest: SandboxExecutionRequest): Promise<DomainResult<SandboxExecutionResult>> => {
     receivedRequest = sandboxRequest;
-    return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+    return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
   };
 
   const result = await executeVerification(
@@ -243,6 +246,88 @@ test("declared verification visibility is the only read grant and keeps writes d
     deny: [],
   });
   assert.deepEqual(request.runtime_projection?.working_set, agentWorkingSet);
+});
+
+test("candidate verification visibility is scoped under its exact staged repository", async () => {
+  const candidateDigest = `sha256:${"c".repeat(64)}`;
+  const sourceKey = "d".repeat(24);
+  const candidateRepository = path.join(
+    request.worktree,
+    ".nawabari-verification-candidates",
+    "c".repeat(64),
+    sourceKey,
+    "repo",
+  );
+  const prefix = path.relative(request.worktree, candidateRepository).split(path.sep).join("/");
+  const candidateRequest = {
+    ...request,
+    owner_candidate_verification: {
+      candidate_digest: candidateDigest,
+      source_key: sourceKey,
+      base_commit: "a".repeat(40),
+      head_id: "b".repeat(40),
+      tree_id: "e".repeat(40),
+    },
+  } as SandboxExecutionRequest;
+  let receivedRequest: SandboxExecutionRequest | null = null;
+  const execute = async (sandboxRequest: SandboxExecutionRequest): Promise<DomainResult<SandboxExecutionResult>> => {
+    receivedRequest = sandboxRequest;
+    return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+  };
+
+  const repositoryResult = await executeVerification({ ...profile, cwd: candidateRepository }, candidateRequest, {
+    execute,
+  });
+  assert.equal(repositoryResult.ok, true, repositoryResult.ok ? "" : repositoryResult.error.message);
+  const repositoryScope = (receivedRequest as unknown as SandboxExecutionRequest).runtime_projection?.working_set
+    ?.scope;
+  assert.deepEqual(repositoryScope, {
+    readOnly: [`${prefix}/**`],
+    write: [],
+    create: [],
+    delete: [],
+    deny: [],
+  });
+  assert.equal(repositoryScope?.readOnly.includes("**"), false);
+  assert.equal(repositoryScope?.readOnly.includes("src/**"), false);
+
+  const declaredResult = await executeVerification(
+    { ...profile, cwd: candidateRepository, read_visibility: "declared", declared_read: ["src/allowed.ts"] },
+    candidateRequest,
+    { execute },
+  );
+  assert.equal(declaredResult.ok, true, declaredResult.ok ? "" : declaredResult.error.message);
+  assert.deepEqual((receivedRequest as unknown as SandboxExecutionRequest).runtime_projection?.working_set?.scope, {
+    readOnly: [`${prefix}/src/allowed.ts`],
+    write: [],
+    create: [],
+    delete: [],
+    deny: [],
+  });
+  assert.deepEqual(request.runtime_projection?.working_set, agentWorkingSet);
+  assert.deepEqual(candidateRequest.runtime_projection?.working_set, agentWorkingSet);
+});
+
+test("candidate verification rejects a cwd outside its exact staged repository", async () => {
+  let executed = false;
+  const candidateRequest = {
+    ...request,
+    owner_candidate_verification: {
+      candidate_digest: `sha256:${"c".repeat(64)}`,
+      source_key: "d".repeat(24),
+      base_commit: "a".repeat(40),
+      head_id: "b".repeat(40),
+      tree_id: "e".repeat(40),
+    },
+  } as SandboxExecutionRequest;
+  const result = await executeVerification({ ...profile, cwd: request.worktree }, candidateRequest, {
+    execute: async () => {
+      executed = true;
+      throw new Error("must not execute");
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(executed, false);
 });
 
 test("verification requires protected execution and rejects worktree escape", async () => {
@@ -293,7 +378,7 @@ test("source-bound verification rejects same-path byte edits during protected ex
           invoked = true;
           fs.writeFileSync(sourcePath, "other\n");
           fs.utimesSync(sourcePath, FIXED_SOURCE_TIME, FIXED_SOURCE_TIME);
-          return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
         },
       },
     );
@@ -316,7 +401,10 @@ test("source witness currentness tracks source, base, profile, policy, runtime, 
       { ...profile, cwd: fixture.root },
       fixture.request,
       policyFence,
-      { execute: async () => success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 }) },
+      {
+        execute: async () =>
+          sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 }),
+      },
     );
     assert.equal(result.ok, true);
     if (!result.ok || result.value.source.status !== "proven") return;
@@ -382,6 +470,70 @@ test("source witness currentness tracks source, base, profile, policy, runtime, 
   }
 });
 
+test("candidate source witness observes only the deterministic staged repository and exact Git identities", () => {
+  const fixture = createSourceRepository();
+  try {
+    const head = runGit(["rev-parse", "HEAD"], fixture.root);
+    const tree = runGit(["rev-parse", "HEAD^{tree}"], fixture.root);
+    const candidateDigest = `sha256:${"c".repeat(64)}`;
+    const sourceKey = "d".repeat(24);
+    const candidateRoot = path.join(
+      fixture.root,
+      ".nawabari-verification-candidates",
+      "c".repeat(64),
+      sourceKey,
+      "repo",
+    );
+    fs.mkdirSync(path.dirname(candidateRoot), { recursive: true });
+    runGit(["clone", "--quiet", fixture.root, candidateRoot], fixture.root);
+    runGit(["checkout", "--quiet", "-B", `nawabari-candidate-${"c".repeat(64)}-${sourceKey}`, head], candidateRoot);
+    const observedCandidate = captureGitSourceObservation({ cwd: candidateRoot, read_selectors: ["**"] });
+    assert.equal(observedCandidate.head_id, head);
+    assert.equal(observedCandidate.tree_id, tree);
+    const ownerCandidateVerification = {
+      candidate_digest: candidateDigest,
+      source_key: sourceKey,
+      base_commit: head,
+      head_id: head,
+      tree_id: tree,
+    };
+    const candidateRequest = {
+      ...fixture.request,
+      owner_candidate_verification: ownerCandidateVerification,
+    } as SandboxExecutionRequest;
+    const candidateProfile = { ...profile, cwd: candidateRoot };
+    const result = captureVerificationSourceWitness(
+      candidateProfile,
+      candidateRequest,
+      sourcePolicyFence("019123e4-7abc-7def-8123-456789abcdef"),
+    );
+    assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+    if (!result.ok) return;
+    assert.equal(result.value.head_id, head);
+    assert.equal(result.value.tree_id, tree);
+    assert.equal(result.value.base_id, head);
+
+    const edited = path.join(candidateRoot, "src", "entry.js");
+    fs.writeFileSync(edited, "modified candidate\n");
+    const changed = captureVerificationSourceWitness(
+      candidateProfile,
+      candidateRequest,
+      sourcePolicyFence("019123e4-7abc-7def-8123-456789abcdef"),
+    );
+    assert.equal(changed.ok, true);
+    if (changed.ok) assert.notEqual(changed.value.source_sha256, result.value.source_sha256);
+
+    const outside = captureVerificationSourceWitness(
+      { ...candidateProfile, cwd: path.join(candidateRoot, "nested") },
+      candidateRequest,
+      sourcePolicyFence("019123e4-7abc-7def-8123-456789abcdef"),
+    );
+    assert.equal(outside.ok, false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("source-bound verification fails closed when a declared source is unobservable", async () => {
   const fixture = createSourceRepository();
   try {
@@ -394,7 +546,7 @@ test("source-bound verification fails closed when a declared source is unobserva
       {
         execute: async () => {
           invoked = true;
-          return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
         },
       },
     );
@@ -438,7 +590,13 @@ test("source-bound verification rejects current policy and runtime changes durin
                 profile: { id: "node-runtime", version: "changed-during-execution" },
               };
             }
-            return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+            return sandboxExecutionMockSuccess({
+              exit_code: 0,
+              signal: null,
+              stdout: "ok",
+              stderr: "",
+              duration_ms: 1,
+            });
           },
         },
       );

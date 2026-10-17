@@ -15,6 +15,11 @@ import {
   type SupervisorChildResult,
   type TrustedSandboxPayload,
 } from "./session-launch-supervisor.js";
+import {
+  sandboxExecutionEvidenceFromError,
+  type SandboxExecutionEvidenceSnapshot,
+} from "./sandbox-execution-evidence.js";
+import { runObservedSandboxChild, type ObservedSandboxProcessResult } from "./sandbox-physical-execution.js";
 
 const MAX_PRIVATE_ENVELOPE_BYTES = 2 * 1_024 * 1_024;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_024 * 1_024;
@@ -40,17 +45,13 @@ export type TrustedSessionSupervisorWorkerOptions = {
   readonly timeout_ms?: number;
   /** Test-only output limit; production uses the launcher default. */
   readonly max_output_bytes?: number;
+  /** Test seam; production uses the shared namespace-gated physical observer. */
+  readonly run_observed_child?: typeof runObservedSandboxChild;
   /** Inherited seccomp descriptor, fixed to fd 3 in the private protocol. */
   readonly seccomp_fd?: number;
 };
 
-type SandboxExecutionResult = {
-  readonly exit_code: number | null;
-  readonly signal: string | null;
-  readonly stdout: string;
-  readonly stderr: string;
-  readonly duration_ms: number;
-};
+type SandboxExecutionResult = ObservedSandboxProcessResult;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -77,6 +78,29 @@ function validatePayload(value: unknown, seccompFd: number): value is TrustedSan
   for (const entry of value.stdio.slice(0, 3)) {
     if (typeof entry === "number" && !isSafeFd(entry)) return false;
     if (typeof entry === "string" && entry !== "ignore" && entry !== "inherit" && entry !== "pipe") return false;
+  }
+  if (
+    !isRecord(value.procfs) ||
+    (value.procfs.mode !== "private" && value.procfs.mode !== "denied") ||
+    (value.procfs.mode === "private" && value.procfs.reason !== null) ||
+    (value.procfs.mode === "denied" &&
+      (typeof value.procfs.reason !== "string" ||
+        value.procfs.reason.length === 0 ||
+        value.procfs.reason.includes("\0")))
+  ) {
+    return false;
+  }
+  if (
+    (value.timeout_ms !== undefined &&
+      (!Number.isSafeInteger(value.timeout_ms) ||
+        (value.timeout_ms as number) < 1 ||
+        (value.timeout_ms as number) > 15 * 60 * 1_000)) ||
+    (value.max_output_bytes !== undefined &&
+      (!Number.isSafeInteger(value.max_output_bytes) ||
+        (value.max_output_bytes as number) < 1 ||
+        (value.max_output_bytes as number) > DEFAULT_MAX_OUTPUT_BYTES))
+  ) {
+    return false;
   }
   if (!isRecord(value.env)) return false;
   for (const [key, entry] of Object.entries(value.env)) {
@@ -126,53 +150,15 @@ async function readBoundedControl(control: Readable): Promise<Buffer | null> {
   return oversized ? null : Buffer.concat(chunks);
 }
 
-function appendBounded(
-  chunks: string[],
-  currentBytes: number,
-  value: Buffer | string,
-  maxBytes: number,
-): { readonly bytes: number; readonly exceeded: boolean } {
-  const encoded = typeof value === "string" ? Buffer.from(value, "utf8") : value;
-  const remaining = maxBytes - currentBytes;
-  if (remaining <= 0) return { bytes: currentBytes, exceeded: encoded.byteLength > 0 };
-  if (encoded.byteLength <= remaining) {
-    chunks.push(encoded.toString("utf8"));
-    return { bytes: currentBytes + encoded.byteLength, exceeded: false };
-  }
-  // Keep the same byte bound and UTF-8 truncation behavior as the existing
-  // sandbox launcher.  The worker drains the stream even after the bound is
-  // reached, but it never retains unbounded output.
-  let end = remaining;
-  while (end > 0) {
-    const last = encoded[end - 1] ?? 0;
-    if ((last & 0x80) === 0) break;
-    if ((last & 0xc0) === 0x80) {
-      let start = end - 1;
-      while (start > 0 && ((encoded[start - 1] ?? 0) & 0xc0) === 0x80) start -= 1;
-      const lead = encoded[start] ?? 0;
-      const width = (lead & 0xe0) === 0xc0 ? 2 : (lead & 0xf0) === 0xe0 ? 3 : (lead & 0xf8) === 0xf0 ? 4 : 1;
-      if (start + width > end) {
-        end = start;
-        continue;
-      }
-    }
-    break;
-  }
-  chunks.push(encoded.subarray(0, end).toString("utf8"));
-  return { bytes: currentBytes + end, exceeded: true };
-}
-
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message.slice(0, 240) : "unknown";
 }
 
 function runPayload(
   payload: TrustedSandboxPayload,
+  executionId: string,
   options: TrustedSessionSupervisorWorkerOptions,
 ): Promise<SupervisorChildResult> {
-  const started = Date.now();
-  const timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
-  const maxOutputBytes = options.max_output_bytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const interactive =
     payload.stdio[0] === "inherit" && payload.stdio[1] === "inherit" && payload.stdio[2] === "inherit";
   let child: ChildProcess;
@@ -181,78 +167,29 @@ function runPayload(
       cwd: payload.cwd,
       env: { ...payload.env },
       shell: false,
-      stdio: [payload.stdio[0], payload.stdio[1], payload.stdio[2], payload.seccomp_fd],
+      stdio: [payload.stdio[0], payload.stdio[1], payload.stdio[2], payload.seccomp_fd, "pipe", "pipe"],
     });
   } catch (error: unknown) {
     return Promise.resolve({ status: "failed", error: errorText(error) });
   }
-
-  return new Promise<SupervisorChildResult>((resolve) => {
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    let outputBytes = 0;
-    let outputExceeded = false;
-    let timedOut = false;
-    let spawnError: Error | null = null;
-    let timer: NodeJS.Timeout | null = null;
-    let settled = false;
-    const finish = (result: SupervisorChildResult): void => {
-      if (settled) return;
-      settled = true;
-      if (timer !== null) clearTimeout(timer);
-      resolve(result);
-    };
-    const collect =
-      (target: string[]) =>
-      (value: Buffer | string): void => {
-        const collected = appendBounded(target, outputBytes, value, maxOutputBytes);
-        outputBytes = collected.bytes;
-        if (collected.exceeded) {
-          outputExceeded = true;
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // The child may exit between output delivery and the kill request.
-          }
-        }
+  return (options.run_observed_child ?? runObservedSandboxChild)(child, {
+    execution_id: executionId,
+    procfs: payload.procfs,
+    interactive,
+    timeout_ms: payload.timeout_ms ?? options.timeout_ms ?? DEFAULT_TIMEOUT_MS,
+    max_output_bytes: payload.max_output_bytes ?? options.max_output_bytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+    forward_parent_signals: interactive,
+  }).then((observed) => {
+    if (!observed.ok) {
+      const evidence: SandboxExecutionEvidenceSnapshot | null = sandboxExecutionEvidenceFromError(observed.error);
+      return {
+        status: "failed",
+        error: errorText(observed.error),
+        ...(evidence === null ? {} : { result: evidence }),
       };
-    child.stdout?.on("data", collect(stdout));
-    child.stderr?.on("data", collect(stderr));
-    child.once("error", (error: Error) => {
-      spawnError = error;
-    });
-    if (!interactive) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // The child may already have exited.
-        }
-      }, timeoutMs);
     }
-    child.once("close", (code, signal) => {
-      if (spawnError !== null) {
-        finish({ status: "failed", error: spawnError.message.slice(0, 240) });
-        return;
-      }
-      if (timedOut) {
-        finish({ status: "failed", error: `sandbox execution exceeded ${timeoutMs}ms` });
-        return;
-      }
-      if (outputExceeded) {
-        finish({ status: "failed", error: `sandbox output exceeded ${maxOutputBytes} bytes` });
-        return;
-      }
-      const result: SandboxExecutionResult = {
-        exit_code: code,
-        signal,
-        stdout: stdout.join(""),
-        stderr: stderr.join(""),
-        duration_ms: Date.now() - started,
-      };
-      finish({ status: "completed", result });
-    });
+    const result: SandboxExecutionResult = observed.value;
+    return { status: "completed", result };
   });
 }
 
@@ -289,7 +226,7 @@ export async function runTrustedSessionSupervisorWorker(
   if (raw === null) return { status: "unknown" };
   const message = parseGoMessage(raw, seccompFd);
   if (message === null) return { status: "unknown" };
-  const outcome = await runPayload(message.payload, options);
+  const outcome = await runPayload(message.payload, message.reservation.execution_id, options);
   if (!(await writeResult(result, outcome))) return { status: "unknown" };
   return outcome;
 }
