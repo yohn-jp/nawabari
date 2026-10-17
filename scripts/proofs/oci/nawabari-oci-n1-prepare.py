@@ -288,7 +288,9 @@ def main() -> int:
                 },
             }
             entries = [entry("README.md", "Required bounded read for strict Git and repository proof")]
-            entries.append(entry(STALE_TRIGGER_FILE, "Bounded path used to advance the session claim generation"))
+            entries.append(
+                entry(STALE_TRIGGER_FILE, "Bounded path used to advance the session claim generation", state="supporting")
+            )
             entries.append(entry(OWNED_FILE, "Owner-claimed session-local strict write proof", state="supporting"))
             working_set = candidate_working_set("target", entries)
             scope_path = write_artifact("target-execution-scope", scope)
