@@ -360,11 +360,19 @@ def main() -> int:
             timeout=30,
             check=False,
         )
+        state_pid = subprocess.run(
+            [args.podman_wrapper, "inspect", "--format", "{{.State.Pid}}", args.container_id],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
         save("engine-hostconfig-inspect.stdout", host.stdout)
         save("engine-hostconfig-inspect.stderr", host.stderr)
+        save("engine-state-pid-inspect.stdout", state_pid.stdout)
+        save("engine-state-pid-inspect.stderr", state_pid.stderr)
         save("engine-network-inspect.stdout", network.stdout)
         save("engine-network-inspect.stderr", network.stderr)
-        if host.returncode != 0 or network.returncode != 0:
+        if host.returncode != 0 or network.returncode != 0 or state_pid.returncode != 0:
             raise RuntimeError("repository container engine resource/network inspection failed")
         try:
             host_config = json.loads(host.stdout)
@@ -373,8 +381,16 @@ def main() -> int:
             raise RuntimeError("repository container engine inspection was not valid JSON") from error
         if not isinstance(host_config, dict) or not isinstance(network_settings, dict):
             raise RuntimeError("repository container engine inspection omitted host/network objects")
+        try:
+            host_pid = int(state_pid.stdout.decode("ascii").strip())
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RuntimeError("repository container engine did not report its running init PID") from error
+        if host_pid < 1:
+            raise RuntimeError("repository container engine reported a non-running init PID")
         networks = network_settings.get("Networks")
         observed = {
+            "container_id": args.container_id,
+            "host_init_pid": host_pid,
             "memory_bytes": host_config.get("Memory"),
             "nano_cpus": host_config.get("NanoCpus"),
             "cpu_quota_usec": host_config.get("CpuQuota"),
@@ -401,10 +417,182 @@ def main() -> int:
         }
         mismatches = {key: {"expected": value, "observed": observed.get(key)} for key, value in expected.items() if observed.get(key) != value}
         if mismatches:
-            failures.append(f"engine resource/isolation observation did not match the bounded OCI profile: {mismatches}")
+            failures.append(f"engine configuration did not match the bounded OCI profile: {mismatches}")
         return observed
 
-    def observe_owned_cgroup_limits(name: str, document: dict, session_id: str) -> dict | None:
+    def proc_starttime(pid: int) -> str:
+        raw = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        command_end = raw.rfind(")")
+        if command_end < 0:
+            raise RuntimeError("host process stat did not contain a command boundary")
+        fields = raw[command_end + 1 :].strip().split()
+        if len(fields) <= 19 or not fields[19].isdigit():
+            raise RuntimeError("host process starttime could not be parsed")
+        return fields[19]
+
+    def proc_unified_cgroup(pid: int) -> str:
+        raw = pathlib.Path(f"/proc/{pid}/cgroup").read_text()
+        unified = next((line[3:] for line in raw.splitlines() if line.startswith("0::")), None)
+        if not isinstance(unified, str) or not unified.startswith("/") or "\0" in unified or ".." in pathlib.PurePosixPath(unified).parts:
+            raise RuntimeError("host process did not expose a canonical unified cgroup identity")
+        return unified
+
+    def read_bounded_text(file: pathlib.Path, max_bytes: int = 64 * 1024) -> str:
+        with file.open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise RuntimeError(f"host cgroup observation exceeded {max_bytes} bytes: {file}")
+        return raw.decode("ascii").strip()
+
+    def read_host_cgroup_chain(leaf: pathlib.Path) -> list[dict]:
+        mount = pathlib.Path("/sys/fs/cgroup")
+        relative = leaf.relative_to(mount)
+        paths = [mount]
+        for index in range(1, len(relative.parts) + 1):
+            paths.append(mount.joinpath(*relative.parts[:index]))
+        chain = []
+        for directory in paths:
+            values = {}
+            for filename in ("cpu.max", "memory.max", "pids.max"):
+                try:
+                    values[filename] = read_bounded_text(directory / filename, 4 * 1024)
+                except OSError as error:
+                    values[filename] = None
+                    values[f"{filename}_error"] = type(error).__name__
+            chain.append({"path": str(directory), "values": values})
+        return chain
+
+    def parse_cgroup_limits(chain: list[dict]) -> tuple[dict, list[dict]]:
+        cpu_limits: list[tuple[float, int, int]] = []
+        memory_limits: list[int] = []
+        pids_limits: list[int] = []
+        unknown = []
+        for level in chain:
+            values = level.get("values")
+            if not isinstance(values, dict):
+                unknown.append({"path": level.get("path"), "controller": "all"})
+                continue
+            cpu_value = values.get("cpu.max")
+            if isinstance(cpu_value, str):
+                parts = cpu_value.split()
+                if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0:
+                    if parts[0] == "max":
+                        pass
+                    elif parts[0].isdigit() and int(parts[0]) > 0:
+                        quota, period = int(parts[0]), int(parts[1])
+                        cpu_limits.append((quota / period, quota, period))
+                    else:
+                        unknown.append({"path": level.get("path"), "controller": "cpu.max", "value": cpu_value})
+                else:
+                    unknown.append({"path": level.get("path"), "controller": "cpu.max", "value": cpu_value})
+            else:
+                if level.get("path") != "/sys/fs/cgroup":
+                    unknown.append({"path": level.get("path"), "controller": "cpu.max", "value": cpu_value})
+            for controller, limits in (("memory.max", memory_limits), ("pids.max", pids_limits)):
+                value = values.get(controller)
+                if value == "max":
+                    continue
+                if isinstance(value, str) and value.isdigit() and int(value) > 0:
+                    limits.append(int(value))
+                elif not (level.get("path") == "/sys/fs/cgroup" and value is None):
+                    unknown.append({"path": level.get("path"), "controller": controller, "value": value})
+        limits = {
+            "cpu": None if not cpu_limits else {
+                "cores": min(cpu_limits)[0],
+                "quota_usec": min(cpu_limits)[1],
+                "period_usec": min(cpu_limits)[2],
+            },
+            "memory_bytes": min(memory_limits) if memory_limits else None,
+            "pids": min(pids_limits) if pids_limits else None,
+        }
+        return limits, unknown
+
+    def observe_host_container_cgroup(engine_observation: dict) -> dict | None:
+        host_pid = engine_observation.get("host_init_pid")
+        if not isinstance(host_pid, int) or host_pid < 1:
+            failures.append("engine inspection omitted a valid owned container init PID")
+            return None
+        try:
+            starttime_before = proc_starttime(host_pid)
+            cgroup_before = proc_unified_cgroup(host_pid)
+            parts = pathlib.PurePosixPath(cgroup_before).parts
+            if (
+                len(parts) < 4
+                or parts[-3:] != ("container", "repository.scope", "init.scope")
+                or f"libpod-{args.container_id}.scope" not in parts
+            ):
+                raise RuntimeError("container init cgroup did not match the selected Podman identity and repository scope")
+            init_path = pathlib.Path("/sys/fs/cgroup").joinpath(*parts[1:])
+            repository_path = init_path.parent
+            chain = read_host_cgroup_chain(init_path)
+            starttime_after = proc_starttime(host_pid)
+            cgroup_after = proc_unified_cgroup(host_pid)
+            if starttime_after != starttime_before or cgroup_after != cgroup_before:
+                raise RuntimeError("container init process identity or cgroup changed during observation")
+            netns = pathlib.Path(f"/proc/{host_pid}/ns/net").readlink().as_posix()
+            caller_netns = pathlib.Path("/proc/self/ns/net").readlink().as_posix()
+            net_prefix = pathlib.Path(f"/proc/{host_pid}/net")
+            net_devices = read_bounded_text(net_prefix / "dev", 16 * 1024)
+            ipv4_routes = read_bounded_text(net_prefix / "route", 16 * 1024)
+            ipv6_routes = read_bounded_text(net_prefix / "ipv6_route", 16 * 1024)
+            interface_names = [
+                line.split(":", 1)[0].strip()
+                for line in net_devices.splitlines()[2:]
+                if ":" in line
+            ]
+            ipv4_route_rows = ipv4_routes.splitlines()[1:]
+            ipv6_route_interfaces = [line.split()[-1] for line in ipv6_routes.splitlines() if line.split()]
+            limits, unknown = parse_cgroup_limits(chain)
+            result = {
+                "container_id": args.container_id,
+                "host_init_pid": host_pid,
+                "host_init_starttime": starttime_before,
+                "proc_cgroup": f"0::{cgroup_before}",
+                "init_cgroup_path": str(init_path),
+                "repository_cgroup_path": str(repository_path),
+                "network_namespace": netns,
+                "caller_network_namespace": caller_netns,
+                "network_namespace_distinct_from_caller": netns != caller_netns,
+                "network_observation": {
+                    "interfaces": interface_names,
+                    "ipv4_route_rows": ipv4_route_rows,
+                    "ipv6_route_interfaces": ipv6_route_interfaces,
+                    "only_loopback_observed": interface_names == ["lo"]
+                    and not ipv4_route_rows
+                    and set(ipv6_route_interfaces) <= {"lo"},
+                },
+                "observed_chain": chain,
+                "effective_host_container_limits": limits,
+                "unobserved_or_invalid_controllers": unknown,
+            }
+            (evidence / "host-physical-cgroup-limits.json").write_text(json.dumps(result, indent=2) + "\n")
+            if unknown or limits["cpu"] is None or limits["memory_bytes"] is None or limits["pids"] is None:
+                failures.append("host kernel cgroup ancestors did not expose all physical CPU/memory/PID limits")
+            if (
+                netns == caller_netns
+                or not result["network_observation"]["only_loopback_observed"]
+                or limits["cpu"] is None
+                or limits["cpu"]["cores"] > 1.0
+                or limits["memory_bytes"] is None
+                or limits["memory_bytes"] > 536_870_912
+                or limits["pids"] is None
+                or limits["pids"] > 128
+            ):
+                failures.append("actual host container cgroup/network boundary exceeded or failed to prove the bounded OCI profile")
+            return result
+        except (OSError, RuntimeError, ValueError) as error:
+            failures.append(f"host physical container identity/cgroup observation unavailable: {error}")
+            return None
+
+    def observe_owned_cgroup_limits(
+        name: str,
+        document: dict,
+        session_id: str,
+        host_container: dict | None,
+    ) -> dict | None:
+        if not isinstance(host_container, dict):
+            failures.append(f"{name} has no host-observed repository cgroup identity")
+            return None
         processes = document.get("processes")
         records = processes if isinstance(processes, list) else []
         owned = [
@@ -414,7 +602,7 @@ def main() -> int:
             and isinstance(item.get("execution"), dict)
             and item["execution"].get("session_id") == session_id
             and isinstance(item.get("cgroups"), dict)
-            and item["cgroups"].get("state") in {"active", "empty"}
+            and item["cgroups"].get("state") == "active"
             and isinstance(item["cgroups"].get("cgroups"), dict)
         ]
         if len(owned) != 1:
@@ -427,8 +615,7 @@ def main() -> int:
         scope = cgroups.get("scope")
         execution_id = execution.get("execution_id")
         if (
-            not isinstance(root, str)
-            or not root.startswith("/sys/fs/cgroup/")
+            root != "/sys/fs/cgroup/repository.scope"
             or not isinstance(scope, str)
             or not scope.startswith("nawabari-")
             or any(char not in "0123456789abcdef" for char in scope.removeprefix("nawabari-"))
@@ -437,87 +624,86 @@ def main() -> int:
         ):
             failures.append(f"{name} public execution record omitted a canonical owner cgroup identity")
             return None
-        script = (
-            "const fs=require('node:fs'),path=require('node:path');"
-            "const root=process.argv[1],scope=process.argv[2];"
-            "if(!root.startsWith('/sys/fs/cgroup/')||!/^nawabari-[0-9a-f]{48}$/.test(scope))process.exit(2);"
-            "const dirs=[root,path.join(root,'nawabari'),path.join(root,'nawabari',scope)];"
-            "const out=dirs.map(directory=>{const values={};for(const file of ['cpu.max','memory.max','pids.max']){"
-            "try{values[file]=fs.readFileSync(path.join(directory,file),'utf8').trim()}catch(e){values[file]=null}}"
-            "return {directory,values}});process.stdout.write(JSON.stringify(out)+'\\n');"
-        )
-        observed = subprocess.run(
-            [*prefix, "node", "-e", script, root, scope],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        save(f"{name}-owned-cgroup-limits.stdout", observed.stdout)
-        save(f"{name}-owned-cgroup-limits.stderr", observed.stderr)
-        if observed.returncode != 0:
-            failures.append(f"{name} could not read its owner-backed cgroup limit chain from the OCI container")
+        identity = item.get("cgroups", {}).get("cgroups", {})
+        population = identity.get("population")
+        if (
+            identity.get("scope") != scope
+            or not isinstance(population, dict)
+            or population.get("state") != "populated"
+            or population.get("populated") is not True
+        ):
+            failures.append(f"{name} public owner observation did not report the exact session scope populated")
             return None
+        repository_path = host_container.get("repository_cgroup_path")
+        if not isinstance(repository_path, str) or not repository_path.startswith("/sys/fs/cgroup/"):
+            failures.append(f"{name} host container observation omitted the canonical repository cgroup path")
+            return None
+        repository_cgroup = pathlib.Path(repository_path)
+        scope_path = repository_cgroup / "nawabari" / scope
         try:
-            chain = json.loads(observed.stdout)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            failures.append(f"{name} cgroup limit-chain output was not valid JSON")
+            if any(path.is_symlink() for path in (repository_cgroup, repository_cgroup / "nawabari", scope_path)):
+                raise RuntimeError("host repository/session cgroup path contains a symlink")
+            if not scope_path.is_dir():
+                raise RuntimeError("owner-identified session cgroup directory is absent from the host kernel hierarchy")
+            chain = read_host_cgroup_chain(scope_path)
+            leaf_values = chain[-1].get("values")
+            if not isinstance(leaf_values, dict):
+                raise RuntimeError("host kernel did not expose the exact session cgroup controllers")
+            cgroup_events = read_bounded_text(scope_path / "cgroup.events", 4 * 1024)
+            cgroup_procs_text = read_bounded_text(scope_path / "cgroup.procs", 64 * 1024)
+            host_pids = [int(line) for line in cgroup_procs_text.splitlines() if line.isdigit()]
+            if len(host_pids) != len(cgroup_procs_text.splitlines()) or not host_pids:
+                raise RuntimeError("host session cgroup did not expose a bounded non-empty process list")
+            event_map = {
+                key: value
+                for line in cgroup_events.splitlines()
+                if len((parts := line.split())) == 2
+                for key, value in [parts]
+            }
+            if event_map.get("populated") != "1":
+                raise RuntimeError("host kernel did not observe the exact owner session cgroup populated")
+            host_pid = host_container.get("host_init_pid")
+            expected_starttime = host_container.get("host_init_starttime")
+            expected_cgroup = host_container.get("proc_cgroup", "").removeprefix("0::")
+            if (
+                not isinstance(host_pid, int)
+                or proc_starttime(host_pid) != expected_starttime
+                or proc_unified_cgroup(host_pid) != expected_cgroup
+            ):
+                raise RuntimeError("container init identity changed during session cgroup observation")
+        except (OSError, RuntimeError, ValueError) as error:
+            failures.append(f"{name} host owner cgroup observation unavailable: {error}")
             return None
-        if not isinstance(chain, list) or len(chain) != 3 or any(not isinstance(level, dict) for level in chain):
-            failures.append(f"{name} cgroup limit-chain observation was incomplete")
-            return None
-
-        def parse_cpu(value: object) -> tuple[float, int, int] | None:
-            if not isinstance(value, str):
-                return None
-            parts = value.split()
-            if len(parts) != 2 or parts[0] == "max":
-                return None
-            try:
-                quota, period = int(parts[0]), int(parts[1])
-            except ValueError:
-                return None
-            if quota < 1 or period < 1:
-                return None
-            return quota / period, quota, period
-
-        cpu_limits = [parse_cpu(level.get("values", {}).get("cpu.max")) for level in chain]
-        cpu_limits = [limit for limit in cpu_limits if limit is not None]
-        scalar_limits: dict[str, list[int]] = {"memory.max": [], "pids.max": []}
-        for level in chain:
-            values = level.get("values")
-            if not isinstance(values, dict):
-                continue
-            for key, limits in scalar_limits.items():
-                value = values.get(key)
-                if isinstance(value, str) and value != "max" and value.isdigit() and int(value) > 0:
-                    limits.append(int(value))
-        effective = {
-            "cpu": None if not cpu_limits else {
-                "cores": min(cpu_limits)[0],
-                "quota_usec": min(cpu_limits)[1],
-                "period_usec": min(cpu_limits)[2],
-            },
-            "memory_bytes": min(scalar_limits["memory.max"]) if scalar_limits["memory.max"] else None,
-            "pids": min(scalar_limits["pids.max"]) if scalar_limits["pids.max"] else None,
-        }
+        limits, invalid_values = parse_cgroup_limits(chain)
         result = {
             "session_id": session_id,
             "execution_id": execution_id,
-            "cgroup_root": root,
+            "container_cgroup_root": root,
+            "host_repository_cgroup_path": repository_path,
             "scope": scope,
+            "host_scope_path": str(scope_path),
+            "host_scope_population": {
+                "state": "populated",
+                "process_count": len(host_pids),
+                "host_process_ids": host_pids,
+                "events": cgroup_events,
+            },
             "chain": chain,
-            "effective_inherited_limits": effective,
+            "observed_session_scope_values": leaf_values,
+            "effective_physical_limits": limits,
+            "invalid_or_unobserved_controllers": invalid_values,
         }
         (evidence / f"{name}-owned-cgroup-limits.json").write_text(json.dumps(result, indent=2) + "\n")
         if (
-            effective["cpu"] is None
-            or effective["cpu"]["cores"] > 1.0
-            or effective["memory_bytes"] is None
-            or effective["memory_bytes"] > 536_870_912
-            or effective["pids"] is None
-            or effective["pids"] > 128
+            invalid_values
+            or limits["cpu"] is None
+            or limits["cpu"]["cores"] > 1.0
+            or limits["memory_bytes"] is None
+            or limits["memory_bytes"] > 536_870_912
+            or limits["pids"] is None
+            or limits["pids"] > 128
         ):
-            failures.append(f"{name} owner cgroup did not observe the bounded inherited 1 CPU/512 MiB/128 PID limits")
+            failures.append(f"{name} could not prove the bounded host ancestor/session cgroup limits")
         return result
 
     def active_cgroup(document: dict) -> bool:
@@ -574,6 +760,7 @@ def main() -> int:
         if container_state.returncode != 0 or container_state.stdout.strip() != b"true":
             raise RuntimeError("selected repository OCI container is not observed running")
         engine_resources = inspect_engine_resources()
+        container_host_cgroup = observe_host_container_cgroup(engine_resources)
 
         target_show = invoke_ok("target-session-before-proof", ["session", "show", "--session", args.session])
         drain_probe_show = invoke_ok(
@@ -765,7 +952,9 @@ def main() -> int:
         if sibling_active is None or not active_cgroup(sibling_active):
             failures.append("sibling strict execution never exposed an active observed owned cgroup")
         else:
-            sibling_cgroup_limits = observe_owned_cgroup_limits("sibling-active", sibling_active, args.sibling_session)
+            sibling_cgroup_limits = observe_owned_cgroup_limits(
+                "sibling-active", sibling_active, args.sibling_session, container_host_cgroup
+            )
 
         drain_before = process_snapshot("drain-probe-processes-before-close", args.drain_probe_session)
         if execution_ids(drain_before):
@@ -861,16 +1050,22 @@ def main() -> int:
         if not isinstance(session_request_identity, dict) or session_request_identity.get("network_mode") != "inherited":
             failures.append("strict target session did not preserve its owner-observed inherited network mode")
         network_isolation = {
-            "container_engine": engine_resources,
+            "container_engine_configuration": engine_resources,
+            "host_kernel_container_observation": container_host_cgroup,
             "session_request_identity": session_request_identity,
             "effective_network_mode": (
                 "none" if engine_resources.get("network_mode") == "none"
+                and isinstance(container_host_cgroup, dict)
+                and container_host_cgroup.get("network_namespace_distinct_from_caller") is True
+                and container_host_cgroup.get("network_observation", {}).get("only_loopback_observed") is True
                 and isinstance(session_request_identity, dict)
                 and session_request_identity.get("network_mode") == "inherited"
                 else "unknown"
             ),
         }
         (evidence / "network-isolation-observation.json").write_text(json.dumps(network_isolation, indent=2) + "\n")
+        if network_isolation["effective_network_mode"] != "none":
+            failures.append("network isolation was not jointly observed through OCI configuration, host net namespace, and session inheritance")
         if boundary_run.returncode != 0 or not isinstance(boundary_result, dict) or boundary_result.get("ok") is not True:
             failures.append(f"strict current-session read/write/boundary payload failed (exit={boundary_run.returncode})")
         checkpoint_result = invoke(
@@ -1108,7 +1303,7 @@ def main() -> int:
                 failures.append(str(error))
         else:
             target_cgroup_limits = observe_owned_cgroup_limits(
-                "target-active-before-cancel", target_active, proof_target_session_id
+                "target-active-before-cancel", target_active, proof_target_session_id, container_host_cgroup
             )
             close_result, close_doc = invoke(
                 "target-close-terminate",
@@ -1338,6 +1533,7 @@ def main() -> int:
             "drain_probe_session_id": args.drain_probe_session,
             "sibling_session_id": args.sibling_session,
             "engine_resources": engine_resources,
+            "host_container_cgroup": container_host_cgroup,
             "session_network_mode": session_request_identity.get("network_mode")
             if isinstance(session_request_identity, dict)
             else None,

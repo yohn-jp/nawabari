@@ -26,10 +26,15 @@ cleanup receipt, a stale-snapshot refusal without a new execution record,
 a verifier timeout with observed descendant cleanup, public owner close with
 `--drain-policy terminate` on the tested target, then publicly creates a
 replacement only after the closed target releases its exclusive write claim.
-The runner records engine-inspected OCI CPU/memory/PID/network settings and
-the selected session's observed network mode. While target and sibling
-executions are active, it reads each owner-identified cgroup limit chain and
-records the effective inherited limits. This preserves the tested replacement,
+The runner records engine configuration separately from host-kernel evidence.
+It binds Podman's owned container init PID to its `/proc` start time and
+cgroup, observes the actual cgroup-v2 ancestor limits and network namespace,
+and checks the container's host-visible interfaces and routes. While target
+and sibling executions are active, it maps each public owner-reported
+Nawabari scope below the observed repository cgroup, then reads that exact
+host-kernel controller chain, `cgroup.events`, and `cgroup.procs`. The report
+keeps explicit session-scope `max` values while deriving effective limits
+from the physical ancestor chain. This preserves the tested replacement,
 active sibling, and container without concurrent write ownership. The bounded
 sibling payload exits naturally, while its session and worktree remain active
 for the owner. Neither script signals a host process, restarts the container,
