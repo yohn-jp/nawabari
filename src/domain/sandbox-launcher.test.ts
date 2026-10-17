@@ -1595,6 +1595,41 @@ test("compiled protected execution keeps a worktree under /tmp visible and hides
     if (!stage.ok) return;
     assert.equal(stage.value.exit_code, 0, JSON.stringify(stage.value));
     assert.equal(stage.value.stdout, "bounded-owner-stage-ok");
+    fs.mkdirSync(path.join(scratch, "repo/.git"), { mode: 0o700 });
+    const candidateRead = await runSandboxedCommand(
+      {
+        ...protectedRequest.value,
+        compiled_session_environment: compiled.value,
+        git_profile: profileResult.value,
+        owner_candidate_verification: {
+          candidate_digest: `sha256:${"a".repeat(64)}`,
+          source_key: "b".repeat(24),
+          head_id: "c".repeat(40),
+          tree_id: "d".repeat(40),
+          base_commit: "e".repeat(40),
+        },
+      },
+      {
+        command: "node",
+        cwd: path.join(scratch, "repo"),
+        args: [
+          "-e",
+          [
+            "const fs=require('node:fs'), assert=require('node:assert/strict'), path=require('node:path');",
+            "assert.equal(fs.readFileSync('objects/pack','utf8'),'exact-stage');",
+            "assert.equal(process.env.GIT_DIR,path.join(process.cwd(),'.git'));",
+            "assert.equal(process.env.GIT_WORK_TREE,process.cwd());",
+            "assert.throws(()=>fs.writeFileSync('objects/pack','forbidden'));",
+            "assert.throws(()=>fs.writeFileSync('new-file','forbidden'));",
+            "process.stdout.write('owner-candidate-read-only-ok');",
+          ].join(" "),
+        ],
+      },
+    );
+    assert.equal(candidateRead.ok, true, candidateRead.ok ? "" : JSON.stringify(candidateRead.error));
+    if (!candidateRead.ok) return;
+    assert.equal(candidateRead.value.exit_code, 0, JSON.stringify(candidateRead.value));
+    assert.equal(candidateRead.value.stdout, "owner-candidate-read-only-ok");
   } finally {
     if (controlServer !== undefined) await controlServer.close();
     removeWorktree(repository, worktree);

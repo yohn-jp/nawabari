@@ -17,12 +17,22 @@ export function candidateStagingSelectorMayOverlap(selector: string, scratchRoot
 
 /** Resolve only the private directory issued by the fixed Nawabari staging operation. */
 export function resolveOwnerCandidateStagingRoot(request: SandboxExecutionRequest): DomainResult<string | null> {
-  const intent = request.owner_candidate_staging;
+  const intent = request.owner_candidate_staging ?? request.owner_candidate_verification;
   if (intent === undefined) return success(null);
   const refuse = (reason: string) =>
     failure(
       new DomainError("SANDBOX_TOPOLOGY_INVALID", "The owner candidate staging scope is unavailable.", { reason }),
     );
+  if (request.owner_candidate_staging !== undefined && request.owner_candidate_verification !== undefined)
+    return refuse("only one fixed candidate operation may be selected");
+  const verification = request.owner_candidate_verification;
+  if (
+    verification !== undefined &&
+    (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(verification.head_id) ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(verification.tree_id) ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(verification.base_commit))
+  )
+    return refuse("invalid staged source identity");
   if (!/^sha256:[0-9a-f]{64}$/u.test(intent.candidate_digest) || !/^[0-9a-f]{24}$/u.test(intent.source_key))
     return refuse("invalid fixed staging identity");
   if (
@@ -54,6 +64,19 @@ export function resolveOwnerCandidateStagingRoot(request: SandboxExecutionReques
         fs.realpathSync.native(current) !== current
       )
         return refuse("reserved scratch must be canonical, owner-private directories without symlinks");
+    }
+    if (verification !== undefined) {
+      for (const child of ["repo", "repo/.git"]) {
+        const target = path.join(current, child);
+        const stat = fs.lstatSync(target);
+        if (
+          !stat.isDirectory() ||
+          stat.isSymbolicLink() ||
+          stat.uid !== process.getuid?.() ||
+          fs.realpathSync.native(target) !== target
+        )
+          return refuse("staged repository metadata is not canonical and owned");
+      }
     }
     return success(current);
   } catch {

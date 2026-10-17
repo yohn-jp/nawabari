@@ -229,6 +229,14 @@ export type SandboxExecutionRequest = {
    * canonical session worktree and grants no such allowance to agent commands.
    */
   owner_candidate_staging?: Readonly<{ candidate_digest: string; source_key: string }>;
+  /** @internal Issued only after the fixed owner staging operation succeeds. */
+  owner_candidate_verification?: Readonly<{
+    candidate_digest: string;
+    source_key: string;
+    head_id: string;
+    tree_id: string;
+    base_commit: string;
+  }>;
 };
 
 export type SandboxCgroupConfig = {
