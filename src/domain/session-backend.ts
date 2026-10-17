@@ -491,8 +491,8 @@ export class LocalSessionBackend implements SessionBackend {
           new DomainError("OPERATION_REJECTED", "Candidate scratch release is blocked until owned executions drain.", {
             session_id: options.session_id,
             status: drained.value.status,
-            active_execution_ids: drained.value.active_execution_ids,
-            unknown_execution_ids: drained.value.unknown_execution_ids,
+            active_execution_ids: [...drained.value.active_execution_ids],
+            unknown_execution_ids: [...drained.value.unknown_execution_ids],
           }),
         );
       }

@@ -64,14 +64,29 @@ test("public contract exposes isolated verification authority", () => {
   assert.equal(contract.session_bound_execution_contract_id, "nawabari.session-bound-verification.v1");
   assert.equal(contract.session_bound_execution_schema_version, 1);
   assert.equal(contract.session_bound_execution_result_schema, "nawabari.session-bound-verification.v1");
-  assert.deepEqual(contract.session_bound_operations, ["snapshot", "execute", "candidate-paths", "stage-candidate"]);
+  assert.deepEqual(contract.session_bound_operations, [
+    "snapshot",
+    "execute",
+    "candidate-paths",
+    "stage-candidate",
+    "release-candidate",
+  ]);
   assert.equal(contract.candidate_bundle_contract_id, "nawabari.session-candidate-bundle.v1");
   assert.equal(contract.candidate_bundle_schema_version, 1);
   assert.equal(contract.candidate_bundle_result_schema, "nawabari.session-candidate-bundle.v1");
   assert.equal(contract.candidate_bundle_paths_contract_id, "nawabari.session-candidate-bundle-paths.v1");
   assert.equal(contract.candidate_bundle_paths_result_schema, "nawabari.session-candidate-bundle-paths.v1");
+  assert.equal(contract.candidate_bundle_release_contract_id, "nawabari.session-candidate-bundle-release.v1");
+  assert.equal(contract.candidate_bundle_release_result_schema, "nawabari.session-candidate-bundle-release.v1");
   assert.equal(contract.candidate_bundle_path_operation, "candidate-paths");
   assert.equal(contract.candidate_bundle_max_bytes, 64 * 1024 * 1024);
+  assert.deepEqual(contract.candidate_release, {
+    requires_exact_snapshot: true,
+    admission: "closed-during-owned-empty-drain-and-release",
+    finalization: "existing-session-close-drain-authority",
+    removes_only: "clean-deterministic-candidate-source-subtree",
+    rejects_dirty_or_unexpected_recoverable_data: true,
+  });
   assert.deepEqual(contract.candidate_staging, {
     mutates_agent_working_set: false,
     owner_operation_scratch: "deterministic-candidate-source-subtree-under-owned-session-worktree",

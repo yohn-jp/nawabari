@@ -56,6 +56,8 @@ import {
   SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
   SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID,
   SESSION_CANDIDATE_BUNDLE_PATHS_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_RELEASE_RESULT_SCHEMA,
   SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA,
   SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
   MAX_SESSION_CANDIDATE_BUNDLE_BYTES,
@@ -63,6 +65,7 @@ import {
   sessionCandidateBundleTransferPath,
   sessionCandidateBundleStagingRootPath,
   describeSessionCandidateBundlePaths,
+  releaseSessionCandidateBundleScratch,
   stageSessionCandidateBundle,
 } from "./session-candidate-bundle.js";
 
@@ -70,6 +73,8 @@ export {
   SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
   SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID,
   SESSION_CANDIDATE_BUNDLE_PATHS_RESULT_SCHEMA,
+  SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_RELEASE_RESULT_SCHEMA,
   SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA,
   SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
   MAX_SESSION_CANDIDATE_BUNDLE_BYTES,
@@ -77,12 +82,15 @@ export {
   sessionCandidateBundleTransferPath,
   sessionCandidateBundleStagingRootPath,
   describeSessionCandidateBundlePaths,
+  releaseSessionCandidateBundleScratch,
   stageSessionCandidateBundle,
 };
 export type {
   SessionCandidateBundleRequest,
   SessionCandidateBundleSource,
   SessionCandidateBundlePathsResult,
+  SessionCandidateBundleReleaseRequest,
+  SessionCandidateBundleReleaseResult,
   SessionCandidateBundleStageResult,
 } from "./session-candidate-bundle.js";
 
@@ -209,12 +217,14 @@ export function nawabariVerificationContract(): JsonObject {
     session_bound_execution_contract_id: SESSION_BOUND_VERIFICATION_CONTRACT_ID,
     session_bound_execution_schema_version: SESSION_BOUND_VERIFICATION_SCHEMA_VERSION,
     session_bound_execution_result_schema: SESSION_BOUND_VERIFICATION_RESULT_SCHEMA,
-    session_bound_operations: ["snapshot", "execute", "candidate-paths", "stage-candidate"],
+    session_bound_operations: ["snapshot", "execute", "candidate-paths", "stage-candidate", "release-candidate"],
     candidate_bundle_contract_id: SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
     candidate_bundle_schema_version: SESSION_CANDIDATE_BUNDLE_SCHEMA_VERSION,
     candidate_bundle_result_schema: SESSION_CANDIDATE_BUNDLE_RESULT_SCHEMA,
     candidate_bundle_paths_contract_id: SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID,
     candidate_bundle_paths_result_schema: SESSION_CANDIDATE_BUNDLE_PATHS_RESULT_SCHEMA,
+    candidate_bundle_release_contract_id: SESSION_CANDIDATE_BUNDLE_RELEASE_CONTRACT_ID,
+    candidate_bundle_release_result_schema: SESSION_CANDIDATE_BUNDLE_RELEASE_RESULT_SCHEMA,
     candidate_bundle_max_bytes: MAX_SESSION_CANDIDATE_BUNDLE_BYTES,
     candidate_bundle_path_operation: "candidate-paths",
     candidate_staging: {
@@ -223,6 +233,13 @@ export function nawabariVerificationContract(): JsonObject {
       stage_write_policy: "owner-operation-only",
       verifier_read_visibility: "invocation-local",
       verifier_write_policy: "deny",
+    },
+    candidate_release: {
+      requires_exact_snapshot: true,
+      admission: "closed-during-owned-empty-drain-and-release",
+      finalization: "existing-session-close-drain-authority",
+      removes_only: "clean-deterministic-candidate-source-subtree",
+      rejects_dirty_or_unexpected_recoverable_data: true,
     },
     legacy_result_freshness: "unproven",
     read_visibility: ["declared", "repository"],

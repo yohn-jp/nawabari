@@ -17,7 +17,6 @@ import { isSuccessfulProtectedExecutionProven } from "./domain/sandbox-execution
 import { isSessionId } from "./session-id.js";
 import {
   inspectSessionCandidateBundleScratch,
-  removeSessionCandidateBundleScratch,
   sessionCandidateBundleIdentityKeys,
   sessionCandidateBundleRepositoryPath,
   sessionCandidateBundleStagingRootPath,
