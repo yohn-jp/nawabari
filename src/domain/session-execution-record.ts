@@ -673,11 +673,12 @@ export function observeExecutionIdentity(
     }
     observed = Object.freeze({ pid: expected.pid, starttime, boot_id: bootId, cgroup_path: cgroupPath });
   } catch (error: unknown) {
-    // A durable terminal record can outlive its supervisor's /proc entry.
-    // Preserve that as unresolved identity evidence; the independently
-    // observed cgroup population remains the only physical cleanup evidence.
+    // A durable terminal or already-unresolved record can outlive its
+    // supervisor's /proc entry. Preserve that as unresolved identity evidence;
+    // the independently observed cgroup population remains the only physical
+    // cleanup evidence.
     if (
-      validated.value.state === "exited" &&
+      (validated.value.state === "exited" || validated.value.state === "unresolved") &&
       typeof error === "object" &&
       error !== null &&
       "code" in error &&

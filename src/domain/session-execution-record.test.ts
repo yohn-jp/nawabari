@@ -226,6 +226,32 @@ test("an exited execution with a vanished supervisor stays unresolved instead of
   assert.equal(observed.value.expected.pid, terminal.value.supervisor_pid);
 });
 
+test("an unresolved execution with a vanished supervisor stays unresolved for separate cgroup observation", () => {
+  const unresolved = recordExecutionState(attached(), {
+    state: "unresolved",
+    now: "2026-09-21T00:00:02.000Z",
+  });
+  assert.equal(unresolved.ok, true);
+  if (!unresolved.ok) return;
+  const missingProcess = Object.assign(new Error("process disappeared"), { code: "ENOENT" });
+  const observed = observeExecutionIdentity(unresolved.value, {
+    reader: {
+      read_boot_id: () => unresolved.value.boot_id,
+      read_process_starttime: () => {
+        throw missingProcess;
+      },
+      read_process_cgroup: () => "/unobserved",
+    },
+  });
+  assert.equal(observed.ok, true, observed.ok ? "" : JSON.stringify(observed.error));
+  if (!observed.ok) return;
+  assert.equal(observed.value.classification, "unresolved");
+  assert.equal(observed.value.matches, false);
+  assert.equal(observed.value.active, false);
+  assert.equal(observed.value.observed, null);
+  assert.equal(observed.value.expected.pid, unresolved.value.supervisor_pid);
+});
+
 test("an attached execution with an unobservable supervisor remains a physical observation failure", () => {
   const active = attached();
   const missingProcess = Object.assign(new Error("process disappeared"), { code: "ENOENT" });
