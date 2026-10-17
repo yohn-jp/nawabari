@@ -563,26 +563,33 @@ function bundleFileIsCurrent(worktree: string, candidateDigest: string, source: 
   try {
     const root = fs.realpathSync(worktree);
     const stagingStat = fs.lstatSync(stagingRoot);
-    const realBundlePath = fs.realpathSync(bundlePath);
-    const stat = fs.lstatSync(bundlePath);
-    const expected = digest.exec(source.bundle_sha256)![1]!;
-    return (
-      root === worktree &&
-      fs.realpathSync(stagingRoot) === stagingRoot &&
-      stagingStat.isDirectory() &&
-      !stagingStat.isSymbolicLink() &&
-      (stagingStat.mode & 0o077) === 0 &&
-      (typeof process.getuid !== "function" || stagingStat.uid === process.getuid()) &&
-      realBundlePath === bundlePath &&
-      path.dirname(realBundlePath) === stagingRoot &&
-      stat.isFile() &&
-      !stat.isSymbolicLink() &&
-      (stat.mode & 0o077) === 0 &&
-      (typeof process.getuid !== "function" || stat.uid === process.getuid()) &&
-      stat.size > 0 &&
-      stat.size <= MAX_SESSION_CANDIDATE_BUNDLE_BYTES &&
-      sha256(fs.readFileSync(bundlePath)) === expected
-    );
+    if (
+      root !== worktree ||
+      fs.realpathSync(stagingRoot) !== stagingRoot ||
+      !stagingStat.isDirectory() ||
+      stagingStat.isSymbolicLink() ||
+      (stagingStat.mode & 0o077) !== 0 ||
+      (typeof process.getuid === "function" && stagingStat.uid !== process.getuid())
+    ) return false;
+    // Open once with O_NOFOLLOW: validation and hashing use the same inode,
+    // not a pathname that can be replaced after lstat/realpath checks.
+    const fd = fs.openSync(bundlePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const stat = fs.fstatSync(fd);
+      const expected = digest.exec(source.bundle_sha256)![1]!;
+      return (
+        fs.realpathSync(bundlePath) === bundlePath &&
+        path.dirname(bundlePath) === stagingRoot &&
+        stat.isFile() &&
+        (stat.mode & 0o077) === 0 &&
+        (typeof process.getuid !== "function" || stat.uid === process.getuid()) &&
+        stat.size > 0 &&
+        stat.size <= MAX_SESSION_CANDIDATE_BUNDLE_BYTES &&
+        sha256(fs.readFileSync(fd)) === expected
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
     return false;
   }
