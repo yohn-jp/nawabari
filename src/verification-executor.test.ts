@@ -248,6 +248,88 @@ test("declared verification visibility is the only read grant and keeps writes d
   assert.deepEqual(request.runtime_projection?.working_set, agentWorkingSet);
 });
 
+test("candidate verification visibility is scoped under its exact staged repository", async () => {
+  const candidateDigest = `sha256:${"c".repeat(64)}`;
+  const sourceKey = "d".repeat(24);
+  const candidateRepository = path.join(
+    request.worktree,
+    ".nawabari-verification-candidates",
+    "c".repeat(64),
+    sourceKey,
+    "repo",
+  );
+  const prefix = path.relative(request.worktree, candidateRepository).split(path.sep).join("/");
+  const candidateRequest = {
+    ...request,
+    owner_candidate_verification: {
+      candidate_digest: candidateDigest,
+      source_key: sourceKey,
+      base_commit: "a".repeat(40),
+      head_id: "b".repeat(40),
+      tree_id: "e".repeat(40),
+    },
+  } as SandboxExecutionRequest;
+  let receivedRequest: SandboxExecutionRequest | null = null;
+  const execute = async (sandboxRequest: SandboxExecutionRequest): Promise<DomainResult<SandboxExecutionResult>> => {
+    receivedRequest = sandboxRequest;
+    return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+  };
+
+  const repositoryResult = await executeVerification({ ...profile, cwd: candidateRepository }, candidateRequest, {
+    execute,
+  });
+  assert.equal(repositoryResult.ok, true, repositoryResult.ok ? "" : repositoryResult.error.message);
+  const repositoryScope = (receivedRequest as unknown as SandboxExecutionRequest).runtime_projection?.working_set
+    ?.scope;
+  assert.deepEqual(repositoryScope, {
+    readOnly: [`${prefix}/**`],
+    write: [],
+    create: [],
+    delete: [],
+    deny: [],
+  });
+  assert.equal(repositoryScope?.readOnly.includes("**"), false);
+  assert.equal(repositoryScope?.readOnly.includes("src/**"), false);
+
+  const declaredResult = await executeVerification(
+    { ...profile, cwd: candidateRepository, read_visibility: "declared", declared_read: ["src/allowed.ts"] },
+    candidateRequest,
+    { execute },
+  );
+  assert.equal(declaredResult.ok, true, declaredResult.ok ? "" : declaredResult.error.message);
+  assert.deepEqual((receivedRequest as unknown as SandboxExecutionRequest).runtime_projection?.working_set?.scope, {
+    readOnly: [`${prefix}/src/allowed.ts`],
+    write: [],
+    create: [],
+    delete: [],
+    deny: [],
+  });
+  assert.deepEqual(request.runtime_projection?.working_set, agentWorkingSet);
+  assert.deepEqual(candidateRequest.runtime_projection?.working_set, agentWorkingSet);
+});
+
+test("candidate verification rejects a cwd outside its exact staged repository", async () => {
+  let executed = false;
+  const candidateRequest = {
+    ...request,
+    owner_candidate_verification: {
+      candidate_digest: `sha256:${"c".repeat(64)}`,
+      source_key: "d".repeat(24),
+      base_commit: "a".repeat(40),
+      head_id: "b".repeat(40),
+      tree_id: "e".repeat(40),
+    },
+  } as SandboxExecutionRequest;
+  const result = await executeVerification({ ...profile, cwd: request.worktree }, candidateRequest, {
+    execute: async () => {
+      executed = true;
+      throw new Error("must not execute");
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(executed, false);
+});
+
 test("verification requires protected execution and rejects worktree escape", async () => {
   const unrestricted = await executeVerification(profile, { ...request, enforce: false } as SandboxExecutionRequest, {
     execute: async () => {

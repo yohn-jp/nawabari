@@ -334,9 +334,40 @@ function failureResult(profile: VerificationProfile, error: DomainError): Verifi
   });
 }
 
-function verificationScope(profile: VerificationProfile): WorkingSetRuntimeProjection["scope"] {
+function candidateRepositorySelectorPrefix(
+  profile: VerificationProfile,
+  request: SandboxExecutionRequest,
+): DomainResult<string | null> {
+  const candidate = request.owner_candidate_verification;
+  if (candidate === undefined) return success(null);
+  const candidateDigest = /^sha256:([0-9a-f]{64})$/u.exec(candidate.candidate_digest);
+  if (
+    !candidateDigest ||
+    !/^[0-9a-f]{24}$/u.test(candidate.source_key) ||
+    !SOURCE_REVISION.test(candidate.base_commit) ||
+    !SOURCE_REVISION.test(candidate.head_id) ||
+    !SOURCE_REVISION.test(candidate.tree_id) ||
+    !path.isAbsolute(request.worktree) ||
+    path.resolve(request.worktree) !== request.worktree
+  )
+    return failure(sourceUnavailable("The owner candidate verification identity is invalid."));
+  const relative = path.join(".nawabari-verification-candidates", candidateDigest[1]!, candidate.source_key, "repo");
+  const repository = path.join(request.worktree, relative);
+  if (profile.cwd !== repository || !isWithin(request.worktree, repository))
+    return failure(sourceUnavailable("Verification must use the exact owner-staged candidate repository."));
+  return success(relative.split(path.sep).join("/"));
+}
+
+function verificationScope(
+  profile: VerificationProfile,
+  candidateRepositoryPrefix: string | null,
+): WorkingSetRuntimeProjection["scope"] {
+  const selected = profile.read_visibility === "repository" ? ["**"] : profile.declared_read;
   return {
-    readOnly: profile.read_visibility === "repository" ? ["**"] : profile.declared_read,
+    readOnly:
+      candidateRepositoryPrefix === null
+        ? selected
+        : selected.map((selector) => `${candidateRepositoryPrefix}/${selector}`),
     write: [],
     create: [],
     delete: [],
@@ -372,9 +403,12 @@ function deriveVerificationRuntimeProjection(
     );
   }
 
+  const candidateRepositoryPrefix = candidateRepositorySelectorPrefix(profile, request);
+  if (!candidateRepositoryPrefix.ok) return candidateRepositoryPrefix;
+
   const projectedWorkingSet = validateWorkingSetRuntimeProjection({
     ...workingSet,
-    scope: verificationScope(profile),
+    scope: verificationScope(profile, candidateRepositoryPrefix.value),
   });
   if (!projectedWorkingSet.ok) return failure(projectedWorkingSet.error);
 
