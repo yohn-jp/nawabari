@@ -11,7 +11,7 @@ import {
   type SessionContext,
   type SessionVerificationSnapshot,
 } from "./domain/session.js";
-import { isSandboxExecutionEvidenceSnapshot } from "./domain/sandbox-execution-evidence.js";
+import { isSuccessfulProtectedExecutionProven } from "./domain/sandbox-execution-evidence.js";
 import { isSessionId } from "./session-id.js";
 
 export const SESSION_CANDIDATE_BUNDLE_CONTRACT_ID = "nawabari.session-candidate-bundle.v1" as const;
@@ -591,30 +591,10 @@ export async function stageSessionCandidateBundle(
     );
   const result = execution.value.result;
   const physical = execution.value.execution_evidence;
-  const physicalExecution = isSandboxExecutionEvidenceSnapshot(physical) ? physical.physical_execution : null;
-  const namespaces = physicalExecution === null ? [] : Object.values(physicalExecution.start.namespaces);
   if (
     result.exit_code !== 0 ||
     result.signal !== null ||
-    physicalExecution === null ||
-    physical.execution_id !== execution.value.execution.execution_id ||
-    physicalExecution.correlation_id !== execution.value.execution.execution_id ||
-    physicalExecution.procfs.mode !== "private" ||
-    physicalExecution.start.state !== "observed" ||
-    physicalExecution.start.outer_pid === null ||
-    physicalExecution.start.process_start_ticks === null ||
-    namespaces.length !== 5 ||
-    !namespaces.every(
-      (namespace) => namespace.state === "observed" && namespace.identity !== null && namespace.distinct_from_caller,
-    ) ||
-    physicalExecution.termination.state !== "observed-exited" ||
-    physicalExecution.termination.reason !== "exited" ||
-    physicalExecution.cleanup.state !== "observed-empty" ||
-    physicalExecution.cleanup.process_count !== 0 ||
-    physical.raw_output.complete !== true ||
-    physical.raw_output.truncated !== false ||
-    physical.raw_output.observed_stdout_bytes !== physical.raw_output.stdout_bytes ||
-    physical.raw_output.observed_stderr_bytes !== physical.raw_output.stderr_bytes ||
+    !isSuccessfulProtectedExecutionProven(physical, execution.value.execution.execution_id) ||
     execution.value.supervisor.status !== "completed" ||
     execution.value.execution.state !== "exited" ||
     execution.value.owned_execution?.state !== "empty" ||

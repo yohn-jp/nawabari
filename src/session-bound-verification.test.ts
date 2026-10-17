@@ -421,3 +421,43 @@ test("unknown physical cleanup can never qualify session-bound verification", ()
     false,
   );
 });
+
+test("protected physical success accepts denied procfs and still requires namespace cleanup", () => {
+  const fake = sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+  assert.ok(fake.ok);
+  if (!fake.ok) return;
+  const namespace = { state: "observed", identity: "namespace:fixture", distinct_from_caller: true } as const;
+  const physical = {
+    ...fake.value.physical_execution,
+    procfs: { mode: "denied", reason: "parent-procfs-has-overmounts" },
+    start: {
+      state: "observed",
+      outer_pid: 123,
+      process_start_ticks: "456",
+      observed_at: "2026-10-17T00:00:00.000Z",
+      namespaces: { pid: namespace, user: namespace, mount: namespace, ipc: namespace, uts: namespace },
+    },
+    termination: {
+      state: "observed-exited",
+      reason: "exited",
+      method: "procfs-process-observation",
+      observed_at: "2026-10-17T00:00:00.000Z",
+    },
+    cleanup: {
+      state: "observed-empty",
+      method: "pid-namespace-proc-scan",
+      process_count: 0,
+      observed_at: "2026-10-17T00:00:00.000Z",
+    },
+  } as const;
+  const denied = { schema_version: 1, ...fake.value, physical_execution: physical } as const;
+  assert.equal(isSessionBoundPhysicalExecutionProven(denied, denied.execution_id), true);
+  const populated = {
+    ...denied,
+    physical_execution: {
+      ...physical,
+      cleanup: { ...physical.cleanup, state: "observed-populated", process_count: 1 },
+    },
+  } as const;
+  assert.equal(isSessionBoundPhysicalExecutionProven(populated, denied.execution_id), false);
+});

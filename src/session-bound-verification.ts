@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 
 import { DomainError, failure, success, type DomainResult } from "./domain/errors.js";
 import {
-  isSandboxExecutionEvidenceSnapshot,
+  isSuccessfulProtectedExecutionProven as isSessionBoundPhysicalExecutionProven,
   type SandboxExecutionEvidenceSnapshot,
 } from "./domain/sandbox-execution-evidence.js";
 import type { SandboxProbe, SandboxRuntimeLayout } from "./domain/sandbox.js";
@@ -36,6 +36,8 @@ import {
   type VerificationSourceWitness,
 } from "./verification-executor.js";
 import { isSessionId } from "./session-id.js";
+
+export { isSuccessfulProtectedExecutionProven as isSessionBoundPhysicalExecutionProven } from "./domain/sandbox-execution-evidence.js";
 
 export const SESSION_BOUND_VERIFICATION_CONTRACT_ID = "nawabari.session-bound-verification.v1" as const;
 export const SESSION_BOUND_VERIFICATION_SCHEMA_VERSION = 1 as const;
@@ -259,35 +261,6 @@ function snapshotMatchesExecutionStart(
   );
 }
 
-export function isSessionBoundPhysicalExecutionProven(
-  evidence: SandboxExecutionEvidenceSnapshot | null,
-  executionId: string,
-): boolean {
-  if (evidence === null || !isSandboxExecutionEvidenceSnapshot(evidence)) return false;
-  const physical = evidence.physical_execution;
-  const namespaces = Object.values(physical.start.namespaces);
-  return (
-    evidence.execution_id === executionId &&
-    physical.correlation_id === executionId &&
-    evidence.exit_code === 0 &&
-    evidence.signal === null &&
-    evidence.raw_output.capture_mode === "pipes" &&
-    evidence.raw_output.complete &&
-    !evidence.raw_output.truncated &&
-    evidence.raw_output.observed_stdout_bytes === evidence.raw_output.stdout_bytes &&
-    evidence.raw_output.observed_stderr_bytes === evidence.raw_output.stderr_bytes &&
-    physical.start.state === "observed" &&
-    physical.start.outer_pid !== null &&
-    physical.start.process_start_ticks !== null &&
-    namespaces.length === 5 &&
-    namespaces.every((namespace) => namespace.state === "observed" && namespace.distinct_from_caller === true) &&
-    physical.termination.state === "observed-exited" &&
-    physical.termination.reason === "exited" &&
-    physical.cleanup.state === "observed-empty" &&
-    physical.cleanup.process_count === 0
-  );
-}
-
 function executionFailed(verification: VerificationResult, evidence: SandboxExecutionEvidenceSnapshot | null): boolean {
   if (verification.status === "failed") return true;
   if (evidence === null) return false;
@@ -444,7 +417,10 @@ export async function executeSessionBoundVerification(
       return invalid("Candidate-backed verification repository identity is invalid.", "candidate_source");
     }
     if (profile.value.cwd !== expectedRepositoryPath) {
-      return invalid("Candidate-backed verifier cwd must be the deterministic Nawabari-owned staged repository.", "profile.cwd");
+      return invalid(
+        "Candidate-backed verifier cwd must be the deterministic Nawabari-owned staged repository.",
+        "profile.cwd",
+      );
     }
     const staged = await stageSessionCandidateBundle(context, backend, {
       contract_id: SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
@@ -474,9 +450,13 @@ export async function executeSessionBoundVerification(
       stageReceiptDigest !== sha256(canonicalJson(stageReceipt))
     ) {
       return failure(
-        new DomainError("PHYSICAL_OBSERVATION_UNAVAILABLE", "Nawabari candidate staging did not bind its exact source receipt.", {
-          session_id: request.session_id,
-        }),
+        new DomainError(
+          "PHYSICAL_OBSERVATION_UNAVAILABLE",
+          "Nawabari candidate staging did not bind its exact source receipt.",
+          {
+            session_id: request.session_id,
+          },
+        ),
       );
     }
     candidateStage = stage;

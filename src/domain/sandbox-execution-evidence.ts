@@ -342,3 +342,37 @@ export function sandboxExecutionEvidenceFromError(error: DomainError): SandboxEx
   const candidate = error.details?.execution_evidence;
   return isSandboxExecutionEvidenceSnapshot(candidate) ? candidate : null;
 }
+
+/** Shared physical success predicate for protected staging and verification. */
+export function isSuccessfulProtectedExecutionProven(
+  evidence: SandboxExecutionEvidenceSnapshot | null,
+  executionId: string,
+): boolean {
+  if (evidence === null || !isSandboxExecutionEvidenceSnapshot(evidence)) return false;
+  const physical = evidence.physical_execution;
+  const namespaces = Object.values(physical.start.namespaces);
+  return (
+    evidence.execution_id === executionId &&
+    physical.correlation_id === executionId &&
+    evidence.exit_code === 0 &&
+    evidence.signal === null &&
+    (physical.procfs.mode === "private" || physical.procfs.mode === "denied") &&
+    evidence.raw_output.capture_mode === "pipes" &&
+    evidence.raw_output.complete &&
+    !evidence.raw_output.truncated &&
+    evidence.raw_output.observed_stdout_bytes === evidence.raw_output.stdout_bytes &&
+    evidence.raw_output.observed_stderr_bytes === evidence.raw_output.stderr_bytes &&
+    physical.start.state === "observed" &&
+    physical.start.outer_pid !== null &&
+    physical.start.process_start_ticks !== null &&
+    namespaces.length === 5 &&
+    namespaces.every(
+      (namespace) =>
+        namespace.state === "observed" && namespace.identity !== null && namespace.distinct_from_caller === true,
+    ) &&
+    physical.termination.state === "observed-exited" &&
+    physical.termination.reason === "exited" &&
+    physical.cleanup.state === "observed-empty" &&
+    physical.cleanup.process_count === 0
+  );
+}
