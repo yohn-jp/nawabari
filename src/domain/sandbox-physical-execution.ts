@@ -78,16 +78,26 @@ export function runObservedSandboxChild(
   const interactive = options.interactive === true;
   const timeoutMs = options.timeout_ms ?? DEFAULT_TIMEOUT_MS;
   const maxOutputBytes = options.max_output_bytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const procfs = options.procfs;
   if (
     !options.execution_id ||
     !Number.isSafeInteger(timeoutMs) ||
     timeoutMs < 1 ||
     !Number.isSafeInteger(maxOutputBytes) ||
     maxOutputBytes < 1 ||
-    (options.procfs.mode === "private" && options.procfs.reason !== null) ||
-    (options.procfs.mode === "denied" &&
-      (typeof options.procfs.reason !== "string" || options.procfs.reason.length === 0))
+    procfs == null ||
+    (procfs.mode === "private" && procfs.reason !== null) ||
+    (procfs.mode === "denied" && (typeof procfs.reason !== "string" || procfs.reason.length === 0)) ||
+    (procfs.mode !== "private" && procfs.mode !== "denied")
   ) {
+    // The helper takes ownership of an already-spawned child. If its request
+    // cannot be observed safely, do not leave Bubblewrap blocked on fd 5.
+    child.once("error", () => undefined);
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // The child may have exited before validation completed.
+    }
     return Promise.resolve(
       failure(new DomainError("INVALID_ARGUMENT", "The physical sandbox observation request is invalid.", {})),
     );

@@ -90,3 +90,24 @@ test("owner cancellation preserves captured bytes and marks physical termination
   assert.equal(evidence.physical_execution.termination.reason, "cancelled");
   assert.equal(evidence.physical_execution.start.state, "unknown");
 });
+
+test("an invalid observation request kills the already-spawned, gated child", async () => {
+  const child = spawn(process.execPath, ["-e", "setTimeout(()=>{}, 5000)"], {
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe", "ignore", "pipe", "pipe"],
+  });
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+
+  const result = await runObservedSandboxChild(child, {
+    execution_id: "invalid-observation-request",
+    procfs: { mode: "private", reason: null },
+    timeout_ms: 0,
+  });
+  const exit = await closed;
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "INVALID_ARGUMENT");
+  assert.equal(exit.signal, "SIGKILL");
+});
