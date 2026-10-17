@@ -33,6 +33,83 @@ import {
 } from "./session-registry.js";
 import { withDirectoryFsyncFailure, withRegistryTempFileFsyncFailure } from "./testing/fs-fault-injection.js";
 
+test("verification snapshot is a read-only active-session filesystem policy fence", () => {
+  const fixture = createRepositoryFixture();
+  const worktreePath = path.join(path.dirname(fixture.repositoryPath), "nawabari-verification-snapshot");
+  try {
+    const repository = resolveRepositoryContext({ cwd: fixture.repositoryPath });
+    const revision = runGit(["rev-parse", "HEAD"], fixture.repositoryPath);
+    const identity = { repositoryHost: "local", repositoryId: repository.repositoryId };
+    const registry = new SessionRegistry({ cwd: fixture.repositoryPath });
+    const session = registry.provision({
+      worktreePath,
+      branchName: "feature/verification-snapshot",
+      executionScope: {
+        version: 1,
+        kind: "implementation-execution-scope",
+        authorization: {
+          version: 1,
+          kind: "implementation-authorization",
+          contractVersion: 1,
+          implementation: { ...identity, number: 9001 },
+          governedBodyDigest: "c".repeat(64),
+        },
+        repository: identity,
+        base: { branch: "main", revision },
+        scope: { readOnly: ["README.md"], write: [], create: [], delete: [], deny: [] },
+      },
+      candidateWorkingSet: {
+        kind: "candidate-working-set",
+        schemaVersion: 1,
+        workingSetId: "candidate-verification-snapshot",
+        repository: { ...identity, repository: "local/nawabari" },
+        revision,
+        entries: [
+          {
+            state: "required",
+            target: { kind: "file", locator: "README.md" },
+            reason: { id: "test:verification-snapshot", summary: "bounded fixture" },
+            evidence: [{ artifact: "test", reference: "README.md" }],
+          },
+        ],
+      },
+    });
+    const beforeRevision = registry.readRepositoryView().registryRevision;
+
+    const snapshot = registry.getSessionVerificationSnapshot(session.sessionId);
+
+    assert.equal(snapshot.contract_id, "nawabari.session-verification-snapshot.v1");
+    assert.equal(snapshot.schema_version, 1);
+    assert.equal(snapshot.session_id, session.sessionId);
+    assert.equal(snapshot.repository, repository.repositoryId);
+    assert.equal(snapshot.worktree, session.worktreePath);
+    assert.equal(snapshot.branch, session.branchName);
+    assert.equal(snapshot.state, "active");
+    assert.equal(snapshot.filesystem_policy_token.session_id, session.sessionId);
+    assert.equal(snapshot.filesystem_policy_token.registry_revision, beforeRevision);
+    assert.equal(snapshot.filesystem_policy_token.session_runtime_epoch, registry.runtimeEpoch);
+    assert.equal(snapshot.filesystem_policy_token.claim_set_generation, registry.readRepositoryView().claimSetGeneration);
+    assert.equal(snapshot.filesystem_policy_token.working_set_revision, session.workingSet?.revision);
+    assert.match(snapshot.filesystem_policy_token.profile_digest, /^[0-9a-f]{64}$/u);
+    assert.deepEqual(snapshot.managed, {
+      profile_digest: null,
+      admission: null,
+      runtime_epoch: registry.runtimeEpoch,
+      registry_revision: beforeRevision,
+      claim_set_generation: registry.readRepositoryView().claimSetGeneration,
+    });
+    assert.equal(registry.readRepositoryView().registryRevision, beforeRevision);
+  } finally {
+    try {
+      runGit(["worktree", "remove", "--force", worktreePath], fixture.repositoryPath);
+    } catch {
+      // Directory cleanup below remains safe if provisioning did not create it.
+    }
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    fixture.cleanup();
+  }
+});
+
 test("hook material authority is explicit and never serialized into registry state", () => {
   const fixture = createRepositoryFixture();
   try {
