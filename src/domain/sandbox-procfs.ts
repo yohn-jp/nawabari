@@ -17,7 +17,7 @@ function mountPath(value: string): string {
  * Instead select an empty read-only directory before launch. This is a narrower
  * view, not a retry after a selected runtime fails.
  */
-export function procfsPolicyFromMountInfo(mountInfo: string): SandboxProcfsPolicy {
+export function procfsPolicyFromMountInfo(mountInfo: string, uidMap?: string): SandboxProcfsPolicy {
   const records = mountInfo
     .trim()
     .split("\n")
@@ -30,6 +30,13 @@ export function procfsPolicyFromMountInfo(mountInfo: string): SandboxProcfsPolic
   });
   if (procRoot === undefined) return { mode: "denied", reason: "parent-procfs-unobservable" };
   if (records.some((fields) => fields.length >= 10 && mountPath(fields[4]).startsWith("/proc/"))) {
+    // Procfs submounts are also present on ordinary Linux hosts. In that
+    // topology a fresh private procfs remains supported; denying it breaks
+    // the existing Node/Git and /proc security contract. A rootless OCI user
+    // namespace does not have the full initial-userns UID mapping and keeps
+    // the narrower denied view when the parent procfs has overmounts.
+    if (uidMap !== undefined && /^\\s*0\\s+0\\s+4294967295\\s*$/u.test(uidMap))
+      return { mode: "private", reason: null };
     return { mode: "denied", reason: "parent-procfs-has-overmounts" };
   }
   return { mode: "private", reason: null };
@@ -37,7 +44,10 @@ export function procfsPolicyFromMountInfo(mountInfo: string): SandboxProcfsPolic
 
 export function observeSandboxProcfsPolicy(): SandboxProcfsPolicy {
   try {
-    return procfsPolicyFromMountInfo(readFileSync("/proc/self/mountinfo", "utf8"));
+    return procfsPolicyFromMountInfo(
+      readFileSync("/proc/self/mountinfo", "utf8"),
+      readFileSync("/proc/self/uid_map", "utf8"),
+    );
   } catch {
     return { mode: "denied", reason: "parent-procfs-unobservable" };
   }
