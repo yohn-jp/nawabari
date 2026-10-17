@@ -81,10 +81,8 @@ export function runObservedSandboxChild(
   const procfs = options.procfs;
   if (
     !options.execution_id ||
-    !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs < 1 ||
-    !Number.isSafeInteger(maxOutputBytes) ||
-    maxOutputBytes < 1 ||
+    (!interactive && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) ||
+    (!interactive && (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1)) ||
     procfs == null ||
     (procfs.mode === "private" && procfs.reason !== null) ||
     (procfs.mode === "denied" && (typeof procfs.reason !== "string" || procfs.reason.length === 0)) ||

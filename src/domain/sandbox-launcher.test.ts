@@ -1089,12 +1089,16 @@ test("interactive execution inherits the caller streams and skips bounded limits
     t.skip("run via pnpm test:linux:system");
     return;
   }
+  const layout = discoverSandboxRuntimeLayout();
+  if (layout.bubblewrap === null) {
+    t.skip("bubblewrap is unavailable in this test environment");
+    return;
+  }
   const repository = createRepository();
   const worktree = `${repository}-owned`;
-  const fixture = createControlledSandboxFixture();
   const marker = path.join(worktree, "interactive-marker.json");
   try {
-    const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const request = await resolvedRequest(repository, worktree, layout);
     const parentStdout = fs.fstatSync(1);
     const script = [
       "const fs = require('node:fs')",
@@ -1116,7 +1120,9 @@ test("interactive execution inherits the caller streams and skips bounded limits
     };
     assert.equal(observed.cwd, worktree);
     assert.equal(observed.home, "/home/nawabari");
-    assert.match(observed.path, /(?:^|:)\/usr\/bin(?:$|:)/u);
+    const invocation = compileSandboxInvocation(request, { command: "node", args: ["-e", script] });
+    assert.equal(invocation.ok, true);
+    if (invocation.ok) assert.equal(observed.path, invocation.value.env.PATH);
     assert.deepEqual(observed.stdout, { dev: parentStdout.dev, ino: parentStdout.ino });
 
     const signal = await runInteractiveSandboxedCommand(request, {
@@ -1146,7 +1152,6 @@ test("interactive execution inherits the caller streams and skips bounded limits
     );
     assert.equal(invalidLimits.ok, true, invalidLimits.ok ? "" : JSON.stringify(invalidLimits.error));
   } finally {
-    fixture.cleanup();
     removeWorktree(repository, worktree);
     fs.rmSync(repository, { recursive: true, force: true });
   }
