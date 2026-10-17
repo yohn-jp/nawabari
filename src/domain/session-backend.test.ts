@@ -29,6 +29,12 @@ import { LocalSessionBackend, probeLocalManagedExecutionReadiness } from "./sess
 import { DomainError, failure } from "./errors.js";
 import { resolveBuiltinWorktreeProfile } from "./worktree-profile-builtins.js";
 import type { SessionHookMaterialAuthority } from "../session-registry.js";
+import type { SessionCandidateScratchReleaseOptions } from "./session.js";
+import {
+  sessionCandidateBundleIdentityKeys,
+  sessionCandidateBundleRepositoryPath,
+  sessionCandidateBundleStagingRootPath,
+} from "../session-candidate-bundle-storage.js";
 
 test("failed protected bootstrap keeps durable ownership pending and normal guard denied", async () => {
   const repositoryPath = createRepository();
@@ -1785,6 +1791,106 @@ test("managed file operations execute after the kernel proves a never-launched s
     fixture.cleanup();
   }
 });
+
+for (const scope of ["populated", "none"] as const) {
+  test(`candidate scratch release uses the owner drain fence when owned scope is ${scope}`, async () => {
+    const fixture = managedFileOperationFixture(scope);
+    try {
+      const options = await candidateScratchReleaseFixture(fixture);
+      const result = await fixture.backend.releaseSessionCandidateScratch({ cwd: fixture.repositoryPath }, options);
+
+      if (scope === "populated") {
+        assert.equal(result.ok, false);
+        if (result.ok) return;
+        assert.equal(result.error.code, "OPERATION_REJECTED");
+        assert.equal(result.error.details?.status, "waiting");
+        assert.equal(fs.existsSync(path.join(options.snapshot.worktree, ".nawabari-verification-candidates")), true);
+        const admission = fixture.registry().getSessionLaunchAdmission(options.session_id);
+        assert.equal(admission?.admission, "closed");
+        assert.ok((admission?.runtime_epoch ?? 0) > options.snapshot.managed.runtime_epoch);
+      } else {
+        assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+        if (!result.ok) return;
+        assert.equal(result.value.removed, true);
+        assert.equal(result.value.session_id, options.session_id);
+        assert.equal(result.value.candidate_id, options.candidate_id);
+        assert.equal(result.value.candidate_digest, options.candidate_digest);
+        assert.equal(result.value.head_id, options.source.candidate_commit);
+        assert.equal(result.value.tree_id, options.source.candidate_tree);
+        assert.equal(fs.existsSync(result.value.staging_root), false);
+        assert.equal(result.value.snapshot.managed.admission, "closed");
+        assert.equal(result.value.snapshot.managed.runtime_epoch, options.snapshot.managed.runtime_epoch + 1);
+        assert.equal(result.value.drain_fence.operation, "close");
+        assert.equal(result.value.drain_fence.policy, "wait");
+        assert.equal(result.value.drain_fence.completion_observed, true);
+        assert.equal(result.value.drain_fence.kernel_empty, true);
+        assert.deepEqual(result.value.drain_fence.active_execution_ids, []);
+        assert.deepEqual(result.value.drain_fence.unknown_execution_ids, []);
+        assert.equal(
+          fixture.observations.some((observation) => !observation.lockHeld),
+          true,
+        );
+        assert.equal(fixture.registry().getSessionLaunchAdmission(options.session_id)?.admission, "closed");
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+async function candidateScratchReleaseFixture(
+  fixture: ReturnType<typeof managedFileOperationFixture>,
+): Promise<SessionCandidateScratchReleaseOptions> {
+  const sessionId = fixture.session.sessionId;
+  const snapshotResult = await fixture.backend.getSessionVerificationSnapshot(
+    { cwd: fixture.repositoryPath },
+    sessionId,
+  );
+  if (!snapshotResult.ok) throw snapshotResult.error;
+  const snapshot = snapshotResult.value;
+  const candidateDigest = `sha256:${"c".repeat(64)}`;
+  const projectId = "project-release-test";
+  const sourceId = "source-release-test";
+  const keys = sessionCandidateBundleIdentityKeys(candidateDigest, projectId, sourceId);
+  const stagingRoot = sessionCandidateBundleStagingRootPath(snapshot.worktree, candidateDigest, projectId, sourceId);
+  const repositoryPath = sessionCandidateBundleRepositoryPath(snapshot.worktree, candidateDigest, projectId, sourceId);
+  const candidateRoot = path.dirname(stagingRoot);
+  const candidateScratchRoot = path.dirname(candidateRoot);
+  for (const directory of [candidateScratchRoot, candidateRoot, stagingRoot, repositoryPath]) {
+    fs.mkdirSync(directory, { mode: 0o700 });
+  }
+  const branch = `nawabari-candidate-${keys.candidate_hex}-${keys.source_key}`;
+  runGit(["init", "--quiet", "-b", branch], repositoryPath);
+  runGit(["config", "user.email", "candidate-release@example.invalid"], repositoryPath);
+  runGit(["config", "user.name", "Candidate Release Test"], repositoryPath);
+  fs.writeFileSync(path.join(repositoryPath, "README.md"), "base\n");
+  runGit(["add", "README.md"], repositoryPath);
+  runGit(["commit", "--quiet", "-m", "base"], repositoryPath);
+  const baseCommit = runGit(["rev-parse", "HEAD"], repositoryPath);
+  fs.writeFileSync(path.join(repositoryPath, "README.md"), "candidate\n");
+  runGit(["commit", "--quiet", "-am", "candidate"], repositoryPath);
+  const candidateCommit = runGit(["rev-parse", "HEAD"], repositoryPath);
+  const candidateTree = runGit(["rev-parse", "HEAD^{tree}"], repositoryPath);
+  runGit(["update-ref", `refs/nawabari/bases/${keys.candidate_hex}`, baseCommit], repositoryPath);
+  runGit(
+    ["update-ref", `refs/nawabari/candidates/${keys.candidate_hex}/${keys.source_key}`, candidateCommit],
+    repositoryPath,
+  );
+  return {
+    session_id: sessionId,
+    snapshot,
+    candidate_id: "candidate-release-test",
+    candidate_digest: candidateDigest,
+    source: {
+      project_id: projectId,
+      source_id: sourceId,
+      bundle_sha256: `sha256:${"d".repeat(64)}`,
+      base_commit: baseCommit,
+      candidate_commit: candidateCommit,
+      candidate_tree: candidateTree,
+    },
+  };
+}
 
 function createRepository(): string {
   const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "nawabari-domain-"));

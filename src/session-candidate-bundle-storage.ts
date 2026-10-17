@@ -1,7 +1,14 @@
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+
+import {
+  createGitCommandRunner,
+  GIT_COMMAND_TIMEOUT_MS,
+  GIT_SOURCE_MAX_METADATA_BYTES,
+  GIT_SOURCE_MAX_DEPTH,
+  GIT_SOURCE_MAX_PATHS,
+} from "./git.js";
 
 const digest = /^sha256:([0-9a-f]{64})$/u;
 const gitObjectId = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
@@ -27,7 +34,11 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function identityParts(candidateDigest: string, projectId: string, sourceId: string): {
+function identityParts(
+  candidateDigest: string,
+  projectId: string,
+  sourceId: string,
+): {
   candidateHex: string;
   sourceKey: string;
 } {
@@ -113,74 +124,85 @@ function lstatOwnedDirectory(target: string, expectedUid: number, requirePrivate
   }
 }
 
+function readBoundedDirectoryNames(directory: string, maximum: number): string[] {
+  const names: string[] = [];
+  const handle = fs.opendirSync(directory);
+  try {
+    for (;;) {
+      const entry = handle.readSync();
+      if (entry === null) return names;
+      if (names.length >= maximum) reject("owner scratch exceeds the source path bound");
+      names.push(entry.name);
+    }
+  } finally {
+    handle.closeSync();
+  }
+}
+
 function scanTreeWithoutMetadataLinks(root: string): void {
-  const pending = [root];
+  const pending = [{ directory: root, depth: 0 }];
+  let paths = 0;
   while (pending.length > 0) {
-    const directory = pending.pop()!;
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      const target = path.join(directory, entry.name);
-      const stat = fs.lstatSync(target);
-      if (stat.isSymbolicLink()) reject("Git metadata contains a symbolic link");
-      if (stat.isDirectory()) {
-        pending.push(target);
-      } else if (!stat.isFile()) {
-        reject("scratch contains a non-regular filesystem object");
+    const { directory, depth } = pending.pop()!;
+    if (depth > GIT_SOURCE_MAX_DEPTH) reject("Git metadata exceeds the source depth bound");
+    const handle = fs.opendirSync(directory);
+    try {
+      for (;;) {
+        const entry = handle.readSync();
+        if (entry === null) break;
+        paths += 1;
+        if (paths > GIT_SOURCE_MAX_PATHS) reject("Git metadata exceeds the source path bound");
+        const target = path.join(directory, entry.name);
+        const stat = fs.lstatSync(target);
+        if (stat.isSymbolicLink()) reject("Git metadata contains a symbolic link");
+        if (stat.isDirectory()) {
+          pending.push({ directory: target, depth: depth + 1 });
+        } else if (!stat.isFile()) {
+          reject("scratch contains a non-regular filesystem object");
+        }
       }
+    } finally {
+      handle.closeSync();
     }
   }
 }
 
 function rejectNestedGitMetadata(repositoryPath: string): void {
-  const pending = [repositoryPath];
+  const pending = [{ directory: repositoryPath, depth: 0 }];
+  let paths = 0;
   while (pending.length > 0) {
-    const directory = pending.pop()!;
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      const target = path.join(directory, entry.name);
-      if (directory === repositoryPath && entry.name === ".git") continue;
-      const stat = fs.lstatSync(target);
-      if (entry.name === ".git") reject("a nested Git repository was added");
-      if (stat.isSymbolicLink()) continue;
-      if (stat.isDirectory()) pending.push(target);
-      else if (!stat.isFile()) reject("candidate contains a non-regular filesystem object");
+    const { directory, depth } = pending.pop()!;
+    if (depth > GIT_SOURCE_MAX_DEPTH) reject("candidate exceeds the source depth bound");
+    const handle = fs.opendirSync(directory);
+    try {
+      for (;;) {
+        const entry = handle.readSync();
+        if (entry === null) break;
+        paths += 1;
+        if (paths > GIT_SOURCE_MAX_PATHS) reject("candidate exceeds the source path bound");
+        const target = path.join(directory, entry.name);
+        if (directory === repositoryPath && entry.name === ".git") continue;
+        const stat = fs.lstatSync(target);
+        if (entry.name === ".git") reject("a nested Git repository was added");
+        if (stat.isSymbolicLink()) continue;
+        if (stat.isDirectory()) pending.push({ directory: target, depth: depth + 1 });
+        else if (!stat.isFile()) reject("candidate contains a non-regular filesystem object");
+      }
+    } finally {
+      handle.closeSync();
     }
   }
 }
 
+const scratchGit = createGitCommandRunner({
+  maxOutputBytes: GIT_SOURCE_MAX_METADATA_BYTES,
+  timeoutMs: GIT_COMMAND_TIMEOUT_MS,
+  env: { GIT_NO_REPLACE_OBJECTS: "1" },
+});
+
 function git(worktree: string, args: readonly string[]): string {
-  const environment: NodeJS.ProcessEnv = {
-    ...process.env,
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_OPTIONAL_LOCKS: "0",
-    GIT_NO_REPLACE_OBJECTS: "1",
-  };
-  for (const name of [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CONFIG_PARAMETERS",
-  ]) {
-    delete environment[name];
-  }
   try {
-    return String(
-      execFileSync(
-        "git",
-        ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "gc.auto=0", ...args],
-        {
-          cwd: worktree,
-          encoding: "utf8",
-          env: environment,
-          maxBuffer: 1024 * 1024,
-          timeout: 30_000,
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      ),
-    ).trim();
+    return scratchGit.run(["--no-replace-objects", ...args], worktree);
   } catch {
     return reject("Git identity or cleanliness could not be verified");
   }
@@ -220,7 +242,11 @@ export function inspectSessionCandidateBundleScratch(
     return reject("owner identity is invalid");
   }
   try {
-    if (!path.isAbsolute(worktree) || path.resolve(worktree) !== worktree || fs.realpathSync.native(worktree) !== worktree)
+    if (
+      !path.isAbsolute(worktree) ||
+      path.resolve(worktree) !== worktree ||
+      fs.realpathSync.native(worktree) !== worktree
+    )
       reject("the owned worktree is not canonical");
     const worktreeStat = fs.lstatSync(worktree);
     if (!worktreeStat.isDirectory() || worktreeStat.isSymbolicLink() || worktreeStat.uid !== uid)
@@ -231,7 +257,7 @@ export function inspectSessionCandidateBundleScratch(
     lstatOwnedDirectory(candidateDirectory, uid);
     lstatOwnedDirectory(stagingRoot, uid);
 
-    const stageEntries = fs.readdirSync(stagingRoot).sort();
+    const stageEntries = readBoundedDirectoryNames(stagingRoot, 2).sort();
     if (stageEntries.length !== 1 || stageEntries[0] !== "repo")
       reject("scratch has an unexpected or recoverable transfer entry");
     lstatOwnedDirectory(repositoryPath, uid);
@@ -240,10 +266,10 @@ export function inspectSessionCandidateBundleScratch(
     scanTreeWithoutMetadataLinks(gitDirectory);
     rejectNestedGitMetadata(repositoryPath);
 
-    const gitEntries = fs.readdirSync(gitDirectory);
+    const gitEntries = readBoundedDirectoryNames(gitDirectory, GIT_SOURCE_MAX_PATHS);
     if (gitEntries.includes("objects")) {
       const info = path.join(gitDirectory, "objects", "info");
-      if (fs.existsSync(info) && fs.readdirSync(info).includes("alternates"))
+      if (fs.existsSync(info) && readBoundedDirectoryNames(info, GIT_SOURCE_MAX_PATHS).includes("alternates"))
         reject("repository depends on external Git objects");
     }
     if (gitEntries.includes("shallow")) reject("repository is shallow");
@@ -257,10 +283,7 @@ export function inspectSessionCandidateBundleScratch(
     const candidateRef = `refs/nawabari/candidates/${candidateHex}/${sourceKey}`;
     const branchRef = `refs/heads/nawabari-candidate-${candidateHex}-${sourceKey}`;
     const expectedRefs = [baseRef, candidateRef, branchRef].sort();
-    const actualRefs = git(repositoryPath, ["for-each-ref", "--format=%(refname)"])
-      .split("\n")
-      .filter(Boolean)
-      .sort();
+    const actualRefs = git(repositoryPath, ["for-each-ref", "--format=%(refname)"]).split("\n").filter(Boolean).sort();
     if (JSON.stringify(actualRefs) !== JSON.stringify(expectedRefs)) reject("repository has unexpected refs");
     if (git(repositoryPath, ["remote"]) !== "") reject("repository has an unexpected remote");
     if (git(repositoryPath, ["rev-parse", "--show-toplevel"]) !== repositoryPath)
@@ -285,25 +308,31 @@ export function inspectSessionCandidateBundleScratch(
       reject("candidate source identity changed");
     }
     try {
-      execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "merge-base", "--is-ancestor", baseId, candidateId], {
-        cwd: repositoryPath,
-        env: {
-          ...process.env,
-          GIT_CONFIG_GLOBAL: "/dev/null",
-          GIT_CONFIG_NOSYSTEM: "1",
-          GIT_TERMINAL_PROMPT: "0",
-          GIT_OPTIONAL_LOCKS: "0",
-          GIT_NO_REPLACE_OBJECTS: "1",
-        },
-        timeout: 30_000,
-        stdio: ["ignore", "ignore", "pipe"],
-      });
+      scratchGit.run(
+        [
+          "--no-replace-objects",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "core.fsmonitor=false",
+          "merge-base",
+          "--is-ancestor",
+          baseId,
+          candidateId,
+        ],
+        repositoryPath,
+      );
     } catch {
       reject("candidate does not descend from the declared base commit");
     }
     if (
-      git(repositoryPath, ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none"]) !==
-      ""
+      git(repositoryPath, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+        "--ignore-submodules=none",
+      ]) !== ""
     ) {
       reject("candidate worktree contains dirty or recoverable files");
     }

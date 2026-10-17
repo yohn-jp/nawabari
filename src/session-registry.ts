@@ -1536,6 +1536,16 @@ export class SessionRegistry implements SessionRetentionAuthority {
           sessionId: options.session_id,
         });
       }
+      // The effective filesystem-policy digest includes the runtime epoch, so
+      // the canonical digest is expected to change as admission closes. All
+      // other owner identities and policy generations must remain exact.
+      const comparableCurrentSnapshot: SessionVerificationSnapshot = {
+        ...currentSnapshot,
+        filesystem_policy_token: {
+          ...currentSnapshot.filesystem_policy_token,
+          profile_digest: options.snapshot.filesystem_policy_token.profile_digest,
+        },
+      };
       const expectedSnapshot: SessionVerificationSnapshot = {
         ...options.snapshot,
         filesystem_policy_token: {
@@ -1550,7 +1560,10 @@ export class SessionRegistry implements SessionRetentionAuthority {
           registry_revision: expectedRevision,
         },
       };
-      if (!isDeepStrictEqual(currentSnapshot, expectedSnapshot)) {
+      if (
+        !/^[0-9a-f]{64}$/u.test(currentSnapshot.filesystem_policy_token.profile_digest) ||
+        !isDeepStrictEqual(comparableCurrentSnapshot, expectedSnapshot)
+      ) {
         throw new SessionRegistryError(
           "STALE_REGISTRY",
           "Candidate release owner snapshot changed after admission was closed.",
