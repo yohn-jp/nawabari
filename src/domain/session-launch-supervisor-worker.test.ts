@@ -385,7 +385,16 @@ test("the compiled trusted supervisor keeps an immediate payload descendant in i
       }
     }
     assert.equal(outcome.ok, true, outcome.ok ? "" : outcome.error.message);
-    if (outcome.ok) assert.equal(outcome.value.status, "completed");
+    if (outcome.ok) {
+      // This cgroup fixture deliberately spawns plain Node, not Bubblewrap.
+      // It proves descendant ownership above; it must not produce protected
+      // execution success without independently observed namespaces.
+      assert.equal(outcome.value.status, "failed", JSON.stringify(outcome.value));
+      assert.equal(
+        (outcome.value.result as SandboxExecutionEvidenceSnapshot).physical_execution.start.state,
+        "unknown",
+      );
+    }
   } finally {
     fs.writeFileSync(release, "release");
     if (runPromise !== null) await runPromise.catch(() => undefined);
