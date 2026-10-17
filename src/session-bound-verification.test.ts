@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createFilesystemPolicyToken } from "./domain/filesystem-policy-revision.js";
-import { success } from "./domain/errors.js";
+import { DomainError, failure, success } from "./domain/errors.js";
 import type { SessionBackend, SessionContext, SessionVerificationSnapshot } from "./domain/session.js";
 import {
   isSessionBoundPhysicalExecutionProven,
@@ -104,6 +104,62 @@ test("a stale owner snapshot is refused before entering managed launch", async (
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.error.code, "STALE_REGISTRY");
   assert.equal(launchAuthorityRead, false);
+});
+
+test("owner identity drift is refused before entering managed launch", async () => {
+  const expected = snapshot();
+  const staleSnapshots = [
+    snapshot({ repository: "github.com/example/other" }),
+    snapshot({
+      filesystem_policy_token: {
+        ...expected.filesystem_policy_token,
+        claim_set_generation: 4,
+      },
+      managed: { ...expected.managed, claim_set_generation: 4 },
+    }),
+    snapshot({
+      filesystem_policy_token: {
+        ...expected.filesystem_policy_token,
+        session_runtime_epoch: 6,
+      },
+      managed: { ...expected.managed, runtime_epoch: 6 },
+    }),
+  ];
+
+  for (const live of staleSnapshots) {
+    let managedRuntimeRead = false;
+    const backend = {
+      getSessionVerificationSnapshot: async () => success(live),
+      getSessionManagedRuntime: async () => {
+        managedRuntimeRead = true;
+        throw new Error("stale owner identity must not reach managed launch");
+      },
+    } as unknown as SessionBackend;
+
+    const result = await executeSessionBoundVerification(context, backend, request(expected));
+
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "STALE_REGISTRY");
+    assert.equal(managedRuntimeRead, false);
+  }
+});
+
+test("an absent owner session returns its backend failure without launch fallback", async () => {
+  let managedRuntimeRead = false;
+  const backend = {
+    getSessionVerificationSnapshot: async () =>
+      failure(new DomainError("SESSION_NOT_FOUND", "The requested session is not registered.")),
+    getSessionManagedRuntime: async () => {
+      managedRuntimeRead = true;
+      throw new Error("an absent session must not reach managed launch");
+    },
+  } as unknown as SessionBackend;
+
+  const result = await executeSessionBoundVerification(context, backend, request(snapshot()));
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "SESSION_NOT_FOUND");
+  assert.equal(managedRuntimeRead, false);
 });
 
 test("a candidate cwd outside the owned session worktree is refused", async () => {
