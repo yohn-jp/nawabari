@@ -1127,22 +1127,22 @@ test("interactive execution inherits the caller streams and skips bounded limits
 
     const signal = await runInteractiveSandboxedCommand(request, {
       command: "node",
-      args: ["-e", "process.kill(process.ppid, 'SIGTERM'); setTimeout(() => {}, 1000)"],
+      args: ["-e", "process.kill(process.pid, 'SIGTERM'); setTimeout(() => {}, 1000)"],
     });
     assert.equal(signal.ok, true, signal.ok ? "" : JSON.stringify(signal.error));
     if (signal.ok) {
-      assert.equal(signal.value.exit_code, null);
-      assert.equal(signal.value.signal, "SIGTERM");
+      assert.equal(signal.value.exit_code, 128 + os.constants.signals.SIGTERM);
+      assert.equal(signal.value.signal, null);
     }
 
     const interrupt = await runInteractiveSandboxedCommand(request, {
       command: "node",
-      args: ["-e", "process.kill(process.ppid, 'SIGINT'); setTimeout(() => {}, 1000)"],
+      args: ["-e", "process.kill(process.pid, 'SIGINT'); setTimeout(() => {}, 1000)"],
     });
     assert.equal(interrupt.ok, true, interrupt.ok ? "" : JSON.stringify(interrupt.error));
     if (interrupt.ok) {
-      assert.equal(interrupt.value.exit_code, null);
-      assert.equal(interrupt.value.signal, "SIGINT");
+      assert.equal(interrupt.value.exit_code, 128 + os.constants.signals.SIGINT);
+      assert.equal(interrupt.value.signal, null);
     }
 
     const invalidLimits = await runSandboxedCommand(
