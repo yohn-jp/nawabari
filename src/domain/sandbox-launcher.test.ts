@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { runCli } from "../cli.js";
 import { startControlServer } from "../control-server.js";
+import { sandboxExecutionEvidenceFromError } from "./sandbox-execution-evidence.js";
 import { LocalSessionBackend } from "./session-backend.js";
 import { compileSessionEnvironment, materializeSessionRuntimeDirectories } from "./session-environment.js";
 import {
@@ -775,7 +776,7 @@ test("explicit compatibility projection is the only enforced legacy visibility a
     assert.equal(compiled.ok, true, compiled.ok ? "" : JSON.stringify(compiled.error));
     if (!compiled.ok) return;
 
-    assert.equal(request.filesystem.system_paths.includes("/usr"), true);
+    assert.equal(request.filesystem.system_paths.includes("/usr"), fixture.layout.usr === "/usr");
     assert.equal(
       compiled.value.args.some(
         (value, index, args) => (value === "--ro-bind" || value === "--bind") && args[index + 2] === "/usr",
@@ -1015,40 +1016,49 @@ test("protected launcher fails closed when bubblewrap is unavailable or the work
   }
 });
 
-test("sandboxed child limits are bounded and fail with stable errors", async () => {
+test("controlled bubblewrap preserves bounded errors and cannot claim physical success", async () => {
   const repository = createRepository();
   const worktree = `${repository}-owned`;
   const fixture = createControlledSandboxFixture();
   try {
     const request = await resolvedRequest(repository, worktree, fixture.layout);
+    const assertUnknownPhysicalRefusal = (
+      result: Awaited<ReturnType<typeof runSandboxedCommand>>,
+      expected: Readonly<{ code: string; exit_code?: number | null; signal?: string | null }>,
+    ): void => {
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.equal(result.error.code, expected.code);
+      const evidence = sandboxExecutionEvidenceFromError(result.error);
+      assert.ok(evidence);
+      if ("exit_code" in expected) assert.equal(evidence.exit_code, expected.exit_code);
+      if ("signal" in expected) assert.equal(evidence.signal, expected.signal);
+      assert.equal(evidence.physical_execution.start.state, "unknown");
+      assert.equal(evidence.physical_execution.termination.state, "unknown");
+      assert.equal(evidence.physical_execution.cleanup.state, "unknown");
+    };
     const output = await runSandboxedCommand(
       request,
       { command: "node", args: ["-e", "process.stdout.write('0123456789')"] },
       { max_output_bytes: 5 },
     );
-    assert.equal(output.ok, false);
-    if (!output.ok) assert.equal(output.error.code, "SANDBOX_OUTPUT_LIMIT");
+    assertUnknownPhysicalRefusal(output, { code: "SANDBOX_OUTPUT_LIMIT" });
 
     const timeout = await runSandboxedCommand(request, { command: "sh", args: ["-c", "sleep 1"] }, { timeout_ms: 20 });
-    assert.equal(timeout.ok, false);
-    if (!timeout.ok) assert.equal(timeout.error.code, "SANDBOX_EXECUTION_TIMEOUT");
+    assertUnknownPhysicalRefusal(timeout, { code: "SANDBOX_EXECUTION_TIMEOUT" });
 
     const nonzero = await runSandboxedCommand(request, { command: "node", args: ["-e", "process.exit(7)"] });
-    assert.equal(nonzero.ok, true, nonzero.ok ? "" : JSON.stringify(nonzero.error));
-    if (nonzero.ok) {
-      assert.equal(nonzero.value.exit_code, 7);
-      assert.equal(nonzero.value.signal, null);
-    }
+    assertUnknownPhysicalRefusal(nonzero, { code: "SANDBOX_EXECUTION_FAILED", exit_code: 7, signal: null });
 
     const signal = await runSandboxedCommand(request, {
       command: "node",
       args: ["-e", "process.kill(process.pid, 'SIGTERM')"],
     });
-    assert.equal(signal.ok, true, signal.ok ? "" : JSON.stringify(signal.error));
-    if (signal.ok) {
-      assert.equal(signal.value.exit_code, null);
-      assert.equal(signal.value.signal, "SIGTERM");
-    }
+    assertUnknownPhysicalRefusal(signal, {
+      code: "SANDBOX_EXECUTION_FAILED",
+      exit_code: null,
+      signal: "SIGTERM",
+    });
 
     const combinedOutput = await runSandboxedCommand(
       request,
@@ -1058,16 +1068,14 @@ test("sandboxed child limits are bounded and fail with stable errors", async () 
       },
       { max_output_bytes: 5 },
     );
-    assert.equal(combinedOutput.ok, false);
-    if (!combinedOutput.ok) assert.equal(combinedOutput.error.code, "SANDBOX_OUTPUT_LIMIT");
+    assertUnknownPhysicalRefusal(combinedOutput, { code: "SANDBOX_OUTPUT_LIMIT" });
 
     const unicodeOutput = await runSandboxedCommand(
       request,
       { command: "node", args: ["-e", "process.stdout.write('あ')"] },
       { max_output_bytes: 2 },
     );
-    assert.equal(unicodeOutput.ok, false);
-    if (!unicodeOutput.ok) assert.equal(unicodeOutput.error.code, "SANDBOX_OUTPUT_LIMIT");
+    assertUnknownPhysicalRefusal(unicodeOutput, { code: "SANDBOX_OUTPUT_LIMIT" });
   } finally {
     fixture.cleanup();
     removeWorktree(repository, worktree);
