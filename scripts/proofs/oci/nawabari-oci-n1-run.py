@@ -34,6 +34,10 @@ def main() -> int:
     parser.add_argument("--package-tar", required=True, help="Exact local Nawabari tarball installed in this consumer")
     parser.add_argument("--installed-proof", required=True, help="Installer-produced exact artifact integrity proof")
     parser.add_argument("--package-sha256", required=True, help="SHA-256 of the exact installed package tarball")
+    parser.add_argument(
+        "--reuse-positive-evidence",
+        help="Reuse a byte-preserved successful strict-boundary receipt instead of starting that payload again",
+    )
     parser.add_argument("--timeout-seconds", type=int, default=20)
     args = parser.parse_args()
 
@@ -331,6 +335,22 @@ def main() -> int:
             item.get("execution", {}).get("execution_id")
             for item in processes
             if isinstance(item, dict) and isinstance(item.get("execution"), dict)
+        )
+
+    def active_execution_ids(document: dict) -> list[str]:
+        processes = document.get("processes")
+        if not isinstance(processes, list):
+            return []
+        return sorted(
+            item.get("execution", {}).get("execution_id")
+            for item in processes
+            if isinstance(item, dict)
+            and isinstance(item.get("execution"), dict)
+            and item["execution"].get("state") == "attached"
+            and isinstance(item.get("cgroups"), dict)
+            and item["cgroups"].get("state") == "active"
+            and isinstance(item["cgroups"].get("cgroups"), dict)
+            and item["cgroups"]["cgroups"].get("population", {}).get("state") == "populated"
         )
 
     def complete_raw_streams(value: object) -> tuple[bytes, bytes] | None:
@@ -960,7 +980,8 @@ def main() -> int:
         if execution_ids(drain_before):
             failures.append("zero-execution drain probe unexpectedly had a recorded payload before close")
         sibling_execution_ids_before_drain = execution_ids(sibling_active) if isinstance(sibling_active, dict) else []
-        if len(sibling_execution_ids_before_drain) != 1 or not active_cgroup(sibling_active or {}):
+        sibling_active_ids_before_drain = active_execution_ids(sibling_active or {})
+        if len(sibling_active_ids_before_drain) != 1 or not active_cgroup(sibling_active or {}):
             failures.append("could not bind zero-record close test to one observed populated sibling execution")
         drain_close, drain_close_doc = invoke(
             "drain-probe-close-wait",
@@ -985,7 +1006,9 @@ def main() -> int:
                 {
                     "drain_probe_execution_ids_before": execution_ids(drain_before),
                     "sibling_execution_ids_before": sibling_execution_ids_before_drain,
+                    "sibling_active_execution_ids_before": sibling_active_ids_before_drain,
                     "sibling_execution_ids_after": sibling_execution_ids_after_drain,
+                    "sibling_active_execution_ids_after": active_execution_ids(sibling_after_drain),
                     "sibling_active_before": active_cgroup(sibling_active or {}),
                     "sibling_active_after": active_cgroup(sibling_after_drain),
                     "drain_close_return_code": drain_close.returncode,
@@ -1022,52 +1045,95 @@ def main() -> int:
             "git_executable:gitVersion.stdout.trim(),git_metadata_denied:{status:gitMetadata.status,stderr:gitMetadata.stderr.trim()},denials};"
             "process.stdout.write(JSON.stringify(report)+'\\n');"
         )
-        boundary_run, boundary_result = invoke(
-            "target-strict-boundary-run",
-            [
-                "session",
-                "run",
-                "--session",
-                args.session,
-                "--runtime-policy",
-                "strict",
-                "--",
-                "node",
-                "-e",
-                boundary_source,
-                owned_file,
-                boundary_paths["outer_oci_root"],
-                boundary_paths["peer_worktree"],
-                boundary_paths["control_store"],
-                boundary_paths["secret"],
-            ],
-            90,
-            target_worktree,
-        )
-        session_request_identity = (
-            recursively_find(boundary_result, "request_identity") if isinstance(boundary_result, dict) else None
-        )
-        if not isinstance(session_request_identity, dict) or session_request_identity.get("network_mode") != "inherited":
+        if args.reuse_positive_evidence:
+            prior_evidence = pathlib.Path(args.reuse_positive_evidence)
+            try:
+                prior_result_bytes = (prior_evidence / "target-strict-boundary-run.stdout").read_bytes()
+                prior_result = json.loads(prior_result_bytes)
+                prior_identity = json.loads((prior_evidence / "run-identity.json").read_text())
+                prior_argv = (prior_evidence / "target-strict-boundary-run.argv.json").read_bytes()
+                prior_stderr = (prior_evidence / "target-strict-boundary-run.stderr").read_bytes()
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError(f"could not load the prior successful strict-boundary receipt: {error}") from error
+            prior_physical = prior_result.get("physical_execution") if isinstance(prior_result, dict) else None
+            prior_cleanup = prior_physical.get("cleanup") if isinstance(prior_physical, dict) else None
+            if (
+                not isinstance(prior_identity, dict)
+                or not isinstance(prior_result, dict)
+                or not isinstance(prior_physical, dict)
+                or not isinstance(prior_cleanup, dict)
+                or prior_identity.get("package_sha256") != args.package_sha256
+                or prior_identity.get("target_session_id") != args.session
+                or prior_result.get("ok") is not True
+                or prior_result.get("exit_code") != 0
+                or prior_result.get("session_id") != args.session
+                or prior_result.get("execution_id") != prior_physical.get("correlation_id")
+                or prior_cleanup.get("state") != "observed-empty"
+            ):
+                raise RuntimeError("prior boundary evidence is not a successful, cleaned run for this exact package and session")
+            boundary_result = prior_result
+            boundary_returncode = 0
+            save("target-strict-boundary-run.stdout", prior_result_bytes)
+            save("target-strict-boundary-run.stderr", prior_stderr)
+            save("target-strict-boundary-run.argv.json", prior_argv)
+            save(
+                "target-strict-boundary-run-reused-from.json",
+                json.dumps(
+                    {
+                        "evidence_directory": str(prior_evidence),
+                        "execution_id": prior_result.get("execution_id"),
+                        "package_sha256": args.package_sha256,
+                        "started_again": False,
+                    },
+                    indent=2,
+                ).encode()
+                + b"\n",
+            )
+        else:
+            boundary_run, boundary_result = invoke(
+                "target-strict-boundary-run",
+                [
+                    "session",
+                    "run",
+                    "--session",
+                    args.session,
+                    "--runtime-policy",
+                    "strict",
+                    "--",
+                    "node",
+                    "-e",
+                    boundary_source,
+                    owned_file,
+                    boundary_paths["outer_oci_root"],
+                    boundary_paths["peer_worktree"],
+                    boundary_paths["control_store"],
+                    boundary_paths["secret"],
+                ],
+                90,
+                target_worktree,
+            )
+            boundary_returncode = boundary_run.returncode
+        session_network_mode = boundary_result.get("network_mode") if isinstance(boundary_result, dict) else None
+        if session_network_mode != "inherited":
             failures.append("strict target session did not preserve its owner-observed inherited network mode")
         network_isolation = {
             "container_engine_configuration": engine_resources,
             "host_kernel_container_observation": container_host_cgroup,
-            "session_request_identity": session_request_identity,
+            "session_network_mode": session_network_mode,
             "effective_network_mode": (
                 "none" if engine_resources.get("network_mode") == "none"
                 and isinstance(container_host_cgroup, dict)
                 and container_host_cgroup.get("network_namespace_distinct_from_caller") is True
                 and container_host_cgroup.get("network_observation", {}).get("only_loopback_observed") is True
-                and isinstance(session_request_identity, dict)
-                and session_request_identity.get("network_mode") == "inherited"
+                and session_network_mode == "inherited"
                 else "unknown"
             ),
         }
         (evidence / "network-isolation-observation.json").write_text(json.dumps(network_isolation, indent=2) + "\n")
         if network_isolation["effective_network_mode"] != "none":
             failures.append("network isolation was not jointly observed through OCI configuration, host net namespace, and session inheritance")
-        if boundary_run.returncode != 0 or not isinstance(boundary_result, dict) or boundary_result.get("ok") is not True:
-            failures.append(f"strict current-session read/write/boundary payload failed (exit={boundary_run.returncode})")
+        if boundary_returncode != 0 or not isinstance(boundary_result, dict) or boundary_result.get("ok") is not True:
+            failures.append(f"strict current-session read/write/boundary payload failed (exit={boundary_returncode})")
         checkpoint_result = invoke(
             "target-checkpoint-after-protected-write",
             ["checkpoint", "--session", args.session],
@@ -1192,7 +1258,7 @@ def main() -> int:
             "argv": ["-e", "process.stdout.write('STALE_SNAPSHOT_MUST_NOT_START\\n')"],
             "cwd": stale_snapshot.get("worktree"),
             "read_visibility": "declared",
-            "declared_read": [],
+            "declared_read": ["README.md"],
             "write_policy": "deny",
             "timeout_ms": 5000,
             "max_output_bytes": 8192,
@@ -1230,7 +1296,57 @@ def main() -> int:
             failures.append("stale snapshot attempt added or removed a durable execution record")
         save("stale-snapshot-comparison.json", json.dumps({"before": execution_ids(target_before), "after": execution_ids(after_stale)}, indent=2).encode() + b"\n")
 
-        timeout_snapshot = fresh_snapshot
+        # Return to the exact original claim ceiling after the intentional
+        # stale-generation mutation. Otherwise the temporary stale-trigger
+        # read claim would exceed the session profile's filesystem ceiling.
+        reset_result, reset_doc = invoke(
+            "target-claims-reset-after-stale-test",
+            [
+                "session",
+                "update",
+                "--session",
+                args.session,
+                "--resource",
+                "README.md",
+                "--mode",
+                "read",
+                "--resource",
+                owned_file,
+                "--mode",
+                "write",
+                "--if-generation",
+                str(candidate_generation),
+            ],
+            30,
+        )
+        if reset_result.returncode != 0 or not isinstance(reset_doc, dict) or reset_doc.get("ok") is not True:
+            raise RuntimeError("could not CAS-restore the exact original target claim set after stale refusal")
+        reset_claims = invoke_ok(
+            "target-claims-after-stale-reset", ["session", "claims", "--session", args.session]
+        ).get("claims")
+        normalized_reset_claims = {
+            (item.get("resource"), item.get("mode")) for item in reset_claims if isinstance(item, dict)
+        } if isinstance(reset_claims, list) else set()
+        if normalized_reset_claims != {("README.md", "read"), (owned_file, "write")}:
+            raise RuntimeError("target claims did not return to the exact pretest read/write baseline")
+        timeout_snapshot = invoke_ok(
+            "target-verification-snapshot-after-stale-reset",
+            ["verification", "snapshot", "--session", args.session],
+        ).get("snapshot")
+        timeout_generation = (
+            timeout_snapshot.get("filesystem_policy_token", {}).get("claim_set_generation")
+            if isinstance(timeout_snapshot, dict)
+            else None
+        )
+        if (
+            not isinstance(timeout_snapshot, dict)
+            or timeout_snapshot.get("session_id") != args.session
+            or not isinstance(timeout_generation, int)
+            or isinstance(timeout_generation, bool)
+            or timeout_generation <= candidate_generation
+        ):
+            raise RuntimeError("the fresh post-reset verifier snapshot did not bind the restored owner claim generation")
+
         timeout_profile = {
             **stale_profile,
             "profile_id": "physical-timeout-descendant-cleanup",
@@ -1534,9 +1650,7 @@ def main() -> int:
             "sibling_session_id": args.sibling_session,
             "engine_resources": engine_resources,
             "host_container_cgroup": container_host_cgroup,
-            "session_network_mode": session_request_identity.get("network_mode")
-            if isinstance(session_request_identity, dict)
-            else None,
+            "session_network_mode": session_network_mode,
             "network_isolation": network_isolation,
             "target_owned_cgroup_limits": target_cgroup_limits,
             "sibling_owned_cgroup_limits": sibling_cgroup_limits,
