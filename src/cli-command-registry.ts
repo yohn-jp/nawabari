@@ -669,7 +669,7 @@ const REGISTRY_DATA = [
   {
     name: "session close",
     summary: "Close the current or selected session",
-    usage: `${CLI_NAME} session close [<session-id>|--session <id>] [--integrated-revision <rev>] [--fetch-remote <name> --fetch-branch <branch>]`,
+    usage: `${CLI_NAME} session close [<session-id>|--session <id>] [--drain-policy <wait|terminate>] [--integrated-revision <rev>] [--fetch-remote <name> --fetch-branch <branch>]`,
     options: [
       option("--session", "Select a session instead of the current worktree owner", { value: "<id>" }),
       option(
@@ -681,9 +681,15 @@ const REGISTRY_DATA = [
         value: "<name>",
       }),
       option("--fetch-branch", "Integration branch to fetch; requires --fetch-remote", { value: "<branch>" }),
+      option(
+        "--drain-policy",
+        "Wait for this session's owned executions (default), or explicitly terminate their exact owned scopes before closing",
+        { value: "<wait|terminate>", default: "wait", values: ["wait", "terminate"] },
+      ),
     ],
     notes: [
       "Ordinary ancestry-based close remains the cheap/default path and requires no flags.",
+      "The default drain policy waits; terminate is explicit and targets only exact owned execution scopes after session admission is closed and ownership is revalidated.",
       "Network access is never implicit; --fetch-remote and --fetch-branch are accepted only with a full lowercase --integrated-revision SHA.",
       "Fetch updates only a disposable internal proof ref with no tags, FETCH_HEAD, tracking-ref, or local integration-branch changes; remote tip races fail closed.",
       "Nawabari never calls provider APIs such as GitHub; only explicit --fetch-remote/--fetch-branch options connect to the configured Git remote.",

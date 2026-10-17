@@ -896,6 +896,7 @@ export class LocalSessionBackend implements SessionBackend {
         runtimeLifecycleAdapter(registry, ({ fence }) => close(fence), this.registryOptions.cgroupFilesystem),
         sessionId,
         registry.runtimeEpoch,
+        options.drain_policy ?? "wait",
       );
       return drained.then((outcome) => {
         if (!outcome.ok) return outcome as DomainResult<SessionCloseResult>;

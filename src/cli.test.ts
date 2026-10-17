@@ -971,6 +971,12 @@ test("canonical command registry resolves aliases without duplicating option def
   )?.values;
   assert.deepEqual(actionValues, SESSION_ACTION_IDS);
 
+  const closeDrainPolicy = resolveCliCommandDefinition("session close")?.options.find(
+    (option) => option.name === "--drain-policy",
+  );
+  assert.deepEqual(closeDrainPolicy?.values, ["wait", "terminate"]);
+  assert.equal(closeDrainPolicy?.default, "wait");
+
   assert.deepEqual(publicNames, [
     "verification snapshot",
     "verification execute",
@@ -1891,7 +1897,7 @@ test("session reconcile requires an explicit target and apply flag, then delegat
   });
 });
 
-test("session close forwards explicit integration fetch metadata and rejects incomplete fetch options", async () => {
+test("session close forwards explicit drain policy and integration fetch metadata, with wait as default", async () => {
   let receivedOptions: SessionCloseOptions | null = null;
   let closeCalls = 0;
   const backend = backendForTests({
@@ -1915,6 +1921,8 @@ test("session close forwards explicit integration fetch metadata and rejects inc
       "origin",
       "--fetch-branch",
       "main",
+      "--drain-policy",
+      "terminate",
       "--json",
     ],
     { backend, io: output.io },
@@ -1925,7 +1933,28 @@ test("session close forwards explicit integration fetch metadata and rejects inc
     integrated_revision: integratedRevision,
     fetch_remote: "origin",
     fetch_branch: "main",
+    drain_policy: "terminate",
   });
+
+  const defaultOutput = capture();
+  const defaultExitCode = await runCli(["session", "close", "--json"], { backend, io: defaultOutput.io });
+  assert.equal(defaultExitCode, 0, defaultOutput.stderr.join("\n"));
+  assert.deepEqual(receivedOptions, {
+    session_id: null,
+    integrated_revision: null,
+    fetch_remote: null,
+    fetch_branch: null,
+    drain_policy: "wait",
+  });
+
+  const invalidPolicyOutput = capture();
+  const invalidPolicyExitCode = await runCli(["session", "close", "--drain-policy", "kill-all", "--json"], {
+    backend,
+    io: invalidPolicyOutput.io,
+  });
+  assert.equal(invalidPolicyExitCode, 2);
+  assert.equal(JSON.parse(invalidPolicyOutput.stdout[0]).code, "INVALID_ARGUMENT");
+  assert.equal(closeCalls, 2);
 
   const incompleteOutput = capture();
   const incompleteExitCode = await runCli(["session", "close", "--fetch-remote", "origin", "--json"], {
@@ -1933,7 +1962,7 @@ test("session close forwards explicit integration fetch metadata and rejects inc
     io: incompleteOutput.io,
   });
   assert.equal(incompleteExitCode, 2);
-  assert.equal(closeCalls, 1);
+  assert.equal(closeCalls, 2);
   assert.equal(JSON.parse(incompleteOutput.stdout[0]).code, "INVALID_ARGUMENT");
 });
 
@@ -1942,9 +1971,17 @@ test("session close help distinguishes provider APIs from explicit Git remote fe
   const exitCode = await runCli(["session", "close", "--help", "--json"], { io: output.io });
 
   assert.equal(exitCode, 0);
-  const response = JSON.parse(output.stdout[0] ?? "") as { notes: string[] };
+  const response = JSON.parse(output.stdout[0] ?? "") as {
+    notes: string[];
+    options: Array<{ name: string; values?: string[]; default?: string }>;
+  };
   assert.ok(response.notes.some((note) => note.includes("never calls provider APIs")));
   assert.ok(response.notes.some((note) => note.includes("only explicit --fetch-remote/--fetch-branch")));
+  assert.ok(response.notes.some((note) => note.includes("default drain policy waits")));
+  const drainPolicy = response.options.find((option) => option.name === "--drain-policy");
+  assert.ok(drainPolicy, "session close help should expose its explicit drain policy");
+  assert.deepEqual(drainPolicy.values, ["wait", "terminate"]);
+  assert.equal(drainPolicy.default, "wait");
 });
 
 test("session-scoped commands accept one consistent positional target and discard requires it", async () => {

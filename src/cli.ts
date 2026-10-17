@@ -405,6 +405,7 @@ type ParsedOptions = {
   integrated_revision: string | null;
   fetch_remote: string | null;
   fetch_branch: string | null;
+  drain_policy: "wait" | "terminate" | null;
   preview: boolean;
   runtime_policy: RuntimePolicyMode | null;
   schema_version: SessionDiagnosticSchemaVersion | null;
@@ -584,6 +585,7 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
     integrated_revision: null,
     fetch_remote: null,
     fetch_branch: null,
+    drain_policy: null,
     preview: false,
     runtime_policy: null,
     schema_version: null,
@@ -733,7 +735,17 @@ function parseOptions(arguments_: string[], allowed: ReadonlySet<string>): Domai
       options.schema_version = value === "1" ? 1 : 2;
     } else if (name === "--fetch-remote") options.fetch_remote = value;
     else if (name === "--fetch-branch") options.fetch_branch = value;
-    else if (name === "--port") options.port = value;
+    else if (name === "--drain-policy") {
+      if (value !== "wait" && value !== "terminate") {
+        return failure(
+          usageError("INVALID_ARGUMENT", "--drain-policy requires wait or terminate.", {
+            option: "--drain-policy",
+            values: ["wait", "terminate"],
+          }),
+        );
+      }
+      options.drain_policy = value;
+    } else if (name === "--port") options.port = value;
   }
 
   if (options.apply && dryRun) {
@@ -2353,6 +2365,7 @@ async function executeCommand(
           integrated_revision: parsed.value.integrated_revision,
           fetch_remote: parsed.value.fetch_remote,
           fetch_branch: parsed.value.fetch_branch,
+          drain_policy: parsed.value.drain_policy ?? "wait",
         };
         const selected = await dependencies.backend.closeSession(context, closeOptions);
         return selected.ok ? { ok: true, value: selected.value } : selected;

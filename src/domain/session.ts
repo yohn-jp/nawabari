@@ -10,6 +10,7 @@ import type { RepositoryIdentity } from "../working-set.js";
 import type { WorkingSetExpansionOutcome, WorkingSetExpansionRequestEntry } from "../working-set.js";
 import type { RepositoryRuntimeSnapshot } from "../repository-runtime-snapshot.js";
 import type { SessionActionDispatcher } from "./session-actions.js";
+import type { SessionDrainPolicy } from "./session-execution-control.js";
 import type {
   CoordinationPreviewOptions as RegistryCoordinationPreviewOptions,
   CoordinationPreviewResult as RegistryCoordinationPreviewResult,
@@ -278,6 +279,8 @@ export type ClaimDeltasResult = {
 
 export type SessionCloseOptions = {
   session_id: string | null;
+  /** Explicitly terminate this session's exact owned execution scopes before closing; omitted means wait. */
+  drain_policy?: SessionDrainPolicy;
   /** Caller-supplied authoritative revision proving non-ancestry integration (e.g. a squash-merge commit). Independently re-verified by exact Git tree-object equivalence; never trusted blindly. */
   integrated_revision?: string | null;
   /** Explicit opt-in remote used only to obtain missing integration-proof objects. */
