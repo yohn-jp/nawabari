@@ -57,8 +57,8 @@ def main() -> int:
     sibling_record = session_manifest.get("sibling", {}).get("session")
     owned_file = session_manifest.get("owned_file")
     stale_trigger_file = session_manifest.get("stale_trigger_file")
-    if owned_file != "nawabari-n1-owned-proof-v2.txt" or stale_trigger_file != "nawabari-n1-stale-trigger-v2.txt":
-        parser.error("bounded session manifest does not contain the reviewed v2 proof fixture paths")
+    if owned_file != "nawabari-n1-owned-proof-v3.txt" or stale_trigger_file != "nawabari-n1-stale-trigger-v3.txt":
+        parser.error("bounded session manifest does not contain the reviewed v3 proof fixture paths")
     args.session = target_record.get("session_id") if isinstance(target_record, dict) else None
     args.drain_probe_session = drain_probe_record.get("session_id") if isinstance(drain_probe_record, dict) else None
     args.sibling_session = sibling_record.get("session_id") if isinstance(sibling_record, dict) else None

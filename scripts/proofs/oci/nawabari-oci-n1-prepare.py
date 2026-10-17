@@ -18,11 +18,11 @@ import sys
 import time
 import uuid
 
-PROFILE_ID = "oci-n1-physical-v2"
-OWNED_FILE = "nawabari-n1-owned-proof-v2.txt"
-STALE_TRIGGER_FILE = "nawabari-n1-stale-trigger-v2.txt"
-BASE_SENTINEL = "OCI_NAWABARI_N1_OWNED_WRITE_BASE_V2\n"
-STALE_SENTINEL = "OCI_NAWABARI_N1_STALE_TRIGGER_BASE_V2\n"
+PROFILE_ID = "oci-n1-physical-v3"
+OWNED_FILE = "nawabari-n1-owned-proof-v3.txt"
+STALE_TRIGGER_FILE = "nawabari-n1-stale-trigger-v3.txt"
+BASE_SENTINEL = "OCI_NAWABARI_N1_OWNED_WRITE_BASE_V3\n"
+STALE_SENTINEL = "OCI_NAWABARI_N1_STALE_TRIGGER_BASE_V3\n"
 
 
 def main() -> int:
@@ -146,7 +146,7 @@ def main() -> int:
         profile["version"] = "1"
         profile["extends"] = []
         profile["filesystem"] = {
-            "readOnly": ["README.md", STALE_TRIGGER_FILE],
+            "readOnly": ["README.md"],
             "write": [OWNED_FILE],
             "create": [],
             "delete": [],
