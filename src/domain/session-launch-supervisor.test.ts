@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { sessionCandidateBundleStageArgs } from "../session-candidate-bundle.js";
 import { createCgroupScope, readCgroupPopulation, type CgroupFileSystem } from "./cgroups-v2.js";
 import { DomainError, failure, success } from "./errors.js";
 import { decideExecutionAdmission, type ExecutionAdmissionReservation } from "./session-admission-decision.js";
@@ -144,6 +145,31 @@ function packet(overrides: Partial<SessionLaunchSupervisorPacket> = {}): Session
     ...overrides,
   };
 }
+
+test("candidate staging argv passes the trusted supervisor per-argument bound", async () => {
+  const stageArgs = sessionCandidateBundleStageArgs({
+    worktree: "/tmp/worktree",
+    candidateDigest: `sha256:${"a".repeat(64)}`,
+    projectId: "project-1",
+    sourceId: "source-1",
+    bundleSha256: `sha256:${"b".repeat(64)}`,
+    baseCommit: "c".repeat(40),
+    candidateCommit: "d".repeat(40),
+    candidateTree: "e".repeat(40),
+  });
+  assert.ok(stageArgs.every((argument) => argument.length <= 4_096));
+  const events: string[] = [];
+  const result = await runSessionLaunchSupervisor({
+    ...packet({ payload: { ...payload, args: stageArgs } }),
+    process_factory: async (request) => {
+      assert.deepEqual(request.payload.args, stageArgs);
+      return fakeProcess(events);
+    },
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.error.message);
+  if (result.ok) assert.equal(result.value.status, "completed");
+  assert.deepEqual(events, ["go", "wait"]);
+});
 
 test("attaches the supervisor, durably revalidates, and sends one GO before waiting for payload result", async () => {
   const events: string[] = [];
