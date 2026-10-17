@@ -42,8 +42,10 @@ Nine real Landlock/protected/readiness/release source cases plus one unmatched-m
 
 Reviewable raw evidence and digests are preserved in Next:
 
-- [Exact-package consumer evidence](https://github.com/yohn-jp/mottainai-next/tree/fabcd62d/docs/reports/implementation/oci-recovery/evidence/20261017-next-physical-consumer-6a3504).
-- [Original cancellation uncertainty and successful owner restart](https://github.com/yohn-jp/mottainai-next/tree/fabcd62d/docs/reports/implementation/oci-recovery/evidence/20261017-n1-cancel-restart).
-- [Continuation chronology](https://github.com/yohn-jp/mottainai-next/blob/fabcd62d/docs/reports/implementation/oci-recovery/nawabari-20261017-continuation.md).
+- [Exact-package consumer evidence](https://github.com/yohn-jp/mottainai-next/tree/02d242a5/docs/reports/implementation/oci-recovery/evidence/20261017-next-physical-consumer-6a3504).
+- [Original cancellation uncertainty and successful owner restart](https://github.com/yohn-jp/mottainai-next/tree/02d242a5/docs/reports/implementation/oci-recovery/evidence/20261017-n1-cancel-restart).
+- [Continuation chronology](https://github.com/yohn-jp/mottainai-next/blob/02d242a5/docs/reports/implementation/oci-recovery/nawabari-20261017-continuation.md).
 
 No npm package is published. Upstream merge/release and external review remain separate. An explicitly authorized compatible model/provider binding remains absent, so full Next R5–R7/Goal acceptance and its post-Goal Tsukai PR lifecycle remain blocked.
+
+The future N1 runner was corrected in `2ad6896f80c61d3e3d0e8cf58aa4683d65a1ba80`: cancellation completion requires repeated exact owner/host cgroup emptiness and re-observation of the captured original PID generations. Dirty work is retained through read-only owner inspection, with no forced discard/replacement. Root freshly compiled the script and evaluated its actual predicate against the saved raw physical observations, preserving namespace unknown, unresolved acknowledgement, absent receipt and the original runner exit 1. This is a driver-only correction and offline evaluation, not a new physical run or a change to producer verification acceptance. Root again compared all 423 compiled files against the exact package.
