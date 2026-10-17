@@ -13,10 +13,11 @@ import {
   isVerificationSourceWitnessCurrent,
   validateVerificationProfile,
 } from "./verification-executor.js";
-import { success, type DomainResult } from "./domain/errors.js";
+import type { DomainResult } from "./domain/errors.js";
 import { createFilesystemPolicyToken } from "./domain/filesystem-policy-revision.js";
 import type { SandboxExecutionRequest } from "./domain/sandbox.js";
 import type { SandboxExecutionResult } from "./domain/sandbox-launcher.js";
+import { sandboxExecutionMockSuccess } from "./testing/sandbox-execution-evidence-mock.js";
 
 const agentWorkingSet = {
   contract_id: "nawabari.working-set-runtime-projection.v1" as const,
@@ -191,7 +192,7 @@ test("verification derives a repository read-only projection without mutating ag
   let receivedRequest: SandboxExecutionRequest | null = null;
   const execute = async (sandboxRequest: SandboxExecutionRequest): Promise<DomainResult<SandboxExecutionResult>> => {
     receivedRequest = sandboxRequest;
-    return success({
+    return sandboxExecutionMockSuccess({
       exit_code: 1,
       signal: null,
       stdout: source,
@@ -225,7 +226,7 @@ test("declared verification visibility is the only read grant and keeps writes d
   let receivedRequest: SandboxExecutionRequest | null = null;
   const execute = async (sandboxRequest: SandboxExecutionRequest): Promise<DomainResult<SandboxExecutionResult>> => {
     receivedRequest = sandboxRequest;
-    return success({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
+    return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "", stderr: "", duration_ms: 1 });
   };
 
   const result = await executeVerification(
@@ -293,7 +294,7 @@ test("source-bound verification rejects same-path byte edits during protected ex
           invoked = true;
           fs.writeFileSync(sourcePath, "other\n");
           fs.utimesSync(sourcePath, FIXED_SOURCE_TIME, FIXED_SOURCE_TIME);
-          return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
         },
       },
     );
@@ -316,7 +317,10 @@ test("source witness currentness tracks source, base, profile, policy, runtime, 
       { ...profile, cwd: fixture.root },
       fixture.request,
       policyFence,
-      { execute: async () => success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 }) },
+      {
+        execute: async () =>
+          sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 }),
+      },
     );
     assert.equal(result.ok, true);
     if (!result.ok || result.value.source.status !== "proven") return;
@@ -394,7 +398,7 @@ test("source-bound verification fails closed when a declared source is unobserva
       {
         execute: async () => {
           invoked = true;
-          return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+          return sandboxExecutionMockSuccess({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
         },
       },
     );
@@ -438,7 +442,13 @@ test("source-bound verification rejects current policy and runtime changes durin
                 profile: { id: "node-runtime", version: "changed-during-execution" },
               };
             }
-            return success({ exit_code: 0, signal: null, stdout: "ok", stderr: "", duration_ms: 1 });
+            return sandboxExecutionMockSuccess({
+              exit_code: 0,
+              signal: null,
+              stdout: "ok",
+              stderr: "",
+              duration_ms: 1,
+            });
           },
         },
       );

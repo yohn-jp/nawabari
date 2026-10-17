@@ -21,6 +21,8 @@ import {
   type ExecutionAdmissionReservation,
 } from "./session-admission-decision.js";
 import { DomainError, failure, success, type DomainResult, type JsonObject } from "./errors.js";
+import { isSandboxExecutionEvidenceSnapshot } from "./sandbox-execution-evidence.js";
+import type { SandboxProcfsSelection } from "./sandbox-physical-execution.js";
 
 export const SESSION_LAUNCH_SUPERVISOR_CONTRACT_ID = "nawabari.session-launch-supervisor.v1" as const;
 export const SESSION_LAUNCH_SUPERVISOR_SCHEMA_VERSION = 1 as const;
@@ -38,6 +40,11 @@ export type TrustedSandboxPayload = {
   readonly args: readonly string[];
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
+  /** Procfs decision resolved by the sandbox owner from parent mount topology. */
+  readonly procfs: SandboxProcfsSelection;
+  /** Profile-bounded command limits for session-bound verification. */
+  readonly timeout_ms?: number;
+  readonly max_output_bytes?: number;
   /** Exact stdio topology expected by the existing launcher. Index 3 is seccomp. */
   readonly stdio: readonly [SupervisorStdioValue, SupervisorStdioValue, SupervisorStdioValue, number];
   /** Descriptor passed to the trusted supervisor as fd 3. */
@@ -101,7 +108,7 @@ export type SupervisorStartRequest = {
 
 export type SupervisorChildResult =
   | { readonly status: "completed"; readonly result?: unknown }
-  | { readonly status: "failed"; readonly error?: string }
+  | { readonly status: "failed"; readonly error?: string; readonly result?: unknown }
   | { readonly status: "unknown" };
 
 export type TrustedSupervisorProcess = {
@@ -127,6 +134,9 @@ export function serializeTrustedSupervisorGoMessage(request: SupervisorStartRequ
       args: request.payload.args,
       cwd: request.payload.cwd,
       env: request.payload.env,
+      procfs: request.payload.procfs,
+      ...(request.payload.timeout_ms === undefined ? {} : { timeout_ms: request.payload.timeout_ms }),
+      ...(request.payload.max_output_bytes === undefined ? {} : { max_output_bytes: request.payload.max_output_bytes }),
       // The parent's descriptor may have any number, but the child receives
       // it at fd 3 because stdio slot 3 is the inherited seccomp descriptor.
       stdio: [request.payload.stdio[0], request.payload.stdio[1], request.payload.stdio[2], 3],
@@ -265,6 +275,28 @@ function validatePayload(payload: TrustedSandboxPayload): DomainResult<TrustedSa
       return invalid("The trusted sandbox stdio mode is invalid.", {});
     }
   }
+  if (
+    typeof payload.procfs !== "object" ||
+    payload.procfs === null ||
+    (payload.procfs.mode !== "private" && payload.procfs.mode !== "denied") ||
+    (payload.procfs.mode === "private" && payload.procfs.reason !== null) ||
+    (payload.procfs.mode === "denied" &&
+      (typeof payload.procfs.reason !== "string" ||
+        payload.procfs.reason.length === 0 ||
+        payload.procfs.reason.includes("\0")))
+  ) {
+    return invalid("The trusted sandbox procfs selection is invalid.", {});
+  }
+  if (
+    (payload.timeout_ms !== undefined &&
+      (!Number.isSafeInteger(payload.timeout_ms) || payload.timeout_ms < 1 || payload.timeout_ms > 15 * 60 * 1_000)) ||
+    (payload.max_output_bytes !== undefined &&
+      (!Number.isSafeInteger(payload.max_output_bytes) ||
+        payload.max_output_bytes < 1 ||
+        payload.max_output_bytes > MAX_PAYLOAD_OUTPUT_BYTES))
+  ) {
+    return invalid("The trusted sandbox execution limits are invalid.", {});
+  }
   for (const [key, value] of Object.entries(payload.env)) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || !isBoundedText(value)) {
       return invalid("The trusted sandbox environment contains an invalid entry.", { key });
@@ -275,6 +307,9 @@ function validatePayload(payload: TrustedSandboxPayload): DomainResult<TrustedSa
     args: args.value,
     cwd: payload.cwd,
     env: { ...payload.env },
+    procfs: { mode: payload.procfs.mode, reason: payload.procfs.reason },
+    ...(payload.timeout_ms === undefined ? {} : { timeout_ms: payload.timeout_ms }),
+    ...(payload.max_output_bytes === undefined ? {} : { max_output_bytes: payload.max_output_bytes }),
     stdio: [...payload.stdio] as [SupervisorStdioValue, SupervisorStdioValue, SupervisorStdioValue, number],
     seccomp_fd: payload.seccomp_fd,
   });
@@ -305,6 +340,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isSandboxExecutionResult(value: unknown): boolean {
   if (!isRecord(value)) return false;
   if (
+    typeof value.execution_id !== "string" ||
     (typeof value.exit_code !== "number" && value.exit_code !== null) ||
     (typeof value.exit_code === "number" && !Number.isSafeInteger(value.exit_code)) ||
     (typeof value.signal !== "string" && value.signal !== null) ||
@@ -313,11 +349,49 @@ function isSandboxExecutionResult(value: unknown): boolean {
     typeof value.stderr !== "string" ||
     typeof value.duration_ms !== "number" ||
     !Number.isFinite(value.duration_ms) ||
-    value.duration_ms < 0
+    value.duration_ms < 0 ||
+    typeof value.raw_output !== "object" ||
+    value.raw_output === null ||
+    typeof value.physical_execution !== "object" ||
+    value.physical_execution === null
   ) {
     return false;
   }
-  return Buffer.byteLength(value.stdout, "utf8") + Buffer.byteLength(value.stderr, "utf8") <= MAX_PAYLOAD_OUTPUT_BYTES;
+  const evidence = {
+    schema_version: 1,
+    execution_id: value.execution_id,
+    exit_code: value.exit_code,
+    signal: value.signal,
+    raw_output: value.raw_output,
+    physical_execution: value.physical_execution,
+  };
+  const rawOutput = value.raw_output as Record<string, unknown>;
+  if (
+    rawOutput.encoding !== "base64" ||
+    (rawOutput.capture_mode !== "pipes" && rawOutput.capture_mode !== "inherited") ||
+    typeof rawOutput.stdout !== "string" ||
+    typeof rawOutput.stderr !== "string" ||
+    !Number.isSafeInteger(rawOutput.stdout_bytes) ||
+    !Number.isSafeInteger(rawOutput.stderr_bytes) ||
+    !Number.isSafeInteger(rawOutput.observed_stdout_bytes) ||
+    !Number.isSafeInteger(rawOutput.observed_stderr_bytes) ||
+    typeof rawOutput.complete !== "boolean" ||
+    typeof rawOutput.truncated !== "boolean"
+  ) {
+    return false;
+  }
+  const stdout = Buffer.from(rawOutput.stdout, "base64");
+  const stderr = Buffer.from(rawOutput.stderr, "base64");
+  return (
+    isSandboxExecutionEvidenceSnapshot(evidence) &&
+    value.execution_id === (value.physical_execution as Record<string, unknown>).correlation_id &&
+    stdout.toString("base64") === rawOutput.stdout &&
+    stderr.toString("base64") === rawOutput.stderr &&
+    stdout.byteLength === rawOutput.stdout_bytes &&
+    stderr.byteLength === rawOutput.stderr_bytes &&
+    stdout.byteLength + stderr.byteLength <= MAX_PAYLOAD_OUTPUT_BYTES &&
+    Buffer.byteLength(value.stdout, "utf8") + Buffer.byteLength(value.stderr, "utf8") <= MAX_PAYLOAD_OUTPUT_BYTES
+  );
 }
 
 function parseSupervisorChildResult(value: Buffer): SupervisorChildResult | null {
@@ -341,7 +415,12 @@ function parseSupervisorChildResult(value: Buffer): SupervisorChildResult | null
     if (parsed.error !== undefined && (typeof parsed.error !== "string" || parsed.error.length > MAX_TEXT_LENGTH)) {
       return null;
     }
-    return { status: "failed", ...(parsed.error === undefined ? {} : { error: parsed.error }) };
+    if (parsed.result !== undefined && !isSandboxExecutionEvidenceSnapshot(parsed.result)) return null;
+    return {
+      status: "failed",
+      ...(parsed.error === undefined ? {} : { error: parsed.error }),
+      ...(parsed.result === undefined ? {} : { result: parsed.result }),
+    };
   }
   return { status: "unknown" };
 }
@@ -847,6 +926,7 @@ export async function runSessionLaunchSupervisor(
     started: true,
     retryable: false,
     ...(observed.result.error === undefined ? {} : { error: observed.result.error }),
+    ...(observed.result.result === undefined ? {} : { result: observed.result.result }),
   });
 }
 

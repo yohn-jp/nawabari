@@ -49,6 +49,7 @@ const payload = {
   args: ["--die-with-parent", "--", "node", "script.js"],
   cwd: "/tmp/worktree",
   env: { PATH: "/usr/bin", NAWABARI_SESSION_ID: "session-1" },
+  procfs: { mode: "private" as const, reason: null },
   stdio: ["ignore", "pipe", "pipe", 9] as ["ignore", "pipe", "pipe", number],
   seccomp_fd: 9,
 };
