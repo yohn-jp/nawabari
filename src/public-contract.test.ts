@@ -59,6 +59,12 @@ test("public contract exposes isolated verification authority", () => {
   assert.equal(contract.source_bound_result_contract_id, "nawabari.verification-result.v2");
   assert.equal(contract.source_witness_contract_id, "nawabari.verification-source-witness.v1");
   assert.equal(contract.source_bound_evidence_contract_id, "nawabari.verification-execution-evidence.v2");
+  assert.equal(contract.session_snapshot_contract_id, "nawabari.session-verification-snapshot.v1");
+  assert.equal(contract.session_snapshot_schema_version, 1);
+  assert.equal(contract.session_bound_execution_contract_id, "nawabari.session-bound-verification.v1");
+  assert.equal(contract.session_bound_execution_schema_version, 1);
+  assert.equal(contract.session_bound_execution_result_schema, "nawabari.session-bound-verification.v1");
+  assert.deepEqual(contract.session_bound_operations, ["snapshot", "execute"]);
   assert.equal(contract.legacy_result_freshness, "unproven");
   assert.deepEqual(contract.read_visibility, ["declared", "repository"]);
   assert.equal(contract.write_policy, "deny");

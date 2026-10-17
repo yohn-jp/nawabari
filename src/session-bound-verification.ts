@@ -197,7 +197,10 @@ function snapshotMatchesExecutionStart(
   );
 }
 
-function physicalExecutionProven(evidence: SandboxExecutionEvidenceSnapshot | null, executionId: string): boolean {
+export function isSessionBoundPhysicalExecutionProven(
+  evidence: SandboxExecutionEvidenceSnapshot | null,
+  executionId: string,
+): boolean {
   if (evidence === null || !isSandboxExecutionEvidenceSnapshot(evidence)) return false;
   const physical = evidence.physical_execution;
   const namespaces = Object.values(physical.start.namespaces);
@@ -382,7 +385,7 @@ export async function executeSessionBoundVerification(
     managed.supervisor.started &&
     managed.execution.state === "exited" &&
     ownerScopeEmpty &&
-    physicalExecutionProven(executionEvidence, managed.execution.execution_id)
+    isSessionBoundPhysicalExecutionProven(executionEvidence, managed.execution.execution_id)
       ? "passed"
       : executionFailed(verification.verification, executionEvidence)
         ? "failed"
