@@ -11,7 +11,8 @@ outside the payload's private PID namespace; unmasking the container would chang
 its security boundary.
 
 The request resolver now reads its own `/proc/self/mountinfo` before launch. A
-parent procfs with child overmounts, or an unobservable parent procfs, selects an
+parent procfs with child overmounts in an unprivileged user namespace, or an
+unobservable parent procfs, selects an
 empty read-only tmpfs at `/proc` instead. An observable procfs without child overmounts
 selects the existing new private procfs. This selection only narrows visibility;
 it does not retry a failed materializer, import the enclosing procfs, or select
