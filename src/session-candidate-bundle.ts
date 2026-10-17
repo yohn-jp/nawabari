@@ -419,38 +419,41 @@ const {execFileSync}=require('node:child_process');
 const {createHash}=require('node:crypto');
 const [worktree,bundlePath,candidateRoot,candidatePath,candidateHex,sourceKey,expectedSha,base,head,tree]=process.argv.slice(1);
 const fail=(message)=>{process.stderr.write(message+'\n');process.exit(41)};
-const within=(root,value)=>{const rel=path.relative(root,value);return rel!==''&&rel!=='..'&&!rel.startsWith('..'+path.sep)&&!path.isAbsolute(rel)};
+const within=(root,value)=>{const rel=path.relative(root,value);return !!rel&&rel!=='..'&&!rel.startsWith('..'+path.sep)&&!path.isAbsolute(rel)};
 const expectedRoot=path.join(worktree,'.nawabari-verification-candidates',candidateHex,sourceKey);
-if(fs.realpathSync(worktree)!==worktree||candidateRoot!==expectedRoot||candidatePath!==path.join(candidateRoot,'repo')||bundlePath!==path.join(candidateRoot,'.candidate-'+expectedSha+'.bundle')||!within(worktree,bundlePath)||!within(worktree,candidateRoot)||!within(worktree,candidatePath))fail('candidate path mismatch');
-const rootStat=fs.lstatSync(candidateRoot);if(!rootStat.isDirectory()||rootStat.isSymbolicLink()||(rootStat.mode&0o077)!==0)fail('candidate root unsafe');
-const st=fs.lstatSync(bundlePath);if(!st.isFile()||st.isSymbolicLink()||(st.mode&0o077)!==0||st.size<1||st.size>67108864)fail('candidate bundle invalid');
-const bytes=fs.readFileSync(bundlePath);if(createHash('sha256').update(bytes).digest('hex')!==expectedSha)fail('candidate bundle hash mismatch');
-const git=(args,cwd=candidatePath)=>execFileSync('/nawabari/bin/git',['-c','core.hooksPath=/dev/null',...args],{cwd,stdio:['ignore','pipe','pipe'],encoding:'utf8',maxBuffer:1048576,env:{PATH:'/nawabari/bin:/usr/bin:/bin',HOME:'/home/nawabari',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_TERMINAL_PROMPT:'0'}}).trim();
+if(fs.realpathSync(worktree)!==worktree||candidateRoot!==expectedRoot||candidatePath!==path.join(candidateRoot,'repo')||bundlePath!==path.join(candidateRoot,'.candidate-'+expectedSha+'.bundle')||!within(worktree,bundlePath)||!within(worktree,candidatePath))fail('stage path');
+const rootStat=fs.lstatSync(candidateRoot);if(!rootStat.isDirectory()||(rootStat.mode&0o077)!==0)fail('unsafe root');
+const st=fs.lstatSync(bundlePath);if(!st.isFile()||(st.mode&0o077)!==0||st.size<1||st.size>67108864)fail('invalid bundle');
+const bytes=fs.readFileSync(bundlePath);if(createHash('sha256').update(bytes).digest('hex')!==expectedSha)fail('bundle checksum');
+const gitEnv={PATH:'/nawabari/bin:/usr/bin:/bin',HOME:'/home/nawabari',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_TERMINAL_PROMPT:'0'};
+const git=(args,cwd=candidatePath,input)=>{const raw=input!==undefined;const out=execFileSync('/nawabari/bin/git',['-c','core.hooksPath=/dev/null',...args],{cwd,input,encoding:raw?'buffer':'utf8',maxBuffer:raw?67108864:1048576,env:gitEnv});return raw?out:out.trim()};
 const repoExists=fs.existsSync(candidatePath);
-if(repoExists){const repoStat=fs.lstatSync(candidatePath);if(!repoStat.isDirectory()||repoStat.isSymbolicLink()||(repoStat.mode&0o077)!==0)fail('candidate repository unsafe');}
+if(repoExists){const repoStat=fs.lstatSync(candidatePath);if(!repoStat.isDirectory()||(repoStat.mode&0o077)!==0)fail('unsafe repo');}
 else fs.mkdirSync(candidatePath,{mode:0o700});
 if(!fs.existsSync(path.join(candidatePath,'.git')))git(['init','--quiet'],candidatePath);
 const baseRef='refs/nawabari/bases/'+candidateHex;
 const ref='refs/nawabari/candidates/'+candidateHex+'/'+sourceKey;
 const baseExists=(()=>{try{return git(['rev-parse','--verify',baseRef])===base}catch{return false}})();
-if(!baseExists){git(['fetch','--no-tags','--no-write-fetch-head','/nawabari/git',base+':'+baseRef],candidatePath);if(git(['rev-parse','--verify',baseRef])!==base)fail('candidate base mismatch');}
+if(!baseExists){const pack=git(['--git-dir=/nawabari/git','pack-objects','--stdout','--revs'],candidatePath,Buffer.from(base+'\n'));if(pack.length<32)fail('source pack');git(['index-pack','--stdin'],candidatePath,pack);git(['update-ref',baseRef,base]);if(git(['rev-parse','--verify',baseRef])!==base)fail('source base');}
 git(['bundle','verify',bundlePath]);
 const heads=git(['bundle','list-heads',bundlePath]).split('\n').filter(Boolean);
-if(heads.length!==1||heads[0]!==head+' refs/heads/mottainai-candidate')fail('unexpected candidate bundle ref');
+if(heads.length!==1||heads[0]!==head+' refs/heads/mottainai-candidate')fail('bundle refs');
 let refExists=false;try{git(['show-ref','--verify','--quiet',ref]);refExists=true}catch{}
 if(!refExists){
- git(['fetch','--no-tags','--no-write-fetch-head',bundlePath,'refs/heads/mottainai-candidate:'+ref]);
+ const imported=git(['bundle','unbundle',bundlePath]).split('\n').filter(Boolean);
+ if(imported.length!==1||imported[0]!==head+' refs/heads/mottainai-candidate')fail('bundle import');
+ git(['update-ref',ref,head]);
  const importedHead=git(['rev-parse','--verify',ref+'^{commit}']);
  const importedTree=git(['rev-parse','--verify',ref+'^{tree}']);
- if(importedHead!==head||importedTree!==tree)fail('candidate commit/tree mismatch');
- try{git(['merge-base','--is-ancestor',base,ref]);}catch{fail('candidate not based on source base');}
+ if(importedHead!==head||importedTree!==tree)fail('identity');
+ try{git(['merge-base','--is-ancestor',base,ref]);}catch{fail('ancestry');}
 }
-if(git(['rev-parse','--verify',ref+'^{commit}'])!==head)fail('candidate ref mismatch');
+if(git(['rev-parse','--verify',ref+'^{commit}'])!==head)fail('candidate ref');
 git(['checkout','--quiet','--force','-B','nawabari-candidate-'+candidateHex+'-'+sourceKey,head],candidatePath);
 const finalHead=git(['rev-parse','--verify','HEAD'],candidatePath);
 const finalTree=git(['rev-parse','--verify','HEAD^{tree}'],candidatePath);
 const clean=git(['status','--porcelain','--untracked-files=all'],candidatePath);
-if(finalHead!==head||finalTree!==tree||clean!=='')fail('candidate checkout mismatch');
+if(finalHead!==head||finalTree!==tree||clean!=='')fail('candidate checkout');
 fs.unlinkSync(bundlePath);
 process.stdout.write(JSON.stringify({worktree:candidatePath,head_id:finalHead,tree_id:finalTree,bundle_removed:true})+'\n');
 `;
