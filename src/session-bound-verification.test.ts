@@ -9,6 +9,15 @@ import {
   executeSessionBoundVerification,
   getSessionVerificationSnapshot,
 } from "./session-bound-verification.js";
+import {
+  SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+  SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID,
+  describeSessionCandidateBundlePaths,
+  sessionCandidateBundleRepositoryPath,
+  sessionCandidateBundleStagingRootPath,
+  sessionCandidateBundleTransferPath,
+  stageSessionCandidateBundle,
+} from "./session-candidate-bundle.js";
 import { sandboxExecutionMockSuccess } from "./testing/sandbox-execution-evidence-mock.js";
 
 const sessionId = "0190f1e0-0000-7000-8000-000000000001";
@@ -221,6 +230,161 @@ test("candidate-backed execution rejects an arbitrary nested Git cwd before stag
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.error.code, "INVALID_ARGUMENT");
   assert.equal(managedRuntimeRead, false);
+});
+
+test("candidate bundle paths are owner-derived for one exact source and candidate", async () => {
+  const expected = snapshot();
+  let observedSessionId = "";
+  const backend = {
+    getSessionVerificationSnapshot: async (_context: SessionContext, id: string) => {
+      observedSessionId = id;
+      return success(expected);
+    },
+  } as unknown as SessionBackend;
+  const candidateDigest = `sha256:${"c".repeat(64)}`;
+  const bundleDigest = `sha256:${"d".repeat(64)}`;
+  const request = {
+    contract_id: SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+    schema_version: 1,
+    session_id: sessionId,
+    snapshot: expected,
+    candidate_id: "candidate-exact-source",
+    candidate_digest: candidateDigest,
+    bundles: [
+      {
+        project_id: "project-exact",
+        source_id: "source-exact",
+        bundle_sha256: bundleDigest,
+        base_commit: "a".repeat(40),
+        candidate_commit: "b".repeat(40),
+        candidate_tree: "c".repeat(40),
+      },
+    ],
+  };
+
+  const result = await describeSessionCandidateBundlePaths(context, backend, request);
+
+  assert.equal(result.ok, true);
+  assert.equal(observedSessionId, sessionId);
+  if (!result.ok) return;
+  assert.equal(result.value.contract_id, SESSION_CANDIDATE_BUNDLE_PATHS_CONTRACT_ID);
+  assert.equal(result.value.session_id, sessionId);
+  assert.equal(result.value.candidate_id, request.candidate_id);
+  assert.equal(result.value.candidate_digest, candidateDigest);
+  assert.equal(result.value.transfers.length, 1);
+  assert.deepEqual(result.value.transfers[0], {
+    project_id: "project-exact",
+    source_id: "source-exact",
+    bundle_sha256: bundleDigest,
+    staging_root: sessionCandidateBundleStagingRootPath(
+      expected.worktree,
+      candidateDigest,
+      "project-exact",
+      "source-exact",
+    ),
+    transfer_path: sessionCandidateBundleTransferPath(
+      expected.worktree,
+      candidateDigest,
+      "project-exact",
+      "source-exact",
+      bundleDigest,
+    ),
+    repository_path: sessionCandidateBundleRepositoryPath(
+      expected.worktree,
+      candidateDigest,
+      "project-exact",
+      "source-exact",
+    ),
+  });
+  assert.ok(
+    result.value.transfers[0]!.staging_root.startsWith(`${expected.worktree}/.nawabari-verification-candidates/`),
+  );
+  assert.ok(result.value.transfers[0]!.transfer_path.startsWith(result.value.transfers[0]!.staging_root));
+  assert.match(result.value.receipt_sha256, /^[0-9a-f]{64}$/u);
+});
+
+test("candidate paths and imports reject a changed owner claim generation before resolving any path", async () => {
+  const expected = snapshot();
+  const stale = snapshot({
+    filesystem_policy_token: {
+      ...expected.filesystem_policy_token,
+      claim_set_generation: expected.filesystem_policy_token.claim_set_generation + 1,
+    },
+    managed: { ...expected.managed, claim_set_generation: expected.managed.claim_set_generation + 1 },
+  });
+  let pathResolutionCalls = 0;
+  let launchAuthorityCalls = 0;
+  const backend = {
+    getSessionVerificationSnapshot: async () => {
+      pathResolutionCalls += 1;
+      return success(stale);
+    },
+    getSessionManagedRuntime: async () => {
+      launchAuthorityCalls += 1;
+      throw new Error("stale candidate must not enter protected launch");
+    },
+  } as unknown as SessionBackend;
+  const candidateDigest = `sha256:${"c".repeat(64)}`;
+  const candidate = {
+    project_id: "project-exact",
+    source_id: "source-exact",
+    bundle_sha256: `sha256:${"d".repeat(64)}`,
+    base_commit: "a".repeat(40),
+    candidate_commit: "b".repeat(40),
+    candidate_tree: "c".repeat(40),
+  };
+  const request = {
+    contract_id: SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+    schema_version: 1,
+    session_id: sessionId,
+    snapshot: expected,
+    candidate_id: "candidate-exact-source",
+    candidate_digest: candidateDigest,
+    bundles: [candidate],
+  };
+
+  const paths = await describeSessionCandidateBundlePaths(context, backend, request);
+  const staged = await stageSessionCandidateBundle(context, backend, request);
+
+  assert.equal(paths.ok, false);
+  if (!paths.ok) assert.equal(paths.error.code, "STALE_REGISTRY");
+  assert.equal(staged.ok, false);
+  if (!staged.ok) assert.equal(staged.error.code, "STALE_REGISTRY");
+  assert.equal(pathResolutionCalls, 2);
+  assert.equal(launchAuthorityCalls, 0);
+});
+
+test("candidate path operation refuses to stage unrelated bundles into one repository session", async () => {
+  const expected = snapshot();
+  let snapshotReads = 0;
+  const backend = {
+    getSessionVerificationSnapshot: async () => {
+      snapshotReads += 1;
+      return success(expected);
+    },
+  } as unknown as SessionBackend;
+  const bundle = {
+    project_id: "project-exact",
+    source_id: "source-exact",
+    bundle_sha256: `sha256:${"d".repeat(64)}`,
+    base_commit: "a".repeat(40),
+    candidate_commit: "b".repeat(40),
+    candidate_tree: "c".repeat(40),
+  };
+
+  const result = await describeSessionCandidateBundlePaths(context, backend, {
+    contract_id: SESSION_CANDIDATE_BUNDLE_CONTRACT_ID,
+    schema_version: 1,
+    session_id: sessionId,
+    snapshot: expected,
+    candidate_id: "candidate-exact-source",
+    candidate_digest: `sha256:${"c".repeat(64)}`,
+    bundles: [bundle, { ...bundle, source_id: "source-unrelated" }],
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "INVALID_ARGUMENT");
+  assert.equal(snapshotReads, 0, "invalid multi-source requests must be rejected before owner path resolution");
 });
 
 test("closed managed admission is refused before launch", async () => {
