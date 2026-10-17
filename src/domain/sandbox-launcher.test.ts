@@ -1597,9 +1597,29 @@ test("compiled protected execution keeps a worktree under /tmp visible and hides
     assert.equal(stage.value.exit_code, 0, JSON.stringify(stage.value));
     assert.equal(stage.value.stdout, "bounded-owner-stage-ok");
     fs.mkdirSync(path.join(scratch, "repo/.git"), { mode: 0o700 });
+    fs.writeFileSync(path.join(scratch, "repo/undeclared.txt"), "private-unselected");
+    const runtime = protectedRequest.value.runtime_projection;
+    assert.ok(runtime?.working_set);
+    if (runtime?.working_set === undefined) return;
+    const candidateRuntime = validateSessionRuntimeProjection({
+      ...runtime,
+      working_set: {
+        ...runtime.working_set,
+        scope: {
+          readOnly: [path.relative(worktree, path.join(scratch, "repo/objects/pack")).split(path.sep).join("/")],
+          write: [],
+          create: [],
+          delete: [],
+          deny: [],
+        },
+      },
+    });
+    assert.ok(candidateRuntime.ok);
+    if (!candidateRuntime.ok) return;
     const candidateRead = await runSandboxedCommand(
       {
         ...protectedRequest.value,
+        runtime_projection: candidateRuntime.value,
         compiled_session_environment: compiled.value,
         git_profile: profileResult.value,
         owner_candidate_verification: {
@@ -1618,12 +1638,15 @@ test("compiled protected execution keeps a worktree under /tmp visible and hides
           [
             "const fs=require('node:fs'), assert=require('node:assert/strict'), path=require('node:path');",
             "assert.equal(fs.readFileSync('objects/pack','utf8'),'exact-stage');",
+            "assert.throws(()=>fs.readFileSync('undeclared.txt'));",
+            "assert.throws(()=>fs.readFileSync(process.argv[1]));",
             "assert.equal(process.env.GIT_DIR,path.join(process.cwd(),'.git'));",
             "assert.equal(process.env.GIT_WORK_TREE,process.cwd());",
             "assert.throws(()=>fs.writeFileSync('objects/pack','forbidden'));",
             "assert.throws(()=>fs.writeFileSync('new-file','forbidden'));",
             "process.stdout.write('owner-candidate-read-only-ok');",
           ].join(" "),
+          path.join(worktree, "README.md"),
         ],
       },
     );
